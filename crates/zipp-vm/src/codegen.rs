@@ -2798,7 +2798,7 @@ fn compile_region(
     // The register/SROA paths decline any region containing a Call/CallMethod, so
     // leaf inlining and method inlining (which apply only to those sites) are
     // reachable only via the memory path below.
-    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan) {
+    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot) {
         return Some(f);
     }
     compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan)
@@ -2814,7 +2814,7 @@ fn compile_region_numeric(proto: &FuncProto, start: u32, end: u32, gh: usize) ->
         return Some((f, true));
     }
     // SROA-rewritten code has no index ops, so an empty TA plan is correct here.
-    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default()).map(|f| (f, false))
+    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default(), 0).map(|f| (f, false))
 }
 
 /// Clone `proto` and rewrite the region's heap ops to scratch field-globals so
@@ -2928,6 +2928,12 @@ struct RegionPlan {
     /// Used to gate the compare+branch flag-fusion peephole: a branch that is
     /// itself a jump target can't rely on flags from the preceding compare.
     jump_targets: FxHashSet<usize>,
+    /// Unboxed-region epic: receiver registers of pinned-Float64Array GetIndex/
+    /// SetIndex (each defined by ONE LoadGlobal, used ONLY as such a receiver). They
+    /// are NOT homed — the element-access emitter reads the live receiver via the
+    /// pin's source for its identity guard — so their defining LoadGlobal body op is
+    /// a no-op. Empty unless the f64-TA element fast path admitted this region.
+    ta_recv_regs: FxHashSet<u16>,
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops
@@ -3535,9 +3541,70 @@ fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: AbsState) ->
 /// VTy::Num xmm home. Not yet consulted — the blanket index/call/bitwise decline
 /// below still applies (regions with those take the memory path).
 fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> Option<RegionPlan> {
-    let _ = ta_plan; // threaded for the unboxed-region increment; not yet consulted
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
+    // ── unboxed-region epic: pinned-Float64Array element access ──
+    // A kind-8 (Float64) pinned GetIndex/SetIndex can run in the f64 register path:
+    // the element IS an f64 (a VTy::Num xmm home). Its receiver `obj` (a heap TA) and
+    // index `key` are NOT homed — the emitter reads the receiver via the pin's source
+    // and the index via `key`'s xmm home. Identify the admissible ops + their receiver
+    // regs so the typing/homing passes below bypass the receivers.
+    let pinned_f64 = |ip: usize| -> bool {
+        ta_plan
+            .access
+            .get(&ip)
+            .map_or(false, |&j| ta_plan.pins[j as usize].kind == 8)
+    };
+    let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
+    {
+        // Candidate receiver regs: the `obj` of every kind-8 pinned index op.
+        let mut recv: FxHashSet<u16> = FxHashSet::default();
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            if pinned_f64(s + off) {
+                if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
+                    recv.insert(obj);
+                }
+            }
+        }
+        if !recv.is_empty() {
+            // Each receiver reg must be defined by EXACTLY ONE LoadGlobal and used
+            // ONLY as a pinned-index `obj` (else it would need a real home — decline
+            // the whole region to the memory path, which handles it).
+            let mut def_n: FxHashMap<u16, u32> = FxHashMap::default();
+            let mut def_lg: FxHashSet<u16> = FxHashSet::default();
+            for instr in &code[s..=e] {
+                if let Some(d) = writes_reg(instr) {
+                    *def_n.entry(d).or_insert(0) += 1;
+                    if matches!(instr, Instr::LoadGlobal { .. }) {
+                        def_lg.insert(d);
+                    }
+                }
+            }
+            let mut used_elsewhere: FxHashSet<u16> = FxHashSet::default();
+            for (off, instr) in code[s..=e].iter().enumerate() {
+                let idx_obj = if pinned_f64(s + off) {
+                    match *instr {
+                        Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => Some(obj),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                for u in instr_uses(instr) {
+                    if Some(u) != idx_obj && recv.contains(&u) {
+                        used_elsewhere.insert(u);
+                    }
+                }
+            }
+            for &r in &recv {
+                if def_n.get(&r) == Some(&1) && def_lg.contains(&r) && !used_elsewhere.contains(&r) {
+                    ta_recv_regs.insert(r);
+                } else {
+                    return None; // a receiver we can't cleanly exclude → memory path
+                }
+            }
+        }
+    }
     let mut ty: FxHashMap<u16, VTy> = FxHashMap::default();
     let mut first_seen: FxHashMap<u16, bool> = FxHashMap::default(); // reg → was first occurrence a def?
     let mut glob_first_read: FxHashMap<u32, bool> = FxHashMap::default(); // slot → first touch was a read?
@@ -3562,23 +3629,24 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
     // Two passes are awkward with closures; do a single ordered pass collecting
     // type (from defs) and first-occurrence (def vs use). Operand type
     // requirements are validated in a second loop once types are known.
-    for instr in &code[s..=e] {
-        // A dense-array element access, any call, or a bitwise op can't be
-        // register-allocated (their operands/result are boxed Values handled by
-        // a helper / int32 lanes, not the planner's f64-or-bool scalars — and a
-        // call can run arbitrary user code) — decline so the region takes the
-        // memory path that emits the helper call / inline int32 sequence.
-        if matches!(
-            instr,
-            Instr::GetIndex { .. }
-                | Instr::SetIndex { .. }
-                | Instr::CallMethod { .. }
-                | Instr::Call { .. }
-                | Instr::Bitwise { .. }
-        ) {
-            return None;
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        // A call or a bitwise op can't be register-allocated (boxed Values / int32
+        // lanes / arbitrary user code) — decline to the memory path. A dense-array
+        // GetIndex/SetIndex likewise declines UNLESS it is a kind-8 (Float64) pinned
+        // TypedArray access, which the f64 element fast path emits inline (the
+        // element is a VTy::Num xmm home; receiver/index handled specially below).
+        match *instr {
+            Instr::CallMethod { .. } | Instr::Call { .. } | Instr::Bitwise { .. } => return None,
+            Instr::GetIndex { .. } | Instr::SetIndex { .. } => {
+                if !pinned_f64(s + off) {
+                    return None;
+                }
+            }
+            _ => {}
         }
         let (def, dty): (Option<u16>, VTy) = match *instr {
+            // A pinned-f64 GetIndex loads an f64 element into a Num home.
+            Instr::GetIndex { dst, .. } => (Some(dst), VTy::Num),
             Instr::LoadInt { dst, .. } => (Some(dst), VTy::Num),
             Instr::LoadConst { dst, .. } => (Some(dst), VTy::Num),
             Instr::LoadGlobal { dst, .. } => (Some(dst), VTy::Num),
@@ -3606,7 +3674,8 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
                 // Type not yet known; tentatively untyped — refined when defined.
             }
         }
-        if let Some(d) = def {
+        // A TA-receiver reg is NOT typed/homed (sourced via the pin); skip its def.
+        if let Some(d) = def.filter(|d| !ta_recv_regs.contains(d)) {
             // Move's dst type follows its src; default Num is corrected here.
             let t = if let Instr::Move { src, .. } = *instr {
                 *ty.get(&src).unwrap_or(&VTy::Num)
@@ -3617,8 +3686,10 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
                 return None;
             }
         }
-        // Globals: order + first-touch direction.
+        // Globals: order + first-touch direction. A TA-receiver's LoadGlobal is
+        // excluded (no numeric home; the element emitter reads it via the pin).
         match *instr {
+            Instr::LoadGlobal { dst, .. } if ta_recv_regs.contains(&dst) => {}
             Instr::LoadGlobal { idx, .. } => {
                 glob_first_read.entry(idx).or_insert(true);
                 if !glob_order.contains(&idx) {
@@ -3638,9 +3709,28 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
     // A register used but never defined in the region is a read-only live-in.
     // Loading/typing it correctly (numeric vs bool) is fiddly, so decline and
     // let the memory path handle it (it reads everything from the reg file).
+    // TA-receiver regs are intentionally untyped (sourced via the pin) — skip them.
     for instr in &code[s..=e] {
         for u in instr_uses(instr) {
-            if !ty.contains_key(&u) {
+            if !ta_recv_regs.contains(&u) && !ty.contains_key(&u) {
+                return None;
+            }
+        }
+    }
+
+    // Each pinned-f64 index op needs its index (and a SetIndex's stored value) in an
+    // xmm Num home: the emitter reads the index from `key`'s home (cvttsd2si) and a
+    // SetIndex stores `val`'s home. Decline if either isn't a number home.
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        if pinned_f64(s + off) {
+            let bad = match *instr {
+                Instr::GetIndex { key, .. } => ty.get(&key) != Some(&VTy::Num),
+                Instr::SetIndex { key, val, .. } => {
+                    ty.get(&key) != Some(&VTy::Num) || ty.get(&val) != Some(&VTy::Num)
+                }
+                _ => false,
+            };
+            if bad {
                 return None;
             }
         }
@@ -4034,6 +4124,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
         addint_imm_home,
         gpr_const,
         jump_targets,
+        ta_recv_regs,
     })
 }
 
@@ -4246,6 +4337,7 @@ fn compile_region_regalloc(
     end: u32,
     globals_base_helper: usize,
     ta_plan: &TaPinPlan,
+    ta_snapshot: usize,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end, None) {
         return None;
@@ -4266,6 +4358,17 @@ fn compile_region_regalloc(
     // alignment past that point is irrelevant and movdqu (unaligned) is fine.
     // r13/r14 are pushed (unused by the double path) to share the one restore
     // sequence with the int path, which uses them for guard constants.
+    // Frame: with pinned TypedArrays, reserve [shadow 32][TA snapshot slots 32·n_ta]
+    // [xmm6..15 save 160][pad 8] — the shadow sits at the BOTTOM so the prologue TA
+    // snapshot calls (the only calls after the globals fetch) have their 32-byte
+    // shadow space, and `frame ≡ 8 (mod 16)` keeps rsp 16-aligned for them. With no
+    // pins this is exactly the legacy 160-byte xmm frame (xmm_off/ta_base = 0).
+    let n_ta = ta_plan.pins.len() as i32;
+    let (frame, xmm_off, ta_base) = if n_ta > 0 {
+        (200 + 32 * n_ta, 32 + 32 * n_ta, 32i32)
+    } else {
+        (160i32, 0i32, 0i32)
+    };
     dynasm!(ops
         ; push rbx
         ; push rsi
@@ -4282,11 +4385,30 @@ fn compile_region_regalloc(
         ; call rax
         ; mov r12, rax
         ; add rsp, 40
-        ; sub rsp, 160                // save area for xmm6..15 (10 × 16)
+        ; sub rsp, frame              // [shadow][TA slots][xmm6..15 save][pad]
     );
     for k in 0..10u32 {
         let xi = 6 + k as u8;
-        dynasm!(ops ; movdqu [rsp + (k as i32) * 16], Rx(xi));
+        dynasm!(ops ; movdqu [rsp + xmm_off + (k as i32) * 16], Rx(xi));
+    }
+    // ── pinned-TypedArray snapshots ── BEFORE loading any numeric home: jit_ta_snapshot
+    // is a win64 call that clobbers volatile xmm0..5 (which double as home registers),
+    // but xmm6..15 are already saved above and no home is loaded yet. Each slot gets
+    // {obj_bits, base, len} (or {0,0,0} if the live receiver is no longer a kind-`kind`
+    // view → the per-access identity guard then misses → deopt). r12/rbx are
+    // callee-saved across the call. This is the last call before the loop.
+    for (j, pin) in ta_plan.pins.iter().enumerate() {
+        match pin.src {
+            TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
+            TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        }
+        dynasm!(ops
+            ; mov rcx, rdi                      // vm
+            ; mov r8d, pin.kind as i32          // expected element kind
+            ; lea r9, [rsp + ta_base + 32 * j as i32] // out: {obj_bits,base,len}
+            ; mov rax, QWORD ta_snapshot as i64
+            ; call rax
+        );
     }
     // Load live-in globals (guarded) and live-in registers (guarded).
     for &(gi, x) in &plan.live_in_globs {
@@ -4365,6 +4487,11 @@ fn compile_region_regalloc(
                     dynasm!(ops ; mov Rq(d), Rq(sg));
                 }
             },
+            // A TA-receiver's LoadGlobal is a no-op: it has no numeric home; the
+            // element-access emitter reads the receiver via the pin's source.
+            Instr::LoadGlobal { dst, .. } if plan.ta_recv_regs.contains(&dst) => {
+                flag_cmp = prev_flag; // nothing emitted; flags still live
+            }
             Instr::LoadGlobal { dst, idx } => {
                 let d = xh(&plan, dst);
                 let g = plan.glob_home[&idx];
@@ -4498,6 +4625,78 @@ fn compile_region_regalloc(
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
             }
+            // ── pinned-Float64Array element read ── x[i] → a direct movsd into the
+            // dst xmm home (UNBOXED). Guards (any miss DEOPTs to the interpreter AT
+            // this ip — index ops are all-or-nothing, so re-execution is sound):
+            // (1) receiver identity vs the prologue snapshot; (2) integral index
+            // (cvttsd2si round-trip; fractional/NaN → deopt); (3) unsigned bounds.
+            Instr::GetIndex { dst, key, .. } => {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let d = xh(&plan, dst);
+                let kx = xh(&plan, key);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rax, [rsp + off]            // receiver vs snapshot obj_bits
+                    ; jne => deopt
+                    ; cvttsd2si rcx, Rx(kx)           // index = trunc(key home)
+                    ; cvtsi2sd xmm0, rcx
+                    ; ucomisd xmm0, Rx(kx)
+                    ; jne => deopt                    // non-integral index
+                    ; jp => deopt                     // NaN index
+                    ; cmp rcx, [rsp + off + 16]       // unsigned: i < len (catches <0)
+                    ; jae => deopt
+                    ; mov rdx, [rsp + off + 8]        // pinned base
+                    ; movsd Rx(d), [rdx + rcx * 8]    // f64 element → home
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32      // resume AT this ip
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
+            // ── pinned-Float64Array element write ── x[i] = v → a direct movsd from
+            // the val xmm home. Same guards; an OOB store deopts (the interpreter
+            // does the spec coerce-then-silent-noop). `val` is already an f64 home,
+            // so the store is exact for every number (integers store their double).
+            Instr::SetIndex { key, val, .. } => {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let kx = xh(&plan, key);
+                let vx = xh(&plan, val);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rax, [rsp + off]
+                    ; jne => deopt
+                    ; cvttsd2si rcx, Rx(kx)
+                    ; cvtsi2sd xmm0, rcx
+                    ; ucomisd xmm0, Rx(kx)
+                    ; jne => deopt
+                    ; jp => deopt
+                    ; cmp rcx, [rsp + off + 16]
+                    ; jae => deopt
+                    ; mov rdx, [rsp + off + 8]
+                    ; movsd [rdx + rcx * 8], Rx(vx)   // home f64 → element
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                lc = None;
+            }
             _ => return None,
         }
     }
@@ -4529,7 +4728,7 @@ fn compile_region_regalloc(
     for &(gi, x) in &plan.globs {
         dynasm!(ops ; movq rax, Rx(x) ; mov [r12 + (gi as i32) * 8], rax);
     }
-    emit_region_restore(&mut ops);
+    emit_region_restore_n(&mut ops, xmm_off, frame);
 
     // ── entry_bail ── a live-in type guard failed; nothing was computed yet, so
     // restore (NO flush — reg file / globals are still consistent) and resume at
@@ -4538,7 +4737,7 @@ fn compile_region_regalloc(
         ; => entry_bail
         ; mov DWORD [rsi], start as i32
     );
-    emit_region_restore(&mut ops);
+    emit_region_restore_n(&mut ops, xmm_off, frame);
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
@@ -5177,12 +5376,20 @@ fn emit_int_box_from_home(ops: &mut dynasmrt::x64::Assembler, h: u8) {
 
 /// Restore xmm6..15 from the save area and the saved gprs, then `ret`.
 fn emit_region_restore(ops: &mut dynasmrt::x64::Assembler) {
+    emit_region_restore_n(ops, 0, 160);
+}
+
+/// Restore the xmm6..15 saves (from `[rsp + xmm_off + k*16]`), pop the saved gprs,
+/// and `ret`. `frame` is the post-prologue rsp adjustment to undo (`160` for the
+/// legacy layout, `200 + 32·n_ta` for the pinned-TypedArray layout whose snapshot
+/// slots sit below the xmm saves).
+fn emit_region_restore_n(ops: &mut dynasmrt::x64::Assembler, xmm_off: i32, frame: i32) {
     for k in 0..10u32 {
         let xi = 6 + k as u8;
-        dynasm!(ops ; movdqu Rx(xi), [rsp + (k as i32) * 16]);
+        dynasm!(ops ; movdqu Rx(xi), [rsp + xmm_off + (k as i32) * 16]);
     }
     dynasm!(ops
-        ; add rsp, 160
+        ; add rsp, frame
         ; pop r14
         ; pop r13
         ; pop r12
