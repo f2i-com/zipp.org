@@ -246,15 +246,6 @@ pub(crate) fn spec_key_order(keys: &[String]) -> Vec<usize> {
     ints.into_iter().map(|(_, i)| i).chain(rest).collect()
 }
 
-/// `spec_key_order`, but skipping tombstoned slots (T0.2): `present` is the
-/// ObjMap's tombstone bitmap, parallel to `keys`. Used by the property
-/// enumerators that walk an ObjMap in canonical order (Object.keys, for-in,
-/// getOwnPropertyNames, JSON, …) so a deleted key never resurfaces. Integer-key
-/// ordering is unaffected — tombstoned indices are simply dropped.
-pub(crate) fn spec_key_order_present(keys: &[String], present: &[bool]) -> Vec<usize> {
-    spec_key_order(keys).into_iter().filter(|&i| present[i]).collect()
-}
-
 /// A canonical non-negative integer property key as a usize index — "0", "1",
 /// "10" but NOT "00", "01", "-1", "1.5", "" or " 1" (no leading zeros / sign /
 /// fraction / whitespace). Mirrors the array-index canonicality used by
