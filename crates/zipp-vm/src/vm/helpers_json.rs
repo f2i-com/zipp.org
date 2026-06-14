@@ -10,12 +10,19 @@ use crate::value::Value;
 /// Quote a string as a JSON string literal (escaping per the JSON spec).
 pub(crate) fn json_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
+    json_quote_into(&mut out, s);
+    out
+}
+
+/// `json_quote` appending into an existing buffer (the stringify fast path —
+/// avoids a fresh String per quoted key/value).
+pub(crate) fn json_quote_into(out: &mut String, s: &str) {
+    out.reserve(s.len() + 2);
     out.push('"');
     for c in s.chars() {
-        json_quote_cp(&mut out, c as u32);
+        json_quote_cp(out, c as u32);
     }
     out.push('"');
-    out
 }
 
 /// `json_quote` over a string's exact WTF-8 bytes: a LONE surrogate emits the
@@ -23,12 +30,18 @@ pub(crate) fn json_quote(s: &str) -> String {
 /// well-formed astral scalars emit as-is.
 pub(crate) fn json_quote_wtf8(b: &[u8]) -> String {
     let mut out = String::with_capacity(b.len() + 2);
+    json_quote_wtf8_into(&mut out, b);
+    out
+}
+
+/// `json_quote_wtf8` appending into an existing buffer.
+pub(crate) fn json_quote_wtf8_into(out: &mut String, b: &[u8]) {
+    out.reserve(b.len() + 2);
     out.push('"');
     for cp in crate::heap::wtf8_code_points(b) {
-        json_quote_cp(&mut out, cp);
+        json_quote_cp(out, cp);
     }
     out.push('"');
-    out
 }
 
 /// One code point of JSON string-literal quoting. `cp` may be a lone

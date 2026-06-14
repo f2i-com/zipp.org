@@ -519,6 +519,26 @@ mod tests {
     }
 
     #[test]
+    fn json_stringify_buffer_append() {
+        // The single-buffer SerializeJSONProperty path: omitted object props (incl.
+        // their comma) vanish, omitted array elements become null, empty/nested
+        // containers and escaping are unchanged. (test262's JSON/stringify suite is
+        // the exhaustive guard; this is a fast smoke test.)
+        assert_eq!(
+            run_ok("console.log(JSON.stringify({a:1,b:undefined,c:[1,undefined,3],d:{},e:function(){}}))"),
+            vec![r#"{"a":1,"c":[1,null,3],"d":{}}"#.to_string()]
+        );
+        assert_eq!(
+            run_ok("console.log(JSON.stringify({a:1,b:[2]},null,2))"),
+            vec!["{\n  \"a\": 1,\n  \"b\": [\n    2\n  ]\n}".to_string()]
+        );
+        assert_eq!(
+            run_ok(r#"console.log(JSON.stringify({x:"a\nb\t\"q\""}))"#),
+            vec![r#"{"x":"a\nb\t\"q\""}"#.to_string()]
+        );
+    }
+
+    #[test]
     fn region_math_imul_inline() {
         // Math.imul emitted INLINE in a region (native 32-bit imul, no FFI) must
         // be byte-identical to the helper path across overflow, negatives, double

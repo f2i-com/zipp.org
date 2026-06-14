@@ -233,6 +233,7 @@ impl<'p> Vm<'p> {
     /// `replacer`); `replacer` is a callable or undefined; `allowlist`, when
     /// `Some`, restricts which object keys are emitted (the array-replacer form).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn json_value(
         &mut self,
         holder: Value,
@@ -244,6 +245,36 @@ impl<'p> Vm<'p> {
         replacer: Value,
         allowlist: Option<&[String]>,
     ) -> Result<Option<String>, Thrown> {
+        let mut out = String::new();
+        if self.json_value_into(holder, key, v, indent, depth, visited, replacer, allowlist, &mut out)?
+        {
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// SerializeJSONProperty, appending straight into a single shared output
+    /// buffer instead of building a per-node `String`/`Vec<String>` tree and
+    /// joining at every level (the V8 approach). Returns `true` if a value was
+    /// written, `false` if the property is OMITTED (undefined / function / symbol
+    /// / a replacer-undefined) — for an object the caller rolls the buffer back to
+    /// the entry start; for an array the caller writes `null`. Byte-for-byte
+    /// identical to the old `Vec<String>` + `wrap_json` path (same escaping,
+    /// indent layout, key order, toJSON/replacer/allowlist/cycle/raw-JSON rules).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn json_value_into(
+        &mut self,
+        holder: Value,
+        key: &str,
+        v: Value,
+        indent: &str,
+        depth: usize,
+        visited: &mut Vec<u32>,
+        replacer: Value,
+        allowlist: Option<&[String]>,
+        out: &mut String,
+    ) -> Result<bool, Thrown> {
         // SerializeJSONProperty: a value with a callable `toJSON` is replaced by
         // `value.toJSON(key)` before serialization (Date, user objects, …).
         let v = if v.is_heap() {
@@ -266,20 +297,27 @@ impl<'p> Vm<'p> {
             v
         };
         if v.is_undefined() {
-            return Ok(None);
+            return Ok(false);
         }
         if v.is_null() {
-            return Ok(Some("null".to_string()));
+            out.push_str("null");
+            return Ok(true);
         }
         if v.is_bool() {
-            return Ok(Some(if v.as_bool() { "true" } else { "false" }.to_string()));
+            out.push_str(if v.as_bool() { "true" } else { "false" });
+            return Ok(true);
         }
         if v.is_number() {
             let n = v.as_f64();
-            return Ok(Some(if n.is_finite() { fmt_f64(n) } else { "null".to_string() }));
+            if n.is_finite() {
+                out.push_str(&fmt_f64(n));
+            } else {
+                out.push_str("null");
+            }
+            return Ok(true);
         }
         if !v.is_heap() {
-            return Ok(None);
+            return Ok(false);
         }
         let idx = v.heap_index();
         // Leaf / primitive-wrapper cases (no recursion into properties).
@@ -288,13 +326,14 @@ impl<'p> Vm<'p> {
                 // EXACT bytes: a lone surrogate must emit its \udXXX escape
                 // (well-formed JSON.stringify), not a U+FFFD substitution.
                 let b = self.heap.str_wtf8_cow(idx).unwrap().into_owned();
-                return Ok(Some(json_quote_wtf8(&b)));
+                json_quote_wtf8_into(out, &b);
+                return Ok(true);
             }
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
             | HeapObj::Native(_)
-            | HeapObj::Symbol { .. } => return Ok(None),
+            | HeapObj::Symbol { .. } => return Ok(false),
             HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
                 return Err(Thrown("TypeError: Do not know how to serialize a BigInt".into()))
             }
@@ -302,18 +341,25 @@ impl<'p> Vm<'p> {
             // observably invoking the wrapper's toString/valueOf (which may throw).
             HeapObj::Boxed { kind: 0, .. } => {
                 let s = self.to_js_string(v)?;
-                return Ok(Some(json_quote(&s)));
+                json_quote_into(out, &s);
+                return Ok(true);
             }
             HeapObj::Boxed { kind: 1, .. } => {
                 // ToNumber(wrapper): ToPrimitive(number) so an overridden
                 // valueOf/@@toPrimitive fires (to_number_coerce reads [[NumberData]]).
                 let prim = self.to_primitive_number(v)?;
                 let n = self.to_number(prim)?;
-                return Ok(Some(if n.is_finite() { fmt_f64(n) } else { "null".to_string() }));
+                if n.is_finite() {
+                    out.push_str(&fmt_f64(n));
+                } else {
+                    out.push_str("null");
+                }
+                return Ok(true);
             }
             HeapObj::Boxed { kind: 2, value } => {
                 let b = self.truthy(*value);
-                return Ok(Some(if b { "true" } else { "false" }.to_string()));
+                out.push_str(if b { "true" } else { "false" });
+                return Ok(true);
             }
             // A boxed BigInt (Object(0n)) throws like a primitive BigInt; a boxed
             // Symbol falls through to SerializeJSONObject ("{}").
@@ -337,7 +383,8 @@ impl<'p> Vm<'p> {
                     .str_cow(raw_val.heap_index())
                     .map(|c| c.into_owned())
                     .unwrap_or_default();
-                return Ok(Some(s));
+                out.push_str(&s);
+                return Ok(true);
             }
             _ => {}
         }
@@ -349,7 +396,9 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: Converting circular structure to JSON".into()));
         }
         visited.push(idx);
-        let result = if self.value_is_array(v) {
+        let pad = if indent.is_empty() { String::new() } else { indent.repeat(depth + 1) };
+        let pad_close = if indent.is_empty() { String::new() } else { indent.repeat(depth) };
+        if self.value_is_array(v) {
             // len = ToLength(Get(val, "length"))
             let lenv = self.get_prop(v, "length")?;
             let lenf = self.to_number_coerce(lenv)?;
@@ -358,9 +407,16 @@ impl<'p> Vm<'p> {
             } else {
                 lenf.min(9007199254740991.0) as u64
             };
-            let mut parts = Vec::with_capacity(len.min(1024) as usize);
+            out.push('[');
             let mut i: u64 = 0;
             while i < len {
+                if i > 0 {
+                    out.push(',');
+                }
+                if !indent.is_empty() {
+                    out.push('\n');
+                    out.push_str(&pad);
+                }
                 let ks = i.to_string();
                 let e = match self.json_get(v, &ks) {
                     Ok(e) => e,
@@ -369,23 +425,26 @@ impl<'p> Vm<'p> {
                         return Err(e);
                     }
                 };
-                let part = match self
-                    .json_value(v, &ks, e, indent, depth + 1, visited, replacer, allowlist)
+                // An omitted array element serializes as `null` (NOT skipped).
+                let wrote = match self
+                    .json_value_into(v, &ks, e, indent, depth + 1, visited, replacer, allowlist, out)
                 {
-                    Ok(p) => p.unwrap_or_else(|| "null".to_string()),
+                    Ok(w) => w,
                     Err(e) => {
                         visited.pop();
                         return Err(e);
                     }
                 };
-                parts.push(part);
+                if !wrote {
+                    out.push_str("null");
+                }
                 i += 1;
             }
-            if parts.is_empty() {
-                "[]".to_string()
-            } else {
-                wrap_json(&parts, '[', ']', indent, depth)
+            if len > 0 && !indent.is_empty() {
+                out.push('\n');
+                out.push_str(&pad_close);
             }
+            out.push(']');
         } else {
             // EnumerableOwnPropertyNames(val) — or the PropertyList, when given.
             let keys: Vec<String> = match allowlist {
@@ -405,7 +464,8 @@ impl<'p> Vm<'p> {
                 }
             };
             let sep = if indent.is_empty() { ":" } else { ": " };
-            let mut parts = Vec::new();
+            out.push('{');
+            let mut any = false;
             for k in keys {
                 let val = match self.json_get(v, &k) {
                     Ok(val) => val,
@@ -414,23 +474,42 @@ impl<'p> Vm<'p> {
                         return Err(e);
                     }
                 };
-                match self.json_value(v, &k, val, indent, depth + 1, visited, replacer, allowlist) {
-                    Ok(Some(vs)) => parts.push(format!("{}{}{}", json_quote(&k), sep, vs)),
-                    Ok(None) => {}
+                // Tentatively write `[,]\n pad "key"sep`, then the value; if the
+                // value is OMITTED, roll the buffer back to before this entry (so
+                // an undefined-valued property leaves no trace, incl. its comma).
+                let mark = out.len();
+                if any {
+                    out.push(',');
+                }
+                if !indent.is_empty() {
+                    out.push('\n');
+                    out.push_str(&pad);
+                }
+                json_quote_into(out, &k);
+                out.push_str(sep);
+                let wrote = match self
+                    .json_value_into(v, &k, val, indent, depth + 1, visited, replacer, allowlist, out)
+                {
+                    Ok(w) => w,
                     Err(e) => {
                         visited.pop();
                         return Err(e);
                     }
+                };
+                if wrote {
+                    any = true;
+                } else {
+                    out.truncate(mark);
                 }
             }
-            if parts.is_empty() {
-                "{}".to_string()
-            } else {
-                wrap_json(&parts, '{', '}', indent, depth)
+            if any && !indent.is_empty() {
+                out.push('\n');
+                out.push_str(&pad_close);
             }
-        };
+            out.push('}');
+        }
         visited.pop();
-        Ok(Some(result))
+        Ok(true)
     }
 
     /// Parse a JSON string into a Value, or throw SyntaxError. Recursive-descent
