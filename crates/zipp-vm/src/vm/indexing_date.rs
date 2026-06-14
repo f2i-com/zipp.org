@@ -601,6 +601,184 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `dst = obj[<string-const `name`> + key]` — the `GetIndexConcat` op. When
+    /// `key` is an int and `obj` is a plain object with an own non-accessor data
+    /// slot for `"<prefix><int>"`, the key is assembled into the reusable scratch
+    /// buffer (NO throwaway heap string) and answered from the ObjMap — the twin
+    /// of `get_index`'s borrowed fast path. Any miss / accessor / exotic shape
+    /// falls back to materialising `prefix + key` and running `get_index`
+    /// (byte-identical to the unfused `obj["prefix" + key]`).
+    pub(crate) fn get_index_concat(
+        &mut self,
+        obj: Value,
+        name: u32,
+        key: Value,
+        func_id: u32,
+    ) -> Result<Value, Thrown> {
+        if key.is_int() && obj.is_heap() {
+            let oidx = obj.heap_index();
+            if !(oidx == self.global_this && self.global_this != 0)
+                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oidx))
+                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oidx))
+                && matches!(self.heap.get(oidx), HeapObj::Object(_))
+            {
+                let mut scratch = std::mem::take(&mut self.idx_key_scratch);
+                self.build_concat_key(&mut scratch, name, key.as_int(), func_id);
+                let hit = match self.heap.get(oidx) {
+                    HeapObj::Object(m) => match m.pos(&scratch) {
+                        Some(i) if !m.attrs[i].accessor && !m.vals[i].is_uninitialized() => {
+                            Some(m.vals[i])
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                self.idx_key_scratch = scratch;
+                if let Some(v) = hit {
+                    return Ok(v);
+                }
+            }
+        }
+        // SLOW PATH: materialise the key exactly as `+` would and run the ordinary
+        // computed read (proto chain, accessors, arrays, typed arrays, …).
+        let full = self.concat_key_value(name, key, func_id)?;
+        self.get_index(obj, full)
+    }
+
+    /// `obj[<string-const `name`> + key] = val` — the `SetIndexConcat` op; the
+    /// `set_index` twin of `get_index_concat`. The fast path handles an own
+    /// writable-data overwrite and a proven-clean new-key append without ever
+    /// allocating the concat key on the heap (only the unavoidable owned ObjMap
+    /// key String is cloned, exactly as `set_index` does). Everything else falls
+    /// back to materialise + `set_index`.
+    pub(crate) fn set_index_concat(
+        &mut self,
+        obj: Value,
+        name: u32,
+        key: Value,
+        val: Value,
+        strict: bool,
+        func_id: u32,
+    ) -> Result<(), Thrown> {
+        if key.is_int() && obj.is_heap() {
+            let idx = obj.heap_index();
+            if !(idx == self.global_this && self.global_this != 0)
+                && idx != self.obj_proto
+                && self.realm_global_objs.is_empty()
+                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
+                && matches!(self.heap.get(idx), HeapObj::Object(_))
+            {
+                let mut scratch = std::mem::take(&mut self.idx_key_scratch);
+                self.build_concat_key(&mut scratch, name, key.as_int(), func_id);
+                // hit: own writable data slot; add: proven-clean new key.
+                let (hit, add) = match self.heap.get(idx) {
+                    HeapObj::Object(m) if scratch != "__proto__" => match m.pos(&scratch) {
+                        Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => (Some(i), false),
+                        Some(_) => (None, false),
+                        None => (
+                            None,
+                            m.extensible
+                                && m.class.is_none()
+                                && !m.is_ctor
+                                && self.plain_add_chain_clear(idx, &scratch),
+                        ),
+                    },
+                    _ => (None, false),
+                };
+                if let Some(i) = hit {
+                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                        m.vals[i] = val;
+                        self.idx_key_scratch = scratch;
+                        return Ok(());
+                    }
+                }
+                if add {
+                    let ks = scratch.clone(); // the unavoidable owned ObjMap key
+                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                        m.push_data(ks, val);
+                        self.heap.bump_version(idx); // key add reallocs vals (IC)
+                        self.idx_key_scratch = scratch;
+                        return Ok(());
+                    }
+                }
+                self.idx_key_scratch = scratch;
+            }
+        }
+        // SLOW PATH: materialise + ordinary computed write.
+        let full = self.concat_key_value(name, key, func_id)?;
+        self.set_index(obj, full, val, strict)
+    }
+
+    /// `dst = delete obj[<string-const `name`> + key]` — the `DeleteIndexConcat`
+    /// op. An int key on a plain object deletes by `&str` from the scratch buffer
+    /// (no concat alloc); a heap object is always object-coercible and
+    /// ToPropertyKey of a string is identity, so both are skipped on the fast
+    /// path. Anything else materialises the key and mirrors `DeleteIndex`.
+    pub(crate) fn delete_index_concat(
+        &mut self,
+        obj: Value,
+        name: u32,
+        key: Value,
+        strict: bool,
+        func_id: u32,
+    ) -> Result<Value, Thrown> {
+        if key.is_int() && obj.is_heap() {
+            let oidx = obj.heap_index();
+            if !(oidx == self.global_this && self.global_this != 0)
+                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oidx))
+                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oidx))
+                && matches!(self.heap.get(oidx), HeapObj::Object(_))
+            {
+                let mut scratch = std::mem::take(&mut self.idx_key_scratch);
+                self.build_concat_key(&mut scratch, name, key.as_int(), func_id);
+                let r = self.delete_property(obj, &scratch);
+                let out = match r {
+                    Ok(v) if strict && v == Value::bool(false) => {
+                        Err(Thrown(format!("TypeError: Cannot delete property '{scratch}'")))
+                    }
+                    other => other,
+                };
+                self.idx_key_scratch = scratch;
+                return out;
+            }
+        }
+        // SLOW PATH: materialise + mirror the ordinary DeleteIndex op.
+        let full = self.concat_key_value(name, key, func_id)?;
+        let ks = self.to_property_key(full)?;
+        self.require_object_coercible(obj)?;
+        let r = self.delete_property(obj, &ks)?;
+        if strict && r == Value::bool(false) {
+            return Err(Thrown(format!("TypeError: Cannot delete property '{ks}'")));
+        }
+        Ok(r)
+    }
+
+    /// Assemble `"<string_constants[name]><int>"` into `buf` (cleared first) — the
+    /// fused-key fast path's no-alloc key builder. The int's decimal form is
+    /// pure ASCII, so the result is well-formed UTF-8.
+    #[inline]
+    fn build_concat_key(&self, buf: &mut String, name: u32, key: i32, func_id: u32) {
+        buf.clear();
+        buf.push_str(&self.func(func_id as usize).string_constants[name as usize]);
+        let (digits, start) = crate::vm::coerce::fmt_i32_buf(key);
+        // SAFETY: fmt_i32_buf yields only ASCII '-' and '0'..='9'.
+        buf.push_str(unsafe { std::str::from_utf8_unchecked(&digits[start..]) });
+    }
+
+    /// Materialise the fused key as a real `prefix + key` Value, byte-identical to
+    /// the unfused `"prefix" + key` (`Add`): the prefix constant is interned and
+    /// `add_values` runs the standard `+` (so a non-int `key` gets full ToString /
+    /// ToPrimitive semantics). Used by both fused ops' slow paths.
+    #[inline]
+    fn concat_key_value(&mut self, name: u32, key: Value, func_id: u32) -> Result<Value, Thrown> {
+        let prefix = self.resolve_const(
+            func_id,
+            Value::heap(crate::vm::helpers_misc::STRING_CONST_BIT | name),
+        );
+        self.add_values(prefix, key)
+    }
+
     /// `new Date(...)` → epoch ms. 0 args = now; 1 number = ms (time-clipped);
     /// 1 Date = copy; 1 string = parsed; ≥2 = UTC components (month0-based).
     pub(crate) fn date_new_ms(&mut self, args: &[Value]) -> Result<f64, Thrown> {

@@ -86,6 +86,7 @@ impl<'p> Vm<'p> {
             class_values: vec![None; program.classes.len()],
             mi_class_epoch: 0,
             mi_recv: rustc_hash::FxHashMap::default(),
+            idx_key_scratch: String::new(),
             site_ics: Vec::new(),
             heap,
             globals,

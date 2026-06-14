@@ -519,6 +519,34 @@ mod tests {
     }
 
     #[test]
+    fn fused_computed_index_concat_key() {
+        // GetIndexConcat / SetIndexConcat / DeleteIndexConcat: the `obj["k" + i]`
+        // map-key idiom must be byte-identical to the unfused path. Covers a plain
+        // get/set/delete/re-add cycle (1), numeric-string-prefix keys treated as
+        // named props on a plain object (2), an ACCESSOR-named computed key whose
+        // getter/setter must still fire via the fallback (3 → calls/hidden), and a
+        // non-int float key falling back to a real concat (4). Expected values
+        // cross-checked against node.
+        assert_jit_matches(
+            "let o={},s=0; \
+             for(let i=0;i<50;i++) o['k'+i]=i*2; \
+             for(let i=0;i<50;i+=2) delete o['k'+i]; \
+             for(let i=0;i<50;i+=2) o['k'+i]=i*3; \
+             for(let i=0;i<50;i++) s+=(o['k'+i]||0); \
+             let n={},s2=0; \
+             for(let i=0;i<10;i++){ n[''+i]=i; n['1'+i]=i+100; } \
+             for(let i=0;i<10;i++) s2+=n[''+i]+n['1'+i]; \
+             let calls=0,hidden=0,a={}; \
+             Object.defineProperty(a,'v0',{get(){calls++;return hidden;},set(x){calls++;hidden=x+1;},configurable:true}); \
+             for(let i=0;i<5;i++){ a['v'+i]=i; } \
+             let s3=a['v'+0]; \
+             let f={}; f['p'+1.5]=7; let s4=f['p'+1.5]; \
+             console.log(s, s2, s3, calls, hidden, s4, a.v1, a.v4)",
+            &["3050 1090 1 2 1 7 1 4"],
+        );
+    }
+
+    #[test]
     fn sroa_declines_class_accessor() {
         // SROA must NOT scalar-replace a CLASS getter/setter on a stable global:
         // the accessor lives on the prototype, so bypassing it (running the getter

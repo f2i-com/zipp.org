@@ -20,7 +20,7 @@ const SMALL_CONCAT_FLAT_UNITS: usize = 24;
 /// in `buf[start..]` of the returned `(buf, start)`. No allocation — the
 /// string⊕int concat fast path copies them straight into its result buffer.
 #[inline]
-fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
+pub(crate) fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
     let mut buf = [0u8; 12];
     let mut i = buf.len();
     let mut m = (n as i64).unsigned_abs(); // i64: |i32::MIN| representable

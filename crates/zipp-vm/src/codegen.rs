@@ -1147,6 +1147,8 @@ fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::Ne { dst, .. }
         | Instr::LoadGlobal { dst, .. }
         | Instr::GetProp { dst, .. }
+        | Instr::GetIndexConcat { dst, .. }
+        | Instr::DeleteIndexConcat { dst, .. }
         | Instr::StrConcat { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
         | Instr::Bitwise { dst, .. }
@@ -4051,6 +4053,9 @@ fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::SetProp { obj, val, .. } => vec![obj, val],
         Instr::GetIndex { obj, key, .. } => vec![obj, key],
         Instr::SetIndex { obj, key, val } => vec![obj, key, val],
+        Instr::GetIndexConcat { obj, key, .. } => vec![obj, key],
+        Instr::SetIndexConcat { obj, key, val, .. } => vec![obj, key, val],
+        Instr::DeleteIndexConcat { obj, key, .. } => vec![obj, key],
         Instr::Return { src } => vec![src],
         _ => vec![],
     }

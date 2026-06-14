@@ -253,6 +253,12 @@ pub struct Vm<'p> {
     /// root: a stale/reused-slot entry is rebuilt-from-live at compile time and
     /// each arm is runtime identity+version-guarded, so a dead entry is harmless.
     mi_recv: rustc_hash::FxHashMap<u64, Vec<u64>>,
+    /// Reusable scratch buffer for the `GetIndexConcat`/`SetIndexConcat` fused
+    /// computed-key fast path: the `"prefix" + i` key is assembled here and
+    /// looked up by `&str`, so the dictionary-churn idiom never allocates a
+    /// throwaway heap string per access. Taken via `mem::take` for the duration
+    /// of a single op (no aliasing) and returned; grows once, then reused.
+    idx_key_scratch: String,
     /// Interpreter inline caches: per MAIN-program function (outer index =
     /// func_id), per instruction (inner index = ip), a lazily-allocated
     /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the

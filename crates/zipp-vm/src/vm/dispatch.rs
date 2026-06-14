@@ -3334,6 +3334,13 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    Instr::GetIndexConcat { dst, obj, name, key } => {
+                        let o = self.get(base, obj);
+                        let k = self.get(base, key);
+                        let r = self.get_index_concat(o, name, k, func_id)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::ToPropKey { dst, obj, src } => {
                         // RequireObjectCoercible(base) precedes ToPropertyKey: a
                         // null/undefined base throws BEFORE the key's toString runs
@@ -3357,6 +3364,14 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let strict = self.func(func_id as usize).is_strict;
                         self.set_index(o, k, v, strict)?;
+                        ip += 1;
+                    }
+                    Instr::SetIndexConcat { obj, name, key, val } => {
+                        let o = self.get(base, obj);
+                        let k = self.get(base, key);
+                        let v = self.get(base, val);
+                        let strict = self.func(func_id as usize).is_strict;
+                        self.set_index_concat(o, name, k, v, strict, func_id)?;
                         ip += 1;
                     }
                     Instr::ImportCall { dst, spec, phase, opts } => {
@@ -3980,6 +3995,13 @@ impl<'p> Vm<'p> {
                         if strict && r == Value::bool(false) {
                             return Err(Thrown(format!("TypeError: Cannot delete property '{ks}'")));
                         }
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::DeleteIndexConcat { dst, obj, name, key, strict } => {
+                        let o = self.get(base, obj);
+                        let k = self.get(base, key);
+                        let r = self.delete_index_concat(o, name, k, strict, func_id)?;
                         self.set(base, dst, r);
                         ip += 1;
                     }

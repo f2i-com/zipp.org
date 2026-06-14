@@ -7184,6 +7184,16 @@ impl<'a> FnCompiler<'a> {
         if m.optional {
             self.emit_optional_check(obj);
         }
+        // Fuse `obj[<plain string literal> + e]` → GetIndexConcat (no throwaway
+        // concat-key heap allocation; see the opcode doc). The literal has no
+        // side effects, so not emitting its LoadConst is unobservable; `e` is
+        // still evaluated after `obj`, matching the unfused order.
+        if let Some((name, rhs)) = concat_key_literal_prefix(&m.expression) {
+            let nidx = self.string_name(name);
+            let key = self.expr(rhs)?;
+            self.emit(Instr::GetIndexConcat { dst, obj, name: nidx, key });
+            return Ok(dst);
+        }
         let key = self.expr(&m.expression)?;
         self.emit(Instr::GetIndex { dst, obj, key });
         Ok(dst)
@@ -7946,8 +7956,16 @@ impl<'a> FnCompiler<'a> {
                     return Ok(dst);
                 }
                 let obj = self.expr(&m.object)?;
-                let key = self.expr(&m.expression)?;
                 let strict = self.cx.in_strict;
+                // Fuse `delete obj[<plain string literal> + e]` → DeleteIndexConcat
+                // (no throwaway concat-key allocation; see GetIndexConcat).
+                if let Some((name, rhs)) = concat_key_literal_prefix(&m.expression) {
+                    let nidx = self.string_name(name);
+                    let key = self.expr(rhs)?;
+                    self.emit(Instr::DeleteIndexConcat { dst, obj, name: nidx, key, strict });
+                    return Ok(dst);
+                }
+                let key = self.expr(&m.expression)?;
                 self.emit(Instr::DeleteIndex { dst, obj, key, strict });
                 Ok(dst)
             }
@@ -9052,6 +9070,15 @@ impl<'a> FnCompiler<'a> {
             T::ComputedMemberExpression(m) => {
                 let save = self.next_reg;
                 let obj = self.expr(&m.object)?;
+                // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat
+                // (no throwaway concat-key allocation; see GetIndexConcat).
+                if let Some((name, rhs)) = concat_key_literal_prefix(&m.expression) {
+                    let nidx = self.string_name(name);
+                    let key = self.expr(rhs)?;
+                    self.emit(Instr::SetIndexConcat { obj, name: nidx, key, val: src });
+                    self.next_reg = save;
+                    return Ok(());
+                }
                 let key = self.expr(&m.expression)?;
                 self.emit(Instr::SetIndex { obj, key, val: src });
                 self.next_reg = save;
@@ -11884,6 +11911,26 @@ fn fmt_key_num(n: f64) -> String {
 /// Conservative static check: is this expression definitely a number? Used to
 /// gate the `+ <int>` fast path (where `+` could otherwise mean string concat).
 /// Only returns true for cases that cannot be strings.
+/// If `key` is `<plain string literal> + <rhs>`, return `(prefix text, rhs)`.
+/// Recognises the `obj["prefix" + i]` computed-member-key idiom so the read/write
+/// can fuse the throwaway concat key (see `Instr::GetIndexConcat`). A
+/// `.lone_surrogates` literal is excluded — its bytes need the WTF-8-decoding
+/// constant slot, not a plain `string_constants` entry.
+fn concat_key_literal_prefix<'a, 'b>(
+    key: &'a ox::Expression<'b>,
+) -> Option<(&'a str, &'a ox::Expression<'b>)> {
+    if let ox::Expression::BinaryExpression(b) = key {
+        if matches!(b.operator, ox::BinaryOperator::Addition) {
+            if let ox::Expression::StringLiteral(s) = &b.left {
+                if !s.lone_surrogates {
+                    return Some((s.value.as_str(), &b.right));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn is_numeric_expr(e: &ox::Expression) -> bool {
     use ox::Expression as E;
     match e {

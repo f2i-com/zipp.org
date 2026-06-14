@@ -571,6 +571,22 @@ pub enum Instr {
     GetIndex { dst: Reg, obj: Reg, key: Reg },
     /// `obj[key] = val` — computed member write.
     SetIndex { obj: Reg, key: Reg, val: Reg },
+    /// `dst = obj[<string-const `name`> + key]` — fused computed read for the
+    /// `obj["prefix" + i]` map-key idiom. `name` indexes `string_constants` (the
+    /// literal prefix). When `key` is an int and `obj` is a plain object, the key
+    /// is assembled into a reusable scratch buffer and looked up by `&str` — NO
+    /// throwaway heap string is allocated for the concat (the dominant cost of
+    /// dictionary-churn loops). Any other operand shape falls back to a real
+    /// `prefix + key` concat + `GetIndex` (semantically identical).
+    GetIndexConcat { dst: Reg, obj: Reg, name: u32, key: Reg },
+    /// `obj[<string-const `name`> + key] = val` — the `SetIndex` twin of
+    /// `GetIndexConcat` (same no-alloc fast path; falls back to concat + `SetIndex`).
+    SetIndexConcat { obj: Reg, name: u32, key: Reg, val: Reg },
+    /// `dst = delete obj[<string-const `name`> + key]` — the `DeleteIndex` twin of
+    /// `GetIndexConcat`: an int key on a plain object deletes by `&str` (no concat
+    /// alloc — these allocs dominate dictionary-churn delete loops via GC
+    /// pressure); other shapes fall back to concat + `DeleteIndex`.
+    DeleteIndexConcat { dst: Reg, obj: Reg, name: u32, key: Reg, strict: bool },
     /// `dst = import(spec)` — dynamic import. ToString the specifier and return a
     /// Promise. With no host module loader, a successfully-coerced specifier rejects
     /// with a TypeError; if the specifier's coercion throws, the Promise rejects
