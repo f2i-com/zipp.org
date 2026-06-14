@@ -929,7 +929,9 @@ impl Jit {
         // loops) unless it already deoptimised for this loop. Fall back to the
         // double/memory path.
         if !self.region_int_blacklist.contains(&key) {
-            if let Some(code) = compile_region_int(proto, start, end, globals_base_helper) {
+            if let Some(code) =
+                compile_region_int(proto, start, end, globals_base_helper, ta_plan, heap_helpers.ta_snapshot)
+            {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
                 }
@@ -2884,7 +2886,8 @@ fn compile_region(
 /// (e.g. register pressure even with reuse), SROA is abandoned and the caller
 /// falls back to the inline-cache mem path on the ORIGINAL bytecode.
 fn compile_region_numeric(proto: &FuncProto, start: u32, end: u32, gh: usize) -> Option<(JitFn, bool)> {
-    if let Some(f) = compile_region_int(proto, start, end, gh) {
+    // SROA-rewritten code has no index ops, so an empty TA plan (no snapshot) is correct.
+    if let Some(f) = compile_region_int(proto, start, end, gh, &TaPinPlan::default(), 0) {
         return Some((f, true));
     }
     // SROA-rewritten code has no index ops, so an empty TA plan is correct here.
@@ -3614,27 +3617,38 @@ fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: AbsState) ->
 /// later increment can admit a pinned-Float64Array element GetIndex/SetIndex as a
 /// VTy::Num xmm home. Not yet consulted — the blanket index/call/bitwise decline
 /// below still applies (regions with those take the memory path).
-fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> Option<RegionPlan> {
+fn plan_region(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+    admit_bitwise: bool,
+) -> Option<RegionPlan> {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
-    // ── unboxed-region epic: pinned-Float64Array element access ──
-    // A kind-8 (Float64) pinned GetIndex/SetIndex can run in the f64 register path:
-    // the element IS an f64 (a VTy::Num xmm home). Its receiver `obj` (a heap TA) and
-    // index `key` are NOT homed — the emitter reads the receiver via the pin's source
-    // and the index via `key`'s xmm home. Identify the admissible ops + their receiver
-    // regs so the typing/homing passes below bypass the receivers.
-    let pinned_f64 = |ip: usize| -> bool {
+    // ── unboxed-region epic: pinned TypedArray element access ──
+    // A pinned GetIndex/SetIndex whose element kind matches the REGISTER PATH can run
+    // unboxed: the double/regalloc path (admit_bitwise=false) hosts a kind-8 Float64
+    // element as an f64 xmm home; the integer path (admit_bitwise=true) hosts a kind-5
+    // Int32 element as a sign-extended i64 home. The two are mutually exclusive (an f64
+    // can't be an i64 home, and vice-versa), so a region mixing kinds declines the
+    // non-matching access to the memory path. The receiver `obj` (a heap TA) and index
+    // `key` are NOT homed — the emitter reads the receiver via the pin's source and the
+    // index via `key`'s home. Identify the admissible ops + their receiver regs so the
+    // typing/homing passes below bypass the receivers.
+    let pin_kind: u8 = if admit_bitwise { 5 } else { 8 };
+    let pinned_elem = |ip: usize| -> bool {
         ta_plan
             .access
             .get(&ip)
-            .map_or(false, |&j| ta_plan.pins[j as usize].kind == 8)
+            .map_or(false, |&j| ta_plan.pins[j as usize].kind == pin_kind)
     };
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
     {
         // Candidate receiver regs: the `obj` of every kind-8 pinned index op.
         let mut recv: FxHashSet<u16> = FxHashSet::default();
         for (off, instr) in code[s..=e].iter().enumerate() {
-            if pinned_f64(s + off) {
+            if pinned_elem(s + off) {
                 if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
                     recv.insert(obj);
                 }
@@ -3656,7 +3670,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
             }
             let mut used_elsewhere: FxHashSet<u16> = FxHashSet::default();
             for (off, instr) in code[s..=e].iter().enumerate() {
-                let idx_obj = if pinned_f64(s + off) {
+                let idx_obj = if pinned_elem(s + off) {
                     match *instr {
                         Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => Some(obj),
                         _ => None,
@@ -3674,7 +3688,12 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
                 if def_n.get(&r) == Some(&1) && def_lg.contains(&r) && !used_elsewhere.contains(&r) {
                     ta_recv_regs.insert(r);
                 } else {
-                    return None; // a receiver we can't cleanly exclude → memory path
+                    // A receiver register reused for other (numeric) values can't be
+                    // cleanly excluded under the non-SSA register model → memory path.
+                    // (Generalizing this needs SSA-like per-use disambiguation; it
+                    // currently blocks e.g. the xorshift-fill `iv[i] = st|0` loop whose
+                    // bytecode reuses the `iv` register for bitwise temps.)
+                    return None;
                 }
             }
         }
@@ -3710,9 +3729,14 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
         // TypedArray access, which the f64 element fast path emits inline (the
         // element is a VTy::Num xmm home; receiver/index handled specially below).
         match *instr {
-            Instr::CallMethod { .. } | Instr::Call { .. } | Instr::Bitwise { .. } => return None,
+            Instr::CallMethod { .. } | Instr::Call { .. } => return None,
+            // A Bitwise op declines UNLESS the caller (the INT path) admits it: its
+            // i64 homes hold sign-extended integers, so the low 32 bits ARE ToInt32
+            // and the op runs inline with no reload/rebox. The regalloc/double path
+            // passes admit_bitwise=false (its homes are f64, not int32 lanes).
+            Instr::Bitwise { .. } if !admit_bitwise => return None,
             Instr::GetIndex { .. } | Instr::SetIndex { .. } => {
-                if !pinned_f64(s + off) {
+                if !pinned_elem(s + off) {
                     return None;
                 }
             }
@@ -3731,6 +3755,9 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
             | Instr::Mul { dst, .. }
             | Instr::Div { dst, .. }
             | Instr::Mod { dst, .. } => (Some(dst), VTy::Num),
+            // A bitwise/shift result is always a number (a signed i32, or a u32
+            // for `>>>` — both fit a Num i64 home).
+            Instr::Bitwise { dst, .. } => (Some(dst), VTy::Num),
             Instr::Lt { dst, .. }
             | Instr::Le { dst, .. }
             | Instr::Gt { dst, .. }
@@ -3792,11 +3819,11 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
         }
     }
 
-    // Each pinned-f64 index op needs its index (and a SetIndex's stored value) in an
-    // xmm Num home: the emitter reads the index from `key`'s home (cvttsd2si) and a
-    // SetIndex stores `val`'s home. Decline if either isn't a number home.
+    // Each pinned index op needs its index (and a SetIndex's stored value) in a
+    // Num home: the emitter reads the index from `key`'s home and a SetIndex stores
+    // `val`'s home. Decline if either isn't a number home.
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if pinned_f64(s + off) {
+        if pinned_elem(s + off) {
             let bad = match *instr {
                 Instr::GetIndex { key, .. } => ty.get(&key) != Some(&VTy::Num),
                 Instr::SetIndex { key, val, .. } => {
@@ -3825,7 +3852,8 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
             | Instr::Eq { a, b, .. }
             | Instr::Ne { a, b, .. }
             | Instr::JumpIfNotLt { a, b, .. }
-            | Instr::JumpIfNotLe { a, b, .. } => {
+            | Instr::JumpIfNotLe { a, b, .. }
+            | Instr::Bitwise { a, b, .. } => {
                 if ty.get(&a) == Some(&VTy::Bool) || ty.get(&b) == Some(&VTy::Bool) {
                     return None; // numeric op on a bool — outside the subset
                 }
@@ -3933,7 +3961,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> 
     // arithmetic results always stay inside [-2^53, 2^53].
     let mut elide_guard: FxHashSet<usize> = FxHashSet::default();
     let mut mul_shift: FxHashMap<usize, (u16, u8)> = FxHashMap::default();
-    if region_is_int(proto, start, end) {
+    if region_is_int(proto, start, end, ta_plan) {
         let mut entry = AbsState {
             regs: FxHashMap::default(),
             globs: FxHashMap::default(),
@@ -4416,7 +4444,9 @@ fn compile_region_regalloc(
     if !region_can_compile(proto, start, end, None) {
         return None;
     }
-    let plan = plan_region(proto, start, end, ta_plan)?;
+    // The regalloc path uses boxed-double semantics and cannot host Bitwise
+    // (int32-lane) ops — they decline to the memory path here.
+    let plan = plan_region(proto, start, end, ta_plan, false)?;
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let (s, e) = (start as usize, end as usize);
 
@@ -4830,12 +4860,19 @@ const TWO_POW_54: i64 = 18_014_398_509_481_984;
 /// `region_is_int`: every op must be integer-valued (no Div — fractional; `Mod`
 /// IS allowed, via integer `idiv`), and every `LoadConst` must be an Int-tagged
 /// constant (a double constant would be misread as i64).
-fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
+fn region_is_int(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> bool {
     if !region_can_compile(proto, start, end, None) {
         return false;
     }
     let (s, e) = (start as usize, end as usize);
-    for instr in &proto.code[s..=e] {
+    // A pinned Int32Array (kind 5) element access runs inline on the int path: the
+    // element is a signed i32 ⇒ sign-extends to an i64 home (GetIndex) / stores its
+    // low 32 bits (SetIndex). Any other element kind (e.g. a Float64Array) declines
+    // here so the region falls through to the regalloc/memory path.
+    let pinned_i32 = |ip: usize| -> bool {
+        ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == 5)
+    };
+    for (off, instr) in proto.code[s..=e].iter().enumerate() {
         match *instr {
             Instr::LoadInt { .. }
             | Instr::Move { .. }
@@ -4850,6 +4887,9 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::Mod { .. }
             | Instr::AddInt { .. }
             | Instr::Neg { .. }
+            // Bitwise/shift: the i64 home's low 32 bits are ToInt32, so these run
+            // inline on the int path (compile_region_int emits the int32-lane op).
+            | Instr::Bitwise { .. }
             | Instr::Lt { .. }
             | Instr::Le { .. }
             | Instr::Gt { .. }
@@ -4863,6 +4903,9 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::JumpIfNotLe { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
+            // A kind-5 (Int32) pinned element op is admissible; any other index op
+            // (non-pinned, or a different element kind) declines to the mem path.
+            Instr::GetIndex { .. } | Instr::SetIndex { .. } if pinned_i32(s + off) => {}
             Instr::LoadConst { idx, .. } => {
                 // Only Int-tagged constants; a double const can't be an i64 home.
                 match proto.constants.get(idx as usize) {
@@ -4870,7 +4913,7 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
                     _ => return false,
                 }
             }
-            _ => return false, // Div / Mod / anything else
+            _ => return false, // Div / a non-int32 / non-pinned index / anything else
         }
     }
     true
@@ -4894,13 +4937,27 @@ fn compile_region_int(
     start: u32,
     end: u32,
     globals_base_helper: usize,
+    ta_plan: &TaPinPlan,
+    ta_snapshot: usize,
 ) -> Option<JitFn> {
-    if !region_is_int(proto, start, end) {
+    if !region_is_int(proto, start, end, ta_plan) {
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!("[jit] INT decline [{start},{end}]: region_is_int=false");
+        }
         return None;
     }
-    // INT path never reaches a GetIndex/SetIndex region (region_is_int rejects them);
-    // pass an empty TA plan so plan_region's index handling stays inert here.
-    let plan = plan_region(proto, start, end, &TaPinPlan::default())?;
+    // The i64 homes carry sign-extended integers, so Bitwise (int32-lane) ops run
+    // inline here with no per-op reload/rebox — admit them (admit_bitwise=true), and
+    // plan_region's pinned-element handling targets kind-5 (Int32) elements.
+    let plan = match plan_region(proto, start, end, ta_plan, true) {
+        Some(p) => p,
+        None => {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!("[jit] INT decline [{start},{end}]: plan_region=None");
+            }
+            return None;
+        }
+    };
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let (s, e) = (start as usize, end as usize);
 
@@ -4910,9 +4967,18 @@ fn compile_region_int(
     let entry_bail = ops.new_dynamic_label();
     let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
 
-    // ── prologue ── identical to the double path (save callee-saved, fetch
-    // globals base, save xmm6..15) — only the live-in loads + body differ. r13/r14
-    // additionally hold the 2^53/2^54 guard constants (pre-loaded once).
+    // ── prologue ── mirrors the double path (save callee-saved, fetch globals base,
+    // pinned-TypedArray snapshots, save xmm6..15) — only the live-in loads + body
+    // differ. r13/r14 additionally hold the 2^53/2^54 guard constants (pre-loaded
+    // once). Frame layout with pinned views matches the regalloc path exactly:
+    // [shadow 32][TA snapshot slots 32·n_ta][xmm6..15 save 160][pad 8], shadow at the
+    // bottom so the snapshot calls have shadow space and rsp stays 16-aligned.
+    let n_ta = ta_plan.pins.len() as i32;
+    let (frame, xmm_off, ta_base) = if n_ta > 0 {
+        (200 + 32 * n_ta, 32 + 32 * n_ta, 32i32)
+    } else {
+        (160i32, 0i32, 0i32)
+    };
     dynasm!(ops
         ; push rbx
         ; push rsi
@@ -4931,11 +4997,29 @@ fn compile_region_int(
         ; add rsp, 40
         ; mov r13, QWORD TWO_POW_53           // guard: + 2^53
         ; mov r14, QWORD TWO_POW_54           // guard: unsigned upper bound 2^54
-        ; sub rsp, 160
+        ; sub rsp, frame
     );
     for k in 0..10u32 {
         let xi = 6 + k as u8;
-        dynasm!(ops ; movdqu [rsp + (k as i32) * 16], Rx(xi));
+        dynasm!(ops ; movdqu [rsp + xmm_off + (k as i32) * 16], Rx(xi));
+    }
+    // ── pinned-TypedArray snapshots ── BEFORE loading any numeric home (jit_ta_snapshot
+    // clobbers volatile xmm0..5, which double as homes; xmm6..15 are already saved and
+    // no home is loaded yet). Each slot gets {obj_bits, base, len} (or {0,0,0} → the
+    // per-access identity guard misses → deopt). r12/rbx/r13/r14 are callee-saved across
+    // the call. This is the last call before the loop.
+    for (j, pin) in ta_plan.pins.iter().enumerate() {
+        match pin.src {
+            TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
+            TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        }
+        dynasm!(ops
+            ; mov rcx, rdi                      // vm
+            ; mov r8d, pin.kind as i32          // expected element kind
+            ; lea r9, [rsp + ta_base + 32 * j as i32] // out: {obj_bits,base,len}
+            ; mov rax, QWORD ta_snapshot as i64
+            ; call rax
+        );
     }
     // Live-in globals/regs: guard Int-tagged, sign-extend payload, into the home.
     for &(gi, x) in &plan.live_in_globs {
@@ -5015,6 +5099,11 @@ fn compile_region_int(
                     dynasm!(ops ; mov Rq(d), Rq(sg));
                 }
             },
+            // A pinned-TA receiver's LoadGlobal is a no-op: it has no numeric home;
+            // the element-access emitter reads the receiver via the pin's source.
+            Instr::LoadGlobal { dst, .. } if plan.ta_recv_regs.contains(&dst) => {
+                flag_cmp = prev_flag; // nothing emitted; flags still live
+            }
             Instr::LoadGlobal { dst, idx } => {
                 let d = xh(&plan, dst);
                 let g = plan.glob_home[&idx];
@@ -5251,6 +5340,95 @@ fn compile_region_int(
                 // !(a<=b) ⇔ a>b (SIGNED).
                 dynasm!(ops ; jg => t);
             }
+            // ── pinned-Int32Array element read ── iv[i] → sign-extend the i32 element
+            // into the dst i64 home (UNBOXED). Guards (any miss DEOPTs to the
+            // interpreter AT this ip — index ops are all-or-nothing, so re-execution
+            // is sound): (1) receiver identity vs the prologue snapshot; (2) unsigned
+            // bounds (catches <0). The index home holds an integer already (no f64
+            // round-trip needed — the int path proves every value integral).
+            Instr::GetIndex { dst, key, .. } => {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let d = xh(&plan, dst);
+                let kx = xh(&plan, key);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rax, [rsp + off]               // receiver vs snapshot obj_bits
+                    ; jne => deopt
+                    ; movq rcx, Rx(kx)                   // index (i64 home, integral)
+                    ; cmp rcx, [rsp + off + 16]          // unsigned: i < len (catches <0)
+                    ; jae => deopt
+                    ; mov rdx, [rsp + off + 8]           // pinned base
+                    ; movsxd rax, DWORD [rdx + rcx * 4]  // sign-extend i32 element → home
+                    ; movq Rx(d), rax
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32         // resume AT this ip
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
+            // ── pinned-Int32Array element write ── iv[i] = v → store the val home's
+            // low 32 bits (== ToInt32(v), the Int32Array store). Same guards; an OOB
+            // store deopts (the interpreter does the spec coerce-then-silent-noop).
+            Instr::SetIndex { key, val, .. } => {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let kx = xh(&plan, key);
+                let vx = xh(&plan, val);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rax, [rsp + off]
+                    ; jne => deopt
+                    ; movq rcx, Rx(kx)
+                    ; cmp rcx, [rsp + off + 16]
+                    ; jae => deopt
+                    ; mov rdx, [rsp + off + 8]
+                    ; movq rax, Rx(vx)                   // value i64 home
+                    ; mov DWORD [rdx + rcx * 4], eax     // store low 32 (== ToInt32(v))
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                lc = None;
+            }
+            Instr::Bitwise { dst, a, b, op } => {
+                use crate::bytecode::BitwiseOp as B;
+                let (d, ax, bx) = (xh(&plan, dst), xh(&plan, a), xh(&plan, b));
+                copy_clobber(&mut lc, d);
+                // The i64 homes hold sign-extended integers, so eax (the low 32 of
+                // operand `a`) IS ToInt32(a), and read unsigned it is ToUint32(a) —
+                // no per-op reload/tag-check/rebox (the mem path's cost). And/Or/Xor
+                // and the signed shifts produce a signed i32 (sign-extended back to
+                // the i64 home, always boxes as Int). `>>>` yields a u32 (0..2^32-1):
+                // the 32-bit `shr` zero-extends it into rax, and it stays within
+                // ±2^53, so exit-boxing picks Int-vs-double. x86 masks the shift
+                // count (cl) to 5 bits, matching JS's `& 31`. rax/rcx are scratch.
+                dynasm!(ops ; movq rax, Rx(ax) ; movq rcx, Rx(bx));
+                match op {
+                    B::And => dynasm!(ops ; and eax, ecx ; movsxd rax, eax),
+                    B::Or => dynasm!(ops ; or eax, ecx ; movsxd rax, eax),
+                    B::Xor => dynasm!(ops ; xor eax, ecx ; movsxd rax, eax),
+                    B::Shl => dynasm!(ops ; shl eax, cl ; movsxd rax, eax),
+                    B::Shr => dynasm!(ops ; sar eax, cl ; movsxd rax, eax),
+                    B::Ushr => dynasm!(ops ; shr eax, cl), // 32-bit write zero-extends rax
+                }
+                dynasm!(ops ; movq Rx(d), rax);
+            }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
             }
@@ -5277,12 +5455,12 @@ fn compile_region_int(
         emit_int_box_from_home(&mut ops, x);
         dynasm!(ops ; mov [r12 + (gi as i32) * 8], rax);
     }
-    emit_region_restore(&mut ops);
+    emit_region_restore_n(&mut ops, xmm_off, frame);
 
     // ── entry_bail ── a live-in wasn't Int-tagged; nothing computed, so restore
     // (NO flush) and resume at the header (interpreted).
     dynasm!(ops ; => entry_bail ; mov DWORD [rsi], start as i32);
-    emit_region_restore(&mut ops);
+    emit_region_restore_n(&mut ops, xmm_off, frame);
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
