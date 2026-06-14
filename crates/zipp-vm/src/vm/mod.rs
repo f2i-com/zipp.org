@@ -236,6 +236,14 @@ pub struct Vm<'p> {
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
     /// `super` call can reach its lexical superclass value at runtime.
     class_values: Vec<Option<Value>>,
+    /// Bumped on every `class_values` write (class declaration / redefinition).
+    /// The JIT method-inline `super.m()` arm bakes this epoch + a pointer to it
+    /// and re-checks it each call: a re-executed class declaration swaps
+    /// `class_values[home_class_id]` to a new class WITHOUT mutating the old
+    /// prototype objects the inline's hop guards watch, so this coarse epoch is
+    /// the discriminator that makes the inline match the interpreter's live
+    /// `class_values[id]` resolution (a mismatch falls to the helper).
+    mi_class_epoch: u32,
     /// Interpreter inline caches: per MAIN-program function (outer index =
     /// func_id), per instruction (inner index = ip), a lazily-allocated
     /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the

@@ -84,6 +84,7 @@ impl<'p> Vm<'p> {
             eval_global_next: program.global_count + FIELD_POOL as u32,
             builtin_globals: std::collections::HashMap::new(),
             class_values: vec![None; program.classes.len()],
+            mi_class_epoch: 0,
             site_ics: Vec::new(),
             heap,
             globals,
@@ -632,6 +633,7 @@ impl<'p> Vm<'p> {
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::MethodInlinePlan> {
         use crate::codegen::MethodInlinePlan;
         use crate::heap::HeapObj;
+        const MAX_ARMS: usize = crate::codegen::JIT_IC_WAYS; // = 8
         let mut plan = rustc_hash::FxHashMap::default();
         if std::env::var_os("ZIPP_NO_METHOD_INLINE").is_some() {
             return plan; // kill-switch (live through all stages)
@@ -643,116 +645,228 @@ impl<'p> Vm<'p> {
             let Instr::CallMethod { obj, name, .. } = caller.code[ip] else {
                 continue;
             };
-            // Live receiver exemplar at the obj reg (the last iteration's value).
-            let recv = match self.regs.get(base + obj as usize) {
-                Some(&v) if v.is_heap() => v,
-                _ => continue,
-            };
-            let ridx = recv.heap_index();
-            if !self.ic_obj_ok(ridx) {
-                continue;
-            }
-            // Receiver must be a plain (non-ctor) class instance.
-            let (recv_class, vals_ptr) = match self.heap.get(ridx) {
-                HeapObj::Object(m) if !m.is_ctor => match m.class {
-                    Some(c) => (c, m.vals.as_ptr() as u64),
-                    None => continue,
-                },
-                _ => continue,
-            };
             let key = &caller.string_constants[name as usize];
-            // G3b: an own property shadowing the method name makes the call
-            // resolve to the own prop, not the class method — decline.
-            if let HeapObj::Object(m) = self.heap.get(ridx) {
-                if m.pos(key).is_some() {
-                    continue;
+            // ── enumerate candidate receivers ── the live exemplar at the obj reg
+            // (last iteration's value) PLUS, when `obj` was `arr[idx]`, the array's
+            // dense elements (the `objs[i&3]` polymorphic shape). Every candidate
+            // is independently identity+version-guarded, so an extra/wrong guess
+            // just yields a dead arm — never a correctness risk.
+            let mut cand_bits: Vec<u64> = Vec::new();
+            let mut push_cand = |v: Value, cands: &mut Vec<Value>, bits: &mut Vec<u64>| {
+                if v.is_heap() && !bits.contains(&v.bits()) && cands.len() < MAX_ARMS {
+                    bits.push(v.bits());
+                    cands.push(v);
                 }
+            };
+            let mut cands: Vec<Value> = Vec::new();
+            if let Some(&v) = self.regs.get(base + obj as usize) {
+                push_cand(v, &mut cands, &mut cand_bits);
             }
-            // Resolve the class method `fid` from the filled IC for recv's class.
-            let Some(fid) = self.ic_class_method_fid(func_id, ip, recv_class) else {
-                if log {
-                    eprintln!("[method] fn{func_id}@{ip} no ClassMethod IC way for class {recv_class}");
-                }
-                continue;
-            };
-            let callee = self.func(fid as usize);
-            let Some(body_len) = Self::method_inline_body_ok(callee) else {
-                if log {
-                    eprintln!("[method] fn{func_id}@{ip} callee fn{fid} body not no-super-inlinable");
-                }
-                continue;
-            };
-            let body: Vec<Instr> = callee.code[..body_len].to_vec();
-            // Bake each `this.<field>` read's own DATA slot from the live receiver
-            // (valid behind the runtime recv-version guard).
-            let mut field_slots = rustc_hash::FxHashMap::default();
-            let mut ok = true;
-            if let HeapObj::Object(m) = self.heap.get(ridx) {
-                for instr in &body {
-                    if let Instr::GetProp { obj: 0, name: fname, .. } = *instr {
-                        let fkey = &callee.string_constants[fname as usize];
-                        match m.pos(fkey) {
-                            Some(s) if !m.attrs[s].accessor => {
-                                field_slots.insert(fname, s as u32);
-                            }
-                            _ => {
-                                ok = false;
-                                break;
+            if let Some(arr_reg) = Self::mi_last_getindex_array(&caller.code, start as usize, ip, obj) {
+                if let Some(&av) = self.regs.get(base + arr_reg as usize) {
+                    if av.is_heap() {
+                        if let HeapObj::Array(items) = self.heap.get(av.heap_index()) {
+                            let snapshot: Vec<Value> = items.iter().copied().collect();
+                            for el in snapshot {
+                                push_cand(el, &mut cands, &mut cand_bits);
                             }
                         }
                     }
                 }
-            } else {
-                ok = false;
             }
-            if !ok {
-                if log {
-                    eprintln!("[method] fn{func_id}@{ip} a this.<field> is not an own data slot on recv");
+            // Build a guarded arm per candidate (any that declines is skipped).
+            let mut shapes = Vec::new();
+            let mut win_top = 0u16;
+            for recv in cands {
+                if let Some((shape, shape_top)) =
+                    self.build_method_shape(func_id, ip, recv, key, reg_window)
+                {
+                    win_top = win_top.max(shape_top);
+                    shapes.push(shape);
                 }
+            }
+            if shapes.is_empty() {
                 continue;
             }
-            // Pre-resolve numeric constants the body reads.
-            let mut consts = rustc_hash::FxHashMap::default();
-            for instr in &body {
-                if let Instr::LoadConst { idx, .. } = *instr {
-                    if let Some(c) = callee.constants.get(idx as usize) {
-                        consts.insert(idx, c.bits());
-                    }
-                }
-            }
-            let recv_ver = self.heap.version_of(ridx);
             if log {
                 eprintln!(
-                    "[method] fn{func_id}@{ip} callee fn{fid} INLINE (class={recv_class} \
-                     body_ops={} fields={} regs={})",
-                    body.len(),
-                    field_slots.len(),
-                    callee.reg_count
+                    "[method] fn{func_id}@{ip} INLINE arms={} win_top={win_top}",
+                    shapes.len()
                 );
             }
-            plan.insert(
-                ip,
-                MethodInlinePlan {
-                    recv_bits: recv.bits(),
-                    recv_ver,
-                    vals_ptr,
-                    field_slots,
-                    reg_window,
-                    callee_reg_count: callee.reg_count,
-                    param_count: callee.param_count,
-                    body,
-                    consts,
-                },
-            );
+            plan.insert(ip, MethodInlinePlan { reg_window, win_top, shapes });
         }
         plan
     }
 
-    /// No-`super` subset of `method_body_inlinable_scan` for the Q7 in-region
-    /// method emitter (v1 emits no super body). Returns the body length (ops up
-    /// to and incl. the first `Return`/`ReturnUndefined`), or `None` to decline.
+    /// The last `GetIndex{dst:obj_reg, obj:arr}` in `code[start..ip]` (the array a
+    /// `arr[idx]` receiver came from), so the planner can bake an arm per array
+    /// element. `None` if `obj_reg` was last produced by something else.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    fn method_inline_body_ok(p: &crate::bytecode::FuncProto) -> Option<usize> {
+    fn mi_last_getindex_array(code: &[Instr], start: usize, ip: usize, obj_reg: u16) -> Option<u16> {
+        let mut arr = None;
+        for instr in &code[start..ip] {
+            if let Instr::GetIndex { dst, obj, .. } = *instr {
+                if dst == obj_reg {
+                    arr = Some(obj);
+                }
+            }
+        }
+        arr
+    }
+
+    /// Build one receiver arm for a `CallMethod` inline: validate `recv` is a
+    /// plain class instance with no own-shadow of `key`, resolve its class method
+    /// (+ any `super.m()`), and bake the per-receiver guards/slots. Returns the
+    /// arm and its scratch-window top, or `None` to skip this receiver. Read-only.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn build_method_shape(
+        &self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        key: &str,
+        reg_window: u16,
+    ) -> Option<(crate::codegen::MethodInlineShape, u16)> {
+        use crate::heap::HeapObj;
+        let ridx = recv.heap_index();
+        if !self.ic_obj_ok(ridx) {
+            return None;
+        }
+        // Receiver must be a plain (non-ctor) class instance.
+        let (recv_class, vals_ptr) = match self.heap.get(ridx) {
+            HeapObj::Object(m) if !m.is_ctor => match m.class {
+                Some(c) => (c, m.vals.as_ptr() as u64),
+                None => return None,
+            },
+            _ => return None,
+        };
+        // G3b: an own property shadowing the method name → resolve to the own
+        // prop, not the class method — decline this arm.
+        if let HeapObj::Object(m) = self.heap.get(ridx) {
+            if m.pos(key).is_some() {
+                return None;
+            }
+        }
+        let fid = self.ic_class_method_fid(func_id, ip, recv_class)?;
+        let callee = self.func(fid as usize);
+        // Outer body admits `super.m()` (Stage 3); super targets do not.
+        let body_len = Self::method_inline_body_ok(callee, true)?;
+        let body: Vec<Instr> = callee.code[..body_len].to_vec();
+        let field_slots = self.mi_bake_fields(ridx, &body, &callee.string_constants)?;
+        let consts = Self::mi_bake_consts(&callee.constants, &body);
+        // ── bake each `super.m()` in the body (Stage 3) ──
+        let super_win = reg_window + callee.reg_count;
+        let mut supers = rustc_hash::FxHashMap::default();
+        let mut max_super_regs = 0u16;
+        for (bi, instr) in body.iter().enumerate() {
+            if let Instr::SuperMethod { home_class_id, name: sname, argc: sargc, .. } = *instr {
+                if sargc != 0 {
+                    return None; // v1: 0-arg super only
+                }
+                let skey = &callee.string_constants[sname as usize];
+                let sr = self.ic_super_method_baked(fid, bi, home_class_id, skey)?;
+                let scallee = self.func(sr.fid as usize);
+                // Super target must be inlinable AND have NO nested super (v1).
+                let sblen = Self::method_inline_body_ok(scallee, false)?;
+                let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
+                let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
+                let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
+                max_super_regs = max_super_regs.max(scallee.reg_count);
+                supers.insert(
+                    bi,
+                    crate::codegen::SuperInline {
+                        // The VM `mi_class_epoch` scalar's address is stable for
+                        // the run (Vm is not moved); bake a pointer + the value.
+                        epoch_ptr: &self.mi_class_epoch as *const u32 as u64,
+                        epoch_val: self.mi_class_epoch,
+                        hops: sr.hops,
+                        holder_vals_ptr: sr.holder_vals_ptr,
+                        holder_slot: sr.holder_slot,
+                        fn_bits: sr.fn_bits,
+                        field_slots: sfields,
+                        consts: sconsts,
+                        body: sbody,
+                        callee_reg_count: scallee.reg_count,
+                        win_off: super_win,
+                    },
+                );
+            }
+        }
+        let win_top = if supers.is_empty() {
+            reg_window + callee.reg_count
+        } else {
+            super_win + max_super_regs
+        };
+        let recv_ver = self.heap.version_of(ridx);
+        Some((
+            crate::codegen::MethodInlineShape {
+                recv_bits: recv.bits(),
+                recv_ver,
+                vals_ptr,
+                field_slots,
+                callee_reg_count: callee.reg_count,
+                param_count: callee.param_count,
+                body,
+                consts,
+                supers,
+            },
+            win_top,
+        ))
+    }
+
+    /// Resolve every `GetProp{obj:0,name}` (own `this.<field>`) in `body` to the
+    /// live receiver's own DATA slot. `None` if any field is missing / an
+    /// accessor / the receiver isn't a plain Object (decline the inline).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_bake_fields(
+        &self,
+        ridx: u32,
+        body: &[Instr],
+        strconsts: &[String],
+    ) -> Option<rustc_hash::FxHashMap<u32, u32>> {
+        let m = match self.heap.get(ridx) {
+            crate::heap::HeapObj::Object(m) => m,
+            _ => return None,
+        };
+        let mut fs = rustc_hash::FxHashMap::default();
+        for instr in body {
+            if let Instr::GetProp { obj: 0, name: fname, .. } = *instr {
+                let fkey = &strconsts[fname as usize];
+                match m.pos(fkey) {
+                    Some(s) if !m.attrs[s].accessor => {
+                        fs.insert(fname, s as u32);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        Some(fs)
+    }
+
+    /// Pre-resolve the numeric-constant bits a body's `LoadConst` ops read.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_bake_consts(
+        consts: &[Value],
+        body: &[Instr],
+    ) -> rustc_hash::FxHashMap<u32, u64> {
+        let mut c = rustc_hash::FxHashMap::default();
+        for instr in body {
+            if let Instr::LoadConst { idx, .. } = *instr {
+                if let Some(v) = consts.get(idx as usize) {
+                    c.insert(idx, v.bits());
+                }
+            }
+        }
+        c
+    }
+
+    /// Trivial-method body scan for the Q7 in-region emitter. Returns the body
+    /// length (ops up to and incl. the first `Return`/`ReturnUndefined`), or
+    /// `None` to decline. `allow_super` admits `SuperMethod` (the outer body); a
+    /// super TARGET is scanned with `allow_super=false` (v1 has no nested super).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn method_inline_body_ok(p: &crate::bytecode::FuncProto, allow_super: bool) -> Option<usize> {
         use crate::bytecode::Instr as I;
         if p.is_generator || p.is_async {
             return None;
@@ -784,7 +898,10 @@ impl<'p> Vm<'p> {
                 | I::AddInt { .. }
                 | I::Neg { .. }
                 | I::Bitwise { .. } => {}
-                // Rejects Super*/MathOp/GetIndex/SetProp/calls/branches/etc.
+                // `super.m()` admitted only in the outer body (Stage 3); the
+                // resolved super target is re-scanned with allow_super=false.
+                I::SuperMethod { .. } if allow_super => {}
+                // Rejects SuperGet/SuperSet/MathOp/GetIndex/SetProp/calls/branches.
                 _ => return None,
             }
         }

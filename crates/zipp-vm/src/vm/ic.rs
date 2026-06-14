@@ -120,6 +120,19 @@ pub(crate) enum IcEntry {
     SuperAcc { home: Value, hops: IcHops, slot: u32 },
 }
 
+/// Read-only resolution of a `super.m()` op for Stage 3 method inlining
+/// (`ic_super_method_baked`): the resolved super-method `fid`, the hop
+/// `(heap_idx, version)` guards to re-check, and the holder slot + baked fn bits
+/// (a same-slot reassignment value guard, in case an overwrite doesn't bump the
+/// hop version).
+pub(crate) struct MiSuperResolved {
+    pub(crate) fid: u32,
+    pub(crate) hops: Vec<(u32, u32)>,
+    pub(crate) holder_vals_ptr: u64,
+    pub(crate) holder_slot: u32,
+    pub(crate) fn_bits: u64,
+}
+
 /// Per-site cache: up to [`IC_WAYS`] entries, a fill-failure counter, and a
 /// round-robin eviction cursor.
 pub(crate) struct SiteIc {
@@ -1095,6 +1108,47 @@ impl<'p> Vm<'p> {
             if let IcEntry::ClassMethod { class: c, fid, .. } = *e {
                 if c == class {
                     return Some(fid);
+                }
+            }
+        }
+        None
+    }
+
+    /// Read-only resolver for a `super.m()` op (Stage 3 method inlining): from the
+    /// FILLED `SuperData` IC way at site `(func_id, ip)` whose `home` matches the
+    /// live `class_values[home_class_id]` and whose hop chain still validates,
+    /// return the resolved plain super-method `fid` and the hop `(heap_idx,
+    /// version)` guards the inline must re-check each call (anchor..holder; a
+    /// `setPrototypeOf` / method reassignment on the chain bumps one). `None` if
+    /// no usable way (unfilled / chain mutated / accessor / not a plain fn).
+    /// Performs no fill / side effect. Mirrors `ic_super_method`'s hit validation.
+    pub(crate) fn ic_super_method_baked(
+        &self,
+        func_id: u32,
+        ip: usize,
+        home_class_id: u32,
+        key: &str,
+    ) -> Option<MiSuperResolved> {
+        let home = self.class_values.get(home_class_id as usize).copied().flatten()?;
+        let site = self.ic_site(func_id, ip)?;
+        for e in &site.entries[..site.n as usize] {
+            if let IcEntry::SuperData { home: h, hops, slot } = *e {
+                if h == home && self.ic_super_chain_ok(&hops) {
+                    if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
+                        let s = slot as usize;
+                        if s < hm.keys.len() && hm.keys[s] == key && !hm.attrs[s].accessor {
+                            let v = hm.vals[s];
+                            if let Some((fid, _closure)) = self.ic_plain_fn(v) {
+                                return Some(MiSuperResolved {
+                                    fid,
+                                    hops: hops.0[..hops.1 as usize].to_vec(),
+                                    holder_vals_ptr: hm.vals.as_ptr() as u64,
+                                    holder_slot: s as u32,
+                                    fn_bits: v.bits(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -230,38 +230,92 @@ impl LeafInlinePlan {
 /// WHOLE call cleanly (nothing committed). A pure body runs no GC safepoint /
 /// alloc / call, so r12/r13/r14 stay valid and the scratch window (zero-filled
 /// like `setup_call`) needs no re-fetch.
-pub struct MethodInlinePlan {
-    /// Guard: the receiver reg must hold exactly these Value bits.
-    pub recv_bits: u64,
-    /// Guard: the receiver heap slot's live version must still equal this — the
-    /// ABA + own-shadow + vals-realloc discriminator (see the type doc).
-    pub recv_ver: u32,
-    /// Baked base pointer of the receiver's ObjMap `vals` (valid behind the
-    /// version guard). A `this.<field>` read loads `vals_ptr[slot]`.
-    pub vals_ptr: u64,
-    /// Per body `GetProp{obj:0,name}`: the callee string-constant name index ->
-    /// the receiver's own DATA slot in `vals`. Baked from the live receiver.
+/// One inlined `super.m()` body (Stage 3), emitted over a sub-window above the
+/// outer method's window, over the SAME receiver (reg 0 = recv). v1: the super
+/// target is itself a NO-`super`, 0-arg trivial method (e.g. `Shape.area(){return
+/// this._v+1}`). Resolution is baked from the live `SuperData` IC entry; the hop
+/// version guards re-check the prototype chain each call (a `setPrototypeOf` /
+/// method reassignment on the chain bumps a hop version → fall to the helper).
+pub struct SuperInline {
+    /// Class-redefinition guard: a raw pointer to the VM's `mi_class_epoch` (a
+    /// scalar field — its address is stable for the run) + the epoch baked at
+    /// compile time. A re-executed class declaration swaps
+    /// `class_values[home_class_id]` to a new class WITHOUT mutating the old
+    /// prototype objects the hop guards watch, so `*epoch_ptr != epoch_val` is
+    /// the discriminator that catches it (→ fall to the helper, which resolves
+    /// super against the live `class_values[id]`). Mirrors the interpreter's
+    /// `ic_super_method` `home == class_values[home_class_id]` check.
+    pub epoch_ptr: u64,
+    pub epoch_val: u32,
+    /// Super-chain hop version guards `(heap_idx, version)`, anchor..holder.
+    pub hops: Vec<(u32, u32)>,
+    /// Holder's `vals` base + the method's slot + its baked function Value bits:
+    /// a same-slot REASSIGNMENT guard (`Shape.prototype.area = fn`). The
+    /// interpreter's super path re-reads the holder slot each call, so the inline
+    /// must too — re-check `holder_vals_ptr[holder_slot] == fn_bits` (a chain
+    /// realloc is already caught by the hop version guards before this deref).
+    pub holder_vals_ptr: u64,
+    pub holder_slot: u32,
+    pub fn_bits: u64,
+    /// Super body `this.<field>` -> own data slot on the SAME receiver.
     pub field_slots: FxHashMap<u32, u32>,
-    /// Carved callee scratch-window offset (callee reg `r` -> caller reg
-    /// `reg_window + r`).
-    pub reg_window: u16,
-    /// Callee register-window size (fits the reserved capacity / headroom flag).
-    pub callee_reg_count: u16,
-    /// Method formal parameter count (args copied into `reg_window + 1 ..`).
-    pub param_count: u16,
-    /// The method body ops to emit inline (callee's own register numbers).
-    pub body: Vec<Instr>,
-    /// Resolved numeric-constant bits for the body's `LoadConst` ops.
+    /// Numeric-constant bits for the super body's `LoadConst` ops.
     pub consts: FxHashMap<u32, u64>,
+    /// The super body ops (the super method's own register numbers).
+    pub body: Vec<Instr>,
+    /// Super body register-window size.
+    pub callee_reg_count: u16,
+    /// Sub-window base for the super body's registers (above the outer window).
+    pub win_off: u16,
 }
 
-impl MethodInlinePlan {
+impl SuperInline {
     fn const_bits(&self, idx: u32) -> u64 {
         self.consts.get(&idx).copied().unwrap_or(0)
     }
     fn field_slot(&self, name: u32) -> u32 {
         self.field_slots.get(&name).copied().unwrap_or(0)
     }
+}
+
+/// One receiver "shape" (arm) of a (possibly polymorphic) inlined CallMethod
+/// (Stage 4). Each arm guards a specific receiver instance's identity+version and
+/// runs that receiver's resolved class method inline; a miss tries the next arm,
+/// and all-miss falls to the helper. v1 enumerates the live receiver exemplar
+/// plus, when the receiver is `arr[idx]`, the array's dense elements (the bench's
+/// `objs[i&3]` shape) — so the ≤4 fixed instances each get an arm.
+pub struct MethodInlineShape {
+    /// Guard: the receiver reg must hold exactly these Value bits.
+    pub recv_bits: u64,
+    /// Guard: the receiver heap slot's live version (ABA + own-shadow +
+    /// vals-realloc discriminator).
+    pub recv_ver: u32,
+    /// Baked base pointer of this receiver's ObjMap `vals` (valid behind the
+    /// version guard); shared by the outer body AND its inlined super bodies.
+    pub vals_ptr: u64,
+    /// Per body `GetProp{obj:0,name}`: callee name index -> own DATA slot.
+    pub field_slots: FxHashMap<u32, u32>,
+    /// Callee register-window size.
+    pub callee_reg_count: u16,
+    /// Method formal parameter count.
+    pub param_count: u16,
+    /// The method body ops to emit inline.
+    pub body: Vec<Instr>,
+    /// Resolved numeric-constant bits for the body's `LoadConst` ops.
+    pub consts: FxHashMap<u32, u64>,
+    /// Inlined `super.m()` bodies keyed by their `SuperMethod` body index.
+    pub supers: FxHashMap<usize, SuperInline>,
+}
+
+pub struct MethodInlinePlan {
+    /// Carved callee scratch-window offset (callee reg `r` -> caller reg
+    /// `reg_window + r`).
+    pub reg_window: u16,
+    /// Highest scratch reg index used across all arms (outer window + super
+    /// sub-windows) — the headroom (`jit_regs_fits`) bound.
+    pub win_top: u16,
+    /// The receiver arms (1 = monomorphic; ≤ JIT_IC_WAYS). A guard tree.
+    pub shapes: Vec<MethodInlineShape>,
 }
 
 /// Win64 addresses of the heap helpers (vm.rs), passed from the interpreter into
@@ -5752,92 +5806,39 @@ fn emit_inline_leaf_call(
     dynasm!(ops ; => done);
 }
 
-/// Q7 method-call inlining (v1): emit a guarded INLINE expansion of a trivial
-/// class method for a region `CallMethod` op, with a fallback to the unchanged
-/// per-call helper. Emitted INSTEAD of `emit_region_call_ic` when a
-/// `MethodInlinePlan` exists for this ip. Mirrors `emit_inline_leaf_call`, but
-/// the guard is on the RECEIVER (`obj` reg) not a callee function, reg 0 is bound
-/// to the receiver (`this`), and `this.<field>` reads are baked `vals_ptr[slot]`
-/// loads. See `MethodInlinePlan` for the soundness argument.
+/// Emit one inlined method body's ops over the scratch window based at `win`
+/// (callee reg `r` -> rbx-reg `win + r`). The caller has already bound reg 0
+/// (`this`), the params, and zero-filled the locals. Handles the straight-line
+/// no-`super` ops directly, and recursively expands a `SuperMethod` (looked up in
+/// `supers` by its body index) over its own `win_off` sub-window (reg 0 = the
+/// SAME receiver). `vals_ptr` is the receiver's baked ObjMap `vals` base — shared
+/// by this body AND its inlined super bodies (same receiver). Returns the body's
+/// return register (in the `win` window), or `None` for `ReturnUndefined`. A
+/// number-guard bail re-runs the WHOLE call via `epilogue` (nothing committed); a
+/// super-chain version-guard miss jumps to `fallback` (the per-call helper).
 #[allow(clippy::too_many_arguments)]
-fn emit_inline_method_call(
+fn emit_mi_body(
     ops: &mut dynasmrt::x64::Assembler,
     call_ip: usize,
     epilogue: dynasmrt::DynamicLabel,
-    method_flag_off: i32,
-    plan: &MethodInlinePlan,
-    obj: u16,
-    arg_base: u16,
-    argc: u16,
-    dst: u16,
-    // Fallback emission (the unchanged per-call helper).
-    helper: usize,
-    packed_fip: u64,
-    packed_args: u64,
-    refetch: Option<(usize, usize)>,
-    ta_refetch: Option<(usize, &TaPinPlan)>,
-) {
-    let fallback = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    let w = plan.reg_window;
-    // ── receiver identity + version guard ── (the GetProp-IC template). A miss
-    // (different/reassigned/GC'd-reused receiver, or any own-key add/delete/
-    // redefine / freeze / setPrototypeOf that bumped the version — incl. a method
-    // OWN SHADOW) falls to the helper, which re-resolves correctly.
-    dynasm!(ops
-        ; mov rax, [rbx + dreg(obj)]
-        ; mov r10, QWORD plan.recv_bits as i64
-        ; cmp rax, r10
-        ; jne => fallback
-        ; mov ecx, eax                          // recv heap idx (low 32 of bits)
-        ; mov edx, [r13 + rcx*4]                // live slot version
-        ; cmp edx, DWORD plan.recv_ver as i32
-        ; jne => fallback
-        // ── headroom flag ── 0 ⇒ the scratch window might overflow the pinned
-        // register file → take the helper.
-        ; cmp QWORD [rsp + method_flag_off], 0
-        ; je => fallback
-        // ── bind reg 0 = `this` (the receiver) ──
-        ; mov rax, [rbx + dreg(obj)]
-        ; mov [rbx + dreg(w)], rax
-    );
-    // ── positional args into W+1.. (a method binds simple positional params) ──
-    let n = argc.min(plan.param_count);
-    for i in 0..plan.param_count {
-        if i < n {
-            dynasm!(ops
-                ; mov rax, [rbx + dreg(arg_base + i)]
-                ; mov [rbx + dreg(w + 1 + i)], rax
-            );
-        } else {
-            dynasm!(ops
-                ; mov rax, QWORD Value::UNDEFINED.bits() as i64
-                ; mov [rbx + dreg(w + 1 + i)], rax
-            );
-        }
-    }
-    // ── zero-fill the callee LOCALS (regs past `this`+params) to undefined ──
-    {
-        let undef = Value::UNDEFINED.bits() as i64;
-        let first_local = 1 + plan.param_count;
-        if first_local < plan.callee_reg_count {
-            dynasm!(ops ; mov rax, QWORD undef);
-            for r in first_local..plan.callee_reg_count {
-                dynasm!(ops ; mov [rbx + dreg(w + r)], rax);
-            }
-        }
-    }
-    // ── inline the body over the scratch window ──
-    let rg = |r: u16| w + r;
+    fallback: dynasmrt::DynamicLabel,
+    body: &[Instr],
+    supers: &FxHashMap<usize, SuperInline>,
+    field_slots: &FxHashMap<u32, u32>,
+    consts: &FxHashMap<u32, u64>,
+    vals_ptr: u64,
+    win: u16,
+) -> Option<u16> {
+    let rg = |r: u16| win + r;
     let mut ret_reg: Option<u16> = None;
-    for instr in &plan.body {
+    for (bi, instr) in body.iter().enumerate() {
         match *instr {
             Instr::LoadInt { dst: d, val } => {
                 let boxed = INT_TAG | (val as u32 as u64);
                 dynasm!(ops ; mov rax, QWORD boxed as i64 ; mov [rbx + dreg(rg(d))], rax);
             }
             Instr::LoadConst { dst: d, idx } => {
-                let bits = plan.const_bits(idx);
+                let bits = consts.get(&idx).copied().unwrap_or(0);
                 dynasm!(ops ; mov rax, QWORD bits as i64 ; mov [rbx + dreg(rg(d))], rax);
             }
             Instr::LoadBool { dst: d, val } => {
@@ -5850,9 +5851,9 @@ fn emit_inline_method_call(
             // `this.<field>` — an own DATA slot, baked behind the receiver guard
             // (the version guard guarantees `vals_ptr`/`slot` are still valid).
             Instr::GetProp { dst: d, obj: 0, name } => {
-                let slot = plan.field_slot(name);
+                let slot = field_slots.get(&name).copied().unwrap_or(0);
                 dynasm!(ops
-                    ; mov rcx, QWORD plan.vals_ptr as i64
+                    ; mov rcx, QWORD vals_ptr as i64
                     ; mov rax, [rcx + (slot as i32) * 8]
                     ; mov [rbx + dreg(rg(d))], rax
                 );
@@ -5978,32 +5979,198 @@ fn emit_inline_method_call(
                 }
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }
+            // `super.m()` — inline the resolved super body over its sub-window,
+            // behind the baked super-chain hop version guards (a chain mutation
+            // misses → helper). The super body runs over the SAME receiver.
+            Instr::SuperMethod { dst: d, .. } => {
+                let s = supers
+                    .get(&bi)
+                    .expect("build_method_inline_plan baked a SuperInline for this op");
+                // ── class-redefinition guard ── a re-executed class declaration
+                // swaps class_values[home_class_id] to a new class (+ new proto
+                // chain) without touching the old prototypes the hop guards watch;
+                // the interpreter re-resolves super via the live class_values, so
+                // catch the swap via the VM epoch (→ helper). One load + compare.
+                dynasm!(ops
+                    ; mov rcx, QWORD s.epoch_ptr as i64
+                    ; mov ecx, [rcx]
+                    ; cmp ecx, DWORD s.epoch_val as i32
+                    ; jne => fallback
+                );
+                // ── super-chain hop version guards (catch setPrototypeOf / a
+                // chain realloc; the holder hop catches a key-add realloc of the
+                // holder before its vals_ptr is dereferenced below) ──
+                for &(idx, ver) in &s.hops {
+                    dynasm!(ops
+                        ; mov edx, [r13 + (idx as i32) * 4]
+                        ; cmp edx, DWORD ver as i32
+                        ; jne => fallback
+                    );
+                }
+                // ── super-method REASSIGNMENT guard ── re-read the holder slot
+                // and confirm it still holds the baked super function (matches the
+                // interpreter, which re-reads the holder each call). Safe to deref:
+                // the holder hop version guard above proved no realloc.
+                dynasm!(ops
+                    ; mov rcx, QWORD s.holder_vals_ptr as i64
+                    ; mov rax, [rcx + (s.holder_slot as i32) * 8]
+                    ; mov r10, QWORD s.fn_bits as i64
+                    ; cmp rax, r10
+                    ; jne => fallback
+                );
+                // Super reg 0 = the SAME receiver (this body's reg 0 = `win`).
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(win)]
+                    ; mov [rbx + dreg(s.win_off)], rax
+                );
+                // Zero-fill the super body's locals (0-arg → regs 1.. are locals).
+                if s.callee_reg_count > 1 {
+                    dynasm!(ops ; mov rax, QWORD Value::UNDEFINED.bits() as i64);
+                    for r in 1..s.callee_reg_count {
+                        dynasm!(ops ; mov [rbx + dreg(s.win_off + r)], rax);
+                    }
+                }
+                // Emit the super body (v1: no nested super → empty supers map).
+                let no_supers: FxHashMap<usize, SuperInline> = FxHashMap::default();
+                let sret = emit_mi_body(
+                    ops, call_ip, epilogue, fallback, &s.body, &no_supers, &s.field_slots,
+                    &s.consts, vals_ptr, s.win_off,
+                );
+                match sret {
+                    Some(r) => dynasm!(ops
+                        ; mov rax, [rbx + dreg(r)]
+                        ; mov [rbx + dreg(rg(d))], rax
+                    ),
+                    None => dynasm!(ops
+                        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                        ; mov [rbx + dreg(rg(d))], rax
+                    ),
+                }
+            }
             Instr::Return { src } => {
                 ret_reg = Some(rg(src));
             }
             Instr::ReturnUndefined => {
                 ret_reg = None;
             }
-            // `build_method_inline_plan` admits only the ops above (no-super v1).
+            // `build_method_inline_plan` / `method_inline_body_ok` admit only the
+            // ops above.
             ref other => unreachable!("inline method body op not admitted: {other:?}"),
         }
     }
-    // ── store the return value into the caller's `dst` ──
-    match ret_reg {
-        Some(r) => dynasm!(ops
-            ; mov rax, [rbx + dreg(r)]
-            ; mov [rbx + dreg(dst)], rax
-        ),
-        None => dynasm!(ops
-            ; mov rax, QWORD Value::UNDEFINED.bits() as i64
-            ; mov [rbx + dreg(dst)], rax
-        ),
-    }
+    ret_reg
+}
+
+/// Q7 method-call inlining: emit a guarded INLINE expansion of a trivial class
+/// method for a region `CallMethod` op, with a fallback to the unchanged per-call
+/// helper. Emitted INSTEAD of `emit_region_call_ic` when a `MethodInlinePlan`
+/// exists for this ip. Mirrors `emit_inline_leaf_call`, but the guard is on the
+/// RECEIVER (`obj` reg) not a callee function, reg 0 is bound to the receiver
+/// (`this`), `this.<field>` reads are baked `vals_ptr[slot]` loads, and a
+/// `super.m()` is inlined recursively (Stage 3). See `MethodInlinePlan`.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_method_call(
+    ops: &mut dynasmrt::x64::Assembler,
+    call_ip: usize,
+    epilogue: dynasmrt::DynamicLabel,
+    method_flag_off: i32,
+    plan: &MethodInlinePlan,
+    obj: u16,
+    arg_base: u16,
+    argc: u16,
+    dst: u16,
+    // Fallback emission (the unchanged per-call helper).
+    helper: usize,
+    packed_fip: u64,
+    packed_args: u64,
+    refetch: Option<(usize, usize)>,
+    ta_refetch: Option<(usize, &TaPinPlan)>,
+) {
+    let fallback = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let w = plan.reg_window;
+    // Load the receiver ONCE into rax. On a per-shape guard MISS we `jne` before
+    // running any body, so rax still holds the receiver for the next arm; only a
+    // HIT clobbers rax (then jumps to `done`). The headroom flag is checked once.
     dynasm!(ops
-        ; jmp => done
-        ; => fallback
+        ; mov rax, [rbx + dreg(obj)]
+        // ── headroom flag ── 0 ⇒ a scratch window might overflow the pinned
+        // register file → take the helper (covers every arm's window).
+        ; cmp QWORD [rsp + method_flag_off], 0
+        ; je => fallback
     );
+    // ── per-receiver guard tree (≤ JIT_IC_WAYS arms) ── each arm guards a
+    // specific instance's identity+version (the ABA / own-shadow / freeze /
+    // setPrototypeOf / vals-realloc discriminator); a miss tries the next arm,
+    // all-miss falls to the helper, which re-resolves correctly.
+    let arm_labels: Vec<_> = (0..plan.shapes.len()).map(|_| ops.new_dynamic_label()).collect();
+    for (si, shape) in plan.shapes.iter().enumerate() {
+        let miss = if si + 1 < plan.shapes.len() { arm_labels[si + 1] } else { fallback };
+        dynasm!(ops
+            ; => arm_labels[si]
+            ; mov r10, QWORD shape.recv_bits as i64
+            ; cmp rax, r10
+            ; jne => miss
+            ; mov ecx, eax                          // recv heap idx (low 32 of bits)
+            ; mov edx, [r13 + rcx*4]                // live slot version
+            ; cmp edx, DWORD shape.recv_ver as i32
+            ; jne => miss
+            // ── bind reg 0 = `this` (rax still = receiver) ──
+            ; mov [rbx + dreg(w)], rax
+        );
+        // ── positional args into W+1.. (simple positional params) ──
+        let n = argc.min(shape.param_count);
+        for i in 0..shape.param_count {
+            if i < n {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(arg_base + i)]
+                    ; mov [rbx + dreg(w + 1 + i)], rax
+                );
+            } else {
+                dynasm!(ops
+                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                    ; mov [rbx + dreg(w + 1 + i)], rax
+                );
+            }
+        }
+        // ── zero-fill the callee LOCALS (regs past `this`+params) ──
+        {
+            let undef = Value::UNDEFINED.bits() as i64;
+            let first_local = 1 + shape.param_count;
+            if first_local < shape.callee_reg_count {
+                dynasm!(ops ; mov rax, QWORD undef);
+                for r in first_local..shape.callee_reg_count {
+                    dynasm!(ops ; mov [rbx + dreg(w + r)], rax);
+                }
+            }
+        }
+        // ── inline this arm's body (incl. any `super.m()` sub-bodies) ──
+        let ret_reg = emit_mi_body(
+            ops,
+            call_ip,
+            epilogue,
+            fallback,
+            &shape.body,
+            &shape.supers,
+            &shape.field_slots,
+            &shape.consts,
+            shape.vals_ptr,
+            w,
+        );
+        match ret_reg {
+            Some(r) => dynasm!(ops
+                ; mov rax, [rbx + dreg(r)]
+                ; mov [rbx + dreg(dst)], rax
+            ),
+            None => dynasm!(ops
+                ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                ; mov [rbx + dreg(dst)], rax
+            ),
+        }
+        dynasm!(ops ; jmp => done);
+    }
     // ── fallback ── the UNCHANGED per-call helper (a pure prefix).
+    dynasm!(ops ; => fallback);
     let helper_bail = ops.new_dynamic_label();
     emit_region_call_ic(
         ops, call_ip, helper_bail, epilogue, helper, packed_fip, packed_args, argc, dst, refetch,
@@ -6064,11 +6231,7 @@ fn compile_region_mem(
     let max_scratch_top: u64 = leaf_plan
         .values()
         .map(|p| p.reg_window as u64 + p.callee_reg_count as u64)
-        .chain(
-            method_plan
-                .values()
-                .map(|p| p.reg_window as u64 + p.callee_reg_count as u64),
-        )
+        .chain(method_plan.values().map(|p| p.win_top as u64))
         .max()
         .unwrap_or(0);
     // Pinned-TypedArray snapshot slots: 32 bytes each, above the 32B shadow +

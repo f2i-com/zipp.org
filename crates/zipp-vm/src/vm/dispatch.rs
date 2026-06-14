@@ -1364,6 +1364,11 @@ impl<'p> Vm<'p> {
                         self.brand_owner.insert(private_brand, v.heap_index());
                         // Remember it so `super` in a derived class can reach it.
                         self.class_values[class_id as usize] = Some(v);
+                        // A re-executed class declaration swaps this slot to a NEW
+                        // class value (+ new prototype chain) without mutating the
+                        // OLD prototype objects a JIT method-inline `super` arm's
+                        // hop guards watch — so bump the epoch the inline re-checks.
+                        self.mi_class_epoch = self.mi_class_epoch.wrapping_add(1);
                         // The class value itself carries the lexical brand chain so the
                         // ctor / field initializers / static blocks (frame.callee = the
                         // class value) resolve the same brands.
