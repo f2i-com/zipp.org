@@ -254,6 +254,50 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Does either default prototype (Object.prototype / Array.prototype) carry a
+    /// callable `toJSON`? Cached on the two protos' shape VERSIONS, so any mutation
+    /// that adds/removes `toJSON` there bumps a version and auto-invalidates the
+    /// cache (no manual invalidation). Used by `json_value_into` to skip the
+    /// per-value `toJSON` probe for plain objects/arrays. `false` ⇒ provably safe
+    /// to skip the probe for a plain value with no own `toJSON`.
+    fn json_default_protos_have_tojson(&mut self) -> bool {
+        let ov = self.heap.version_of(self.obj_proto);
+        let av = self.heap.version_of(self.arr_proto);
+        if let Some((co, ca, r)) = self.json_default_tj {
+            if co == ov && ca == av {
+                return r;
+            }
+        }
+        let has = |vm: &mut Self, proto: u32| -> bool {
+            if proto == 0 {
+                return false;
+            }
+            let tj = vm.get_prop(Value::heap(proto), "toJSON").unwrap_or(Value::UNDEFINED);
+            vm.is_callable(tj)
+        };
+        let r = has(self, self.obj_proto) || has(self, self.arr_proto);
+        self.json_default_tj = Some((ov, av, r));
+        r
+    }
+
+    /// Is `idx` a PLAIN object/array whose only possible `toJSON` would be on a
+    /// default prototype? (no custom proto, not a class instance / raw-json, no
+    /// own `toJSON`, no `arr_props` overlay for arrays). When true AND
+    /// `!json_default_protos_have_tojson()`, `get_prop(v,"toJSON")` is provably
+    /// `undefined` and the serializer skips the chain-walking probe entirely.
+    fn json_plain_no_own_tojson(&self, idx: u32) -> bool {
+        if self.proto_of.contains_key(&idx) {
+            return false;
+        }
+        match self.heap.get(idx) {
+            HeapObj::Object(map) => {
+                map.class.is_none() && !map.is_raw_json && map.pos("toJSON").is_none()
+            }
+            HeapObj::Array(_) => !self.arr_props.contains_key(&idx),
+            _ => false,
+        }
+    }
+
     /// SerializeJSONProperty, appending straight into a single shared output
     /// buffer instead of building a per-node `String`/`Vec<String>` tree and
     /// joining at every level (the V8 approach). Returns `true` if a value was
@@ -277,13 +321,23 @@ impl<'p> Vm<'p> {
     ) -> Result<bool, Thrown> {
         // SerializeJSONProperty: a value with a callable `toJSON` is replaced by
         // `value.toJSON(key)` before serialization (Date, user objects, …).
+        // FAST PATH (T0.1): a plain object/array with no own `toJSON` whose
+        // default prototypes carry no `toJSON` provably has no callable `toJSON`,
+        // so skip the per-value `get_prop(v,"toJSON")` prototype-chain walk
+        // (~900k walks on the json bench). The version-keyed cache stays correct
+        // if user code mutates a default prototype mid-serialization.
         let v = if v.is_heap() {
-            let tj = self.get_prop(v, "toJSON")?;
-            if self.is_callable(tj) {
-                let kv = self.alloc_str(key.to_string());
-                self.call_value(tj, v, &[kv])?
-            } else {
+            let idx = v.heap_index();
+            if self.json_plain_no_own_tojson(idx) && !self.json_default_protos_have_tojson() {
                 v
+            } else {
+                let tj = self.get_prop(v, "toJSON")?;
+                if self.is_callable(tj) {
+                    let kv = self.alloc_str(key.to_string());
+                    self.call_value(tj, v, &[kv])?
+                } else {
+                    v
+                }
             }
         } else {
             v
@@ -417,13 +471,41 @@ impl<'p> Vm<'p> {
                     out.push('\n');
                     out.push_str(&pad);
                 }
-                let ks = i.to_string();
-                let e = match self.json_get(v, &ks) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        visited.pop();
-                        return Err(e);
+                // FAST PATH (T0.1): for a dense in-range element of an array with
+                // no `arr_props` overlay, read `items[i]` directly — skipping the
+                // `json_get` generic-index dispatch (string-key coercion + chain
+                // resolution) per element. Any overlay / virtual-length / OOB falls
+                // back to `json_get` (which handles holes/proto exactly).
+                let direct = if !self.arr_props.contains_key(&idx) {
+                    match self.heap.get(idx) {
+                        // A present (non-hole) dense element. A HOLE falls back to
+                        // `json_get` so the prototype chain is walked exactly.
+                        HeapObj::Array(a) => match a.get(i as usize) {
+                            Some(e) if !e.is_hole() => Some(*e),
+                            _ => None,
+                        },
+                        _ => None,
                     }
+                } else {
+                    None
+                };
+                let e = match direct {
+                    Some(e) => e,
+                    None => match self.json_get(v, &i.to_string()) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            visited.pop();
+                            return Err(e);
+                        }
+                    },
+                };
+                // The element key is only observable if the element has a callable
+                // `toJSON` / there is a replacer — defer the `i.to_string()` alloc
+                // to that case (a heap element); primitives pass an empty key.
+                let ks: String = if e.is_heap() || self.is_callable(replacer) {
+                    i.to_string()
+                } else {
+                    String::new()
                 };
                 // An omitted array element serializes as `null` (NOT skipped).
                 let wrote = match self

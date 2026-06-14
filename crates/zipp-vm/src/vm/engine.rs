@@ -87,6 +87,7 @@ impl<'p> Vm<'p> {
             mi_class_epoch: 0,
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
+            json_default_tj: None,
             site_ics: Vec::new(),
             heap,
             globals,

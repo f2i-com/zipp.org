@@ -259,6 +259,13 @@ pub struct Vm<'p> {
     /// throwaway heap string per access. Taken via `mem::take` for the duration
     /// of a single op (no aliasing) and returned; grows once, then reused.
     idx_key_scratch: String,
+    /// JSON.stringify fast-path cache: `(obj_proto version, arr_proto version,
+    /// either default prototype has a callable `toJSON`)`. Keyed on the two proto
+    /// shape versions so any mutation that adds/removes `toJSON` on the default
+    /// Object/Array prototype auto-invalidates it (no manual invalidation). Lets
+    /// the serializer skip the per-value `get_prop(v,"toJSON")` chain walk for a
+    /// plain object/array when no default prototype carries `toJSON`.
+    json_default_tj: Option<(u32, u32, bool)>,
     /// Interpreter inline caches: per MAIN-program function (outer index =
     /// func_id), per instruction (inner index = ip), a lazily-allocated
     /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the
