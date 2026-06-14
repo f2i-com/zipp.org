@@ -183,6 +183,16 @@ pub struct ObjMap {
     /// `vals[i]` is the value; for an ACCESSOR `vals[i]` is the getter and
     /// `attrs[i].setter` the setter.
     pub attrs: Vec<PropAttr>,
+    /// Tombstone bitmap parallel to `keys`/`vals`/`attrs` (T0.2): `present[i] ==
+    /// false` marks a DELETED slot whose position is kept so live slots never
+    /// move (O(1) delete; `pos`/the PropIndex/JIT+interp inline caches stay
+    /// valid). Every raw slot-order reader must skip `!present[i]`; `pos()` does.
+    /// PRIVATE so the keys⇄present⇄index invariant is owned by this impl block;
+    /// readers holding `&ObjMap` use `slot_present`/`iter_live`/`spec_key_order`.
+    present: Vec<bool>,
+    /// Count of LIVE (present) slots = `keys.len()` minus tombstones. Avoids
+    /// re-counting in `pos`'s linear branch and gates index-drop / compaction.
+    live: usize,
     /// Heap index of the class this object is an instance of (`new C()`), used
     /// for prototype-style method lookup and `instanceof`. `None` for a plain
     /// object literal. Own properties (the fields) live in `keys`/`vals`;
@@ -243,6 +253,8 @@ impl ObjMap {
             keys: Vec::new(),
             vals: Vec::new(),
             attrs: Vec::new(),
+            present: Vec::new(),
+            live: 0,
             class: None,
             extensible: true,
             is_ctor: false,
@@ -287,10 +299,48 @@ impl ObjMap {
 
     #[inline]
     pub fn pos(&self, key: &str) -> Option<usize> {
+        // Skip tombstoned slots (T0.2): a deleted key must miss. `delete` removes
+        // the key's PropIndex entry, so the index branch can only return a LIVE
+        // slot (debug-asserted); the linear branch filters `present`.
         match &self.index {
-            Some(ix) => ix.find(&self.keys, key),
-            None => self.keys.iter().position(|k| k == key),
+            Some(ix) => {
+                let r = ix.find(&self.keys, key);
+                debug_assert!(r.map_or(true, |s| self.present[s]), "pos: index returned tombstoned slot");
+                r
+            }
+            None => self
+                .keys
+                .iter()
+                .enumerate()
+                .find(|(i, k)| self.present[*i] && *k == key)
+                .map(|(i, _)| i),
         }
+    }
+
+    /// Is slot `i` a LIVE (non-tombstoned) property? Raw slot-order readers that
+    /// index `keys`/`vals`/`attrs` directly MUST gate on this (T0.2).
+    #[inline]
+    pub fn slot_present(&self, i: usize) -> bool {
+        self.present[i]
+    }
+
+    /// Count of live (non-tombstoned) own properties.
+    #[inline]
+    pub fn live_len(&self) -> usize {
+        self.live
+    }
+
+    /// `(slot_index, &key)` for every LIVE slot in raw insertion (slot) order —
+    /// the tombstone-skipping replacement for `keys.iter().enumerate()`.
+    pub fn iter_live(&self) -> impl Iterator<Item = (usize, &String)> {
+        self.keys.iter().enumerate().filter(move |(i, _)| self.present[*i])
+    }
+
+    /// The tombstone bitmap (parallel to `keys`), for vm-side enumerators that
+    /// need canonical-order skipping via `spec_key_order_present(&keys, present)`.
+    #[inline]
+    pub fn present_slice(&self) -> &[bool] {
+        &self.present
     }
 
     /// Maintain the index across the append of `keys`' LAST entry: insert it
@@ -325,6 +375,8 @@ impl ObjMap {
             self.keys.push(key.to_string());
             self.vals.push(val);
             self.attrs.push(PropAttr::data());
+            self.present.push(true);
+            self.live += 1;
             self.index_appended();
             true
         }
@@ -342,6 +394,8 @@ impl ObjMap {
             self.keys.push(key.to_string());
             self.vals.push(val);
             self.attrs.push(attr);
+            self.present.push(true);
+            self.live += 1;
             self.index_appended();
             true
         }
@@ -354,6 +408,8 @@ impl ObjMap {
         self.keys.push(key);
         self.vals.push(val);
         self.attrs.push(PropAttr::data());
+        self.present.push(true);
+        self.live += 1;
         self.index_appended();
     }
 
@@ -362,9 +418,14 @@ impl ObjMap {
     /// may have recorded a now-stale slot index for another key).
     pub fn remove(&mut self, key: &str) -> bool {
         if let Some(i) = self.pos(key) {
+            // T0.2 step 1 (behavior-neutral foundation): still SHIFTS here so
+            // `present` stays all-true and `pos`/readers are exercised inertly.
+            // Step 4 flips this to a tombstone (mark present[i]=false, no shift).
             self.keys.remove(i);
             self.vals.remove(i);
             self.attrs.remove(i);
+            self.present.remove(i);
+            self.live -= 1;
             if let Some(ix) = &mut self.index {
                 if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
                     self.index = None;
