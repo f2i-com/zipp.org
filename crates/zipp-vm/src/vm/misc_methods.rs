@@ -265,6 +265,7 @@ impl<'p> Vm<'p> {
                 .unwrap_or(Value::UNDEFINED)
                 .bits();
             let heap_helper_addrs = self.jit_heap_helper_addrs();
+            let const_strs = self.jit_build_const_strs(fid);
             self.jit.compile(
                 fid,
                 proto_ref,
@@ -272,6 +273,7 @@ impl<'p> Vm<'p> {
                 self_val,
                 jit_globals_base as usize,
                 heap_helper_addrs,
+                &const_strs,
             );
         }
         let entry = self.jit.get(fid)?.entry();

@@ -1291,6 +1291,97 @@ pub(crate) extern "win64" fn jit_forin_live(
     Value::bool(live).bits()
 }
 
+/// Win64 helper for Tier C `TypeOf` (`typeof v`): `vm.type_of(v)` (a fixed
+/// &'static str) materialised to a heap string; returns its Value bits. The
+/// downstream `=== "number"` compares by CONTENT via `region_poly_eq`'s slow
+/// `jit_strict_eq` path (multi-char strings are non-interned ⇒ index ≥
+/// USER_OBJ_START ⇒ slow path), so a fresh alloc each call is CORRECT. ALLOCATES
+/// (a real heap Str for multi-char names) ⇒ the caller refetches r13/r14 after
+/// this op when it has GetProp. `alloc` never itself collects, so no guard.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `v_bits` is a valid Value whose heap object (if
+/// any) is rooted in the caller's frame registers.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_typeof(vm: *mut core::ffi::c_void, v_bits: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let t: &'static str = vm.type_of(Value::from_bits(v_bits));
+    vm.alloc_str(t.to_string()).bits()
+}
+
+/// Win64 helper for Tier C `IsArray` (`Array.isArray(v)`): returns the Bool
+/// Value bits, or `SELF_CALL_DEOPT` for the rare throwing case (a revoked
+/// Proxy) so the interpreter re-executes the op and throws — safe to redo
+/// because the check is side-effect-free. PURE (no alloc, no user code).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `v_bits` is a valid Value rooted in the caller.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_is_array(vm: *mut core::ffi::c_void, v_bits: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.value_is_array_throwing(Value::from_bits(v_bits)) {
+        Ok(b) => Value::bool(b).bits(),
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Win64 helper for Tier C `LenOf` (the for-in/for-of length op): length of a
+/// for-in key snapshot Array / Array / String / Cons / Map / Set, else 0.
+/// Mirrors the interpreter's `LenOf` arm (dispatch.rs). PURE, total (no deopt).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `obj_bits` is a valid Value rooted in the caller.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_len_of(vm: *mut core::ffi::c_void, obj_bits: u64) -> u64 {
+    let vm = unsafe { &*(vm as *mut Vm) };
+    let o = Value::from_bits(obj_bits);
+    let v = if o.is_heap() {
+        match vm.heap.get(o.heap_index()) {
+            HeapObj::Array(items) => len_value(
+                vm.array_js_len
+                    .get(&o.heap_index())
+                    .map_or(items.len(), |&n| n as usize),
+            ),
+            HeapObj::Str(s) => len_value(s.units()),
+            HeapObj::Cons { len, .. } => len_value(*len),
+            HeapObj::Map { keys, .. } => {
+                len_value(keys.iter().filter(|k| !k.is_hole()).count())
+            }
+            HeapObj::Set(items) => len_value(items.iter().filter(|v| !v.is_hole()).count()),
+            _ => Value::int(0),
+        }
+    } else {
+        Value::int(0)
+    };
+    v.bits()
+}
+
+/// Win64 helper for Tier C `ForInKeys`: materialise the for-in key snapshot
+/// Array (a nullish receiver iterates nothing → empty Array; else `to_object`
+/// then `for_in_keys`). Returns the Array Value bits, `CALL_THREW` if a Proxy
+/// trap / coercion threw (`pending_throw` set — the caller unwinds, never
+/// re-executes), or — never `SELF_CALL_DEOPT` here (no redo case). ALLOCATES
+/// (a key Array) ⇒ the caller refetches r13/r14 after this op when it has
+/// GetProp. `for_in_keys` self-guards its working set (gc_lock_guard), so NO
+/// outer guard (which would wrongly suppress GC across `to_object`).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `obj_bits` is a valid Value rooted in the caller.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_forin_keys(vm: *mut core::ffi::c_void, obj_bits: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let o = Value::from_bits(obj_bits);
+    let r = if o.is_nullish() {
+        Ok(Value::heap(vm.heap.alloc(HeapObj::Array(Vec::new()))))
+    } else {
+        vm.to_object(o).and_then(|o| vm.for_in_keys(o))
+    };
+    match r {
+        Ok(v) => v.bits(),
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
 /// Win64 helper: the `in` operator (`HasProp`, brand=false) in a region. `key`/
 /// `obj` are the operand Value bits — returns the BOOL Value bits (`i in arr`)
 /// or `SELF_CALL_DEOPT` when the answer needs user code / a throw (non-object

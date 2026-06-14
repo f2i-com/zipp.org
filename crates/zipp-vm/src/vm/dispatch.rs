@@ -228,6 +228,7 @@ impl<'p> Vm<'p> {
                         .unwrap_or(Value::UNDEFINED)
                         .bits();
                     let heap_helper_addrs = self.jit_heap_helper_addrs();
+                    let const_strs = self.jit_build_const_strs(func_id);
                     self.jit.compile(
                         func_id,
                         proto_ref,
@@ -235,6 +236,7 @@ impl<'p> Vm<'p> {
                         self_val,
                         jit_globals_base as usize,
                         heap_helper_addrs,
+                        &const_strs,
                     );
                 }
             }
@@ -5798,6 +5800,10 @@ impl<'p> Vm<'p> {
             forin_live: jit_forin_live as usize,
             has_property: jit_has_property as usize,
             regs_fits: jit_regs_fits as usize,
+            typeof_str: jit_typeof as usize,
+            is_array: jit_is_array as usize,
+            len_of: jit_len_of as usize,
+            forin_keys: jit_forin_keys as usize,
         }
     }
 
@@ -5815,6 +5821,47 @@ impl<'p> Vm<'p> {
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
         Some((Value::from_bits(bits), bail))
+    }
+
+    /// Pre-intern `func_id`'s multi-char string constants (for Tier C's whole-
+    /// function mem path to embed their bits as immediates), returning a
+    /// `const-index → interned bits` map. Each interned Value is rooted for the
+    /// VM's life in `jit_const_strings` (compiled code isn't GC-traced). Mirrors
+    /// the OSR region's const_strs build (over the whole function body here).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_build_const_strs(
+        &mut self,
+        func_id: u32,
+    ) -> rustc_hash::FxHashMap<u32, u64> {
+        let pending: Vec<u32> = {
+            let proto = self.func(func_id as usize);
+            proto
+                .code
+                .iter()
+                .filter_map(|ins| match *ins {
+                    Instr::LoadConst { idx, .. } => {
+                        let c = proto.constants[idx as usize];
+                        if c.is_heap() && (c.heap_index() & STRING_CONST_BIT) != 0 {
+                            Some(idx)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut const_strs: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
+        for idx in pending {
+            if const_strs.contains_key(&idx) {
+                continue;
+            }
+            let c = self.func(func_id as usize).constants[idx as usize];
+            let v = self.resolve_const(func_id, c);
+            self.jit_const_strings.push(v); // GC root
+            const_strs.insert(idx, v.bits());
+        }
+        const_strs
     }
 
     /// Run the compiled OSR region for the loop headed at `entry_ip` (in
