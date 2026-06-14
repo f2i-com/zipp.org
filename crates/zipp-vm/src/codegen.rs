@@ -6047,6 +6047,19 @@ fn emit_mi_body(
                     ),
                 }
             }
+            // `this.<field> = val` (a trivial setter's store) — a baked in-place
+            // store to the receiver's own data slot (no version bump, matching
+            // accessor_fast_set). The body's ONLY effect; method_inline_body_ok
+            // admits it ONLY as the last op before the terminator, so any earlier
+            // op's number-guard bail re-runs the whole call cleanly.
+            Instr::SetProp { obj: 0, name, val } => {
+                let slot = field_slots.get(&name).copied().unwrap_or(0);
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(rg(val))]
+                    ; mov rcx, QWORD vals_ptr as i64
+                    ; mov [rcx + (slot as i32) * 8], rax
+                );
+            }
             Instr::Return { src } => {
                 ret_reg = Some(rg(src));
             }
@@ -6177,6 +6190,81 @@ fn emit_inline_method_call(
         ta_refetch,
     );
     dynasm!(ops ; => done);
+}
+
+/// Q7 Stage 5: inline a trivial class GETTER (`o.v`) or SETTER (`o.v = x`) for a
+/// region GetProp/SetProp op, as a per-receiver guard tree (like the method
+/// emitter). Emitted as a PREFIX before the site's existing inline-cache probe:
+/// on an arm HIT it writes the result (getter → `payload`=dst) or performs the
+/// store (setter, `payload`=value reg) and jumps to `cont` (the site's IC
+/// continuation); on ALL-MISS (or tight headroom) it falls through to the
+/// existing IC probe (the unchanged fallback — a real accessor → PROP_VIA_IC
+/// helper). reg 0 = receiver; for a setter reg 1 = the value. Body via emit_mi_body.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_accessor(
+    ops: &mut dynasmrt::x64::Assembler,
+    call_ip: usize,
+    epilogue: dynasmrt::DynamicLabel,
+    method_flag_off: i32,
+    plan: &MethodInlinePlan,
+    obj: u16,
+    payload: u16,
+    is_setter: bool,
+    cont: dynasmrt::DynamicLabel,
+) {
+    let after = ops.new_dynamic_label();
+    let w = plan.reg_window;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]
+        ; cmp QWORD [rsp + method_flag_off], 0
+        ; je => after
+    );
+    let arm_labels: Vec<_> = (0..plan.shapes.len()).map(|_| ops.new_dynamic_label()).collect();
+    for (si, shape) in plan.shapes.iter().enumerate() {
+        let miss = if si + 1 < plan.shapes.len() { arm_labels[si + 1] } else { after };
+        dynasm!(ops
+            ; => arm_labels[si]
+            ; mov r10, QWORD shape.recv_bits as i64
+            ; cmp rax, r10
+            ; jne => miss
+            ; mov ecx, eax
+            ; mov edx, [r13 + rcx*4]
+            ; cmp edx, DWORD shape.recv_ver as i32
+            ; jne => miss
+            ; mov [rbx + dreg(w)], rax          // reg 0 = this (receiver)
+        );
+        if is_setter {
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(payload)]
+                ; mov [rbx + dreg(w + 1)], rax  // reg 1 = the value
+            );
+        }
+        let first_local = if is_setter { 2 } else { 1 };
+        if first_local < shape.callee_reg_count {
+            dynasm!(ops ; mov rax, QWORD Value::UNDEFINED.bits() as i64);
+            for r in first_local..shape.callee_reg_count {
+                dynasm!(ops ; mov [rbx + dreg(w + r)], rax);
+            }
+        }
+        let ret = emit_mi_body(
+            ops, call_ip, epilogue, after, &shape.body, &shape.supers, &shape.field_slots,
+            &shape.consts, shape.vals_ptr, w,
+        );
+        if !is_setter {
+            match ret {
+                Some(r) => dynasm!(ops
+                    ; mov rax, [rbx + dreg(r)]
+                    ; mov [rbx + dreg(payload)], rax
+                ),
+                None => dynasm!(ops
+                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                    ; mov [rbx + dreg(payload)], rax
+                ),
+            }
+        }
+        dynasm!(ops ; jmp => cont);
+    }
+    dynasm!(ops ; => after);
 }
 
 /// Memory-based region codegen: every op loads operands from the register file
@@ -6891,6 +6979,15 @@ fn compile_region_mem(
                 let via_ic = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
                 let hop = ops.new_dynamic_label();
+                // Stage 5: inline a trivial class GETTER for this `o.v` site as a
+                // per-receiver guard tree (a pure prefix). A hit writes `dst` and
+                // jumps to `cont`; all-miss falls through to the IC probe below
+                // (which routes a real accessor via PROP_VIA_IC → helper).
+                if let Some(gp) = method_plan.get(&ip) {
+                    emit_inline_accessor(
+                        &mut ops, ip, epilogue, leaf_flag_off, gp, obj, dst, false, cont,
+                    );
+                }
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(obj)]          // receiver bits (probe-invariant)
                     ; lea r9, [r14 + off]                 // way 0 of this site
@@ -6982,6 +7079,15 @@ fn compile_region_mem(
                 let probe = ops.new_dynamic_label();
                 let next = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
+                // Stage 5: inline a trivial class SETTER for this `o.v = x` site as
+                // a per-receiver guard tree (a pure prefix). A hit does the baked
+                // store and jumps to `cont`; all-miss falls through to the IC probe
+                // (a real setter → PROP_VIA_IC → helper).
+                if let Some(sp) = method_plan.get(&ip) {
+                    emit_inline_accessor(
+                        &mut ops, ip, epilogue, leaf_flag_off, sp, obj, val, true, cont,
+                    );
+                }
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(obj)]          // receiver bits
                     ; lea r9, [r14 + off]

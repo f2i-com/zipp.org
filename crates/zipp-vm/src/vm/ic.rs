@@ -1137,6 +1137,38 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// Read-only: the trivial class GETTER `fid` for a `GetProp` site whose
+    /// receiver belongs to `class` (Stage 5 accessor inlining), from a filled
+    /// `ClassGetter` IC way. zipp resolves class accessors via the class id
+    /// (prototype-accessor reassignment ignored — verified JIT==NOJIT), so an arm
+    /// baked off this fid + the receiver identity/version guard matches the
+    /// interpreter. `None` if no such way / not a plain user fn.
+    pub(crate) fn ic_class_getter_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
+        let site = self.ic_site(func_id, ip)?;
+        for e in &site.entries[..site.n as usize] {
+            if let IcEntry::ClassGetter { class: c, getter, .. } = *e {
+                if c == class {
+                    return self.ic_plain_fn(getter).map(|(fid, _)| fid);
+                }
+            }
+        }
+        None
+    }
+
+    /// Read-only: the trivial class SETTER `fid` for a `SetProp` site whose
+    /// receiver belongs to `class` (Stage 5), from a filled `ClassSetter` IC way.
+    pub(crate) fn ic_class_setter_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
+        let site = self.ic_site(func_id, ip)?;
+        for e in &site.entries[..site.n as usize] {
+            if let IcEntry::ClassSetter { class: c, setter, .. } = *e {
+                if c == class {
+                    return self.ic_plain_fn(setter).map(|(fid, _)| fid);
+                }
+            }
+        }
+        None
+    }
+
     /// Read-only resolver for a `super.m()` op (Stage 3 method inlining): from the
     /// FILLED `SuperData` IC way at site `(func_id, ip)` whose `home` matches the
     /// live `class_values[home_class_id]` and whose hop chain still validates,

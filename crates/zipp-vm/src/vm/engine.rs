@@ -642,9 +642,22 @@ impl<'p> Vm<'p> {
         let log = std::env::var_os("ZIPP_JITLOG").is_some();
         let caller = self.func(func_id as usize);
         let reg_window = caller.reg_count;
+        // The op at `ip` selects how the receiver's resolved member is inlined:
+        // CallMethod -> class method; GetProp -> trivial class getter; SetProp ->
+        // trivial class setter (Stage 5). All share receiver enumeration + the
+        // guard tree; only the per-shape resolve/body/binding differ.
+        #[derive(Clone, Copy)]
+        enum MiKind {
+            Method,
+            Getter,
+            Setter,
+        }
         for ip in start as usize..=end as usize {
-            let Instr::CallMethod { obj, name, .. } = caller.code[ip] else {
-                continue;
+            let (obj, name, kind) = match caller.code[ip] {
+                Instr::CallMethod { obj, name, .. } => (obj, name, MiKind::Method),
+                Instr::GetProp { obj, name, .. } => (obj, name, MiKind::Getter),
+                Instr::SetProp { obj, name, .. } => (obj, name, MiKind::Setter),
+                _ => continue,
             };
             let key = &caller.string_constants[name as usize];
             // ── enumerate candidate receivers ── the live exemplar at the obj reg
@@ -692,9 +705,16 @@ impl<'p> Vm<'p> {
             let mut shapes = Vec::new();
             let mut win_top = 0u16;
             for recv in cands {
-                if let Some((shape, shape_top)) =
-                    self.build_method_shape(func_id, ip, recv, key, reg_window)
-                {
+                let built = match kind {
+                    MiKind::Method => self.build_method_shape(func_id, ip, recv, key, reg_window),
+                    MiKind::Getter => {
+                        self.build_accessor_shape(func_id, ip, recv, key, reg_window, false)
+                    }
+                    MiKind::Setter => {
+                        self.build_accessor_shape(func_id, ip, recv, key, reg_window, true)
+                    }
+                };
+                if let Some((shape, shape_top)) = built {
                     win_top = win_top.max(shape_top);
                     shapes.push(shape);
                 }
@@ -703,8 +723,13 @@ impl<'p> Vm<'p> {
                 continue;
             }
             if log {
+                let k = match kind {
+                    MiKind::Method => "method",
+                    MiKind::Getter => "getter",
+                    MiKind::Setter => "setter",
+                };
                 eprintln!(
-                    "[method] fn{func_id}@{ip} INLINE arms={} win_top={win_top}",
+                    "[mi] fn{func_id}@{ip} INLINE {k} arms={} win_top={win_top}",
                     shapes.len()
                 );
             }
@@ -765,7 +790,7 @@ impl<'p> Vm<'p> {
         let fid = self.ic_class_method_fid(func_id, ip, recv_class)?;
         let callee = self.func(fid as usize);
         // Outer body admits `super.m()` (Stage 3); super targets do not.
-        let body_len = Self::method_inline_body_ok(callee, true)?;
+        let body_len = Self::method_inline_body_ok(callee, true, false)?;
         let body: Vec<Instr> = callee.code[..body_len].to_vec();
         let field_slots = self.mi_bake_fields(ridx, &body, &callee.string_constants)?;
         let consts = Self::mi_bake_consts(&callee.constants, &body);
@@ -782,7 +807,7 @@ impl<'p> Vm<'p> {
                 let sr = self.ic_super_method_baked(fid, bi, home_class_id, skey)?;
                 let scallee = self.func(sr.fid as usize);
                 // Super target must be inlinable AND have NO nested super (v1).
-                let sblen = Self::method_inline_body_ok(scallee, false)?;
+                let sblen = Self::method_inline_body_ok(scallee, false, false)?;
                 let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
                 let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
                 let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
@@ -829,9 +854,76 @@ impl<'p> Vm<'p> {
         ))
     }
 
-    /// Resolve every `GetProp{obj:0,name}` (own `this.<field>`) in `body` to the
-    /// live receiver's own DATA slot. `None` if any field is missing / an
-    /// accessor / the receiver isn't a plain Object (decline the inline).
+    /// Build one receiver arm for an ACCESSOR (getter/setter) inline (Stage 5):
+    /// validate `recv` is a plain class instance with no own-shadow of `name`,
+    /// resolve its TRIVIAL class getter/setter, bake the per-receiver guards +
+    /// field slot(s). v1: NO super (Tri/Hex super-accessors decline → helper).
+    /// zipp resolves class accessors via the class id (prototype reassignment
+    /// ignored — verified JIT==NOJIT, model limit), so the receiver identity +
+    /// version guard alone matches the interpreter (like methods; no class-version
+    /// guard, and class redefinition keeps the old instance's old accessor).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn build_accessor_shape(
+        &self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        name: &str,
+        reg_window: u16,
+        is_setter: bool,
+    ) -> Option<(crate::codegen::MethodInlineShape, u16)> {
+        use crate::heap::HeapObj;
+        let ridx = recv.heap_index();
+        if !self.ic_obj_ok(ridx) {
+            return None;
+        }
+        let (recv_class, vals_ptr) = match self.heap.get(ridx) {
+            HeapObj::Object(m) if !m.is_ctor => match m.class {
+                Some(c) => (c, m.vals.as_ptr() as u64),
+                None => return None,
+            },
+            _ => return None,
+        };
+        // G3b: an own property named `name` shadows the accessor → decline (the
+        // recv-version guard catches a LATER own-add).
+        if let HeapObj::Object(m) = self.heap.get(ridx) {
+            if m.pos(name).is_some() {
+                return None;
+            }
+        }
+        let fid = if is_setter {
+            self.ic_class_setter_fid(func_id, ip, recv_class)?
+        } else {
+            self.ic_class_getter_fid(func_id, ip, recv_class)?
+        };
+        let callee = self.func(fid as usize);
+        // v1 accessors: NO super (allow_super=false); a setter body ends in a
+        // SetProp{obj:0} store (allow_setprop=is_setter).
+        let body_len = Self::method_inline_body_ok(callee, false, is_setter)?;
+        let body: Vec<Instr> = callee.code[..body_len].to_vec();
+        let field_slots = self.mi_bake_fields(ridx, &body, &callee.string_constants)?;
+        let consts = Self::mi_bake_consts(&callee.constants, &body);
+        let recv_ver = self.heap.version_of(ridx);
+        Some((
+            crate::codegen::MethodInlineShape {
+                recv_bits: recv.bits(),
+                recv_ver,
+                vals_ptr,
+                field_slots,
+                callee_reg_count: callee.reg_count,
+                param_count: callee.param_count,
+                body,
+                consts,
+                supers: rustc_hash::FxHashMap::default(),
+            },
+            reg_window + callee.reg_count, // no super → window is just the body
+        ))
+    }
+
+    /// Resolve every `this.<field>` (GetProp/SetProp `obj:0`) in `body` to the
+    /// live receiver's own DATA slot (a store also requires it be WRITABLE).
+    /// `None` if any field is missing / an accessor / (store) non-writable / the
+    /// receiver isn't a plain Object (decline the inline).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn mi_bake_fields(
         &self,
@@ -845,14 +937,19 @@ impl<'p> Vm<'p> {
         };
         let mut fs = rustc_hash::FxHashMap::default();
         for instr in body {
-            if let Instr::GetProp { obj: 0, name: fname, .. } = *instr {
-                let fkey = &strconsts[fname as usize];
-                match m.pos(fkey) {
-                    Some(s) if !m.attrs[s].accessor => {
-                        fs.insert(fname, s as u32);
-                    }
-                    _ => return None,
+            // GetProp{obj:0} reads need a non-accessor slot; SetProp{obj:0} (a
+            // setter's store) needs a non-accessor WRITABLE slot.
+            let (fname, need_writable) = match *instr {
+                Instr::GetProp { obj: 0, name: fname, .. } => (fname, false),
+                Instr::SetProp { obj: 0, name: fname, .. } => (fname, true),
+                _ => continue,
+            };
+            let fkey = &strconsts[fname as usize];
+            match m.pos(fkey) {
+                Some(s) if !m.attrs[s].accessor && (!need_writable || m.attrs[s].writable) => {
+                    fs.insert(fname, s as u32);
                 }
+                _ => return None,
             }
         }
         Some(fs)
@@ -880,7 +977,11 @@ impl<'p> Vm<'p> {
     /// `None` to decline. `allow_super` admits `SuperMethod` (the outer body); a
     /// super TARGET is scanned with `allow_super=false` (v1 has no nested super).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    fn method_inline_body_ok(p: &crate::bytecode::FuncProto, allow_super: bool) -> Option<usize> {
+    fn method_inline_body_ok(
+        p: &crate::bytecode::FuncProto,
+        allow_super: bool,
+        allow_setprop: bool,
+    ) -> Option<usize> {
         use crate::bytecode::Instr as I;
         if p.is_generator || p.is_async {
             return None;
@@ -896,7 +997,7 @@ impl<'p> Vm<'p> {
         let term = code
             .iter()
             .position(|i| matches!(i, I::Return { .. } | I::ReturnUndefined))?;
-        for instr in &code[..term] {
+        for (ix, instr) in code[..term].iter().enumerate() {
             match *instr {
                 I::LoadInt { .. } | I::LoadBool { .. } | I::Move { .. } => {}
                 I::LoadConst { idx, .. } => match p.constants.get(idx as usize) {
@@ -915,7 +1016,12 @@ impl<'p> Vm<'p> {
                 // `super.m()` admitted only in the outer body (Stage 3); the
                 // resolved super target is re-scanned with allow_super=false.
                 I::SuperMethod { .. } if allow_super => {}
-                // Rejects SuperGet/SuperSet/MathOp/GetIndex/SetProp/calls/branches.
+                // A setter's `this.<field> = val` store (Stage 5): the body's ONLY
+                // effect, so it must be the LAST op before the terminator (no later
+                // op can decline AFTER the store commits — the no-deopt-after-effect
+                // rule). emit_mi_body handles `obj: 0` only.
+                I::SetProp { obj: 0, .. } if allow_setprop && ix + 1 == term => {}
+                // Rejects SuperGet/SuperSet/MathOp/GetIndex/non-last-SetProp/calls.
                 _ => return None,
             }
         }
