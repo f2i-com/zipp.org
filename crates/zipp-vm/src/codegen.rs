@@ -1147,6 +1147,11 @@ fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::Ne { dst, .. }
         | Instr::LoadGlobal { dst, .. }
         | Instr::GetProp { dst, .. }
+        // GetIndex defines `dst`: needed so the regalloc path's dead/hoist passes
+        // treat a pinned-TypedArray element load as a normal def (unboxed-region
+        // epic). Inert elsewhere — the int path never sees GetIndex (region_is_int
+        // rejects it) and an SROA region with a GetIndex isn't field-promotable.
+        | Instr::GetIndex { dst, .. }
         | Instr::GetIndexConcat { dst, .. }
         | Instr::DeleteIndexConcat { dst, .. }
         | Instr::StrConcat { dst, .. }
@@ -2793,7 +2798,7 @@ fn compile_region(
     // The register/SROA paths decline any region containing a Call/CallMethod, so
     // leaf inlining and method inlining (which apply only to those sites) are
     // reachable only via the memory path below.
-    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper) {
+    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan) {
         return Some(f);
     }
     compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan)
@@ -2808,7 +2813,8 @@ fn compile_region_numeric(proto: &FuncProto, start: u32, end: u32, gh: usize) ->
     if let Some(f) = compile_region_int(proto, start, end, gh) {
         return Some((f, true));
     }
-    compile_region_regalloc(proto, start, end, gh).map(|f| (f, false))
+    // SROA-rewritten code has no index ops, so an empty TA plan is correct here.
+    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default()).map(|f| (f, false))
 }
 
 /// Clone `proto` and rewrite the region's heap ops to scratch field-globals so
@@ -3524,7 +3530,12 @@ fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: AbsState) ->
 }
 
 /// Plan register homes for `[start, end]`, or `None` to decline (use mem path).
-fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
+/// `ta_plan` (unboxed-region epic): the pinned-TypedArray plan, threaded so a
+/// later increment can admit a pinned-Float64Array element GetIndex/SetIndex as a
+/// VTy::Num xmm home. Not yet consulted — the blanket index/call/bitwise decline
+/// below still applies (regions with those take the memory path).
+fn plan_region(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> Option<RegionPlan> {
+    let _ = ta_plan; // threaded for the unboxed-region increment; not yet consulted
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
     let mut ty: FxHashMap<u16, VTy> = FxHashMap::default();
@@ -4234,11 +4245,12 @@ fn compile_region_regalloc(
     start: u32,
     end: u32,
     globals_base_helper: usize,
+    ta_plan: &TaPinPlan,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end, None) {
         return None;
     }
-    let plan = plan_region(proto, start, end)?;
+    let plan = plan_region(proto, start, end, ta_plan)?;
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let (s, e) = (start as usize, end as usize);
 
@@ -4613,7 +4625,9 @@ fn compile_region_int(
     if !region_is_int(proto, start, end) {
         return None;
     }
-    let plan = plan_region(proto, start, end)?;
+    // INT path never reaches a GetIndex/SetIndex region (region_is_int rejects them);
+    // pass an empty TA plan so plan_region's index handling stays inert here.
+    let plan = plan_region(proto, start, end, &TaPinPlan::default())?;
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let (s, e) = (start as usize, end as usize);
 
