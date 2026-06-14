@@ -115,7 +115,30 @@ polymorphic-objects 4.74x     sparse-array       8.40x
 
 ## STAGE 1 — Widen unboxed regalloc + leaf/closure inlining
 
-**Summary.** Effort: weeks. Risk: med–high (heavy codegen, all on a branch behind an opt-in flag, default flipped last). Aggregate expected effect: typedarray 3.25x→~1.5–2x, parse 3.4x→~2.3x, markdown 4.6x→~2.8x, plus incidental wins on json/class/polymorphic loops with `|0`/`&` idioms. No new substrate — every task reuses the existing INT (i64-home), REGALLOC (f64-home), leaf-inline, and Tier-C emitters.
+> ⚠️ **MEASURED RE-PRIORITIZATION 2026-06-14 (scout wf_965feab3-10b — section-timed node vs zipp, best-of-3).**
+> The original task order below (INT-arithmetic first: T1.1 bitwise → T1.2 shift → T1.3 int32-TA) is
+> WRONG per the measurements. The real Stage-1 money is **call/dispatch overhead (inlining)**, not INT
+> arithmetic. Revised order:
+> 1. **non-leaf-inline (≈430–500ms summed, the #1 lever)** — generalize the region/Tier-C leaf-inliner
+>    to CFG/array-indexing/charCodeAt bodies (T1.6) so the parse quartet (`tokIs`/`pFactor`/`pTerm`/
+>    `pExpr`) stops paying `setup_call`+`run_loop` per call (parse S4 = 14.2x, the worst ratio in any
+>    bench; inlining `tokIs` alone ≈−54ms). Partially unblocks the json `walk` elephant (~316ms). Root
+>    cause: the per-call interpreter re-entry, codegen.rs ~8246-8252 (Tier-C Call arm) + emit_region_call_ic.
+> 2. **charCodeAt-on-INT (≈850–950ms summed)** — admit charCodeAt + FOLD IN math.imul + bitwise/shift as
+>    co-requisites (they are worthless alone — see below) + a string-concat/index fast path. Hits markdown
+>    renderInline (~395, soft), fnv1a (json/regex/markdown), parse tokenize. Verify renderInline headroom
+>    by A/B (node's 136ms is real string-alloc cost a char loop still pays).
+> 3. **DataView-reads-on-INT (≈228ms, isolated)** — the typedarray dataview ELEPHANT (367ms, 3.7x), the
+>    biggest single typedarray loop. Self-contained, clean A/B. (T1.3 int32-TA is only ~78ms — fold in.)
+> **DEAD/redundant per measurement (do NOT schedule as standalone):** T1.4/norm (reg-reuse, already
+> reverted); math.imul-on-INT alone (≈0, always paired w/ charCodeAt+Div); bitwise/shift-on-INT alone
+> (≈0, co-req only). closure/upvalue-inline (T1.8) headline ~1800ms is ~75% regex SETUP — real workload
+> ~400-500ms at highest cost; schedule only after non-leaf-inline proves the substrate.
+> NEXT ACTION: implement non-leaf-inline, scoped to `tokIs` first, behind ZIPP_JIT_STAGE1, A/B parse.
+> Full ranked data in scout output wf_965feab3-10b. The task descriptions below are kept for their
+> file:line anchors but READ THE REVISED ORDER ABOVE.
+
+**Summary.** Effort: weeks. Risk: med–high (heavy codegen, all on a branch behind an opt-in flag, default flipped last). Aggregate expected effect (REVISED, measured): parse ~3.4x→~2.6–3x (inlining), markdown via charCodeAt+string path, typedarray via DataView-on-INT. The INT-arithmetic-only projection (typedarray→1.5-2x) was optimistic (norm dead + dataview is the real lever). No new substrate — every task reuses the existing INT (i64-home), REGALLOC (f64-home), leaf-inline, and Tier-C emitters.
 
 **Path facts (verified):** dispatch order in `compile_region` (`codegen.rs:888-963`) is SROA → INT → REGALLOC → MEM. INT path (`region_is_int` `codegen.rs:4833`, `compile_region_int` `codegen.rs:4892`) homes i64 in xmm via paddq/psubq, rejects Bitwise at the `_ => return false` (`codegen.rs:4873`). REGALLOC path (`compile_region_regalloc` `codegen.rs:4408`, `plan_region` `codegen.rs:3617`) homes f64, rejects Bitwise/Call/CallMethod at `codegen.rs:3713`, admits only kind-8 (Float64) pinned TA via `pinned_f64` (`codegen.rs:3626-3631`). MEM path (`compile_region_mem` `codegen.rs:6651`) is boxed, handles Bitwise (`codegen.rs:7014`) with reload+rebox every op. Leaf inline: `callee_leaf_ok` (`codegen.rs:2602`, straight-line only), `emit_inline_leaf_call` (`codegen.rs:5857`, reg re-basing `:5946`), `build_leaf_inline_plan` (`engine.rs:524`, upvalue decline `:552`, arrow/sloppy decline `:564`). Tier C: `mem_can_compile` (`codegen.rs:8276`), `compile_proto_mem` (`codegen.rs:8354`, globals via `[r12+slot*8]`).
 
