@@ -3705,13 +3705,30 @@ fn plan_region(
             .get(&ip)
             .map_or(false, |&j| ta_plan.pins[j as usize].kind == pin_kind)
     };
+    // A pinned flat-ASCII STRING access (kind 254): `str.charCodeAt(i)` (CallMethod)
+    // and `str.length` (GetProp), both on the int path only (admit_bitwise). The
+    // receiver is read via the pin snapshot, never the register, so its reg is
+    // excluded from typing/homing exactly like a pinned-element receiver.
+    let pinned_str = |ip: usize| -> bool {
+        admit_bitwise
+            && ta_plan
+                .access
+                .get(&ip)
+                .map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
+    };
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
     {
-        // Candidate receiver regs: the `obj` of every kind-8 pinned index op.
+        // Candidate receiver regs: the `obj` of every pinned index op, and the
+        // `obj` of every pinned-STRING charCodeAt/length access.
         let mut recv: FxHashSet<u16> = FxHashSet::default();
         for (off, instr) in code[s..=e].iter().enumerate() {
             if pinned_elem(s + off) {
                 if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
+                    recv.insert(obj);
+                }
+            }
+            if pinned_str(s + off) {
+                if let Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. } = *instr {
                     recv.insert(obj);
                 }
             }
@@ -3732,9 +3749,19 @@ fn plan_region(
             }
             let mut used_elsewhere: FxHashSet<u16> = FxHashSet::default();
             for (off, instr) in code[s..=e].iter().enumerate() {
+                // The receiver use AT a pinned access is exempt (read via the pin,
+                // not the register). For a pinned-STRING access the obj-use is also
+                // invisible to instr_uses today (CallMethod→vec![]; GetProp→[obj]),
+                // so the CallMethod half is forward-defensive; the GetProp half is
+                // the one that actually exempts a dual-use string receiver.
                 let idx_obj = if pinned_elem(s + off) {
                     match *instr {
                         Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => Some(obj),
+                        _ => None,
+                    }
+                } else if pinned_str(s + off) {
+                    match *instr {
+                        Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. } => Some(obj),
                         _ => None,
                     }
                 } else {
@@ -3747,7 +3774,17 @@ fn plan_region(
                 }
             }
             for &r in &recv {
-                if def_n.get(&r) == Some(&1) && def_lg.contains(&r) && !used_elsewhere.contains(&r) {
+                // Cleanly excludable when EITHER: (a) defined by exactly one
+                // LoadGlobal and used only as a pinned obj (the global-receiver
+                // case); OR (b) a live-in PARAM receiver — ZERO in-region defs and
+                // used only as a pinned obj (`str` in fnv1a is reg1, the param,
+                // read only via the STR pin). `def_n.get(&r).is_none()` (NOT
+                // `!= Some(&1)`) is load-bearing: a multiply-defined reg must NOT
+                // be admitted (it would need a real home).
+                let clean_global =
+                    def_n.get(&r) == Some(&1) && def_lg.contains(&r) && !used_elsewhere.contains(&r);
+                let clean_param = def_n.get(&r).is_none() && !used_elsewhere.contains(&r);
+                if clean_global || clean_param {
                     ta_recv_regs.insert(r);
                 } else {
                     // A receiver register reused for other (numeric) values can't be
@@ -3791,7 +3828,12 @@ fn plan_region(
         // TypedArray access, which the f64 element fast path emits inline (the
         // element is a VTy::Num xmm home; receiver/index handled specially below).
         match *instr {
-            Instr::CallMethod { .. } | Instr::Call { .. } => return None,
+            Instr::Call { .. } => return None,
+            // A pinned-STRING charCodeAt is admitted on the int path (inlines to a
+            // byte load, runs no user code, allocates nothing — the no-call
+            // invariant that keeps BOOL_GPRS alive holds). Any other method call,
+            // or a charCodeAt whose receiver isn't pinned, declines.
+            Instr::CallMethod { .. } if !pinned_str(s + off) => return None,
             // A Bitwise op declines UNLESS the caller (the INT path) admits it: its
             // i64 homes hold sign-extended integers, so the low 32 bits ARE ToInt32
             // and the op runs inline with no reload/rebox. The regalloc/double path
@@ -3826,6 +3868,14 @@ fn plan_region(
             | Instr::Ge { dst, .. }
             | Instr::Eq { dst, .. }
             | Instr::Ne { dst, .. } => (Some(dst), VTy::Bool),
+            // Pinned-STRING charCodeAt → a small int (0..65535); pinned-STRING
+            // length → the snapshot units; both land in a Num i64 home.
+            Instr::CallMethod { dst, .. } if pinned_str(s + off) => (Some(dst), VTy::Num),
+            Instr::GetProp { dst, .. } if pinned_str(s + off) => (Some(dst), VTy::Num),
+            // `Math.imul` → a signed i32 (Num). BLOCKER FIX: without this the carried
+            // fnv1a accumulator (written ONLY by Imul) is never typed → the
+            // used-but-undefined scan declines the whole region.
+            Instr::MathOp { dst, op: MathFn::Imul, argc: 2, .. } => (Some(dst), VTy::Num),
             Instr::Move { dst, .. } => (Some(dst), VTy::Num), // refined below
             _ => (None, VTy::Num),
         };
@@ -3963,6 +4013,36 @@ fn plan_region(
             used.insert(u);
         }
     }
+    // ── pinned-STRING / Math.imul operand liveness ── instr_uses + writes_reg are
+    // BLIND to CallMethod and MathOp operands/dsts (verified: both hit their `_`
+    // arm). So the charCodeAt index reg, the Imul operand regs, and the charCodeAt/
+    // Imul result-def ips are invisible — without this the index/operands would be
+    // classed DEAD (their defining Move/Bitwise/LoadInt DCE'd → the inline op reads
+    // an unmaterialised home / `xh` panics), and the home-reuse allocator would
+    // free them at the wrong ip. Collect them LOCALLY (NOT by widening the shared
+    // instr_uses/writes_reg, which SROA / f64-regalloc / leaf-inline depend on) and
+    // feed both `used` (here) and the live-range touch loop (below). `(ip,reg,def)`.
+    let mut str_imul_touch: Vec<(usize, u16, bool)> = Vec::new();
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        let ip = s + off;
+        match *instr {
+            Instr::CallMethod { dst, arg_base, argc: 1, .. } if pinned_str(ip) => {
+                str_imul_touch.push((ip, arg_base, false)); // index (use)
+                str_imul_touch.push((ip, dst, true)); // charCodeAt result (def)
+            }
+            Instr::MathOp { dst, arg_base, op: MathFn::Imul, argc: 2, .. } => {
+                str_imul_touch.push((ip, arg_base, false));
+                str_imul_touch.push((ip, arg_base + 1, false));
+                str_imul_touch.push((ip, dst, true)); // imul result (def)
+            }
+            _ => {}
+        }
+    }
+    for &(_, r, is_def) in &str_imul_touch {
+        if !is_def {
+            used.insert(r);
+        }
+    }
     // ── dead-code elimination ── a register written in the region but never read
     // (not in `used`) is dead. Every int-region op is a pure value computation, so
     // its defining op produces a result nothing observes and can be skipped — and
@@ -4082,6 +4162,19 @@ fn plan_region(
         }
         if let Some(d) = writes_reg(instr) {
             touch(d);
+        }
+    }
+    // Extend the live ranges for the charCodeAt-index / Imul-operand uses and the
+    // charCodeAt/Imul result defs that instr_uses/writes_reg miss (S5 MAJOR): the
+    // home-reuse allocator (active when n_numeric > POOL) would otherwise free/
+    // reuse these homes at the wrong ip and clobber them. (fnv1a has few regs so
+    // reuse is off and this is inert there, but it is required for a larger
+    // STR-pinned region to be sound.)
+    for &(ip, r, _is_def) in &str_imul_touch {
+        first_ip.entry(r).or_insert(ip);
+        let e = last_ip.entry(r).or_insert(ip);
+        if ip > *e {
+            *e = ip;
         }
     }
     let range = |r: u16| -> (usize, usize) {
@@ -4934,6 +5027,13 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -
     let pinned_i32 = |ip: usize| -> bool {
         ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == 5)
     };
+    // A pinned flat-ASCII STRING (kind 254) access: `str.charCodeAt(i)` (a direct
+    // byte load into an i64 home, OOB→deopt) and `str.length` (read from the pin's
+    // `units`). Both gate on the per-access identity guard. Lets the fnv1a-style
+    // `for (i<str.length) h=imul(h^str.charCodeAt(i),C)` loop run unboxed.
+    let pinned_str = |ip: usize| -> bool {
+        ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
+    };
     for (off, instr) in proto.code[s..=e].iter().enumerate() {
         match *instr {
             Instr::LoadInt { .. }
@@ -4968,6 +5068,14 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -
             // A kind-5 (Int32) pinned element op is admissible; any other index op
             // (non-pinned, or a different element kind) declines to the mem path.
             Instr::GetIndex { .. } | Instr::SetIndex { .. } if pinned_i32(s + off) => {}
+            // Pinned flat-ASCII STRING `str.length` (GetProp) + `str.charCodeAt(i)`
+            // (CallMethod). A non-length GetProp / non-charCodeAt or unpinned call
+            // still hits the catch-all reject below.
+            Instr::GetProp { .. } if pinned_str(s + off) => {}
+            Instr::CallMethod { .. } if pinned_str(s + off) => {}
+            // `Math.imul(a, b)` — a 2-arg int32 multiply (ToInt32 of the low 32 of
+            // the product); the int path emits a native `imul eax, ecx`.
+            Instr::MathOp { op: MathFn::Imul, argc: 2, .. } => {}
             Instr::LoadConst { idx, .. } => {
                 // Only Int-tagged constants; a double const can't be an i64 home.
                 match proto.constants.get(idx as usize) {
@@ -5490,6 +5598,95 @@ fn compile_region_int(
                     B::Ushr => dynasm!(ops ; shr eax, cl), // 32-bit write zero-extends rax
                 }
                 dynasm!(ops ; movq Rx(d), rax);
+            }
+            // ── pinned-STRING charCodeAt ── str.charCodeAt(i) → a DIRECT ASCII byte
+            // load into the dst i64 home (0..255, zero-extended). Guards: receiver
+            // identity + unsigned bounds vs the pin's `units`. An OOB index (i >=
+            // units) — where the interpreter returns NaN, which an i64 home CANNOT
+            // represent — DEOPTs at this ip (flush + resume; the loop is pure so the
+            // re-run is sound). Index read from the i64 home (already integral).
+            Instr::CallMethod { dst, arg_base, .. }
+                if ta_plan
+                    .access
+                    .get(&ip)
+                    .map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND) =>
+            {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let d = xh(&plan, dst);
+                let kx = xh(&plan, arg_base);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rax, [rsp + off]               // receiver identity vs snapshot
+                    ; jne => deopt
+                    ; movq rcx, Rx(kx)                   // index (i64 home, integral)
+                    ; cmp rcx, [rsp + off + 16]          // unsigned: i < units (catches <0/OOB)
+                    ; jae => deopt                       // OOB → deopt (interp yields NaN)
+                    ; mov rdx, [rsp + off + 8]           // pinned bytes base
+                    ; movzx eax, BYTE [rdx + rcx]        // ASCII code unit, zero-extend 0..255
+                    ; movq Rx(d), rax
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32         // resume AT this ip
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
+            // ── pinned-STRING length ── str.length → the snapshot `units` (==
+            // str.length for the flat-ASCII pin). Identity-guarded; a miss deopts.
+            Instr::GetProp { dst, .. }
+                if ta_plan
+                    .access
+                    .get(&ip)
+                    .map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND) =>
+            {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let d = xh(&plan, dst);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rax, [rsp + off]               // receiver identity vs snapshot
+                    ; jne => deopt
+                    ; mov rax, [rsp + off + 16]          // units == str.length
+                    ; movq Rx(d), rax
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
+            // ── Math.imul(a, b) ── ToInt32 of the low 32 bits of the product. The
+            // i64 homes' low 32 bits ARE ToInt32 of the operands, so `imul eax,ecx`
+            // gives the low 32 of the product (signedness-agnostic); interpreted
+            // signed it IS Math.imul → sign-extend to the home (fits i32, no guard).
+            // MUST NOT route through the generic i64 Mul arm (it i53-guards a 64-bit
+            // product and would box e.g. imul(0xFFFF,0xFFFF) as +4294836225 not -131071).
+            Instr::MathOp { dst, arg_base, op: MathFn::Imul, argc: 2, .. } => {
+                let d = xh(&plan, dst);
+                let (ax, bx) = (xh(&plan, arg_base), xh(&plan, arg_base + 1));
+                copy_clobber(&mut lc, d);
+                dynasm!(ops
+                    ; movq rax, Rx(ax)
+                    ; movq rcx, Rx(bx)
+                    ; imul eax, ecx
+                    ; movsxd rax, eax
+                    ; movq Rx(d), rax
+                );
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);

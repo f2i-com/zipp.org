@@ -124,10 +124,19 @@ polymorphic-objects 4.74x     sparse-array       8.40x
 >    `pExpr`) stops paying `setup_call`+`run_loop` per call (parse S4 = 14.2x, the worst ratio in any
 >    bench; inlining `tokIs` alone ≈−54ms). Partially unblocks the json `walk` elephant (~316ms). Root
 >    cause: the per-call interpreter re-entry, codegen.rs ~8246-8252 (Tier-C Call arm) + emit_region_call_ic.
-> 2. **charCodeAt-on-INT (≈850–950ms summed)** — admit charCodeAt + FOLD IN math.imul + bitwise/shift as
->    co-requisites (they are worthless alone — see below) + a string-concat/index fast path. Hits markdown
->    renderInline (~395, soft), fnv1a (json/regex/markdown), parse tokenize. Verify renderInline headroom
->    by A/B (node's 136ms is real string-alloc cost a char loop still pays).
+> 2. **charCodeAt-on-INT** — ✅ DONE 2026-06-15 (fnv1a loop; adversarial design wf_05accf99-fb9). Admitted
+>    pinned-STRING `str.charCodeAt(i)` (direct ASCII byte-load into i64 home, OOB→deopt), pinned-STRING
+>    `str.length` (GetProp resolved via the STR-pin `units`), and 2-arg `Math.imul` (native `imul eax,ecx;
+>    movsxd`) into the INT region — reusing the landed bitwise/Int32-on-INT substrate + the STR_PIN snapshot.
+>    Key wrinkles the design caught: the guard is GetProp(length) NOT LenOf; `str` is a PARAM dual-use
+>    receiver (charCodeAt + length) → generalized the receiver-exclusion to a live-in (`def_n==None`) param
+>    pin; MathOp/CallMethod are invisible to instr_uses/writes_reg → local extra-uses/defs liveness (else the
+>    accumulator is untyped-declined / operands DCE'd / `xh` panics). **MEASURED: json −77ms (4.0x→3.7x),
+>    markdown −81ms (5.1x→4.8x), regex −225ms (12.5x→12.0x; replHash=fnv1a is central there)** ≈ −383ms total.
+>    Full gate REG=0 jit+nojit, cargo 30, ALL_CORRECT; OOB-charCodeAt + non-ASCII-pin-miss + imul-wrap edge
+>    cases correct across jit/nojit/node. parse unchanged (its fnv `mix(kinds[ti])` has dense-array GetIndex →
+>    stays MEM). Note: a non-ASCII string fnv-hashed in a hot loop deopts every iter (slow but correct +
+>    bounded; ASCII benches never hit it).
 > 3. **DataView-reads-on-INT (≈228ms, isolated)** — the typedarray dataview ELEPHANT (367ms, 3.7x), the
 >    biggest single typedarray loop. Self-contained, clean A/B. (T1.3 int32-TA is only ~78ms — fold in.)
 > **DEAD/redundant per measurement (do NOT schedule as standalone):** T1.4/norm (reg-reuse, already

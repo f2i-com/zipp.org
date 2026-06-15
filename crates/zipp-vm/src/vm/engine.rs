@@ -445,6 +445,18 @@ impl<'p> Vm<'p> {
                 {
                     (obj, Recv::Str)
                 }
+                // `str.length` on the SAME receiver coalesces onto the charCodeAt
+                // STR pin (the snapshot's `units` IS the length), so a `for (i <
+                // str.length) str.charCodeAt(i)` loop guard resolves via the pin
+                // instead of a GetProp IC — letting the whole loop run unboxed.
+                Instr::GetProp { obj, name, .. }
+                    if proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| k == "length") =>
+                {
+                    (obj, Recv::Str)
+                }
                 _ => continue,
             };
             let writer = (s..aip).rev().find(|&wip| writes(&proto.code[wip], obj));
