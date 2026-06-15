@@ -266,6 +266,11 @@ impl<'p> Vm<'p> {
                 .bits();
             let heap_helper_addrs = self.jit_heap_helper_addrs();
             let const_strs = self.jit_build_const_strs(fid);
+            let leaf_plan = if std::env::var_os("ZIPP_NO_TIERC_LEAF").is_none() {
+                self.build_leaf_inline_plan(fid, 0, (proto_ref.code.len() - 1) as u32)
+            } else {
+                rustc_hash::FxHashMap::default()
+            };
             self.jit.compile(
                 fid,
                 proto_ref,
@@ -274,6 +279,7 @@ impl<'p> Vm<'p> {
                 jit_globals_base as usize,
                 heap_helper_addrs,
                 &const_strs,
+                &leaf_plan,
             );
         }
         let entry = self.jit.get(fid)?.entry();

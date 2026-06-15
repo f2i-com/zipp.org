@@ -733,6 +733,9 @@ impl Jit {
         globals_base_helper: usize,
         heap_helpers: HeapHelperAddrs,
         const_strs: &FxHashMap<u32, u64>,
+        // Tier-C leaf-inline plan for this whole function (built by the caller from
+        // the live ICs; empty = no inlining, e.g. when ZIPP_NO_TIERC_LEAF is set).
+        leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -762,10 +765,13 @@ impl Jit {
             let ic_base_idx = self.reserve_ic_sites(n_sites);
             let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
             if let Some(f) =
-                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs)
+                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs, leaf_plan)
             {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
-                    eprintln!("[jit] Tier C fn{func_id} compiled (whole-function mem path)");
+                    eprintln!(
+                        "[jit] Tier C fn{func_id} compiled (whole-function mem path, leaf_inlines={})",
+                        leaf_plan.len()
+                    );
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
@@ -8710,6 +8716,7 @@ fn compile_proto_mem(
     globals_base_helper: usize,
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
+    leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -8721,21 +8728,36 @@ fn compile_proto_mem(
     let labels: Vec<_> = (0..=n).map(|_| ops.new_dynamic_label()).collect();
     // Shared epilogue: every Return / bail records [rsi] then jumps here.
     let epilogue = ops.new_dynamic_label();
-    // 32B shadow + 8B 5th-arg slot = 40 ⇒ rsp 16-aligned after the 6 pushes.
-    let frame: i32 = 40;
+    // ── Q4 leaf-call inlining (Tier C) ── inline a monomorphic plain-leaf callee
+    // at a Call site over a scratch window carved above the whole-function frame.
+    let do_leaf = !leaf_plan.is_empty();
+    let max_scratch_top: u64 = leaf_plan
+        .values()
+        .map(|p| p.reg_window as u64 + p.callee_reg_count as u64)
+        .max()
+        .unwrap_or(0);
+    // 32B shadow + 8B 5th-arg slot = 40; + a 16B leaf-headroom-flag slot when
+    // inlining (keeps the frame's 16-alignment after the 6 pushes).
+    let frame: i32 = 40 + if do_leaf { 16 } else { 0 };
+    // Byte offset of the headroom flag (1 = the carved window fits → inline; 0 =
+    // fall back to the per-call helper). MUST equal the prologue store offset.
+    let leaf_flag_off = frame - 8;
 
-    // r13 (heap versions base) and r14 (JIT IC table base) are READ only by the
-    // GetProp inline-cache probe. Pin + post-call/alloc refetch them iff this
-    // function has a GetProp. INVARIANT (the refetch obligation): r13 moves on
-    // EVERY heap allocation (versions Vec push), r14 on a nested region compile
-    // (during user code); so when `has_prop`, EVERY op that allocates or runs
-    // user code (Call, Add-concat, TypeOf, ForInKeys, ForInLive, GetProp-slow)
-    // MUST `emit_refetch_pinned` after committing its result.
+    // r13 (heap versions base) and r14 (JIT IC table base) are READ by the GetProp
+    // inline-cache probe AND the leaf-inline identity version guard. Pin + post-
+    // call/alloc refetch them iff this function has a GetProp OR inlines a leaf.
+    // INVARIANT (the refetch obligation): r13 moves on EVERY heap allocation
+    // (versions Vec push), r14 on a nested region compile (during user code); so
+    // EVERY op that allocates or runs user code (Call, Add-concat, TypeOf,
+    // ForInKeys, ForInLive, GetProp-slow) MUST `emit_refetch_pinned` after
+    // committing its result. fn11/12/13 have GetIndex-but-no-GetProp (has_prop=
+    // false), so folding do_leaf in is REQUIRED — else the leaf version guard
+    // (`[r13+rcx*4]`) reads an unpinned r13.
     let has_prop = proto
         .code
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
-    let refetch_pinned = has_prop;
+    let refetch_pinned = has_prop || do_leaf;
     let refetch = refetch_pinned.then_some((heap.versions_base, heap.ic_base));
 
     // ── prologue ── save callee-saved regs, stash inputs, pin r12 = globals base.
@@ -8760,7 +8782,8 @@ fn compile_proto_mem(
     );
     if refetch_pinned {
         // Pin the heap version-array base (r13) and the IC table base (r14) —
-        // copied from the region prologue. Read by the GetProp IC probe.
+        // copied from the region prologue. Read by the GetProp IC probe and the
+        // leaf-inline identity version guard.
         dynasm!(ops
             ; mov rcx, rdi
             ; mov rax, QWORD heap.versions_base as i64
@@ -8770,6 +8793,20 @@ fn compile_proto_mem(
             ; mov rax, QWORD heap.ic_base as i64
             ; call rax
             ; mov r14, rax
+        );
+    }
+    // ── Q4 leaf-inline headroom check (once per entry) ── `jit_regs_fits` → 1 if
+    // every carved scratch window lies inside the pinned register file. Each
+    // inlined Call site reads the flag and falls back to the helper on 0. rbx is
+    // callee-saved; rcx/rdx/r8 are volatile scratch here.
+    if do_leaf {
+        dynasm!(ops
+            ; mov rcx, rdi                            // vm
+            ; mov rdx, rbx                            // caller window base
+            ; mov r8, QWORD max_scratch_top as i64    // highest scratch slot used
+            ; mov rax, QWORD heap.regs_fits as i64
+            ; call rax
+            ; mov [rsp + leaf_flag_off], rax          // 1 = inline ok, 0 = helper
         );
     }
 
@@ -9180,23 +9217,53 @@ fn compile_proto_mem(
                 // General `f(args…)` (`this = undefined`) via the interpreter-IC
                 // call helper. Packing: r9 = (callee<<16) | arg_base; argc on the
                 // stack. The callee runs user code + allocates + can trigger a
-                // nested compile ⇒ refetch r13/r14 after, when has_prop (else the
-                // next GetProp probe reads a moved table → silent miscompute).
+                // nested compile ⇒ refetch r13/r14 after, when refetch_pinned (else
+                // the next GetProp probe / leaf version guard reads a moved table).
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args = ((callee as u64) << 16) | arg_base as u64;
-                emit_region_call_ic(
-                    &mut ops,
-                    ip,
-                    bail,
-                    epilogue,
-                    heap.call_ic,
-                    packed_fip,
-                    packed_args,
-                    argc,
-                    dst,
-                    refetch,
-                    None,
-                );
+                // Q4 leaf-call inlining: a monomorphic plain-leaf callee is inlined
+                // with an identity guard; a guard miss / tight headroom falls through
+                // to the SAME helper (a pure prefix). Tier C has no TA pins → no
+                // ta_refetch.
+                if let Some(lp) = leaf_plan.get(&ip) {
+                    emit_inline_leaf_call(
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        lp,
+                        callee,
+                        arg_base,
+                        argc,
+                        dst,
+                        heap.math_unary,
+                        heap.math_two,
+                        // v2 body-op helpers (order matches the signature).
+                        heap.get_index,
+                        heap.char_code_at,
+                        heap.strict_eq,
+                        heap.truthy,
+                        heap.call_ic,
+                        packed_fip,
+                        packed_args,
+                        refetch,
+                        None,
+                    );
+                } else {
+                    emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        heap.call_ic,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        refetch,
+                        None,
+                    );
+                }
             }
             Instr::Return { src } => {
                 // Whole-function return: NO_BAIL + result Value (UNLIKE the region,
