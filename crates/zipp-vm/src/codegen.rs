@@ -2583,9 +2583,16 @@ fn region_can_compile(
     true
 }
 
-/// Q4 v1 leaf-call inlining eligibility: is `callee`'s body a PLAIN LEAF the
-/// region emitter can inline straight-line over a scratch window? Returns the
-/// body ops to inline, or `None` to decline (the Call keeps the per-call helper).
+/// Max callee register count an inlined leaf may use (its body runs over a
+/// scratch window carved above the caller frame; `jit_regs_fits` validates the
+/// real window at host entry, so this compile-time cap only bounds the window).
+const LEAF_MAX_REGS: u16 = 32;
+
+/// Q4 leaf-call inlining eligibility: is `callee`'s body a leaf the region/Tier-C
+/// emitter can inline over a scratch window? Returns the body ops to inline, or
+/// `None` to decline (the Call keeps the per-call helper). v2 admits FORWARD
+/// in-body branches (a converging diamond like `a && b && c`), dense-array reads,
+/// `charCodeAt`, and comparisons — not just straight-line bodies.
 ///
 /// Requirements (all NON-NEGOTIABLE for soundness — see `LeafInlinePlan`):
 /// * Not a generator/async; reg_count ≤ 16; no rest/`arguments`; simple_params
@@ -2611,23 +2618,35 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
     if !callee.simple_params {
         return None;
     }
-    if callee.reg_count > 16 {
+    // The inlined body runs over a scratch window carved above the caller frame;
+    // `jit_regs_fits` validates `reg_window + callee_reg_count` at host entry (a
+    // tight window → fallback), so a generous compile-time cap is sound. 32 covers
+    // a CFG-ish leaf like `tokIs` (22 regs) plus headroom.
+    if callee.reg_count > LEAF_MAX_REGS {
         return None;
     }
     let full = &callee.code;
     if full.is_empty() {
         return None;
     }
-    // The straight-line body ends at the FIRST `Return`/`ReturnUndefined` (the
-    // body must have no branch before it, so that return is the unique exit; any
-    // op after it is dead — the compiler routinely appends a `ReturnUndefined`
-    // after an explicit `Return`). Truncate the body there.
+    // The body ends at the FIRST `Return`/`ReturnUndefined`: it is the UNIQUE exit
+    // (forward in-body branches may skip ahead, but all converge here), and any op
+    // after it is dead (the compiler appends a `ReturnUndefined` after an explicit
+    // `Return`). Truncate there; `term == code.len()-1` is the single terminator.
     let term = full
         .iter()
         .position(|i| matches!(i, Instr::Return { .. } | Instr::ReturnUndefined))?;
     let code: Vec<Instr> = full[..=term].to_vec();
-    // Every op except the terminator must be a non-control-flow value/global op.
-    // `seen_effect` enforces the side-effect-freedom-before-deopt ordering rule.
+    // Every op except the terminator must be in the inline emitter's subset.
+    // `seen_effect` enforces the side-effect-freedom-before-deopt ordering rule:
+    // a deopt-capable op that bails re-runs the WHOLE call from the call ip, so no
+    // such op may follow a committed effect (`StoreGlobal*`). The newly admitted
+    // GetIndex / charCodeAt / Eq/Ne/Lt/Le/Gt/Ge are ALSO deopt-capable (they bail
+    // via a helper deopt sentinel / a non-numeric operand), so they join that rule
+    // — which keeps an effectful leaf like `mix` (a trailing `h = …`) sound while
+    // admitting a pure CFG leaf like `tokIs`. Internal jumps must be FORWARD and
+    // stay within the body (a back-edge = a loop, breaking deopt-idempotency and
+    // the no-safepoint invariant).
     let mut seen_effect = false;
     for (i, instr) in code.iter().enumerate() {
         let is_last = i == code.len() - 1;
@@ -2639,6 +2658,8 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
             _ if is_last => return None, // unreachable: last op is the terminator
             // ── deopt-capable value ops (may bail mid-body) ── forbidden AFTER
             // an effect (a bail would re-run the call and re-apply the effect).
+            // The comparisons + dense-array read bail the same way (non-numeric
+            // operand / a deopt sentinel from `jit_get_index`), so they join here.
             Instr::Add { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
@@ -2646,8 +2667,43 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
             | Instr::Mod { .. }
             | Instr::AddInt { .. }
             | Instr::Neg { .. }
-            | Instr::Bitwise { .. } => {
+            | Instr::Bitwise { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::GetIndex { .. } => {
                 if seen_effect {
+                    return None;
+                }
+            }
+            // `str.charCodeAt(i)` only — a read-only, alloc-free, no-user-code 1-arg
+            // builtin (the inline emitter routes it through the `jit_char_code_at`
+            // helper). Any other method call declines. Also deopt-capable.
+            Instr::CallMethod { name, argc, .. } => {
+                if argc != 1
+                    || callee.string_constants.get(name as usize).map(|s| s.as_str())
+                        != Some("charCodeAt")
+                {
+                    return None;
+                }
+                if seen_effect {
+                    return None;
+                }
+            }
+            // ── forward, in-body control flow ── a `Jump`/`JumpIf*` whose target
+            // is strictly AHEAD of it and within the body (`> i && <= term`). A
+            // backward edge would make the inlined body a loop over the caller
+            // scratch window, breaking deopt-idempotency and the no-safepoint
+            // invariant; an out-of-body target would escape the inline. Branches
+            // do not bail, so the `seen_effect` rule does not gate them.
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. } => {
+                let t = target as usize;
+                if t <= i || t > term {
                     return None;
                 }
             }
@@ -6044,7 +6100,16 @@ fn emit_inline_leaf_call(
     dst: u16,
     math_unary: usize,
     math_two: usize,
-    // Fallback emission (the unchanged per-call helper).
+    // Helpers for the v2 body ops (DISTINCT names — do NOT confuse with `helper`
+    // below, which is the fallback call_ic; a literal copy of a region template's
+    // `QWORD helper` would emit `call call_ic` with the wrong ABI). Param order is
+    // load-bearing (all usize → a mis-order is a silent miscompile): keep it in
+    // sync with BOTH call sites.
+    gidx_helper: usize, // jit_get_index   (dense-array / string element read)
+    cc_helper: usize,   // jit_char_code_at
+    strict_eq: usize,   // jit_strict_eq   (Eq/Ne slow path)
+    truthy: usize,      // jit_truthy      (JumpIf* non-Int/Bool condition)
+    // Fallback emission (the unchanged per-call helper = call_ic).
     helper: usize,
     packed_fip: u64,
     packed_args: u64,
@@ -6122,8 +6187,16 @@ fn emit_inline_leaf_call(
     // `w + r`. Each op that can bail uses a FRESH bail label whose block resumes
     // the interpreter at the CALL IP (so the whole call re-runs cleanly).
     let rg = |r: u16| w + r; // scratch-window register mapping
+    // One label per body ip (plus a fall-off sink at `body.len()`), so FORWARD
+    // in-body branches (`callee_leaf_ok` admits only `> i && <= term`) re-base to
+    // `blabels[target]`. Body index == callee ip (the body is the contiguous
+    // truncated prefix `full[..=term]`). Control converges on the single trailing
+    // Return; the sink is never reached for a well-formed body (no target == len).
+    let blabels: Vec<dynasmrt::DynamicLabel> =
+        (0..=plan.body.len()).map(|_| ops.new_dynamic_label()).collect();
     let mut ret_reg: Option<u16> = None;
-    for instr in &plan.body {
+    for (bi, instr) in plan.body.iter().enumerate() {
+        dynasm!(ops ; => blabels[bi]);
         match *instr {
             Instr::LoadInt { dst: d, val } => {
                 let boxed = INT_TAG | (val as u32 as u64);
@@ -6323,6 +6396,100 @@ fn emit_inline_leaf_call(
                 }
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }
+            // ── forward in-body control flow (re-based to the body labels) ──
+            Instr::Jump { target } => {
+                dynasm!(ops ; jmp => blabels[target as usize]);
+            }
+            Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
+                // Int/Bool condition tests its payload; anything else asks the
+                // read-only `jit_truthy` helper (alloc-free, no user code → no
+                // refetch). Mirrors the region JumpIf arm.
+                let if_false = matches!(*instr, Instr::JumpIfFalse { .. });
+                let t = blabels[target as usize];
+                let testit = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(rg(cond))]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, INT_TAG_HI as i32
+                    ; je => testit
+                    ; cmp r10d, (INT_TAG_HI + 1) as i32
+                    ; je => testit
+                    ; mov rcx, rdi
+                    ; mov rdx, rax
+                    ; mov rax, QWORD truthy as i64
+                    ; call rax
+                    ; => testit
+                    ; test eax, eax
+                );
+                if if_false {
+                    dynasm!(ops ; jz => t);
+                } else {
+                    dynasm!(ops ; jnz => t);
+                }
+            }
+            // ── dense-array / string element read `a[i]` ── generic win64 helper
+            // (read-only, no alloc, no user code → no r13/r14/TA refetch; matches
+            // the region GetIndex generic tail). Deopt sentinel → re-run the call.
+            Instr::GetIndex { dst: d, obj, key } => {
+                let bail = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(rg(obj))]
+                    ; mov r8, [rbx + dreg(rg(key))]
+                    ; mov rax, QWORD gidx_helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+                emit_region_bail(ops, call_ip, bail, epilogue);
+            }
+            // ── str.charCodeAt(i) ── `callee_leaf_ok` admitted only this 1-arg
+            // method. Uses `cc_helper` (jit_char_code_at) — NEVER the fallback
+            // `helper` (call_ic). Read-only, no alloc → no refetch.
+            Instr::CallMethod { dst: d, obj, arg_base: ab, .. } => {
+                let bail = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(rg(obj))]
+                    ; mov r8, [rbx + dreg(rg(ab))]
+                    ; mov rax, QWORD cc_helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+                emit_region_bail(ops, call_ip, bail, epilogue);
+            }
+            // ── comparisons ── region_poly_eq / dcmp both emit their own bail
+            // block internally (record CALL ip → epilogue).
+            Instr::Eq { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                region_poly_eq(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), false, strict_eq);
+            }
+            Instr::Ne { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                region_poly_eq(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), true, strict_eq);
+            }
+            Instr::Lt { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Lt);
+            }
+            Instr::Le { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Le);
+            }
+            Instr::Gt { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Gt);
+            }
+            Instr::Ge { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                dcmp(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), Cmp::Ge);
+            }
             Instr::Return { src } => {
                 ret_reg = Some(rg(src));
             }
@@ -6333,6 +6500,9 @@ fn emit_inline_leaf_call(
             ref other => unreachable!("inline leaf body op not admitted: {other:?}"),
         }
     }
+    // Fall-off sink: a target == body.len() (none for a well-formed single-return
+    // body) lands here and falls through to the return-store.
+    dynasm!(ops ; => blabels[plan.body.len()]);
     // ── store the return value into the caller's `dst` ──
     match ret_reg {
         Some(r) => dynasm!(ops
@@ -8286,6 +8456,11 @@ fn compile_region_mem(
                         dst,
                         heap.math_unary,
                         heap.math_two,
+                        // v2 body-op helpers (order matches the signature).
+                        heap.get_index,
+                        heap.char_code_at,
+                        heap.strict_eq,
+                        heap.truthy,
                         heap.call_ic,
                         packed_fip,
                         packed_args,
