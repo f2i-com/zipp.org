@@ -292,6 +292,7 @@ impl<'p> Vm<'p> {
             let mut nested = rustc_hash::FxHashMap::default();
             let mut extra_regs = 0u16;
             let mut nested_upvals: rustc_hash::FxHashMap<u16, u64> = rustc_hash::FxHashMap::default();
+            let mut nested_consts: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
             let body = match callee_leaf_ok(callee) {
                 Some(b) => b,
                 None => {
@@ -302,10 +303,11 @@ impl<'p> Vm<'p> {
                         continue;
                     };
                     match self.splice_nested_leaf(fid, callee, &outer, call_at) {
-                        Some((flat, guard, inner_regs, inner_upvals)) => {
+                        Some((flat, guard, inner_regs, inner_upvals, inner_consts)) => {
                             nested.insert(call_at, guard);
                             extra_regs = inner_regs;
                             nested_upvals = inner_upvals;
+                            nested_consts = inner_consts;
                             if log {
                                 eprintln!(
                                     "[leaf] fn{func_id}@{ip} callee fn{fid} NESTED-INLINE \
@@ -346,6 +348,7 @@ impl<'p> Vm<'p> {
                 );
             }
             upvals.extend(nested_upvals);
+            consts.extend(nested_consts);
             plan.insert(
                 ip,
                 LeafInlinePlan {
@@ -511,7 +514,13 @@ impl<'p> Vm<'p> {
         outer: &crate::bytecode::FuncProto,
         outer_body: &[Instr],
         call_at: usize,
-    ) -> Option<(Vec<Instr>, crate::codegen::NestedGuard, u16, rustc_hash::FxHashMap<u16, u64>)> {
+    ) -> Option<(
+        Vec<Instr>,
+        crate::codegen::NestedGuard,
+        u16,
+        rustc_hash::FxHashMap<u16, u64>,
+        rustc_hash::FxHashMap<u32, u64>,
+    )> {
         use crate::codegen::{callee_leaf_ok, NestedGuard};
         if !outer.upvalues.is_empty() {
             return None;
@@ -545,9 +554,25 @@ impl<'p> Vm<'p> {
             Instr::ReturnUndefined => None,
             _ => return None,
         };
+        // The inner body's `LoadConst` indices address the INNER constant pool, so
+        // bias them past the outer pool and bake the inner values under the biased
+        // keys. Without this the emitter looked the index up in the WRONG pool,
+        // got nothing, materialised zero bits and bailed — which is why a body
+        // ending in `/ 4294967296` (a double constant) deopted 64 times and
+        // evicted, while the same body ending in `/ 4` (a small int, emitted as
+        // `LoadInt`) inlined cleanly.
+        let const_off = outer.constants.len() as u32;
+        let mut consts = rustc_hash::FxHashMap::default();
         let mut flat: Vec<Instr> = outer_body[..=call_at].to_vec(); // keep the Call as the guard marker
         for instr in &inner_body[..inner_body.len() - 1] {
-            flat.push(shift_leaf_regs(instr, off)?);
+            if let Instr::LoadConst { idx, .. } = *instr {
+                let c = inner.constants.get(idx as usize)?;
+                if !c.is_number() {
+                    return None;
+                }
+                consts.insert(idx + const_off, c.bits());
+            }
+            flat.push(shift_leaf_regs(instr, off, const_off)?);
         }
         // The inner result becomes the wrapper's call destination.
         flat.push(match ret_src {
@@ -578,7 +603,7 @@ impl<'p> Vm<'p> {
             }
         }
         let guard = NestedGuard { callee_reg, bits, ver };
-        Some((flat, guard, inner.reg_count, upvals))
+        Some((flat, guard, inner.reg_count, upvals, consts))
     }
 
     /// The last `GetIndex{dst:obj_reg, obj:arr}` in `code[start..ip]` (the array a
@@ -902,15 +927,19 @@ impl<'p> Vm<'p> {
 /// that is a decline, never a silent mis-shift, because a missed operand would be
 /// a wrong-register read.
 ///
-/// Non-register fields (`idx`, `imm`, `name`, `argc`, `op`, `val`) are copied
-/// through: an upvalue index, a global slot and a constant index are not
-/// registers. `arg_base` IS a register (the base of a contiguous window).
+/// Non-register fields are copied through, EXCEPT a `LoadConst` pool index,
+/// which is biased by `const_off`: the spliced body's constants come from the
+/// INNER function's pool, and the plan's single `consts` map is keyed by index,
+/// so the two pools have to be given disjoint key ranges. Getting this wrong is
+/// silent — the emitter falls back to zero bits, the op bails, and the call just
+/// re-runs in the interpreter. `arg_base` IS a register (a window base).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn shift_leaf_regs(i: &Instr, off: u16) -> Option<Instr> {
+fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
     let s = |r: u16| r + off;
+    let c = |i: u32| i + const_off;
     Some(match *i {
         Instr::LoadInt { dst, val } => Instr::LoadInt { dst: s(dst), val },
-        Instr::LoadConst { dst, idx } => Instr::LoadConst { dst: s(dst), idx },
+        Instr::LoadConst { dst, idx } => Instr::LoadConst { dst: s(dst), idx: c(idx) },
         Instr::LoadBool { dst, val } => Instr::LoadBool { dst: s(dst), val },
         Instr::LoadUndefined { dst } => Instr::LoadUndefined { dst: s(dst) },
         Instr::Move { dst, src } => Instr::Move { dst: s(dst), src: s(src) },
