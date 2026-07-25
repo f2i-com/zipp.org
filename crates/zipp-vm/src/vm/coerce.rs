@@ -14,7 +14,30 @@ use crate::value::Value;
 /// access content immediately) — the same reasoning as V8's ConsString
 /// minimum length (13). `s += part` loops building LONG strings still get
 /// O(1) rope appends (their combined length exceeds this almost immediately).
-const SMALL_CONCAT_FLAT_UNITS: usize = 24;
+///
+/// MEASURED 2026-07-26 — this was 24, which is far too eager to build ropes.
+/// Real string-building code assembles a line from ~20 pieces and then READS it
+/// (stores it, matches it, joins it), so the rope is flattened almost
+/// immediately and every node allocated on the way was waste. Worse, a
+/// `str + int` past the limit loses its fused fast path and pays TWO allocations
+/// per part (a heap string for the number, then the Cons).
+///
+/// Sweeping the threshold against the real suite and an adversarial case:
+///
+/// ```text
+/// units    markdown  regex-log-scan   many-2KB-strings (adversarial)
+///    24       857ms          2610ms                       80ms
+///   128       760ms          2210ms                       83ms
+///   256       767ms          1965ms                       85ms
+///   512       676ms          1980ms                      112ms
+///  2048       613ms          1992ms                      646ms
+/// ```
+///
+/// 256 takes essentially the whole regex-log-scan win (-25%) for a 6% cost on
+/// the adversarial shape — building many strings up to the threshold one small
+/// piece at a time, which is O(n²) copying and the reason this cannot simply be
+/// raised without bound. Above 512 that term dominates and the curve inverts.
+const SMALL_CONCAT_FLAT_UNITS: usize = 256;
 
 /// Decimal ASCII form of an i32 written into a stack buffer: the digits live
 /// in `buf[start..]` of the returned `(buf, start)`. No allocation — the
