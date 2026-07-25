@@ -2354,56 +2354,16 @@ mod tests {
     }
 
     #[test]
-    fn cold_branch_side_exits_match_the_interpreter() {
-        // B9: an op with no INT-path arm makes its whole BASIC BLOCK a side exit
-        // instead of demoting the region to the boxed tier. The block must
-        // produce identical results whether it is never taken, sometimes taken,
-        // or always taken, and the homes flushed at the exit must be visible to
-        // the interpreter that resumes there.
-        //
-        // The feature is opt-in (see `cold_exit_enabled`), so turn it on or this
-        // test silently exercises the mem path instead. Setting it globally is
-        // fine under the parallel test harness: it only lets the JIT ATTEMPT an
-        // extra tier, and every other test asserts JIT == interpreter anyway.
-        std::env::set_var("ZIPP_JIT_COLD_EXIT", "1");
-
-        // Never taken — the case the optimisation exists for.
+    fn fused_concat_key_in_a_branchy_loop() {
+        // Regression for the bug that killed the B9 cold-exit tier: admitting
+        // `GetIndexConcat` let regions containing it reach that tier for the
+        // first time, and it computed `s` as 0 instead of 3050. Cold exits are
+        // gone; this pins the shape that exposed them — a fused computed key
+        // read inside a `||` (so the loop body has branches) after a
+        // delete/re-add cycle.
         assert_jit_matches(
-            "let n=0,s=''; for(let i=0;i<20000;i++){ if(i<0){ s+='x'; } n=n+i; } \
-             console.log(n, s.length)",
-            &["199990000 0"],
-        );
-        // Sometimes taken.
-        assert_jit_matches(
-            "let n=0,s=''; for(let i=0;i<20000;i++){ if(i%1000===7){ s+='x'; n+=100; } n=n+i; } \
-             console.log(n, s.length)",
-            &["199992000 20"],
-        );
-        // ALWAYS taken: correct, just no faster than the mem path.
-        assert_jit_matches(
-            "let n=0,s=''; for(let i=0;i<5000;i++){ s+='y'; n=n+i; } console.log(n, s.length)",
-            &["12497500 5000"],
-        );
-        // The cold block WRITES a value the hot path reads afterwards — this is
-        // what makes the flush-at-exit mandatory.
-        assert_jit_matches(
-            "let acc=0,k=0; for(let i=0;i<20000;i++){ if(i===1234){ k=parseInt('77',10); } \
-             acc=acc+k; } console.log(acc, k)",
-            &["1444982 77"],
-        );
-        // Cold block with an early `continue` (exit target is not the join).
-        assert_jit_matches(
-            "let acc=0,s=''; for(let i=0;i<20000;i++){ if((i&1023)===0){ s+=String(i&7); continue; } \
-             acc=(acc+i)|0; } console.log(acc, s.length)",
-            &["199795440 20"],
-        );
-        // The markdown/escapeHtml shape: a hot charCodeAt scan whose rare branch
-        // slices — the region this whole change was built for.
-        assert_jit_matches(
-            "const src='the quick brown fox & the lazy dog '; let cnt=0,o=''; \
-             for(let i=0;i<30000;i++){ const c=src.charCodeAt(i%src.length); \
-             if(c===38){ o+=src.substring(0,1)+'&amp;'; cnt++; } } console.log(cnt, o.length)",
-            &["857 5142"],
+            "let o={},s=0;              for(let i=0;i<50;i++) o['k'+i]=i*2;              for(let i=0;i<50;i+=2) delete o['k'+i];              for(let i=0;i<50;i+=2) o['k'+i]=i*3;              for(let i=0;i<50;i++) s+=(o['k'+i]||0);              console.log(s)",
+            &["3050"],
         );
     }
 

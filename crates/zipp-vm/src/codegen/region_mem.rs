@@ -545,6 +545,28 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::GetIndexConcat { dst, obj, name, key } => {
+                // `obj["name" + i]`. The helper answers only the own-DATA hit on
+                // a plain object with an Int key — no allocation (the key goes
+                // into a reused scratch buffer) and no user code — and deopts on
+                // a miss so the interpreter runs the real computed read
+                // (prototype chain, accessors, arrays). `packed` keeps the call
+                // to four register args.
+                let packed: u64 = ((heap.func_id as u64) << 32) | (name as u64);
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(obj)]         // receiver bits
+                    ; mov r8, QWORD packed as i64        // (func_id << 32) | name
+                    ; mov r9, [rbx + dreg(key)]          // key bits
+                    ; mov rax, QWORD heap.get_index_concat as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // miss / exotic → interpreter
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::ToNum { dst, a } => {
                 // `+x`. A number passes through UNCHANGED — note the raw `mov`
                 // rather than a round trip through xmm, which would re-tag an

@@ -1333,6 +1333,59 @@ pub(crate) extern "win64" fn jit_cell_get(vm: *mut core::ffi::c_void, cell_bits:
     v.bits()
 }
 
+/// Win64 helper: `obj["name" + i]` (`GetIndexConcat`), the fused computed-key
+/// read. Handles ONLY the non-observable fast path — an Int key, a plain-Object
+/// receiver that is not the global object or a namespace, and an own DATA hit —
+/// which is exactly the shape `Vm::get_index_concat` short-circuits, and which
+/// allocates nothing (the key is built into a reused scratch buffer) and runs no
+/// user code. Anything else returns `SELF_CALL_DEOPT` so the interpreter
+/// materialises the key and does the full computed read.
+///
+/// `packed = (func_id << 32) | name_idx`, keeping this to four register args.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_get_index_concat(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    packed: u64,
+    key_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let obj = Value::from_bits(obj_bits);
+    let key = Value::from_bits(key_bits);
+    if !key.is_int() || !obj.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let oidx = obj.heap_index();
+    if (oidx == vm.global_this && vm.global_this != 0)
+        || (!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
+        || (!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
+        || !matches!(vm.heap.get(oidx), HeapObj::Object(_))
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let func_id = (packed >> 32) as u32;
+    let name = packed as u32;
+    let mut scratch = std::mem::take(&mut vm.idx_key_scratch);
+    vm.build_concat_key(&mut scratch, name, key.as_int(), func_id);
+    let hit = match vm.heap.get(oidx) {
+        HeapObj::Object(m) => match m.pos(&scratch) {
+            Some(i) if !m.attrs[i].accessor && !m.vals[i].is_uninitialized() => Some(m.vals[i]),
+            _ => None,
+        },
+        _ => None,
+    };
+    vm.idx_key_scratch = scratch;
+    match hit {
+        Some(v) => v.bits(),
+        // A miss must take the interpreter's slow path (prototype chain,
+        // accessors, arrays) — it is not "undefined".
+        None => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper: write a captured cell (`CellSet`). A cell is one heap slot and
 /// the store is unconditional — no TDZ check (that is `CellSetChecked`), no
 /// allocation, no user code, no GC safe point — so it needs no pinned-pointer

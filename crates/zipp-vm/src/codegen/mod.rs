@@ -410,6 +410,9 @@ pub struct HeapHelperAddrs {
     /// store: no TDZ check, no alloc, no user code, so no pinned refetch.
     pub cell_set: usize,
     pub upval_set: usize,
+    /// Helper for `GetIndexConcat` (`obj["name" + i]`) — the own-DATA fast path
+    /// only; a miss or an exotic receiver deopts to the interpreter.
+    pub get_index_concat: usize,
     /// Helper for `ForInLive` (per-iteration for-in liveness). Delegates to the
     /// shared `Vm::forin_live`, so it matches the interpreter byte-for-byte.
     /// May allocate transiently (key re-derivation) — GC-guarded internally.
@@ -469,6 +472,7 @@ impl HeapHelperAddrs {
             cell_get: self.cell_get,
             cell_set: self.cell_set,
             upval_set: self.upval_set,
+            get_index_concat: self.get_index_concat,
             upval_get: self.upval_get,
             forin_live: self.forin_live,
             has_property: self.has_property,
@@ -488,28 +492,6 @@ impl HeapHelperAddrs {
 /// prior tiers only. (`ZIPP_NOJIT` disables the whole JIT upstream of here.) Read
 /// once per `Jit::compile` call (compiles are rare relative to execution).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-/// B9 cold-branch side exits — OPT-IN via `ZIPP_JIT_COLD_EXIT`.
-///
-/// Correctness is not the reason it is off: the full gate passes with it
-/// enabled (test262 byte-identical across all 96,029 executions on BOTH tiers,
-/// 250 unit tests, bench ALL_CORRECT, GC-stress clean, plus targeted
-/// never-taken / sometimes-taken / always-taken / writes-read-after /
-/// early-continue cases). It is off because it does not MEASURE on
-/// bench/real: isolated, it takes a `charCodeAt` loop with a never-taken
-/// `substring` branch from 8.0 ns/iteration to 1.7 ns — exact parity with V8 —
-/// but the suite's geomean moves 3.31x -> 3.28x, inside a noise band where
-/// sparse-array alone swings 3.43x-5.90x between runs.
-///
-/// The benches simply do not contain enough of the shape: markdown-render,
-/// whose escapeHtml/renderInline are textbook cases, compiles ZERO INT-cold
-/// regions because its loops decline for unrelated reasons. Fixing those is the
-/// follow-up that would make this pay; until then, enabling it by default would
-/// be shipping new codegen on an unmeasured promise, which is how this project
-/// already lost two epics.
-fn cold_exit_enabled() -> bool {
-    std::env::var_os("ZIPP_JIT_COLD_EXIT").is_some()
-}
-
 fn fnjit_mem_enabled() -> bool {
     std::env::var_os("ZIPP_NO_FNJIT_MEM").is_none()
 }
@@ -991,24 +973,6 @@ impl Jit {
             {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
-                }
-                self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, field_plan: None });
-                return;
-            }
-        }
-        // B9: the INT path again, this time compiling ops it has no arm for as
-        // SIDE EXITS instead of declining. Placed AFTER regalloc so no region
-        // that compiles today changes tier — this only catches regions that
-        // would otherwise fall to the boxed mem path, which is where a hot
-        // `charCodeAt` loop lands merely because a branch it never takes does a
-        // `substring` or a `+=` (measured 1.7 ns/iteration -> 8.0 ns).
-        if cold_exit_enabled() && !self.region_int_blacklist.contains(&key) {
-            if let Some(code) = compile_region_int_maybe_cold(
-                proto, start, end, globals_base_helper, ta_plan, heap_helpers.ta_snapshot, true,
-            ) {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
-                    eprintln!("[jit] INT-cold region fn{func_id} [{start},{end}] compiled");
                 }
                 self.regions
                     .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, field_plan: None });

@@ -432,51 +432,43 @@ async and generator functions alike) — the async gap is entirely the promise
 runtime, and the claim to the contrary in earlier notes was wrong. Rewriting
 map-set-heavy's for-of as `.next()` loops made it SLOWER (1.33s vs 1.09s).
 
-### B9 — Cold-branch side exits### B9 — Cold-branch side exits — IMPLEMENTED, opt-in, does NOT measure
+### B9 — Cold-branch side exits — BUILT, THEN REMOVED (wrong answers)
 
-`ZIPP_JIT_COLD_EXIT=1`. Correct and gate-green; off by default because it does
-not move `bench/real`.
+Do not rebuild this as it was. It shipped opt-in behind `ZIPP_JIT_COLD_EXIT`
+after a full green gate — test262 byte-identical across all 96,029 executions on
+both tiers, GC stress, and targeted never-taken / sometimes-taken /
+always-taken / cold-block-writes-a-value-read-after / early-`continue` cases —
+and it was still **wrong**.
 
-**What it does.** One op with no INT-path arm used to disqualify a whole region
-from the integer tier, dropping it to the boxed mem path. Now the containing
-BASIC BLOCK becomes a side exit (`mov [rsi], ip ; jmp flush_exit`) and the rest
-of the region still compiles. Isolated, 3M iterations:
+Admitting `GetIndexConcat` later let regions containing it reach the tier for the
+first time (previously `region_can_compile` rejected them outright, so they never
+got there). With cold exits on, this returns `s = 0`:
 
-| loop | before | with B9 | node |
-|---|---|---|---|
-| `charCodeAt` + integer compares | 1.7 ns/it | 1.7 ns/it | 1.7 ns |
-| + a NEVER-TAKEN `substring` branch | 8.0 ns/it | **1.7 ns/it** | 1.7 ns |
-| + a NEVER-TAKEN `+= "&"` branch | 5.3 ns/it | **1.7 ns/it** | 1.7 ns |
+    let o={},s=0;
+    for(let i=0;i<50;i++) o['k'+i]=i*2;
+    for(let i=0;i<50;i+=2) delete o['k'+i];
+    for(let i=0;i<50;i+=2) o['k'+i]=i*3;
+    for(let i=0;i<50;i++) s+=(o['k'+i]||0);   // 3050 everywhere else
 
-Exact parity with V8 on the shape, a 4.7x local win.
+Verified as B9's fault, not the new op's: the same program is correct at HEAD
+with cold exits on, and correct with the new op and cold exits off. The idea —
+one op in a cold block should not demote a region — remains sound and is worth
+0 to 4.7x locally on a `charCodeAt` scan whose rare branch slices. But
+block-granular exits over a register plan built by SKIPPING those blocks is not
+the right mechanism: the plan and the emitted code disagree about what the cold
+block does, and the disagreement is invisible until a region shape nobody tested
+reaches it.
 
-**Why it is off.** The suite geomean moved 3.31x → 3.28x — inside the noise
-band (sparse-array alone swung 3.43x–5.90x across runs of the same binary).
-`markdown-render`, whose `escapeHtml`/`renderInline` are textbook instances of
-the shape, compiles **zero** INT-cold regions: its loops decline for unrelated
-reasons. Shipping new codegen on an unmeasured promise is exactly how this
-project lost the tombstone-delete and hole-`in` epics.
+Retained as a regression test (`fused_concat_key_in_a_branchy_loop`), so the
+shape that exposed it is pinned even though the feature is gone.
 
-**The follow-up that would make it pay** is finding why the bench loops still
-decline — run `ZIPP_JIT_COLD_EXIT=1 ZIPP_JITLOG=1` over `bench/real` and chase
-the `INT-cold decline` lines (markdown 1, parse 5, json 4, sparse 4). Each is
-either a cold header/back-edge block or a `plan_region` type rejection that the
-cold set did not clear.
-
-**Granularity note for whoever picks this up:** the cold unit must be the basic
-BLOCK, not the instruction. Excluding only the unadmitted op is unsound —
-`s += "x"` is `LoadGlobal s; StrConcat; StoreGlobal s`, and `LoadGlobal` IS
-admitted, so `s` still gets an i64 home and the entry guard rejects the string
-every iteration. That bug was hit and fixed during implementation.
-
-Soundness argument, for review: every i64 home is loaded from the register file
-at region entry and only updated by ops that actually execute natively. An op
-in a cold block never executes natively, so no home can hold a value it did not
-produce, and `flush_exit` writes every home back before the interpreter resumes
-at that exact ip. Verified by test262 byte-identical on both tiers (96,029
-executions), GC stress, and `cold_branch_side_exits_match_the_interpreter`
-(never-taken / sometimes-taken / always-taken / cold-writes-value-read-after /
-early-`continue` / the escapeHtml shape).
+**Lesson worth more than the feature.** The gate passed. 96,029 test262
+executions, both tiers, GC stress and six hand-written shapes did not catch a
+wrong answer in a JIT tier, because none of them produced the region shape that
+triggers it. For codegen that changes TIER SELECTION, passing the gate is not
+evidence of correctness — only of not having found the counterexample yet. That
+is also the argument for keeping such work opt-in until something independent
+forces new shapes through it, which is exactly what happened here.
 
 ### B8 — Regex engine (the single largest item)
 

@@ -758,7 +758,7 @@ impl<'p> Vm<'p> {
     /// fused-key fast path's no-alloc key builder. The int's decimal form is
     /// pure ASCII, so the result is well-formed UTF-8.
     #[inline]
-    fn build_concat_key(&self, buf: &mut String, name: u32, key: i32, func_id: u32) {
+    pub(crate) fn build_concat_key(&self, buf: &mut String, name: u32, key: i32, func_id: u32) {
         buf.clear();
         buf.push_str(&self.func(func_id as usize).string_constants[name as usize]);
         let (digits, start) = crate::vm::coerce::fmt_i32_buf(key);

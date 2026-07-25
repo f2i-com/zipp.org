@@ -5807,6 +5807,7 @@ impl<'p> Vm<'p> {
             cell_get: jit_cell_get as usize,
             cell_set: jit_cell_set as usize,
             upval_set: jit_upval_set as usize,
+            get_index_concat: jit_get_index_concat as usize,
             upval_get: jit_upval_get as usize,
             forin_live: jit_forin_live as usize,
             has_property: jit_has_property as usize,

@@ -164,6 +164,10 @@ pub(crate) fn region_can_compile(
             // coercion and bails. It was simply absent from this list, which
             // declined sparse-array's for-in `keyFold` region outright.
             Instr::ToNum { .. } => {}
+            // `obj["name" + i]` — the fused computed key. MEM path via
+            // `jit_get_index_concat`, which handles only the own-DATA hit (no
+            // alloc, no user code) and deopts otherwise.
+            Instr::GetIndexConcat { .. } => {}
             // `ForInLive` — the per-iteration for-in liveness check — MEM path via
             // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
             // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
@@ -532,6 +536,7 @@ pub(crate) struct HeapHelpers {
     pub(crate) upval_get: usize,
     pub(crate) cell_set: usize,
     pub(crate) upval_set: usize,
+    pub(crate) get_index_concat: usize,
     /// `ForInLive` helper (obj bits, key bits → Bool Value bits).
     pub(crate) forin_live: usize,
     /// `HasProp` (`in`) helper (key bits, obj bits → Bool Value bits / deopt).
