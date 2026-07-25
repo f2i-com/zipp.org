@@ -218,6 +218,22 @@ pub struct LeafInlinePlan {
     /// Resolved numeric-constant bits the body's `LoadConst` ops reference,
     /// keyed by the constant index (the callee's own constant pool index).
     pub consts: FxHashMap<u32, u64>,
+    /// Baked CELL for each upvalue index the body READS, as Value bits.
+    ///
+    /// An inlined body has no frame of its own, so the interpreter's
+    /// `jit_upval_get` — which resolves the running closure from the TOP frame —
+    /// would read the CALLER's closure. It cannot be used here. The identity
+    /// guard above pins the exact closure instance, and a closure's upvalue cells
+    /// are fixed for its lifetime, so each cell is resolved once at plan time and
+    /// read through `jit_cell_get` at runtime (the cell's CONTENTS still change,
+    /// which is why it is a load and not a constant). Empty for a plain function
+    /// or a closure with no captures.
+    pub upvals: FxHashMap<u16, u64>,
+    /// `jit_cell_get` / `jit_cell_set` — carried in the plan rather than as more
+    /// positional parameters to `emit_inline_leaf_call`, whose argument order is
+    /// documented as load-bearing.
+    pub cell_get: usize,
+    pub cell_set: usize,
 }
 
 impl LeafInlinePlan {

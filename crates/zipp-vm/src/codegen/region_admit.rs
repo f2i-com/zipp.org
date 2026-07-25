@@ -305,6 +305,21 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
     // admitting a pure CFG leaf like `tokIs`. Internal jumps must be FORWARD and
     // stay within the body (a back-edge = a loop, breaking deopt-idempotency and
     // the no-safepoint invariant).
+    // An upvalue WRITE is admitted only in a BRANCH-FREE body, because the inline
+    // emitter buffers it: `UpvalSet` emits nothing, later `UpvalGet`s of the same
+    // index read the buffered register, and the cell is written ONCE after the
+    // last op. That keeps a mid-body bail idempotent (nothing is committed yet,
+    // so re-running the whole call is correct) — which is what lets a body like
+    // mulberry32's `a = (a + K)|0; …imul…` inline at all, since its write comes
+    // FIRST and is followed by deopt-capable arithmetic. Buffering is only valid
+    // if the write is unconditional, hence no branches. Nothing can observe the
+    // cell mid-body: the subset admits no calls.
+    let branchy = code.iter().any(|i| {
+        matches!(
+            i,
+            Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }
+        )
+    });
     let mut seen_effect = false;
     for (i, instr) in code.iter().enumerate() {
         let is_last = i == code.len() - 1;
@@ -332,8 +347,23 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
             | Instr::Le { .. }
             | Instr::Gt { .. }
             | Instr::Ge { .. }
-            | Instr::GetIndex { .. } => {
+            | Instr::GetIndex { .. }
+            // An upvalue READ. Deopt-capable (a TDZ cell returns the deopt
+            // sentinel), so it joins the effect-ordering rule. Reads only: an
+            // upvalue WRITE is an effect that a mid-body bail would re-apply
+            // when the call re-runs, and every remaining op after it would have
+            // to be bail-free — `_ => return None` below still rejects
+            // `UpvalSet`/`CellSet`/`StoreUpvalDyn`.
+            | Instr::UpvalGet { .. } => {
                 if seen_effect {
+                    return None;
+                }
+            }
+            // Buffered upvalue write — see `branchy` above. Deliberately does NOT
+            // set `seen_effect`: nothing is committed to the cell until after the
+            // body's last op, so deopt-capable ops may still follow it.
+            Instr::UpvalSet { .. } => {
+                if branchy || seen_effect {
                     return None;
                 }
             }

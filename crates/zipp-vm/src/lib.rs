@@ -492,6 +492,57 @@ mod tests {
         assert_jit_matches(&src, &["199999 399998 599997"]);
     }
 
+    // ── inlining closures that capture variables ─────────────────────────────
+    // Leaf inlining used to decline any callee that captured upvalues, so every
+    // closure-over-a-variable paid a full call. Reads are baked to their cell;
+    // writes are BUFFERED in a scratch register and committed once after the
+    // body, which is what keeps a mid-body bail idempotent.
+
+    #[test]
+    fn inline_closure_reads_upvalue() {
+        assert_jit_matches(
+            "function mk(){ var u=3; return function(x){ return (x*u)|0; }; } \
+             var c=mk(), s=0; for (var i=0;i<200;i++) s=(s+c(i))|0; console.log(s)",
+            &["59700"],
+        );
+    }
+
+    #[test]
+    fn inline_closure_write_is_visible_outside() {
+        // The buffered write must be committed to the real cell, not just held in
+        // the scratch window — a second closure over the same binding reads it.
+        assert_jit_matches(
+            "function mk(){ var v=0; return [function(){ v=(v+2)|0; return v; }, function(){ return v; }]; } \
+             var p=mk(), a=p[0], b=p[1], s=0; for (var i=0;i<200;i++){ a(); s=(s+b())|0; } console.log(s)",
+            &["40200"],
+        );
+    }
+
+    #[test]
+    fn inline_closure_write_before_deopt_capable_ops() {
+        // mulberry32: the upvalue write comes FIRST and is followed by Math.imul
+        // and shifts, all of which can bail. Buffering is what makes this legal.
+        assert_jit_matches(
+            "function mk(seed){ var a=seed|0; return function(){ a=(a+0x6D2B79F5)|0; \
+             var t=Math.imul(a^(a>>>15),1|a); t=(t+Math.imul(t^(t>>>7),61|t))^t; \
+             return ((t^(t>>>14))>>>0)/4294967296; }; } \
+             var r=mk(0x10C5CAB), s=0; for (var i=0;i<5000;i++) s+=r(); console.log(s.toFixed(6))",
+            &["2483.497902"],
+        );
+    }
+
+    #[test]
+    fn inline_closure_bail_after_write_is_not_double_applied() {
+        // A late non-numeric argument bails the inlined body AFTER the upvalue
+        // write. Because the write is still buffered, re-running the call from the
+        // call ip applies the increment exactly once.
+        assert_jit_matches(
+            "function mk(){ var n=0; return function(x){ n=(n+1)|0; return (x*2)|0; }; } \
+             var c=mk(), s=0; for (var i=0;i<200;i++){ s=(s+c(i<150 ? i : '7'))|0; } console.log(s)",
+            &["23050"],
+        );
+    }
+
     // ── numeric edge cases the register tiers used to get wrong ──────────────
 
     #[test]

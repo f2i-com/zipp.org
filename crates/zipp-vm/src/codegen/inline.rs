@@ -193,6 +193,9 @@ pub(crate) fn emit_inline_leaf_call(
     let blabels: Vec<dynasmrt::DynamicLabel> =
         (0..=plan.body.len()).map(|_| ops.new_dynamic_label()).collect();
     let mut ret_reg: Option<u16> = None;
+    // Pending captured-variable writes: upvalue index → the scratch register
+    // holding the value to commit after the body. See the `UpvalSet` arm.
+    let mut upval_buf: FxHashMap<u16, u16> = FxHashMap::default();
     for (bi, instr) in plan.body.iter().enumerate() {
         dynasm!(ops ; => blabels[bi]);
         match *instr {
@@ -464,6 +467,46 @@ pub(crate) fn emit_inline_leaf_call(
                 );
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }
+            // ── captured-variable read ── the cell was resolved at plan time from
+            // the closure the identity guard pins, so it is an immediate here; the
+            // VALUE still has to be loaded, since the cell is mutable. Cannot use
+            // `jit_upval_get`: that walks to the running closure from the TOP
+            // frame, and an inlined body does not have one. A TDZ cell returns the
+            // deopt sentinel, so the interpreter re-runs the call and throws.
+            Instr::UpvalGet { dst: d, idx } => {
+                // Once this body has written the upvalue, the live value is in the
+                // buffer register, NOT the cell (the cell is written after the last
+                // op). Read whichever is current.
+                if let Some(&buf) = upval_buf.get(&idx) {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(buf)]
+                        ; mov [rbx + dreg(rg(d))], rax
+                    );
+                } else {
+                    let bail = ops.new_dynamic_label();
+                    let cell_bits = plan.upvals.get(&idx).copied().unwrap_or(0);
+                    dynasm!(ops
+                        ; mov rcx, rdi                          // vm
+                        ; mov rdx, QWORD cell_bits as i64       // baked cell Value
+                        ; mov rax, QWORD plan.cell_get as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(rg(d))], rax
+                    );
+                    emit_region_bail(ops, call_ip, bail, epilogue);
+                }
+            }
+            // ── captured-variable write ── BUFFERED: emit nothing here, record
+            // which scratch register holds the pending value, and commit the cell
+            // once after the body. Until then every bail is idempotent, so the
+            // deopt-capable arithmetic that follows the write in a PRNG-style body
+            // is safe. `callee_leaf_ok` restricted this to branch-free bodies, so
+            // the write is unconditional and one commit per index is enough.
+            Instr::UpvalSet { idx, src } => {
+                upval_buf.insert(idx, rg(src));
+            }
             // ── comparisons ── region_poly_eq / dcmp both emit their own bail
             // block internally (record CALL ip → epilogue).
             Instr::Eq { dst: d, a, b } => {
@@ -503,6 +546,27 @@ pub(crate) fn emit_inline_leaf_call(
     // Fall-off sink: a target == body.len() (none for a well-formed single-return
     // body) lands here and falls through to the return-store.
     dynasm!(ops ; => blabels[plan.body.len()]);
+    // ── commit buffered captured-variable writes ──
+    // Deliberately the LAST thing the inlined body does. Every bail above this
+    // point leaves the cell untouched, so the interpreter re-running the whole
+    // call from the call ip reproduces the same state — which is what makes it
+    // sound to inline a body whose upvalue write precedes deopt-capable ops.
+    // Bodies that reach here are branch-free (`callee_leaf_ok`), so each write is
+    // unconditional. `jit_cell_set` cannot fail: a cell is one heap slot.
+    if !upval_buf.is_empty() {
+        let mut pending: Vec<(u16, u16)> = upval_buf.iter().map(|(&i, &r)| (i, r)).collect();
+        pending.sort_unstable(); // deterministic emission order
+        for (idx, src) in pending {
+            let cell_bits = plan.upvals.get(&idx).copied().unwrap_or(0);
+            dynasm!(ops
+                ; mov rcx, rdi                          // vm
+                ; mov rdx, QWORD cell_bits as i64       // baked cell Value
+                ; mov r8, [rbx + dreg(src)]             // value bits
+                ; mov rax, QWORD plan.cell_set as i64
+                ; call rax
+            );
+        }
+    }
     // ── store the return value into the caller's `dst` ──
     match ret_reg {
         Some(r) => dynasm!(ops

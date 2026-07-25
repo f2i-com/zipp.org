@@ -230,15 +230,39 @@ impl<'p> Vm<'p> {
                 }
                 continue;
             };
-            // v1: only callees with NO captured upvalues (the body has no
-            // Upval/Cell ops anyway, but a closure value with upvalues whose
-            // body somehow reads them would be unsound — exclude by construction).
             let callee = self.func(fid as usize);
+            // A closure that captures upvalues is inlinable as long as its body
+            // only READS them (`callee_leaf_ok` admits `UpvalGet` and nothing
+            // else upvalue-shaped). Each cell is resolved HERE, from the exact
+            // closure the identity guard pins — the inlined body has no frame, so
+            // the frame-walking `jit_upval_get` would read the caller's closure.
+            //
+            // Before this, every captured-variable closure fell back to a real
+            // call: `function mk(){ var u=3; return function(x){ return (x*u)|0; }; }`
+            // ran 88ms/3M against 14ms for the identical closure with no capture,
+            // which is the same 14ms a plain inlined leaf costs. The gate, not
+            // closure dispatch, was the whole 6.3x.
+            let mut upvals = rustc_hash::FxHashMap::default();
             if closure != NO_CLOSURE && !callee.upvalues.is_empty() {
-                if log {
-                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (closure w/ upvalues)");
+                let cidx = Value::from_bits(callee_bits).heap_index();
+                let n_up = match self.heap.get(cidx) {
+                    crate::heap::HeapObj::Closure { upvalues, .. } => upvalues.len(),
+                    // Not actually a closure object — the guard would fail anyway.
+                    _ => 0,
+                };
+                if n_up < callee.upvalues.len() {
+                    if log {
+                        eprintln!(
+                            "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (closure has {n_up} \
+                             upvalues, body expects {})",
+                            callee.upvalues.len()
+                        );
+                    }
+                    continue;
                 }
-                continue;
+                for i in 0..callee.upvalues.len() as u16 {
+                    upvals.insert(i, Value::heap(self.closure_upvalue(cidx, i)).bits());
+                }
             }
             // The inline emitter forces `this = undefined` for the callee window.
             // That is ONLY correct for a STRICT, NON-ARROW leaf (its `this` is
@@ -294,6 +318,9 @@ impl<'p> Vm<'p> {
                     param_count: callee.param_count,
                     body,
                     consts,
+                    upvals,
+                    cell_get: crate::vm::helpers_misc::jit_cell_get as usize,
+                    cell_set: crate::vm::helpers_misc::jit_cell_set as usize,
                 },
             );
         }
