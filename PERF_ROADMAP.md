@@ -815,11 +815,36 @@ needs `PropKey` threaded from `SetProp { name: idx }` / the object-literal path
 through to `ObjMap::define`, which is a different (and smaller) change than
 retyping every key site.
 
-Second-order, and independent of the above: fold `keys`/`vals`/`attrs` into one
-`Vec<Prop>` to turn three allocations into one (worth ~35ns of the ~58ns
-first-key cost), and give `NewObject` a key-count hint so the literal path
-pre-sizes instead of regrowing (the 6-key case pays ~36ns/key at the tail, well
-above the ~17ns steady-state, which is regrowth).
+**Inline storage does not work either — MEASURED.** If the cost is the three
+`Vec`s allocating, `SmallVec<[T; N]>` should remove it, and in isolation it does:
+
+```text
+                  before   inline(4)
+1-key literal       82ms       44ms
+3-key literal      106ms       75ms
+new Pt(x,y)        288ms      221ms
+```
+
+But the SUITE regressed hard, 2.82x -> 3.05x — json-large 545->610ms,
+markdown-render 730->863, map-set-heavy 790->999, async-promise-chain 752->910.
+The reason is structural: `HeapObj::Object(ObjMap)` stores the map INLINE, so
+`HeapObj`'s size is the max over all variants and four inline slots grew EVERY
+heap slot — strings, arrays, numbers, all of them. Cache footprint dominates the
+allocation saved. Dropping to two slots still regressed. Reverted.
+
+**So the real prerequisite is boxing: `HeapObj::Object(Box<ObjMap>)`.** With the
+map behind a pointer, its size stops inflating every other heap object, and
+inline property storage then costs one allocation TOTAL for a small object
+(the box) instead of one slot plus three Vec allocations. That is the change to
+make first; inline storage on top of it should then deliver the isolated numbers
+above. It touches every `HeapObj::Object(m)` pattern match, so it wants its own
+commit and a full gate.
+
+Also still open, and independent: give `NewObject` a key-count hint so the
+literal path pre-sizes instead of regrowing (6 keys pays ~36ns/key at the tail
+against ~17ns steady-state), and skip the `pos()` existence probe when building
+an object literal, whose keys the compiler already knows are distinct — that
+probe makes literal construction O(n^2) in key count.
 
 Second-order once that lands: fold `keys`/`vals`/`attrs` into one `Vec<Prop>` to
 turn three allocations into one, and give `NewObject` a key-count hint so the
