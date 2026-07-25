@@ -59,6 +59,16 @@ const NO_CLOSURE: u32 = u32::MAX;
 /// process possibly building several arrays) comfortably bounded.
 pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 
+/// Largest length an ITERATION METHOD will materialize eagerly as a dense
+/// result (`Array.prototype.map`). Distinct from `MAX_DENSE_ARRAY_LEN`, which
+/// is the point at which *storage* spills to the sparse overlay: an array can
+/// legitimately be far longer than that (`new Array(1 << 24)` works), and such
+/// an array must still `map` correctly rather than silently returning a
+/// truncated result. 2^24 elements ≈ 134 MB — the largest array the engine
+/// already builds eagerly — beyond which `map` reports a RangeError instead of
+/// attempting a multi-gigabyte allocation the host cannot satisfy.
+pub(crate) const MAX_EAGER_ITER_RESULT: usize = 1 << 24;
+
 /// An active `try` handler within a frame.
 /// One activation record.
 struct Frame {

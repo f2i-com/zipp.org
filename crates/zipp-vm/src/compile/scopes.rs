@@ -24,6 +24,7 @@ impl<'a> FnCompiler<'a> {
             scopes: vec![Vec::new()],
             next_reg: 0,
             max_reg: 0,
+            reg_overflow: false,
             rest_reg: None,
             arguments_reg: None,
             uses_arguments: false,
@@ -157,11 +158,27 @@ impl<'a> FnCompiler<'a> {
     }
 
     // ── register allocation ──
+    /// Allocate the next frame register.
+    ///
+    /// A frame is addressed by `u16` (`Reg`, `FuncProto::reg_count`), so the
+    /// space is finite. On exhaustion this SATURATES and records
+    /// `reg_overflow`; it must never wrap, because wrapping hands out registers
+    /// that are already live and silently corrupts the frame. The flag is
+    /// checked wherever a `FuncProto` is finalised, which turns the condition
+    /// into a clean compile error instead of a wrong answer at runtime.
     pub(crate) fn alloc_reg(&mut self) -> Reg {
         let r = self.next_reg;
-        self.next_reg += 1;
-        if self.next_reg > self.max_reg {
-            self.max_reg = self.next_reg;
+        match self.next_reg.checked_add(1) {
+            Some(n) => {
+                self.next_reg = n;
+                if n > self.max_reg {
+                    self.max_reg = n;
+                }
+            }
+            None => {
+                self.reg_overflow = true;
+                self.max_reg = Reg::MAX;
+            }
         }
         r
     }
@@ -169,6 +186,20 @@ impl<'a> FnCompiler<'a> {
     /// bump the high-water mark but let it be reused by resetting next_reg.
     pub(crate) fn temp(&mut self) -> Reg {
         self.alloc_reg()
+    }
+
+    /// Refuse to emit a `FuncProto` whose frame overflowed the `u16` register
+    /// space. Called at every finalisation site; without it `alloc_reg`'s
+    /// saturation would hand the same register to several live values.
+    pub(crate) fn check_regs(&self) -> R<()> {
+        if self.reg_overflow {
+            return Err(format!(
+                "function needs more than {} registers (too many locals, \
+                 temporaries or literal elements in one function body)",
+                Reg::MAX
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn emit(&mut self, i: Instr) {
@@ -187,7 +218,10 @@ impl<'a> FnCompiler<'a> {
         // and drop their per-register markings, or a later local reallocated
         // onto the same register would inherit const-ness / cell-ness
         // (`{ const a = 1; } { let b = 2; b = 3; }` falsely threw TypeError).
-        self.next_reg -= scope.len() as Reg;
+        // Saturating: after a `reg_overflow` the counter no longer tracks the
+        // real allocation depth, and a plain `-=` would underflow-panic (the
+        // release profile is `panic = "abort"`, so that would be a hard crash).
+        self.next_reg = self.next_reg.saturating_sub(scope.len() as Reg);
         for (_, r) in &scope {
             self.const_regs.remove(r);
             self.cell_regs.remove(r);

@@ -2323,4 +2323,88 @@ mod tests {
             vec!["5 5 3"],
         );
     }
+
+    #[test]
+    fn huge_array_literal_does_not_corrupt_the_frame() {
+        // REGRESSION: `NewArray`'s argc is a u16 and its elements need one
+        // CONTIGUOUS register each, so a literal with >= 2^16 elements used to
+        // truncate its count (70000 -> 4464) AND wrap `next_reg` back over live
+        // registers, silently corrupting unrelated locals. Big literals now take
+        // the incremental ArrayAppend path (which needs one scratch register).
+        let n = 70_000usize;
+        let elems = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let src = format!(
+            "function f(){{ var x = 111; var y = 222; var a = [{elems}]; \
+             return [a.length, x, y, a[0], a[{}]]; }} console.log(f().join(','))",
+            n - 1
+        );
+        assert_eq!(run_ok(&src), vec![format!("{n},111,222,0,{}", n - 1)]);
+    }
+
+    #[test]
+    fn huge_array_literal_preserves_holes() {
+        // The incremental path must reproduce NewArray's hole semantics: an
+        // elision is an ABSENT element, not a present `undefined`.
+        let n = 70_000usize;
+        let src = format!(
+            "var a = [1,,3{}]; console.log(a.length, 1 in a, 0 in a, a[2])",
+            ",4".repeat(n)
+        );
+        assert_eq!(run_ok(&src), vec![format!("{} false true 3", n + 3)]);
+    }
+
+    #[test]
+    fn typedarray_length_in_jit_region_matches_interpreter() {
+        // `ta.length` is an INHERITED accessor, so the JIT's direct answer is
+        // only valid while the built-in getter is intact. JIT and interpreter
+        // must agree in every case: pristine, shadowed by an own property,
+        // re-pointed prototype, and detached buffer.
+        assert_jit_matches(
+            "const t=new Float64Array(2048); let s=0; \
+             for(let i=0;i<t.length;i++) s+=t.length; console.log(s)",
+            &["4194304"],
+        );
+        // An own `length` shadows the inherited accessor.
+        assert_jit_matches(
+            "const t=new Float64Array(8); Object.defineProperty(t,'length',{value:99}); \
+             let s=0; for(let i=0;i<200;i++) s+=t.length; console.log(s)",
+            &["19800"],
+        );
+        // A re-pointed prototype. Both tiers currently report the TypedArray's
+        // own length (8), not the shadowing `{length: 7}` — the KNOWN DEVIATION
+        // documented in vm/props/member.rs. What this case pins is that the JIT
+        // and the interpreter AGREE, so fixing the deviation moves both.
+        assert_jit_matches(
+            "const t=new Float64Array(8); Object.setPrototypeOf(t,{length:7}); \
+             let s=0; for(let i=0;i<200;i++) s+=t.length; console.log(s)",
+            &["1600"],
+        );
+        // A detached buffer reports 0.
+        assert_jit_matches(
+            "const b=new ArrayBuffer(64); const t=new Float64Array(b); \
+             let s=0; for(let i=0;i<200;i++){ if(i===100) transfer(b); s+=t.length; } \
+             console.log(s); function transfer(x){ x.transfer(); }",
+            &["800"],
+        );
+    }
+
+    #[test]
+    fn sparse_array_iteration_covers_the_whole_length() {
+        // REGRESSION: elements past MAX_DENSE_ARRAY_LEN (2^20) live in the sparse
+        // overlay, and `array_like_iterate` clamped its ascending probe to that
+        // constant — so every callback method silently stopped at 1,048,576.
+        // `some()` returned false while `find()` found a match on the SAME array.
+        let src = "
+            const N = 1200000, a = new Array(N);
+            for (let i = 0; i < N; i++) a[i] = i;
+            a[N + 5] = 99;
+            console.log(
+                a.some(x => x > 1100000),
+                a.filter(x => x > 1100000).length,
+                a.map(x => x).length,
+                a.reduce(n => n + 1, 0),
+            );
+        ";
+        assert_eq!(run_ok(src), vec!["true 99999 1200006 1200001"]);
+    }
 }

@@ -331,6 +331,15 @@ struct FnCompiler<'a> {
     /// Next free register / high-water mark.
     next_reg: Reg,
     max_reg: Reg,
+    /// Set when `alloc_reg` ran out of the u16 register space. `Reg` is a `u16`
+    /// and `FuncProto::reg_count` is a `u16`, so a frame simply cannot address
+    /// more than `u16::MAX` registers; before this flag existed the counter
+    /// wrapped and the function silently miscompiled (a 70k-element array
+    /// literal produced `length === 4464` AND clobbered unrelated locals,
+    /// because `next_reg` wrapped back over live registers). Allocation now
+    /// saturates instead of wrapping, and every site that finalises a
+    /// `FuncProto` refuses to emit one when this is set.
+    reg_overflow: bool,
     /// Register holding the rest-parameter array, if this function has one.
     rest_reg: Option<Reg>,
     /// Register reserved for the `arguments` object (non-arrow functions), and

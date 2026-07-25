@@ -940,9 +940,27 @@ impl<'a> FnCompiler<'a> {
     }
 
     pub(crate) fn array_literal(&mut self, a: &ox::ArrayExpression, dst: Reg) -> R<Reg> {
+        // The fixed-block `NewArray` form needs one CONTIGUOUS register per
+        // element and passes the count as a `u16` argc, so it is only usable
+        // for literals that actually fit the frame. A big literal (machine-
+        // generated lookup tables are the real-world case) must take the
+        // incremental path instead: `[70000 elements]` used to truncate its
+        // count to `u16` (70000 -> 4464) and wrap `next_reg` back over live
+        // registers, silently corrupting unrelated locals in the same frame.
+        //
+        // `ArrayAppend` needs a single scratch register regardless of length,
+        // and pushes each value (including an explicit `LoadHole`) onto the
+        // dense store, so it is semantically identical to `NewArray` — the
+        // spread case below has always relied on that.
+        const NEWARRAY_MAX_ELEMS: usize = 1024;
+        let n_elems = a.elements.len();
+        let block_fits = self.next_reg as usize + n_elems <= Reg::MAX as usize;
+        let incremental = n_elems > NEWARRAY_MAX_ELEMS
+            || !block_fits
+            || a.elements.iter().any(|e| matches!(e, ox::ArrayExpressionElement::SpreadElement(_)));
         // With a `...spread` element the final length is dynamic, so build the
         // array incrementally via ArrayAppend instead of the fixed-block NewArray.
-        if a.elements.iter().any(|e| matches!(e, ox::ArrayExpressionElement::SpreadElement(_))) {
+        if incremental {
             self.emit(Instr::NewArray { dst, arg_base: self.next_reg, argc: 0 }); // []
             for el in &a.elements {
                 let save = self.next_reg;
@@ -970,7 +988,8 @@ impl<'a> FnCompiler<'a> {
         // Elements must occupy a contiguous register run for NewArray. Reserve
         // the block first (same contiguity discipline as call args) so an
         // element expression's scratch temps allocate above the block.
-        let count = a.elements.len() as u16;
+        // `n_elems <= NEWARRAY_MAX_ELEMS` here, so the cast cannot truncate.
+        let count = n_elems as u16;
         let base = self.next_reg;
         for _ in &a.elements {
             self.alloc_reg();

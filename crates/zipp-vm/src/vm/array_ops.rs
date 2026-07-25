@@ -507,14 +507,17 @@ impl<'p> Vm<'p> {
         let this = self.to_object(this)?;
         let lv = self.get_prop(this, "length")?;
         let lenf = self.to_number_coerce(lv)?;
-        // ToLength: a positive length (incl. +Infinity / "Infinity" / a huge finite)
-        // clamps to MAX_DENSE_ARRAY_LEN for the ascending probe loops; the
-        // descending/own-keys arms below use the FULL spec ToLength (2^53-1).
-        let len: usize = if lenf > 0.0 {
-            (lenf as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
-        } else {
-            0
-        };
+        // ToLength. The ascending probe loops MUST use the full length: this is
+        // the path every hole-sensitive callback method takes for an array with
+        // a sparse overlay (elements past `MAX_DENSE_ARRAY_LEN` are stored in
+        // `arr_props`, not the dense `items` Vec), so clamping the bound to
+        // `MAX_DENSE_ARRAY_LEN` silently skipped every element beyond 2^20 —
+        // `some()` returned false while `find()` found a match on the SAME
+        // array, and `filter()` dropped the tail. Probing an absent index is
+        // just a miss, so the full bound is also what V8 does (measurably: it
+        // is O(length) on a sparse array too).
+        // (`as usize` on an f64 saturates, so a huge/­infinite length cannot wrap.)
+        let len: usize = if lenf > 0.0 { lenf as usize } else { 0 };
         let full_len: u64 = if lenf > 0.0 {
             lenf.trunc().min(9_007_199_254_740_991.0) as u64
         } else {
@@ -546,6 +549,21 @@ impl<'p> Vm<'p> {
                 // non-finite one (Infinity, via ToLength → 2^53-1) is a RangeError.
                 if lenf > 4_294_967_295.0 {
                     return Err(Thrown("RangeError: Invalid array length".into()));
+                }
+                // `out` is materialised DENSELY, so unlike the probe-only arms
+                // above its length is bounded by what the host can hold: a
+                // 2^32-1 result would be 34 GB. V8 answers with a sparse array;
+                // zipp has no sparse result representation here, so it reports
+                // the documented RangeError rather than OOM-aborting the
+                // process (`panic = "abort"` makes an allocation failure fatal).
+                // The bound is the largest array the engine builds eagerly
+                // elsewhere, so every length that `new Array(n)` accepts still
+                // maps successfully.
+                if len > MAX_EAGER_ITER_RESULT {
+                    return Err(Thrown(
+                        "RangeError: array length exceeds the engine's dense-array limit"
+                            .into(),
+                    ));
                 }
                 let mut out = vec![Value::UNDEFINED; len];
                 for k in 0..len {
