@@ -6,6 +6,14 @@
 
 use std::process::ExitCode;
 
+/// The engine is allocation-bound: every object owns three parallel `Vec`s plus
+/// a `String` per property, so constructing `{a: 1}` costs four allocations.
+/// Measured against the platform allocator that was ~290ns for the first
+/// property alone — roughly 72ns per malloc, which is the allocator, not the
+/// data structure.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {

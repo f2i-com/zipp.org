@@ -10,4 +10,5 @@ name = "zipp"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
 zipp-vm = { path = "../zipp-vm" }
