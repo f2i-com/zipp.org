@@ -1130,13 +1130,37 @@ impl<'p> Vm<'p> {
         let (value, ret_done, latch) = if done {
             (Value::UNDEFINED, true, true)
         } else {
+            // Captured BEFORE the exec: `regexp_exec_fast_ok` proves the result
+            // array is the one RegExpBuiltinExec builds, so element 0 can be read
+            // from the dense store below. A user `exec` can return anything, and
+            // could also install one between iterations, so it is re-checked
+            // every step rather than cached on the iterator.
+            let pristine_exec = matches!(self.heap.get(regexp), HeapObj::RegExp { .. })
+                && self.regexp_exec_fast_ok(regexp);
             let r = self.regexp_exec_abstract(regexp, string)?;
             if r == Value::NULL {
                 (Value::UNDEFINED, true, true)
             } else if !global {
                 (r, false, true)
             } else {
-                let m0 = self.get_index(r, Value::int(0))?;
+                // Was the match EMPTY? Only then does lastIndex need advancing.
+                //
+                // The generic answer is Get(match,"0") + ToString + length, but
+                // `get_index` on the result array takes its slow path: the array
+                // ALWAYS carries an `arr_props` side table (index/input/groups),
+                // so the read formats the key "0" into a fresh String and does a
+                // map lookup — per match, in a matchAll loop. When we built the
+                // array ourselves (real RegExp, pristine `exec`, so no user code
+                // could have replaced element 0 with a getter), read `items[0]`
+                // straight out of the dense store instead.
+                let fast0 = pristine_exec.then(|| match self.heap.get(r.heap_index()) {
+                    HeapObj::Array(items) => items.first().copied(),
+                    _ => None,
+                });
+                let m0 = match fast0 {
+                    Some(Some(v)) => v,
+                    _ => self.get_index(r, Value::int(0))?,
+                };
                 // ToString(Get(match,"0")) — IDENTITY for a string value (no
                 // copy); only a non-string coerces.
                 let m0v = self.to_str_value(m0)?;

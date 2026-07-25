@@ -55,7 +55,27 @@ pub const OSR_THRESHOLD: u32 = 8;
 /// INSIDE the region — a type guard bailed — rather than exiting cleanly) before
 /// it is evicted and blacklisted. Prevents a livelock where the interpreter
 /// re-enters native every back-edge only for it to bail at the same guard.
-pub const OSR_DEOPT_LIMIT: u32 = 4;
+/// Bails tolerated before a region is evicted.
+///
+/// Was 4, which is a LIFETIME total and far too tight: a single call running a
+/// 3M-iteration loop over a Float64Array containing four fractional values bails
+/// four times and is then blacklisted for the rest of the process — measured as
+/// 4.00 ns/op -> 18.00 ns/op, a 4.5x cliff at a 0.00003% event rate, and three of
+/// the ten benches hit it. A failed entry costs one guard check and an immediate
+/// exit, so tolerating more of them is cheap; a region that really is wrong (it
+/// bails on EVERY entry) still evicts, just after 64 cheap attempts instead of 4.
+pub const OSR_DEOPT_LIMIT: u32 = 64;
+
+/// Clean region exits that forgive one accumulated deopt. Makes `OSR_DEOPT_LIMIT`
+/// a RATE ("bails without good runs between them") instead of a lifetime total.
+///
+/// One, not more: a clean exit means the region ran its loop all the way to the
+/// loop's own exit, which is a whole unit of productive work — very different
+/// from a bail. Note this alone does NOT rescue the case above, where a single
+/// long-running loop bails several times and only ever cleanly exits once at the
+/// very end; that is what the raised limit is for. The decay covers the other
+/// shape: a short loop inside a function called many times.
+pub const DEOPT_DECAY_RUNS: u32 = 1;
 
 /// Sentinel in `bail_ip` meaning the native code completed via `Return` (the
 /// result is in the returned `u64`). Any other value is the ip to resume at.
@@ -528,6 +548,9 @@ pub struct Region {
     start: u32,
     end: u32,
     deopts: u32,
+    /// Successful (non-bailing) exits since the last decay. `deopts` is a RATE
+    /// budget, not a lifetime total — see `note_region_resume`.
+    ok_runs: u32,
     /// True if compiled by the integer path. On eviction an int region falls
     /// back to the double path (rather than full-blacklisting the loop).
     is_int: bool,
@@ -945,7 +968,7 @@ impl Jit {
                         };
                         self.regions.insert(
                             key,
-                            Region { code, start, end, deopts: 0, is_int, field_plan: Some(plan) },
+                            Region { code, start, end, deopts: 0, ok_runs: 0, is_int, field_plan: Some(plan) },
                         );
                         return;
                     }
@@ -964,7 +987,7 @@ impl Jit {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
                 }
                 self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, is_int: true, field_plan: None });
+                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, field_plan: None });
                 return;
             }
         }
@@ -982,7 +1005,7 @@ impl Jit {
                     eprintln!("[jit] INT-cold region fn{func_id} [{start},{end}] compiled");
                 }
                 self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, is_int: true, field_plan: None });
+                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, field_plan: None });
                 return;
             }
         }
@@ -1000,7 +1023,7 @@ impl Jit {
                     eprintln!("[jit] DOUBLE/MEM region fn{func_id} [{start},{end}] compiled");
                 }
                 self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, is_int: false, field_plan: None });
+                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: false, field_plan: None });
             }
             None => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -1028,6 +1051,23 @@ impl Jit {
                 // non-numeric → the inline-cache mem path handles any type).
                 (r.deopts >= OSR_DEOPT_LIMIT, r.is_int || r.field_plan.is_some())
             } else {
+                // A clean exit: the region reached its loop exit instead of
+                // bailing. DECAY the deopt budget.
+                //
+                // `deopts` used to be a lifetime total, so four rare guard
+                // misses spread over an entire program permanently blacklisted
+                // a loop — measured as a 4.5x cliff (4.00 ns/op -> 18.00 ns/op)
+                // triggered by a 0.00003% event rate, and three of the ten
+                // benches were hitting it. Decaying on success turns it into
+                // "four bails without DEOPT_DECAY_RUNS clean exits between
+                // them", so a region that genuinely misbehaves is still evicted
+                // just as fast (it never earns a decay), while a hot loop with
+                // an occasional cold guard keeps its native code.
+                r.ok_runs += 1;
+                if r.ok_runs >= DEOPT_DECAY_RUNS {
+                    r.ok_runs = 0;
+                    r.deopts = r.deopts.saturating_sub(1);
+                }
                 (false, false)
             }
         } else {
