@@ -259,13 +259,48 @@ pub(crate) extern "win64" fn jit_get_index(
 ) -> u64 {
     let arr = Value::from_bits(arr_bits);
     let key = Value::from_bits(key_bits);
-    // Only a numeric key on a heap object is handled here; a string/other key
-    // (or non-heap receiver) deopts so the interpreter applies full semantics.
-    if !arr.is_heap() || !key.is_number() {
+    if !arr.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     // SAFETY: read-only view; the running region holds no conflicting borrow.
     let vm = unsafe { &*(vm as *const Vm) };
+    // ── plain-object computed read: `o[k]` with a flat string key ───────────
+    // Mirrors the interpreter's fast path in `vm/indexing_date.rs` EXACTLY.
+    // Without it every non-numeric key deopted, so `o[k]` was never compiled AND
+    // the deopts evicted the whole enclosing region — an identical arithmetic
+    // loop measured 12.0 ns/op with `o.a` and 82.5 ns/op with `o[k]`, and the
+    // penalty grew with the loop body, which is the signature of collateral
+    // eviction rather than a slow read.
+    //
+    // Own DATA property only. Accessors, misses (prototype/class chain),
+    // uninitialised (TDZ) slots, the slot-backed global object and module /
+    // deferred namespaces all keep deopting — they have live bindings or run
+    // user code, and parity with the interpreter is what makes this sound.
+    if key.is_heap() {
+        let oidx = arr.heap_index();
+        if !(oidx == vm.global_this && vm.global_this != 0)
+            && !(!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
+            && !(!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
+        {
+            if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(key.heap_index()) {
+                if let (Ok(k), HeapObj::Object(m)) = (std::str::from_utf8(b), vm.heap.get(oidx)) {
+                    if let Some(i) = m.pos(k) {
+                        if !m.attrs[i].accessor {
+                            let v = m.vals[i];
+                            if !v.is_uninitialized() {
+                                return v.bits();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Beyond the plain-object case above, only a numeric key is handled here; a
+    // string/other key deopts so the interpreter applies full semantics.
+    if !key.is_number() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     // A TypedArray element read mirrors the interpreter's get_index TA arm
     // EXACTLY (which never consults arr_props for element keys): a numeric
     // integer index → ta_element_get semantics (undefined for OOB/detached);
