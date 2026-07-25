@@ -18,9 +18,28 @@ pub(crate) const TWO_POW_54: i64 = 18_014_398_509_481_984;
 /// IS allowed, via integer `idiv`), and every `LoadConst` must be an Int-tagged
 /// constant (a double constant would be misread as i64).
 pub(crate) fn region_is_int(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> bool {
+    int_unadmitted_ips(proto, start, end, ta_plan).is_some_and(|v| v.is_empty())
+}
+
+/// The ips in `[start, end]` the INT emitter has no arm for, or `None` when the
+/// region cannot be compiled at all.
+///
+/// An empty vec is the strict case — exactly the old `region_is_int == true`.
+/// A non-empty vec is compilable only in COLD-EXIT mode (B9): each such ip
+/// becomes a side exit (`mov [rsi], ip ; jmp flush_exit`) instead of
+/// disqualifying the whole region from the integer tier. That matters because a
+/// single `substring`/`+=` in a branch that never runs was demoting an entire
+/// `charCodeAt` scan loop from 1.7 ns/iteration (parity with V8) to 8.0 ns.
+pub(crate) fn int_unadmitted_ips(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+) -> Option<Vec<usize>> {
     if !region_can_compile(proto, start, end, None) {
-        return false;
+        return None;
     }
+    let mut unadmitted: Vec<usize> = Vec::new();
     let (s, e) = (start as usize, end as usize);
     // A pinned Int32Array (kind 5) element access runs inline on the int path: the
     // element is a signed i32 ⇒ sign-extends to an i64 home (GetIndex) / stores its
@@ -82,13 +101,13 @@ pub(crate) fn region_is_int(proto: &FuncProto, start: u32, end: u32, ta_plan: &T
                 // Only Int-tagged constants; a double const can't be an i64 home.
                 match proto.constants.get(idx as usize) {
                     Some(c) if c.is_int() => {}
-                    _ => return false,
+                    _ => unadmitted.push(s + off),
                 }
             }
-            _ => return false, // Div / a non-int32 / non-pinned index / anything else
+            _ => unadmitted.push(s + off), // Div / non-int32 / non-pinned index / anything else
         }
     }
-    true
+    Some(unadmitted)
 }
 
 /// INTEGER region codegen: each numeric region value is stored as a raw i64 in
@@ -112,16 +131,85 @@ pub(crate) fn compile_region_int(
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
 ) -> Option<JitFn> {
-    if !region_is_int(proto, start, end, ta_plan) {
+    compile_region_int_maybe_cold(proto, start, end, globals_base_helper, ta_plan, ta_snapshot, false)
+}
+
+/// `cold_exit`: compile ops the INT emitter has no arm for as SIDE EXITS rather
+/// than declining the region (B9). Sound because every i64 home is loaded from
+/// the register file at region entry and only ever updated by ops that actually
+/// execute natively — an op we exit at never runs natively, so no home can hold
+/// a value it did not produce, and `flush_exit` writes every home back before
+/// the interpreter resumes at that exact ip.
+pub(crate) fn compile_region_int_maybe_cold(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    globals_base_helper: usize,
+    ta_plan: &TaPinPlan,
+    ta_snapshot: usize,
+    cold_exit: bool,
+) -> Option<JitFn> {
+    let unadmitted = int_unadmitted_ips(proto, start, end, ta_plan)?;
+    let cold: FxHashSet<usize> = if unadmitted.is_empty() {
+        FxHashSet::default()
+    } else if !cold_exit {
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!("[jit] INT decline [{start},{end}]: region_is_int=false");
         }
         return None;
-    }
+    } else {
+        // The cold unit is the BASIC BLOCK, not the instruction. Excluding only
+        // the unadmitted op is unsound: `s += "x"` is
+        // `LoadGlobal s; StrConcat; StoreGlobal s`, and LoadGlobal IS admitted —
+        // so `s` would still be given an i64 home and the entry guard would
+        // reject the string every iteration. Taking the whole block means no
+        // admitted op inside it runs natively, so nothing it touches is homed.
+        let (s_, e_) = (start as usize, end as usize);
+        let targets = region_jump_targets(&proto.code, s_, e_);
+        let mut is_block_start = vec![false; e_ - s_ + 1];
+        is_block_start[0] = true;
+        for &t in &targets {
+            if (s_..=e_).contains(&t) {
+                is_block_start[t - s_] = true;
+            }
+        }
+        for ip in s_..=e_ {
+            let branches = matches!(
+                proto.code[ip],
+                Instr::Jump { .. }
+                    | Instr::JumpIfFalse { .. }
+                    | Instr::JumpIfTrue { .. }
+                    | Instr::JumpIfNotLt { .. }
+                    | Instr::JumpIfNotLe { .. }
+            );
+            if branches && ip + 1 <= e_ {
+                is_block_start[ip + 1 - s_] = true;
+            }
+        }
+        let mut block_of = vec![s_; e_ - s_ + 1];
+        let mut cur = s_;
+        for ip in s_..=e_ {
+            if is_block_start[ip - s_] {
+                cur = ip;
+            }
+            block_of[ip - s_] = cur;
+        }
+        let cold_blocks: FxHashSet<usize> =
+            unadmitted.iter().map(|&ip| block_of[ip - s_]).collect();
+        // The header's block and the back-edge's block must run natively, or the
+        // region exits every iteration and is worse than not compiling at all.
+        if cold_blocks.contains(&block_of[0]) || cold_blocks.contains(&block_of[e_ - s_]) {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!("[jit] INT-cold decline [{start},{end}]: header/back-edge block is cold");
+            }
+            return None;
+        }
+        (s_..=e_).filter(|&ip| cold_blocks.contains(&block_of[ip - s_])).collect()
+    };
     // The i64 homes carry sign-extended integers, so Bitwise (int32-lane) ops run
     // inline here with no per-op reload/rebox — admit them (admit_bitwise=true), and
     // plan_region's pinned-element handling targets kind-5 (Int32) elements.
-    let plan = match plan_region(proto, start, end, ta_plan, true) {
+    let plan = match plan_region_cold(proto, start, end, ta_plan, true, &cold) {
         Some(p) => p,
         None => {
             if std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -231,6 +319,13 @@ pub(crate) fn compile_region_int(
         dynasm!(ops ; => lbl(ip as u32, &in_region));
         if plan.jump_targets.contains(&ip) {
             lc = None; // control may arrive here with different home contents
+        }
+        // B9: an ip in a cold block never runs natively — flush every home and
+        // hand this exact ip back to the interpreter, which runs the block (and
+        // the rest of the iteration) itself.
+        if cold.contains(&ip) {
+            dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
+            continue;
         }
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
             if plan.hoisted.contains(&dst) {

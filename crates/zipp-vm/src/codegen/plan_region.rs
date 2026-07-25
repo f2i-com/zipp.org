@@ -17,6 +17,22 @@ pub(crate) fn plan_region(
     ta_plan: &TaPinPlan,
     admit_bitwise: bool,
 ) -> Option<RegionPlan> {
+    plan_region_cold(proto, start, end, ta_plan, admit_bitwise, &FxHashSet::default())
+}
+
+/// `cold`: ips the caller will emit as SIDE EXITS (B9) rather than as native
+/// code. They are skipped by every analysis pass here — they never execute
+/// natively, so they neither define a home's value nor constrain its type, and
+/// letting them into the walks would only make the planner decline a region
+/// whose hot path is perfectly typed.
+pub(crate) fn plan_region_cold(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+    admit_bitwise: bool,
+    cold: &FxHashSet<usize>,
+) -> Option<RegionPlan> {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
     // ── unboxed-region epic: pinned TypedArray element access ──
@@ -53,6 +69,8 @@ pub(crate) fn plan_region(
         // `obj` of every pinned-STRING charCodeAt/length access.
         let mut recv: FxHashSet<u16> = FxHashSet::default();
         for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
+            if cold.contains(&(s + off)) { continue; }
             if pinned_elem(s + off) {
                 if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
                     recv.insert(obj);
@@ -70,7 +88,8 @@ pub(crate) fn plan_region(
             // the whole region to the memory path, which handles it).
             let mut def_n: FxHashMap<u16, u32> = FxHashMap::default();
             let mut def_lg: FxHashSet<u16> = FxHashSet::default();
-            for instr in &code[s..=e] {
+            for (off, instr) in code[s..=e].iter().enumerate() {
+                if cold.contains(&(s + off)) { continue; }
                 if let Some(d) = writes_reg(instr) {
                     *def_n.entry(d).or_insert(0) += 1;
                     if matches!(instr, Instr::LoadGlobal { .. }) {
@@ -80,6 +99,9 @@ pub(crate) fn plan_region(
             }
             let mut used_elsewhere: FxHashSet<u16> = FxHashSet::default();
             for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
+                if cold.contains(&(s + off)) { continue; }
+            if cold.contains(&(s + off)) { continue; }
                 // The receiver use AT a pinned access is exempt (read via the pin,
                 // not the register). For a pinned-STRING access the obj-use is also
                 // invisible to instr_uses today (CallMethod→vec![]; GetProp→[obj]),
@@ -153,6 +175,7 @@ pub(crate) fn plan_region(
     // type (from defs) and first-occurrence (def vs use). Operand type
     // requirements are validated in a second loop once types are known.
     for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
         // A call or a bitwise op can't be register-allocated (boxed Values / int32
         // lanes / arbitrary user code) — decline to the memory path. A dense-array
         // GetIndex/SetIndex likewise declines UNLESS it is a kind-8 (Float64) pinned
@@ -254,7 +277,8 @@ pub(crate) fn plan_region(
     // Loading/typing it correctly (numeric vs bool) is fiddly, so decline and
     // let the memory path handle it (it reads everything from the reg file).
     // TA-receiver regs are intentionally untyped (sourced via the pin) — skip them.
-    for instr in &code[s..=e] {
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
         for u in instr_uses(instr) {
             if !ta_recv_regs.contains(&u) && !ty.contains_key(&u) {
                 return None;
@@ -266,6 +290,7 @@ pub(crate) fn plan_region(
     // Num home: the emitter reads the index from `key`'s home and a SetIndex stores
     // `val`'s home. Decline if either isn't a number home.
     for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
         if pinned_elem(s + off) {
             let bad = match *instr {
                 Instr::GetIndex { key, .. } => ty.get(&key) != Some(&VTy::Num),
@@ -281,7 +306,8 @@ pub(crate) fn plan_region(
     }
 
     // Validate operand type requirements now that types are known.
-    for instr in &code[s..=e] {
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
         match *instr {
             Instr::Add { a, b, .. }
             | Instr::Sub { a, b, .. }
@@ -322,6 +348,7 @@ pub(crate) fn plan_region(
     let mut def_count: FxHashMap<u16, u32> = FxHashMap::default();
     let mut const_def_ip: FxHashMap<u16, usize> = FxHashMap::default();
     for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
         match *instr {
             Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } => {
                 *def_count.entry(dst).or_insert(0) += 1;
@@ -339,7 +366,8 @@ pub(crate) fn plan_region(
     // `LoadInt 0` by the field-promotion rewrite) — it must NOT be hoisted, or it
     // would consume a permanent xmm home for a value that's never read.
     let mut used: FxHashSet<u16> = FxHashSet::default();
-    for instr in &code[s..=e] {
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
         for u in instr_uses(instr) {
             used.insert(u);
         }
@@ -355,6 +383,7 @@ pub(crate) fn plan_region(
     // feed both `used` (here) and the live-range touch loop (below). `(ip,reg,def)`.
     let mut str_imul_touch: Vec<(usize, u16, bool)> = Vec::new();
     for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
         let ip = s + off;
         match *instr {
             Instr::CallMethod { dst, arg_base, argc: 1, .. } if pinned_str(ip) => {
@@ -483,6 +512,7 @@ pub(crate) fn plan_region(
     let mut first_ip: FxHashMap<u16, usize> = FxHashMap::default();
     let mut last_ip: FxHashMap<u16, usize> = FxHashMap::default();
     for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
         let ip = s + off;
         let mut touch = |r: u16| {
             first_ip.entry(r).or_insert(ip);
@@ -599,7 +629,8 @@ pub(crate) fn plan_region(
     let mut addint_imm_home: FxHashMap<i32, u8> = FxHashMap::default();
     {
         let mut imms: Vec<i32> = Vec::new();
-        for instr in &code[s..=e] {
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            if cold.contains(&(s + off)) { continue; }
             if let Instr::AddInt { imm, .. } = *instr {
                 if !imms.contains(&imm) {
                     imms.push(imm);
@@ -620,7 +651,8 @@ pub(crate) fn plan_region(
     let mut gpr_const: FxHashMap<u16, (u8, i64)> = FxHashMap::default();
     {
         let mut cand: Vec<u16> = Vec::new();
-        for instr in &code[s..=e] {
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            if cold.contains(&(s + off)) { continue; }
             let (a, b) = match *instr {
                 Instr::Lt { a, b, .. }
                 | Instr::Le { a, b, .. }
