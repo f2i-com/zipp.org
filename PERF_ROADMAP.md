@@ -790,25 +790,36 @@ copy for a property name that is nearly always already interned in the callee's
 `string_constants`, and repeated for every object of the same shape. The base
 term is `keys`/`vals`/`attrs` being three separate `Vec`s.
 
-**The fix is interning: `keys: Vec<Rc<str>>` behind a process-wide table**, so
-adding a key is a refcount bump. Attempted and reverted (see below), but the
-migration is fully specified:
+**Interning at define-time does NOT work — MEASURED, do not repeat it.** The
+obvious fix is `keys: Vec<Rc<str>>` behind a process-wide table so adding a key
+is a refcount bump. That was built to completion (88 mechanical errors across 12
+files, all resolved, tests green, benches matching node) and it came out
+**5-8% SLOWER**:
 
-- `pub type PropKey = Rc<str>` plus a thread-local `FxHashSet<PropKey>` interner;
-  `ObjMap::define`/`set` call `intern_key(key)` instead of `to_string()`.
-- The compiler finds every affected site: **88 errors across 12 files**, all
-  mechanical — `&*k == key` for comparisons, `intern_key` at the owning sites,
-  and `.map(|k| k.to_string())` where something collects into `Vec<String>`
-  (`natives.rs` 21, `enumerate.rs` 15, `descriptors.rs` 15, `ic.rs` 10,
-  `heap.rs` 10, `dispatch.rs` 6, the rest 1-2 each).
-- Expect ~50ns off a 3-key literal (106ms -> ~60ms), and more on wider objects.
+```text
+                  before   interned
+3-key literal      106ms      113ms
+6-key literal      215ms      233ms
+```
 
-It was reverted rather than half-finished: 88 errors in the engine's most
-correctness-critical structure needs its own session with the full gate between
-steps, not the tail of a long one. Do it as a single commit that changes nothing
-else, and re-run the differential repro set as well as test262 — a bad property
-key is exactly the kind of defect that passes a conformance suite and corrupts a
-real program.
+The reason is arithmetic that should have been done first: `intern_key` hashes
+the string, probes a `HashSet`, and clones an `Arc` (atomic increment) — call it
+~20ns — to avoid a malloc+memcpy of a short string, which is ~15ns. The
+allocation was never the expensive part relative to a hash lookup.
+
+**What would actually work: intern at COMPILE time, not per `define`.** Every hot
+property name already exists in the callee's `string_constants`. Interning that
+pool once at load and passing a pre-made `PropKey` down to `define` makes the
+runtime cost a bare refcount bump with NO hashing — ~2ns instead of ~15ns. That
+needs `PropKey` threaded from `SetProp { name: idx }` / the object-literal path
+through to `ObjMap::define`, which is a different (and smaller) change than
+retyping every key site.
+
+Second-order, and independent of the above: fold `keys`/`vals`/`attrs` into one
+`Vec<Prop>` to turn three allocations into one (worth ~35ns of the ~58ns
+first-key cost), and give `NewObject` a key-count hint so the literal path
+pre-sizes instead of regrowing (the 6-key case pays ~36ns/key at the tail, well
+above the ~17ns steady-state, which is regrowth).
 
 Second-order once that lands: fold `keys`/`vals`/`attrs` into one `Vec<Prop>` to
 turn three allocations into one, and give `NewObject` a key-count hint so the
