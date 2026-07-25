@@ -22,6 +22,10 @@ import argparse, os, re, subprocess, sys, tempfile, threading, concurrent.future
 
 FM = re.compile(r"/\*---(.*?)---\*/", re.S)
 
+# Prefix for the per-execution scratch files this runner drops beside each test.
+# Anything carrying it is OURS, never a test — see the walk filter in main().
+TMP_PREFIX = ".zipptmp-"
+
 # ---- byte-faithful source reading -------------------------------------------
 # Function.prototype.toString must reproduce a function's ORIGINAL line
 # terminators, so test sources have to reach the engine byte-faithful (the old
@@ -107,32 +111,84 @@ def load_harness(h):
         return cache[name]
     return get
 
+# `sta.js`'s $DONOTEVALUATE throws this exact string, and `assert.js`'s failures
+# are Test262Error. Either one appearing in the output of a NEGATIVE test is
+# definitional proof that the test body EXECUTED — i.e. the early error the test
+# exists to check was never raised. Scoring those as passes (which the old
+# `phase == "parse"` blanket did) hid ~1,200 genuine failures.
+DONOTEVALUATE = "should not be evaluated"
+TEST262ERROR = "Test262Error"
+
+
 def classify(meta, code, out, err):
+    blob = (out or "") + (err or "")
     neg = meta["negative"]
     if neg:
         # Should fail. Pass if it errored; tighten by matching the error type name.
         if code == 0:
             return ("FAIL", "negative-but-passed")
         want = neg["type"]
+        # The body ran, so whatever the exit code says, the required early error
+        # was NOT raised. This check must precede the type match: a test whose
+        # body throws its own TypeError would otherwise "match" want=TypeError.
+        if DONOTEVALUATE in blob or TEST262ERROR in blob:
+            return ("FAIL", f"early-error-not-raised want={want}")
         if want and (want in err or want.lower() in err.lower()):
             return ("PASS", None)
-        # Errored but type unknown/mismatched — still count as pass-ish for parse
-        # phase (the VM's parse errors aren't always typed), else a soft fail.
+        # Errored, but the engine did not name a type. zipp's parse rejections
+        # are not all typed (e.g. "`break` target not found"), and the check
+        # above already excludes the "body ran" case, so accept it for the parse
+        # phase only — a runtime-phase mismatch stays a failure.
         if neg["phase"] == "parse":
             return ("PASS", None)
         return ("FAIL", f"wrong-error want={want}")
     if "async" in meta["flags"]:
-        return ("PASS", None) if "Test262:AsyncTestComplete" in out else ("FAIL", err.strip().splitlines()[0] if err.strip() else "async-no-complete")
+        # An async test must print COMPLETE and must NOT print FAILURE: a promise
+        # resolved twice yields FAILURE-then-COMPLETE, which is exactly the bug
+        # these tests exist to catch. A nonzero exit (a post-completion crash)
+        # is a failure too.
+        if "Test262:AsyncTestFailure" in blob:
+            fail = next((l for l in blob.splitlines() if "AsyncTestFailure" in l), "async-failure")
+            return ("FAIL", fail.strip()[:80])
+        if "Test262:AsyncTestComplete" not in out:
+            return ("FAIL", err.strip().splitlines()[0] if err.strip() else "async-no-complete")
+        if code != 0:
+            return ("FAIL", f"async-completed-then-exit={code}")
+        return ("PASS", None)
     if code == 0:
+        # A positive test that reported a Test262Error but still exited 0 did not
+        # pass: an assertion inside a promise reaction throws, the rejection goes
+        # unhandled, and the process exits cleanly.
+        if TEST262ERROR in blob:
+            line = next((l for l in blob.splitlines() if TEST262ERROR in l), TEST262ERROR)
+            return ("FAIL", f"swallowed: {line.strip()[:64]}")
         return ("PASS", None)
     sig = err.strip().splitlines()[-1] if err.strip() else f"exit={code}"
     return ("FAIL", sig[:80])
 
-def run_one(args, get_harness, path):
+def modes_for(flags):
+    """The execution modes INTERPRETING.md requires for a test.
+
+    A test carrying none of `onlyStrict` / `noStrict` / `raw` / `module` must be
+    run TWICE — once as sloppy code and once with a "use strict" directive
+    prepended. Running it once (the old behaviour) performed 48,556 of the
+    93,065 required executions, so all strict-only semantics reachable from the
+    44,509 default-flag tests went unmeasured."""
+    if "raw" in flags or "module" in flags:
+        return ("sloppy",)
+    if "onlyStrict" in flags:
+        return ("strict",)
+    if "noStrict" in flags:
+        return ("sloppy",)
+    return ("sloppy", "strict")
+
+
+def run_one(args, get_harness, job):
+    path, mode = job
     try:
         src = read_source(path, args.t262)
     except Exception as e:
-        return ("SKIP", f"read-error {e}", path)
+        return ("SKIP", f"read-error {e}", job)
     meta = parse_frontmatter(src)
     flags = meta["flags"]
     is_module = "module" in flags
@@ -142,7 +198,7 @@ def run_one(args, get_harness, path):
     cannot_block = "CanBlockIsFalse" in flags
     # Assemble.
     parts = []
-    strict = "onlyStrict" in flags
+    strict = mode == "strict"
     if strict and "raw" not in flags:
         parts.append('"use strict";')
     if "raw" not in flags:
@@ -154,7 +210,7 @@ def run_one(args, get_harness, path):
             try:
                 parts.append(get_harness(inc))
             except Exception:
-                return ("SKIP", f"missing-include {inc}", path)
+                return ("SKIP", f"missing-include {inc}", job)
     if is_module:
         # The harness runs as a realm SCRIPT (its vars become realm globals,
         # visible to every module -- real-engine harness semantics); the TEST
@@ -169,7 +225,11 @@ def run_one(args, get_harness, path):
     # Create the temp script IN THE TEST'S OWN DIRECTORY so a relative dynamic
     # `import('./x_FIXTURE.js')` resolves against the fixtures beside the test
     # (zipp resolves import() relative to the running script's directory).
-    fd, tmp = tempfile.mkstemp(suffix=".js", dir=os.path.dirname(path))
+    #
+    # The `.zipptmp-` prefix (plus the `_FIXTURE`-style skip in the walk) keeps a
+    # leftover from a crashed sweep from being collected as a phantom TEST on the
+    # next run — which silently inflated the file count and scored as a PASS.
+    fd, tmp = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=".js", dir=os.path.dirname(path))
     hf = None
     try:
         os.write(fd, assembled.encode("utf-8"))
@@ -187,7 +247,7 @@ def run_one(args, get_harness, path):
             entry = path if is_module else tmp
             cmd = [args.zipp, subcmd, entry]
             if harness_src is not None:
-                hfd, hf = tempfile.mkstemp(suffix=".js", dir=os.path.dirname(path))
+                hfd, hf = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=".js", dir=os.path.dirname(path))
                 os.write(hfd, harness_src.encode("utf-8"))
                 os.close(hfd)
                 cmd.append(hf)
@@ -203,7 +263,7 @@ def run_one(args, get_harness, path):
         try:
             if hf: os.remove(hf)
         except OSError: pass
-    return (verdict, sig, path)
+    return (verdict, sig, job)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -214,37 +274,58 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--timeout", type=int, default=20)
     ap.add_argument("--show-fails", type=int, default=25)
-    ap.add_argument("--dump-fails", default="", help="write sorted FAIL relpaths to this file (exact regression diffs)")
+    ap.add_argument("--dump-fails", default="", help="write sorted FAIL ids ('relpath [mode]') to this file (exact regression diffs)")
+    ap.add_argument("--include-intl402", action="store_true",
+                    help="also run test/intl402 (ECMA-402). Excluded by default: it has its own baseline")
+    ap.add_argument("--no-staging", action="store_true",
+                    help="skip test/staging (INTERPRETING.md says it should be run; this opts out)")
     a = ap.parse_args()
     root = os.path.join(a.t262, a.sub)
     files = []
     for dp, _, fns in os.walk(root):
-        if os.sep + "intl402" in dp or os.sep + "staging" in dp:
+        norm = dp.replace(os.sep, "/")
+        if "/intl402" in norm and not a.include_intl402:
+            continue
+        if "/staging" in norm and a.no_staging:
             continue
         for fn in fns:
+            if fn.startswith(TMP_PREFIX):
+                continue
             if fn.endswith(".js") and not fn.endswith("_FIXTURE.js"):
                 files.append(os.path.join(dp, fn))
     files.sort()
     if a.limit:
         files = files[: a.limit]
+    # One JOB per required execution: an unflagged test contributes both a
+    # sloppy and a strict run (INTERPRETING.md), so the totals below count
+    # executions, not files.
+    jobs = []
+    for p in files:
+        try:
+            flags = parse_frontmatter(read_source(p, a.t262))["flags"]
+        except Exception:
+            flags = []
+        for mode in modes_for(flags):
+            jobs.append((p, mode))
     get_harness = load_harness(os.path.join(a.t262, "harness"))
     totals = collections.Counter()
     by_cat = collections.defaultdict(collections.Counter)
     fail_sigs = collections.Counter()
-    n = len(files)
-    print(f"running {n} tests with {a.jobs} workers …", flush=True)
+    n = len(jobs)
+    print(f"running {n} executions ({len(files)} files) with {a.jobs} workers …", flush=True)
     fail_paths = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
-        for i, (verdict, sig, path) in enumerate(
-            ex.map(lambda p: run_one(a, get_harness, p), files)
+        for i, (verdict, sig, job) in enumerate(
+            ex.map(lambda j: run_one(a, get_harness, j), jobs)
         ):
+            path, mode = job
             totals[verdict] += 1
             rel = os.path.relpath(path, os.path.join(a.t262, "test"))
             cat = os.sep.join(rel.split(os.sep)[:3])
             by_cat[cat][verdict] += 1
             if verdict == "FAIL":
                 fail_sigs[sig] += 1
-                fail_paths.append(rel.replace(os.sep, "/"))
+                fail_paths.append(f"{rel.replace(os.sep, '/')} [{mode}]")
             if (i + 1) % 2000 == 0:
                 print(f"  … {i+1}/{n}", flush=True)
     if a.dump_fails:
@@ -252,9 +333,11 @@ def main():
             fh.write("\n".join(sorted(fail_paths)) + "\n")
         print(f"wrote {len(fail_paths)} FAIL relpaths to {a.dump_fails}")
     p, f, s = totals["PASS"], totals["FAIL"], totals["SKIP"]
-    ran = p + f
+    # SKIPs stay in the denominator: a change that made 500 tests unreadable
+    # must not be able to RAISE the reported pass rate.
+    ran = p + f + s
     print(f"\n==== test262 ({a.sub}) ====")
-    print(f"PASS {p}  FAIL {f}  SKIP {s}   pass-rate {100*p/ran:.1f}% of {ran} run\n")
+    print(f"PASS {p}  FAIL {f}  SKIP {s}   pass-rate {100*p/ran:.1f}% of {ran} executions\n")
     print("worst categories (by FAIL count):")
     for cat, c in sorted(by_cat.items(), key=lambda kv: -kv[1]["FAIL"])[:20]:
         r = c["PASS"] + c["FAIL"]
