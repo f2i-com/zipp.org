@@ -190,15 +190,30 @@ pub(crate) extern "win64" fn jit_str_substring(
         Value::from_bits(unsafe { *(packed_args as *const u64) }),
         Value::from_bits(unsafe { *((packed_args as *const u64).add(1)) }),
     );
-    if !a.is_int() || !b.is_int() {
+    // Int OR an exactly-integral double. Accepting only Int-tagged values was a
+    // deopt storm: the memory path deliberately keeps `Mul` off its integer fast
+    // path (hot integer multiplies overflow i32), so an ordinary `s.substring(0,
+    // n * 2)` hands this a DOUBLE and every call bailed — 150 deopts in
+    // markdown-render, enough to evict the region permanently.
+    let as_i64 = |v: Value| -> Option<i64> {
+        if v.is_int() {
+            Some(v.as_int() as i64)
+        } else if v.is_number() {
+            let d = v.as_f64();
+            (d.fract() == 0.0 && d.abs() < 9.007_199_254_740_992e15).then_some(d as i64)
+        } else {
+            None
+        }
+    };
+    let (Some(ax), Some(bx)) = (as_i64(a), as_i64(b)) else {
         return crate::codegen::SELF_CALL_DEOPT;
-    }
+    };
     vm.heap.flatten(r.heap_index());
     let len = match vm.heap.get(r.heap_index()) {
         crate::heap::HeapObj::Str(js) if js.is_ascii() => js.units() as i64,
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
-    let (mut x, mut y) = (a.as_int() as i64, b.as_int() as i64);
+    let (mut x, mut y) = (ax, bx);
     if is_slice != 0 {
         // slice: negative counts from the end, then clamp; empty if start >= end.
         if x < 0 { x += len; }
