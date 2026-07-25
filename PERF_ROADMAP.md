@@ -761,6 +761,62 @@ The `IterNext` admission was reverted rather than kept: it is inert for the shap
 it was written for, and unexercised codegen that some future region shape reaches
 is exactly the B9 failure mode.
 
+### B16 — Where the JIT actually reaches, per bench
+
+Census with `ZIPP_JITLOG=1` (`bench/tiers.sh` extended). Useful because "the JIT
+is worth 5x" is only true where it runs:
+
+```text
+bench                   INT  MEM black callmix deopts
+parse-large-js            1    8     0     0      0
+json-large                1    5     0     0    101
+markdown-render           4    7     0     0      0
+map-set-heavy             0    0     2     8      0
+typedarray-math           1    8     0     0      0
+regex-log-scan            1    4     2     2     64
+class-prototype-hot       1    3     0     0      0
+async-promise-chain       0    1     3     1      0
+polymorphic-objects       0    7     2     0    131
+sparse-array              0    8     1     0    128
+```
+
+**map-set-heavy compiles NOTHING** — all eight loop regions are declined by the
+call-mix gate. Its JIT time (890ms) equals its interpreter time (876ms). Same
+story for async-promise-chain (one region, three blacklisted).
+
+The obvious move — relax the gate — was tried and reverted: it gives
+map-set-heavy 6% but costs async-promise-chain a reproducible 8%, netting zero.
+The gate is right that a region whose calls always fall back is not worth
+compiling. The correct order is the one the whitelist already encodes: give the
+method an INTRINSIC first, then whitelist it. `Map.get`/`set`/`has` are the
+candidates for map-set-heavy.
+
+Sizing it honestly first, though: map-set-heavy is 890ms against node's 564ms —
+**1.58x, our best bench ratio, while running fully interpreted**. Its lookup is
+already O(1) (`CollIndex`). Compiling it perfectly caps out at ~326ms, and
+realistically recovers less than half. That is ~3% of the ~5.1s parity needs.
+
+The deopt columns were chased too. `polymorphic-objects` (ips 145, 182),
+`sparse-array` (ip 27) and `json-large` (ip 55) are **all `SetIndex`**, and both
+causes are deliberate:
+
+- a SPARSE write (`i > len`) resizes-with-holes, possibly hugely, and the
+  helper deopts so the allocation happens in the interpreter where a panic
+  unwinds through normal Rust rather than across an `extern "win64"` boundary;
+- a NEW key on a plain object is a shape change, which reallocates `vals` and
+  invalidates the inline caches that address values through `vals_ptr + slot`.
+
+Neither is a bug, but each costs 64+ deopts and then an eviction with
+`retry=false`, so the region is lost to the interpreter for the whole run. The
+tractable half is the sparse write: handling a SMALL gap inline (push a bounded
+number of holes) would keep those regions alive without reintroducing the
+unbounded-allocation hazard. The new-key half needs the inline caches to stop
+caching raw `vals` pointers, which is the same property-storage item as B1/B3.
+
+Sizing, so nobody starts here expecting a lot: `sparse-array` is 163ms against
+node's 50ms, and `polymorphic-objects` 722ms against 288ms. Recovering both
+evicted regions perfectly is worth ~2-3% of the parity gap.
+
 ### B8 — CORRECTED: the regex ENGINE is not the problem
 
 This section previously said regex was "41.8% of the remaining gap, and not
