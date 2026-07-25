@@ -356,7 +356,83 @@ be the first half of it.
 - [ ] **B6.1+** Moving young-generation collector over a tagged-index heap.
   **Effort:** XL. **Risk:** highest in the document.
 
-### B9 — Cold-branch side exits — IMPLEMENTED, opt-in, does NOT measure
+### B10 — Measured backlog from the 2026-07-25 agent hunt
+
+25 agents: six subsystem hunts, each finding independently re-measured by a
+verifier that wrote its own benchmark and tried to refute it. 213 microbenchmarks,
+every row with an in-file control and 2+ runs. Ranked by (impact x confidence) /
+effort. **Nothing here clears 5% geomean alone** — that is the honest headline.
+
+**B10.1 — Answer a HOLE inline in the array JIT `HasProp` (biggest single item).**
+Phase split of sparse-array (zipp 299ms / node 52ms): the `if (i in holey)` loop
+is **147ms vs 12ms = 55% of that bench's entire gap**. Measured 29.1 ns/elem vs
+8.75 for the same loop on a packed array (node 0.88). `codegen/region_mem.rs:585`
+already answers `true` call-free for a present element but routes every HOLE to
+`jit_has_property` -> `has_property_jit` (`vm/values.rs:867`), which walks the
+prototype chain and allocates a transient key String. Fix: on a pinned array with
+the existing `array_proto_has_index` protector clear and no `arr_props` overlay,
+emit `false` inline. **Note this is where the old T0.3 went wrong** — it added the
+fast path to the *helper*, measured nothing, and was reverted; the helper is not
+the layer that costs. **Effort M. Estimated geomean -4.8% (+/-1.5).**
+
+**B10.2 — Plain-object arms in `jit_get_index` / `jit_set_index`.**
+`vm/helpers_misc.rs:264` rejects every string key and `:317` deopts on every
+non-Array/Str receiver, so `o[k]` is never JIT-compiled AND four deopts evict the
+enclosing region. Dict-shape read 52.8ns JIT / 48.6 NOJIT / node 3.25 — the JIT is
+a net loss. Verified eviction sites: json-large `fn7` ip65 is `for (var k in v)
+walk(v[k])`; polymorphic `fn0 [132]`/`[167]`. The interpreter already has the
+correct path at `vm/indexing_date.rs:66-95` to mirror. **Effort M per part.
+~3% geomean for read + write + GetIndexConcat.**
+
+**B10.3 — Admit `CellSet`/`UpvalSet` to the region JIT.** A loop writing a
+CAPTURED local costs 26.3-35.0 ns/iter vs 2.67 for the identical loop over a
+non-captured local (node shows no penalty). `codegen/region_admit.rs:153-155`
+admits the reads and says outright that the writes "keep declining". **These are
+markdown-render's ONLY region declines** — `[decline] CellSet at region [16,158]`.
+markdown is 3.99x and no other finding produced a lever for it. **Effort M.
+Caveat: microbenchmark ratio only, the markdown slice is unsized — size it first.**
+
+**B10.4 — for-of poisons the ENCLOSING region.** for-of 29.6 vs indexed 3.00
+ns/elem, but under `ZIPP_NOJIT=1` both cost the same (26.8 vs 26.9) — so the gap
+is entirely missing JIT coverage, not iterator-protocol cost.
+`codegen/region_admit.rs:197` rejects `GetIterator`/`IterPrime`/`IterNext`;
+`GetIterator` runs once per loop entry but sits in the enclosing region, so one
+for-of de-JITs the whole nest. Split it: admitting `GetIterator`+`IterPrime` alone
+un-poisons the nest and is low risk; `IterNext` + per-iteration
+`PushHandler`/`PopHandler` mutate frame state across a mid-region deopt and are
+not. **Effort M for the low-risk half. Bench exposure thin — only regex-log-scan
+has an enclosed for-of; size it first.**
+
+**B10.5 — for-in snapshot CONSTRUCTION.** 129 ns fixed per loop entry + 38.7 ns
+per key (node ~2.5 + ~0.1); `break` after one key on a 32-key object still costs
+820 ns. End-to-end ablation: polymorphic 811->737ms (-9.1%), sparse 316->270ms
+(-14.6%). **The obvious fix is wrong**: a per-shape enum cache does nothing here
+because all three real uses enumerate each object exactly once. Target the
+construction instead — `helpers_numeric.rs:233 spec_key_order` allocates two Vecs
+and re-parses every key, `enumerate.rs:440` clones each key, `:450` allocates a
+heap string, `:377` a heap Array, and ~70 ns/entry is a walk to `Object.prototype`
+that finds nothing. **Effort L, ceiling 3% geomean, realistically ~1.5%.**
+
+**B10.6 — Cheap S-effort items.** (a) `ToNum` is simply missing from the
+`region_admit.rs` whitelist and declines sparse-array's 54ms for-in phase.
+(b) `typeof` allocates its result string every time (`vm/dispatch.rs:890`) though
+`vm/access.rs:35` returns a `&'static str`; better still, peephole-fuse
+`TypeOf`+`StrictEq(const)` into a tag check. (c) Cache `promise_ctor_value()`'s
+per-call `get_prop(promise_proto,"constructor")` (`async_runtime.rs:1560`),
+invalidating on writes to `Promise.prototype.constructor` and the global binding.
+(d) `emit_misc.rs:57-61` already computes `cvttsd2si` and then does a
+`cvtsi2sd`/`ucomisd` round-trip only to detect NaN/Inf/huge — replace with a
+single sentinel compare; strictly fewer uops, and integral doubles get faster.
+(e) Box the `Combinator` variant of `HeapObj`: 112B -> 96B. Boxing `ObjMap`
+instead — the obvious guess — saves **nothing**, `Combinator` is what pins the size.
+
+**Refuted by the hunt, do not re-derive:** async/generator functions are NOT
+excluded from the JIT (identical `Math.imul` loops run at 3.00 ns/iter in sync,
+async and generator functions alike) — the async gap is entirely the promise
+runtime, and the claim to the contrary in earlier notes was wrong. Rewriting
+map-set-heavy's for-of as `.next()` loops made it SLOWER (1.33s vs 1.09s).
+
+### B9 — Cold-branch side exits### B9 — Cold-branch side exits — IMPLEMENTED, opt-in, does NOT measure
 
 `ZIPP_JIT_COLD_EXIT=1`. Correct and gate-green; off by default because it does
 not move `bench/real`.
