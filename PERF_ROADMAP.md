@@ -32,27 +32,28 @@ The failures are extremely concentrated — this is a short list, not a long tai
 `tools/test262-expected-failures.txt` is the checked-in baseline; a regression
 is a `diff`, not a remembered number.
 
-### Performance — geomean 4.20× slower than node
+### Performance — geomean 3.31× slower than node
 
 `bench/real/*.js`, best-of-7, output byte-identical to node.
 
 | bench | node | zipp | ratio |
 |---|---|---|---|
-| map-set-heavy | 609ms | 1287ms | 2.11× |
-| parse-large-js | 240ms | 759ms | 3.16× |
-| class-prototype-hot | 257ms | 811ms | 3.16× |
-| polymorphic-objects | 294ms | 1127ms | 3.83× |
-| json-large | 227ms | 925ms | 4.07× |
-| typedarray-math | 165ms | 677ms | 4.10× |
-| async-promise-chain | 310ms | 1345ms | 4.34× |
-| markdown-render | 416ms | 1137ms | 2.73× |
-| sparse-array | 45ms | 412ms | 9.16× |
-| regex-log-scan | 411ms | 4765ms | 11.59× |
+| map-set-heavy | 607ms | 977ms | 1.61× |
+| async-promise-chain | 333ms | 794ms | 2.38× |
+| json-large | 232ms | 556ms | 2.40× |
+| polymorphic-objects | 299ms | 807ms | 2.70× |
+| parse-large-js | 237ms | 692ms | 2.92× |
+| class-prototype-hot | 260ms | 777ms | 2.99× |
+| markdown-render | 236ms | 942ms | 3.99× |
+| typedarray-math | 170ms | 696ms | 4.09× |
+| sparse-array | 52ms | 286ms | 5.50× |
+| regex-log-scan | 411ms | 3354ms | 8.16× |
 
 **Run-to-run variance is ±10–17%** — node's own `map-set` time has ranged
 609–966ms and `markdown` 231–416ms across runs on the same machine. A
 single-row move under ~10% is noise; re-run before attributing it to a change.
-Track the geomean, which has moved 4.77× → 4.20× over the last campaign.
+Track the geomean, which has moved 4.77× → 4.20× → **3.31×** (the last step
+being the mimalloc global allocator plus the string-receiver borrow).
 
 Startup is ~1.9× faster than node (30ms vs 58ms).
 
@@ -101,15 +102,25 @@ Isolated microbenchmarks (`zipp`, absolute ns/op — V8's own figures for these
 are low-nanosecond, but its loops are partly dead-code-eliminated, so treat
 them as a floor rather than a target):
 
-| operation | zipp | where it hurts |
+| operation | zipp | was (system alloc) | where it hurts |
+|---|---|---|---|
+| add a dynamic key | **197 ns** | 530 ns | polymorphic |
+| build a 4-property object literal | **170 ns** | 513 ns | json, parse, poly, class |
+| `str.indexOf` on an 880-char string | **137 ns** | 240 ns | markdown, parse |
+| `for-in` per key | **72 ns** | 180 ns | json (25% of `walk`), sparse, poly |
+| `Object.keys` per key | **53 ns** | 127 ns | json, markdown |
+| property read `o.a` | **17 ns** | 41 ns | everything |
+| `s.charCodeAt(i)` in a JIT'd loop | **1.7 ns** | 1.7 ns | already at parity |
+
+The object-construction ladder that found the allocator (per-property marginal
+cost, so the first row includes the three `Vec` first-allocations):
+
+| | system alloc | mimalloc |
 |---|---|---|
-| build a 4-property object literal | **513 ns** | json, parse, poly, class |
-| add a dynamic key | **530 ns** | polymorphic |
-| `for-in` per key | **180 ns** | json (25% of `walk`), sparse, poly |
-| `Object.keys` per key | **127 ns** | json, markdown |
-| property read `o.a` | **41 ns** | everything |
-| `str.indexOf` on an 880-char string | **240 ns** | markdown, parse |
-| `s.charCodeAt(i)` in a JIT'd loop | **1.7 ns** | already at parity |
+| `{}` | 26 ns | 26 ns |
+| `{a}` | 316 ns | **88 ns** |
+| `{a..d}` | 434 ns | **134 ns** |
+| `{a..h}` | 896 ns | **278 ns** |
 
 Three architectural causes, in order of cost:
 
@@ -277,8 +288,10 @@ be the first half of it.
   4-property literal at 513 ns total, most of it *construction* (the three
   `Vec` first-allocations plus the key `String`s) rather than collection —
   and a nursery does not fix construction. **B1 is likely to remove more of
-  this than a nursery would.** Do not start B6 until a profiler attributes
-  the remaining cost to GC. **Effort:** S (measurement). **This is a hard gate
+  this than a nursery would**, and the mimalloc switch already took the
+  4-property literal from 513 ns to 170 ns — i.e. two thirds of what looked
+  like "GC pressure" was allocator cost, not collection. Do not start B6 until
+  a profiler attributes the remaining cost to GC. **Effort:** S (measurement). **This is a hard gate
   on the rest of B6.**
 - [ ] **B6.1+** Moving young-generation collector over a tagged-index heap.
   **Effort:** XL. **Risk:** highest in the document.

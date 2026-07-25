@@ -42,21 +42,21 @@ be constructed at all (`vm/intl.rs:436`).
 `tools/test262-expected-failures.txt` is the checked-in baseline, so a
 regression is a diff rather than a remembered number.
 
-**Performance — geomean 4.2× slower than node (V8)** on the ten real-world
+**Performance — geomean 3.3× slower than node (V8)** on the ten real-world
 benchmarks in `bench/real/`, best-of-7, every output byte-identical to node:
 
 | bench | node | zipp | ratio |
 |---|---|---|---|
-| map-set-heavy | 811ms | 1424ms | 1.76× |
-| class-prototype-hot | 262ms | 808ms | 3.08× |
-| parse-large-js | 245ms | 791ms | 3.23× |
-| json-large | 256ms | 906ms | 3.54× |
-| typedarray-math | 182ms | 699ms | 3.84× |
-| polymorphic-objects | 295ms | 1136ms | 3.85× |
-| async-promise-chain | 311ms | 1349ms | 4.34× |
-| markdown-render | 248ms | 1180ms | 4.76× |
-| sparse-array | 49ms | 417ms | 8.51× |
-| regex-log-scan | 438ms | 4706ms | 10.74× |
+| map-set-heavy | 607ms | 977ms | 1.61× |
+| async-promise-chain | 333ms | 794ms | 2.38× |
+| json-large | 232ms | 556ms | 2.40× |
+| polymorphic-objects | 299ms | 807ms | 2.70× |
+| parse-large-js | 237ms | 692ms | 2.92× |
+| class-prototype-hot | 260ms | 777ms | 2.99× |
+| markdown-render | 236ms | 942ms | 3.99× |
+| typedarray-math | 170ms | 696ms | 4.09× |
+| sparse-array | 52ms | 286ms | 5.50× |
+| regex-log-scan | 411ms | 3354ms | 8.16× |
 
 Startup is ~1.9× faster than node (30ms vs 58ms — no snapshot to load).
 
