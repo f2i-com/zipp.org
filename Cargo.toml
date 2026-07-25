@@ -1,22 +1,20 @@
-# ZIPP language — standalone workspace.
-# v0 brings up a working vertical slice: source -> lex -> parse -> typecheck ->
-# bytecode -> VM, plus an OPTIONAL zk-STARK proving profile over the VM trace.
+# zipp — a clean-sheet JavaScript engine.
 #
-# Heavier backends from PLAN.md (LLVM/PGO native, WASM-contract, full oxc/swc
-# frontend, parallel scheduler, fast stdlib) are roadmap — see PLAN.md.
+# `crates/zipp-vm` is the project: a NaN-boxed, explicit-frame register VM with
+# per-call-site inline caches and a native x86-64 OSR JIT. `zipp-cli` is a thin
+# `zipp js <file.js>` front end over it, and `regress-fork` is the ECMAScript
+# regex engine it depends on.
+#
+# The workspace previously carried a separate ahead-of-time language (`zippc`
+# plus Cranelift/LLVM/WASM/zk back ends and a TypeScript frontend). That effort
+# predates the engine and the objective moved; those crates were removed rather
+# than left to rot alongside code they no longer share anything with.
 [workspace]
 resolver = "2"
 members = [
-    "crates/zippc",     # compiler core + register VM (lexer, ast, parser, check, ir, vm)
-    "crates/zipp-rt",   # shared native runtime: allocator + conservative GC (rlib + staticlib)
-    "crates/zipp-zk",   # OPTIONAL zk-STARK profile: Winterfell prover/verifier over the VM trace
-    "crates/zipp-jit",  # OPTIONAL native backend: Cranelift JIT for the scalar subset (tier-0)
-    "crates/zipp-llvm", # OPTIONAL release tier: emit LLVM IR, compile with clang -O3
-    "crates/zipp-wasm", # OPTIONAL contract profile: emit gas-metered WebAssembly
-    "crates/zipp-ts",   # OPTIONAL TypeScript frontend: parse .ts with oxc, lower the subset
-    "crates/zipp-vm",   # dynamic JS engine: explicit-frame register VM (recursion in an explicit frame stack, not the native stack) + native x86-64 OSR JIT — `zipp js`
-    "crates/zipp-cli",  # `zipp run [--prove] [--jit|--llvm|--wasm] file.zipp` + `zipp js file.js`
-    "crates/regress-patched", # vendored regress 0.11.1 + upstream-bug patches (see its VENDORED.md); wired via [patch.crates-io]
+    "crates/zipp-vm",      # the JavaScript engine: register VM + native x86-64 OSR JIT
+    "crates/zipp-cli",     # `zipp js file.js` / `zipp mjs file.mjs`
+    "crates/regress-fork", # our fork of regress 0.11.1 — the regex engine (see its FORK.md)
 ]
 
 [workspace.package]
@@ -25,24 +23,15 @@ edition = "2021"
 license = "Apache-2.0"
 
 # Shared dependency versions referenced via `.workspace = true` (one resolved
-# copy each). `rustc-hash` is the JS engine's fast hasher; `dynasm`/`dynasmrt`
-# back its optional native x86-64 JIT.
+# copy each). `rustc-hash` is the engine's fast hasher; `dynasm`/`dynasmrt` back
+# its optional native x86-64 JIT.
 [workspace.dependencies]
 rustc-hash = "2"
 dynasm = "2.0"
 dynasmrt = "2.0"
 
-# Vendored regress 0.11.1 with upstream-bug patches (scoped ignoreCase for
-# \p/\b/backrefs, duplicate named-group backreference participation,
-# Script=Unknown). See crates/regress-patched/VENDORED.md.
-[patch.crates-io]
-regress = { path = "crates/regress-patched" }
-
 [profile.release]
 opt-level = 3
-# `--prove` runs in release: Winterfell's per-constraint degree check is a
-# debug_assert, and selector-gated AIR constraints look like degree-0 polys on
-# traces that don't exercise every opcode. Release also makes proving fast.
 lto = false
 # Panics are internal bugs, never normal control flow (JS errors propagate as
 # `Result`/`Thrown`). Aborting lets the JIT's per-self-call `catch_unwind` at the

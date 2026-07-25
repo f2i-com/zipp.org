@@ -1,19 +1,41 @@
-# Vendored: regress 0.11.1 (patched)
+# zipp-regress — our fork of regress 0.11.1
 
-- **Upstream**: `regress` 0.11.1 from crates.io
-  (https://github.com/ridiculousfish/regress), copied verbatim from
-  `~/.cargo/registry/src/index.crates.io-*/regress-0.11.1/`
-  (minus `Cargo.lock`, `Cargo.toml.orig`, and the registry's dangling
-  `[profile.release]` section in the normalized `Cargo.toml`).
-- **Why vendored**: three upstream correctness bugs hit by test262
-  (`built-ins/RegExp/regexp-modifiers`, `named-groups`, `property-escapes`).
-  Wired via `[patch.crates-io] regress = { path = "crates/regress-patched" }`
-  in the workspace root `Cargo.toml`; zipp-vm keeps depending on
-  `regress = { version = "0.11", features = ["utf16"] }`.
-- **Re-upgrading**: when bumping regress, re-apply the three patches below (or
-  drop whichever has been upstreamed) and regenerate `unicodetables_unknown.rs`.
+The ECMAScript regex engine. This is a FORK, not a vendored copy waiting to be
+dropped: `zipp-vm` calls `Regex::from_unicode_byteopt` (`src/api.rs`), which
+does not exist upstream, so the crates.io crate does not compile against this
+code at all. On top of that it carries three correctness patches for bugs
+test262 hits (`built-ins/RegExp/regexp-modifiers`, `named-groups`,
+`property-escapes`).
 
-All patches are intended to be upstreamable. `cargo test -p regress` passes.
+## Why not a different crate
+
+There is no substitute. ECMAScript regexes require backreferences and
+lookbehind, which rules out `regex` (rust-lang) — a finite-automata engine that
+deliberately supports neither in order to guarantee linear time. `fancy-regex`
+adds both but implements its own dialect, not ES semantics: no `/v` unicode
+sets, different property-escape handling, and none of the `lastIndex`/sticky
+protocol. `regress` is the only Rust crate written to the ECMAScript grammar,
+which is why it was chosen. Replacing it means writing an engine — that is
+Stage 5A of PERF_ROADMAP.md, and it is also where the regex benchmark's ~10.7x
+gap has to be closed eventually.
+
+## Relationship to upstream
+
+- **Upstream**: `regress` 0.11.1 (https://github.com/ridiculousfish/regress),
+  Apache-2.0/MIT, copied from the crates.io registry.
+- **Wiring**: a plain path dependency from `zipp-vm` under the package name
+  `zipp-regress` (the *lib* is still `regress`, so `regress::` paths in the
+  engine are untouched). It used to be wired through `[patch.crates-io]`, which
+  pretended the dependency was the upstream crate; it is not.
+- **Upstream's own test corpus was removed** (`pcre_tests.rs`, `tests.rs`,
+  `unicode_property_escapes.rs`, `unicodesets.rs` — 1.2 MB): it is
+  PCRE/upstream-shaped coverage, and the 2,063 RegExp files in test262 exercise
+  the ES semantics this engine actually has to satisfy. The smaller targeted
+  suites (escape/pattern/replacement/syntax-error/anchored) are kept.
+- **Re-upgrading**: re-apply the three patches below (or drop whichever has been
+  upstreamed) and regenerate `unicodetables_unknown.rs`.
+
+All patches are intended to be upstreamable.
 
 ## Patch B1: effective (modifier-scoped) ignoreCase for `\p`/`\P`, `\b`/`\B`, and backreferences
 

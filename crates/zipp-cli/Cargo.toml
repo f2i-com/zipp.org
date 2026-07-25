@@ -3,29 +3,11 @@ name = "zipp-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "ZIPP command-line interface: `zipp run [--prove] file.zipp`"
+description = "zipp command-line interface: `zipp js <file.js>`"
 
 [[bin]]
 name = "zipp"
 path = "src/main.rs"
 
-# The zk-STARK proving profile, the Cranelift JIT, and the LLVM release tier are
-# all OPTIONAL (on by default). `--no-default-features` drops the heavy deps
-# (Winterfell, Cranelift); the LLVM tier itself has no build-time dependency
-# (it shells out to clang), so it's cheap to keep.
-[features]
-default = ["zk", "jit", "llvm", "wasm", "ts"]
-zk = ["dep:zipp-zk"]
-jit = ["dep:zipp-jit"]
-llvm = ["dep:zipp-llvm"]
-wasm = ["dep:zipp-wasm"]
-ts = ["dep:zipp-ts"]
-
 [dependencies]
-zippc = { path = "../zippc" }
-zipp-zk = { path = "../zipp-zk", optional = true }
-zipp-jit = { path = "../zipp-jit", optional = true }
-zipp-llvm = { path = "../zipp-llvm", optional = true }
-zipp-wasm = { path = "../zipp-wasm", optional = true }
-zipp-ts = { path = "../zipp-ts", optional = true }
 zipp-vm = { path = "../zipp-vm" }
