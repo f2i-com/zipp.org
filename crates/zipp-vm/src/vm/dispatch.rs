@@ -5805,6 +5805,8 @@ impl<'p> Vm<'p> {
             math_unary: jit_math_unary as usize,
             math_two: jit_math_two as usize,
             cell_get: jit_cell_get as usize,
+            cell_set: jit_cell_set as usize,
+            upval_set: jit_upval_set as usize,
             upval_get: jit_upval_get as usize,
             forin_live: jit_forin_live as usize,
             has_property: jit_has_property as usize,

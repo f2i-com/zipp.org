@@ -545,6 +545,35 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::CellSet { cell, src } => {
+                // Per-op captured-cell write (jit_cell_set). Unconditional — a
+                // cell is one heap slot and the store cannot fail, so unlike the
+                // reads there is no TDZ sentinel to test. No alloc / no user
+                // code, so no r13/r14/TA refetch.
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(cell)]        // cell Value bits
+                    ; mov r8, [rbx + dreg(src)]          // value bits
+                    ; mov rax, QWORD heap.cell_set as i64
+                    ; call rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::UpvalSet { idx, src } => {
+                // Per-op upvalue write; resolves the running closure from the TOP
+                // frame exactly as UpvalGet does. Bails on a malformed closure.
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov edx, idx as i32                // upvalue index
+                    ; mov r8, [rbx + dreg(src)]          // value bits
+                    ; mov rax, QWORD heap.upval_set as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // malformed closure → interp
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::UpvalGet { dst, idx } => {
                 // Per-op upvalue read (jit_upval_get resolves the running closure
                 // from the TOP frame). Same no-hoist soundness as CellGet.

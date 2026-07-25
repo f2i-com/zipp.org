@@ -153,6 +153,12 @@ pub(crate) fn region_can_compile(
             // pinned-pointer (r13/r14/TA) re-fetch is needed. Writes (`CellSet`,
             // `CellSetChecked`, `UpvalSet`) are NOT admitted — they keep declining.
             Instr::CellGet { .. } | Instr::UpvalGet { .. } => {}
+            // Closure-cell / upvalue WRITES — same shape as the reads: one heap
+            // store, no TDZ check (that is CellSetChecked, still declined), no
+            // alloc, no user code. These used to decline, and one captured-local
+            // assignment took the whole enclosing region down with it — they are
+            // markdown-render's only region declines.
+            Instr::CellSet { .. } | Instr::UpvalSet { .. } => {}
             // `ForInLive` — the per-iteration for-in liveness check — MEM path via
             // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
             // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
@@ -519,6 +525,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) cell_get: usize,
     /// `UpvalGet` helper (upvalue idx → inner Value bits / TDZ-deopt sentinel).
     pub(crate) upval_get: usize,
+    pub(crate) cell_set: usize,
+    pub(crate) upval_set: usize,
     /// `ForInLive` helper (obj bits, key bits → Bool Value bits).
     pub(crate) forin_live: usize,
     /// `HasProp` (`in`) helper (key bits, obj bits → Bool Value bits / deopt).

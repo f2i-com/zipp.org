@@ -1333,6 +1333,59 @@ pub(crate) extern "win64" fn jit_cell_get(vm: *mut core::ffi::c_void, cell_bits:
     v.bits()
 }
 
+/// Win64 helper: write a captured cell (`CellSet`). A cell is one heap slot and
+/// the store is unconditional — no TDZ check (that is `CellSetChecked`), no
+/// allocation, no user code, no GC safe point — so it needs no pinned-pointer
+/// refetch, exactly like `jit_cell_get`. Always succeeds; returns 0.
+///
+/// Admitting the WRITE matters because one captured-variable assignment used to
+/// decline the entire enclosing region: a loop writing a captured local measured
+/// 26-35 ns/iteration against 2.7 for the identical loop over a non-captured
+/// local, and these are markdown-render's only region declines.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_cell_set(
+    vm: *mut core::ffi::c_void,
+    cell_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = Value::from_bits(cell_bits).heap_index();
+    vm.heap.cell_set(idx, Value::from_bits(val_bits));
+    0
+}
+
+/// Win64 helper: write one of the running closure's captured cells (`UpvalSet`).
+/// Resolves the closure from the TOP frame with the same reasoning as
+/// `jit_upval_get`, and bails on a malformed closure rather than unwinding
+/// across the FFI boundary. Returns 0, or `SELF_CALL_DEOPT`.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_upval_set(
+    vm: *mut core::ffi::c_void,
+    idx: u32,
+    val_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let cur_closure = match vm.frames.last() {
+        Some(f) => f.closure,
+        None => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    let cell = match vm.heap.get(cur_closure) {
+        crate::heap::HeapObj::Closure { upvalues, .. } => match upvalues.get(idx as usize) {
+            Some(&c) => c,
+            None => return crate::codegen::SELF_CALL_DEOPT,
+        },
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    vm.heap.cell_set(cell, Value::from_bits(val_bits));
+    0
+}
+
 /// Win64 helper: read one of the running closure's captured cells (`UpvalGet`).
 /// Resolves the closure from the TOP frame — the OSR region runs in place in
 /// that frame, and every helper call returns/pops before the next region op, so

@@ -406,6 +406,10 @@ pub struct HeapHelperAddrs {
     /// Helper for `UpvalGet` (resolves the running closure's k-th upvalue cell,
     /// then loads it). Same purity/TDZ contract as `cell_get`.
     pub upval_get: usize,
+    /// Helpers for `CellSet` / `UpvalSet` — a captured-cell WRITE. A plain heap
+    /// store: no TDZ check, no alloc, no user code, so no pinned refetch.
+    pub cell_set: usize,
+    pub upval_set: usize,
     /// Helper for `ForInLive` (per-iteration for-in liveness). Delegates to the
     /// shared `Vm::forin_live`, so it matches the interpreter byte-for-byte.
     /// May allocate transiently (key re-derivation) — GC-guarded internally.
@@ -463,6 +467,8 @@ impl HeapHelperAddrs {
             math_unary: self.math_unary,
             math_two: self.math_two,
             cell_get: self.cell_get,
+            cell_set: self.cell_set,
+            upval_set: self.upval_set,
             upval_get: self.upval_get,
             forin_live: self.forin_live,
             has_property: self.has_property,
