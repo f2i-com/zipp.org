@@ -1319,6 +1319,52 @@ pub(crate) fn compile_region_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                     continue;
                 }
+                // `m.get(k)` / `m.has(k)` / `s.has(v)` intrinsic. The receiver
+                // kind is checked in the helper (a wrong kind deopts), so a
+                // same-named method on any other object is unaffected.
+                if argc == 1 && matches!(key, "get" | "has") {
+                    let bail = ops.new_dynamic_label();
+                    // 0 = Map.get, 1 = Map.has, 2 = Set.has. Map and Set are
+                    // distinguished at runtime, so `has` tries Map first and the
+                    // helper falls through to Set on a kind mismatch.
+                    let opsel: i32 = if key == "get" { 0 } else { 1 };
+                    let set_try = ops.new_dynamic_label();
+                    let coll_done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                          // vm
+                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
+                        ; mov r8, [rbx + dreg(arg_base)]        // key bits
+                        ; mov r9d, opsel
+                        ; mov rax, QWORD heap.coll_lookup as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; jne => coll_done
+                    );
+                    if opsel == 1 {
+                        // `has` on a Set: retry with op = 2 before deopting.
+                        dynasm!(ops
+                            ; => set_try
+                            ; mov rcx, rdi
+                            ; mov rdx, [rbx + dreg(obj)]
+                            ; mov r8, [rbx + dreg(arg_base)]
+                            ; mov r9d, 2
+                            ; mov rax, QWORD heap.coll_lookup as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                        );
+                    } else {
+                        dynasm!(ops ; => set_try ; jmp => bail);
+                    }
+                    dynasm!(ops
+                        ; => coll_done
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    continue;
+                }
                 if argc == 1 && key == "indexOf" {
                     let bail = ops.new_dynamic_label();
                     dynasm!(ops

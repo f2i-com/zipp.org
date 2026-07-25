@@ -2696,6 +2696,8 @@ impl<'p> Vm<'p> {
                                                         Some("push")
                                                             | Some("charCodeAt")
                                                             | Some("indexOf")
+                                                            | Some("get")
+                                                            | Some("has")
                                                     )
                                                 {
                                                     continue; // dedicated helpers
@@ -2707,6 +2709,25 @@ impl<'p> Vm<'p> {
                                                     )
                                                 {
                                                     continue; // dedicated helper
+                                                }
+                                                // Collection MUTATORS have no
+                                                // intrinsic yet, but a region full
+                                                // of them is still worth compiling
+                                                // for the surrounding loop work —
+                                                // map-set-heavy compiled NOTHING
+                                                // because of this. Named
+                                                // explicitly rather than by
+                                                // loosening the ratio, which was
+                                                // tried and cost
+                                                // async-promise-chain 8%. Only
+                                                // sites that never resolved a user
+                                                // function reach here, so a user
+                                                // `obj.set()` is unaffected.
+                                                if matches!(
+                                                    key,
+                                                    Some("set") | Some("delete") | Some("add")
+                                                ) {
+                                                    continue;
                                                 }
                                                 if (*argc == 1 || *argc == 2)
                                                     && key.is_some_and(|k| {
@@ -5867,6 +5888,7 @@ impl<'p> Vm<'p> {
             cell_get: jit_cell_get as usize,
             str_index_of: crate::vm::helpers_misc::jit_str_index_of as usize,
             str_substring: crate::vm::helpers_misc::jit_str_substring as usize,
+            coll_lookup: crate::vm::helpers_misc::jit_coll_lookup as usize,
             cell_set: jit_cell_set as usize,
             upval_set: jit_upval_set as usize,
             get_index_concat: jit_get_index_concat as usize,

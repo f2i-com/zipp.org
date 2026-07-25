@@ -234,6 +234,58 @@ pub(crate) extern "win64" fn jit_str_substring(
     vm.ascii_slice_value(r.heap_index(), x as usize..y as usize).bits()
 }
 
+/// Win64 helper for the 1-argument Map/Set lookups — `m.get(k)`, `m.has(k)`,
+/// `s.has(v)`. `op` selects: 0 = Map.get, 1 = Map.has, 2 = Set.has.
+///
+/// These exist to unblock COMPILATION, not just to be fast. map-set-heavy
+/// compiled nothing at all: the call-mix gate declines a region whose calls
+/// always fall back to the generic helper, so all eight of its loop regions were
+/// rejected and the bench ran fully interpreted (JIT 890ms == interpreter 876ms).
+/// A method only earns a place on the gate's whitelist once it has a dedicated
+/// helper, which is what this is.
+///
+/// Lookup itself was already O(1) (`coll_find` builds a `CollIndex` past a
+/// threshold); what this removes is the dispatch chain, exactly as for the
+/// string intrinsics. Anything that is not the expected collection kind returns
+/// the deopt sentinel and the interpreter runs the real method.
+///
+/// # Safety
+/// `vm` is the live `Vm`; operands are raw Value bits from the reg file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_coll_lookup(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    key_bits: u64,
+    op: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let recv = Value::from_bits(recv_bits);
+    if !recv.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let idx = recv.heap_index();
+    let want_map = op == 0 || op == 1;
+    let kind_ok = match vm.heap.get(idx) {
+        crate::heap::HeapObj::Map { .. } => want_map,
+        crate::heap::HeapObj::Set(_) => !want_map,
+        _ => false,
+    };
+    if !kind_ok {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let found = vm.coll_find(idx, Value::from_bits(key_bits));
+    match op {
+        0 => match found {
+            Some(i) => match vm.heap.get(idx) {
+                crate::heap::HeapObj::Map { vals, .. } => vals[i].bits(),
+                _ => Value::UNDEFINED.bits(),
+            },
+            None => Value::UNDEFINED.bits(),
+        },
+        _ => Value::bool(found.is_some()).bits(),
+    }
+}
+
 /// Win64 helper for a generic `f(args…)` (`Call`) inside a compiled OSR region:
 /// the plain-call sibling of [`jit_call_method_ic`] (consults `ic_call`,
 /// `this = undefined`). r9 = (callee_reg<<16)|arg_base; same protocol otherwise.
