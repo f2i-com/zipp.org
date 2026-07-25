@@ -74,6 +74,23 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let idx = recv.heap_index();
+        // ── strings first ──
+        // A string receiver reaches the same `string_method` call further down,
+        // but only after a Temporal probe, `is_callable`, a realm lookup and a
+        // Boxed probe — each its own heap load, none of which a string can ever
+        // match (a string is not a number, a Temporal, callable, or a wrapper
+        // object). The `toString`/`valueOf`/`toLocaleString`/`toJSON` deferral
+        // above still runs first, so an overridden `String.prototype.toString` is
+        // unaffected; this is purely the same dispatch reached sooner.
+        //
+        // Worth it because string method calls are everywhere and the fixed
+        // dispatch cost dominated them: `s.indexOf(…)`, `s.slice(…)`,
+        // `s.toUpperCase()` all measured ~70-95ns per call against node's ~3ns,
+        // while `charCodeAt` and `length` — which have inline JIT fast paths and
+        // never reach here — were already at parity.
+        if matches!(self.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+            return self.string_method(idx, name, args);
+        }
         // Temporal receivers route to their own dispatch (so valueOf throws and
         // toString gives the ISO string, not the generic Object behavior).
         if matches!(self.heap.get(idx), HeapObj::Temporal { .. }) {

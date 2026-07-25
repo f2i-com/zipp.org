@@ -170,6 +170,45 @@ impl<'p> Vm<'p> {
         // Single-char index methods: read one char directly from the heap with NO
         // full-string clone (the clone below is O(n), so these would be O(n²) in a
         // per-char loop — `s.charCodeAt(i)` scanning is a very common idiom).
+        // ── no-clone search methods ──
+        // The generic path further down does `js.clone()` — a full copy of the
+        // RECEIVER — purely to release the `self.heap` borrow before it can
+        // allocate a result. These five allocate nothing (they return a number or
+        // a boolean), so they run under a plain immutable borrow of both
+        // operands. That clone was essentially the entire cost of a string method
+        // call: `s.indexOf(t)` on an 85-char subject measured ~90ns against
+        // node's ~3ns, while `charCodeAt`/`length` — which never reach here —
+        // were already at parity.
+        //
+        // Restricted to the shapes where byte offsets equal UTF-16 unit offsets
+        // and no coercion is observable: both operands already ASCII heap
+        // strings, and no second argument (`fromIndex`/`position` change the
+        // answer and go the general way). A RegExp argument can never match
+        // `HeapObj::Str`, so the `includes`/`startsWith`/`endsWith` TypeError
+        // still comes from the general path.
+        if args.len() <= 1
+            && arg0.is_heap()
+            && matches!(
+                name,
+                "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith"
+            )
+        {
+            if let (HeapObj::Str(hay), HeapObj::Str(ned)) =
+                (self.heap.get(idx), self.heap.get(arg0.heap_index()))
+            {
+                if hay.is_ascii() && ned.is_ascii() {
+                    let (hc, nc) = (hay.as_str_lossy(), ned.as_str_lossy());
+                    let (h, n): (&str, &str) = (&hc, &nc);
+                    return Ok(Some(match name {
+                        "indexOf" => Value::int(h.find(n).map_or(-1, |b| b as i32)),
+                        "lastIndexOf" => Value::int(h.rfind(n).map_or(-1, |b| b as i32)),
+                        "includes" => Value::bool(h.contains(n)),
+                        "startsWith" => Value::bool(h.starts_with(n)),
+                        _ => Value::bool(h.ends_with(n)),
+                    }));
+                }
+            }
+        }
         match name {
             "charCodeAt" => {
                 let i = self.to_integer_strict(arg0)?;
