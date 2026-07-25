@@ -259,7 +259,14 @@ impl<'p> Vm<'p> {
             HeapObj::Str(js) => (js.clone(), js.is_ascii()),
             _ => return Ok(None),
         };
-        let s: String = js_recv.to_lossy_string();
+        // BORROW the lossy view rather than copying it. `as_str_lossy` is
+        // `Cow::Borrowed` whenever the receiver is well-formed — i.e. always,
+        // outside lone-surrogate strings — so this turns a second full copy of
+        // the receiver into a pointer. Every string method reaching this point
+        // paid it: `s.indexOf(t)` on an 880-char subject was copying 880 bytes
+        // per call on top of the `js.clone()` above.
+        let s_cow = js_recv.as_str_lossy();
+        let s: &str = &s_cow;
         // JS positions/lengths are UTF-16 code units; `ascii` short-circuits the
         // walks (unit == byte). All three closures take the RECEIVER `s` only.
         let unit_len = |s: &str| -> usize {
@@ -669,7 +676,7 @@ impl<'p> Vm<'p> {
             "toWellFormed" => Ok(Some(if js_recv.is_wellformed() {
                 Value::heap(idx)
             } else {
-                self.alloc_str(s.clone())
+                self.alloc_str(s.to_string())
             })),
             // String.prototype.valueOf/toString return the string primitive itself
             // (used by a boxed String's valueOf/toString after unwrapping).
