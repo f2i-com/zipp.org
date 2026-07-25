@@ -729,6 +729,38 @@ correct and only the timing gave them away:
 call site (removing the division takes the same wrapper from 597ms to 65ms with
 zero deopts). That is the next thread to pull.
 
+### B15 — `for-of` is 28x node, and `IterNext` is NOT what blocks it
+
+`for (v of a)` over a plain array costs 113ms where the equivalent counted loop
+over the same array costs 16ms — 7x, in our own engine, on the most common loop
+form in modern JavaScript. node makes the two equal (4ms vs 3ms). Iterating a
+Map is 61x node.
+
+Half of it was the interpreter: each step ran a generic cascade of six separate
+`heap.get` probes (generator test, iterator-object test, tombstone scan,
+`flatten`, string-step test, length test) and then a full `get_index`. A direct
+dense-array read cut that to 74ms, falling through to the generic path for holes,
+sparse arrays and side-table-carrying arrays. Verified on 18 shapes including
+`Array.prototype[1]` shadowing a hole and mutation during iteration.
+
+The other half is that **every `for-of` region is declined outright by the JIT**.
+The obvious hypothesis — that `region_can_compile` lacks an `IterNext` arm — is
+WRONG, and was tried: admitting `IterNext` (with a helper that handles a dense
+array and deopts otherwise) changes nothing, because the actual decline is
+
+    [decline] PushHandler { catch_target: 44 } at region [32,43]
+    [decline] GetIterator { dst: 11, src: 11 } at region [24,50]
+
+`for-of` desugars to a try/finally so that `iterator.return()` runs on `break` or
+throw, and the region contains the `PushHandler` that installs it. Compiling a
+`for-of` body therefore needs EXCEPTION-HANDLER state in compiled code, not
+iterator support. That is a much larger item and it gates the remaining
+74ms → ~25ms.
+
+The `IterNext` admission was reverted rather than kept: it is inert for the shape
+it was written for, and unexercised codegen that some future region shape reaches
+is exactly the B9 failure mode.
+
 ### B8 — Regex engine (the single largest item)
 
 41.8% of the remaining gap, and not reachable by tuning the wrapper. `regress`
