@@ -50,15 +50,29 @@ pub(crate) fn load_toint32(ops: &mut dynasmrt::x64::Assembler, reg: u16, bail: d
         ; sub r10d, (INT_TAG_HI + 1) as i32      // 0x7FFA (bool tag)
         ; cmp r10d, 3                            // high16 ∈ [0x7FFA,0x7FFD] ⇒ not a number
         ; jbe => bail
-        // A double: accept an exact integral value; eax (the i64's low 32) IS
-        // its ToInt32. NaN/±Inf/|x|≥2^63 fail the round-trip (cvttsd2si yields
-        // the 0x8000… sentinel, which converts back to -2^63 ≠ x) → bail.
+        // A double. ToInt32 TRUNCATES toward zero, so a fractional value is
+        // perfectly representable — this used to demand an exactly-integral
+        // double and bail otherwise, which sent the single most common
+        // truncation idiom in JS (`(x * k) | 0`) to the interpreter on every
+        // iteration: 127ms vs 15ms per 3M ops, against node's 3ms.
+        //
+        // Truncate to i64 and take the low 32 bits. That IS ToInt32 for every
+        // |x| < 2^63: truncation toward zero followed by modulo 2^32, which is
+        // exactly what discarding the high half does — for fractional values
+        // (3.7 -> 3) and for large ones alike (5e9 -> 705032704, 2^31 ->
+        // -2147483648, 2^32 -> 0).
+        //
+        // The one case that must bail is `cvttsd2si` OVERFLOWING, which it
+        // signals with the 0x8000_0000_0000_0000 indefinite: NaN, ±Inf, and
+        // |x| >= 2^63. Their low 32 bits would be 0, which is right for NaN/±Inf
+        // by luck but wrong for e.g. 1e21 (-559939584), so all three go to the
+        // interpreter. A true -2^63 is folded in with them; harmless, it is the
+        // same value the sentinel denotes.
         ; movq xmm0, rax
-        ; cvttsd2si rax, xmm0                    // i64 trunc (NaN/±Inf → 0x8000…)
-        ; cvtsi2sd xmm1, rax
-        ; ucomisd xmm1, xmm0
-        ; jne => bail                            // fractional (or the NaN/Inf sentinel)
-        ; jp => bail                             // NaN (unordered)
+        ; cvttsd2si rax, xmm0                    // i64 trunc toward zero
+        ; mov r10, QWORD i64::MIN
+        ; cmp rax, r10
+        ; je => bail                             // NaN / ±Inf / |x| >= 2^63
         ; jmp => done
         ; => int_path
         // eax already holds the i32 payload (low 32 of the boxed Value).

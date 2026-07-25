@@ -212,7 +212,7 @@ impl<'p> Vm<'p> {
         start: u32,
         end: u32,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::LeafInlinePlan> {
-        use crate::codegen::{callee_leaf_ok, LeafInlinePlan};
+        use crate::codegen::{callee_leaf_ok, callee_leaf_ok_one_call, LeafInlinePlan};
         let mut plan = rustc_hash::FxHashMap::default();
         let caller = self.func(func_id as usize);
         let reg_window = caller.reg_count;
@@ -283,11 +283,48 @@ impl<'p> Vm<'p> {
             // The carved scratch window must hold the callee's whole register
             // file; the headroom (vs MAX_FRAMES recursion) is checked at the
             // region entry by `jit_regs_fits`.
-            let Some(body) = callee_leaf_ok(callee) else {
-                if log {
-                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (not leaf-eligible)");
+            // A plain leaf inlines directly. Otherwise try the WRAPPER shape: a
+            // body whose only disqualifier is one `Call`, whose own callee is a
+            // leaf. `function ri(n){ return (rnd()*n)|0; }` is the motivating case
+            // — 3.75M calls per run of the log-scan benchmark, and inlining `rnd`
+            // into `ri` did nothing on its own because the hot loop still called
+            // `ri` for real.
+            let mut nested = rustc_hash::FxHashMap::default();
+            let mut extra_regs = 0u16;
+            let mut nested_upvals: rustc_hash::FxHashMap<u16, u64> = rustc_hash::FxHashMap::default();
+            let body = match callee_leaf_ok(callee) {
+                Some(b) => b,
+                None => {
+                    let Some((outer, call_at)) = callee_leaf_ok_one_call(callee) else {
+                        if log {
+                            eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (not leaf-eligible)");
+                        }
+                        continue;
+                    };
+                    match self.splice_nested_leaf(fid, callee, &outer, call_at) {
+                        Some((flat, guard, inner_regs, inner_upvals)) => {
+                            nested.insert(call_at, guard);
+                            extra_regs = inner_regs;
+                            nested_upvals = inner_upvals;
+                            if log {
+                                eprintln!(
+                                    "[leaf] fn{func_id}@{ip} callee fn{fid} NESTED-INLINE \
+                                     (spliced at body ip {call_at}, +{inner_regs} regs)"
+                                );
+                            }
+                            flat
+                        }
+                        None => {
+                            if log {
+                                eprintln!(
+                                    "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                                     (wrapper's inner call not inlinable)"
+                                );
+                            }
+                            continue;
+                        }
+                    }
                 }
-                continue;
             };
             // Pre-resolve the numeric constants the body's `LoadConst` ops read
             // (callee_leaf_ok rejected any non-numeric constant).
@@ -308,16 +345,18 @@ impl<'p> Vm<'p> {
                     body.len()
                 );
             }
+            upvals.extend(nested_upvals);
             plan.insert(
                 ip,
                 LeafInlinePlan {
                     callee_bits,
                     callee_ver,
                     reg_window,
-                    callee_reg_count: callee.reg_count,
+                    callee_reg_count: callee.reg_count + extra_regs,
                     param_count: callee.param_count,
                     body,
                     consts,
+                    nested,
                     upvals,
                     cell_get: crate::vm::helpers_misc::jit_cell_get as usize,
                     cell_set: crate::vm::helpers_misc::jit_cell_set as usize,
@@ -449,6 +488,97 @@ impl<'p> Vm<'p> {
             plan.insert(ip, MethodInlinePlan { reg_window, win_top, shapes });
         }
         plan
+    }
+
+    /// Splice a wrapper's single inner call into a FLAT body: the inner callee's
+    /// ops replace the `Call`, with every inner register shifted above the outer
+    /// window so the two never alias, and the inner `Return` rewritten as a `Move`
+    /// into the call's `dst`.
+    ///
+    /// Returns `(flat_body, guard, inner_reg_count)`. `None` declines.
+    ///
+    /// v1 restrictions, all checked here: the inner call passes NO arguments (so
+    /// there is no argument binding to emit mid-body — the prologue's zero-fill
+    /// already leaves the whole inner window `undefined`, which is also the right
+    /// `this` for the strict callees inlining admits); the wrapper captures no
+    /// upvalues (the plan's `upvals` map is keyed by index, so two functions'
+    /// upvalues would collide); and the inner body is branch-free (its ops are
+    /// renumbered by the splice and v1 does not remap branch targets).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn splice_nested_leaf(
+        &self,
+        outer_fid: u32,
+        outer: &crate::bytecode::FuncProto,
+        outer_body: &[Instr],
+        call_at: usize,
+    ) -> Option<(Vec<Instr>, crate::codegen::NestedGuard, u16, rustc_hash::FxHashMap<u16, u64>)> {
+        use crate::codegen::{callee_leaf_ok, NestedGuard};
+        if !outer.upvalues.is_empty() {
+            return None;
+        }
+        let (callee_reg, dst, argc) = match outer_body[call_at] {
+            Instr::Call { callee, dst, argc, .. } => (callee, dst, argc),
+            _ => return None,
+        };
+        if argc != 0 {
+            return None;
+        }
+        // Resolve the wrapper's own call site from ITS live IC.
+        let (bits, ver, inner_fid, inner_closure) = self.ic_call_mono(outer_fid, call_at)?;
+        let inner = self.func(inner_fid as usize);
+        if inner.lexical_this || !inner.is_strict {
+            return None;
+        }
+        let inner_body = callee_leaf_ok(inner)?;
+        if inner_body.iter().any(|i| {
+            matches!(
+                i,
+                Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }
+            )
+        }) {
+            return None;
+        }
+        // Shift every inner register above the outer window.
+        let off = outer.reg_count;
+        let ret_src = match inner_body.last()? {
+            Instr::Return { src } => Some(*src + off),
+            Instr::ReturnUndefined => None,
+            _ => return None,
+        };
+        let mut flat: Vec<Instr> = outer_body[..=call_at].to_vec(); // keep the Call as the guard marker
+        for instr in &inner_body[..inner_body.len() - 1] {
+            flat.push(shift_leaf_regs(instr, off)?);
+        }
+        // The inner result becomes the wrapper's call destination.
+        flat.push(match ret_src {
+            Some(src) => Instr::Move { dst, src },
+            None => Instr::LoadUndefined { dst },
+        });
+        flat.extend_from_slice(&outer_body[call_at + 1..]);
+        // The spliced body's upvalue ops need the INNER closure's cells. Without
+        // this they fell back to a zero cell, deopted on every iteration and the
+        // call quietly re-ran in the interpreter — correct, but 10x slower than
+        // the plain call it replaced. The outer wrapper is required to capture
+        // nothing (checked above), so these indices own the map.
+        let mut upvals = rustc_hash::FxHashMap::default();
+        if !inner.upvalues.is_empty() {
+            if inner_closure == NO_CLOSURE {
+                return None;
+            }
+            let cidx = Value::from_bits(bits).heap_index();
+            let n_up = match self.heap.get(cidx) {
+                crate::heap::HeapObj::Closure { upvalues, .. } => upvalues.len(),
+                _ => return None,
+            };
+            if n_up < inner.upvalues.len() {
+                return None;
+            }
+            for i in 0..inner.upvalues.len() as u16 {
+                upvals.insert(i, Value::heap(self.closure_upvalue(cidx, i)).bits());
+            }
+        }
+        let guard = NestedGuard { callee_reg, bits, ver };
+        Some((flat, guard, inner.reg_count, upvals))
     }
 
     /// The last `GetIndex{dst:obj_reg, obj:arr}` in `code[start..ip]` (the array a
@@ -764,4 +894,52 @@ impl<'p> Vm<'p> {
         false
     }
 
+}
+
+/// Offset every REGISTER operand of a leaf-body instruction by `off`, so a
+/// spliced inner body occupies a window above the wrapper's own registers and the
+/// two can never alias. Returns `None` for anything outside the leaf subset —
+/// that is a decline, never a silent mis-shift, because a missed operand would be
+/// a wrong-register read.
+///
+/// Non-register fields (`idx`, `imm`, `name`, `argc`, `op`, `val`) are copied
+/// through: an upvalue index, a global slot and a constant index are not
+/// registers. `arg_base` IS a register (the base of a contiguous window).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn shift_leaf_regs(i: &Instr, off: u16) -> Option<Instr> {
+    let s = |r: u16| r + off;
+    Some(match *i {
+        Instr::LoadInt { dst, val } => Instr::LoadInt { dst: s(dst), val },
+        Instr::LoadConst { dst, idx } => Instr::LoadConst { dst: s(dst), idx },
+        Instr::LoadBool { dst, val } => Instr::LoadBool { dst: s(dst), val },
+        Instr::LoadUndefined { dst } => Instr::LoadUndefined { dst: s(dst) },
+        Instr::Move { dst, src } => Instr::Move { dst: s(dst), src: s(src) },
+        Instr::LoadGlobal { dst, idx } => Instr::LoadGlobal { dst: s(dst), idx },
+        Instr::StoreGlobal { idx, src } => Instr::StoreGlobal { idx, src: s(src) },
+        Instr::StoreGlobalStrict { idx, src } => Instr::StoreGlobalStrict { idx, src: s(src) },
+        Instr::Add { dst, a, b } => Instr::Add { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Sub { dst, a, b } => Instr::Sub { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Mul { dst, a, b } => Instr::Mul { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Div { dst, a, b } => Instr::Div { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Mod { dst, a, b } => Instr::Mod { dst: s(dst), a: s(a), b: s(b) },
+        Instr::AddInt { dst, a, imm, upd } => Instr::AddInt { dst: s(dst), a: s(a), imm, upd },
+        Instr::Neg { dst, a } => Instr::Neg { dst: s(dst), a: s(a) },
+        Instr::Bitwise { dst, a, b, op } => Instr::Bitwise { dst: s(dst), a: s(a), b: s(b), op },
+        Instr::Eq { dst, a, b } => Instr::Eq { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Ne { dst, a, b } => Instr::Ne { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Lt { dst, a, b } => Instr::Lt { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Le { dst, a, b } => Instr::Le { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Gt { dst, a, b } => Instr::Gt { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Ge { dst, a, b } => Instr::Ge { dst: s(dst), a: s(a), b: s(b) },
+        Instr::GetIndex { dst, obj, key } => Instr::GetIndex { dst: s(dst), obj: s(obj), key: s(key) },
+        Instr::CallMethod { dst, obj, name, arg_base, argc } => {
+            Instr::CallMethod { dst: s(dst), obj: s(obj), name, arg_base: s(arg_base), argc }
+        }
+        Instr::MathOp { dst, op, arg_base, argc } => {
+            Instr::MathOp { dst: s(dst), op, arg_base: s(arg_base), argc }
+        }
+        Instr::UpvalGet { dst, idx } => Instr::UpvalGet { dst: s(dst), idx },
+        Instr::UpvalSet { idx, src } => Instr::UpvalSet { idx, src: s(src) },
+        _ => return None,
+    })
 }

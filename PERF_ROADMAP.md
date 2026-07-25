@@ -663,6 +663,72 @@ particular regions aren't hot. Kept because it is strictly more admission for no
 cost, and because the shape it fixes is everywhere in real numeric code even
 though this bench set happens not to lean on it.
 
+### B13 — `x | 0` on a fractional double no longer deopts
+
+`load_toint32` demanded an *exactly integral* double and bailed otherwise. ToInt32
+truncates toward zero, so a fractional value is perfectly representable — the
+requirement was simply wrong, and it sent the most common truncation idiom in
+JavaScript to the interpreter on every iteration:
+
+    |0 on INTEGRAL double     15ms      (3M ops)
+    |0 on FRACTIONAL double  127ms      node: 3ms
+    after                     17ms
+
+The fix is also *cheaper* than what it replaced. Truncate to i64 and keep the low
+32 bits: that IS ToInt32 for every `|x| < 2^63`, covering fractional values
+(`3.7 → 3`) and large ones alike (`5e9 → 705032704`, `2^31 → -2147483648`,
+`2^32 → 0`). Only `cvttsd2si` OVERFLOWING needs a bail, which it signals with the
+`0x8000_0000_0000_0000` indefinite — NaN, ±Inf and `|x| ≥ 2^63`. No round-trip
+`cvtsi2sd`/`ucomisd` pair any more.
+
+**Watch the first attempt.** Requiring the truncation to fit *i32* looks
+equivalent and is not: the old code already handled large integral doubles by
+taking their low 32 bits, and narrowing to i32 range regressed typedarray-math
+**7.8x** (743ms → 5882ms) by deopting them instead. Caught because the bench
+suddenly showed 256 deopts. The lesson is that `load_toint32`'s accept set must
+only ever *grow*: it is on the hot path of every bitwise op in the engine.
+
+Incidentally it removed a pre-existing deopt source — typedarray-math went from
+256 deopts per run to **zero**, because its fractional values had been bailing all
+along.
+
+### B14 — Inlining through a wrapper (nested leaf inline)
+
+Closure inlining (B-closures, previous section) fixed `rnd()` but not the shape
+that actually appears:
+
+    function ri(n){ return (rnd() * n) | 0; }        // called 3.75M times
+
+`ri` inlines `rnd` happily, but the hot loop could not inline `ri`, because its
+body contains a `Call` and the leaf subset rejects that outright. So the call was
+still real. `callee_leaf_ok_one_call` now admits exactly one `Call`, and the
+planner splices the inner callee's body in at that index — registers shifted
+above the wrapper's window so the two never alias, the inner `Return` rewritten
+as a `Move` into the call's `dst`, and the whole thing behind its own
+`(bits, version)` identity guard whose miss jumps to the outer fallback.
+
+Measured on the wrapper shape, 3M iterations: **129-158ms → 17ms** for a plain
+inner, **200ms → 24ms** for a closure inner. v1 restrictions: the inner call
+passes no arguments, the wrapper captures nothing, and both bodies are
+branch-free (the splice renumbers ops without remapping branch targets).
+
+Two bugs worth recording, because both were *invisible* — the answers stayed
+correct and only the timing gave them away:
+
+1. The guard read `dreg(callee_reg)` directly. `callee_reg` is the wrapper's own
+   register number and had to go through the scratch-window mapping like every
+   other body operand. It therefore compared the wrong slot, missed every time,
+   and silently took the fallback — a correct real call. Zero test would ever
+   catch this; only the absent speedup did.
+2. The spliced closure's upvalue cells were never baked, so `UpvalGet` fell back
+   to cell `0`, hit the deopt sentinel and re-ran the whole call in the
+   interpreter — again correct, and ~10x slower than the plain call it replaced.
+
+**Still not reached:** the log-scan generator remains ~1.5s. Its `rnd` ends in
+`(… >>> 0) / 4294967296`, and something in that spliced body still bails at the
+call site (removing the division takes the same wrapper from 597ms to 65ms with
+zero deopts). That is the next thread to pull.
+
 ### B8 — Regex engine (the single largest item)
 
 41.8% of the remaining gap, and not reachable by tuning the wrapper. `regress`

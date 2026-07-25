@@ -267,6 +267,31 @@ pub(crate) const LEAF_MAX_REGS: u16 = 32;
 ///   so an effect that already ran would double-apply. (For v1 the only effect
 ///   admitted is `StoreGlobal*`; `SetProp`/`SetIndex` are NOT in the subset.)
 pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
+    leaf_ok_impl(callee, false).map(|(body, _)| body)
+}
+
+/// Like `callee_leaf_ok`, but admits ONE `Call` in the body and reports its
+/// index. Used for the nested (wrapper) inline: a one-line forwarder such as
+///
+/// ```text
+/// function ri(n){ return (rnd() * n) | 0; }
+/// ```
+///
+/// is not leaf-eligible — its body contains a `Call` — so a hot loop calling it
+/// paid a real call per iteration even once `rnd` itself became inlinable. The
+/// planner splices the inner callee's body in at that index behind its own
+/// identity guard.
+///
+/// The admitted `Call` must precede any committed effect, so that a guard miss
+/// can jump to the outer fallback (which re-runs the whole call) with nothing
+/// applied yet. The body must also be branch-free: the splice renumbers ops, and
+/// v1 does not remap branch targets.
+pub fn callee_leaf_ok_one_call(callee: &FuncProto) -> Option<(Vec<Instr>, usize)> {
+    let (body, call_at) = leaf_ok_impl(callee, true)?;
+    Some((body, call_at?))
+}
+
+fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>, Option<usize>)> {
     if callee.is_generator || callee.is_async {
         return None;
     }
@@ -321,6 +346,7 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
         )
     });
     let mut seen_effect = false;
+    let mut call_at: Option<usize> = None;
     for (i, instr) in code.iter().enumerate() {
         let is_last = i == code.len() - 1;
         match *instr {
@@ -358,6 +384,14 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
                 if seen_effect {
                     return None;
                 }
+            }
+            // ── the ONE nested call (wrapper inlining) ── admitted only for
+            // `callee_leaf_ok_one_call`. Deopt-capable (the identity guard can
+            // miss, and the spliced body can bail), so it obeys the effect rule;
+            // branch-free because the splice renumbers ops without remapping
+            // branch targets.
+            Instr::Call { .. } if allow_one_call && !branchy && !seen_effect && call_at.is_none() => {
+                call_at = Some(i);
             }
             // Buffered upvalue write — see `branchy` above. Deliberately does NOT
             // set `seen_effect`: nothing is committed to the cell until after the
@@ -446,7 +480,11 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
             }
         }
     }
-    Some(code)
+    // `callee_leaf_ok_one_call` requires the call it was asked to find.
+    if allow_one_call && call_at.is_none() {
+        return None;
+    }
+    Some((code, call_at))
 }
 
 /// Detect a loop-invariant `g.length` to hoist out of a memory-path region: a

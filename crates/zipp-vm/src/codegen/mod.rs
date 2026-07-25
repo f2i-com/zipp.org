@@ -234,6 +234,23 @@ pub struct LeafInlinePlan {
     /// documented as load-bearing.
     pub cell_get: usize,
     pub cell_set: usize,
+    /// Nested (wrapper) inline: body index of the spliced-in `Call` → the guard
+    /// that must hold for the spliced body to be the right one. See
+    /// `callee_leaf_ok_one_call`.
+    pub nested: FxHashMap<usize, NestedGuard>,
+}
+
+/// Identity guard for a nested inline. Same `(bits, version)` tuple the outer
+/// call guards, checked against the register the WRAPPER loaded its callee into.
+/// A miss jumps to the outer fallback, which re-runs the whole outer call — sound
+/// because the admitted nested call precedes any committed effect.
+#[derive(Clone, Copy)]
+pub struct NestedGuard {
+    /// The wrapper's OWN callee register number (the emitter maps it into the
+    /// scratch window, like every other body operand).
+    pub callee_reg: u16,
+    pub bits: u64,
+    pub ver: u32,
 }
 
 impl LeafInlinePlan {

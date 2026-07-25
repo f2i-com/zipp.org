@@ -320,9 +320,13 @@ pub(crate) fn emit_inline_leaf_call(
             Instr::Neg { dst: d, a } => {
                 let bail = ops.new_dynamic_label();
                 load_num_xmm(ops, rg(a), 1, bail);
+                // Sign-bit flip, not `0.0 - x`: `0.0 - 0.0` is `+0.0` under
+                // round-to-nearest, so negating zero lost the sign. Same defect
+                // as the region/regalloc emitters carried.
                 dynasm!(ops
-                    ; xorps xmm0, xmm0
-                    ; subsd xmm0, xmm1
+                    ; mov rax, QWORD (1u64 << 63) as i64
+                    ; movq xmm0, rax
+                    ; xorpd xmm0, xmm1
                 );
                 store_xmm(ops, rg(d));
                 emit_region_bail(ops, call_ip, bail, epilogue);
@@ -506,6 +510,33 @@ pub(crate) fn emit_inline_leaf_call(
             // the write is unconditional and one commit per index is enough.
             Instr::UpvalSet { idx, src } => {
                 upval_buf.insert(idx, rg(src));
+            }
+            // ── nested (wrapper) inline ── the spliced-in callee's body follows
+            // immediately in this same flat body; all this op emits is the
+            // identity guard for it. A miss jumps to the OUTER fallback, which
+            // re-runs the whole outer call: sound because `callee_leaf_ok_one_call`
+            // only admits this before any committed effect, and everything written
+            // so far lives in the scratch window.
+            Instr::Call { .. } => {
+                let g = plan
+                    .nested
+                    .get(&bi)
+                    .expect("callee_leaf_ok_one_call admitted a Call with no nested guard");
+                dynasm!(ops
+                    // `callee_reg` is the WRAPPER's own register number, so it
+                    // must go through the scratch-window mapping like every other
+                    // body operand. Reading the caller's slot instead made the
+                    // guard miss every time: results stayed correct (the fallback
+                    // is a real call) and the inline was silently never used.
+                    ; mov rax, [rbx + dreg(rg(g.callee_reg))]
+                    ; mov r10, QWORD g.bits as i64
+                    ; cmp rax, r10
+                    ; jne => fallback
+                    ; mov ecx, eax                   // heap index (low 32 of bits)
+                    ; mov edx, [r13 + rcx*4]         // live slot version
+                    ; cmp edx, DWORD g.ver as i32
+                    ; jne => fallback
+                );
             }
             // ── comparisons ── region_poly_eq / dcmp both emit their own bail
             // block internally (record CALL ip → epilogue).
@@ -726,9 +757,13 @@ pub(crate) fn emit_mi_body(
             Instr::Neg { dst: d, a } => {
                 let bail = ops.new_dynamic_label();
                 load_num_xmm(ops, rg(a), 1, bail);
+                // Sign-bit flip, not `0.0 - x`: `0.0 - 0.0` is `+0.0` under
+                // round-to-nearest, so negating zero lost the sign. Same defect
+                // as the region/regalloc emitters carried.
                 dynasm!(ops
-                    ; xorps xmm0, xmm0
-                    ; subsd xmm0, xmm1
+                    ; mov rax, QWORD (1u64 << 63) as i64
+                    ; movq xmm0, rax
+                    ; xorpd xmm0, xmm1
                 );
                 store_xmm(ops, rg(d));
                 emit_region_bail(ops, call_ip, bail, epilogue);
