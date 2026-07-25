@@ -920,6 +920,29 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             let n = vm.array_js_len.get(&idx).map_or(items.len(), |&n| n as usize);
             return len_value(n).bits();
         }
+        // `ta.length` in a region. A TypedArray's `length` is an ACCESSOR
+        // inherited from %TypedArray%.prototype (not an own exotic slot like an
+        // Array's), so this only answers directly while that accessor is
+        // provably the pristine built-in; anything else defers to the
+        // interpreter, which invokes the real getter.
+        //
+        // Without this arm `for (i = 0; i < ta.length; i++)` — the most common
+        // numeric-JS loop there is — missed here, deopted, and after
+        // OSR_DEOPT_LIMIT blacklisted the region for the life of the process:
+        // the identical kernel written with a constant bound ran ~57x faster.
+        HeapObj::TypedArray { buffer, length, .. } if key == "length" => {
+            let (buffer, length) = (*buffer, *length);
+            // A length-TRACKING view over a resizable buffer re-derives its
+            // length from the buffer, and a detached buffer reports 0 — both go
+            // to the interpreter so this stays a single unambiguous read.
+            if vm.ta_tracking.contains(&idx)
+                || matches!(vm.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. })
+                || !vm.ta_length_is_intrinsic(idx)
+            {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return len_value(length).bits();
+        }
         HeapObj::Str(s) if key == "length" => return len_value(s.units()).bits(),
         HeapObj::Cons { len, .. } if key == "length" => return len_value(*len).bits(),
         _ => return crate::codegen::SELF_CALL_DEOPT, // other array/string props → interpreter

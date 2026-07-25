@@ -1908,13 +1908,23 @@ impl<'p> Vm<'p> {
                         }
                     };
                 let size = native::TA_KINDS[kind as usize].1;
-                let detached =
-                    matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. });
+                let _ = length;
+                // Use the EFFECTIVE length, not the stored field: a
+                // length-tracking view over a resizable buffer re-derives its
+                // length from the buffer's current size, and a detached or
+                // shrunk-past view reports 0. The stored `length` is the value
+                // captured at construction, so reading it directly reported a
+                // stale length after `rab.resize(...)` — this getter must agree
+                // with the instance fast path in `props/member.rs`, which is
+                // what every `Array.prototype.*.call(ta, …)` goes through.
+                let eff = self.ta_effective_len(this.heap_index());
                 match id {
                     TA_GET_BUFFER => Value::heap(buffer),
-                    TA_GET_BYTELENGTH => Value::num(if detached { 0.0 } else { (length * size) as f64 }),
-                    TA_GET_BYTEOFFSET => Value::num(if detached { 0.0 } else { byte_offset as f64 }),
-                    _ => Value::num(if detached { 0.0 } else { length as f64 }), // TA_GET_LENGTH
+                    TA_GET_BYTELENGTH => Value::num((eff.unwrap_or(0) * size) as f64),
+                    TA_GET_BYTEOFFSET => {
+                        Value::num(if eff.is_none() { 0.0 } else { byte_offset as f64 })
+                    }
+                    _ => Value::num(eff.unwrap_or(0) as f64), // TA_GET_LENGTH
                 }
             }
             // `get [Symbol.species]` — returns the receiver constructor unchanged.

@@ -32,6 +32,122 @@ impl<'p> Vm<'p> {
     /// methods then treat it like a detached buffer. A length-tracking view's
     /// length follows the buffer. For a non-resizable buffer this returns the
     /// fixed length unchanged (the ta_tracking set is empty in the common case).
+    /// Whether `key` on this TypedArray instance still resolves, along its REAL
+    /// prototype chain, to the built-in %TypedArray%.prototype accessor (or, for
+    /// `BYTES_PER_ELEMENT`, the intrinsic data property on the type prototype),
+    /// so the instance path may answer it directly instead of walking.
+    ///
+    /// Deliberately NOT an identity check against this realm's `ta_protos`: a
+    /// TypedArray created in another realm carries that realm's prototype, which
+    /// is just as intrinsic. What must be rejected is a chain a user re-pointed
+    /// or shadowed (`Object.setPrototypeOf(ta, {length: 7})`), where the spec
+    /// requires the ordinary lookup to win.
+    pub(crate) fn ta_named_is_intrinsic(&self, ta_idx: u32, key: &str) -> bool {
+        let want = match key {
+            "length" => crate::vm::native::TA_GET_LENGTH,
+            "byteLength" => crate::vm::native::TA_GET_BYTELENGTH,
+            "byteOffset" => crate::vm::native::TA_GET_BYTEOFFSET,
+            "buffer" => crate::vm::native::TA_GET_BUFFER,
+            "@@toStringTag" => crate::vm::native::TA_GET_TOSTRINGTAG,
+            // A data property on the type prototype, not an accessor: accept the
+            // direct answer only while some level still carries it.
+            "BYTES_PER_ELEMENT" => {
+                return self.ta_chain_has_own(ta_idx, key).is_some();
+            }
+            _ => return false,
+        };
+        let Some(owner) = self.ta_chain_has_own(ta_idx, key) else {
+            return false; // nothing in the chain defines it -> `undefined`
+        };
+        match self.heap.get(owner) {
+            HeapObj::Object(m) => match m.pos(key) {
+                Some(s) if m.attrs[s].accessor && m.vals[s].is_heap() => matches!(
+                    self.heap.get(m.vals[s].heap_index()),
+                    HeapObj::Native(id) if *id == want
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The nearest object on `ta_idx`'s prototype chain with an own `key`
+    /// (the instance's own side-table props are checked by the caller first).
+    fn ta_chain_has_own(&self, ta_idx: u32, key: &str) -> Option<u32> {
+        let mut cur = match self.proto_of.get(&ta_idx) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            Some(_) => return None, // explicit null prototype
+            None => match self.heap.get(ta_idx) {
+                HeapObj::TypedArray { kind, .. } => *self.ta_protos.get(*kind as usize)?,
+                _ => return None,
+            },
+        };
+        for _ in 0..8 {
+            match self.heap.get(cur) {
+                HeapObj::Object(m) if m.pos(key).is_some() => return Some(cur),
+                _ => {}
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                _ => return None,
+            };
+        }
+        None
+    }
+
+    /// Whether `ta.length` on this TypedArray still resolves to the pristine
+    /// built-in %TypedArray%.prototype getter, so a caller may answer it
+    /// directly instead of invoking the accessor.
+    ///
+    /// Unlike `Array`, whose `length` is an OWN exotic property that no
+    /// prototype can shadow, a TypedArray's `length` is inherited, so all four
+    /// of these must hold: no own `length` on the instance, the instance's
+    /// prototype is still its kind's intrinsic, that intrinsic does not shadow
+    /// `length`, and %TypedArray%.prototype's `length` is still the built-in
+    /// accessor (`Native(TA_GET_LENGTH)`).
+    pub(crate) fn ta_length_is_intrinsic(&self, ta_idx: u32) -> bool {
+        let kind = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { kind, .. } => *kind as usize,
+            _ => return false,
+        };
+        // An extra NAMED own property (`ta.length = …` / defineProperty) lives
+        // in the side table and wins over the inherited accessor.
+        if self.arr_props.get(&ta_idx).is_some_and(|m| m.pos("length").is_some()) {
+            return false;
+        }
+        let want_proto = match self.ta_protos.get(kind) {
+            Some(&p) if p != 0 => p,
+            _ => return false,
+        };
+        // `Object.setPrototypeOf(ta, …)` re-points the chain.
+        match self.proto_of.get(&ta_idx) {
+            Some(v) if v.is_heap() && v.heap_index() == want_proto => {}
+            _ => return false,
+        }
+        // %Float64Array.prototype% etc. must not shadow `length` …
+        if let HeapObj::Object(m) = self.heap.get(want_proto) {
+            if m.pos("length").is_some() {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        // … and the base prototype's slot must still be the built-in getter.
+        if self.ta_base_proto == 0 {
+            return false;
+        }
+        match self.heap.get(self.ta_base_proto) {
+            HeapObj::Object(m) => match m.pos("length") {
+                Some(s) if m.attrs[s].accessor && m.vals[s].is_heap() => matches!(
+                    self.heap.get(m.vals[s].heap_index()),
+                    HeapObj::Native(id) if *id == crate::vm::native::TA_GET_LENGTH
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     pub(crate) fn ta_effective_len(&self, ta_idx: u32) -> Option<usize> {
         let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
             HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
