@@ -159,6 +159,11 @@ pub(crate) fn region_can_compile(
             // assignment took the whole enclosing region down with it — they are
             // markdown-render's only region declines.
             Instr::CellSet { .. } | Instr::UpvalSet { .. } => {}
+            // `+x` — a NUMBER passes straight through (the interpreter returns
+            // the Value verbatim); anything else needs observable ToNumber
+            // coercion and bails. It was simply absent from this list, which
+            // declined sparse-array's for-in `keyFold` region outright.
+            Instr::ToNum { .. } => {}
             // `ForInLive` — the per-iteration for-in liveness check — MEM path via
             // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
             // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe

@@ -545,6 +545,27 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::ToNum { dst, a } => {
+                // `+x`. A number passes through UNCHANGED — note the raw `mov`
+                // rather than a round trip through xmm, which would re-tag an
+                // Int as a double and diverge from the interpreter. Bool / null /
+                // undefined / heap need ToNumber, which can run a user `valueOf`,
+                // so they bail.
+                let is_num = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(a)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, INT_TAG_HI as i32
+                    ; je => is_num                       // Int payload
+                    ; sub r10d, (INT_TAG_HI + 1) as i32  // 0x7FFA (bool tag)
+                    ; cmp r10d, 3                        // high16 in [0x7FFA,0x7FFD] ⇒ not a number
+                    ; jbe => bail
+                    ; => is_num                          // double falls through here
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::CellSet { cell, src } => {
                 // Per-op captured-cell write (jit_cell_set). Unconditional — a
                 // cell is one heap slot and the store cannot fail, so unlike the
