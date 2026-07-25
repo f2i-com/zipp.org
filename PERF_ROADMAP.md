@@ -832,13 +832,33 @@ The reason is structural: `HeapObj::Object(ObjMap)` stores the map INLINE, so
 heap slot — strings, arrays, numbers, all of them. Cache footprint dominates the
 allocation saved. Dropping to two slots still regressed. Reverted.
 
-**So the real prerequisite is boxing: `HeapObj::Object(Box<ObjMap>)`.** With the
-map behind a pointer, its size stops inflating every other heap object, and
-inline property storage then costs one allocation TOTAL for a small object
-(the box) instead of one slot plus three Vec allocations. That is the change to
-make first; inline storage on top of it should then deliver the isolated numbers
-above. It touches every `HeapObj::Object(m)` pattern match, so it wants its own
-commit and a full gate.
+**Boxing does not rescue it either — MEASURED.** `HeapObj::Object(Box<ObjMap>)`
+was built (442 pattern sites, nearly all unchanged because `Box` auto-derefs;
+110 construction sites needed `Box::new`). Two findings:
+
+1. `HeapObj` stayed at **112 bytes**, because `ObjMap` (96) is not the only fat
+   variant — `Combinator` (8 fields, three `Vec`s, ~104 bytes) is the other one.
+   Boxing `ObjMap` alone shrinks nothing.
+2. The extra allocation costs **~20% on construction** on its own: `{}` 21->32ms,
+   3-key literal 104->123ms.
+
+Boxing `Combinator` too would take `HeapObj` to ~80 (then `Generator` sets it).
+By the SmallVec calibration above — +118 bytes cost 8% — a 32-byte reduction is
+worth roughly 2%, which does not pay for the 20% construction cost.
+
+**Three failed directions is the finding.** Interning (hash > malloc), inline
+storage (grows the enum), and boxing (adds an allocation) all fail for the same
+underlying reason: `ObjMap` lives INSIDE `HeapObj`, so its size is charged to
+every heap slot and its storage cannot be made inline OR indirect without paying
+somewhere else.
+
+**The design that squares it is a side arena**: `HeapObj::Object(u32)` indexing
+a dedicated `Vec<ObjMap>`. Then the enum is tiny (so every string/number slot
+shrinks), `ObjMap` can carry inline property storage (so a small object needs no
+Vec allocations), and there is no per-object `Box` because the arena slot is
+amortised. That is a real structural change — GC has to trace and compact a
+second arena — and it should be attempted only with the whole gate plus the
+117-program differential set, not incrementally.
 
 Also still open, and independent: give `NewObject` a key-count hint so the
 literal path pre-sizes instead of regrowing (6 keys pays ~36ns/key at the tail
