@@ -5445,6 +5445,53 @@ impl<'p> Vm<'p> {
                                 self.display(it)
                             )));
                         }
+                        // ── fast path: a plain dense Array ──
+                        // By far the most common `for-of` subject, and the generic
+                        // cascade below costs it SIX separate `heap.get` probes (the
+                        // generator test, the iterator-object test, the tombstone
+                        // scan, `flatten`, the string-step test, the length test)
+                        // and then a full `get_index`. One probe and a direct
+                        // element read instead: `for (v of a)` measured 113ms
+                        // against 16ms for the equivalent counted loop over the
+                        // same array, where node makes the two forms equal.
+                        //
+                        // Falls through to the generic path for anything the direct
+                        // read cannot answer identically: a HOLE (its value comes
+                        // from the prototype chain), a sparse array with a virtual
+                        // length, or an array carrying side-table properties.
+                        if self.array_js_len.is_empty()
+                            || !self.array_js_len.contains_key(&it.heap_index())
+                        {
+                            if self.arr_props.is_empty()
+                                || !self.arr_props.contains_key(&it.heap_index())
+                            {
+                                let cur =
+                                    array_index(self.get(base, idx)).unwrap_or(0);
+                                let hit = match self.heap.get(it.heap_index()) {
+                                    HeapObj::Array(items) => match items.get(cur) {
+                                        Some(v) if !v.is_hole() => Some(Some(*v)),
+                                        Some(_) => None,      // hole → generic path
+                                        None => Some(None),   // exhausted
+                                    },
+                                    _ => None,
+                                };
+                                match hit {
+                                    Some(Some(v)) => {
+                                        self.set(base, value_dst, v);
+                                        self.set(base, done_dst, Value::bool(false));
+                                        self.set(base, idx, Value::int((cur + 1) as i32));
+                                        ip += 1;
+                                        continue;
+                                    }
+                                    Some(None) => {
+                                        self.set(base, done_dst, Value::bool(true));
+                                        ip += 1;
+                                        continue;
+                                    }
+                                    None => {}
+                                }
+                            }
+                        }
                         // A generator is driven by `.next()`; the cursor is unused.
                         if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. }) {
                             let res = self
