@@ -660,11 +660,30 @@ pub(crate) fn plan_region_cold(
         // defined) OR a HOISTED constant — hoisted values are materialised once
         // in the prologue and read every iteration, so their home must never be
         // freed/reused mid-region (doing so clobbered them — a real bug).
-        if first_seen.get(&r) == Some(&false) || hoisted.contains(&r) {
+        // A register READ OUTSIDE the region also keeps a permanent home. Sharing
+        // one is only sound when clobbering the loser's frame slot is invisible,
+        // and that is exactly the condition: `flush_exit` writes the shared home
+        // to EVERY sharer's slot, so a sharer whose value still matters after the
+        // region would come back holding an unrelated temp. Region-local liveness
+        // does not imply the register is dead in the enclosing function — that is
+        // what made blanket reuse unsound. Same `read_outside` set the dead-code
+        // pass uses.
+        if first_seen.get(&r) == Some(&false)
+            || hoisted.contains(&r)
+            || read_outside.contains(&r)
+        {
             (s, e)
         } else {
             (first_ip[&r], last_ip[&r])
         }
+    };
+    // Registers eligible to SHARE an xmm: not loop-carried, not a hoisted
+    // constant, and not read after the region. They need no entry load either —
+    // an early exit flushing a stale value into their slot is unobservable.
+    let shareable = |r: u16| -> bool {
+        first_seen.get(&r) != Some(&false)
+            && !hoisted.contains(&r)
+            && !read_outside.contains(&r)
     };
 
     // The xmm home pool size. If one-home-per-numeric-value fits, use the simple
@@ -684,8 +703,14 @@ pub(crate) fn plan_region_cold(
     // `xmm`, so the prologue loads overwrite each other and only the last one
     // survives. Needs the same must-def / live-out analysis as UNIFY_HOMES; the
     // regions affected (>POOL numeric values) fall back to the memory tier.
-    const REUSE_HOMES: bool = false;
-    let reuse = REUSE_HOMES && n_numeric > POOL;
+    // Re-enabled, but only for `shareable` registers (see `range` above). The
+    // blanket version was unsound: it shared homes on REGION-LOCAL liveness, so a
+    // local assigned early in a big loop came back holding a later temp. Scoping
+    // it to registers that are provably never read after the region removes the
+    // failure mode and keeps what reuse is for — letting a loop with more live
+    // numeric values than the 14-home pool reach the register tiers at all,
+    // instead of declining to the memory path.
+    let reuse = n_numeric > POOL;
 
     // ── allocate xmm/gpr homes ──
     let mut reg_home: FxHashMap<u16, Home> = FxHashMap::default();
@@ -834,11 +859,15 @@ pub(crate) fn plan_region_cold(
         match reg_home[&r] {
             Home::Xmm(x) => {
                 num_regs.push((r, x));
-                // EVERY flushed home is entry-loaded, not just the read-first
-                // ones — see `RegionPlan::live_in_regs`. `hoisted` regs are the
-                // one exception: the prologue materialises their constant right
-                // after this, so a load would be dead.
-                if !hoisted.contains(&r) {
+                // Every flushed home is entry-loaded, not just the read-first
+                // ones — see `RegionPlan::live_in_regs`. Two exceptions:
+                // `hoisted` regs (the prologue materialises their constant right
+                // after this, so a load would be dead), and `shareable` regs,
+                // whose slot is never read after the region — flushing a stale
+                // value into it is unobservable, and they may SHARE an xmm with
+                // another register, which makes a per-register entry load
+                // meaningless (the loads would overwrite each other).
+                if !hoisted.contains(&r) && !shareable(r) {
                     live_in_regs.push((r, x));
                 }
             }
