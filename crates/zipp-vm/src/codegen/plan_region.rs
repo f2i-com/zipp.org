@@ -274,8 +274,17 @@ pub(crate) fn plan_region_cold(
     }
 
     // A register used but never defined in the region is a read-only live-in.
-    // Loading/typing it correctly (numeric vs bool) is fiddly, so decline and
-    // let the memory path handle it (it reads everything from the reg file).
+    // Decline to the memory path, which reads everything from the reg file.
+    //
+    // MEASURED 2026-07-25 — do not "fix" this by typing them Num and letting the
+    // entry guard sort it out. That is correct (emit_int_entry_load bails unless
+    // the value is genuinely Int-tagged, so nothing can be misread) but it is
+    // SLOWER: the INT path then accepts regions whose live-ins are strings,
+    // doubles or objects, entry-bails on every OSR entry, and displaces the MEM
+    // compile that was working. Suite geomean regressed 3.31x -> 3.45x, worst on
+    // sparse-array (-18%) and async-promise-chain (-16%). Making this pay needs
+    // evidence the live-in is numeric — a profile-fed type, or restricting it to
+    // registers used ONLY as arithmetic operands — not a guard-and-hope.
     // TA-receiver regs are intentionally untyped (sourced via the pin) — skip them.
     for (off, instr) in code[s..=e].iter().enumerate() {
         if cold.contains(&(s + off)) { continue; }
