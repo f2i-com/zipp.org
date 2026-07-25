@@ -439,6 +439,8 @@ pub struct HeapHelperAddrs {
     /// Helper for `UpvalGet` (resolves the running closure's k-th upvalue cell,
     /// then loads it). Same purity/TDZ contract as `cell_get`.
     pub upval_get: usize,
+    /// Intrinsic for `s.indexOf(t)` (ASCII/ASCII, 1 arg); deopts otherwise.
+    pub str_index_of: usize,
     /// Helpers for `CellSet` / `UpvalSet` — a captured-cell WRITE. A plain heap
     /// store: no TDZ check, no alloc, no user code, so no pinned refetch.
     pub cell_set: usize,
@@ -507,6 +509,7 @@ impl HeapHelperAddrs {
             upval_set: self.upval_set,
             get_index_concat: self.get_index_concat,
             upval_get: self.upval_get,
+            str_index_of: self.str_index_of,
             forin_live: self.forin_live,
             has_property: self.has_property,
             regs_fits: self.regs_fits,

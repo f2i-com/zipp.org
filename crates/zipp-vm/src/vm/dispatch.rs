@@ -2691,7 +2691,12 @@ impl<'p> Vm<'p> {
                                                     .get(*name as usize)
                                                     .map(|x| x.as_str());
                                                 if *argc == 1
-                                                    && matches!(key, Some("push") | Some("charCodeAt"))
+                                                    && matches!(
+                                                        key,
+                                                        Some("push")
+                                                            | Some("charCodeAt")
+                                                            | Some("indexOf")
+                                                    )
                                                 {
                                                     continue; // dedicated helpers
                                                 }
@@ -5852,6 +5857,7 @@ impl<'p> Vm<'p> {
             math_unary: jit_math_unary as usize,
             math_two: jit_math_two as usize,
             cell_get: jit_cell_get as usize,
+            str_index_of: crate::vm::helpers_misc::jit_str_index_of as usize,
             cell_set: jit_cell_set as usize,
             upval_set: jit_upval_set as usize,
             get_index_concat: jit_get_index_concat as usize,

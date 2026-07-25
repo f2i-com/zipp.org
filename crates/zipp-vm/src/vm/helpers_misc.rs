@@ -125,6 +125,43 @@ pub(crate) extern "win64" fn jit_call_method_ic(
     }
 }
 
+/// Win64 helper for `s.indexOf(t)` inside a compiled region — a JIT INTRINSIC,
+/// the same shape that already puts `charCodeAt` and `.length` at node parity
+/// while every other string method pays ~47ns of call plumbing (jit_call_method_ic
+/// -> jit_region_call_impl -> try_builtin_method -> dispatch_builtin_method ->
+/// string_method) to reach ~5ns of actual work.
+///
+/// Handles the ASCII/ASCII, one-argument case and returns the Int Value bits of
+/// the result; anything else returns the deopt sentinel and the region bails to
+/// the interpreter at this ip, which runs the full method unchanged.
+///
+/// # Safety
+/// `vm` is the live `Vm`; the operands are raw Value bits from the reg file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_index_of(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    needle_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let (r, n) = (Value::from_bits(recv_bits), Value::from_bits(needle_bits));
+    if !r.is_heap() || !n.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // A rope receiver must be materialised before its bytes can be read.
+    vm.heap.flatten(r.heap_index());
+    match (vm.heap.get(r.heap_index()), vm.heap.get(n.heap_index())) {
+        (crate::heap::HeapObj::Str(hay), crate::heap::HeapObj::Str(ned))
+            if hay.is_ascii() && ned.is_ascii() =>
+        {
+            let (hc, nc) = (hay.as_str_lossy(), ned.as_str_lossy());
+            let (h, nd): (&str, &str) = (&hc, &nc);
+            Value::int(h.find(nd).map_or(-1, |b| b as i32)).bits()
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper for a generic `f(args…)` (`Call`) inside a compiled OSR region:
 /// the plain-call sibling of [`jit_call_method_ic`] (consults `ic_call`,
 /// `this = undefined`). r9 = (callee_reg<<16)|arg_base; same protocol otherwise.

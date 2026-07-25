@@ -622,6 +622,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) math_two: usize,
     /// Pure `CellGet` helper (cell bits → inner Value bits / TDZ-deopt sentinel).
     pub(crate) cell_get: usize,
+    /// `jit_str_index_of` intrinsic.
+    pub(crate) str_index_of: usize,
     /// `UpvalGet` helper (upvalue idx → inner Value bits / TDZ-deopt sentinel).
     pub(crate) upval_get: usize,
     pub(crate) cell_set: usize,

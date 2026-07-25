@@ -1288,6 +1288,31 @@ pub(crate) fn compile_region_mem(
             }
             Instr::CallMethod { dst, obj, name, arg_base, argc } => {
                 let key = proto.string_constants[name as usize].as_str();
+                // ── `s.indexOf(t)` intrinsic ──
+                // A direct call to the search, skipping the whole builtin call
+                // chain (jit_call_method_ic -> jit_region_call_impl ->
+                // try_builtin_method -> dispatch_builtin_method -> string_method)
+                // that costs ~47ns to reach ~5ns of work. This is the shape that
+                // already puts `charCodeAt` and `.length` at node parity. The
+                // helper deopts for anything but ASCII/ASCII, so the interpreter
+                // runs the full method (fromIndex forms, non-ASCII, coercible
+                // arguments, a non-string receiver) at this ip unchanged.
+                if argc == 1 && key == "indexOf" {
+                    let bail = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                          // vm
+                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
+                        ; mov r8, [rbx + dreg(arg_base)]        // needle bits
+                        ; mov rax, QWORD heap.str_index_of as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    continue;
+                }
                 if (argc == 1 || argc == 2) && dv_get_kind(key).is_some() {
                     // Whitelisted DataView `get*(pos[, littleEndian])`.
                     // ── pinned-DataView fast path ── when the OSR plan pinned
