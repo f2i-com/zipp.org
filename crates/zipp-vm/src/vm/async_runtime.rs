@@ -2413,16 +2413,26 @@ impl<'p> Vm<'p> {
             }
             let now = std::time::Instant::now();
             // Fire due timers (FIFO among due ones by due-time order).
-            let mut due_timers: Vec<usize> = (0..self.timer_queue.len())
+            //
+            // Firing ORDER and removal ORDER are different orders and must not
+            // share a list: callbacks run earliest-due-first, but `Vec::remove`
+            // is only index-safe from the back. Sorting one list by due time and
+            // then removing through it in reverse assumed due-time order implied
+            // index order; it does not, so a timer queued earlier but due LATER
+            // (`race([sleep(9), sleep(5)])`) removed a stale index and panicked
+            // — a hard crash, since the release profile is `panic = "abort"`.
+            let due_idx: Vec<usize> = (0..self.timer_queue.len())
                 .filter(|&i| self.timer_queue[i].0 <= now)
                 .collect();
-            due_timers.sort_by_key(|&i| self.timer_queue[i].0);
-            // Remove from the back so earlier indices stay valid.
-            let mut fired: Vec<Value> = Vec::new();
-            for &i in due_timers.iter().rev() {
-                fired.push(self.timer_queue.remove(i).1);
+            // `due_idx` is ascending by construction, so a STABLE sort by due
+            // time keeps insertion order among equal deadlines (FIFO).
+            let mut order = due_idx.clone();
+            order.sort_by_key(|&i| self.timer_queue[i].0);
+            let fired: Vec<Value> = order.iter().map(|&i| self.timer_queue[i].1).collect();
+            // Now drop the entries, highest index first.
+            for &i in due_idx.iter().rev() {
+                self.timer_queue.remove(i);
             }
-            fired.reverse();
             for cb in fired {
                 let _gc = self.gc_lock_guard();
                 let _ = self.call_value(cb, Value::UNDEFINED, &[]);

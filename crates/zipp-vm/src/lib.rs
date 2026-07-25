@@ -2354,6 +2354,34 @@ mod tests {
     }
 
     #[test]
+    fn timers_fire_in_due_order_when_queued_out_of_order() {
+        // REGRESSION: the event loop sorted due timers by DEADLINE and then
+        // removed through that list in reverse, assuming deadline order implied
+        // index order. A timer queued first but due LATER made `Vec::remove`
+        // take a stale index and panic -- a hard crash under `panic = "abort"`.
+        assert_eq!(
+            run_ok(
+                "const s=ms=>new Promise(r=>setTimeout(r,ms)); \
+                 Promise.race([s(9).then(()=>1), s(5).then(()=>2)]) \
+                   .then(v=>console.log('race', v))"
+            ),
+            vec!["race 2"],
+        );
+        // Several out-of-order deadlines must still fire earliest-first.
+        assert_eq!(
+            run_ok(
+                "for (const ms of [30, 10, 20]) setTimeout(()=>console.log('t'+ms), ms)"
+            ),
+            vec!["t10", "t20", "t30"],
+        );
+        // Equal deadlines keep insertion order (FIFO).
+        assert_eq!(
+            run_ok("for (const n of [1,2,3]) setTimeout(()=>console.log('n'+n), 5)"),
+            vec!["n1", "n2", "n3"],
+        );
+    }
+
+    #[test]
     fn typedarray_length_in_jit_region_matches_interpreter() {
         // `ta.length` is an INHERITED accessor, so the JIT's direct answer is
         // only valid while the built-in getter is intact. JIT and interpreter
