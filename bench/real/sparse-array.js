@@ -5,15 +5,18 @@
 // delete-punched holes iterated hole-aware; concat/slice over holey windows.
 // Deterministic checksums.
 //
-// CALIBRATION NOTE (zipp): zipp's sparse-element storage is linear-scan —
-// O(populated) per access and quadratic to populate: 100k stride writes into
-// a length-50M array take 11.3s on zipp (node 5ms); ONE for-in walk over
-// those 100k keys adds 26.8s (node 7ms); in/hasOwn probes cost ~18us each at
-// 100k populated (node ~27ns). Packed arrays with delete-punched holes are
-// FINE on zipp (1M-element hole-aware pass ~120ms). The sparse sections are
-// therefore sized down (40k keys, one for-in rep) and the packed/holey
-// sections carry the volume; node lands ~100ms — below the suite's usual
-// 150-800ms band, accepted to keep zipp's run ~12s.
+// CALIBRATION NOTE (zipp) — RE-MEASURED 2026-07-25, the original premise is
+// GONE. Sparse-element storage is no longer linear-scan: per-access cost is now
+// flat as the populated count scales (60ns/probe at 2k through 100k keys), and
+// populating is linear, not quadratic — 100k stride writes into a length-50M
+// array take 14ms (was quoted as 11.3s; node 13ms). The one section still
+// behind is the for-in key walk at ~700ns/key vs node's ~180ns.
+//
+// The sparse sections below are therefore sized for a problem that no longer
+// exists (40k keys, one for-in rep), so this bench now mostly measures its
+// packed/holey sections. RESIZING IT IS DELIBERATELY NOT DONE HERE: it would
+// silently invalidate every historical ratio in PERF_ROADMAP. Re-size it in a
+// commit that does nothing else and re-baselines the table.
 var hasOwn = Object.prototype.hasOwnProperty;
 
 // ---- virtual-length sparse array: stride writes ----

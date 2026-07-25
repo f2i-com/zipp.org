@@ -122,6 +122,53 @@ cost, so the first row includes the three `Vec` first-allocations):
 | `{a..d}` | 434 ns | **134 ns** |
 | `{a..h}` | 896 ns | **278 ns** |
 
+### Where the remaining gap actually is
+
+Decomposed by absolute milliseconds behind node, not by ratio — a 10x bench that
+takes 50ms matters less than a 3x bench that takes 900ms:
+
+| bench | gap | share |
+|---|---|---|
+| regex-log-scan | 2943ms | **41.8%** |
+| markdown-render | 706ms | 10.0% |
+| typedarray-math | 526ms | 7.5% |
+| class-prototype-hot | 517ms | 7.3% |
+| polymorphic-objects | 508ms | 7.2% |
+| async-promise-chain | 461ms | 6.5% |
+| parse-large-js | 455ms | 6.5% |
+| map-set-heavy | 370ms | 5.3% |
+| json-large | 324ms | 4.6% |
+| sparse-array | 234ms | 3.3% |
+
+**Regex is 41.8% of everything left, and it is the MATCHER, not the wrapper.**
+Measured per call:
+
+| | zipp | node |
+|---|---|---|
+| `/ERROR/.test('')` — pure call overhead | 98 ns | 8 ns |
+| `.test()` on a 200-char miss | 110 ns | 14 ns |
+| `.test()` on a 200-char hit at the end | 120 ns | 24 ns |
+| `.exec()` with 4 capture groups | 765 ns | 50 ns |
+
+Scanning 200 characters costs 12 ns, so the byte path, the `ascii_twin`
+byteopt compile and memchr prefiltering are all working. Fixed per-call
+overhead is ~90 ns excess, which over the bench's ~1.2M regex operations is
+only ~110 ms of the 2943 ms. The rest is the backtracking VM executing capture
+groups: ~277 ns of matching where V8's Irregexp — which compiles the pattern to
+native code — takes ~22 ns. **This corrects two earlier claims:** that regex was
+mostly result-object construction (it is ~270 ns fixed, real but not dominant),
+and that a lazy-result change (old B5.2) was the lever. It is not; the engine is.
+
+**Property access is boxing-bound, not cache-bound.** The 8-way identity-keyed
+IC does have a hard cliff at 9 same-shape receivers — measured 8.5 ns/read at 8
+receivers, 20.5 ns at 9, flat thereafter, against node's 1.0 ns at every count.
+But neither bench blamed for it reaches the cliff: `class-prototype-hot` cycles
+4 receivers and `polymorphic-objects` uses `shapes[i & 7]`, i.e. 8. The number
+that matters is that a **hitting** IC still costs 8.5 ns against node's 1.0 ns.
+That gap is the per-operation NaN-box/tag-guard tax, and only an optimizing
+tier that keeps values unboxed across operations (B7) removes it — shapes (B3)
+would flatten the cliff but not the 8.5 ns.
+
 Three architectural causes, in order of cost:
 
 1. **No shared hidden classes.** `heap.rs` — every object owns
@@ -268,10 +315,23 @@ be the first half of it.
   is sound (the pass already rejects `Call`/`SetIndex`/`SetProp`, so nothing in
   range can change a length). **Effort:** M. **Gain:** measured ~5× on that
   kernel shape.
-- [ ] **B5.2 Lazy RegExp result objects.** `vm/proxy_regexp.rs` — `exec` builds
-  ≥8 heap objects per call and is ~69% result construction; `matchAll` ~79%.
-  Only ~13% of `regex-log-scan` is actually matcher-bound, so do this **before**
-  any linear-matcher epic. **Effort:** M. **Gain:** regex −25–35%.
+- [~] **B5.2 Lazy RegExp result objects — REFUTED as a lever, do not schedule.**
+  The premise ("exec is ~69% result construction; only ~13% is matcher-bound")
+  does not survive measurement. Result construction is ~270 ns fixed per exec;
+  the matcher is ~277 ns for a 4-group pattern against Irregexp's ~22 ns, and
+  `test()` — which builds no result at all — is already 375 ns vs node's 30 ns.
+  A lazy-result change would win a few percent of a bench that is 42% of the
+  total gap. The lever is B8, not this. Kept as a note so it is not re-derived.
+- [ ] **B5.2b `matchAll` iterator step overhead.** Measured 1.38 µs per match
+  through `for-of matchAll` vs 678 ns through an equivalent manual
+  `while ((m = re.exec(s)))` loop — so the iterator path costs ~700 ns per match
+  ON TOP of the exec it performs. The `{value, done}` object is already skipped
+  by the for-of fast path (`vm/dispatch.rs`), so the cost is inside
+  `regexp_string_iter_step` and its `get_index(r, 0)` / `to_str_value` /
+  double `regexp_string_iters` hash lookups. This is the one contained regex win
+  left; unlike B5.2 it is measured against a control. **Effort:** M.
+  **Gain:** the bench's matchAll section is 552 ms of ~1276 ms.
+
 - [ ] **B5.3 Builtin method dispatch jump table.** `vm/builtins.rs` and
   `vm/string_ops.rs` resolve `CallMethod` by a chained `match` on `&str`.
   Resolve to a `u16` builtin id at compile time. **Effort:** M. **Gain:**
@@ -296,10 +356,25 @@ be the first half of it.
 - [ ] **B6.1+** Moving young-generation collector over a tagged-index heap.
   **Effort:** XL. **Risk:** highest in the document.
 
+### B8 — Regex engine (the single largest item)
+
+41.8% of the remaining gap, and not reachable by tuning the wrapper. `regress`
+is a backtracking VM; V8's Irregexp compiles each pattern to native code. The
+existing byte path, `ascii_twin` byteopt compile and memchr prefilters are
+already in use, so the ~9x per-match difference is the execution model.
+Realistic options, in increasing order of work: emit a DFA/Pike-VM for patterns
+without backreferences or lookaround (covers most real patterns); or compile
+patterns to native code through the existing dynasm infrastructure. Either is a
+multi-week epic. **Effort:** XL. Note the previously-quoted "~5x floor without a
+native regex JIT" is consistent with this measurement.
+
 ### B7 — Optimizing tier (SSA + deopt)
 
-Deliberately last. It consumes everything above: it needs B3's shape feedback to
-speculate on, and B4's allocation admission to be worth entering. Building it
+Deliberately last, but note it is what the *majority* of the non-regex gap
+needs: a hitting inline cache still costs 8.5 ns against node's 1.0 ns, and
+that difference is per-operation boxing and tag-guarding, which no amount of
+cache tuning removes. It consumes everything above — B3's shape feedback to
+speculate on, B4's allocation admission to be worth entering — so building it
 before the object model is stable means speculating against a moving target.
 
 ---
