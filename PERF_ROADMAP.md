@@ -761,6 +761,59 @@ The `IterNext` admission was reverted rather than kept: it is inert for the shap
 it was written for, and unexercised codegen that some future region shape reaches
 is exactly the B9 failure mode.
 
+### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
+
+Property READS are fine. Construction is not:
+
+```text
+                        zipp    node
+mono read o.a           13ms     2ms    5M iterations — 2.6ns/read, 6.5x
+poly read (4 shapes)    26ms     4ms
+array element           18ms     2ms
+new Pt(x,y)            287ms     2ms    1M iterations — 143x
+{a:i,b:i,c:i}          108ms     2ms    54x
+```
+
+Decomposed by key count, the shape of it is unambiguous — a fixed base plus a
+per-key term:
+
+```text
+{}            21ms    ~21ns   the heap slot alone
+1 key         79ms    +58ns   three Vec allocations + one String
+2 keys        88ms    +14ns
+3 keys       106ms    +17ns
+6 keys       215ms    +36ns/key at the tail (Vec regrowth on top)
+```
+
+**The per-key term is `ObjMap::define` doing `key.to_string()`** — a malloc and
+copy for a property name that is nearly always already interned in the callee's
+`string_constants`, and repeated for every object of the same shape. The base
+term is `keys`/`vals`/`attrs` being three separate `Vec`s.
+
+**The fix is interning: `keys: Vec<Rc<str>>` behind a process-wide table**, so
+adding a key is a refcount bump. Attempted and reverted (see below), but the
+migration is fully specified:
+
+- `pub type PropKey = Rc<str>` plus a thread-local `FxHashSet<PropKey>` interner;
+  `ObjMap::define`/`set` call `intern_key(key)` instead of `to_string()`.
+- The compiler finds every affected site: **88 errors across 12 files**, all
+  mechanical — `&*k == key` for comparisons, `intern_key` at the owning sites,
+  and `.map(|k| k.to_string())` where something collects into `Vec<String>`
+  (`natives.rs` 21, `enumerate.rs` 15, `descriptors.rs` 15, `ic.rs` 10,
+  `heap.rs` 10, `dispatch.rs` 6, the rest 1-2 each).
+- Expect ~50ns off a 3-key literal (106ms -> ~60ms), and more on wider objects.
+
+It was reverted rather than half-finished: 88 errors in the engine's most
+correctness-critical structure needs its own session with the full gate between
+steps, not the tail of a long one. Do it as a single commit that changes nothing
+else, and re-run the differential repro set as well as test262 — a bad property
+key is exactly the kind of defect that passes a conformance suite and corrupts a
+real program.
+
+Second-order once that lands: fold `keys`/`vals`/`attrs` into one `Vec<Prop>` to
+turn three allocations into one, and give `NewObject` a key-count hint so the
+literal path pre-sizes instead of regrowing.
+
 ### B16 — Where the JIT actually reaches, per bench
 
 Census with `ZIPP_JITLOG=1` (`bench/tiers.sh` extended). Useful because "the JIT
