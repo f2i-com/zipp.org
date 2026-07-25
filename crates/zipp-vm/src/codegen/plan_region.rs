@@ -460,10 +460,33 @@ pub(crate) fn plan_region_cold(
     // consume no xmm home and don't count toward the pool-overflow check (which can
     // flip the loop to the slower home-reuse path). `dead` excludes loop-carried
     // (live-in) regs — those are read across iterations even if not within one.
+    // "Never read IN THE REGION" is not "dead": a dead reg gets no home, its
+    // defining op is skipped and nothing is flushed, so the frame slot keeps
+    // whatever the INTERPRETER last left there. If the register is read AFTER
+    // the region, that is a silent wrong answer —
+    //
+    //     function f(){ for (var i=0;i<40;i++) { var q = i; } return q; }
+    //
+    // returned 7 (the value at the final pre-OSR iteration) instead of 39. The
+    // declarator form is what exposes it: a plain `q = expr` also emits
+    // `Move{dst:temp, src:q}` for the statement's value, which keeps `q` in
+    // `used`, but `var q = expr` does not.
+    //
+    // There is no live-out analysis in codegen, so require the register to be
+    // untouched by the REST OF THE FUNCTION as well. Conservative (a reg read
+    // anywhere outside `[s, e]` is kept) and cheap — one scan of the proto.
+    let read_outside: FxHashSet<u16> = code
+        .iter()
+        .enumerate()
+        .filter(|(ip, _)| *ip < s || *ip > e)
+        .flat_map(|(_, instr)| instr_uses(instr))
+        .collect();
     let dead: FxHashSet<u16> = reg_order
         .iter()
         .copied()
-        .filter(|r| !used.contains(r) && first_seen.get(r) != Some(&false))
+        .filter(|r| {
+            !used.contains(r) && first_seen.get(r) != Some(&false) && !read_outside.contains(r)
+        })
         .collect();
     reg_order.retain(|r| !dead.contains(r));
     let mut hoist_ips: Vec<usize> = Vec::new();

@@ -592,6 +592,50 @@ measured before being built, and is **not worth it**: summing 3M elements six
 times costs 90ms through a plain `Array` vs 87ms through a `Float64Array`. The
 memory tier's element path is already fine; those 12 declines are close to free.
 
+#### B11c — the numeric seam: `-0`, `NaN % k`, and a live-out hole in DCE
+
+A differential fuzz sweep (~2,400 generated programs plus ~460 hand probes,
+comparing JIT vs interpreter vs node) turned up 27 more JIT-only wrong answers.
+They collapsed to four defects:
+
+1. **DCE had no live-out analysis.** `dead` meant "written in the region but
+   never read *in the region*"; a dead reg gets no home, its defining op is
+   skipped, and nothing is flushed — so the frame keeps whatever the interpreter
+   last left there. `function f(){ for (var i=0;i<40;i++) { var q = i; } return q; }`
+   returned **7** (the value at the last pre-OSR iteration) instead of 39. The
+   declarator form is what exposes it: a plain `q = expr` also emits
+   `Move{dst:temp, src:q}` for the statement value, which keeps `q` in `used`.
+   Now a register read anywhere outside `[s, e]` is never classed dead.
+
+2. **Negation was `0.0 - x`** in the f64 and memory tiers. Under round-to-nearest
+   `0.0 - 0.0` is `+0.0`, so `-(+0)` produced `+0` and `1 / -0` printed
+   `Infinity`. JS negation is a sign-bit flip. This is not an exotic input: the
+   compiler lowers the *literal* `-0` to `LoadInt 0; Neg`.
+
+3. **The INT tier cannot represent `-0` at all** (i64 homes), so `Neg` of zero
+   silently produced integer 0 — `Object.is(-0, -0)` was false inside a compiled
+   loop. Same for `%`: a zero remainder from a negative dividend is `-0` in JS
+   (`-20 % 5`), not `0`. Both now bail for that one input.
+
+4. **`NaN % k` took the integer fast path.** The guard is
+   `cvtsi2sd; ucomisd; jne => bail`, but NaN compares *unordered* (ZF=PF=CF=1) so
+   `jne` is not taken — the guard fell through and ran `idiv` on the
+   integer-indefinite `i64::MIN` that `cvttsd2si` produces. `NaN % 1` gave `0`,
+   and **`NaN % -1` raised #DE and killed the process** (`i64::MIN / -1`
+   overflows the quotient). The rest of the codegen pairs `jne` with `jp`; three
+   copies of this block did not.
+
+Fixing (2) and (3) cleared 26 of the 27 by itself — the fuzzer's programs are
+dense with `-0`, so a single sign bug accounted for nearly the whole set. After
+all four: **0 JIT-vs-interpreter divergences** across the 114 accumulated repro
+programs. Thirteen cases remain where *both* zipp modes differ from node; those
+are interpreter-level conformance gaps, not miscompiles, and are tracked under
+Track A rather than here.
+
+Also worth recording, because it invalidated the first ~370 comparisons in that
+sweep: **`ZIPP_NOJIT` is presence-checked**, so `ZIPP_NOJIT=0` also disables the
+JIT. A differential run must *unset* it.
+
 ### B12 — Read-only live-ins: numeric parameters now reach the INT tier
 
 `plan_region` declined any region containing a register that is *used but never

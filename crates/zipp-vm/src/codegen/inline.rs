@@ -265,9 +265,11 @@ pub(crate) fn emit_inline_leaf_call(
                     ; jz => bail
                     ; cvtsi2sd xmm2, rax
                     ; ucomisd xmm2, xmm0
+                    ; jp => bail                     // NaN: unordered, `jne` misses
                     ; jne => bail
                     ; cvtsi2sd xmm2, rcx
                     ; ucomisd xmm2, xmm1
+                    ; jp => bail
                     ; jne => bail
                     ; cqo
                     ; idiv rcx
@@ -608,9 +610,11 @@ pub(crate) fn emit_mi_body(
                     ; jz => bail
                     ; cvtsi2sd xmm2, rax
                     ; ucomisd xmm2, xmm0
+                    ; jp => bail                     // NaN: unordered, `jne` misses
                     ; jne => bail
                     ; cvtsi2sd xmm2, rcx
                     ; ucomisd xmm2, xmm1
+                    ; jp => bail
                     ; jne => bail
                     ; cqo
                     ; idiv rcx

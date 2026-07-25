@@ -464,6 +464,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 copy_clobber(&mut lc, d);
                 let zbail = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
+                let store = ops.new_dynamic_label();
                 dynasm!(ops
                     ; movq rax, Rx(ax)
                     ; movq rcx, Rx(bx)
@@ -471,6 +472,16 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; jz => zbail              // % 0 → NaN → redo in interp
                     ; cqo                       // sign-extend rax into rdx:rax
                     ; idiv rcx                  // rdx = remainder, rax = quotient
+                    // A ZERO remainder from a NEGATIVE dividend is -0 in JS
+                    // (`-20 % 5` is -0, not 0), and -0 has no i64 home. Bail so
+                    // the interpreter produces the double. rcx is dead after the
+                    // idiv, so reload the dividend through it to test its sign.
+                    ; test rdx, rdx
+                    ; jnz => store
+                    ; movq rcx, Rx(ax)
+                    ; test rcx, rcx
+                    ; js => zbail
+                    ; => store
                     ; movq Rx(d), rdx
                     ; jmp => done
                     ; => zbail
@@ -518,7 +529,21 @@ pub(crate) fn compile_region_int_maybe_cold(
             Instr::Neg { dst, a } => {
                 let d = xh(&plan, dst);
                 let ax = xh(&plan, a);
+                // `-0` is NOT representable in an i64 home, and `-(0)` must yield
+                // the double -0: negating zero here silently produced integer 0,
+                // so `Object.is(-0, -0)` came out false inside a compiled loop
+                // (the literal `-0` lowers to `LoadInt 0; Neg`). Bail to the
+                // interpreter for that one input. Neg is pure, so resuming AT this
+                // ip is idempotent, and `dst`'s home is entry-loaded so the flush
+                // writes back its pre-op value.
+                let nonzero = ops.new_dynamic_label();
                 dynasm!(ops
+                    ; movq rax, Rx(ax)
+                    ; test rax, rax
+                    ; jnz => nonzero
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => flush_exit
+                    ; => nonzero
                     ; pxor xmm0, xmm0
                     ; psubq xmm0, Rx(ax)
                     ; movdqa Rx(d), xmm0

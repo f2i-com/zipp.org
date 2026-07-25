@@ -492,6 +492,67 @@ mod tests {
         assert_jit_matches(&src, &["199999 399998 599997"]);
     }
 
+    // ── numeric edge cases the register tiers used to get wrong ──────────────
+
+    #[test]
+    fn dce_keeps_a_register_read_after_the_region() {
+        // `dead` was "never read IN THE REGION", so the store was skipped and the
+        // frame kept the last interpreted value. Returned 7 instead of 39.
+        assert_jit_matches(
+            "function f(){ for (var i=0;i<40;i++) { var q = i; } return q; } console.log(f())",
+            &["39"],
+        );
+    }
+
+    #[test]
+    fn negate_zero_keeps_the_sign() {
+        // Negation was `0.0 - x`, and `0.0 - 0.0` is `+0.0` under round-to-nearest.
+        assert_jit_matches(
+            "var z=0, r=1; for (var i=0;i<20;i++) { r = 1/(-z); } console.log(r)",
+            &["-Infinity"],
+        );
+    }
+
+    #[test]
+    fn negate_zero_is_observable_in_an_int_region() {
+        // The literal `-0` lowers to `LoadInt 0; Neg`, and an i64 home cannot hold
+        // -0 — the int path must bail rather than produce integer 0.
+        assert_jit_matches(
+            "var v=0; for (var i=0;i<10;i++){ v = Object.is(-0,-0) ? 1 : 2; } console.log(v)",
+            &["1"],
+        );
+    }
+
+    #[test]
+    fn mod_of_nan_is_nan_not_an_integer() {
+        // `ucomisd` leaves NaN UNORDERED, so the `jne` integer-valued guard fell
+        // through and ran idiv on cvttsd2si's i64::MIN. Returned 0.
+        assert_jit_matches(
+            "var r=0, x=NaN, d=0; for (var i=0;i<20;i++) { d=i/2; r = x % 1; } console.log(r)",
+            &["NaN"],
+        );
+    }
+
+    #[test]
+    fn mod_of_nan_by_minus_one_does_not_crash() {
+        // Same missing guard, but i64::MIN / -1 overflows the quotient and raised
+        // #DE — this aborted the process rather than returning a wrong answer.
+        assert_jit_matches(
+            "var r=0, x=NaN, d=0; for (var i=0;i<20;i++) { d=i/2; r = x % -1; } console.log(r)",
+            &["NaN"],
+        );
+    }
+
+    #[test]
+    fn mod_with_negative_dividend_and_zero_remainder_is_negative_zero() {
+        // `-20 % 5` is -0 in JS, which has no integer home: the int/idiv paths
+        // must bail instead of boxing Int(0).
+        assert_jit_matches(
+            "var r=1; for (var i=0;i<20;i++) { r = 1/(-20 % 5); } console.log(r)",
+            &["-Infinity"],
+        );
+    }
+
     #[test]
     fn early_exit_flush_pinned_string() {
         // Same defect reached through the pinned-string charCodeAt path.

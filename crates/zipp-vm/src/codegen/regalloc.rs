@@ -230,10 +230,16 @@ pub(crate) fn compile_region_regalloc(
             Instr::Neg { dst, a } => {
                 let d = xh(&plan, dst);
                 let ax = xh(&plan, a);
+                // FLIP THE SIGN BIT, don't subtract from zero. Under round-to-
+                // nearest `0.0 - 0.0` is `+0.0`, so `-(+0)` came out `+0` and
+                // `1 / -0` printed `Infinity` instead of `-Infinity`. JS negation
+                // is defined on the sign bit, and `-0` is not exotic here: the
+                // compiler lowers the literal `-0` itself to `LoadInt 0; Neg`.
                 dynasm!(ops
-                    ; xorps xmm0, xmm0
-                    ; subsd xmm0, Rx(ax)
-                    ; movaps Rx(d), xmm0
+                    ; mov rax, QWORD (1u64 << 63) as i64
+                    ; movq xmm0, rax
+                    ; movapd Rx(d), Rx(ax)
+                    ; xorpd Rx(d), xmm0
                 );
                 copy_clobber(&mut lc, d);
             }

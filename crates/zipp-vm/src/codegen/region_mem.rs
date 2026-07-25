@@ -304,6 +304,7 @@ pub(crate) fn compile_region_mem(
                 load_num_xmm(&mut ops, b, 1, bail); // xmm1 = b
                 let as_dbl = ops.new_dynamic_label();
                 let mod_done = ops.new_dynamic_label();
+                let rem_signed = ops.new_dynamic_label();
                 dynasm!(ops
                     ; cvttsd2si rax, xmm0            // a → i64 (trunc toward 0)
                     ; cvttsd2si rcx, xmm1            // b → i64
@@ -311,12 +312,31 @@ pub(crate) fn compile_region_mem(
                     ; jz => bail                     // % 0 → NaN (interp)
                     ; cvtsi2sd xmm2, rax
                     ; ucomisd xmm2, xmm0
+                    // NaN compares UNORDERED (ZF=PF=CF=1), so `jne` does not
+                    // take — the guard fell through and ran `idiv` on the
+                    // integer-indefinite i64::MIN that `cvttsd2si` produced.
+                    // `NaN % 1` returned 0, and `NaN % -1` raised #DE and killed
+                    // the process (i64::MIN / -1 overflows the quotient). The
+                    // rest of the codegen pairs `jne` with `jp` — these three
+                    // copies of this block did not.
+                    ; jp => bail                     // a is NaN → fmod (interp)
                     ; jne => bail                    // a not integer-valued → fmod
                     ; cvtsi2sd xmm2, rcx
                     ; ucomisd xmm2, xmm1
+                    ; jp => bail                     // b is NaN → fmod (interp)
                     ; jne => bail                    // b not integer-valued → fmod
                     ; cqo                            // sign-extend rax into rdx:rax
                     ; idiv rcx                       // rdx = a % b (i64 remainder)
+                    // Zero remainder from a NEGATIVE dividend (including -0.0,
+                    // which passes the integer-valued guard because 0.0 == -0.0)
+                    // is -0 in JS. Boxing it as Int(0) loses that. xmm0 still
+                    // holds the original dividend; rax is dead after the idiv.
+                    ; test rdx, rdx
+                    ; jnz => rem_signed
+                    ; movq rax, xmm0
+                    ; test rax, rax
+                    ; js => bail
+                    ; => rem_signed
                     // Box the remainder as an Int Value when it fits i32 (it does
                     // for any |b| ≤ 2^31). Keeping it Int — not a double — means a
                     // downstream `s += (i%k)` concat hits the interned-digit fast
@@ -365,11 +385,15 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Neg { dst, a } => {
-                // Negate via 0.0 - a (keeps it in the f64 domain).
+                // FLIP THE SIGN BIT. `0.0 - a` looks equivalent but is not: under
+                // round-to-nearest `0.0 - 0.0` is `+0.0`, so `-(+0)` produced `+0`
+                // and `1 / -0` gave `Infinity`. JS negation is defined on the sign
+                // bit, and the literal `-0` lowers to `LoadInt 0; Neg`.
                 load_num_xmm(&mut ops, a, 1, bail);
                 dynasm!(ops
-                    ; xorps xmm0, xmm0
-                    ; subsd xmm0, xmm1
+                    ; mov rax, QWORD (1u64 << 63) as i64
+                    ; movq xmm0, rax
+                    ; xorpd xmm0, xmm1
                 );
                 store_xmm(&mut ops, dst);
                 emit_region_bail(&mut ops, ip, bail, epilogue);

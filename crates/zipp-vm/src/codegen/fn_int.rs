@@ -584,11 +584,15 @@ pub(crate) fn int_binop(
         // `cdq` sign-extends eax into edx:eax; `idiv r9d` puts the remainder in
         // edx, which we move into eax for `box_eax`. (Division `/` is NOT done
         // here — JS `/` is float division, e.g. 7/2 == 3.5, not an integer.)
+        // A zero remainder from a NEGATIVE dividend is -0 in JS (`-20 % 5`),
+        // which is not an Int — bail and let the interpreter make the double.
         BinOp::Mod => dynasm!(ops
             ; test r9d, r9d
             ; jz => bail
             ; cmp r9d, -1
             ; je => bail
+            ; test eax, eax
+            ; js => bail
             ; cdq
             ; idiv r9d
             ; mov eax, edx
