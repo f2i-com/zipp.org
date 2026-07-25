@@ -761,7 +761,52 @@ The `IterNext` admission was reverted rather than kept: it is inert for the shap
 it was written for, and unexercised codegen that some future region shape reaches
 is exactly the B9 failure mode.
 
-### B8 — Regex engine (the single largest item)
+### B8 — CORRECTED: the regex ENGINE is not the problem
+
+This section previously said regex was "41.8% of the remaining gap, and not
+reachable by tuning the wrapper — `regress` is a backtracking VM; V8's Irregexp
+compiles each pattern to native code", and named an engine rewrite as the single
+largest item. **That is wrong, and the measurement that shows it is cheap to
+repeat.**
+
+Matching cost is FLAT in subject length, which is what a working literal
+prefilter looks like — `regress` already has one (`startpredicate.rs`,
+`bytesearch.rs`, memchr/memmem), and zipp already feeds it the byte path
+(`find_from_ascii`, plus the `ascii_twin` compile):
+
+```text
+/zqx/.test(s), no match       zipp     node
+  subject 20 chars            105ns     15ns
+  subject 10,000 chars        200ns     20ns      → ~0.01ns/char, i.e. memchr
+  2000-char scan × 200k        25ms     42ms      → FASTER THAN V8
+```
+
+The gap is entirely in the JS-level wrapper, and it splits cleanly:
+
+```text
+                              zipp     node
+  test, matches early          30ms      3ms     ~135ns fixed per-call
+  exec, matches early          76ms      7ms     +~230ns result construction
+```
+
+**Fixed per-call (~135ns).** The builtin-method dispatch chain, plus
+`regexp_exec_fast_ok` on every call (two HashMap probes and an `exec` lookup on
+`RegExp.prototype`). Identical in kind to the ~70ns every String method pays —
+`charCodeAt` and `length`, which have inline JIT fast paths and skip the chain
+entirely, are at parity with node.
+
+**Result construction (~230ns, and ~530ns more for two capture groups).** Each
+`exec` allocates the result array, an `ObjMap` for its properties (three `Vec`s),
+and a **`String` per key** for `index`/`input`/`groups` — `ObjMap::define` does
+`key.to_string()`. Roughly eight allocations per match.
+
+So the top item is NOT an engine rewrite. It is **property storage and name
+interning** (B1/B3), which now has three independent measurements pointing at it:
+string-method dispatch, regex per-call dispatch, and regex result construction.
+An engine rewrite would buy nothing on these benches — our matcher already beats
+V8 at the thing an engine rewrite would improve.
+
+### B8b — Regex work that IS worth doing
 
 41.8% of the remaining gap, and not reachable by tuning the wrapper. `regress`
 is a backtracking VM; V8's Irregexp compiles each pattern to native code. The
