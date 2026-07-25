@@ -356,6 +356,66 @@ be the first half of it.
 - [ ] **B6.1+** Moving young-generation collector over a tagged-index heap.
   **Effort:** XL. **Risk:** highest in the document.
 
+### B9 — Cold-branch side exits (best measured lead; do this before B3/B7)
+
+**A never-taken branch costs the whole loop 3-5x.** Measured, same loop body,
+3M iterations:
+
+| loop | zipp | node |
+|---|---|---|
+| `charCodeAt` + integer compares | **1.7 ns/it** | 1.7 ns |
+| the same + a NEVER-TAKEN `substring` branch | **8.0 ns/it** | 1.7 ns |
+| the same + a NEVER-TAKEN `+= "&"` branch | **5.3 ns/it** | 1.7 ns |
+
+The first row is *parity with V8*. The engine loses it because one op in a cold
+block disqualifies the whole region from the fast tier:
+
+    $ ZIPP_JITLOG=1 zipp js d2.js
+    [jit] INT decline [11,49]: region_is_int=false
+    [jit] DOUBLE/MEM region fn0 [11,49] compiled
+
+This is exactly the shape of `escapeHtml` and `renderInline` in
+markdown-render (#2 in the gap table at 706ms) — a hot `charCodeAt` scan whose
+rare branches slice or concatenate — and of any tokenizer or parser loop with
+uncommon cases. It is the same failure mode as B4 (a dead literal blacklisting
+a loop), generalised.
+
+**The fix is a side exit, and the machinery already exists.** Region bail is
+two instructions, already emitted for guard misses and loop-exit stubs in
+`codegen/region_int.rs`:
+
+    ; mov DWORD [rsi], ip as i32    // resume the interpreter at THIS op
+    ; jmp => flush_exit             // boxes every home back to the reg file
+
+`flush_exit` writes *all* homes back, so an exit at any ip leaves a consistent
+frame: a homed register read or written by the skipped op is correct either
+way, and the interpreter simply continues from that ip. Soundness is the same
+argument the existing bail already relies on.
+
+**Land it additively.** The dispatch in `codegen/mod.rs` is INT(strict) →
+REGALLOC → MEM. Insert a fourth tier — INT-with-cold-exits — *between* REGALLOC
+and MEM, behind `ZIPP_JIT_COLD_EXIT`, so no region that compiles today changes
+tier. Three edits:
+
+1. `compile_region_int`: thread `allow_cold_exit`; its instruction match already
+   ends in `_ => return None`, which becomes the two-instruction exit above.
+2. `region_is_int`: collect the unadmitted ips instead of returning false on the
+   first. Decline outright only when the header or the back-edge is unadmitted
+   (the region would exit immediately and be pointless).
+3. `plan_region`: **the real work.** It declines at `Call`/`CallMethod`
+   (`plan_region.rs:162,167`) and at several VTy-inference points. Relaxing it
+   needs the set of registers *written* by unadmitted ops computed first and
+   excluded from i64 homes — a register written by an op the planner does not
+   model can hold anything, so it cannot carry a typed home. Everything else in
+   the region plans as it does today.
+
+**Effort:** L (a day; step 3 is the care). **Risk:** med-high — hand-emitted x64
+register allocation. **Gate:** the full standing gate plus `assert_jit_matches`
+cases for a taken cold branch, a cold branch in a loop that also deopts, and a
+cold branch that rejoins the loop body. **Gain:** on the measured shape, 8.0 ns
+-> 1.7 ns, i.e. parity. Ranked above B3 and B7 because it is bounded, and above
+B8 because it is a day rather than an epic.
+
 ### B8 — Regex engine (the single largest item)
 
 41.8% of the remaining gap, and not reachable by tuning the wrapper. `regress`
