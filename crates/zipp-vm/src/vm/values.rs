@@ -1586,16 +1586,13 @@ impl<'p> Vm<'p> {
         // form (lone-surrogate pattern string) feeds the surrogates verbatim;
         // `.source` stays lossy (display only).
         let unicode_mode = seen.contains(&'u') || seen.contains(&'v');
-        let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
-            (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
-            (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
-                &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
-            ),
-            (None, true) => source.chars().map(u32::from).collect(),
-            (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
-                &source.encode_utf16().collect::<Vec<u16>>(),
-            ),
-        };
+        // NOTE: building the pattern-character vector is DEFERRED into the
+        // cache-miss arm below. A regex LITERAL evaluates afresh every time it is
+        // reached (ES5+ semantics: a new object per evaluation), so a literal in
+        // a loop hit this path once per iteration and paid the UTF-16 encode plus
+        // two Vec collects even though the compiled program was already cached —
+        // `/re/.test(s)` in a loop cost 79ms/200k against 22ms for the same regex
+        // hoisted out, while node treats the two identically (4ms).
         // Compile, through the (source, flags) cache: @@matchAll/@@split
         // construct a species clone per call, so hot loops re-build the same
         // pattern — share the immutable compiled program instead.
@@ -1605,6 +1602,16 @@ impl<'p> Vm<'p> {
             match cache_key.as_ref().and_then(|k| self.regex_compile_cache.get(k)) {
                 Some(rc) => rc.clone(),
                 None => {
+                    let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
+                        (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
+                        (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
+                            &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
+                        ),
+                        (None, true) => source.chars().map(u32::from).collect(),
+                        (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
+                            &source.encode_utf16().collect::<Vec<u16>>(),
+                        ),
+                    };
                     let r = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
                         .map_err(|e| {
                             Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
