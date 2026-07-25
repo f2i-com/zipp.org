@@ -372,16 +372,62 @@ pub(crate) extern "win64" fn jit_set_index(
 ) -> u64 {
     let arr = Value::from_bits(arr_bits);
     let key = Value::from_bits(key_bits);
-    if !arr.is_heap() || !key.is_number() {
+    if !arr.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: exclusive view; the running region holds no conflicting borrow and
+    // pins only the register file (not the array's Vec, which may reallocate).
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    // ── plain-object computed write: `o[k] = v` overwriting an EXISTING own
+    // writable data slot ────────────────────────────────────────────────────
+    // Deliberately narrower than the read arm. Only an in-place value store on a
+    // slot that already exists is handled, so nothing observable happens: no
+    // shape change, no `vals` reallocation (the JIT inline caches address values
+    // through `vals_ptr + slot`, so an existing-slot store cannot invalidate
+    // them), no prototype involvement (an own data property shadows any
+    // inherited setter), and no length/index bookkeeping.
+    //
+    // Everything else keeps deopting — a NEW key (shape change), an accessor
+    // (runs user code), a non-writable slot (frozen/sealed objects land here,
+    // and strict mode must throw), an uninitialised TDZ slot, the slot-backed
+    // global object, and module / deferred namespaces (live bindings).
+    if key.is_heap() {
+        let oidx = arr.heap_index();
+        if !(oidx == vm.global_this && vm.global_this != 0)
+            && !(!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
+            && !(!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
+            && !vm.arr_props.contains_key(&oidx)
+        {
+            let flat = matches!(
+                vm.heap.str_wtf8_cow(key.heap_index()),
+                Some(std::borrow::Cow::Borrowed(_))
+            );
+            if flat {
+                let k = match vm.heap.str_wtf8_cow(key.heap_index()) {
+                    Some(std::borrow::Cow::Borrowed(b)) => std::str::from_utf8(b).ok().map(|x| x.to_string()),
+                    _ => None,
+                };
+                if let Some(k) = k {
+                    if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
+                        if let Some(i) = m.pos(&k) {
+                            let a = m.attrs[i];
+                            if !a.accessor && a.writable && !m.vals[i].is_uninitialized() {
+                                m.vals[i] = Value::from_bits(val_bits);
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !key.is_number() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let i = match array_index(key) {
         Some(i) => i,
         None => return crate::codegen::SELF_CALL_DEOPT, // negative/fractional → interpreter
     };
-    // SAFETY: exclusive view; the running region holds no conflicting borrow and
-    // pins only the register file (not the array's Vec, which may reallocate).
-    let vm = unsafe { &mut *(vm as *mut Vm) };
     // A TypedArray element write with a NUMBER value mirrors ta_element_set
     // (coercion of a plain number is unobservable; bounds re-check, silent OOB
     // no-op). A non-number value (observable ToNumber/ToBigInt), a BigInt
