@@ -1141,7 +1141,16 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         // `arr.length = n` truncates/grows — deopt so the interpreter's set_prop
         // applies it (no-op here would diverge from the interpreter).
         HeapObj::Array(_) if key == "length" => return crate::codegen::SELF_CALL_DEOPT,
-        _ => return 0, // other heap non-Object props: silent no-op (matches interpreter)
+        // Any other heap receiver — Array, Proxy, Func, Closure, Date, Map, Set,
+        // Promise, RegExp, Boxed, TypedArray — must DEOPT, not no-op.
+        //
+        // This used to `return 0`, which is the helper's SUCCESS code, on the
+        // premise that the interpreter also no-ops. It does not: it performs the
+        // store. So `for (i…) a.p = i` on an array left `a.p` at whatever value
+        // it held when the region compiled, and a Proxy's `set` trap simply
+        // stopped firing once the loop got hot — silent data loss, and skipped
+        // observable side effects.
+        _ => return crate::codegen::SELF_CALL_DEOPT,
     };
     let (added, vals_ptr, slot) = match vm.heap.get_mut(idx) {
         HeapObj::Object(map) => match own {

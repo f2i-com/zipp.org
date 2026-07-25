@@ -100,6 +100,12 @@ pub(crate) fn compile_region_regalloc(
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_box_to_home(&mut ops, x, entry_bail);
     }
+    // Bool homes last: the loads above use r10 as scratch and r10 is itself one
+    // of BOOL_GPRS, so loading bools earlier would be undone here.
+    for &(r, g) in &plan.live_in_bools {
+        dynasm!(ops ; mov rax, [rbx + dreg(r)]);
+        emit_bool_entry_load(&mut ops, g, entry_bail);
+    }
     // Hoisted loop-invariant constants: materialise once, here.
     for &hip in &plan.hoist_ips {
         emit_load_const(&mut ops, &plan, &proto.code[hip], proto);

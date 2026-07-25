@@ -470,6 +470,65 @@ evidence of correctness — only of not having found the counterexample yet. Tha
 is also the argument for keeping such work opt-in until something independent
 forces new shapes through it, which is exactly what happened here.
 
+### B11 — Region flush soundness — FIXED, and it cost nothing
+
+The exit flush wrote a strictly larger set than the entry prologue loaded.
+`plan_region` built the flush set from every homed value (`num_regs`,
+`bool_regs`, `globs`) but the entry-load set only from values **read before
+written** (`live_in_regs`, `live_in_globs`). A register whose first occurrence in
+the region is a *write* therefore got a home that was never initialised — and
+`flush_exit` wrote it back anyway.
+
+That is reachable by ordinary code, because OSR entry happens at a back-edge: a
+loop with a trip count of exactly `OSR_THRESHOLD` (8) compiles the region on the
+final back-edge, enters it, finds the condition already false, runs **zero** body
+iterations, and flushes. Same story for a write that sits on an untaken branch,
+or any guard that side-exits before the write. Nine shapes, seven wrong:
+
+    var s = 999; for (var i = 0; i < 8; i++) { s = (i * 3) | 0 | 0; }  // 0, want 21
+    var s = 999; for (var i = 0; i < 8; i++) { s = i; }                // 8, want 7
+    var s = 5;   for (var i = 0; i < 8; i++) { if (i > 100) { s = i; } } // 8, want 5
+    var g = 42;  (function(){ for (var i=0;i<8;i++) { g = i*2; } })();   // 4626604192193053000, want 14
+
+The last one is the signature: an uninitialised xmm flushed through the
+double-boxing path, so a raw f64 bit pattern surfaced as a JavaScript number.
+Bool homes were worse — they live in gprs the prologue never touched at all, so
+the flush boxed whatever the register happened to hold into a `Boolean`.
+
+**Fix:** entry-load every home the flush writes, type-guarded exactly like a
+live-in (`entry_bail` when the guard fails — sound, because a bail restores
+without flushing). `hoisted` constants are the one exclusion; the prologue
+materialises them immediately after.
+
+This forced out **home unification** (copy coalescing, `unify_homes_with_globals`
+/ `unify_move_homes`). It shares one home between two registers, so the home
+cannot be initialised from either register's own frame slot, and an exit before
+the alias's def flushes the *other* value — that is exactly why `s = i` returned
+`i`. Restoring it needs per-exit flush sets driven by a must-def dataflow over
+the region CFG, so an exit only flushes what provably reached its def.
+
+**Measured before removing it, on the two shapes it was written for** (a
+global-shuttle accumulator and a move-heavy 8-variable loop, 20M iterations
+each): 369ms with unification, 371ms without — best-of-3, i.e. nothing. The four
+real benches were likewise unchanged (2242ms vs 2240ms total). So the must-def
+dataflow buys back ~0.5% at best and is not worth building; the flag
+(`UNIFY_HOMES` in `plan_region.rs`) is left in place documenting why.
+
+A separate crash fell out of the same audit: a `Bool`-typed register stored to a
+global asked `xh()` for the xmm home of a gpr-homed register, which is
+`unreachable!`. `var b = i < 100;` at top level inside any hot loop **panicked
+the engine**. Globals are unconditionally homed as numbers and there is no boxing
+path between the two home kinds, so the region now declines to the memory tier.
+
+Six regression tests pin these (`early_exit_flush_*` in `lib.rs`), each
+differential (JIT vs interpreter) rather than golden-output.
+
+**Lesson.** B9's was "a green gate is not evidence for tier-selection changes."
+This one is narrower and sharper: *the set you restore must cover the set you
+spill.* It is a one-line invariant, it was violated for the whole life of the
+register tiers, and no amount of test262 caught it — 8-iteration loops whose
+result is read afterwards are simply not what a conformance suite is made of.
+
 ### B8 — Regex engine (the single largest item)
 
 41.8% of the remaining gap, and not reachable by tuning the wrapper. `regress`

@@ -27,9 +27,20 @@ pub(crate) enum Home {
 pub(crate) struct RegionPlan {
     pub(crate) reg_home: FxHashMap<u16, Home>,
     pub(crate) glob_home: FxHashMap<u32, u8>, // global slot → xmm index
-    /// Numeric registers that are read before written (must be loaded at entry).
+    /// Numeric registers loaded (and type-guarded) at entry. This is EVERY
+    /// xmm-homed reg except the hoisted constants, not just the loop-carried
+    /// ones: `flush_exit` writes every home in `num_regs` back to the reg file,
+    /// and a region entered at the OSR back-edge can reach an exit BEFORE a
+    /// def-first reg's def runs (loop condition already false, or a guard fails
+    /// early, or the def sits on an untaken branch). Loading them all makes that
+    /// flush write back the value the frame already held instead of whatever
+    /// happened to be in the home. See `live_in_bools`.
     pub(crate) live_in_regs: Vec<(u16, u8)>, // (reg, xmm)
-    /// Globals read before written (loaded + guarded at entry).
+    /// Bool registers loaded (and Bool-guarded) at entry — all of them, for the
+    /// same reason as `live_in_regs`. Bool homes are gprs the prologue does not
+    /// otherwise initialise, so before this they flushed raw garbage.
+    pub(crate) live_in_bools: Vec<(u16, u8)>, // (reg, gpr)
+    /// Globals loaded (and guarded) at entry — every global in `globs`.
     pub(crate) live_in_globs: Vec<(u32, u8)>, // (slot, xmm)
     /// All numeric reg homes (flushed to the reg file on exit).
     pub(crate) num_regs: Vec<(u16, u8)>,

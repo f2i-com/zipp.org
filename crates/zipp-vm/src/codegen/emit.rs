@@ -18,6 +18,21 @@ pub(crate) fn emit_int_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, 
     );
 }
 
+/// Entry load for a bool gpr home: the Value bits are in `rax`. Guard Bool-tagged
+/// (else `bail`), then put the 0/1 payload in the home. Scratch is `rdx`, NOT
+/// `r10` — `r10` is itself one of `BOOL_GPRS`, so using it here would clobber an
+/// already-loaded bool home on the next iteration of the load loop.
+pub(crate) fn emit_bool_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, bail: dynasmrt::DynamicLabel) {
+    dynasm!(ops
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; cmp edx, (INT_TAG_HI + 1) as i32 // 0x7FFA — BOOL_TAG's high 16 bits
+        ; jne => bail                      // not Bool-tagged
+        ; and eax, 1                       // payload is 0/1; zero-extends to rax
+        ; mov Rq(home), rax
+    );
+}
+
 /// Materialise an integer constant (`LoadInt`/`LoadConst`-Int) into its i64 home:
 /// the FULL sign-extended i64 immediate, then `movq` (NOT cvtsi2sd — we want the
 /// integer bit pattern, not its f64 form).

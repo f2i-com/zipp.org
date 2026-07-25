@@ -395,6 +395,65 @@ mod tests {
         assert_jit_matches("let s=0; for(let i=0;i<1000;i++){ s-=i; } console.log(s)", &["-499500"]);
     }
 
+    // ── early-exit flush soundness ────────────────────────────────────────────
+    // A trip count of exactly OSR_THRESHOLD (8) compiles the region on the final
+    // back-edge, so it is ENTERED and then exits with zero body iterations. Every
+    // home `flush_exit` writes back must therefore already hold the register's
+    // real value at entry — otherwise the flush silently overwrites correct
+    // interpreter state with whatever was in the xmm/gpr. Each of these returned
+    // a wrong answer (not a deopt) before the entry loads covered def-first regs,
+    // bool gprs and def-first globals.
+
+    #[test]
+    fn early_exit_flush_def_first_move() {
+        // Returned 8 (the loop counter's value, via a unified home) instead of 7.
+        assert_jit_matches("var s=999; for(var i=0;i<8;i++){ s=i; } console.log(s)", &["7"]);
+    }
+
+    #[test]
+    fn early_exit_flush_def_first_arith() {
+        // Returned 0 — an xmm home that was never loaded and never written.
+        assert_jit_matches("var s=999; for(var i=0;i<8;i++){ s=(i*3)|0|0; } console.log(s)", &["21"]);
+    }
+
+    #[test]
+    fn early_exit_flush_conditional_def() {
+        // The def never runs, so `s` must keep its pre-loop value. Returned 8.
+        assert_jit_matches(
+            "var s=5; for(var i=0;i<8;i++){ if(i>100){ s=i; } } console.log(s)",
+            &["5"],
+        );
+    }
+
+    #[test]
+    fn early_exit_flush_def_first_global() {
+        // A def-first GLOBAL flushed an uninitialised xmm as a double, printing a
+        // raw bit pattern (4626604192193053000) instead of 14.
+        assert_jit_matches(
+            "var g=42; (function(){ for(var i=0;i<8;i++){ g=i*2; } })(); console.log(g)",
+            &["14"],
+        );
+    }
+
+    #[test]
+    fn early_exit_flush_bool_home() {
+        // Bool homes live in gprs the prologue never initialised, so the flush
+        // boxed whatever the register happened to hold into a Bool.
+        assert_jit_matches(
+            "var b='keep'; for(var i=0;i<8;i++){ b=i<100; } console.log(b)",
+            &["true"],
+        );
+    }
+
+    #[test]
+    fn early_exit_flush_pinned_string() {
+        // Same defect reached through the pinned-string charCodeAt path.
+        assert_jit_matches(
+            "var s='ab',e=777; for(var m=0;m<8;m++){ e=(s.charCodeAt(0)^0)|0; } console.log(e)",
+            &["97"],
+        );
+    }
+
     #[test]
     fn int_region_crosses_i32() {
         // sum 0..99999 = 4999950000 > 2^31 — value stays i64 in the loop, flushes

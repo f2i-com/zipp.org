@@ -163,7 +163,18 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::StrConcat { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
         | Instr::Bitwise { dst, .. }
-        | Instr::Call { dst, .. } => Some(dst),
+        | Instr::Call { dst, .. }
+        // MathOp and CallMethod DEFINE their dst. They used to fall through the
+        // `_` arm below and report "writes nothing", so a register defined by
+        // `Math.imul(..)` or a pinned-string `charCodeAt(..)` looked
+        // never-defined to the home-unification passes and got coalesced onto an
+        // unrelated global's home — in practice the loop counter's. That
+        // produced a dropped store, a loop counter that took the accumulator's
+        // value (`i` ending at 61 instead of 20), an infinite loop when the
+        // aliased counter could never reach its bound, and an `xh` panic when
+        // the register had no home at all.
+        | Instr::MathOp { dst, .. }
+        | Instr::CallMethod { dst, .. } => Some(dst),
         _ => None,
     }
 }

@@ -69,7 +69,6 @@ pub(crate) fn plan_region_cold(
         // `obj` of every pinned-STRING charCodeAt/length access.
         let mut recv: FxHashSet<u16> = FxHashSet::default();
         for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
             if cold.contains(&(s + off)) { continue; }
             if pinned_elem(s + off) {
                 if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
@@ -99,9 +98,7 @@ pub(crate) fn plan_region_cold(
             }
             let mut used_elsewhere: FxHashSet<u16> = FxHashSet::default();
             for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
                 if cold.contains(&(s + off)) { continue; }
-            if cold.contains(&(s + off)) { continue; }
                 // The receiver use AT a pinned access is exempt (read via the pin,
                 // not the register). For a pinned-STRING access the obj-use is also
                 // invisible to instr_uses today (CallMethod→vec![]; GetProp→[obj]),
@@ -457,14 +454,48 @@ pub(crate) fn plan_region_cold(
         }
     }
 
+    // ── bool ↔ global decline ── globals are always homed as NUMBERS (an xmm,
+    // flushed through `emit_int_box_from_home`), while a bool-typed reg is homed
+    // in a gpr. Moving a value between the two would ask `xh()` for the xmm home
+    // of a gpr-homed register, which is `unreachable!` — so `var b = i < 100;` at
+    // top level inside any hot loop PANICKED the engine rather than declining.
+    // There is no boxing path here, so decline the region to the memory tier.
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) {
+            continue;
+        }
+        let bool_glob = match *instr {
+            Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } => src,
+            Instr::LoadGlobal { dst, .. } => dst,
+            _ => continue,
+        };
+        if ty.get(&bool_glob) == Some(&VTy::Bool) {
+            return None;
+        }
+    }
+
     // ── home unification (copy coalescing) ── temps that only shuttle a global's
     // (or a live-in reg's) value share that value's home; the body copies vanish.
+    //
+    // DISABLED (soundness): an aliased reg shares another value's home, so its
+    // home cannot be initialised from its own frame slot at entry — and an exit
+    // taken before the alias's def then flushes the OTHER value into its slot.
+    // That is a silent wrong answer, not a deopt: `for (i=0;i<8;i++) s = i;`
+    // returned `i` (8) instead of 7, because the region is entered on the final
+    // back-edge, runs zero body iterations, and flushes anyway. Re-enabling this
+    // needs per-exit flush sets driven by a must-def dataflow (see PERF_ROADMAP).
+    const UNIFY_HOMES: bool = false;
     let jump_targets = region_jump_targets(code, s, e);
-    let glob_alias =
-        unify_homes_with_globals(code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets);
-    let move_alias = unify_move_homes(
-        code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets, &glob_alias,
-    );
+    let (glob_alias, move_alias) = if UNIFY_HOMES {
+        let g =
+            unify_homes_with_globals(code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets);
+        let m = unify_move_homes(
+            code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets, &g,
+        );
+        (g, m)
+    } else {
+        (FxHashMap::default(), FxHashMap::default())
+    };
     // Aliased regs don't consume an xmm home of their own.
     reg_order.retain(|r| !glob_alias.contains_key(r) && !move_alias.contains_key(r));
 
@@ -706,15 +737,23 @@ pub(crate) fn plan_region_cold(
     let mut num_regs = Vec::new();
     let mut bool_regs = Vec::new();
     let mut live_in_regs = Vec::new();
+    let mut live_in_bools = Vec::new();
     for &r in &reg_order {
         match reg_home[&r] {
             Home::Xmm(x) => {
                 num_regs.push((r, x));
-                if first_seen.get(&r) == Some(&false) {
+                // EVERY flushed home is entry-loaded, not just the read-first
+                // ones — see `RegionPlan::live_in_regs`. `hoisted` regs are the
+                // one exception: the prologue materialises their constant right
+                // after this, so a load would be dead.
+                if !hoisted.contains(&r) {
                     live_in_regs.push((r, x));
                 }
             }
-            Home::Gpr(g) => bool_regs.push((r, g)),
+            Home::Gpr(g) => {
+                bool_regs.push((r, g));
+                live_in_bools.push((r, g));
+            }
         }
     }
     // Home-unified regs aren't in reg_order; they're flushed from the SHARED home
@@ -732,15 +771,17 @@ pub(crate) fn plan_region_cold(
     for &gi in &glob_order {
         let x = glob_home[&gi];
         globs.push((gi, x));
-        if glob_first_read.get(&gi) == Some(&true) {
-            live_in_globs.push((gi, x));
-        }
+        // Every flushed global is entry-loaded too. A def-first global used to
+        // flush an uninitialised xmm, which surfaced as a raw f64 bit pattern
+        // (`g = i * 2` in an 8-trip loop printed 4626604192193053000).
+        live_in_globs.push((gi, x));
     }
 
     Some(RegionPlan {
         reg_home,
         glob_home,
         live_in_regs,
+        live_in_bools,
         live_in_globs,
         num_regs,
         bool_regs,
@@ -788,6 +829,18 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::SetIndexConcat { obj, key, val, .. } => vec![obj, key, val],
         Instr::DeleteIndexConcat { obj, key, .. } => vec![obj, key],
         Instr::Return { src } => vec![src],
+        // MathOp / CallMethod read a CONTIGUOUS argument window starting at
+        // `arg_base` (plus the receiver for a method call). Reporting no uses
+        // let the home-unification passes treat those registers as dead and
+        // alias over them — see the matching note in `writes_reg`.
+        Instr::MathOp { arg_base, argc, .. } => {
+            (0..argc).map(|k| arg_base + k).collect()
+        }
+        Instr::CallMethod { obj, arg_base, argc, .. } => {
+            let mut v = vec![obj];
+            v.extend((0..argc).map(|k| arg_base + k));
+            v
+        }
         _ => vec![],
     }
 }

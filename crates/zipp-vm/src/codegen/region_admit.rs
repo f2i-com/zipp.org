@@ -197,9 +197,23 @@ pub(crate) fn region_can_compile(
                 // `s[i] === "x"` scans); a multi-char string constant is
                 // accepted on the MEM path when its pre-interned bits are in
                 // `const_strs`. Anything else rejects the region.
+                //
+                // BOTH string arms require `const_strs`, i.e. the MEM path. The
+                // register paths (int/regalloc, which pass None) home values in
+                // i64/f64 registers and have no way to hold a string: their
+                // `emit_load_const` writes `v.bits()` straight into an xmm home,
+                // and for a not-yet-interned constant those bits are the
+                // `STRING_CONST_BIT | idx` SENTINEL, not a heap value. Admitting
+                // a single-char literal there put that sentinel in a float
+                // register, where it escaped on flush and was indexed as a heap
+                // slot (`for (var s,i=0;i<20;i++) s="a"` aborted the process at
+                // heap.rs), read as a NaN by arithmetic (so `1 < "2"` inside a
+                // hot loop was always false), or flushed as a bogus value
+                // (`typeof s` becoming "number"). MEM resolves it properly.
                 match proto.constants.get(idx as usize) {
                     Some(c) if c.is_number() => {}
-                    Some(&c) if single_char_const_bits(proto, c).is_some() => {}
+                    Some(&c)
+                        if const_strs.is_some() && single_char_const_bits(proto, c).is_some() => {}
                     Some(_) if const_strs.is_some_and(|m| m.contains_key(&idx)) => {}
                     _ => {
                         if std::env::var_os("ZIPP_JITDUMP").is_some() {
