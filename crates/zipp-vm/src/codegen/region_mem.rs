@@ -1297,6 +1297,28 @@ pub(crate) fn compile_region_mem(
                 // helper deopts for anything but ASCII/ASCII, so the interpreter
                 // runs the full method (fromIndex forms, non-ASCII, coercible
                 // arguments, a non-string receiver) at this ip unchanged.
+                // `s.substring(a,b)` / `s.slice(a,b)` intrinsic — same shape as
+                // indexOf below. The two args are read from the contiguous arg
+                // window, so the helper takes a pointer to it rather than four
+                // register operands.
+                if argc == 2 && (key == "substring" || key == "slice") {
+                    let bail = ops.new_dynamic_label();
+                    let is_slice = (key == "slice") as i32;
+                    dynasm!(ops
+                        ; mov rcx, rdi                          // vm
+                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
+                        ; lea r8, [rbx + dreg(arg_base)]        // &args[0..2]
+                        ; mov r9d, is_slice
+                        ; mov rax, QWORD heap.str_substring as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    continue;
+                }
                 if argc == 1 && key == "indexOf" {
                     let bail = ops.new_dynamic_label();
                     dynasm!(ops

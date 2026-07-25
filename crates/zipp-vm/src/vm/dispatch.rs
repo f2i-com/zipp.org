@@ -2700,6 +2700,14 @@ impl<'p> Vm<'p> {
                                                 {
                                                     continue; // dedicated helpers
                                                 }
+                                                if *argc == 2
+                                                    && matches!(
+                                                        key,
+                                                        Some("substring") | Some("slice")
+                                                    )
+                                                {
+                                                    continue; // dedicated helper
+                                                }
                                                 if (*argc == 1 || *argc == 2)
                                                     && key.is_some_and(|k| {
                                                         crate::codegen::dv_get_kind(k).is_some()
@@ -5858,6 +5866,7 @@ impl<'p> Vm<'p> {
             math_two: jit_math_two as usize,
             cell_get: jit_cell_get as usize,
             str_index_of: crate::vm::helpers_misc::jit_str_index_of as usize,
+            str_substring: crate::vm::helpers_misc::jit_str_substring as usize,
             cell_set: jit_cell_set as usize,
             upval_set: jit_upval_set as usize,
             get_index_concat: jit_get_index_concat as usize,

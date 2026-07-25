@@ -441,6 +441,8 @@ pub struct HeapHelperAddrs {
     pub upval_get: usize,
     /// Intrinsic for `s.indexOf(t)` (ASCII/ASCII, 1 arg); deopts otherwise.
     pub str_index_of: usize,
+    /// Intrinsic for `s.substring(a,b)` / `s.slice(a,b)` (ASCII, Int args).
+    pub str_substring: usize,
     /// Helpers for `CellSet` / `UpvalSet` — a captured-cell WRITE. A plain heap
     /// store: no TDZ check, no alloc, no user code, so no pinned refetch.
     pub cell_set: usize,
@@ -510,6 +512,7 @@ impl HeapHelperAddrs {
             get_index_concat: self.get_index_concat,
             upval_get: self.upval_get,
             str_index_of: self.str_index_of,
+            str_substring: self.str_substring,
             forin_live: self.forin_live,
             has_property: self.has_property,
             regs_fits: self.regs_fits,

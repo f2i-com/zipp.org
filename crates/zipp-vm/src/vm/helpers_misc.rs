@@ -162,6 +162,63 @@ pub(crate) extern "win64" fn jit_str_index_of(
     }
 }
 
+/// Win64 helper for `s.substring(a, b)` / `s.slice(a, b)` inside a compiled
+/// region — the same JIT-intrinsic shape as `jit_str_index_of`. `is_slice`
+/// selects the two different clamping rules (`slice` counts a negative index
+/// from the end and yields "" when start >= end; `substring` clamps negatives to
+/// 0 and SWAPS a reversed pair).
+///
+/// Restricted to an ASCII flat receiver with two Int arguments, where UTF-16
+/// unit offsets are byte offsets; anything else returns the deopt sentinel and
+/// the interpreter runs the full method at that ip.
+///
+/// # Safety
+/// `vm` is the live `Vm`; the operands are raw Value bits from the reg file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_substring(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    packed_args: u64,
+    is_slice: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let r = Value::from_bits(recv_bits);
+    if !r.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let (a, b) = (
+        Value::from_bits(unsafe { *(packed_args as *const u64) }),
+        Value::from_bits(unsafe { *((packed_args as *const u64).add(1)) }),
+    );
+    if !a.is_int() || !b.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    vm.heap.flatten(r.heap_index());
+    let len = match vm.heap.get(r.heap_index()) {
+        crate::heap::HeapObj::Str(js) if js.is_ascii() => js.units() as i64,
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    let (mut x, mut y) = (a.as_int() as i64, b.as_int() as i64);
+    if is_slice != 0 {
+        // slice: negative counts from the end, then clamp; empty if start >= end.
+        if x < 0 { x += len; }
+        if y < 0 { y += len; }
+        x = x.clamp(0, len);
+        y = y.clamp(0, len);
+        if x >= y {
+            return Value::heap(crate::heap::INTERN_EMPTY).bits();
+        }
+    } else {
+        // substring: clamp both to [0, len], then order them.
+        x = x.clamp(0, len);
+        y = y.clamp(0, len);
+        if x > y {
+            core::mem::swap(&mut x, &mut y);
+        }
+    }
+    vm.ascii_slice_value(r.heap_index(), x as usize..y as usize).bits()
+}
+
 /// Win64 helper for a generic `f(args…)` (`Call`) inside a compiled OSR region:
 /// the plain-call sibling of [`jit_call_method_ic`] (consults `ic_call`,
 /// `this = undefined`). r9 = (callee_reg<<16)|arg_base; same protocol otherwise.
