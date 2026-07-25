@@ -899,6 +899,9 @@ impl<'p> Vm<'p> {
             result,
             handlers: Vec::new(),
         })));
+        // GC roots suspended activations from this registry instead of scanning
+        // the whole heap every collection; see `Vm::async_activations`.
+        self.async_activations.push(idx);
         if gen_callee != Value::UNDEFINED {
             // Every drive/resume binds this as Frame.callee (LoadCallee identity).
             self.gen_callee.insert(idx, gen_callee);
@@ -1005,6 +1008,7 @@ impl<'p> Vm<'p> {
             queue: Vec::new(),
             awaiting_return: false,
         })));
+        self.async_activations.push(ag);
         // OrdinaryCreateFromConstructor: honor the callee's `prototype`
         // object; the HeapObj::AsyncGenerator fallback stays %AsyncGenProto%.
         // A REALM-BORN async generator function with a NON-OBJECT `prototype`

@@ -431,6 +431,18 @@ pub struct Vm<'p> {
     /// no explicit length): heap idx set. Their effective length follows the
     /// buffer's current byte length.
     ta_tracking: std::collections::HashSet<u32>,
+    /// Heap indices of async activations (`AsyncState` / `AsyncGenerator`) that
+    /// may still be suspended. A suspended activation is referenced only by the
+    /// await-reaction it registered — a cycle the program cannot otherwise reach
+    /// — so the collector must root it explicitly. It used to find them by
+    /// LINEARLY SCANNING THE WHOLE HEAP on every collection, which costs
+    /// ~2.8ns per slot in every program, including programs with no async code
+    /// at all (measured 1.9% of the benchmark suite, streaming hundreds of MB to
+    /// find nothing). Registering the two allocation sites instead makes the
+    /// root phase proportional to the number of activations. Stale entries are
+    /// pruned in the same pass that roots them, so completion needs no
+    /// deregistration at any of the 11 sites that finish an activation.
+    async_activations: Vec<u32>,
     /// Length-tracking DataViews (created on a resizable/growable buffer with no
     /// explicit byteLength): heap idx set. Their byteLength follows the buffer's
     /// current size, and byteLength/byteOffset throw (IsViewOutOfBounds) once the

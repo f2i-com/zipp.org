@@ -112,6 +112,7 @@ impl<'p> Vm<'p> {
             arr_props: rustc_hash::FxHashMap::default(),
             ab_max: std::collections::HashMap::new(),
             ta_tracking: std::collections::HashSet::new(),
+            async_activations: Vec::new(),
             dv_tracking: std::collections::HashSet::new(),
             deleted_callable_intrinsics: std::collections::HashSet::new(),
             deleted_globals: std::collections::HashSet::new(),

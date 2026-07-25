@@ -364,17 +364,29 @@ impl Vm<'_> {
         // non-completed async activation; tracing it then keeps its awaited
         // promises / saved registers alive. A completed activation is unrooted
         // here and reclaimed normally.
-        for i in floor..n {
-            match self.heap.get(i as u32) {
-                HeapObj::AsyncState(s) if !matches!(s.state, GenState::Completed) => {
-                    root_idx!(i)
-                }
-                HeapObj::AsyncGenerator(s) if !matches!(s.state, GenState::Completed) => {
-                    root_idx!(i)
-                }
-                _ => {}
+        // Walk the REGISTRY, not the heap. This used to be a linear scan of
+        // every slot on every collection — ~2.8 ns/slot paid by every program,
+        // including those with no async code at all (measured at 1.9% of the
+        // benchmark suite; async-promise-chain 4.9%, markdown-render 4.4%).
+        // The same pass prunes: an entry whose slot is no longer a suspended
+        // activation (completed, or the slot was reclaimed and reused) is
+        // dropped, so none of the 11 sites that finish an activation has to
+        // deregister. Sorting/deduping keeps a reused slot from being held
+        // twice after its predecessor was collected.
+        let mut acts = std::mem::take(&mut self.async_activations);
+        acts.sort_unstable();
+        acts.dedup();
+        acts.retain(|&i| {
+            let live = matches!(self.heap.get(i),
+                HeapObj::AsyncState(s) if !matches!(s.state, GenState::Completed))
+                || matches!(self.heap.get(i),
+                    HeapObj::AsyncGenerator(s) if !matches!(s.state, GenState::Completed));
+            if live {
+                root_idx!(i as usize);
             }
-        }
+            live
+        });
+        self.async_activations = acts;
 
         // --- Trace ---------------------------------------------------------
         while let Some(idx) = stack.pop() {
