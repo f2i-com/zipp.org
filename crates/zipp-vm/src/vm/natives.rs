@@ -1538,6 +1538,68 @@ impl<'p> Vm<'p> {
                 let _gc = self.gc_lock_guard();
                 // ToString(string) — IDENTITY for a string value (exact WTF-8).
                 let s_val = self.to_str_value(a0)?;
+                // ── pristine fast path ──
+                // Every step of the observable protocol below is guaranteed to
+                // return the intrinsic when `regexp_matchall_fast_ok` holds, so
+                // the whole sequence reduces to cloning the compiled regex. The
+                // slow path costs ~6 property lookups, 3 string allocations and a
+                // full Construct (which re-derives the pattern) — 1.2us per
+                // `matchAll` call before a single match is attempted, against
+                // node's 47ns.
+                if let Some(re_idx) = self.as_regexp(this) {
+                    // `lastIndex = ToLength(Get(R, "lastIndex"))` is OBSERVABLE when
+                    // the slot holds an object — `valueOf` runs and may throw
+                    // (test262 Symbol.matchAll/this-tolength-lastindex-throws). Only
+                    // a plain number can take the fast path.
+                    let li_number = matches!(
+                        self.heap.get(re_idx),
+                        HeapObj::RegExp { last_index, .. } if last_index.is_number()
+                    );
+                    if li_number && self.regexp_matchall_fast_ok(re_idx) {
+                        let (regex, source, flags, li_raw) = match self.heap.get(re_idx) {
+                            HeapObj::RegExp { regex, source, flags, last_index, .. } => (
+                                regex.clone(),
+                                source.clone(),
+                                flags.clone(),
+                                *last_index,
+                            ),
+                            _ => unreachable!("as_regexp checked the tag"),
+                        };
+                        // Still needs the same ToLength clamp the slow path
+                        // applies: truncate toward zero, floor at 0, cap 2^53-1.
+                        let li = {
+                            let d = li_raw.as_f64().trunc();
+                            let d = if d.is_nan() { 0.0 } else { d };
+                            d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize
+                        };
+                        let global = flags.contains('g');
+                        let full_unicode = flags.contains('u') || flags.contains('v');
+                        // The matcher is a SEPARATE object: the iterator advances
+                        // its lastIndex independently of the source regex.
+                        let matcher_idx = self.heap.alloc(HeapObj::RegExp {
+                            regex,
+                            source,
+                            flags,
+                            last_index: Value::num(li as f64),
+                            ascii_twin: None,
+                        });
+                        // A lone-surrogate pattern keeps its exact source bytes.
+                        if let Some(b) = self.regexp_exact_source.get(&re_idx).cloned() {
+                            self.regexp_exact_source.insert(matcher_idx, b);
+                        }
+                        self.proto_of.insert(matcher_idx, Value::heap(self.regexp_proto));
+                        let proto = self.regexp_string_iter_proto;
+                        let it = self.heap.alloc(HeapObj::Iterator {
+                            items: Vec::new(),
+                            index: 0,
+                            proto,
+                            live: None,
+                        });
+                        let fbits = (global as u8) | ((full_unicode as u8) << 1);
+                        self.regexp_string_iters.insert(it, (matcher_idx, s_val, fbits, false));
+                        return Ok(Value::heap(it));
+                    }
+                }
                 let flags_v = self.get_prop(this, "flags")?;
                 let flags = self.to_js_string(flags_v)?;
                 let global = flags.contains('g');
