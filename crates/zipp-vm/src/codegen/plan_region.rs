@@ -5,6 +5,19 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Decline this region, naming the reason under `ZIPP_JITDECLINE=1`. The planner
+/// has ~25 exit points and `ZIPP_JITLOG` only reports `plan_region=None`, which
+/// says a region missed the fastest tier but not what to fix. Diagnostic only —
+/// the env lookup happens once per declined region-compile, never per iteration.
+macro_rules! decline {
+    ($reason:expr) => {{
+        if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+            eprintln!("[decline-reason] {}", $reason);
+        }
+        return None;
+    }};
+}
+
 /// Plan register homes for `[start, end]`, or `None` to decline (use mem path).
 /// `ta_plan` (unboxed-region epic): the pinned-TypedArray plan, threaded so a
 /// later increment can admit a pinned-Float64Array element GetIndex/SetIndex as a
@@ -179,20 +192,20 @@ pub(crate) fn plan_region_cold(
         // TypedArray access, which the f64 element fast path emits inline (the
         // element is a VTy::Num xmm home; receiver/index handled specially below).
         match *instr {
-            Instr::Call { .. } => return None,
+            Instr::Call { .. } => decline!("Call"),
             // A pinned-STRING charCodeAt is admitted on the int path (inlines to a
             // byte load, runs no user code, allocates nothing — the no-call
             // invariant that keeps BOOL_GPRS alive holds). Any other method call,
             // or a charCodeAt whose receiver isn't pinned, declines.
-            Instr::CallMethod { .. } if !pinned_str(s + off) => return None,
+            Instr::CallMethod { .. } if !pinned_str(s + off) => decline!("CallMethod (receiver not a pinned string)"),
             // A Bitwise op declines UNLESS the caller (the INT path) admits it: its
             // i64 homes hold sign-extended integers, so the low 32 bits ARE ToInt32
             // and the op runs inline with no reload/rebox. The regalloc/double path
             // passes admit_bitwise=false (its homes are f64, not int32 lanes).
-            Instr::Bitwise { .. } if !admit_bitwise => return None,
+            Instr::Bitwise { .. } if !admit_bitwise => decline!("Bitwise on the double path"),
             Instr::GetIndex { .. } | Instr::SetIndex { .. } => {
                 if !pinned_elem(s + off) {
-                    return None;
+                    decline!("GetIndex/SetIndex (element not a pinned TypedArray)");
                 }
             }
             _ => {}
@@ -247,7 +260,7 @@ pub(crate) fn plan_region_cold(
                 dty
             };
             if !note_def(d, t, &mut ty, &mut first_seen, &mut reg_order) {
-                return None;
+                decline!("type conflict on a reused register");
             }
         }
         // Globals: order + first-touch direction. A TA-receiver's LoadGlobal is
@@ -270,25 +283,56 @@ pub(crate) fn plan_region_cold(
         }
     }
 
-    // A register used but never defined in the region is a read-only live-in.
-    // Decline to the memory path, which reads everything from the reg file.
+    // A register used but never defined in the region is a read-only live-in —
+    // most often a numeric FUNCTION PARAMETER, e.g. the `n` in
+    // `function f(n){ for (var k=0;k<n;k++) ... }`.
     //
-    // MEASURED 2026-07-25 — do not "fix" this by typing them Num and letting the
-    // entry guard sort it out. That is correct (emit_int_entry_load bails unless
-    // the value is genuinely Int-tagged, so nothing can be misread) but it is
-    // SLOWER: the INT path then accepts regions whose live-ins are strings,
-    // doubles or objects, entry-bails on every OSR entry, and displaces the MEM
-    // compile that was working. Suite geomean regressed 3.31x -> 3.45x, worst on
-    // sparse-array (-18%) and async-promise-chain (-16%). Making this pay needs
-    // evidence the live-in is numeric — a profile-fed type, or restricting it to
-    // registers used ONLY as arithmetic operands — not a guard-and-hope.
+    // MEASURED 2026-07-25 — do not admit these BLANKETLY by typing them Num and
+    // letting the entry guard sort it out. That is correct (emit_int_entry_load
+    // bails unless the value is genuinely Int-tagged, so nothing can be misread)
+    // but it is SLOWER: the INT path then accepts regions whose live-ins are
+    // strings, doubles or objects, entry-bails on every OSR entry, and displaces
+    // the MEM compile that was working. Suite geomean regressed 3.31x -> 3.45x,
+    // worst on sparse-array (-18%) and async-promise-chain (-16%).
+    //
+    // What that note asked for, and what this is: admit ONLY registers used
+    // exclusively as ARITHMETIC OPERANDS (`numeric_operand_uses`), so the guard
+    // is backed by how the value is consumed rather than by hope. A live-in that
+    // ever reaches a heap op, a `Move`, a `StoreGlobal`, an `Add` (which is also
+    // string concat) or an `Eq`/`Ne` (which accept any type) still declines the
+    // whole region, exactly as before. When the guard does fail, `entry_bail`
+    // resumes at the loop header — an in-region ip — so it counts as a deopt and
+    // the region self-evicts to the memory path after OSR_DEOPT_LIMIT tries.
+    //
+    // Worth 2.2x on the shape it unblocks: the same 20M-iteration loop ran 115ms
+    // with a parameter bound (INT declined -> DOUBLE/MEM) vs 52ms with a literal
+    // bound (INT compiled).
+    //
     // TA-receiver regs are intentionally untyped (sourced via the pin) — skip them.
+    let mut ro_live_in: Vec<u16> = Vec::new();
     for (off, instr) in code[s..=e].iter().enumerate() {
         if cold.contains(&(s + off)) { continue; }
         for u in instr_uses(instr) {
-            if !ta_recv_regs.contains(&u) && !ty.contains_key(&u) {
-                return None;
+            if !ta_recv_regs.contains(&u) && !ty.contains_key(&u) && !ro_live_in.contains(&u) {
+                ro_live_in.push(u);
             }
+        }
+    }
+    if !ro_live_in.is_empty() {
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            if cold.contains(&(s + off)) { continue; }
+            let numeric = numeric_operand_uses(instr);
+            for u in instr_uses(instr) {
+                if ro_live_in.contains(&u) && !numeric.contains(&u) {
+                    decline!("read-only live-in used where a number isn't required"); // 
+                }
+            }
+        }
+        // Entry-guarded Int, permanently homed (live-in ⇒ whole-region range).
+        for &r in &ro_live_in {
+            ty.insert(r, VTy::Num);
+            first_seen.insert(r, false);
+            reg_order.push(r);
         }
     }
 
@@ -306,7 +350,7 @@ pub(crate) fn plan_region_cold(
                 _ => false,
             };
             if bad {
-                return None;
+                decline!("pinned index operand is not numeric");
             }
         }
     }
@@ -330,7 +374,7 @@ pub(crate) fn plan_region_cold(
             | Instr::JumpIfNotLe { a, b, .. }
             | Instr::Bitwise { a, b, .. } => {
                 if ty.get(&a) == Some(&VTy::Bool) || ty.get(&b) == Some(&VTy::Bool) {
-                    return None; // numeric op on a bool — outside the subset
+                    decline!("numeric op on a bool"); // outside the subset
                 }
             }
             Instr::AddInt { a, .. } | Instr::Neg { a, .. } => {
@@ -341,7 +385,7 @@ pub(crate) fn plan_region_cold(
             Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => {
                 // Only bool conditions are supported (the loop-guard shape).
                 if ty.get(&cond) != Some(&VTy::Bool) {
-                    return None;
+                    decline!("branch condition is not a bool");
                 }
             }
             _ => {}
@@ -425,7 +469,17 @@ pub(crate) fn plan_region_cold(
     let mut hoist_ips: Vec<usize> = Vec::new();
     let mut hoisted: FxHashSet<u16> = FxHashSet::default();
     for (&r, &ip) in &const_def_ip {
-        if def_count.get(&r) == Some(&1) && first_seen.get(&r) == Some(&true) && used.contains(&r) {
+        // `first_seen == true` only says the first OCCURRENCE is a def — it says
+        // nothing about whether that def runs. Hoisting a constant whose def sits
+        // on an untaken branch is wrong twice over: the prologue materialises it
+        // (so the flush writes it over the register's real value) and the body op
+        // is elided (so reads inside the region see the constant too). Require
+        // the def to run on every pass. See `runs_every_iteration`.
+        if def_count.get(&r) == Some(&1)
+            && first_seen.get(&r) == Some(&true)
+            && used.contains(&r)
+            && runs_every_iteration(code, s, e, ip)
+        {
             hoist_ips.push(ip);
             hoisted.insert(r);
         }
@@ -470,7 +524,7 @@ pub(crate) fn plan_region_cold(
             _ => continue,
         };
         if ty.get(&bool_glob) == Some(&VTy::Bool) {
-            return None;
+            decline!("bool value moved to/from a global (globals are numeric homes)");
         }
     }
 
@@ -596,7 +650,19 @@ pub(crate) fn plan_region_cold(
     // live ranges (lets bigger loops JIT, and is required for object SROA).
     const POOL: usize = (HOME_XMM_LAST - HOME_XMM_FIRST + 1) as usize;
     let n_numeric = reg_order.iter().filter(|r| ty[r] == VTy::Num).count() + glob_order.len();
-    let reuse = n_numeric > POOL;
+    // DISABLED (soundness): linear-scan reuse gives two registers with
+    // non-overlapping IN-REGION live ranges the same home, but `flush_exit`
+    // writes that home to BOTH frame slots, so the sharer whose range already
+    // ended is overwritten with an unrelated temp's value. Region-local liveness
+    // does not imply the register is dead in the ENCLOSING FUNCTION — a loop
+    // that assigns five locals early and then runs a long chain returned the
+    // chain's temps in place of the locals. Reuse also defeats the entry-load
+    // fix: `live_in_regs` then holds several `(reg, xmm)` pairs sharing one
+    // `xmm`, so the prologue loads overwrite each other and only the last one
+    // survives. Needs the same must-def / live-out analysis as UNIFY_HOMES; the
+    // regions affected (>POOL numeric values) fall back to the memory tier.
+    const REUSE_HOMES: bool = false;
+    let reuse = REUSE_HOMES && n_numeric > POOL;
 
     // ── allocate xmm/gpr homes ──
     let mut reg_home: FxHashMap<u16, Home> = FxHashMap::default();
@@ -619,7 +685,10 @@ pub(crate) fn plan_region_cold(
         intervals.sort_by_key(|&(a, _, _)| a);
         let mut alloc = XmmAlloc::new();
         for (a, b, v) in intervals {
-            let x = alloc.alloc(a, b)?; // None ⇒ pool exhausted even with reuse
+            let x = match alloc.alloc(a, b) {
+                Some(x) => x,
+                None => decline!("xmm pool exhausted even with home reuse"),
+            };
             match v {
                 NumVal::Reg(r) => {
                     reg_home.insert(r, Home::Xmm(x));
@@ -636,7 +705,7 @@ pub(crate) fn plan_region_cold(
         for &r in &reg_order {
             if ty[&r] == VTy::Num {
                 if next_xmm > HOME_XMM_LAST {
-                    return None;
+                    decline!("xmm pool exhausted (registers)");
                 }
                 reg_home.insert(r, Home::Xmm(next_xmm));
                 next_xmm += 1;
@@ -644,7 +713,7 @@ pub(crate) fn plan_region_cold(
         }
         for &gi in &glob_order {
             if next_xmm > HOME_XMM_LAST {
-                return None;
+                decline!("xmm pool exhausted (globals)");
             }
             glob_home.insert(gi, next_xmm);
             next_xmm += 1;
@@ -656,7 +725,7 @@ pub(crate) fn plan_region_cold(
     for &r in &reg_order {
         if ty[&r] == VTy::Bool {
             if first_seen.get(&r) == Some(&false) || next_bool >= BOOL_GPRS.len() {
-                return None;
+                decline!("bool live-in, or bool gpr pool exhausted");
             }
             reg_home.insert(r, Home::Gpr(BOOL_GPRS[next_bool]));
             next_bool += 1;
@@ -796,6 +865,67 @@ pub(crate) fn plan_region_cold(
         jump_targets,
         ta_recv_regs,
     })
+}
+
+/// Does the instruction at `d` run on EVERY pass through region `[s, e]`?
+///
+/// True when no branch in `[s, d)` can jump PAST `d` while staying inside the
+/// region. Branches that LEAVE the region are deliberately allowed, including
+/// the loop header's own exit test: OSR entry only happens after the interpreter
+/// has already executed the loop `OSR_THRESHOLD` times, so a def that runs every
+/// iteration has already written its value into the frame slot — the region
+/// materialising the same constant into a home and flushing it back is then a
+/// no-op. A def that can be SKIPPED has no such guarantee.
+///
+/// This is the cheap sound approximation of "the def dominates every exit". It
+/// is what makes constant hoisting (and `hoistable_length`) safe without a full
+/// dominator tree.
+pub(crate) fn runs_every_iteration(code: &[Instr], s: usize, e: usize, d: usize) -> bool {
+    for (ip, instr) in code.iter().enumerate().take(d).skip(s) {
+        let target = match *instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => target as usize,
+            _ => continue,
+        };
+        let _ = ip;
+        if target > d && target <= e {
+            return false; // jumps over `d` and stays in the region
+        }
+    }
+    true
+}
+
+/// The operand positions of `i` that REQUIRE a number, as opposed to positions
+/// that accept any value. A read-only live-in is admitted as a numeric home only
+/// when every one of its uses appears here, so the entry Int-guard is backed by
+/// how the value is consumed.
+///
+/// Deliberately EXCLUDES: `Add` (also string concatenation), `Eq`/`Ne` (defined
+/// on every type), `Move` and `StoreGlobal` (pure transfers that say nothing
+/// about the value), `StrConcat`, and every heap-op receiver/key. Admitting
+/// those is what made the blanket version of this a 3.31x -> 3.45x regression.
+/// Relational ops are included: they are string-comparable in principle, but in
+/// a region that already type-checked as numeric a `<` operand is a loop bound.
+pub(crate) fn numeric_operand_uses(i: &Instr) -> Vec<u16> {
+    match *i {
+        Instr::Sub { a, b, .. }
+        | Instr::Mul { a, b, .. }
+        | Instr::Div { a, b, .. }
+        | Instr::Mod { a, b, .. }
+        | Instr::Bitwise { a, b, .. }
+        | Instr::Lt { a, b, .. }
+        | Instr::Le { a, b, .. }
+        | Instr::Gt { a, b, .. }
+        | Instr::Ge { a, b, .. }
+        | Instr::JumpIfNotLt { a, b, .. }
+        | Instr::JumpIfNotLe { a, b, .. } => vec![a, b],
+        Instr::AddInt { a, .. } | Instr::Neg { a, .. } => vec![a],
+        Instr::MathOp { arg_base, argc, .. } => (0..argc).map(|k| arg_base + k).collect(),
+        _ => vec![],
+    }
 }
 
 /// The VM registers an instruction reads (operands). Used for live-in analysis.

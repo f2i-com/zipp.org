@@ -445,6 +445,53 @@ mod tests {
         );
     }
 
+    // ── speculative prologue work must be guarded by "does it actually run" ──
+    // The prologue materialises hoisted constants and the hoisted `arr.length`
+    // BEFORE the body, and elides the body op that would have produced them. If
+    // that op sits on a branch the loop never takes, the prologue value is pure
+    // invention: it is flushed over the register's real value, and reads inside
+    // the region see it too. `runs_every_iteration` is what gates this now.
+
+    #[test]
+    fn hoisted_const_on_untaken_branch() {
+        // `c`'s only def is inside a branch that never runs; it must stay 3.
+        assert_jit_matches(
+            "function f(){ let s=0, c=3; for (let i=0;i<200000;i++){ if (i>1e9) { c=7; s+=c; } s+=i; } return c; } console.log(f())",
+            &["3"],
+        );
+    }
+
+    #[test]
+    fn hoisted_const_on_untaken_branch_double() {
+        // Same shape on the f64 regalloc tier (fractional constants).
+        assert_jit_matches(
+            "function f(){ let s=0.5, c=3.5; for (let i=0;i<200000;i++){ if (i>1e9) { c=7.5; s+=c; } s+=i; } return c; } console.log(f())",
+            &["3.5"],
+        );
+    }
+
+    #[test]
+    fn hoisted_length_on_untaken_branch() {
+        // The memory tier hoists `arr.length` straight into the register file.
+        assert_jit_matches(
+            "var arr=[1,2,3,4,5,6,7]; function f(){ let n=99,s=0; for (let i=0;i<200000;i++){ if (i>1e9) { n=arr.length; } s+=i; } return n; } console.log(f())",
+            &["99"],
+        );
+    }
+
+    #[test]
+    fn home_reuse_does_not_clobber_early_locals() {
+        // >14 numeric values put the planner on the home-reuse path, where one
+        // xmm backed several registers and the exit flush wrote it to ALL their
+        // slots — so locals assigned early came back holding a later temp.
+        let mut src = String::from("function f(){ let a1=0,a2=0,a3=0,s=0;\n for (let i=0;i<200000;i++){ a1=i; a2=a1+a1; a3=a2+a1;\n let c0=a3+a2;\n");
+        for k in 1..=20 {
+            src.push_str(&format!("let c{k}=c{}+{};\n", k - 1, k));
+        }
+        src.push_str(" s+=c20; }\n return a1+' '+a2+' '+a3; } console.log(f())");
+        assert_jit_matches(&src, &["199999 399998 599997"]);
+    }
+
     #[test]
     fn early_exit_flush_pinned_string() {
         // Same defect reached through the pinned-string charCodeAt path.

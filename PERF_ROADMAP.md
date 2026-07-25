@@ -529,6 +529,96 @@ spill.* It is a one-line invariant, it was violated for the whole life of the
 register tiers, and no amount of test262 caught it — 8-iteration loops whose
 result is read afterwards are simply not what a conformance suite is made of.
 
+#### B11b — three more of the same, found by auditing the invariant
+
+Stating the invariant precisely made it worth re-deriving *every* place the
+prologue writes state the body might not produce. Three more violations, all
+confirmed with repros, all the same missing analysis: **is this op guaranteed to
+run?** The planner was answering it with `first_seen == true`, which only means
+"the first occurrence in ip order is a def" — it says nothing about reachability.
+
+1. **Hoisted constants** (`plan_region.rs`, both register tiers). A
+   `LoadInt`/`LoadConst` on a branch that never runs was still materialised in
+   the prologue *and* its body op elided. Doubly wrong: the flush wrote the
+   constant over the register's real value, and reads inside the region saw it
+   too — so this was also an unsound LICM.
+
+       function f(){ let s=0, c=3;
+         for (let i=0;i<200000;i++){ if (i>1e9) { c=7; s+=c; } s+=i; }
+         return c; }                                  // returned 7, want 3
+
+2. **Hoisted `arr.length`** (`region_admit.rs::hoistable_length`, memory tier).
+   Same shape, worse mechanism: the prologue writes the length *straight into
+   the register file*, so no flush is even involved.
+
+       let n=99; for (...) { if (i>1e9) { n = arr.length; } }   // n became 7
+
+3. **Linear-scan home reuse** (`plan_region.rs`). Two registers with
+   non-overlapping *in-region* live ranges share one xmm, and `flush_exit`
+   writes that xmm to **both** frame slots — so the sharer whose range already
+   ended came back holding an unrelated temp. Region-local liveness is not
+   function liveness. It also silently defeated the entry-load fix above:
+   `live_in_regs` then contains several `(reg, xmm)` pairs sharing one `xmm`, so
+   the prologue loads overwrite each other and only the last survives.
+
+**Fixes.** (1) and (2) now require `runs_every_iteration` — no branch in
+`[s, def_ip)` may jump past the def *and stay in the region*. Branches that
+leave the region are deliberately allowed, and that is the whole trick: OSR
+entry only happens after the interpreter has run the loop `OSR_THRESHOLD` times,
+so a def that runs every iteration has already written its value to the frame,
+and re-materialising it is a no-op. This is the cheap sound approximation of
+"the def dominates every exit" and needs no dominator tree.
+
+(3) is disabled (`REUSE_HOMES`), so regions above the 14-home pool fall back to
+the memory tier. **Measured cost: 3.6%, on one bench.** typedarray-math 753ms
+sound vs 726ms unsound; every other bench was inside ambient noise. Doing better
+needs per-exit flush sets — but note this case is *easier* than the general
+must-def dataflow that `UNIFY_HOMES` would need, because the live ranges already
+exist: at an exit ip, each home has at most one owner (the register whose range
+covers it), so the per-exit set is a lookup, not a fixpoint. Worth ~0.4% geomean.
+
+**Tooling that came out of it.** `ZIPP_JITDECLINE=1` now names which of the
+planner's ~25 exit points rejected a region, instead of `plan_region=None`.
+First census over the ten real benches:
+
+    12  GetIndex/SetIndex (element not a pinned TypedArray)
+    10  Bitwise on the double path
+     4  Call
+     3  CallMethod (receiver not a pinned string)
+     2  type conflict on a reused register
+
+The obvious read — "admit plain dense arrays into the register tiers" — was
+measured before being built, and is **not worth it**: summing 3M elements six
+times costs 90ms through a plain `Array` vs 87ms through a `Float64Array`. The
+memory tier's element path is already fine; those 12 declines are close to free.
+
+### B12 — Read-only live-ins: numeric parameters now reach the INT tier
+
+`plan_region` declined any region containing a register that is *used but never
+defined* in it. That is every function whose loop reads a numeric parameter —
+`function f(n){ for (var k=0;k<n;k++) ... }` — so the single most ordinary shape
+in numeric JavaScript was locked out of the fastest tier.
+
+The blanket fix had already been tried and reverted (geomean 3.31x → 3.45x): it
+admitted live-ins that are strings, doubles or objects, which entry-bail on every
+OSR entry and displace the memory compile that was working. The note left behind
+asked for "registers used ONLY as arithmetic operands", and that is what shipped:
+`numeric_operand_uses` admits a live-in only when *every* use of it is an
+operand position that requires a number. `Add` is excluded (also string
+concatenation), as are `Eq`/`Ne` (defined on every type), `Move`, `StoreGlobal`
+and every heap-op receiver. When the entry guard does fail, `entry_bail` resumes
+at the loop header — an in-region ip — so it counts as a deopt and the region
+self-evicts to the memory path after `OSR_DEOPT_LIMIT`, which bounds the damage
+the blanket version did unboundedly.
+
+**Measured 2.2x on the shape it unblocks**: the identical 20M-iteration loop ran
+115ms with a parameter bound (INT declined → DOUBLE/MEM) and 52ms with a literal
+bound; it is now 48ms vs 49ms. Across the ten real benches it converts 4 declines
+into INT regions (5 → 9) with no new evictions, but **no measurable time**: those
+particular regions aren't hot. Kept because it is strictly more admission for no
+cost, and because the shape it fixes is everywhere in real numeric code even
+though this bench set happens not to lean on it.
+
 ### B8 — Regex engine (the single largest item)
 
 41.8% of the remaining gap, and not reachable by tuning the wrapper. `regress`

@@ -461,6 +461,14 @@ pub(crate) fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Optio
         }
     }
     let (get_ip, dst, obj) = found?;
+    // The prologue writes `dst` DIRECTLY into the register file and then elides
+    // the body `GetProp`, so the load must actually run on every pass. Without
+    // this, `if (never) { n = arr.length; }` had `n` overwritten with the length
+    // by a loop that never took the branch. Same requirement, and same argument,
+    // as constant hoisting in `plan_region::runs_every_iteration`.
+    if !runs_every_iteration(code, s, e, get_ip) {
+        return None;
+    }
     // `dst` must be written ONLY by this GetProp in the region.
     for ip in s..=e {
         if ip != get_ip && writes_reg(&code[ip]) == Some(dst) {
