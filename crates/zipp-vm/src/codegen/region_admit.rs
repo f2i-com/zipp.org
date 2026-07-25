@@ -1,0 +1,627 @@
+// Split out of the former monolithic parent file by tools/split_rs.py.
+// Pure code move: `use super::*` keeps the parent module's imports in
+// scope, and items are widened to pub(crate) so the pieces still see
+// each other. No logic changed.
+#![allow(unused_imports)]
+use super::*;
+
+/// Top-16 bits of the canonical bool tag (`0x7FFA`). The five tag patterns
+/// 0x7FF9..=0x7FFD are: Int, Bool, Null, Undefined, Heap — only Int is a number.
+pub(crate) const BOOL_TAG: u64 = INT_TAG + (1u64 << 48);
+
+/// Can the loop region `[start, end]` be compiled in the double subset? Every op
+/// in range must be numeric/control-flow with no closure op, and any `LoadConst`
+/// must reference a numeric constant, a single-ASCII-char string, or (MEM path
+/// only — `const_strs` is `Some`) a string constant pre-interned at compile time
+/// whose bits the emitter embeds (`const_strs` maps constant index → bits).
+pub(crate) fn region_can_compile(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    const_strs: Option<&FxHashMap<u32, u64>>,
+) -> bool {
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    if e <= s || e >= code.len() {
+        return false;
+    }
+    // The back-edge must be an unconditional jump to the header (canonical
+    // while/for shape). This guarantees no fall-through past `end`, so the only
+    // out-of-region control transfers are explicit jump targets (loop exit /
+    // break), which become exit stubs.
+    match code[e] {
+        Instr::Jump { target } if target == start => {}
+        _ => return false,
+    }
+    for instr in &code[s..=e] {
+        match *instr {
+            Instr::LoadInt { .. }
+            | Instr::Move { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::StoreGlobal { .. }
+            // A `let`/`const` global write (TDZ-checked); inside a hot loop region the
+            // binding is already initialized, so the JIT treats it like StoreGlobal.
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            // Bitwise ops (`|`/`&`/`^`/`<<`/`>>`/`>>>`) — handled by the MEMORY
+            // path (Int or exactly-integral-double operands; anything else
+            // bails). The `(x + y) | 0` / `i & 7` idioms gate most real
+            // object/method loops, so regions must admit them.
+            | Instr::Bitwise { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            // Heap property ops — handled by the MEMORY path via win64 helper
+            // calls (the int/regalloc paths decline, so heap regions take the
+            // mem path). A `Print`/etc. anywhere still rejects the region.
+            | Instr::GetProp { .. }
+            | Instr::SetProp { .. }
+            // Dense-array element read/write `a[i]` / `a[i]=v` — handled by the
+            // MEMORY path via win64 helpers (the int/regalloc paths decline).
+            | Instr::GetIndex { .. }
+            | Instr::SetIndex { .. }
+            // Read-modify-write key coercion (`o[k] += v`, `o[k]++`): a NUMBER
+            // key on a non-nullish base is a plain move (the MEMORY path's
+            // inline case); anything else bails to the interpreter.
+            | Instr::ToPropKey { .. }
+            // String concat (`s += …`) — handled by the MEMORY path via the
+            // `jit_concat` / `jit_str_append` win64 helpers (the numeric
+            // int/regalloc paths don't list them, so they decline → mem path).
+            | Instr::StrConcat { .. }
+            | Instr::StrAppendInPlace { .. }
+            | Instr::Return { .. }
+            | Instr::ReturnUndefined => {}
+            // Method calls — handled by the MEMORY path. `arr.push(x)` /
+            // `str.charCodeAt(i)` keep their dedicated win64 helpers; every
+            // other `obj.m(…)` compiles to a `jit_call_method_ic` helper call
+            // that consults the interpreter's per-site inline cache and
+            // frame-calls the resolved plain user function (IC miss /
+            // megamorphic / native callee → deopt to the interpreter at this
+            // op; repeated deopts evict the region).
+            Instr::CallMethod { .. } => {}
+            // Plain calls `f(…)` — same protocol via `jit_call_ic`.
+            Instr::Call { .. } => {}
+            // Logical `!` — MEM path (Bool flips natively; anything else goes
+            // through the `jit_truthy` helper).
+            Instr::Not { .. } => {}
+            // `Math.<op>(args…)` — MEM path. A 1-arg unary op (`abs`/`sqrt`/
+            // `floor`/`sin`/…) loads its arg as a number (bails to the
+            // interpreter — which runs ToNumber coercion — if not) and calls the
+            // PURE `jit_math_unary` helper (the interpreter's exact `math_unary`,
+            // so every JS quirk matches). A 2-arg op (`pow`/`atan2`/`imul`/
+            // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`.
+            // Any other arity (variadic min/max/hypot, a 0-arg call) declines —
+            // the interpreter handles it. The helpers run no user code and never
+            // allocate (a non-numeric arg already bailed), so no pinned-pointer
+            // re-fetch is needed.
+            Instr::MathOp { op, argc, .. } => {
+                let ok = match argc {
+                    // `Math.imul(x)` (one arg) diverges: the unary helper returns
+                    // NaN, but the interpreter coerces the missing 2nd arg to
+                    // `to_uint32(NaN)==0` and yields 0. Decline so the interpreter
+                    // runs it (every other unary op agrees at argc==1).
+                    1 => !matches!(op, MathFn::Imul),
+                    2 => matches!(
+                        op,
+                        MathFn::Pow
+                            | MathFn::Atan2
+                            | MathFn::Imul
+                            | MathFn::Min
+                            | MathFn::Max
+                            | MathFn::Hypot
+                    ),
+                    _ => false,
+                };
+                if !ok {
+                    if std::env::var_os("ZIPP_JITDUMP").is_some() {
+                        eprintln!("[decline] MathOp arity {argc} op {op:?} at region [{start},{end}]");
+                    }
+                    return false;
+                }
+            }
+            // `LoadBool` — materialise the boolean Value bits inline (a single
+            // store; call-free, pure). Unblocks loops carrying a bool literal
+            // (parser flags, `done=false`).
+            Instr::LoadBool { .. } => {}
+            // `CheckCoercible` — RequireObjectCoercible before a member access
+            // (`objs[i&3].area()` emits one). MEM path: a null/undefined operand
+            // bails to the interpreter (which throws the TypeError); any other
+            // value is a pure no-op. Pure, call-free, no alloc — unblocks the
+            // class-method-call loops (the GetIndex'd receiver is coerced before
+            // the CallMethod).
+            Instr::CheckCoercible { .. } => {}
+            // Closure-cell / upvalue READS — MEM path via the pure `jit_cell_get`
+            // / `jit_upval_get` helpers (a single heap LOAD of the cell's inner
+            // Value; a TDZ cell → deopt sentinel → interpreter throws). Emitted
+            // PER-OP (never hoisted across a Call/CallMethod), so a value an inner
+            // closure mutated via a call in the SAME region is re-read on the next
+            // execution. The helpers allocate nothing and run no user code, so no
+            // pinned-pointer (r13/r14/TA) re-fetch is needed. Writes (`CellSet`,
+            // `CellSetChecked`, `UpvalSet`) are NOT admitted — they keep declining.
+            Instr::CellGet { .. } | Instr::UpvalGet { .. } => {}
+            // `ForInLive` — the per-iteration for-in liveness check — MEM path via
+            // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
+            // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
+            // point — and it is GC-locked internally for belt-and-suspenders).
+            // Emitted per-op (re-derives the live shape each execution). Lets
+            // `for (k in obj)` loops over plain objects compile.
+            Instr::ForInLive { .. } => {}
+            // `HasProp` — the `in` operator — MEM path via the `jit_has_property`
+            // helper (read-only `Vm::has_property_jit`, byte-identical to the
+            // interpreter's `has_property_dyn` on a non-Proxy chain). Only a plain
+            // `in` (`brand: false`) is admitted; the `#x in obj` ergonomic brand
+            // check needs the private machinery → keeps declining. The helper runs
+            // no user code and never allocates on the VM heap (a Proxy/exotic/
+            // throwing case returns the deopt sentinel and the interpreter takes
+            // over), so no r13/r14/TA refetch. Unblocks sparse-array's 8M
+            // hole-aware `if (i in packed)` loops.
+            Instr::HasProp { brand: false, .. } => {}
+            Instr::HasProp { brand: true, .. } => {
+                if std::env::var_os("ZIPP_JITDUMP").is_some() {
+                    eprintln!("[decline] HasProp brand-check at region [{start},{end}]");
+                }
+                return false;
+            }
+            Instr::LoadConst { idx, .. } => {
+                // Numeric constants run in the f64 region; a single-ASCII-char
+                // string constant is resolvable to its interned slot (for
+                // `s[i] === "x"` scans); a multi-char string constant is
+                // accepted on the MEM path when its pre-interned bits are in
+                // `const_strs`. Anything else rejects the region.
+                match proto.constants.get(idx as usize) {
+                    Some(c) if c.is_number() => {}
+                    Some(&c) if single_char_const_bits(proto, c).is_some() => {}
+                    Some(_) if const_strs.is_some_and(|m| m.contains_key(&idx)) => {}
+                    _ => {
+                        if std::env::var_os("ZIPP_JITDUMP").is_some() {
+                            eprintln!("[decline] non-region LoadConst at region [{start},{end}]");
+                        }
+                        return false;
+                    }
+                }
+            }
+            ref other => {
+                if std::env::var_os("ZIPP_JITDUMP").is_some() {
+                    eprintln!("[decline] {other:?} at region [{start},{end}]");
+                }
+                return false;
+            }
+        }
+    }
+    // NOTE: helpers that can allocate (`StrConcat`/`StrAppendInPlace`) or run
+    // user code (`Call`/`CallMethod`) USED to be forbidden alongside
+    // GetProp/SetProp because the inline cache pins the heap version-array
+    // pointer (r13) and the IC table pointer (r14), which an allocation /
+    // a nested region compile can move. The memory path now RE-FETCHES those
+    // pinned pointers after every such helper call instead (see
+    // `emit_refetch_pinned`), so the mix is allowed.
+    true
+}
+
+/// Max callee register count an inlined leaf may use (its body runs over a
+/// scratch window carved above the caller frame; `jit_regs_fits` validates the
+/// real window at host entry, so this compile-time cap only bounds the window).
+pub(crate) const LEAF_MAX_REGS: u16 = 32;
+
+/// Q4 leaf-call inlining eligibility: is `callee`'s body a leaf the region/Tier-C
+/// emitter can inline over a scratch window? Returns the body ops to inline, or
+/// `None` to decline (the Call keeps the per-call helper). v2 admits FORWARD
+/// in-body branches (a converging diamond like `a && b && c`), dense-array reads,
+/// `charCodeAt`, and comparisons — not just straight-line bodies.
+///
+/// Requirements (all NON-NEGOTIABLE for soundness — see `LeafInlinePlan`):
+/// * Not a generator/async; reg_count ≤ 16; no rest/`arguments`; simple_params
+///   (so arg binding is a plain positional copy, no defaults/destructuring).
+/// * Body ops ⊂ a SAFE SUBSET of the region-admissible value/global ops, minus
+///   anything that calls (`Call`/`CallMethod`/`Super*`), allocates on the VM
+///   heap, reads a closure cell / upvalue (`Cell*`/`Upval*`), or touches the
+///   `arguments`/heap property machinery. The subset below is exactly what the
+///   inline emitter implements; any other op declines.
+/// * Exactly ONE trailing `Return`/`ReturnUndefined`, reached by fall-through —
+///   NO internal jump (straight-line; the inline emitter has no branch labels).
+/// * NO deopt-capable op may appear AFTER an effect (`StoreGlobal*`): if an
+///   inlined op bails, the interpreter re-runs the WHOLE call from the call ip,
+///   so an effect that already ran would double-apply. (For v1 the only effect
+///   admitted is `StoreGlobal*`; `SetProp`/`SetIndex` are NOT in the subset.)
+pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
+    if callee.is_generator || callee.is_async {
+        return None;
+    }
+    if callee.rest_reg.is_some() || callee.arguments_reg.is_some() {
+        return None;
+    }
+    if !callee.simple_params {
+        return None;
+    }
+    // The inlined body runs over a scratch window carved above the caller frame;
+    // `jit_regs_fits` validates `reg_window + callee_reg_count` at host entry (a
+    // tight window → fallback), so a generous compile-time cap is sound. 32 covers
+    // a CFG-ish leaf like `tokIs` (22 regs) plus headroom.
+    if callee.reg_count > LEAF_MAX_REGS {
+        return None;
+    }
+    let full = &callee.code;
+    if full.is_empty() {
+        return None;
+    }
+    // The body ends at the FIRST `Return`/`ReturnUndefined`: it is the UNIQUE exit
+    // (forward in-body branches may skip ahead, but all converge here), and any op
+    // after it is dead (the compiler appends a `ReturnUndefined` after an explicit
+    // `Return`). Truncate there; `term == code.len()-1` is the single terminator.
+    let term = full
+        .iter()
+        .position(|i| matches!(i, Instr::Return { .. } | Instr::ReturnUndefined))?;
+    let code: Vec<Instr> = full[..=term].to_vec();
+    // Every op except the terminator must be in the inline emitter's subset.
+    // `seen_effect` enforces the side-effect-freedom-before-deopt ordering rule:
+    // a deopt-capable op that bails re-runs the WHOLE call from the call ip, so no
+    // such op may follow a committed effect (`StoreGlobal*`). The newly admitted
+    // GetIndex / charCodeAt / Eq/Ne/Lt/Le/Gt/Ge are ALSO deopt-capable (they bail
+    // via a helper deopt sentinel / a non-numeric operand), so they join that rule
+    // — which keeps an effectful leaf like `mix` (a trailing `h = …`) sound while
+    // admitting a pure CFG leaf like `tokIs`. Internal jumps must be FORWARD and
+    // stay within the body (a back-edge = a loop, breaking deopt-idempotency and
+    // the no-safepoint invariant).
+    let mut seen_effect = false;
+    for (i, instr) in code.iter().enumerate() {
+        let is_last = i == code.len() - 1;
+        match *instr {
+            // The single trailing return — IS the last op (by construction above).
+            Instr::Return { .. } | Instr::ReturnUndefined => {
+                debug_assert!(is_last);
+            }
+            _ if is_last => return None, // unreachable: last op is the terminator
+            // ── deopt-capable value ops (may bail mid-body) ── forbidden AFTER
+            // an effect (a bail would re-run the call and re-apply the effect).
+            // The comparisons + dense-array read bail the same way (non-numeric
+            // operand / a deopt sentinel from `jit_get_index`), so they join here.
+            Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Bitwise { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::GetIndex { .. } => {
+                if seen_effect {
+                    return None;
+                }
+            }
+            // `str.charCodeAt(i)` only — a read-only, alloc-free, no-user-code 1-arg
+            // builtin (the inline emitter routes it through the `jit_char_code_at`
+            // helper). Any other method call declines. Also deopt-capable.
+            Instr::CallMethod { name, argc, .. } => {
+                if argc != 1
+                    || callee.string_constants.get(name as usize).map(|s| s.as_str())
+                        != Some("charCodeAt")
+                {
+                    return None;
+                }
+                if seen_effect {
+                    return None;
+                }
+            }
+            // ── forward, in-body control flow ── a `Jump`/`JumpIf*` whose target
+            // is strictly AHEAD of it and within the body (`> i && <= term`). A
+            // backward edge would make the inlined body a loop over the caller
+            // scratch window, breaking deopt-idempotency and the no-safepoint
+            // invariant; an out-of-body target would escape the inline. Branches
+            // do not bail, so the `seen_effect` rule does not gate them.
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. } => {
+                let t = target as usize;
+                if t <= i || t > term {
+                    return None;
+                }
+            }
+            // The inline emitter only implements the MathOp arities the region
+            // path does (1-arg, or a fixed 2-arg op set).
+            Instr::MathOp { op, argc, .. } => {
+                if seen_effect {
+                    return None;
+                }
+                let ok = match argc {
+                    // See region_can_compile: `Math.imul(x)` (one arg) diverges
+                    // (unary helper → NaN, interpreter → 0). Decline this leaf.
+                    1 => !matches!(op, MathFn::Imul),
+                    2 => matches!(
+                        op,
+                        MathFn::Pow
+                            | MathFn::Atan2
+                            | MathFn::Imul
+                            | MathFn::Min
+                            | MathFn::Max
+                            | MathFn::Hypot
+                    ),
+                    _ => false,
+                };
+                if !ok {
+                    return None;
+                }
+            }
+            // ── pure, never-bail value/load ops ── safe anywhere.
+            Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::LoadBool { .. }
+            | Instr::Move { .. }
+            | Instr::LoadGlobal { .. } => {}
+            // ── the one admitted effect ── a global write. Must be the only
+            // kind of effect; after it, no deopt-capable op may follow.
+            Instr::StoreGlobal { .. } | Instr::StoreGlobalStrict { .. } => {
+                seen_effect = true;
+            }
+            // Anything else (calls, heap props, branches, closures, throw, …)
+            // declines — the inline emitter doesn't implement it.
+            _ => return None,
+        }
+    }
+    // A `LoadConst` must be a NUMERIC constant (the inline emitter materialises
+    // it as raw bits; a string/heap constant needs interning we don't do here).
+    for instr in &code {
+        if let Instr::LoadConst { idx, .. } = *instr {
+            match callee.constants.get(idx as usize) {
+                Some(c) if c.is_number() => {}
+                _ => return None,
+            }
+        }
+    }
+    Some(code)
+}
+
+/// Detect a loop-invariant `g.length` to hoist out of a memory-path region: a
+/// `GetProp{obj, name:"length"}` whose object is loaded from a global `g` that the
+/// region never mutates (no `StoreGlobal(g)`, and no length-changing op anywhere —
+/// `push`, `SetIndex`, `SetProp`). Then `g.length` is the same every iteration, so
+/// it can be computed ONCE in the prologue rather than re-read (a helper call) per
+/// iteration — the `for (i < s.length)` / `for (i < a.length)` idiom. Returns
+/// `(get_ip, dst_reg, global_slot, name_idx)`, or `None` if no single such GetProp
+/// qualifies (only the unique-GetProp case is hoisted, to keep it simple/safe).
+pub(crate) fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Option<(usize, u16, u32, u32)> {
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    // The region must not change any container's length. A generic call
+    // (`Call`, or any `CallMethod` other than the read-only `charCodeAt`)
+    // can run ARBITRARY user code — which may mutate the container's length
+    // or reassign the global holding it — so it rejects the hoist outright
+    // (the per-iteration miss-helper read stays correct, just not hoisted).
+    for instr in &code[s..=e] {
+        match instr {
+            Instr::SetIndex { .. } | Instr::SetProp { .. } | Instr::Call { .. } => return None,
+            Instr::CallMethod { name, .. } => {
+                if proto.string_constants.get(*name as usize).map(|s| s.as_str())
+                    != Some("charCodeAt")
+                {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Exactly one `GetProp(_, "length")` in the region.
+    let mut found: Option<(usize, u16, u16)> = None; // (ip, dst, obj)
+    for ip in s..=e {
+        if let Instr::GetProp { dst, obj, name } = code[ip] {
+            if proto.string_constants.get(name as usize).map(|s| s.as_str()) == Some("length") {
+                if found.is_some() {
+                    return None; // more than one — bail
+                }
+                found = Some((ip, dst, obj));
+            }
+        }
+    }
+    let (get_ip, dst, obj) = found?;
+    // `dst` must be written ONLY by this GetProp in the region.
+    for ip in s..=e {
+        if ip != get_ip && writes_reg(&code[ip]) == Some(dst) {
+            return None;
+        }
+    }
+    // `obj` must be defined in the region only by `LoadGlobal(g)` (same `g`), and
+    // `g` never stored in the region.
+    let mut g: Option<u32> = None;
+    for ip in s..=e {
+        match code[ip] {
+            Instr::LoadGlobal { dst: ld, idx } if ld == obj => {
+                if g.is_some() && g != Some(idx) {
+                    return None; // obj loaded from two different globals
+                }
+                g = Some(idx);
+            }
+            Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } => {
+                if Some(idx) == g {
+                    return None; // g mutated in the loop
+                }
+            }
+            _ => {
+                // `obj` defined by something other than LoadGlobal → not a global.
+                if writes_reg(&code[ip]) == Some(obj) {
+                    return None;
+                }
+            }
+        }
+    }
+    let name_idx = match code[get_ip] {
+        Instr::GetProp { name, .. } => name,
+        _ => return None,
+    };
+    g.map(|g| (get_ip, dst, g, name_idx))
+}
+
+/// Addresses of the win64 heap helpers (vm.rs), the COMPILING function's id, and
+/// the inline-cache base site index — threaded to the memory path so `GetProp`/
+/// `SetProp` emit a call-free monomorphic inline cache (miss → helper).
+#[derive(Clone, Copy)]
+pub(crate) struct HeapHelpers {
+    pub(crate) func_id: u32,
+    pub(crate) get_prop_miss: usize,
+    pub(crate) set_prop_miss: usize,
+    /// Helper returning `vm.heap.versions_ptr()` (pinned in r13).
+    pub(crate) versions_base: usize,
+    /// Helper returning `vm.jit.ic_base_ptr()` (pinned in r14).
+    pub(crate) ic_base: usize,
+    /// Helper for a dense-array `GetIndex` (`a[i]`).
+    pub(crate) get_index: usize,
+    /// Helper for a dense-array `SetIndex` (`a[i] = v`).
+    pub(crate) set_index: usize,
+    /// Helper for `arr.push(x)`.
+    pub(crate) array_push: usize,
+    /// Helper for `str.charCodeAt(i)`.
+    pub(crate) char_code_at: usize,
+    /// Helper for `a + b` (`StrConcat`).
+    pub(crate) concat: usize,
+    /// Helper for in-place `a + b` (`StrAppendInPlace`).
+    pub(crate) str_append: usize,
+    /// Helper for a generic `obj.m(args…)` via the interpreter's per-site IC.
+    pub(crate) call_method_ic: usize,
+    /// Helper for a generic `f(args…)` via the interpreter's per-site IC.
+    pub(crate) call_ic: usize,
+    /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).
+    pub(crate) get_prop_slow: usize,
+    /// `PROP_VIA_IC` continuation for SetProp.
+    pub(crate) set_prop_slow: usize,
+    /// Full `===` for non-interned heap operands (read-only, 0/1).
+    pub(crate) strict_eq: usize,
+    /// Full truthiness for non-Int/Bool conditions (read-only, 0/1).
+    pub(crate) truthy: usize,
+    /// TypedArray pin snapshot helper (see `HeapHelperAddrs::ta_snapshot`).
+    pub(crate) ta_snapshot: usize,
+    /// Uint8Clamped double-store helper (pure).
+    pub(crate) ta_clamp_store: usize,
+    /// Whitelisted DataView `get*` helper.
+    pub(crate) dv_get: usize,
+    /// Pure unary `Math.<op>` helper (MathFn code, f64 bits → f64 bits).
+    pub(crate) math_unary: usize,
+    /// Pure two-arg `Math.<op>` helper (MathFn code, f64 bits, f64 bits → f64 bits).
+    pub(crate) math_two: usize,
+    /// Pure `CellGet` helper (cell bits → inner Value bits / TDZ-deopt sentinel).
+    pub(crate) cell_get: usize,
+    /// `UpvalGet` helper (upvalue idx → inner Value bits / TDZ-deopt sentinel).
+    pub(crate) upval_get: usize,
+    /// `ForInLive` helper (obj bits, key bits → Bool Value bits).
+    pub(crate) forin_live: usize,
+    /// `HasProp` (`in`) helper (key bits, obj bits → Bool Value bits / deopt).
+    pub(crate) has_property: usize,
+    /// Q4 leaf-inline entry headroom check (`jit_regs_fits`).
+    pub(crate) regs_fits: usize,
+    /// Tier C `TypeOf` helper (v bits → heap-string Value bits).
+    pub(crate) typeof_str: usize,
+    /// Tier C `IsArray` helper (v bits → Bool bits / deopt sentinel).
+    pub(crate) is_array: usize,
+    /// Tier C `LenOf` helper (obj bits → length Value bits).
+    pub(crate) len_of: usize,
+    /// Tier C `ForInKeys` helper (obj bits → key-Array bits / deopt / threw).
+    pub(crate) forin_keys: usize,
+    /// First global inline-cache site id for this region; the k-th heap op uses
+    /// `ic_base_idx + k`.
+    pub(crate) ic_base_idx: u32,
+}
+
+/// Compile the loop region `[start, end]` (entered at `start`). Tries the
+/// register-promoting path first (values live in xmm/gpr across the loop, no
+/// per-op memory traffic — competitive with V8) and falls back to the simpler
+/// memory-based path if the region's shape is outside the register allocator's
+/// subset (e.g. it contains heap property ops). Returns `None` only if even the
+/// fallback can't handle it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_region(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    globals_base_helper: usize,
+    heap: HeapHelpers,
+    const_strs: &FxHashMap<u32, u64>,
+    ta_plan: &TaPinPlan,
+    leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+    method_plan: &FxHashMap<usize, MethodInlinePlan>,
+) -> Option<JitFn> {
+    // The register/SROA paths decline any region containing a Call/CallMethod, so
+    // leaf inlining and method inlining (which apply only to those sites) are
+    // reachable only via the memory path below.
+    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot) {
+        return Some(f);
+    }
+    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan)
+}
+
+/// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
+/// double register path; returns `(code, is_int)`. Deliberately NOT the memory
+/// path — the rewrite removed all heap ops, so if the register paths decline
+/// (e.g. register pressure even with reuse), SROA is abandoned and the caller
+/// falls back to the inline-cache mem path on the ORIGINAL bytecode.
+pub(crate) fn compile_region_numeric(proto: &FuncProto, start: u32, end: u32, gh: usize) -> Option<(JitFn, bool)> {
+    // SROA-rewritten code has no index ops, so an empty TA plan (no snapshot) is correct.
+    if let Some(f) = compile_region_int(proto, start, end, gh, &TaPinPlan::default(), 0) {
+        return Some((f, true));
+    }
+    // SROA-rewritten code has no index ops, so an empty TA plan is correct here.
+    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default(), 0).map(|f| (f, false))
+}
+
+/// Clone `proto` and rewrite the region's heap ops to scratch field-globals so
+/// the register paths can compile it: `GetProp(o.name) → LoadGlobal(dst, slot)`,
+/// `SetProp(o.name, val) → StoreGlobal(slot, val)`, where `slot = pool_base + i`
+/// and `i` is the field's index in `fp.fields`. The interpreter syncs each pool
+/// slot ↔ the object's field around the native run (see `FieldSyncPlan`).
+pub(crate) fn rewrite_for_field_promotion(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    fp: &FieldPromotePlan,
+    pool_base: u32,
+) -> FuncProto {
+    let mut p = proto.clone();
+    // Map a name-constant index to its pool slot BY FIELD STRING (fp.fields holds
+    // one representative index per distinct field string).
+    let slot_of = |name: u32| -> u32 {
+        let s = &proto.string_constants[name as usize];
+        let i = fp
+            .fields
+            .iter()
+            .position(|&n| proto.string_constants[n as usize] == *s)
+            .unwrap();
+        pool_base + i as u32
+    };
+    for ip in start as usize..=end as usize {
+        match p.code[ip] {
+            Instr::GetProp { dst, name, .. } => {
+                p.code[ip] = Instr::LoadGlobal { dst, idx: slot_of(name) };
+            }
+            Instr::SetProp { name, val, .. } => {
+                p.code[ip] = Instr::StoreGlobal { idx: slot_of(name), src: val };
+            }
+            // The object-ref loads (`LoadGlobal o → r`) are now DEAD — their only
+            // consumers (the heap ops above) no longer use `r`. Neutralise them to
+            // `LoadInt 0` so the numeric path doesn't try to promote the object
+            // global itself (a heap ref would fail its is-number entry guard, and
+            // the whole region would bail). `r` stays dead/unread.
+            Instr::LoadGlobal { dst, idx } if idx == fp.obj_global => {
+                p.code[ip] = Instr::LoadInt { dst, val: 0 };
+            }
+            _ => {}
+        }
+    }
+    p
+}
+

@@ -1,0 +1,316 @@
+// Split out of the former monolithic parent file by tools/split_rs.py.
+// Pure code move: `use super::*` keeps the parent module's imports in
+// scope, and items are widened to pub(crate) so the pieces still see
+// each other. No logic changed.
+#![allow(unused_imports)]
+use super::*;
+
+pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
+    compile_program_inner(prog, source, false)
+}
+
+/// Compile a MODULE as the program entry: the top level is an async context
+/// (top-level `await`), and the VM runs func 0 as an async activation.
+pub fn compile_module(prog: &ox::Program, source: &str) -> R<Program> {
+    compile_program_inner(prog, source, true)
+}
+
+pub(crate) fn compile_program_inner(prog: &ox::Program, source: &str, module_mode: bool) -> R<Program> {
+    let mut c = Compiler::new(source.to_string());
+    c.module_mode = module_mode;
+    c.compile(prog)?;
+    for (i, f) in c.functions.iter_mut().enumerate() {
+        rewrite_string_accumulators(f, i == 0);
+    }
+    let module_decl_globals = c.collect_module_decl_globals();
+    Ok(Program {
+        functions: c.functions,
+        global_count: c.globals.len() as u32,
+        classes: c.classes,
+        global_names: c.globals,
+        hoisted_globals: c.hoisted_globals,
+        decl_globals: c.decl_globals.iter().copied().collect(),
+        lexical_globals: c.lexical_globals.iter().copied().collect(),
+        const_globals: c.const_globals.iter().copied().collect(),
+        eval_dynamic_names: c.eval_dynamic_names.iter().cloned().collect(),
+        module_exports: std::mem::take(&mut c.module_exports),
+        module_has_imports: c.module_has_imports,
+        module_reexports: std::mem::take(&mut c.module_reexports),
+        module_star_reexports: std::mem::take(&mut c.module_star_reexports),
+        module_ns_reexports: std::mem::take(&mut c.module_ns_reexports),
+        module_imports: std::mem::take(&mut c.module_imports),
+        module_decl_globals,
+    })
+}
+
+/// Compile an `eval` code string. Identical to [`compile_program`] except the
+/// top-level script returns its *completion value* (the value of the last
+/// evaluated expression statement) — what `eval("1 + 1")` must yield. The VM
+/// installs the resulting functions into its runtime function table and remaps
+/// the program's independently-numbered global slots onto the live globals.
+impl Compiler {
+    /// Whether `#name` (full key, '#'-prefixed) is declared by an enclosing
+    /// class body or visible to this direct eval.
+    pub(crate) fn private_name_declared(&self, key: &str) -> bool {
+        self.private_names_stack.iter().any(|v| v.iter().any(|n| n == key))
+            || self.eval_visible_privates.contains(key)
+    }
+}
+
+/// The top-level var + function declared names of a parsed eval body —
+/// EvalDeclarationInstantiation's varNames/functionNames for collision checks.
+pub fn eval_var_and_fn_names(prog: &ox::Program) -> Vec<String> {
+    let mut vars = std::collections::HashSet::new();
+    for s in &prog.body {
+        collect_hoisted_vars(s, &mut vars);
+    }
+    let mut out: Vec<String> = vars.into_iter().collect();
+    for s in &prog.body {
+        if let ox::Statement::FunctionDeclaration(f) = s {
+            if let Some(id) = &f.id {
+                out.push(id.name.to_string());
+            }
+        }
+    }
+    out
+}
+
+pub fn compile_eval(
+    prog: &ox::Program,
+    source: &str,
+    force_strict: bool,
+    force_new_target_ok: bool,
+    inherit_super: Option<bool>,
+    ban_arguments: bool,
+    visible_privates: std::collections::HashSet<String>,
+    is_module: bool,
+    inherit_super_obj: bool,
+    caller_scope: Vec<String>,
+    fn_var_env: bool,
+    exact_src: Option<&[u8]>,
+) -> R<Program> {
+    // MODULE early errors (ModuleDeclarationInstantiation): duplicate
+    // LexicallyDeclaredNames (let/const/class AND top-level function — module
+    // top-level functions are LEXICAL), or a lexical name colliding with any
+    // VarDeclaredName (deep), is a SyntaxError before any evaluation.
+    if is_module {
+        let mut vars = std::collections::HashSet::new();
+        for s in &prog.body {
+            collect_hoisted_vars(s, &mut vars);
+        }
+        let mut lexical: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut add_lexical = |n: String,
+                               lexical: &mut std::collections::HashSet<String>|
+         -> Result<(), String> {
+            if !lexical.insert(n.clone()) || vars.contains(&n) {
+                return Err(format!("duplicate declaration of '{n}' in module code"));
+            }
+            Ok(())
+        };
+        let mut check_decl = |d: &ox::Declaration,
+                              lexical: &mut std::collections::HashSet<String>|
+         -> Result<(), String> {
+            match d {
+                ox::Declaration::VariableDeclaration(vd) if vd.kind.is_lexical() => {
+                    let mut names = std::collections::HashSet::new();
+                    for decl in &vd.declarations {
+                        capture::collect_pattern_names(&decl.id, &mut names);
+                    }
+                    for n in names {
+                        add_lexical(n, lexical)?;
+                    }
+                }
+                ox::Declaration::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        add_lexical(id.name.to_string(), lexical)?;
+                    }
+                }
+                ox::Declaration::ClassDeclaration(cd) => {
+                    if let Some(id) = &cd.id {
+                        add_lexical(id.name.to_string(), lexical)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+        for s in &prog.body {
+            match s {
+                ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                    let mut names = std::collections::HashSet::new();
+                    for decl in &d.declarations {
+                        capture::collect_pattern_names(&decl.id, &mut names);
+                    }
+                    for n in names {
+                        add_lexical(n, &mut lexical)?;
+                    }
+                }
+                ox::Statement::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        add_lexical(id.name.to_string(), &mut lexical)?;
+                    }
+                }
+                ox::Statement::ClassDeclaration(cd) => {
+                    if let Some(id) = &cd.id {
+                        add_lexical(id.name.to_string(), &mut lexical)?;
+                    }
+                }
+                ox::Statement::ExportNamedDeclaration(e) => {
+                    if let Some(d) = &e.declaration {
+                        check_decl(d, &mut lexical)?;
+                    }
+                }
+                ox::Statement::ExportDefaultDeclaration(e) => {
+                    use ox::ExportDefaultDeclarationKind as K;
+                    match &e.declaration {
+                        K::FunctionDeclaration(f) => {
+                            if let Some(id) = &f.id {
+                                add_lexical(id.name.to_string(), &mut lexical)?;
+                            }
+                        }
+                        K::ClassDeclaration(cd) => {
+                            if let Some(id) = &cd.id {
+                                add_lexical(id.name.to_string(), &mut lexical)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut c = Compiler::new(source.to_string());
+    // EXACT WTF-8 source bytes (eval of a string holding lone surrogates):
+    // lets regex literals recover their exact pattern text. None (free) for
+    // well-formed sources.
+    c.exact_src = exact_src.map(<[u8]>::to_vec);
+    c.eval_mode = true;
+    c.eval_locals = !is_module;
+    // A module body is an ASYNC context: top-level `await` compiles and the
+    // activation returns its body promise (read by the loader). No-await
+    // bodies still complete synchronously.
+    c.module_mode = is_module;
+    // A sloppy FUNCTION-context eval declares its var/function names into the
+    // caller's dynamic EvalScope (never globals): record them so the var
+    // hoist skips them and their accesses compile to the Dyn global ops.
+    if fn_var_env && !(force_strict || has_use_strict(&prog.directives)) {
+        c.eval_fn_context = true;
+        for n in eval_var_and_fn_names(prog) {
+            if !caller_scope.iter().any(|c| *c == n) {
+                c.eval_dynamic_names.insert(n);
+            }
+        }
+        // Annex B.3.3: a BLOCK-level function declaration in this sloppy eval
+        // also creates a function-scoped binding — in the CALLER's EvalScope,
+        // exactly like the eval's top-level vars (never a realm global).
+        let mut blockers = std::collections::HashSet::new();
+        for s in &prog.body {
+            match s {
+                ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                    for decl in &d.declarations {
+                        capture::collect_pattern_names(&decl.id, &mut blockers);
+                    }
+                }
+                ox::Statement::ClassDeclaration(cd) => {
+                    if let Some(id) = &cd.id {
+                        blockers.insert(id.name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut b33 = std::collections::HashSet::new();
+        for s in &prog.body {
+            collect_b33_block_fns(s, false, &blockers, &mut b33);
+        }
+        for n in b33 {
+            if !caller_scope.iter().any(|c| *c == n) {
+                c.eval_dynamic_names.insert(n);
+            }
+        }
+    }
+    c.eval_caller_scope = caller_scope;
+    // DIRECT EVAL INSIDE `with`: the caller's eval-site map threads each active
+    // with-object's hidden cell binding (" with-object-N") along with the
+    // ordinary caller bindings, listed INNERMOST-FIRST. ResolveBinding for the
+    // eval program's identifiers must probe those objects (HasProperty —
+    // observable through a Proxy `has` trap) before the caller bindings /
+    // globals, so seed the eval ROOT's inherited_with_shadows exactly like a
+    // nested closure's: per free-or-var-declared name, the chain of with-objects
+    // that shadow it. Map ORDER encodes nesting — a with-object shadows
+    // precisely the caller bindings listed AFTER it; a name with no caller
+    // binding (a global, or a sloppy eval var that lives in the EvalScope) is
+    // shadowed by the entire chain. Names the eval binds LEXICALLY become root
+    // locals, and with_obj_regs' bound-here check skips their chains.
+    if !is_module {
+        let with_chain: Vec<(usize, String)> = c
+            .eval_caller_scope
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.starts_with(" with-object-"))
+            .map(|(i, n)| (i, n.clone()))
+            .collect();
+        if !with_chain.is_empty() {
+            let mut names = capture::free_vars(&[], &prog.body);
+            for n in eval_var_and_fn_names(prog) {
+                names.insert(n);
+            }
+            let mut map = std::collections::HashMap::new();
+            for name in names {
+                if name.starts_with(" with-object-") {
+                    continue;
+                }
+                let pos = c.eval_caller_scope.iter().position(|n| *n == name);
+                let chain: Vec<String> = with_chain
+                    .iter()
+                    .filter(|(i, _)| pos.map_or(true, |p| *i < p))
+                    .map(|(_, n)| n.clone())
+                    .collect();
+                if !chain.is_empty() {
+                    map.insert(name, chain);
+                }
+            }
+            c.pending_with_shadows = map;
+        }
+    }
+    // A STRICT eval (strict caller or "use strict" source) gets its own
+    // discarded variable environment: top-level var/function decls are frame
+    // locals, never realm globals.
+    c.script_binds_globals =
+        !(c.eval_locals && (force_strict || has_use_strict(&prog.directives)));
+    c.eval_inherit_super_obj = inherit_super_obj;
+    c.force_strict = force_strict;
+    c.force_new_target_ok = force_new_target_ok;
+    // A direct eval from a class-member context inherits the caller's home
+    // class: `super.x` in the eval'd top level (and its arrows) compiles
+    // against the u32::MAX SENTINEL, which prepare_eval_program remaps to the
+    // caller's runtime class id. Plain nested functions still reset it.
+    c.eval_inherit_super = inherit_super;
+    c.in_field_init = ban_arguments;
+    c.eval_visible_privates = visible_privates;
+    c.compile(prog)?;
+    for (i, f) in c.functions.iter_mut().enumerate() {
+        rewrite_string_accumulators(f, i == 0);
+    }
+    let module_decl_globals = c.collect_module_decl_globals();
+    Ok(Program {
+        functions: c.functions,
+        global_count: c.globals.len() as u32,
+        classes: c.classes,
+        global_names: c.globals,
+        hoisted_globals: c.hoisted_globals,
+        decl_globals: c.decl_globals.iter().copied().collect(),
+        lexical_globals: c.lexical_globals.iter().copied().collect(),
+        const_globals: c.const_globals.iter().copied().collect(),
+        eval_dynamic_names: c.eval_dynamic_names.iter().cloned().collect(),
+        module_exports: std::mem::take(&mut c.module_exports),
+        module_has_imports: c.module_has_imports,
+        module_reexports: std::mem::take(&mut c.module_reexports),
+        module_star_reexports: std::mem::take(&mut c.module_star_reexports),
+        module_ns_reexports: std::mem::take(&mut c.module_ns_reexports),
+        module_imports: std::mem::take(&mut c.module_imports),
+        module_decl_globals,
+    })
+}
+
