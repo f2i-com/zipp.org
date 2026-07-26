@@ -854,6 +854,54 @@ Suite geomean is UNCHANGED — `bench/real/` is dominated by objects, strings an
 regex, not int-array loops. That is a gap in the bench set, not evidence the fix
 does not matter; see §1b.
 
+### B19 — Recycling dead `ObjMap`s: 38% faster construction, 3% SLOWER suite (REVERTED)
+
+Every plain object costs a `Box<ObjMap>` allocation plus one per parallel vector
+on first push. The obvious fix is to stop returning them to the allocator: on
+sweep, leave the dead map IN PLACE in its slot, cleared, and let the next
+allocation refill it. The free list is exactly the right pool, so this costs no
+memory over the tombstone it replaces, and the GC already pre-marks free slots
+without tracing them, so a cleared map sitting in one is unreachable.
+
+It worked, on the microbenchmark:
+
+    {}          34 -> 20ns   (-41%)
+    {a:i}       77 -> 48ns   (-38%)
+    {a,b,c}    111 -> 70ns   (-37%)
+    new P2     244 -> 200ns  (-18%)
+
+And it lost, on the actual suite — interleaved best-of-5, both binaries built
+from the same tree:
+
+    class-prototype-hot  +3.8%    json-large      +2.2%
+    map-set-heavy       +10.8%    markdown-render +0.8%
+    polymorphic-objects  +1.0%    parse-large-js  +1.0%
+                                  mean            +3.0%
+
+`map-set-heavy` identified the mechanism: retained buffers. A recycled map keeps
+its vectors' capacity, so every free slot parks up to 32*24 bytes of `keys`
+buffer that the allocator can no longer hand to the Map entries the bench is
+actually building. Capping recycling at capacity 4 fixed that one specifically
+(+10.8% -> -2.1%) but left the mean at +0.6% — still a loss.
+
+The deeper reason the win does not transfer, and the part worth remembering:
+**the microbenchmark allocates and immediately drops, so recycling hits every
+time; the real benches RETAIN their objects** — a parsed AST, a JSON document, a
+component tree. Their free list is mostly empty, so the allocation path never
+finds a recycled map and only the GC-side cost is paid. A construction
+microbenchmark measures the churn case, which is not the case the suite is made
+of.
+
+This is the same shape as the earlier `SmallVec` result (B-series): a local
+construction win that a global memory-footprint effect erases. Two independent
+attempts at "make object construction cheaper by managing its memory better" have
+now regressed the suite. The conclusion is not that construction does not matter
+— it is that the win has to come from objects that are SMALLER and hold FEWER
+allocations by construction, not from recycling the same allocations faster.
+That is shapes: no per-object `keys` vector, no per-object `attrs` vector, no
+`String` per property. Shapes reduce steady-state memory and construction cost at
+the same time, which is exactly the pair every attempt so far has traded against.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
