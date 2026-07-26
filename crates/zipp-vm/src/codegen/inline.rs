@@ -952,6 +952,20 @@ pub(crate) fn emit_inline_method_call(
             ; mov edx, [r13 + rcx*4]                // live slot version
             ; cmp edx, DWORD shape.recv_ver as i32
             ; jne => miss
+        );
+        // ── plain-object receiver: the method is an own property, so its SLOT
+        // VALUE must still be the callee we baked. An in-place overwrite does
+        // not change the shape and so does not bump the version above.
+        if let Some((slot, bits)) = shape.method_slot {
+            dynasm!(ops
+                ; mov rcx, QWORD shape.vals_ptr as i64
+                ; mov rcx, [rcx + (slot as i32) * 8]
+                ; mov r10, QWORD bits as i64
+                ; cmp rcx, r10
+                ; jne => miss
+            );
+        }
+        dynasm!(ops
             // ── bind reg 0 = `this` (rax still = receiver) ──
             ; mov [rbx + dreg(w)], rax
         );

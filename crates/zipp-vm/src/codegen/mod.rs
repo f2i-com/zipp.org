@@ -380,6 +380,18 @@ pub struct MethodInlineShape {
     pub consts: FxHashMap<u32, u64>,
     /// Inlined `super.m()` bodies keyed by their `SuperMethod` body index.
     pub supers: FxHashMap<usize, SuperInline>,
+    /// For a PLAIN-OBJECT receiver (`{ m() {} }`, the module/callback shape),
+    /// the own `vals` slot the method was found at and the callee bits baked
+    /// from it — guarded as `vals_ptr[slot] == bits` before the body runs.
+    ///
+    /// `None` for a class instance, whose method comes from the class rather
+    /// than a property and is already covered by the receiver-version guard.
+    ///
+    /// This guard is REQUIRED, not defensive: `obj.m = other` overwrites an
+    /// existing slot in place and deliberately does NOT bump the version (the
+    /// ordinary-set fast path keeps the shape unchanged so JIT caches stay
+    /// valid), so identity+version alone would happily run the OLD body.
+    pub method_slot: Option<(u32, u64)>,
 }
 
 pub struct MethodInlinePlan {

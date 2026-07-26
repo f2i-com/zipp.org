@@ -784,6 +784,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plain_object_method_inline_guards_the_slot() {
+        // A method held as an own property of a PLAIN object now inlines. The
+        // receiver-version guard is NOT enough on its own: `o.m = other`
+        // overwrites the slot in place and deliberately does not bump the
+        // version (the ordinary-set fast path keeps the shape stable so JIT
+        // caches survive), so the arm also guards the slot's VALUE.
+        //
+        // Each case runs far past the OSR threshold and then changes something
+        // the inline must notice.
+        assert_jit_matches(
+            "var out=[];              (function(){var o={m:function(){return 1;}},s=0;                for(var i=0;i<200000;i++){ if(i===100000) o.m=function(){return 2;}; s+=o.m(); }                out.push(s);})();              (function(){var o={v:7,m:function(){return this.v;}},s=0;                for(var i=0;i<200000;i++){ if(i===100000) o.v=9; s+=o.m(); } out.push(s);})();              (function(){var k=3,o={m:function(){return k;}},s=0;                for(var i=0;i<200000;i++){ if(i===100000) k=5; s+=o.m(); } out.push(s);})();              (function(){var o={m:function(){return 1;}},s=0,e=0;                for(var i=0;i<100000;i++){ if(i===50000) delete o.m;                  try{ s+=o.m(); }catch(x){ e++; } } out.push(s+'/'+e);})();              console.log(out.join('|'))",
+            &["300000|1600000|800000|50000/50000"],
+        );
+    }
+
     // ── INT live-in interval contract ─────────────────────────────────────────
     // `emit_int_entry_load` admits an Int-tagged value OR a double holding an
     // exact integer in [-2^53, 2^53], so `plan_region` must seed the interval
