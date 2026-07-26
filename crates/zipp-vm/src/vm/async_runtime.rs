@@ -1554,11 +1554,27 @@ impl<'p> Vm<'p> {
     /// `Promise.prototype.constructor` (so `Get(C, "resolve")` reaches an
     /// overridden `Promise.resolve`).
     pub(crate) fn promise_ctor_value(&mut self) -> Value {
-        if self.promise_proto == 0 {
+        // The RECORDED intrinsic, not `Get(%Promise.prototype%, "constructor")`.
+        //
+        // Every caller is asking "is this %Promise% itself" — as the C of
+        // PromiseResolve/NewPromiseCapability, or to decide whether a combinator
+        // may take its unobservable fast path. That is a question about the
+        // intrinsic, and reading it back out of a mutable property answered a
+        // different one.
+        //
+        // It is also a correctness fix, not only a speed one. `Promise.resolve(x)`
+        // returns x unchanged only when `Get(x, "constructor")` is C. With
+        // `Promise.prototype.constructor` patched to X, a plain promise reports X
+        // and the old code compared it against X too — so it passed x through even
+        // though C is still %Promise% and the spec requires a fresh adopting
+        // promise.
+        //
+        // Speed: this ran a full property lookup on %Promise.prototype% on EVERY
+        // `Promise.resolve`, `Promise.reject` and combinator entry.
+        if self.promise_ctor_intrinsic == 0 {
             return Value::UNDEFINED;
         }
-        self.get_prop(Value::heap(self.promise_proto), "constructor")
-            .unwrap_or(Value::UNDEFINED)
+        Value::heap(self.promise_ctor_intrinsic)
     }
 
     pub(crate) fn promise_combine(

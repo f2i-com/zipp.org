@@ -640,6 +640,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn promise_resolve_uses_the_intrinsic_not_prototype_constructor() {
+        // PromiseResolve step 2 returns x unchanged only when Get(x,"constructor")
+        // is C, and C here is %Promise% itself. Reading C back out of the mutable
+        // `Promise.prototype.constructor` answered a different question and got
+        // BOTH patched cases wrong: a plain promise passed through when it must
+        // not, and one whose OWN constructor is %Promise% did not when it must.
+        assert_jit_matches(
+            "var out=[]; var p1=Promise.resolve(1); out.push(Promise.resolve(p1)===p1);              Promise.prototype.constructor=function X(){};              var p2=Promise.resolve(2); out.push(Promise.resolve(p2)===p2);              var p3=Promise.resolve(3); p3.constructor=Promise;              out.push(Promise.resolve(p3)===p3); console.log(out.join(','))",
+            &["true,false,true"],
+        );
+    }
+
     // ── INT live-in interval contract ─────────────────────────────────────────
     // `emit_int_entry_load` admits an Int-tagged value OR a double holding an
     // exact integer in [-2^53, 2^53], so `plan_region` must seed the interval
