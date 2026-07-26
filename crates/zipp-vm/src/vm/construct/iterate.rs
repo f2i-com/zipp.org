@@ -803,6 +803,14 @@ impl<'p> Vm<'p> {
                     return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
                 }
             }
+            // An ITERATOR OBJECT is iterable through the protocol and nothing
+            // else — `%ArrayIteratorPrototype%[Symbol.iterator]` returns `this`.
+            // Without this arm it fell to the positional fast path below, which
+            // reads `it[0]`, `it[1]`, … off the ITERATOR, so
+            // `var [p, q] = [10, 20].values()` bound two `undefined`s. Arrays,
+            // Sets, strings and generators all worked, which is why it survived:
+            // the broken shape is the one nobody writes by hand.
+            HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => true,
             _ => false,
         };
         if !drain {

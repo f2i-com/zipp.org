@@ -1316,6 +1316,53 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B45 — B33-A landed: the array-iterator result object is elided
+
+| loop | before | after | node |
+|---|---|---|---|
+| `for (v of a)` (existing fast path) | 16.5 | 16.8 | 1.3 |
+| `for (v of a.values())` | 167.5 | **44.3** | 1.8 |
+| `for (k of a.keys())` | 157.0 | **37.5** | 1.3 |
+| `for (e of a.entries())` | 176.5 | **76.5** | 3.0 |
+
+ns/step. **3.8x, 4.2x and 2.3x**, against B33's predicted 143 -> ~45.
+
+The step is now `Vm::array_iter_step`, lifted verbatim out of the `ITER_NEXT`
+native and shared with the `IterNext` opcode, which takes the `(value, done)`
+pair and never builds the object. The elision is legal for the reason
+`dispatch.rs` already states where it does the same for %RegExpStringIterator%:
+7.4.14 makes an ordinary object with two own DATA properties, which shadow
+anything on `Object.prototype`, so neither `IteratorComplete`'s nor
+`IteratorValue`'s Get can run user code, and the object's identity never leaves
+the loop. The caller checks that `next` is the PRISTINE intrinsic first, so a
+patched `%ArrayIteratorPrototype%.next` is still honoured.
+
+Verified against node across eleven shapes: a patched `next` (honoured, then
+restored), growth during iteration (length re-read every step), exhaustion
+LATCHING so a later grow is not iterated, `next.call({})` throwing, holes,
+`entries`, the result object when the USER holds it (still a real object with
+own `value`/`done`), iterator helpers, TypedArray iterators (not this path),
+destructuring and spread — in both tiers and under `ZIPP_GC_STRESS`.
+
+**And it found a conformance bug that had nothing to do with performance.**
+`var [p, q] = [10, 20].values()` bound two `undefined`s. `iter_to_array`'s drain
+match had arms for Generator, Object, TypedArray and Array but none for
+`HeapObj::Iterator`, so an iterator object fell through to the POSITIONAL fast
+path and read `it[0]`, `it[1]` off the iterator. Arrays, Sets, strings and
+generators all worked, which is why it survived — and test262 does not cover the
+shape, so the fix shows **zero newly-passing tests**. It was found only because
+writing the adversarial check for the elision meant enumerating every way an
+array iterator can be consumed.
+
+Suite effect: none — no bench in `bench/real` iterates via `.values()`/`.keys()`/
+`.entries()`, exactly as B33 warned. This is a real-world win (every iterator
+helper chain, `map.entries()`, `Object.entries()`-free iteration) and a
+correctness fix, not a geomean move.
+
+Still open from B33: the same treatment for GENERATOR results
+(`async_runtime.rs` `iter_result`, 174ns/step, with the `yield*` verbatim case
+that must stay an object), and Map/Set entry `[k,v]` arrays.
+
 ### B44 — Hidden classes, part 2: the JIT cliff, without touching codegen
 
 The 8 -> 9 receiver cliff, re-measured with an explicit wrap counter (see the

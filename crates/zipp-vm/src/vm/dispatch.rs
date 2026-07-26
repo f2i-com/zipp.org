@@ -5652,6 +5652,20 @@ impl<'p> Vm<'p> {
                                         ip += 1;
                                         continue;
                                     }
+                                    // Same argument, same intrinsic `next`: a
+                                    // live %ArrayIteratorPrototype% iterator
+                                    // (`a.values()`, `a.keys()`, `a.entries()`,
+                                    // and every iterator-helper chain over an
+                                    // array) is stepped inline, and the
+                                    // {value, done} object it would have built
+                                    // — 90ns of a 143ns step — is never made.
+                                    if let Some(step) = self.array_iter_step(it.heap_index()) {
+                                        let (val, done) = step?;
+                                        self.set(base, value_dst, val);
+                                        self.set(base, done_dst, Value::bool(done));
+                                        ip += 1;
+                                        continue;
+                                    }
                                 }
                                 let res = self.call_value(next, it, &[])?;
                                 // IteratorNext step 3: a non-Object result is a TypeError.
