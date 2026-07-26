@@ -244,7 +244,7 @@ impl<'p> Vm<'p> {
         }
         m.define("error", error, attr);
         m.define("suppressed", suppressed, attr);
-        let idx = self.heap.alloc(HeapObj::Object(m));
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
         if self.suppressederror_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.suppressederror_proto));
         }
@@ -409,7 +409,7 @@ impl<'p> Vm<'p> {
     /// Allocate a fresh `DisposableStack` instance (a plain object linked to
     /// %DisposableStack.prototype%, with an empty, not-yet-disposed disposer stack).
     pub(crate) fn alloc_disposable_stack(&mut self, is_async: bool) -> u32 {
-        let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
         let proto = if is_async {
             self.asyncdisposablestack_proto
         } else {
@@ -547,7 +547,7 @@ impl<'p> Vm<'p> {
     /// evaluation.
     pub(crate) fn alloc_empty_namespace(&mut self) -> u32 {
         let m = ObjMap::new();
-        let idx = self.heap.alloc(HeapObj::Object(m));
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
         self.proto_of.insert(idx, Value::NULL);
         self.module_namespaces.insert(idx, std::collections::HashMap::new());
         idx
@@ -603,7 +603,7 @@ impl<'p> Vm<'p> {
         );
         m.extensible = false;
         if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
-            *slot = m;
+            *slot = Box::new(m);
         }
         // The whole map (and its vals Vec) was replaced: invalidate any JIT
         // inline cache that captured the old vals pointer.

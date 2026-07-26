@@ -965,7 +965,7 @@ impl<'p> Vm<'p> {
                 };
                 gm.set(name, v);
             }
-            let gidx = self.heap.alloc(HeapObj::Object(gm));
+            let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
             // The groups object is OrdinaryObjectCreate(null) — no prototype.
             self.proto_of.insert(gidx, Value::NULL);
             Value::heap(gidx)
@@ -1008,7 +1008,7 @@ impl<'p> Vm<'p> {
                     };
                     gm.set(name, v);
                 }
-                let gidx = self.heap.alloc(HeapObj::Object(gm));
+                let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
                 self.proto_of.insert(gidx, Value::NULL);
                 Value::heap(gidx)
             };
@@ -1347,7 +1347,7 @@ impl<'p> Vm<'p> {
                         };
                         gm.set(name, v);
                     }
-                    let gidx = self.heap.alloc(HeapObj::Object(gm));
+                    let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
                     self.proto_of.insert(gidx, Value::NULL);
                     argv.push(Value::heap(gidx));
                 }
@@ -1473,7 +1473,7 @@ impl<'p> Vm<'p> {
                         };
                         gm.set(name, v);
                     }
-                    let gidx = self.heap.alloc(HeapObj::Object(gm));
+                    let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
                     self.proto_of.insert(gidx, Value::NULL);
                     argv.push(Value::heap(gidx));
                 }

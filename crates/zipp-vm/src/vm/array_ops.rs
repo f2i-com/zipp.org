@@ -322,7 +322,7 @@ impl<'p> Vm<'p> {
         m.set("writable", Value::TRUE);
         m.set("enumerable", Value::TRUE);
         m.set("configurable", Value::TRUE);
-        let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+        let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
         let key = index.to_string();
         self.object_define_property(target, &key, desc)
     }

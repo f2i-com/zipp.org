@@ -1115,7 +1115,7 @@ impl<'p> Vm<'p> {
         if let Some(mi) = msg_idx {
             map.define("message", Value::heap(mi), attr);
         }
-        let obj = self.heap.alloc(HeapObj::Object(map));
+        let obj = self.heap.alloc(HeapObj::Object(Box::new(map)));
         let p = self.error_protos[k];
         if p != 0 {
             self.proto_of.insert(obj, Value::heap(p));

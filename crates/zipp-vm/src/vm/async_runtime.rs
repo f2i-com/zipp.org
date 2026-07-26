@@ -391,7 +391,7 @@ impl<'p> Vm<'p> {
         let mut map = ObjMap::new();
         map.set("value", value);
         map.set("done", Value::bool(done));
-        Value::heap(self.heap.alloc(HeapObj::Object(map)))
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))))
     }
 
     // ── promises / microtasks ──
@@ -1718,7 +1718,7 @@ impl<'p> Vm<'p> {
         // iteration decrements it — when it hits 0 the combinator resolves/rejects.
         // results/settled grow as the iterator is stepped (LAZY, so an abrupt
         // Call(promiseResolve)/Invoke(.then) can IteratorClose the live iterator).
-        let comb = self.heap.alloc(HeapObj::Combinator {
+        let comb = self.heap.alloc(HeapObj::Combinator(Box::new(crate::heap::CombinatorData {
             kind,
             results: Vec::new(),
             remaining: 1,
@@ -1727,7 +1727,7 @@ impl<'p> Vm<'p> {
             cap_resolve,
             cap_reject,
             keys: comb_keys,
-        });
+        })));
         loop {
             // IteratorStep; a throwing next() leaves the iterator done → no close.
             let val = if let Some(pos) = fast_pos {
@@ -1788,7 +1788,8 @@ impl<'p> Vm<'p> {
                 }
             }
             let index = match self.heap.get_mut(comb) {
-                HeapObj::Combinator { results, settled, remaining, .. } => {
+                HeapObj::Combinator(__c) => {
+                    let crate::heap::CombinatorData { results, settled, remaining, .. } = &mut **__c;
                     let i = results.len() as u32;
                     results.push(Value::UNDEFINED);
                     settled.push(false);
@@ -1884,7 +1885,8 @@ impl<'p> Vm<'p> {
         // Iteration complete: drop the initial count. Race never uses the counter
         // (it settles on the first element), so its empty form stays pending.
         if !matches!(kind, CombKind::Race) {
-            if let HeapObj::Combinator { remaining, .. } = self.heap.get_mut(comb) {
+            if let HeapObj::Combinator(__c) = self.heap.get_mut(comb) {
+                let remaining = &mut __c.remaining;
                 *remaining -= 1;
             }
             self.combinator_finish(comb);
@@ -1913,7 +1915,8 @@ impl<'p> Vm<'p> {
     fn combinator_finish(&mut self, comb: u32) {
         use crate::heap::CombKind;
         let (ckind, remaining, cap_resolve, cap_reject) = match self.heap.get(comb) {
-            HeapObj::Combinator { kind, remaining, cap_resolve, cap_reject, .. } => {
+            HeapObj::Combinator(__c) => {
+                let crate::heap::CombinatorData { kind, remaining, cap_resolve, cap_reject, .. } = &**__c;
                 (*kind, *remaining, *cap_resolve, *cap_reject)
             }
             _ => return,
@@ -1922,7 +1925,7 @@ impl<'p> Vm<'p> {
             return;
         }
         let (collected, comb_keys) = match self.heap.get(comb) {
-            HeapObj::Combinator { results, keys, .. } => (results.clone(), keys.clone()),
+            HeapObj::Combinator(__c) => (__c.results.clone(), __c.keys.clone()),
             _ => return,
         };
         // Settle THROUGH the result capability (per spec): Any rejects with an
@@ -1940,7 +1943,7 @@ impl<'p> Vm<'p> {
                 for (k, v) in comb_keys.iter().zip(collected.iter()) {
                     map.set(k, *v);
                 }
-                let obj = self.heap.alloc(HeapObj::Object(map));
+                let obj = self.heap.alloc(HeapObj::Object(Box::new(map)));
                 self.proto_of.insert(obj, Value::NULL);
                 if let Err(Thrown(msg)) =
                     self.call_value(cap_resolve, Value::UNDEFINED, &[Value::heap(obj)])
@@ -1975,7 +1978,8 @@ impl<'p> Vm<'p> {
     pub(crate) fn combinator_step(&mut self, comb: u32, index: u32, kind: ReactionKind, value: Value) {
         use crate::heap::CombKind;
         let (ckind, cap_resolve, cap_reject) = match self.heap.get(comb) {
-            HeapObj::Combinator { kind, cap_resolve, cap_reject, .. } => {
+            HeapObj::Combinator(__c) => {
+                let crate::heap::CombinatorData { kind, cap_resolve, cap_reject, .. } = &**__c;
                 (*kind, *cap_resolve, *cap_reject)
             }
             _ => return,
@@ -1983,7 +1987,8 @@ impl<'p> Vm<'p> {
         // [[AlreadyCalled]]: a custom thenable may invoke a resolve/reject element
         // (or both) more than once for the same index — only the first counts.
         let already = match self.heap.get_mut(comb) {
-            HeapObj::Combinator { settled, .. } => {
+            HeapObj::Combinator(__c) => {
+                let settled = &mut __c.settled;
                 let s = &mut settled[index as usize];
                 if *s {
                     true
@@ -2023,7 +2028,8 @@ impl<'p> Vm<'p> {
                 } else {
                     value
                 };
-                if let HeapObj::Combinator { results, remaining, .. } = self.heap.get_mut(comb) {
+                if let HeapObj::Combinator(__c) = self.heap.get_mut(comb) {
+                    let crate::heap::CombinatorData { results, remaining, .. } = &mut **__c;
                     results[index as usize] = stored;
                     *remaining -= 1;
                 }
@@ -2048,7 +2054,7 @@ impl<'p> Vm<'p> {
                 map.set("reason", value);
             }
         }
-        Value::heap(self.heap.alloc(HeapObj::Object(map)))
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))))
     }
 
     /// Build an `AggregateError`-like object `{name, message, errors}` for a
@@ -2069,7 +2075,7 @@ impl<'p> Vm<'p> {
         map.define("message", msg, attr);
         let errs = Value::heap(self.heap.alloc(HeapObj::Array(errors)));
         map.define("errors", errs, attr);
-        let idx = self.heap.alloc(HeapObj::Object(map));
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
         self.error_data.insert(idx); // [[ErrorData]] internal slot
         // Link [[Prototype]] to %AggregateError.prototype% (error_protos[7]) so the
         // internally-created error is a real AggregateError instance:

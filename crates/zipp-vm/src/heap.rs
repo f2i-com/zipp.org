@@ -1289,6 +1289,19 @@ impl std::ops::DerefMut for AbData {
     }
 }
 
+/// Payload of `HeapObj::Combinator`, boxed out of the enum (see the variant).
+#[derive(Clone, Debug)]
+pub struct CombinatorData {
+    pub kind: CombKind,
+    pub results: Vec<Value>,
+    pub remaining: u32,
+    pub result: u32,
+    pub settled: Vec<bool>,
+    pub cap_resolve: Value,
+    pub cap_reject: Value,
+    pub keys: Vec<String>,
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -1334,7 +1347,7 @@ pub enum HeapObj {
     /// A dense array.
     Array(Vec<Value>),
     /// A plain object.
-    Object(ObjMap),
+    Object(Box<ObjMap>),
     /// A JS Promise. `result` holds the fulfillment value / rejection reason
     /// (undefined while Pending); `fulfill`/`reject` are reactions registered
     /// while Pending (drained as microtasks on settle). `handled` tracks whether
@@ -1369,7 +1382,10 @@ pub enum HeapObj {
     /// custom `this`-constructor's executor-provided functions are observably
     /// invoked. On the native path they are `BoundResolver`s bound to `result`, so
     /// calling them is identical to `self.resolve/reject(result, …)`.
-    Combinator { kind: CombKind, results: Vec<Value>, remaining: u32, result: u32, settled: Vec<bool>, cap_resolve: Value, cap_reject: Value, keys: Vec<String> },
+    /// BOXED. Eight fields including three `Vec`s made this ~104 bytes, which —
+    /// with `ObjMap` — set `HeapObj`'s size for EVERY heap slot. MEASURED: 64
+    /// bytes of pure padding on `HeapObj` costs 7.9% across the suite.
+    Combinator(Box<CombinatorData>),
     /// A native resolve/reject element for a combinator: performs one combinator
     /// step (`is_reject` selects fulfill vs reject when CALLED directly by a custom
     /// thenable; via the native reaction the kind comes from the reaction list).

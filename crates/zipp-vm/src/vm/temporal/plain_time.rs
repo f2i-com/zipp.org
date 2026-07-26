@@ -235,7 +235,7 @@ impl<'p> Vm<'p> {
                     o.set(nm, Value::num(f[i] as f64));
                 }
                 o.set("calendar", cal);
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(o)))))
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))))
             }
             _ => Ok(None),
         }

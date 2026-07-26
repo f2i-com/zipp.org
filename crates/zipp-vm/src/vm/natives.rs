@@ -220,14 +220,14 @@ impl<'p> Vm<'p> {
         }
         let mut g = ObjMap::new();
         for (name, main_proto) in ctors {
-            let proto_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            let proto_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
             let name_v = self.alloc_str(name.to_string());
             let mut cmap = ObjMap::new();
             cmap.is_ctor = true;
             cmap.define("prototype", Value::heap(proto_idx), proto_attr);
             cmap.define("name", name_v, ne);
             cmap.define("length", Value::int(1), ne);
-            let ctor_idx = self.heap.alloc(HeapObj::Object(cmap));
+            let ctor_idx = self.heap.alloc(HeapObj::Object(Box::new(cmap)));
             if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
                 pm.define("constructor", Value::heap(ctor_idx), ne);
             }
@@ -370,7 +370,7 @@ impl<'p> Vm<'p> {
                 // The `.prototype` image (%GeneratorFunction.prototype% etc.):
                 // main own props copied (fresh same-id natives / shared data),
                 // `constructor`/`prototype` re-pointed at the realm identities.
-                let fnp_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                let fnp_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_fn_proto) {
                     HeapObj::Object(mm) => mm
                         .keys
@@ -403,7 +403,7 @@ impl<'p> Vm<'p> {
                 cmap.define("prototype", Value::heap(fnp_idx), proto_attr);
                 cmap.define("name", name_v, ne);
                 cmap.define("length", Value::int(1), ne);
-                let ctor_idx = self.heap.alloc(HeapObj::Object(cmap));
+                let ctor_idx = self.heap.alloc(HeapObj::Object(Box::new(cmap)));
                 if let HeapObj::Object(pm) = self.heap.get_mut(fnp_idx) {
                     pm.define("constructor", Value::heap(ctor_idx), ne);
                 }
@@ -419,7 +419,7 @@ impl<'p> Vm<'p> {
                 // props for the async kind; `prototype`/`constructor` linkage
                 // mirrors setup.rs (the OBJECT back-reference, w:f e:f c:t).
                 if main_inst_proto != 0 {
-                    let instp_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                    let instp_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                     let mut sources = vec![main_inst_proto];
                     if let Some(f) = flatten {
                         sources.push(f);
@@ -493,7 +493,7 @@ impl<'p> Vm<'p> {
                     m.define(&k, copy, a);
                 }
             }
-            let o_idx = self.heap.alloc(HeapObj::Object(m));
+            let o_idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
             self.obj_realm.insert(o_idx, r);
             g.define(ns, Value::heap(o_idx), data);
         }
@@ -514,7 +514,7 @@ impl<'p> Vm<'p> {
         g.define("undefined", Value::UNDEFINED, frozen);
         g.define("NaN", Value::num(f64::NAN), frozen);
         g.define("Infinity", Value::num(f64::INFINITY), frozen);
-        let g_idx = self.heap.alloc(HeapObj::Object(g));
+        let g_idx = self.heap.alloc(HeapObj::Object(Box::new(g)));
         self.obj_realm.insert(g_idx, r);
         // Register as a child-realm global: keys the realm's own binding table
         // (active_realm / realm_globals) and the get/set interception that makes
@@ -556,7 +556,7 @@ impl<'p> Vm<'p> {
         self.realm_fns.insert(script_idx, (g_idx, 1));
         realm.define("evalScript", Value::heap(script_idx), PropAttr::data());
         realm.define("global", Value::heap(g_idx), data);
-        Value::heap(self.heap.alloc(HeapObj::Object(realm)))
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(realm))))
     }
 
     /// The GLOBAL object of createRealm child `r` (None for the main realm or a
@@ -891,7 +891,7 @@ impl<'p> Vm<'p> {
                         "TypeError: Object prototype may only be an Object or null".into(),
                     ));
                 }
-                let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                let o = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
                 if a0 != Value::UNDEFINED {
                     self.proto_of.insert(o.heap_index(), a0);
                 }
@@ -2345,7 +2345,7 @@ impl<'p> Vm<'p> {
                     }
                     map.set(&ks, desc);
                 }
-                Value::heap(self.heap.alloc(HeapObj::Object(map)))
+                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))))
             }
             // Integrity traits. Non-object arguments pass through unchanged
             // (freeze/seal/preventExtensions) or report as already-locked
@@ -2550,7 +2550,7 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
-                    let result = self.heap.alloc(HeapObj::Object(map));
+                    let result = self.heap.alloc(HeapObj::Object(Box::new(map)));
                     self.proto_of.insert(result, Value::NULL); // null prototype per spec
                     Value::heap(result)
                 } else {
@@ -2611,7 +2611,7 @@ impl<'p> Vm<'p> {
                 map.set("promise", promise);
                 map.set("resolve", resolve);
                 map.set("reject", reject);
-                Value::heap(self.heap.alloc(HeapObj::Object(map)))
+                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))))
             }
             PROMISE_TRY => {
                 if !self.is_constructor(this) {
@@ -2916,7 +2916,7 @@ impl<'p> Vm<'p> {
                                         let mut m = crate::heap::ObjMap::new();
                                         m.set("value", value);
                                         let desc =
-                                            Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                                            Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                                         self.object_define_property(receiver, &key, desc)?;
                                         true
                                     }
@@ -2927,7 +2927,7 @@ impl<'p> Vm<'p> {
                                     m.set("writable", Value::TRUE);
                                     m.set("enumerable", Value::TRUE);
                                     m.set("configurable", Value::TRUE);
-                                    let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                                    let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                                     self.object_define_property(receiver, &key, desc)?;
                                     true
                                 }
@@ -3106,7 +3106,7 @@ impl<'p> Vm<'p> {
                     let (parsed, srctree) = self.json_parse_with_src(&s)?;
                     let mut m = crate::heap::ObjMap::new();
                     m.set("", parsed);
-                    let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                    let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                     self.internalize_json(wrapper, "", reviver, Some(&srctree))?
                 } else {
                     self.json_parse(&s)?
@@ -3122,7 +3122,7 @@ impl<'p> Vm<'p> {
                 let _gc = self.gc_lock_guard();
                 let mut m = crate::heap::ObjMap::new();
                 m.set("", a0);
-                let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                 let mut visited = Vec::new();
                 match self.json_value(
                     wrapper,
@@ -3170,7 +3170,7 @@ impl<'p> Vm<'p> {
                         setter: Value::UNDEFINED,
                     },
                 );
-                let idx = self.heap.alloc(HeapObj::Object(m));
+                let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
                 self.proto_of.insert(idx, Value::NULL); // OrdinaryObjectCreate(null)
                 Value::heap(idx)
             }
@@ -3303,7 +3303,7 @@ impl<'p> Vm<'p> {
                     let mut m = ObjMap::new();
                     m.set("value", value);
                     m.set("done", Value::bool(ret_done));
-                    return Ok(Value::heap(self.heap.alloc(HeapObj::Object(m))));
+                    return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))));
                 }
                 // A live TypedArray iterator (keys/values/entries) re-reads the view's
                 // current length each step, so a resizable buffer's grow yields new
@@ -3349,7 +3349,7 @@ impl<'p> Vm<'p> {
                         let mut m = ObjMap::new();
                         m.set("value", result.0);
                         m.set("done", Value::bool(result.1));
-                        return Ok(Value::heap(self.heap.alloc(HeapObj::Object(m))));
+                        return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))));
                     }
                 }
                 // A live ARRAY-LIKE iterator (%ArrayIteratorPrototype% over an
@@ -3407,7 +3407,7 @@ impl<'p> Vm<'p> {
                         let mut m = ObjMap::new();
                         m.set("value", result.0);
                         m.set("done", Value::bool(result.1));
-                        return Ok(Value::heap(self.heap.alloc(HeapObj::Object(m))));
+                        return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))));
                     }
                 }
                 let (val, done) = if let Some((coll, kind)) = live {
@@ -3472,7 +3472,7 @@ impl<'p> Vm<'p> {
                 let mut m = ObjMap::new();
                 m.set("value", val);
                 m.set("done", Value::bool(done));
-                Value::heap(self.heap.alloc(HeapObj::Object(m)))
+                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
             }
             ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
             ITER_DISPOSE => {
@@ -3661,7 +3661,7 @@ impl<'p> Vm<'p> {
                 d.set(if id == OBJPROTO_DEFINE_GETTER { "get" } else { "set" }, a1);
                 d.set("enumerable", Value::bool(true));
                 d.set("configurable", Value::bool(true));
-                let desc = Value::heap(self.heap.alloc(HeapObj::Object(d)));
+                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(d))));
                 self.object_define_property(this, &key, desc)?;
                 Value::UNDEFINED
             }
@@ -4010,7 +4010,7 @@ impl<'p> Vm<'p> {
                 };
                 m.define("read", Value::num(read as f64), attr);
                 m.define("written", Value::num(written as f64), attr);
-                let obj = self.heap.alloc(HeapObj::Object(m));
+                let obj = self.heap.alloc(HeapObj::Object(Box::new(m)));
                 if self.obj_proto != 0 {
                     self.proto_of.insert(obj, Value::heap(self.obj_proto));
                 }
@@ -4069,7 +4069,7 @@ impl<'p> Vm<'p> {
                 };
                 m.define("read", Value::num(read as f64), attr);
                 m.define("written", Value::num(written as f64), attr);
-                let obj = self.heap.alloc(HeapObj::Object(m));
+                let obj = self.heap.alloc(HeapObj::Object(Box::new(m)));
                 if self.obj_proto != 0 {
                     self.proto_of.insert(obj, Value::heap(self.obj_proto));
                 }
@@ -4442,7 +4442,7 @@ impl<'p> Vm<'p> {
                 let mut m = ObjMap::new();
                 m.set("proxy", p);
                 m.set("revoke", revoke);
-                Value::heap(self.heap.alloc(HeapObj::Object(m)))
+                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
             }
             PROXY_REVOKE => {
                 if this.is_heap() {
@@ -4839,7 +4839,7 @@ impl<'p> Vm<'p> {
                 let ty = self.alloc_str("integer".to_string());
                 part.set("type", ty);
                 part.set("value", formatted);
-                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(part))));
                 Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
             }
             INTL_DTF_FORMAT => {
@@ -4865,7 +4865,7 @@ impl<'p> Vm<'p> {
                 part.set("type", ty);
                 let sv = self.alloc_str(s);
                 part.set("value", sv);
-                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(part))));
                 Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
             }
             INTL_COLLATOR_COMPARE => {
@@ -4911,7 +4911,7 @@ impl<'p> Vm<'p> {
                 part.set("type", ty);
                 let sv = self.alloc_str(s);
                 part.set("value", sv);
-                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(part))));
                 Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
             }
             INTL_RTF_FORMAT | INTL_RTF_FORMAT_TO_PARTS => {
@@ -4927,7 +4927,7 @@ impl<'p> Vm<'p> {
                     part.set("type", ty);
                     let sv = self.alloc_str(s);
                     part.set("value", sv);
-                    let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                    let p = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(part))));
                     Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
                 }
             }
@@ -4957,7 +4957,7 @@ impl<'p> Vm<'p> {
                 let mut o = ObjMap::new();
                 let sv = self.alloc_str(s);
                 o.set("@@seginput", sv);
-                Value::heap(self.heap.alloc(HeapObj::Object(o)))
+                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
             }
             INTL_DURATION_FORMAT => {
                 let _ = self.intl_this(this, INTL_DURATIONFORMAT, "format")?;

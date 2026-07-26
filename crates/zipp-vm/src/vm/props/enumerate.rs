@@ -531,7 +531,7 @@ impl<'p> Vm<'p> {
         m.set("writable", Value::bool(w));
         m.set("enumerable", Value::bool(e));
         m.set("configurable", Value::bool(c));
-        Value::heap(self.heap.alloc(HeapObj::Object(m)))
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
     }
 
     /// Build an accessor descriptor object `{get, set, enumerable, configurable}`.
@@ -541,7 +541,7 @@ impl<'p> Vm<'p> {
         m.set("set", set);
         m.set("enumerable", Value::bool(e));
         m.set("configurable", Value::bool(c));
-        Value::heap(self.heap.alloc(HeapObj::Object(m)))
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
     }
 
 }

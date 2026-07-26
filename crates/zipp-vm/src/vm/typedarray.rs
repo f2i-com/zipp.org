@@ -764,7 +764,7 @@ impl<'p> Vm<'p> {
             };
             m.define("async", Value::bool(is_async), attr);
             m.define("value", value, attr);
-            let obj = self.heap.alloc(HeapObj::Object(m));
+            let obj = self.heap.alloc(HeapObj::Object(Box::new(m)));
             if self.obj_proto != 0 {
                 self.proto_of.insert(obj, Value::heap(self.obj_proto));
             }

@@ -908,7 +908,7 @@ impl<'p> Vm<'p> {
                         let _gc = self.gc_lock_guard();
                         let mut m = crate::heap::ObjMap::new();
                         m.set("", v);
-                        let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                        let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                         let mut visited = Vec::new();
                         let result = match self.json_value(
                             wrapper,
@@ -1072,7 +1072,7 @@ impl<'p> Vm<'p> {
                         // → gopd → get per key, excluded keys never probed).
                         if s.is_heap() && self.proxy_parts(s.heap_index()).is_some() {
                             let m = self.copy_data_properties_rest(s, excluded)?;
-                            let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                            let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                             self.set(base, dst, v);
                             ip += 1;
                             continue;
@@ -1108,7 +1108,7 @@ impl<'p> Vm<'p> {
                             let v = self.get_prop(s, &k)?;
                             m.set(&k, v);
                         }
-                        let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -1123,7 +1123,7 @@ impl<'p> Vm<'p> {
                         // A Proxy source: trap-aware CopyDataProperties.
                         if s.is_heap() && self.proxy_parts(s.heap_index()).is_some() {
                             let m = self.copy_data_properties_rest(s, &excluded)?;
-                            let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                            let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                             self.set(base, dst, v);
                             ip += 1;
                             continue;
@@ -1154,7 +1154,7 @@ impl<'p> Vm<'p> {
                             let v = self.get_prop(s, &k)?;
                             m.set(&k, v);
                         }
-                        let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2529,7 +2529,7 @@ impl<'p> Vm<'p> {
                                         "TypeError: Object prototype may only be an Object or null".into(),
                                     ));
                                 }
-                                let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                                let o = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
                                 if a0 != Value::UNDEFINED {
                                     self.proto_of.insert(o.heap_index(), a0);
                                 }
@@ -3221,7 +3221,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::NewObject { dst } => {
-                        let v = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -4050,7 +4050,7 @@ impl<'p> Vm<'p> {
                                     // Lazily created, host-defined: ordinary
                                     // extensible null-proto object (GC-rooted
                                     // via module_metas).
-                                    let m = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                                    let m = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                                     self.proto_of.insert(m, Value::NULL);
                                     self.module_metas.insert(k, m);
                                     m
@@ -4058,7 +4058,7 @@ impl<'p> Vm<'p> {
                             },
                             None => {
                                 if self.import_meta == 0 {
-                                    let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                                    let idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                                     self.proto_of.insert(idx, Value::NULL);
                                     self.import_meta = idx;
                                 }

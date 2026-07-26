@@ -44,7 +44,7 @@ impl<'p> Vm<'p> {
             return Ok(s);
         }
         let s = self.alloc_module_shared_slot()?;
-        let idx = self.heap.alloc(HeapObj::Object(crate::heap::ObjMap::new()));
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new())));
         if self.abstractmodulesource_proto != 0 {
             self.proto_of
                 .insert(idx, Value::heap(self.abstractmodulesource_proto));
@@ -1033,7 +1033,7 @@ impl<'p> Vm<'p> {
             },
         );
         m.extensible = false;
-        let idx = self.heap.alloc(HeapObj::Object(m));
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
         self.proto_of.insert(idx, Value::NULL);
         self.deferred_ns_cache.insert(path.clone(), Value::heap(idx));
         self.deferred_ns_state.insert(idx, path);

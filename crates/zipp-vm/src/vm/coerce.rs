@@ -291,7 +291,7 @@ impl<'p> Vm<'p> {
         }
         if !v.is_heap() {
             // null / undefined → a fresh ordinary object.
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new()))));
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())))));
         }
         // A heap value: string/symbol/bigint primitives box; every real object
         // (Object/Array/Func/Map/Boxed/…) is already an object → unchanged.

@@ -156,11 +156,11 @@ impl<'p> Vm<'p> {
             // newTarget / GetFunctionRealm subject). A realm-tagged NON-ctor
             // object falls through to the ordinary paths (TypeError).
             if matches!(self.heap.get(cv.heap_index()), HeapObj::Object(m) if m.is_ctor) {
-                let proto_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                let proto_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                 let mut m = ObjMap::new();
                 m.is_ctor = true;
                 m.define("prototype", Value::heap(proto_idx), PropAttr::data());
-                let idx = self.heap.alloc(HeapObj::Object(m));
+                let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
                 self.obj_realm.insert(idx, cr);
                 self.obj_realm.insert(proto_idx, cr);
                 return Ok(Value::heap(idx));
@@ -341,7 +341,7 @@ impl<'p> Vm<'p> {
         }
         if ci == self.shadowrealm_ctor && ci != 0 {
             let over = self.newtarget_proto_override(new_target, cv, self.shadowrealm_proto)?;
-            let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            let idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
             if self.shadowrealm_proto != 0 {
                 self.proto_of.insert(idx, Value::heap(self.shadowrealm_proto));
             }
@@ -399,7 +399,7 @@ impl<'p> Vm<'p> {
             }
             let proto =
                 self.newtarget_proto(new_target, cv, Value::heap(self.iterator_proto_root))?;
-            let oidx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            let oidx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
             if proto.is_heap() {
                 self.proto_of.insert(oidx, proto);
             }
@@ -590,7 +590,7 @@ impl<'p> Vm<'p> {
                 // (spec 20.1.1.1 step 1). Otherwise ToObject(value), with a
                 // nullish value yielding a fresh ordinary object.
                 if over.is_some() {
-                    let r = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                    let r = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
                     return Ok(self.set_ctor_proto(r, over));
                 }
                 return self.to_object(a0);
@@ -711,7 +711,7 @@ impl<'p> Vm<'p> {
                     proto = Value::heap(rp);
                 }
             }
-            let obj = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+            let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
             if proto.is_heap() {
                 self.proto_of.insert(obj.heap_index(), proto);
             }
@@ -749,7 +749,7 @@ impl<'p> Vm<'p> {
         // keys hold only the fields (so enumeration / JSON stay method-free).
         let mut map = ObjMap::new();
         map.class = Some(cv.heap_index());
-        let obj = Value::heap(self.heap.alloc(HeapObj::Object(map)));
+        let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
         // OrdinaryCreateFromConstructor: a `Reflect.construct(Class, args, NT)` (or
         // any newTarget other than the class) gives the instance NT.prototype as its
         // [[Prototype]], overriding the class-derived default (proto_of is consulted

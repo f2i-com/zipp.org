@@ -22,7 +22,7 @@ impl<'p> Vm<'p> {
         m.set("writable", Value::TRUE);
         m.set("enumerable", Value::TRUE);
         m.set("configurable", Value::TRUE);
-        let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+        let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
         self.object_define_property(target, key, desc)
     }
 
@@ -119,7 +119,7 @@ impl<'p> Vm<'p> {
                     if let Some(c) = cf {
                         m.set("configurable", Value::bool(c));
                     }
-                    let desc_obj = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                    let desc_obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                     let kv = self.key_to_value(key);
                     let r = self.call_value(trap, handler, &[target, kv, desc_obj])?;
                     if !self.truthy(r) {

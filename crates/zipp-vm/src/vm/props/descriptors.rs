@@ -1136,7 +1136,7 @@ impl<'p> Vm<'p> {
                 if freeze && !is_accessor {
                     m.set("writable", Value::bool(false));
                 }
-                let idesc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                let idesc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                 self.object_define_property(proxy, &key, idesc)?;
             }
         }

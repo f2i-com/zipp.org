@@ -49,7 +49,7 @@ impl<'p> Vm<'p> {
             dm.define("writable", Value::bool(true), attr);
             dm.define("enumerable", Value::bool(true), attr);
             dm.define("configurable", Value::bool(true), attr);
-            let desc = self.heap.alloc(HeapObj::Object(dm));
+            let desc = self.heap.alloc(HeapObj::Object(Box::new(dm)));
             if self.obj_proto != 0 {
                 self.proto_of.insert(desc, Value::heap(self.obj_proto));
             }
@@ -808,7 +808,7 @@ impl<'p> Vm<'p> {
             }
             // The zipKeyed result is a NULL-prototype ordinary object (its keyed
             // properties keep the default data attributes from `set`).
-            let o = self.heap.alloc(HeapObj::Object(m));
+            let o = self.heap.alloc(HeapObj::Object(Box::new(m)));
             self.proto_of.insert(o, Value::NULL);
             Value::heap(o)
         } else {

@@ -551,7 +551,8 @@ impl Vm<'_> {
                 }
             }
             HeapObj::BoundResolver { promise, .. } => m_idx!(*promise),
-            HeapObj::Combinator { results, result, cap_resolve, cap_reject, .. } => {
+            HeapObj::Combinator(__c) => {
+                let crate::heap::CombinatorData { results, result, cap_resolve, cap_reject, .. } = &**__c;
                 for &v in results {
                     m_val!(v);
                 }

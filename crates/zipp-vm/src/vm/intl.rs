@@ -55,7 +55,7 @@ impl<'p> Vm<'p> {
         for (k, v) in pairs {
             o.set(&k, v);
         }
-        Value::heap(self.heap.alloc(HeapObj::Object(o)))
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
     }
 
     /// CanonicalizeLocaleList(locales) → the requested tags (canonical). Accepts
@@ -583,7 +583,7 @@ impl<'p> Vm<'p> {
             }
             _ => {}
         }
-        let resolved = self.heap.alloc(HeapObj::Object(r));
+        let resolved = self.heap.alloc(HeapObj::Object(Box::new(r)));
         let idx = self.heap.alloc(HeapObj::Intl { kind, resolved });
         if self.intl_protos[kind as usize] != 0 {
             self.proto_of.insert(idx, Value::heap(self.intl_protos[kind as usize]));
@@ -677,7 +677,7 @@ impl<'p> Vm<'p> {
             None
         };
         r.set("numeric", Value::bool(numeric.unwrap_or(false)));
-        let resolved = self.heap.alloc(HeapObj::Object(r));
+        let resolved = self.heap.alloc(HeapObj::Object(Box::new(r)));
         let idx = self.heap.alloc(HeapObj::Intl { kind: native::INTL_LOCALE, resolved });
         if self.intl_protos[native::INTL_LOCALE as usize] != 0 {
             self.proto_of.insert(idx, Value::heap(self.intl_protos[native::INTL_LOCALE as usize]));

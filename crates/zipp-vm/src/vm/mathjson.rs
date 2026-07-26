@@ -750,7 +750,7 @@ impl<'p> Vm<'p> {
         for (k, v) in pairs {
             map.set(&k, v);
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Object(map))))
+        Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map)))))
     }
 
     /// If `holder` is an Array and `key` is a canonical index string, the index.
@@ -787,7 +787,7 @@ impl<'p> Vm<'p> {
         m.set("writable", Value::TRUE);
         m.set("enumerable", Value::TRUE);
         m.set("configurable", Value::TRUE);
-        let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+        let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
         let r = self.object_define_property(target, key, desc);
         if is_proxy {
             r
@@ -885,7 +885,7 @@ impl<'p> Vm<'p> {
     /// carries a `"source"` data property holding the value's raw JSON text.
     /// An array/object node yields an empty context.
     fn make_json_context(&mut self, src: Option<&JsonSrc>) -> Value {
-        let ctx = Value::heap(self.heap.alloc(HeapObj::Object(crate::heap::ObjMap::new())));
+        let ctx = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new()))));
         if let Some(JsonSrc::Prim(s, _)) = src {
             let sv = self.alloc_str(s.clone());
             if let HeapObj::Object(m) = self.heap.get_mut(ctx.heap_index()) {
@@ -996,7 +996,7 @@ impl<'p> Vm<'p> {
         for (k, v) in pairs {
             map.set(&k, v);
         }
-        let ov = Value::heap(self.heap.alloc(HeapObj::Object(map)));
+        let ov = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
         Ok((ov, JsonSrc::Obj(srcs, ov)))
     }
 }

@@ -434,7 +434,7 @@ impl<'p> Vm<'p> {
                 o.set("isoMonth", Value::num(m as f64));
                 o.set("isoDay", Value::num(rd as f64));
                 o.set("calendar", cal);
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(o)))))
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))))
             }
             _ => Ok(None),
         }
@@ -636,7 +636,7 @@ impl<'p> Vm<'p> {
                 o.set("isoMonth", Value::num(m as f64));
                 o.set("isoDay", Value::num(d as f64));
                 o.set("calendar", cal);
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(o)))))
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))))
             }
             _ => Ok(None),
         }

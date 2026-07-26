@@ -577,14 +577,14 @@ impl<'p> Vm<'p> {
                     }
                     let mut m = ObjMap::new();
                     m.set("value", val);
-                    Value::heap(self.heap.alloc(HeapObj::Object(m)))
+                    Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
                 } else {
                     let mut m = ObjMap::new();
                     m.set("value", val);
                     m.set("writable", Value::TRUE);
                     m.set("enumerable", Value::TRUE);
                     m.set("configurable", Value::TRUE);
-                    Value::heap(self.heap.alloc(HeapObj::Object(m)))
+                    Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
                 };
                 // A falsish defineProperty-trap result is a failed [[Set]]
                 // (sloppy false / strict TypeError); other aborts propagate.

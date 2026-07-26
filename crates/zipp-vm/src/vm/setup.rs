@@ -115,7 +115,7 @@ impl<'p> Vm<'p> {
                 map.define(k, Value::UNDEFINED, a);
             }
         }
-        let p = self.heap.alloc(HeapObj::Object(map));
+        let p = self.heap.alloc(HeapObj::Object(Box::new(map)));
         self.prototypes.insert(idx, p);
         // A function born in a $262.createRealm child gets a `.prototype` whose
         // [[Prototype]] is the CHILD's %Object.prototype% (OrdinaryFunctionCreate
@@ -207,12 +207,12 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
-        let proto = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+        let proto = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
         self.proto_of.insert(proto, Value::heap(self.fn_proto));
         let mut cm = ObjMap::new();
         cm.define("prototype", Value::heap(proto), proto_attr);
         cm.is_ctor = true;
-        let ctor = self.heap.alloc(HeapObj::Object(cm));
+        let ctor = self.heap.alloc(HeapObj::Object(Box::new(cm)));
         self.proto_of.insert(ctor, Value::heap(self.function_ctor));
         let namev = self.alloc_str(tag.to_string());
         let tagv = self.alloc_str(tag.to_string());
@@ -262,7 +262,7 @@ impl<'p> Vm<'p> {
                 // a namespace (Reflect/Math/JSON, protolink None) is not.
                 m.is_ctor = true;
             }
-            vm.heap.alloc(HeapObj::Object(m))
+            vm.heap.alloc(HeapObj::Object(Box::new(m)))
         };
         // Prototypes.
         self.obj_proto = build(
@@ -595,7 +595,7 @@ impl<'p> Vm<'p> {
             m.define("parseFloat", Value::heap(parse_float_fn), method_attr);
             m.define("prototype", Value::heap(num_proto), proto_attr);
             m.is_ctor = true; // Number is a constructor (typeof "function").
-            self.heap.alloc(HeapObj::Object(m))
+            self.heap.alloc(HeapObj::Object(Box::new(m)))
         };
         // Set / Map / Boolean / Date globals: their .prototype (construction is
         // compile-lowered to NewSet / NewMap / DateNew; value-level shape here).
@@ -983,7 +983,7 @@ impl<'p> Vm<'p> {
         ] {
             unsc.define(name, Value::TRUE, unsc_data_attr);
         }
-        let unsc_idx = self.heap.alloc(HeapObj::Object(unsc));
+        let unsc_idx = self.heap.alloc(HeapObj::Object(Box::new(unsc)));
         self.proto_of.insert(unsc_idx, Value::NULL);
         let unsc_attr = PropAttr {
             writable: false,
@@ -1130,7 +1130,7 @@ impl<'p> Vm<'p> {
             // paths make it throw) — so it is a valid Reflect.construct newTarget
             // and its [[Prototype]] reports %Function.prototype%.
             m.is_ctor = true;
-            let symbol_ctor = self.heap.alloc(HeapObj::Object(m));
+            let symbol_ctor = self.heap.alloc(HeapObj::Object(Box::new(m)));
             self.symbol_ctor = symbol_ctor;
             // Symbol.prototype.constructor === Symbol.
             if let HeapObj::Object(p) = self.heap.get_mut(symbol_proto) {
@@ -1194,7 +1194,7 @@ impl<'p> Vm<'p> {
             // IsConstructor(BigInt) is TRUE (like Symbol above); `new BigInt()`
             // still throws via the explicit construct-path arms.
             m.is_ctor = true;
-            let bigint_ctor = self.heap.alloc(HeapObj::Object(m));
+            let bigint_ctor = self.heap.alloc(HeapObj::Object(Box::new(m)));
             self.bigint_ctor = bigint_ctor;
             // BigInt.prototype[@@toStringTag] === "BigInt" (a non-writable,
             // non-enumerable, configurable own data property), so Object.prototype
@@ -1544,7 +1544,7 @@ impl<'p> Vm<'p> {
             let mut pm = ObjMap::new();
             pm.define("revocable", revocable, method_attr);
             pm.is_ctor = true;
-            self.proxy_ctor = self.heap.alloc(HeapObj::Object(pm));
+            self.proxy_ctor = self.heap.alloc(HeapObj::Object(Box::new(pm)));
             // `Temporal` namespace + `Temporal.Duration`.
             let dur_methods: Vec<(&str, u16)> = native::TEMPORAL_DURATION_METHODS
                 .iter()
@@ -1565,7 +1565,7 @@ impl<'p> Vm<'p> {
             dm.define("name", dname, fn_attr);
             dm.define("length", Value::num(0.0), fn_attr);
             dm.is_ctor = true;
-            let duration_ctor = self.heap.alloc(HeapObj::Object(dm));
+            let duration_ctor = self.heap.alloc(HeapObj::Object(Box::new(dm)));
             self.duration_ctor = duration_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(duration_proto) {
                 p.define("constructor", Value::heap(duration_ctor), method_attr);
@@ -1591,7 +1591,7 @@ impl<'p> Vm<'p> {
             pdm.define("name", pdname, fn_attr);
             pdm.define("length", Value::num(3.0), fn_attr);
             pdm.is_ctor = true;
-            let plaindate_ctor = self.heap.alloc(HeapObj::Object(pdm));
+            let plaindate_ctor = self.heap.alloc(HeapObj::Object(Box::new(pdm)));
             self.plaindate_ctor = plaindate_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(plaindate_proto) {
                 p.define("constructor", Value::heap(plaindate_ctor), method_attr);
@@ -1617,7 +1617,7 @@ impl<'p> Vm<'p> {
             ptm.define("name", ptname, fn_attr);
             ptm.define("length", Value::num(0.0), fn_attr);
             ptm.is_ctor = true;
-            let plaintime_ctor = self.heap.alloc(HeapObj::Object(ptm));
+            let plaintime_ctor = self.heap.alloc(HeapObj::Object(Box::new(ptm)));
             self.plaintime_ctor = plaintime_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(plaintime_proto) {
                 p.define("constructor", Value::heap(plaintime_ctor), method_attr);
@@ -1643,7 +1643,7 @@ impl<'p> Vm<'p> {
             pdtm.define("name", pdtname, fn_attr);
             pdtm.define("length", Value::num(3.0), fn_attr);
             pdtm.is_ctor = true;
-            let plaindatetime_ctor = self.heap.alloc(HeapObj::Object(pdtm));
+            let plaindatetime_ctor = self.heap.alloc(HeapObj::Object(Box::new(pdtm)));
             self.plaindatetime_ctor = plaindatetime_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(plaindatetime_proto) {
                 p.define("constructor", Value::heap(plaindatetime_ctor), method_attr);
@@ -1676,7 +1676,7 @@ impl<'p> Vm<'p> {
             im.define("name", iname, fn_attr);
             im.define("length", Value::num(1.0), fn_attr);
             im.is_ctor = true;
-            let instant_ctor = self.heap.alloc(HeapObj::Object(im));
+            let instant_ctor = self.heap.alloc(HeapObj::Object(Box::new(im)));
             self.instant_ctor = instant_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(instant_proto) {
                 p.define("constructor", Value::heap(instant_ctor), method_attr);
@@ -1702,7 +1702,7 @@ impl<'p> Vm<'p> {
             pymm.define("name", pymname, fn_attr);
             pymm.define("length", Value::num(2.0), fn_attr);
             pymm.is_ctor = true;
-            let plainyearmonth_ctor = self.heap.alloc(HeapObj::Object(pymm));
+            let plainyearmonth_ctor = self.heap.alloc(HeapObj::Object(Box::new(pymm)));
             self.plainyearmonth_ctor = plainyearmonth_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(plainyearmonth_proto) {
                 p.define("constructor", Value::heap(plainyearmonth_ctor), method_attr);
@@ -1726,7 +1726,7 @@ impl<'p> Vm<'p> {
             pmdm.define("name", pmdname, fn_attr);
             pmdm.define("length", Value::num(2.0), fn_attr);
             pmdm.is_ctor = true;
-            let plainmonthday_ctor = self.heap.alloc(HeapObj::Object(pmdm));
+            let plainmonthday_ctor = self.heap.alloc(HeapObj::Object(Box::new(pmdm)));
             self.plainmonthday_ctor = plainmonthday_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(plainmonthday_proto) {
                 p.define("constructor", Value::heap(plainmonthday_ctor), method_attr);
@@ -1752,7 +1752,7 @@ impl<'p> Vm<'p> {
             zdtm.define("name", zdtname, fn_attr);
             zdtm.define("length", Value::num(2.0), fn_attr);
             zdtm.is_ctor = true;
-            let zoneddatetime_ctor = self.heap.alloc(HeapObj::Object(zdtm));
+            let zoneddatetime_ctor = self.heap.alloc(HeapObj::Object(Box::new(zdtm)));
             self.zoneddatetime_ctor = zoneddatetime_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(zoneddatetime_proto) {
                 p.define("constructor", Value::heap(zoneddatetime_ctor), method_attr);
@@ -1773,7 +1773,7 @@ impl<'p> Vm<'p> {
                 nown.define(n, v, method_attr);
             }
             nown.define("@@toStringTag", nowtag, fn_attr);
-            let now_ns = self.heap.alloc(HeapObj::Object(nown));
+            let now_ns = self.heap.alloc(HeapObj::Object(Box::new(nown)));
             let mut tn = ObjMap::new();
             tn.define("Duration", Value::heap(duration_ctor), method_attr);
             tn.define("PlainDate", Value::heap(plaindate_ctor), method_attr);
@@ -1789,7 +1789,7 @@ impl<'p> Vm<'p> {
             // like the Now namespace above. { w:false, e:false, c:true }.
             let temporal_tag = self.alloc_str("Temporal".to_string());
             tn.define("@@toStringTag", temporal_tag, fn_attr);
-            self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
+            self.temporal_ns = self.heap.alloc(HeapObj::Object(Box::new(tn)));
             // Register each Temporal type's field getters as accessor properties on
             // its prototype (the value still resolves via get_member's fast path;
             // this gives `getOwnPropertyDescriptor(Type.prototype, field).get` a real
@@ -2014,7 +2014,7 @@ impl<'p> Vm<'p> {
             intl_ns_map.define("supportedValuesOf", svo, method_attr);
             let intltag = self.alloc_str("Intl".to_string());
             intl_ns_map.define("@@toStringTag", intltag, fn_attr);
-            self.intl_ns = self.heap.alloc(HeapObj::Object(intl_ns_map));
+            self.intl_ns = self.heap.alloc(HeapObj::Object(Box::new(intl_ns_map)));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
             if let HeapObj::Object(m) = self.heap.get_mut(dataview_proto) {
@@ -2353,7 +2353,7 @@ impl<'p> Vm<'p> {
             self.heap.alloc(HeapObj::Native(native::ANNEXB_REF_ERROR));
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
-        let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+        let global_this = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
         self.global_this = global_this;
         // The test262 `$262` host object: { global, detachArrayBuffer, gc }.
         let d262_detach = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_DETACH)));
@@ -2362,7 +2362,7 @@ impl<'p> Vm<'p> {
         // `$262.IsHTMLDDA` — the `document.all` [[IsHTMLDDA]] emulation: an ordinary
         // object tagged in `is_htmldda` (typeof "undefined", == null/undefined,
         // falsy, callable→undefined).
-        let d262_htmldda = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+        let d262_htmldda = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
         self.is_htmldda.insert(d262_htmldda);
         // `$262.agent`: the full multi-agent surface (vm/agents.rs). getReport
         // must exist (returning null on empty) even before any worker agent
@@ -2389,7 +2389,7 @@ impl<'p> Vm<'p> {
         agent.define("receiveBroadcast", ag_recv, method_attr);
         agent.define("report", ag_rep, method_attr);
         agent.define("leaving", ag_leave, method_attr);
-        let agent_obj = Value::heap(self.heap.alloc(HeapObj::Object(agent)));
+        let agent_obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(agent))));
         let d262_eval_script =
             Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_EVAL_SCRIPT)));
         let mut d262 = ObjMap::new();
@@ -2405,7 +2405,7 @@ impl<'p> Vm<'p> {
             Value::heap(self.abstractmodulesource_ctor),
             method_attr,
         );
-        self.dollar262 = self.heap.alloc(HeapObj::Object(d262));
+        self.dollar262 = self.heap.alloc(HeapObj::Object(Box::new(d262)));
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).
         // Every builtin global NAME → its heap value, built ONCE and recorded in

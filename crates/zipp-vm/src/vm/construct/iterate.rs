@@ -915,7 +915,7 @@ impl<'p> Vm<'p> {
             };
             map.set(&pk, v);
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Object(map))))
+        Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map)))))
     }
 
     /// AddEntriesFromIterable using a collection's OBSERVABLE adder (Map/WeakMap
