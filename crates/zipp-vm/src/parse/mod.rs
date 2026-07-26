@@ -18,11 +18,11 @@
 //!   (`compile/mod.rs` `exact_src`) to work around it. [`token::StrVal`] holds
 //!   UTF-16 units when it has to, so that buffer can go away.
 //!
-//! Built incrementally behind the existing oxc path, and swapped in only when a
-//! differential gate shows both front ends compile the corpus to identical
-//! bytecode. Dead until then.
-
-#![allow(dead_code)]
+//! This IS the engine's front end: every path from source text to bytecode
+//! parses here (see `crate::front` for the four entry points). It was built
+//! incrementally behind the oxc path and swapped in once a differential gate
+//! showed both front ends producing identical ASTs across a multi-thousand-file
+//! corpus; the bridge and oxc were then deleted.
 
 pub mod ast;
 pub mod lexer;
@@ -420,6 +420,28 @@ mod parser_tests {
         assert!(err("return 1;").contains("return"));
         assert!(err("a ?? b || c;").contains("mixed"));
         assert!(err("-a ** b;").contains("parentheses"));
+    }
+
+    #[test]
+    fn statement_position_declarations() {
+        // A VariableStatement IS a Statement: `if (c) var x = 1;` is legal and
+        // transpiled code produces it constantly (`if (e) var r = new WeakMap()`
+        // is verbatim Babel output). Lexical declarations stay restricted.
+        let _ = ok("if (c) var x = 1;");
+        let _ = ok("if (c) var x = 1; else var y = 2;");
+        let _ = ok("while (c) var x = 1;");
+        assert!(parse("if (c) let x = 1;", ParseOptions::script()).is_err());
+        assert!(parse("if (c) const x = 1;", ParseOptions::script()).is_err());
+
+        // Annex B B.3.4: a function declaration as an if-body is sloppy-legal.
+        let _ = ok("if (c) function f() {}");
+        let _ = ok("l: function f() {}");
+        assert!(
+            parse("'use strict'; if (c) function f() {}", ParseOptions::script()).is_err(),
+            "strict keeps the error"
+        );
+        // A class is never legal there, in either mode.
+        assert!(parse("if (c) class K {}", ParseOptions::script()).is_err());
     }
 
     #[test]

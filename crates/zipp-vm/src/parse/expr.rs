@@ -504,7 +504,10 @@ impl<'s> Parser<'s> {
                     e = Expr::Call(Box::new(CallExpr { callee: e, args, optional: true }));
                 } else if self.at(Punct::LBracket) {
                     self.bump_before_operand()?;
+                    let saved_in = self.ctx.in_;
+                    self.ctx.in_ = true;
                     let idx = self.parse_expr_full()?;
+                    self.ctx.in_ = saved_in;
                     self.expect(Punct::RBracket, false)?;
                     e = Expr::Member(Box::new(Member {
                         object: e,
@@ -517,7 +520,10 @@ impl<'s> Parser<'s> {
                 }
             } else if self.at(Punct::LBracket) {
                 self.bump_before_operand()?;
+                let saved_in = self.ctx.in_;
+                self.ctx.in_ = true;
                 let idx = self.parse_expr_full()?;
+                self.ctx.in_ = saved_in;
                 self.expect(Punct::RBracket, false)?;
                 e = Expr::Member(Box::new(Member {
                     object: e,
@@ -608,6 +614,11 @@ impl<'s> Parser<'s> {
 
     fn parse_args(&mut self) -> PResult<Vec<Arg>> {
         self.expect(Punct::LParen, true)?;
+        // The `[In]` restriction applies only to the TOP level of a `for`
+        // head; every bracketed subcontext restores it. `for (var c = f(1 in
+        // {});;)` is legal.
+        let saved_in = self.ctx.in_;
+        self.ctx.in_ = true;
         let mut out = Vec::new();
         while !self.at(Punct::RParen) {
             if self.at(Punct::DotDotDot) {
@@ -620,6 +631,7 @@ impl<'s> Parser<'s> {
                 break;
             }
         }
+        self.ctx.in_ = saved_in;
         self.expect(Punct::RParen, false)?;
         Ok(out)
     }
@@ -828,6 +840,9 @@ impl<'s> Parser<'s> {
 
     fn parse_array_literal(&mut self) -> PResult<Expr> {
         self.expect(Punct::LBracket, true)?;
+        // `[In]` restores inside the brackets — see `parse_args`.
+        let saved_in = self.ctx.in_;
+        self.ctx.in_ = true;
         let mut items: Vec<Option<ArrayElem>> = Vec::new();
         loop {
             if self.at(Punct::RBracket) {
@@ -856,12 +871,16 @@ impl<'s> Parser<'s> {
                 break;
             }
         }
+        self.ctx.in_ = saved_in;
         self.expect(Punct::RBracket, false)?;
         Ok(Expr::Array(items))
     }
 
     fn parse_object_literal(&mut self) -> PResult<Expr> {
         self.expect(Punct::LBrace, true)?;
+        // `[In]` restores inside the braces — see `parse_args`.
+        let saved_in = self.ctx.in_;
+        self.ctx.in_ = true;
         let mut members = Vec::new();
         let mut proto_count = 0usize;
         let mut proto_pos = 0u32;
@@ -883,6 +902,7 @@ impl<'s> Parser<'s> {
                 break;
             }
         }
+        self.ctx.in_ = saved_in;
         self.expect(Punct::RBrace, false)?;
         // Duplicate `__proto__` is an early error — but only for PLAIN
         // `__proto__: v` properties, not shorthand, methods or computed keys,

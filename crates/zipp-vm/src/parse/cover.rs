@@ -30,6 +30,9 @@ impl<'s> Parser<'s> {
     ) -> PResult<Option<Expr>> {
         let outer_cover = std::mem::take(&mut self.cover);
         let lparen = self.expect(Punct::LParen, true)?;
+        // `[In]` restores inside the parentheses: `for (var i = (a in b);;)`.
+        let saved_in = self.ctx.in_;
+        self.ctx.in_ = true;
 
         let mut items: Vec<Expr> = Vec::new();
         let mut rest: Option<(Expr, u32)> = None;
@@ -61,6 +64,7 @@ impl<'s> Parser<'s> {
                 trailing_comma = true;
             }
         }
+        self.ctx.in_ = saved_in;
         let rparen = self.expect(Punct::RParen, false)?;
 
         // `()` is only ever a parameter list.
