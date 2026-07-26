@@ -88,9 +88,7 @@ impl<'p> Vm<'p> {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
         self.regs.extend_from_slice(&regs);
-        if new_base + reg_count > self.regs_hw {
-            self.regs_hw = new_base + reg_count;
-        }
+        self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
         self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX,
             func: func_id,
@@ -238,9 +236,7 @@ impl<'p> Vm<'p> {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
         self.regs.extend_from_slice(&saved);
-        if new_base + reg_count > self.regs_hw {
-            self.regs_hw = new_base + reg_count;
-        }
+        self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
         self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
             func: fid,
@@ -971,9 +967,7 @@ impl<'p> Vm<'p> {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
         self.regs.extend_from_slice(&regs);
-        if new_base + reg_count > self.regs_hw {
-            self.regs_hw = new_base + reg_count;
-        }
+        self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
         self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
             func: func_id,
@@ -1290,9 +1284,7 @@ impl<'p> Vm<'p> {
             return;
         }
         self.regs.extend_from_slice(&saved);
-        if new_base + reg_count > self.regs_hw {
-            self.regs_hw = new_base + reg_count;
-        }
+        self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
         self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
             func: fid,
@@ -2125,9 +2117,7 @@ impl<'p> Vm<'p> {
             return;
         }
         self.regs.extend_from_slice(&saved);
-        if new_base + reg_count > self.regs_hw {
-            self.regs_hw = new_base + reg_count;
-        }
+        self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
         self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
             func: fid,

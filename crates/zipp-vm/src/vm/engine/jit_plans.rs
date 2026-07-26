@@ -947,6 +947,24 @@ impl<'p> Vm<'p> {
         false
     }
 
+    /// Raise the initialized-slots high-water mark to `needed` after a frame
+    /// window has been pushed. Only the native self-call path reads `regs_hw`
+    /// (to expose an already-initialized window with `set_len` instead of a
+    /// zero-filling `resize`), so on an interpreter-only build — no JIT feature,
+    /// or any target that is not x86-64 — this is a no-op and the field does not
+    /// exist at all.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn bump_regs_hw(&mut self, needed: usize) {
+        if needed > self.regs_hw {
+            self.regs_hw = needed;
+        }
+    }
+
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    #[inline]
+    pub(crate) fn bump_regs_hw(&mut self, _needed: usize) {}
+
 }
 
 /// Offset every REGISTER operand of a leaf-body instruction by `off`, so a

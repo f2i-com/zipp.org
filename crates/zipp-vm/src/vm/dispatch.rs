@@ -5775,14 +5775,6 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// If `func_id` has compiled native code, run it over the register window
-    /// at `base` and return `(result_bits_as_Value, bail_ip)`. `None` if there
-    /// is no compiled code for this function.
-    ///
-    /// The native code reads/writes `self.regs[base..]` directly via a raw
-    /// pointer taken here and used ONLY for the duration of the call â€” nothing
-    /// in between can resize `self.regs` (the JIT subset issues no calls/allocs).
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     /// Proper-tail-call frame reuse: when `callee_v` is a PLAIN (non-generator,
     /// non-async) function or closure, rebuild the CURRENT frame's register
     /// window in place for it (constant stack for tail recursion) and return
@@ -5923,6 +5915,14 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// If `func_id` has compiled native code, run it over the register window
+    /// at `base` and return `(result_bits_as_Value, bail_ip)`. `None` if there
+    /// is no compiled code for this function.
+    ///
+    /// The native code reads/writes `self.regs[base..]` directly via a raw
+    /// pointer taken here and used ONLY for the duration of the call â€” nothing
+    /// in between can resize `self.regs` (the JIT subset issues no calls/allocs).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn try_run_jit(&mut self, func_id: u32, base: usize) -> Option<(Value, u32)> {
         let jitfn = self.jit.get(func_id)? as *const crate::codegen::JitFn;
         // SAFETY: `jitfn` points into self.jit.compiled (stable for the call).
