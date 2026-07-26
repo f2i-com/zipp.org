@@ -28,21 +28,24 @@ wasm32 are built and tested.
 Both figures below are measured on this repo, not estimated. Neither is a
 finished result — they are the current state.
 
-**Conformance — 96.97% of test262**, 93,122 of 96,029 required executions
+**Conformance — 97.72% of test262**, 93,835 of 96,029 required executions
 (ECMA-262 + `staging`, run in both sloppy and strict mode as
 `INTERPRETING.md` requires):
 
 | slice | executions | pass |
 |---|---|---|
-| ECMA-262 + staging, both modes | 96,029 | 93,122 (96.97%) |
+| ECMA-262 + staging, both modes | 96,029 | 93,835 (97.72%) |
 | intl402 (opt-in, `--include-intl402`) | 3,341 | 563 (16.9%) |
 
-2,214 of the 2,907 failures are **static-semantics early errors the engine does
-not raise at all** — `let x; let x;`, `let x; var x;`, duplicate class
+The 2,194 remaining failures are 1,265 distinct files (most run in both sloppy
+and strict mode). **845 of those are static-semantics early errors the engine
+does not raise at all** — `let x; let x;`, `let x; var x;`, duplicate class
 constructors and duplicate labels all currently run instead of being a
 `SyntaxError`. The cause is that `zipp-vm` pulls `oxc_parser` but not
-`oxc_semantic`. The dominant intl402 cause is that `Intl.DateTimeFormat` cannot
-be constructed at all (`vm/intl.rs:436`).
+`oxc_semantic`, which is one of the reasons the engine is growing its own front
+end (`src/parse/`): a parser that raises early errors as it goes closes the
+single largest category left. The dominant intl402 cause is separate —
+`Intl.DateTimeFormat` cannot be constructed at all (`vm/intl.rs:436`).
 
 `tools/test262-expected-failures.txt` is the checked-in baseline, so a
 regression is a diff rather than a remembered number.
