@@ -332,6 +332,33 @@ impl<'s> Parser<'s> {
             }
             self.restore(save);
         }
+        // `using x = …` — explicit resource management. `using` is contextual:
+        // it is a declaration only when followed, on the SAME line, by a plain
+        // binding identifier (patterns are not allowed in using declarations),
+        // so `using = 5` and a line-broken `using x` stay ordinary expressions.
+        if matches!(&self.cur().kind, TokenKind::Ident { name, kw: Keyword::None, had_escape: false, private: false } if name == "using")
+        {
+            let save = self.save();
+            self.bump_after_operand()?;
+            if !self.cur().newline_before && self.is_binding_ident() {
+                return Ok(Some(VarKind::Using));
+            }
+            self.restore(save);
+        }
+        // `await using x = …`, in contexts where `await` is a keyword.
+        if self.ctx.await_ && self.at_kw(Keyword::Await) {
+            let save = self.save();
+            self.bump_after_operand()?;
+            let is_using = !self.cur().newline_before
+                && matches!(&self.cur().kind, TokenKind::Ident { name, kw: Keyword::None, had_escape: false, private: false } if name == "using");
+            if is_using {
+                self.bump_after_operand()?;
+                if !self.cur().newline_before && self.is_binding_ident() {
+                    return Ok(Some(VarKind::AwaitUsing));
+                }
+            }
+            self.restore(save);
+        }
         Ok(None)
     }
 
@@ -342,6 +369,13 @@ impl<'s> Parser<'s> {
             let id = self.parse_binding_pattern()?;
             self.declare_pattern(&id, kind, pos)?;
             let init = if self.eat(Punct::Eq, true)? { Some(self.parse_assign_full()?) } else { None };
+            // `using` requires an initializer wherever it appears.
+            if init.is_none() && matches!(kind, VarKind::Using | VarKind::AwaitUsing) {
+                return Err(SyntaxError::new(
+                    "SyntaxError: missing initializer in using declaration",
+                    pos,
+                ));
+            }
             // `const` without an initializer is an early error — except in a
             // for-in/of head, which parses through a different path.
             if init.is_none() && kind == VarKind::Const {

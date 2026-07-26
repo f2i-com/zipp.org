@@ -212,13 +212,8 @@ impl<'p> Vm<'p> {
         }
         let code = std::fs::read_to_string(&path)
             .map_err(|_| Thrown("TypeError: module not found".into()))?;
-        let allocator = oxc_allocator::Allocator::default();
-        let ret =
-            oxc_parser::Parser::new(&allocator, &code, oxc_span::SourceType::mjs()).parse();
-        if !ret.errors.is_empty() {
-            return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
-        }
-        let prog = match crate::compile::compile_eval_oxc(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) {
+        let ast = crate::front::parse_module(&code).map_err(Thrown)?;
+        let prog = match crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
             // evaluation pipeline (not built yet): surface a host TypeError —
@@ -1119,13 +1114,10 @@ impl<'p> Vm<'p> {
         let Ok(code) = std::fs::read_to_string(path) else {
             return false;
         };
-        let allocator = oxc_allocator::Allocator::default();
-        let ret =
-            oxc_parser::Parser::new(&allocator, &code, oxc_span::SourceType::mjs()).parse();
-        if !ret.errors.is_empty() {
+        let Ok(ast) = crate::front::parse_module(&code) else {
             return false;
-        }
-        let Ok(prog) = crate::compile::compile_eval_oxc(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) else {
+        };
+        let Ok(prog) = crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) else {
             return false;
         };
         prog.functions
@@ -1191,22 +1183,18 @@ impl<'p> Vm<'p> {
                 path.display()
             ))
         })?;
-        let allocator = oxc_allocator::Allocator::default();
-        let ret =
-            oxc_parser::Parser::new(&allocator, &code, oxc_span::SourceType::mjs()).parse();
-        if !ret.errors.is_empty() {
-            return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
-        }
+        let ast = crate::front::parse_module(&code).map_err(Thrown)?;
         let dir = path.parent().map(|p| p.to_path_buf());
         let mut out = Vec::new();
-        for s in &ret.program.body {
-            use oxc_ast::ast::Statement as S;
+        for s in &ast.body {
+            use crate::parse::ast::{ExportDecl, Stmt};
             let spec: Option<String> = match s {
-                S::ImportDeclaration(d) => Some(d.source.value.to_string()),
-                S::ExportNamedDeclaration(e) => {
-                    e.source.as_ref().map(|src| src.value.to_string())
-                }
-                S::ExportAllDeclaration(e) => Some(e.source.value.to_string()),
+                Stmt::Import(d) => Some(d.source.to_lossy_string()),
+                Stmt::Export(e) => match &**e {
+                    ExportDecl::Named { source: Some(src), .. } => Some(src.to_lossy_string()),
+                    ExportDecl::All { source, .. } => Some(source.to_lossy_string()),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(spec) = spec {

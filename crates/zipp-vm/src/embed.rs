@@ -130,15 +130,10 @@ pub fn compile_script(src: &str) -> Result<ScriptState, String> {
 /// an assignment target and fatal-errors instead. A page script that trips this
 /// should behave the same whether it is run through `run` or embedded.
 fn compile_program_source(src: &str) -> Result<Program, String> {
-    let allocator = oxc_allocator::Allocator::default();
-    let ret = oxc_parser::Parser::new(&allocator, src, oxc_span::SourceType::cjs()).parse();
-    if !ret.errors.is_empty() {
-        if let Some(fixed) = crate::annexb_call_target_rewrite(src) {
-            return compile_program_source(&fixed);
-        }
-        return Err(format!("SyntaxError: {}", ret.errors[0]));
-    }
-    crate::compile::compile_program_oxc(&ret.program, src)
+    // The parser handles Annex B call assignment targets natively
+    // (`Target::Call`), so the old rewrite-and-reparse retry is gone.
+    let ast = crate::front::parse_script(src)?;
+    crate::compile::compile_program(&ast, src)
 }
 
 impl ScriptState {

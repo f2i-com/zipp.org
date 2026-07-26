@@ -699,26 +699,26 @@ impl<'p> Vm<'p> {
         eval_scope_idx: Option<u32>,
         exact_src: Option<&[u8]>,
     ) -> Result<Value, Thrown> {
-        // 1. Parse.
-        let allocator = oxc_allocator::Allocator::default();
-        // eval code is a Script (never a module), so `await` is a valid identifier
-        // and the body runs in sloppy mode unless it carries a "use strict".
-        let ret = oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::script()).parse();
-        if !ret.errors.is_empty() {
-            return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
-        }
+        // 1. Parse: the true Script goal plus what only the call site knows
+        // (caller strictness, new.target / super validity). `import`/`export`
+        // are rejected by the parser itself under this goal, so the old
+        // explicit statement scan is gone.
+        let ast = crate::front::parse_eval(
+            code,
+            crate::front::EvalFlags {
+                force_strict,
+                allow_new_target: force_new_target_ok,
+                allow_super: inherit_super.is_some() || caller_home_obj.is_some(),
+            },
+        )
+        .map_err(Thrown)?;
         // A direct eval in a PARAMETER DEFAULT: its sloppy var/function names
         // may not collide with the param-scope bindings (params + implicit
         // `arguments`) — SyntaxError BEFORE anything runs or is declared.
         if param_collisions.is_some() || !lexical_collisions.is_empty() {
-            let src_strict = force_strict
-                || ret
-                    .program
-                    .directives
-                    .iter()
-                    .any(|d| d.directive.as_str() == "use strict");
-            if !src_strict {
-                for n in crate::compile::eval_var_and_fn_names_oxc(&ret.program) {
+            // `ast.strict` folds force_strict and the directive prologue.
+            if !ast.strict {
+                for n in crate::compile::eval_var_and_fn_names(&ast) {
                     if param_collisions.as_ref().map_or(false, |c| c.iter().any(|c| *c == n)) {
                         return Err(Thrown(format!(
                             "SyntaxError: Identifier '{n}' has already been declared"
@@ -736,29 +736,13 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // Eval code is never module code: import/export declarations are a
-        // SyntaxError (spec PerformEval parses goal Script; oxc's script goal
-        // still produces the module-decl statement variants).
-        if ret.program.body.iter().any(|s| {
-            matches!(
-                s,
-                oxc_ast::ast::Statement::ImportDeclaration(_)
-                    | oxc_ast::ast::Statement::ExportNamedDeclaration(_)
-                    | oxc_ast::ast::Statement::ExportDefaultDeclaration(_)
-                    | oxc_ast::ast::Statement::ExportAllDeclaration(_)
-            )
-        }) {
-            return Err(Thrown(
-                "SyntaxError: import/export declarations may only appear in modules".into(),
-            ));
-        }
         // UsingDeclaration is not allowed at eval top level (eval-code is not
         // a "using"-eligible scope: spec UsingDeclaration static semantics).
-        if ret.program.body.iter().any(|s| {
-            matches!(s, oxc_ast::ast::Statement::VariableDeclaration(d)
+        if ast.body.iter().any(|s| {
+            matches!(s, crate::parse::ast::Stmt::VarDecl(d)
                 if matches!(d.kind,
-                    oxc_ast::ast::VariableDeclarationKind::Using
-                        | oxc_ast::ast::VariableDeclarationKind::AwaitUsing))
+                    crate::parse::ast::VarKind::Using
+                        | crate::parse::ast::VarKind::AwaitUsing))
         }) {
             return Err(Thrown(
                 "SyntaxError: using declarations may not appear at eval top level".into(),
@@ -786,8 +770,8 @@ impl<'p> Vm<'p> {
             (std::collections::HashSet::new(), None)
         };
         // 2. Compile in eval mode (top-level returns its completion value).
-        let eval_prog = match crate::compile::compile_eval_oxc(
-            &ret.program,
+        let eval_prog = match crate::compile::compile_eval(
+            &ast,
             code,
             force_strict,
             force_new_target_ok,

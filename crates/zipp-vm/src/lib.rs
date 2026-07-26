@@ -26,6 +26,7 @@ mod compile;
 /// Persistent-VM embedding API, for hosts that keep a script alive across many
 /// re-entries rather than running it once (see the module docs).
 pub mod embed;
+mod front;
 mod heap;
 /// Hand-written front end (lexer/AST/parser) being built to replace
 /// `oxc_parser` — see the module docs for why. Not yet wired in.
@@ -132,38 +133,20 @@ pub fn lower_to_text(src: &str, module: bool) -> Result<String, String> {
 /// Parse + compile, no VM. Shares `run_with_base`'s Annex B parse-retry so the
 /// dump reflects what would actually run.
 fn compile_only(src: &str, module: bool) -> Result<bytecode::Program, String> {
-    let allocator = Allocator::default();
-    let source_type = if module { SourceType::mjs() } else { SourceType::cjs() };
-    let ret = Parser::new(&allocator, src, source_type).parse();
-    if !ret.errors.is_empty() {
-        if let Some(fixed) = annexb_call_target_rewrite(src) {
-            return compile_only(&fixed, module);
-        }
-        return Err(format!("SyntaxError: {}", ret.errors[0]));
-    }
-    compile::compile_program_oxc(&ret.program, src)
+    let ast =
+        if module { front::parse_module(src)? } else { front::parse_script(src)? };
+    compile::compile_program(&ast, src)
 }
 
 /// Like [`run`], but `base_dir` is the directory the script was loaded from, used
 /// to resolve a dynamic `import(specifier)` against the filesystem. `None` (the
 /// `run` default) means no host module loader, so `import()` rejects.
 pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, src, SourceType::unambiguous()).parse();
-    if !ret.errors.is_empty() {
-        // Annex B web compat ("Runtime Errors for Function Call Assignment
-        // Targets"): in sloppy code `f() = 1`, `f() += 1`, `f()++`, `++f()` and
-        // `for (f() in/of x)` must PARSE and throw a ReferenceError at runtime,
-        // but oxc's AssignmentTarget AST cannot represent a CallExpression
-        // target, so it fatal-errors. When EVERY diagnostic is exactly that
-        // error, rewrite the offending call targets and re-run (the rewrite
-        // declines for anything else, so ordinary syntax errors are untouched).
-        if let Some(fixed) = annexb_call_target_rewrite(src) {
-            return run_with_base(&fixed, base_dir);
-        }
-        return Err(format!("SyntaxError: {}", ret.errors[0]));
-    }
-    let program = compile::compile_program_oxc(&ret.program, src)?;
+    // Annex B call assignment targets (`f() = 1` in sloppy code) need no
+    // source-rewrite-and-reparse any more: the parser produces `Target::Call`
+    // directly and the compiler emits the runtime ReferenceError.
+    let ast = front::parse_auto(src)?;
+    let program = compile::compile_program(&ast, src)?;
     // Dev aid: `ZIPP_VM_DUMP=1` prints each function's bytecode to stderr before
     // running (so the JIT-able regions can be inspected).
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
@@ -186,107 +169,6 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
     }
 }
 
-/// Annex B "Runtime Errors for Function Call Assignment Targets": when every
-/// parse diagnostic is oxc's invalid-assignment-target error ("Cannot assign to
-/// this expression") and every flagged span is a plain CallExpression, rewrite
-/// each call target `f(…)` into `((f(…)), __zipp_annexb_ref_error__())[0]` — a
-/// valid MemberExpression assignment target whose base first evaluates the call
-/// (per the web-compat spec order), then throws the ReferenceError BEFORE any
-/// RHS evaluation, old-value read, or ToNumeric coercion. One shape covers all
-/// five contexts (`=`, `op=`, prefix/postfix `++`/`--`, and for-in/of heads —
-/// where the error correctly fires per iteration, only after enumeration
-/// yields a value). Returns the rewritten source only when it re-parses clean;
-/// any other diagnostic (a real syntax error, a non-call target like `1 = 2`,
-/// or strict code, where the early SyntaxError must stand) declines with None.
-fn annexb_call_target_rewrite(src: &str) -> Option<String> {
-    // IsStrict(target) must be false for the web-compat carve-out. Without an
-    // AST only whole-source strictness is detectable: a `"use strict"`
-    // directive prologue keeps the early SyntaxError. (A strict FUNCTION inside
-    // a sloppy script slips through, but the parse-retry then yields a runtime
-    // ReferenceError rather than running broken code.)
-    if has_use_strict_prologue(src) {
-        return None;
-    }
-    let mut cur = src.to_string();
-    // oxc stops at the FIRST fatal cover-grammar error, so a source with N
-    // offending targets converges over N rounds (bounded: error paths only).
-    for _ in 0..16 {
-        let allocator = Allocator::default();
-        let ret = Parser::new(&allocator, &cur, SourceType::unambiguous()).parse();
-        if ret.errors.is_empty() {
-            return Some(cur);
-        }
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for e in &ret.errors {
-            if e.message != "Cannot assign to this expression" {
-                return None;
-            }
-            // The diagnostic labels exactly one span: the invalid target,
-            // as BYTE offsets into the current source.
-            let labels = e.labels.as_deref()?;
-            let [label] = labels else { return None };
-            let (off, len) = (label.offset(), label.len());
-            let text = cur.get(off..off + len)?;
-            if !is_plain_call_expression(text) {
-                return None;
-            }
-            spans.push((off, len));
-        }
-        // Rewrite back-to-front so earlier offsets stay valid.
-        spans.sort_unstable();
-        spans.dedup();
-        for &(off, len) in spans.iter().rev() {
-            let call = &cur[off..off + len];
-            let patched =
-                format!("(({call}), {}())[0]", vm::native::ANNEXB_REF_ERROR_NAME);
-            cur.replace_range(off..off + len, &patched);
-        }
-    }
-    None
-}
-
-/// Does `text` parse standalone as exactly one CallExpression statement? That
-/// is the only target shape the Annex B web-compat carve-out covers (an
-/// optional chain `a?.b()` parses as a ChainExpression and is rejected).
-fn is_plain_call_expression(text: &str) -> bool {
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, text, SourceType::script()).parse();
-    if !ret.errors.is_empty() || ret.program.body.len() != 1 {
-        return false;
-    }
-    let oxc_ast::ast::Statement::ExpressionStatement(stmt) = &ret.program.body[0] else {
-        return false;
-    };
-    matches!(stmt.expression, oxc_ast::ast::Expression::CallExpression(_))
-}
-
-/// Does the source open with a `"use strict"` directive prologue? (Leading
-/// whitespace, comments, and other string directives may precede it.)
-fn has_use_strict_prologue(src: &str) -> bool {
-    let mut rest = src;
-    loop {
-        rest = rest.trim_start();
-        if let Some(r) = rest.strip_prefix("//") {
-            rest = r.split_once('\n').map_or("", |(_, tail)| tail);
-        } else if let Some(r) = rest.strip_prefix("/*") {
-            match r.split_once("*/") {
-                Some((_, tail)) => rest = tail,
-                None => return false,
-            }
-        } else if rest.starts_with("\"use strict\"") || rest.starts_with("'use strict'") {
-            return true;
-        } else if let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
-            // Another directive ("use asm", …): skip the string literal and a
-            // trailing semicolon, then keep scanning the prologue.
-            let Some(end) = rest[1..].find(q) else { return false };
-            rest = rest[1 + end + 1..].trim_start();
-            rest = rest.strip_prefix(';').unwrap_or(rest);
-        } else {
-            return false;
-        }
-    }
-}
-
 /// Run `src` as an ES MODULE entry: the top level is an async context (top-level
 /// `await`), declarations are module-scoped, and the event loop drains to
 /// completion. `base_dir` resolves relative imports. Like [`run_with_base`] but
@@ -304,12 +186,8 @@ pub fn run_module_file(
         Some(h) => Some(std::fs::read_to_string(h).map_err(|e| format!("read error: {e}"))?),
         None => None,
     };
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, &src, SourceType::mjs()).parse();
-    if !ret.errors.is_empty() {
-        return Err(format!("SyntaxError: {}", ret.errors[0]));
-    }
-    compile::compile_module_oxc(&ret.program, &src)?;
+    let entry_ast = front::parse_module(&src)?;
+    compile::compile_module(&entry_ast, &src)?;
     // The harness (if any) runs as a realm SCRIPT — its vars become realm
     // globals every module can reference — then the entry loads through the
     // module loader: imports link before evaluation and the module's own
@@ -318,12 +196,11 @@ pub fn run_module_file(
     // loader's eval pipeline can't suspend yet); nothing of the entry has run
     // when that compile-time rejection surfaces.
     let host_src = harness.clone().unwrap_or_default();
-    let host_alloc = Allocator::default();
-    let host_ret = Parser::new(&host_alloc, &host_src, SourceType::default()).parse();
-    if !host_ret.errors.is_empty() {
-        return Err(format!("SyntaxError: {}", host_ret.errors[0]));
-    }
-    let host = compile::compile_program_oxc(&host_ret.program, &host_src)?;
+    // The harness runs as a realm SCRIPT (its declarations become realm
+    // globals), so it parses script-first — which is also what it compiled as
+    // before the front-end swap, oxc's module-flavoured default notwithstanding.
+    let host_ast = front::parse_auto(&host_src)?;
+    let host = compile::compile_program(&host_ast, &host_src)?;
     let mut vm = vm::Vm::new(&host);
     vm.set_module_base_dir(base_dir.clone());
     if let Err(thrown) = vm.run() {
@@ -354,12 +231,8 @@ pub fn run_module_file(
                 }
                 None => src.as_str(),
             };
-            let alloc2 = Allocator::default();
-            let ret2 = Parser::new(&alloc2, text, SourceType::mjs()).parse();
-            if !ret2.errors.is_empty() {
-                return Err(format!("SyntaxError: {}", ret2.errors[0]));
-            }
-            let program2 = compile::compile_module_oxc(&ret2.program, text)?;
+            let ast2 = front::parse_module(text)?;
+            let program2 = compile::compile_module(&ast2, text)?;
             let mut vm = vm::Vm::new(&program2);
             vm.set_module_base_dir(base_dir);
             match vm.run_module() {
@@ -380,12 +253,8 @@ pub fn run_module_file(
 }
 
 pub fn run_module_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
-    let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, src, SourceType::mjs()).parse();
-    if !ret.errors.is_empty() {
-        return Err(format!("SyntaxError: {}", ret.errors[0]));
-    }
-    let program = compile::compile_module_oxc(&ret.program, src)?;
+    let ast = front::parse_module(src)?;
+    let program = compile::compile_module(&ast, src)?;
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
             eprintln!("── fn {fid} (regs={}, params={}) ──", f.reg_count, f.param_count);
@@ -690,10 +559,8 @@ mod tests {
     /// Run a program with the JIT forced OFF (pure interpreter), for differential
     /// checks against the default JIT-on `run`.
     fn run_nojit(src: &str) -> Vec<String> {
-        let allocator = Allocator::default();
-        let ret = Parser::new(&allocator, src, SourceType::unambiguous()).parse();
-        assert!(ret.errors.is_empty(), "parse error: {:?}", ret.errors);
-        let program = compile::compile_program_oxc(&ret.program, src).expect("compile");
+        let ast = front::parse_auto(src).expect("parse");
+        let program = compile::compile_program(&ast, src).expect("compile");
         let mut vm = vm::Vm::new(&program);
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         vm.set_jit_enabled(false);

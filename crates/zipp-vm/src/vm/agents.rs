@@ -77,16 +77,9 @@ fn agent_worker(
     rx: mpsc::Receiver<BroadcastMsg>,
     started: Arc<(Mutex<bool>, Condvar)>,
 ) {
-    use oxc_allocator::Allocator;
-    use oxc_parser::Parser;
-    use oxc_span::SourceType;
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, &src, SourceType::unambiguous()).parse();
-    let program = if parsed.errors.is_empty() {
-        crate::compile::compile_program_oxc(&parsed.program, &src).ok()
-    } else {
-        None
-    };
+    let program = crate::front::parse_auto(&src)
+        .ok()
+        .and_then(|ast| crate::compile::compile_program(&ast, &src).ok());
     let Some(program) = program else {
         // A worker that fails to compile must STILL signal `started` (or
         // agent.start deadlocks) and still ack broadcasts (broadcast blocks

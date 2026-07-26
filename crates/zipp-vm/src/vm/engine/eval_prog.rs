@@ -517,16 +517,11 @@ impl<'p> Vm<'p> {
     /// pipeline's name-mapped slots), matching script
     /// GlobalDeclarationInstantiation rather than eval semantics.
     pub(crate) fn eval_script(&mut self, code: &str) -> Result<Value, Thrown> {
-        let allocator = oxc_allocator::Allocator::default();
-        // SCRIPT goal, not the oxc default (mjs): module mode would make the
-        // whole program strict and silently disable Annex B.3.3 hoisting,
-        // sloppy semantics, and HTML comments.
-        let ret =
-            oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::cjs()).parse();
-        if !ret.errors.is_empty() {
-            return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
-        }
-        let prog = crate::compile::compile_program_oxc(&ret.program, code)
+        // SCRIPT goal: module mode would make the whole program strict and
+        // silently disable Annex B.3.3 hoisting, sloppy semantics, and HTML
+        // comments.
+        let ast = crate::front::parse_script(code).map_err(Thrown)?;
+        let prog = crate::compile::compile_program(&ast, code)
             .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
         // Dev aid (same flag as the main-program dump in lib.rs).
         if std::env::var_os("ZIPP_VM_DUMP").is_some() {
