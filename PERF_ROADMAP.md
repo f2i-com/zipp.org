@@ -1316,6 +1316,52 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B37 — node's `{}` is 0.4ns because it does not allocate. That is the gap.
+
+The last measurement needed to close the "compact object storage" question, and
+it is the simplest one in this file:
+
+| expression | zipp | node |
+|---|---|---|
+| loop baseline | 0.3ns | 0.3ns |
+| `{}` | **33.2ns** | **0.5ns** |
+| `{a:1}` | 54.4ns | 0.4ns |
+| `{a:1,b:2}` | 71.2ns | 0.5ns |
+| `[]` | 19.8ns | 0.4ns |
+| `[1,2]` | 26.8ns | 0.4ns |
+
+`{}` performs essentially ONE malloc — `ObjMap`'s three `Vec`s are empty and
+`Vec::new()` does not allocate — plus a heap-slot push. It costs 33.2ns. So the
+malloc is a small fraction of it and the rest is the `NewObject` opcode path.
+
+And node is at **0.5ns for all six**, flat in property count. V8 is not
+allocating faster; **V8 is not allocating.** Escape analysis proves the object
+never escapes the loop and deletes it. That is why every layout change measured
+in this file lands on nothing: a cheaper object is still an object, and the
+competitor is making zero.
+
+Together with B36 (property reads at PARITY on a 60-key dictionary object) and
+B29 (removing 7 of ~13 allocations per enumeration: +0.1%), the compact-object-
+storage line of attack is closed by measurement from three independent angles.
+It agrees with what B26 concluded from the other direction — "where the object
+construction gap ISN'T: escape analysis, not allocation" — and with B24, which
+built and reverted allocation-in-JIT-regions.
+
+**The consequence for planning.** The remaining gap is not any single missing
+optimisation; it is a uniform per-operation constant across a register machine
+with no SSA form. That is one project — an optimizing tier — and escape
+analysis, hidden classes and inlined allocation all fall out of it. Anything
+scheduled ahead of it should be justified by a MEASURED phase, not by an
+allocation count.
+
+**Refuted while establishing this** (ninth and tenth probes of the session):
+* `GC_GROWTH` 3 -> 8 with `GC_MIN_THRESHOLD` 64k -> 256k: **+1.2% mean**,
+  regressing polymorphic-objects +4.5%, regex-log-scan +4.4%, markdown +3.9%.
+  A larger live heap costs more in cache misses than the skipped collections
+  save. B25's 3x was already the right side of that curve.
+* Property-name interning for enumeration (B29), and Option A atoms generally
+  for this suite (B36).
+
 ### B36 — Property READS are at parity on a 60-key object. Compact object
 storage is not this suite's lever, and here is the measurement that settles it
 
