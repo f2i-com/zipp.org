@@ -323,6 +323,30 @@ mod tests {
     /// walkers every name inside `r()?.getItem(k)` was invisible: never boxed,
     /// nothing for a nested function to capture, ReferenceError at runtime.
     /// Under-inclusion in that scan is not a slower lookup, it is a throw.
+    /// `var` is a Statement, so it is legal as an unbraced statement body.
+    ///
+    /// Only `let`/`const`/`class`/`function` are Declarations and barred there.
+    /// Rejecting `if (x) var y = 1;` broke every minified bundle, since dropping
+    /// the braces is a standard minifier size win.
+    #[test]
+    fn var_is_legal_as_an_unbraced_statement_body() {
+        assert_eq!(run_ok("if(true)var x=1; console.log(x)"), vec!["1"]);
+        assert_eq!(run_ok("if(false)var x=1; else var y=2; console.log(y)"), vec!["2"]);
+        assert_eq!(run_ok("for(var i=0;i<1;i++)var q=5; console.log(q)"), vec!["5"]);
+        assert_eq!(run_ok("for(var k in {a:1})var m=1; console.log(m)"), vec!["1"]);
+        assert_eq!(run_ok("for(var v of [1])var n=2; console.log(n)"), vec!["2"]);
+        assert_eq!(run_ok("do var d=1; while(false); console.log(d)"), vec!["1"]);
+        assert_eq!(run_ok("var i=0; while(i<1){i++} console.log(i)"), vec!["1"]);
+        // `var` hoists out of the body, so it is visible afterwards even when
+        // the branch never ran.
+        assert_eq!(
+            run_ok("if(false)var h=1; console.log(typeof h)"),
+            vec!["undefined"]
+        );
+        // A real Declaration in the same position is still an error.
+        assert!(run("if(true)class C{}").is_err());
+    }
+
     #[test]
     fn optional_chain_captures_enclosing() {
         assert_eq!(

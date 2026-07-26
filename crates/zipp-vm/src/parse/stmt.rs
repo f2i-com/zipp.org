@@ -533,6 +533,22 @@ impl<'s> Parser<'s> {
                     let body = self.parse_stmt()?;
                     Ok(Stmt::With { object, body: Box::new(body) })
                 }
+                // `var` is a VariableStatement, which IS a Statement, so it is
+                // legal as the unbraced body of `if`/`else`/`while`/`for`/`do`.
+                // Only `let`/`const`/`class`/`function` are Declarations and
+                // barred here.
+                //
+                // Falling through to the expression parser instead rejected
+                // `if (x) var y = 1;` as "unexpected reserved word". Minifiers
+                // emit that shape constantly — dropping the braces is one of
+                // their standard size wins — so this took out every real-world
+                // bundle, React's included.
+                Keyword::Var => {
+                    self.bump_after_operand()?;
+                    let d = self.parse_var_decl(VarKind::Var)?;
+                    self.semicolon()?;
+                    Ok(Stmt::VarDecl(d))
+                }
                 // A declaration is NOT a Statement, so it is an error here even
                 // though it is fine as a StatementListItem.
                 Keyword::Function | Keyword::Class => Err(SyntaxError::new(
