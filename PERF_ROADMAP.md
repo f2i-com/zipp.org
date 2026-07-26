@@ -1246,10 +1246,26 @@ So `/a/.test("a")` measuring 100ns flat in subject length (100ns at 1 char,
 107ns at 200) does NOT mean 95ns of regex setup — it is interpreted loop
 overhead plus native dispatch plus setup, and the three were not separated.
 What the flatness DOES establish is that matching itself is cheap and the cost
-is per-call, which is consistent with `MatchAttempter::new` building three
-`Vec`s (`bts`, `loops`, `groups`) on every call — regress's own source says
-`// TODO: avoid allocating so much`. Making those `SmallVec` in the fork is the
-obvious next probe, worth an estimated 20-30ns per regex call.
+is per-call. The obvious suspect was `MatchAttempter::new` building three `Vec`s
+(`bts`, `loops`, `groups`) on every call — regress's own source even says
+`// TODO: avoid allocating so much`.
+
+**Probed and refuted.** All three were converted to `SmallVec` with inline
+capacity (8 backtrack entries, 8 groups, 2 loops), which for a simple pattern
+removes every one of those allocations. Result: **102ns vs 100ns — nothing**,
+and the regex bench phases unchanged. Reverted, along with the `smallvec`
+dependency it added.
+
+Two things follow. The allocations were mostly not happening in the first place
+(`vec![x; 0]` does not allocate, and a simple pattern has zero loops and zero
+groups, so only the one-element `bts` did). And whatever the ~100ns is, it is
+not per-call matcher setup — the remaining candidates are the generic native
+`CallMethod` dispatch and, in these microbenchmarks specifically, the
+interpretation the call-mix gate guarantees.
+
+Estimating a win from reading the source — "three Vecs per call, obviously
+20-30ns" — was wrong by the entire amount. The prediction is left here next to
+its refutation deliberately.
 
 Before quoting any microbenchmark in this file, check with `ZIPP_JITLOG=1`
 whether its loop actually compiled.
