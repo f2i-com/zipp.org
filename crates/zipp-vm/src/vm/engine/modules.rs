@@ -218,7 +218,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) {
+        let prog = match crate::compile::compile_eval_oxc(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
             // evaluation pipeline (not built yet): surface a host TypeError —
@@ -1125,7 +1125,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return false;
         }
-        let Ok(prog) = crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) else {
+        let Ok(prog) = crate::compile::compile_eval_oxc(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) else {
             return false;
         };
         prog.functions

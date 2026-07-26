@@ -5,6 +5,15 @@
 #![allow(unused_imports)]
 use super::*;
 
+// NOTE (port): this file is UNCHANGED by the oxc -> zipp_ast retarget, and that
+// is a fact about it rather than an omission — it never referenced `ox::` at
+// all. Everything here works in the currency the emitter already speaks:
+// registers, `Instr`, `Binding`, and identifier spellings as `&str`. The AST
+// swap does not reach it. Identifiers stay `&str` (not `StrVal`): `ast::Name`
+// is `Box<str>`, which deref-coerces at every call site below, so a caller
+// holding a `&Name` needs no conversion. `StrVal` is for string *literals* —
+// no with-chain helper takes one.
+
 impl<'a> FnCompiler<'a> {
     /// The active `with`-object registers that can shadow `name`, innermost
     /// first. Empty (the common case) when no `with` is active or the name is

@@ -2,6 +2,13 @@
 // Pure code move: `use super::*` keeps the parent module's imports in
 // scope, and items are widened to pub(crate) so the pieces still see
 // each other. No logic changed.
+//
+// NOTE: this module names no AST type. It is register allocation, the lexical
+// scope chain, upvalue threading and the constant pools — all of which were
+// already expressed in terms of `String`/`Reg`/`Value` — so the port touches
+// exactly one doc comment (`add_string_const_wtf8`, below), whose reference to
+// oxc's `.lone_surrogates` flag no longer names anything. No signature and no
+// emitted instruction changes.
 #![allow(unused_imports)]
 use super::*;
 
@@ -446,10 +453,13 @@ impl<'a> FnCompiler<'a> {
         self.add_const(v)
     }
 
-    /// `add_string_const` for a literal oxc flagged `.lone_surrogates`: the
-    /// text is the lossless MARKER form (`\u{FFFD}XXXX` per lone surrogate);
-    /// recording the index makes `resolve_const` decode it to real WTF-8 lone
-    /// surrogates at intern time.
+    /// `add_string_const` for a literal that holds a LONE SURROGATE (its
+    /// `StrVal` is the `Utf16` arm): `s` is the lossless MARKER form
+    /// (`\u{FFFD}XXXX` per lone surrogate, as produced by
+    /// `heap::encode_lone_surrogate_markers`); recording the index makes
+    /// `resolve_const` decode it to real WTF-8 lone surrogates at intern time.
+    /// The marker form stays the on-disk encoding because `string_constants` is
+    /// `Vec<String>`, which cannot itself hold a lone surrogate.
     pub(crate) fn add_string_const_wtf8(&mut self, s: &str) -> u32 {
         let si = self.string_constants.len() as u32;
         self.wtf8_consts.push(si);

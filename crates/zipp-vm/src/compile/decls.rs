@@ -5,13 +5,40 @@
 #![allow(unused_imports)]
 use super::*;
 
+use crate::parse::ast;
+
+// NOTE (port): cross-group call shapes this module now assumes. The oxc STRUCT
+// nodes these functions took (`ox::IfStatement`, `ox::WhileStatement`, …) have
+// no `zipp_ast` counterpart — the payload lives in the `Stmt` variant — so each
+// takes the payload instead. Names are unchanged:
+//   if_stmt(test: &ast::Expr, cons: &ast::Stmt, alt: Option<&ast::Stmt>)
+//   while_stmt(test: &ast::Expr, body: &ast::Stmt)
+//   do_while_statement(body: &ast::Stmt, test: &ast::Expr)
+//   for_stmt(init: Option<&ast::ForInit>, test: Option<&ast::Expr>,
+//            update: Option<&ast::Expr>, body: &ast::Stmt)
+//   for_in_statement(left: &ast::ForTarget, right: &ast::Expr, body: &ast::Stmt)
+//   for_of_statement(left: &ast::ForTarget, right: &ast::Expr,
+//                    body: &ast::Stmt, is_await: bool)
+//   switch_stmt(disc: &ast::Expr, cases: &[ast::SwitchCase])
+//   try_statement(block: &[ast::Stmt], handler: Option<&ast::CatchClause>,
+//                 finalizer: Option<&[ast::Stmt]>)
+// The struct-shaped ones keep their arity: `func_decl(&ast::Function)`,
+// `func_decl_inner(&ast::Function, bool)`, `class_decl(&ast::Class)`,
+// `class_expr(&ast::Class, Reg, Option<&str>)`,
+// `compile_func_expr(Option<String>, &ast::Function)`,
+// `compile_arrow(&ast::Arrow, &str)`.
+// Free helpers: `module_export_name(&ast::ModuleExportName) -> String`,
+// `class_key_name(&ast::PropKey) -> R<String>`,
+// `string_literal_key(&StrVal) -> String`,
+// `capture::collect_pattern_names(&ast::Pattern, &mut HashSet<String>)`.
+
 impl<'a> FnCompiler<'a> {
     // ── statements ──
-    pub(crate) fn stmt(&mut self, s: &ox::Statement) -> R<()> {
-        use ox::Statement as S;
+    pub(crate) fn stmt(&mut self, s: &ast::Stmt) -> R<()> {
+        use ast::Stmt as S;
         match s {
-            S::ExpressionStatement(e) => {
-                let r = self.expr(&e.expression)?;
+            S::Expr(e) => {
+                let r = self.expr(e)?;
                 // eval completion: remember this expression's value (the last one
                 // executed wins, matching the spec's expression-completion value).
                 if let Some(cr) = self.completion_reg {
@@ -19,8 +46,8 @@ impl<'a> FnCompiler<'a> {
                 }
                 let _ = r; // value otherwise discarded
             }
-            S::VariableDeclaration(d) => self.var_decl(d)?,
-            S::BlockStatement(b) => {
+            S::VarDecl(d) => self.var_decl(d)?,
+            S::Block(body) => {
                 self.push_scope();
                 // Pre-create TDZ cells for the block's CAPTURED simple-identifier
                 // lexical (`let`/`const`/`class`) declarations, so a closure
@@ -29,7 +56,7 @@ impl<'a> FnCompiler<'a> {
                 // TDZ → ReferenceError) instead of resolving to a global. The
                 // textual declaration reuses the register, ending the TDZ.
                 // Non-captured names keep plain registers (no runtime cost).
-                self.predeclare_lexical_tdz(&b.body);
+                self.predeclare_lexical_tdz(body);
                 // Hoist block-level function declarations: declare each as a local
                 // in this block scope first, so `func_decl` binds it (and forward
                 // references / calls within the block resolve to the local rather
@@ -39,9 +66,9 @@ impl<'a> FnCompiler<'a> {
                 // uninitialized slot.
                 let mut entry_fns: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                for st in &b.body {
-                    if let S::FunctionDeclaration(f) = st {
-                        if let Some(id) = &f.id {
+                for st in body {
+                    if let S::FnDecl(f) = st {
+                        if let Some(id) = &f.name {
                             // Inside a function body, block functions are always
                             // block-local. At script level they normally hoist to
                             // a global (Annex B) and so are NOT pre-declared here —
@@ -49,7 +76,7 @@ impl<'a> FnCompiler<'a> {
                             // lexical binding (conflict-skip), OR the code is STRICT
                             // (Annex B is not honored in strict mode, so the function
                             // stays block-local and does not leak past the block).
-                            let nm = id.name.as_str();
+                            let nm: &str = id;
                             // Block-local for strict / enclosing-block lexical
                             // conflict / a protected param-lexical-class name / a
                             // B.3.3 var name. A name matching an existing function is
@@ -65,30 +92,30 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                 }
-                if Self::block_has_using(&b.body) {
+                if Self::block_has_using(body) {
                     // A block with a top-level `using` declaration disposes its
                     // resources on every exit — desugar onto a synthetic finally.
-                    self.compile_using_block(&b.body, false)?;
+                    self.compile_using_block(body, false)?;
                 } else {
                     // BlockDeclarationInstantiation: the block's function
                     // declarations are materialized at BLOCK ENTRY (a call
                     // before the textual declaration works), while the Annex B
                     // var-binding sync stays at the declaration's textual
                     // position (B.3.3.3 fires at evaluation, not entry).
-                    for st in &b.body {
-                        if let S::FunctionDeclaration(f) = st {
-                            if let Some(id) = &f.id {
-                                if entry_fns.contains(id.name.as_str()) {
+                    for st in body {
+                        if let S::FnDecl(f) = st {
+                            if let Some(id) = &f.name {
+                                if entry_fns.contains(&**id) {
                                     self.func_decl_inner(f, false)?;
                                 }
                             }
                         }
                     }
-                    for st in &b.body {
-                        if let S::FunctionDeclaration(f) = st {
-                            if let Some(id) = &f.id {
-                                if entry_fns.contains(id.name.as_str()) {
-                                    self.emit_b33_sync(id.name.as_str());
+                    for st in body {
+                        if let S::FnDecl(f) = st {
+                            if let Some(id) = &f.name {
+                                if entry_fns.contains(&**id) {
+                                    self.emit_b33_sync(id);
                                     continue;
                                 }
                             }
@@ -98,35 +125,34 @@ impl<'a> FnCompiler<'a> {
                 }
                 self.pop_scope();
             }
-            S::IfStatement(i) => self.if_stmt(i)?,
-            S::WhileStatement(w) => {
+            S::If { test, cons, alt } => self.if_stmt(test, cons, alt.as_deref())?,
+            S::While { test, body } => {
                 self.reset_loop_completion();
-                self.while_stmt(w)?
+                self.while_stmt(test, body)?
             }
-            S::DoWhileStatement(d) => {
+            S::DoWhile { body, test } => {
                 self.reset_loop_completion();
-                self.do_while_statement(d)?
+                self.do_while_statement(body, test)?
             }
-            S::ForStatement(f) => {
+            S::For { init, test, update, body } => {
                 self.reset_loop_completion();
-                self.for_stmt(f)?
+                self.for_stmt(init.as_ref(), test.as_ref(), update.as_ref(), body)?
             }
-            S::ForOfStatement(f) => {
+            S::ForOf { left, right, body, is_await } => {
                 self.reset_loop_completion();
-                self.for_of_statement(f)?
+                self.for_of_statement(left, right, body, *is_await)?
             }
-            S::ForInStatement(f) => {
+            S::ForIn { left, right, body } => {
                 self.reset_loop_completion();
-                self.for_in_statement(f)?
+                self.for_in_statement(left, right, body)?
             }
-            S::BreakStatement(b) => {
+            S::Break(label) => {
                 // `break label` targets the labeled loop/switch; bare `break` the
                 // innermost.
-                let idx = match &b.label {
-                    Some(lbl) => self
-                        .loop_ctx
-                        .iter()
-                        .rposition(|c| c.label.as_deref() == Some(lbl.name.as_str())),
+                let idx = match label {
+                    Some(lbl) => {
+                        self.loop_ctx.iter().rposition(|c| c.label.as_deref() == Some(&**lbl))
+                    }
                     None => self.loop_ctx.len().checked_sub(1),
                 };
                 let idx = match idx {
@@ -145,14 +171,14 @@ impl<'a> FnCompiler<'a> {
                 }
                 self.emit_loop_jump(idx, true);
             }
-            S::ContinueStatement(c) => {
+            S::Continue(label) => {
                 // `continue [label]` targets the (labeled) enclosing LOOP, skipping
                 // switch frames.
-                let idx = match &c.label {
+                let idx = match label {
                     Some(lbl) => self
                         .loop_ctx
                         .iter()
-                        .rposition(|ctx| ctx.is_loop && ctx.label.as_deref() == Some(lbl.name.as_str())),
+                        .rposition(|ctx| ctx.is_loop && ctx.label.as_deref() == Some(&**lbl)),
                     None => self.loop_ctx.iter().rposition(|ctx| ctx.is_loop),
                 };
                 let idx = match idx {
@@ -169,15 +195,15 @@ impl<'a> FnCompiler<'a> {
                 }
                 self.emit_loop_jump(idx, false);
             }
-            S::LabeledStatement(l) => {
-                if let S::BlockStatement(b) = &l.body {
+            S::Labeled { label, body } => {
+                if let S::Block(stmts) = &**body {
                     // `label: { … break label … }` — a break-only target around a
                     // block (continue to a block label is invalid, and naturally
                     // won't match: the frame is not a loop).
                     self.loop_ctx
-                        .push(LoopCtx::switch_frame(Some(l.label.name.to_string()), self.handler_depth));
+                        .push(LoopCtx::switch_frame(Some(label.to_string()), self.handler_depth));
                     self.push_scope();
-                    for s in &b.body {
+                    for s in stmts {
                         self.stmt(s)?;
                     }
                     self.pop_scope();
@@ -189,13 +215,13 @@ impl<'a> FnCompiler<'a> {
                 } else {
                     // A loop/switch consumes the label for break/continue;
                     // cleared afterwards if the body was something else.
-                    self.pending_label = Some(l.label.name.to_string());
-                    self.stmt(&l.body)?;
+                    self.pending_label = Some(label.to_string());
+                    self.stmt(body)?;
                     self.pending_label = None;
                 }
             }
-            S::SwitchStatement(s) => self.switch_stmt(s)?,
-            S::ReturnStatement(r) => {
+            S::Switch { disc, cases } => self.switch_stmt(disc, cases)?,
+            S::Return(argument) => {
                 // Proper tail call: strict `return <expr with a call in tail
                 // position>` in an UNPROTECTED context (no try handlers, no
                 // enclosing loop with an iterator to close, no using scope,
@@ -205,7 +231,12 @@ impl<'a> FnCompiler<'a> {
                 // sequence finals, parenthesization, and plain-tag tagged
                 // templates. The TailCall prefix falls through to the
                 // ordinary Call+Return for non-plain callees.
-                if let Some(arg) = &r.argument {
+                //
+                // NOTE: "parenthesization" above is now vacuous — the AST has no
+                // ParenthesizedExpression, so a parenthesized tail call IS the
+                // call node. `expr_has_tail_call` sees the same set of tail
+                // positions either way, so nothing changes.
+                if let Some(arg) = argument {
                     if self.tail_call_position() && self.expr_has_tail_call(arg) {
                         self.emit_tail_return(arg)?;
                         return Ok(());
@@ -216,7 +247,7 @@ impl<'a> FnCompiler<'a> {
                 // for-await-of (innermost first) — a `return` is an abrupt completion
                 // that closes the iterator (a throwing `return()` then propagates,
                 // discarding the value). `break`/`throw` already close via their paths.
-                let v = match &r.argument {
+                let v = match argument {
                     Some(arg) => {
                         let v = self.expr(arg)?;
                         // In an ASYNC GENERATOR, `return expr;` performs
@@ -245,16 +276,18 @@ impl<'a> FnCompiler<'a> {
                     None => self.emit(Instr::ReturnUndefined),
                 }
             }
-            S::FunctionDeclaration(f) => self.func_decl(f)?,
-            S::ThrowStatement(t) => {
-                let v = self.expr(&t.argument)?;
+            S::FnDecl(f) => self.func_decl(f)?,
+            S::Throw(argument) => {
+                let v = self.expr(argument)?;
                 self.emit(Instr::Throw { src: v });
             }
-            S::TryStatement(t) => self.try_statement(t)?,
-            S::ClassDeclaration(c) => self.class_decl(c)?,
-            S::EmptyStatement(_) => {}
-            S::DebuggerStatement(_) => {} // `debugger;` is a no-op (no attached debugger)
-            S::WithStatement(w) => {
+            S::Try { block, handler, finalizer } => {
+                self.try_statement(block, handler.as_ref(), finalizer.as_deref())?
+            }
+            S::ClassDecl(c) => self.class_decl(c)?,
+            S::Empty => {}
+            S::Debugger => {} // `debugger;` is a no-op (no attached debugger)
+            S::With { object, body } => {
                 // `with` is a SyntaxError in strict mode (early error) — preserve
                 // that so strict negative tests keep passing.
                 if self.cx.in_strict {
@@ -266,7 +299,7 @@ impl<'a> FnCompiler<'a> {
                 // ToObject(GetValue(object)) becomes the with-environment's binding
                 // object. Held in a hidden scope-local so it survives the whole body
                 // (per-statement temp resets allocate above it).
-                let raw = self.expr(&w.object)?;
+                let raw = self.expr(object)?;
                 // ToObject(null)/ToObject(undefined) throw a TypeError (the with
                 // object must be coercible).
                 self.emit(Instr::CheckCoercible { src: raw });
@@ -284,157 +317,167 @@ impl<'a> FnCompiler<'a> {
                 self.cell_regs.insert(obj_reg);
                 let floor = self.scopes.len();
                 self.with_stack.push(WithScope { obj_reg, floor });
-                let r = self.stmt(&w.body);
+                let r = self.stmt(body);
                 self.with_stack.pop();
                 self.pop_scope();
                 r?;
             }
-            // ── ES module declarations (only reached for SourceType::module, i.e.
+            // ── ES module declarations (only reached for Goal::Module, i.e.
             // a fixture loaded by a dynamic `import()`; a script never parses these).
-            S::ImportDeclaration(_) => {
+            S::Import(_) => {
                 // Handled by the MODULE PRE-PASS (import bindings hoist: a
                 // reference or assignment may precede the declaration).
             }
-            S::ExportNamedDeclaration(e) => {
+            // oxc had three statement variants here; ours has one carrying an
+            // `ExportDecl`, and the `export <decl>` form is its own variant
+            // rather than a `declaration` field beside the specifiers.
+            S::Export(e) => match &**e {
                 // `export {imported as exported} from './m'` (re-export): record the
                 // (exported, imported, specifier) triples so the loader can resolve
                 // them against the dependency module. No local binding is created.
-                if let Some(src) = &e.source {
-                    let spec = src.value.to_string();
-                    for spec_item in &e.specifiers {
+                ast::ExportDecl::Named { specifiers, source: Some(source), .. } => {
+                    let spec = source.to_lossy_string();
+                    for spec_item in specifiers {
                         let exported = module_export_name(&spec_item.exported);
                         let imported = module_export_name(&spec_item.local);
                         self.cx.module_reexports.push((exported, imported, spec.clone()));
                     }
                     return Ok(());
                 }
+                // `export { local as exported, … }`.
+                ast::ExportDecl::Named { specifiers, .. } => {
+                    for spec in specifiers {
+                        let local = module_export_name(&spec.local);
+                        let exported = module_export_name(&spec.exported);
+                        self.cx.module_exports.push((exported, local));
+                    }
+                }
                 // `export var/let/const/function/class …`: compile the inner
                 // declaration normally (its top-level binding becomes a global), then
                 // record each bound name as an export (exported name == local name).
-                if let Some(decl) = &e.declaration {
-                    match decl {
-                        ox::Declaration::VariableDeclaration(d) => {
-                            self.var_decl(d)?;
-                            let mut names = std::collections::HashSet::new();
-                            for dd in &d.declarations {
-                                capture::collect_pattern_names(&dd.id, &mut names);
-                            }
-                            for n in names {
-                                self.cx.module_exports.push((n.clone(), n));
-                            }
+                ast::ExportDecl::Decl(decl) => match &**decl {
+                    S::VarDecl(d) => {
+                        self.var_decl(d)?;
+                        let mut names = std::collections::HashSet::new();
+                        for dd in &d.decls {
+                            capture::collect_pattern_names(&dd.id, &mut names);
                         }
-                        ox::Declaration::FunctionDeclaration(f) => {
-                            self.func_decl(f)?;
-                            if let Some(id) = &f.id {
-                                let n = id.name.to_string();
-                                self.cx.module_exports.push((n.clone(), n));
-                            }
-                        }
-                        ox::Declaration::ClassDeclaration(c) => {
-                            self.class_decl(c)?;
-                            if let Some(id) = &c.id {
-                                let n = id.name.to_string();
-                                self.cx.module_exports.push((n.clone(), n));
-                            }
-                        }
-                        _ => return Err("unsupported export declaration".into()),
-                    }
-                }
-                // `export { local as exported, … }`.
-                for spec in &e.specifiers {
-                    let local = module_export_name(&spec.local);
-                    let exported = module_export_name(&spec.exported);
-                    self.cx.module_exports.push((exported, local));
-                }
-            }
-            S::ExportDefaultDeclaration(e) => {
-                use ox::ExportDefaultDeclarationKind as K;
-                // Bind the default value to a synthetic global "*default*" (not a
-                // valid identifier, so no user collision) and export it as "default".
-                let slot = self.cx.global_slot("*default*") as u32;
-                let tmp = self.temp();
-                // `export default function f(){}` / `class C{}` also binds the NAME
-                // (f / C) as a module-local declaration, so code in the module can
-                // reference it (the slot is module-declared for per-module isolation).
-                let mut bind_name: Option<String> = None;
-                match &e.declaration {
-                    K::FunctionDeclaration(f) => {
-                        // A NAMED default hoistable declaration is an ordinary
-                        // MUTABLE module binding (`fn = 2` inside the body works,
-                        // unlike a function EXPRESSION self-name) and the export
-                        // entry LocalName is the NAME — ns.default tracks the
-                        // LIVE binding, not a *default* snapshot.
-                        if let Some(id) = &f.id {
-                            let n = id.name.to_string();
-                            self.func_decl(f)?;
-                            let nslot = self.cx.global_slot(&n) as u32;
-                            self.cx.decl_globals.insert(nslot);
-                            self.cx.module_exports.push(("default".to_string(), n));
-                            self.next_reg -= 1;
-                            return Ok(());
-                        }
-                        // An ANONYMOUS default-exported function/generator is named
-                        // "default" (NamedEvaluation) and HOISTS like any other
-                        // function declaration — `f()` before this statement works
-                        // through an `import f from './self'` alias.
-                        let (id, has_up) =
-                            self.compile_func_expr(Some("default".to_string()), f)?;
-                        if self.is_script && self.cx.script_binds_globals && !has_up {
-                            self.cx.functions[id as usize].name_global = Some(slot as u16);
-                            self.cx.decl_globals.insert(slot);
-                            self.next_reg -= 1;
-                            self.cx
-                                .module_exports
-                                .push(("default".to_string(), "*default*".to_string()));
-                            return Ok(());
-                        }
-                        self.emit_make_callable(tmp, id, has_up);
-                        bind_name = None;
-                    }
-                    K::ClassDeclaration(c) => {
-                        // An ANONYMOUS default-exported class is named "default".
-                        let r = self.class_expr(c, tmp, if c.id.is_none() { Some("default") } else { None })?;
-                        if r != tmp {
-                            self.emit(Instr::Move { dst: tmp, src: r });
-                        }
-                        bind_name = c.id.as_ref().map(|i| i.name.to_string());
-                    }
-                    other => {
-                        // `export default <AssignmentExpression>`: an anonymous
-                        // function/arrow/class expression is named "default"
-                        // (NamedEvaluation), like `const default = …` would.
-                        let expr = other.as_expression().ok_or("unsupported default export")?;
-                        let v = self.compile_named_init(tmp, expr, "default")?;
-                        if v != tmp {
-                            self.emit(Instr::Move { dst: tmp, src: v });
+                        for n in names {
+                            self.cx.module_exports.push((n.clone(), n));
                         }
                     }
-                }
-                self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
-                if let Some(name) = bind_name {
-                    let nslot = self.cx.global_slot(&name) as u32;
-                    self.cx.decl_globals.insert(nslot); // module-declared → per-module slot
-                    self.emit(Instr::StoreGlobal { idx: nslot, src: tmp });
-                }
-                self.next_reg -= 1;
-                self.cx
-                    .module_exports
-                    .push(("default".to_string(), "*default*".to_string()));
-            }
-            S::ExportAllDeclaration(e) => {
-                if let Some(exported) = &e.exported {
-                    // `export * as ns from './m'` exports the dependency's
-                    // NAMESPACE object under `ns` (linked by the loader).
+                    S::FnDecl(f) => {
+                        self.func_decl(f)?;
+                        if let Some(id) = &f.name {
+                            let n = id.to_string();
+                            self.cx.module_exports.push((n.clone(), n));
+                        }
+                    }
+                    S::ClassDecl(c) => {
+                        self.class_decl(c)?;
+                        if let Some(id) = &c.name {
+                            let n = id.to_string();
+                            self.cx.module_exports.push((n.clone(), n));
+                        }
+                    }
+                    _ => return Err("unsupported export declaration".into()),
+                },
+                ast::ExportDecl::Default(default) => {
+                    // Bind the default value to a synthetic global "*default*" (not a
+                    // valid identifier, so no user collision) and export it as "default".
+                    let slot = self.cx.global_slot("*default*") as u32;
+                    let tmp = self.temp();
+                    // `export default function f(){}` / `class C{}` also binds the NAME
+                    // (f / C) as a module-local declaration, so code in the module can
+                    // reference it (the slot is module-declared for per-module isolation).
+                    let mut bind_name: Option<String> = None;
+                    match default {
+                        ast::ExportDefault::Function(f) => {
+                            // A NAMED default hoistable declaration is an ordinary
+                            // MUTABLE module binding (`fn = 2` inside the body works,
+                            // unlike a function EXPRESSION self-name) and the export
+                            // entry LocalName is the NAME — ns.default tracks the
+                            // LIVE binding, not a *default* snapshot.
+                            if let Some(id) = &f.name {
+                                let n = id.to_string();
+                                self.func_decl(f)?;
+                                let nslot = self.cx.global_slot(&n) as u32;
+                                self.cx.decl_globals.insert(nslot);
+                                self.cx.module_exports.push(("default".to_string(), n));
+                                self.next_reg -= 1;
+                                return Ok(());
+                            }
+                            // An ANONYMOUS default-exported function/generator is named
+                            // "default" (NamedEvaluation) and HOISTS like any other
+                            // function declaration — `f()` before this statement works
+                            // through an `import f from './self'` alias.
+                            let (id, has_up) =
+                                self.compile_func_expr(Some("default".to_string()), f)?;
+                            if self.is_script && self.cx.script_binds_globals && !has_up {
+                                self.cx.functions[id as usize].name_global = Some(slot as u16);
+                                self.cx.decl_globals.insert(slot);
+                                self.next_reg -= 1;
+                                self.cx
+                                    .module_exports
+                                    .push(("default".to_string(), "*default*".to_string()));
+                                return Ok(());
+                            }
+                            self.emit_make_callable(tmp, id, has_up);
+                            bind_name = None;
+                        }
+                        ast::ExportDefault::Class(c) => {
+                            // An ANONYMOUS default-exported class is named "default".
+                            let r = self.class_expr(
+                                c,
+                                tmp,
+                                if c.name.is_none() { Some("default") } else { None },
+                            )?;
+                            if r != tmp {
+                                self.emit(Instr::Move { dst: tmp, src: r });
+                            }
+                            bind_name = c.name.as_ref().map(|i| i.to_string());
+                        }
+                        ast::ExportDefault::Expr(expr) => {
+                            // `export default <AssignmentExpression>`: an anonymous
+                            // function/arrow/class expression is named "default"
+                            // (NamedEvaluation), like `const default = …` would.
+                            let v = self.compile_named_init(tmp, expr, "default")?;
+                            if v != tmp {
+                                self.emit(Instr::Move { dst: tmp, src: v });
+                            }
+                        }
+                    }
+                    self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                    if let Some(name) = bind_name {
+                        let nslot = self.cx.global_slot(&name) as u32;
+                        self.cx.decl_globals.insert(nslot); // module-declared → per-module slot
+                        self.emit(Instr::StoreGlobal { idx: nslot, src: tmp });
+                    }
+                    self.next_reg -= 1;
                     self.cx
-                        .module_ns_reexports
-                        .push((module_export_name(exported), e.source.value.to_string()));
-                } else {
-                    // `export * from './m'` — copy all of the dependency's exports
-                    // (except default) into this module's namespace at link time.
-                    self.cx.module_star_reexports.push(e.source.value.to_string());
+                        .module_exports
+                        .push(("default".to_string(), "*default*".to_string()));
                 }
-            }
-            _ => return Err("unsupported statement (not in the zipp-vm v1 subset yet)".into()),
+                ast::ExportDecl::All { alias, source, .. } => {
+                    if let Some(exported) = alias {
+                        // `export * as ns from './m'` exports the dependency's
+                        // NAMESPACE object under `ns` (linked by the loader).
+                        self.cx
+                            .module_ns_reexports
+                            .push((module_export_name(exported), source.to_lossy_string()));
+                    } else {
+                        // `export * from './m'` — copy all of the dependency's exports
+                        // (except default) into this module's namespace at link time.
+                        self.cx.module_star_reexports.push(source.to_lossy_string());
+                    }
+                }
+            },
+            // NOTE: the former `_ => Err("unsupported statement (not in the zipp-vm
+            // v1 subset yet)")` arm is gone. It only ever fired for oxc's
+            // TypeScript-only `Statement` variants, which `ast::Stmt` does not
+            // have — every variant is handled above, so a catch-all would now be
+            // unreachable. A future variant will fail to compile here, which is
+            // the point.
         }
         Ok(())
     }
@@ -442,47 +485,46 @@ impl<'a> FnCompiler<'a> {
     /// Evaluate an initializer into `dst`, inferring a name for an anonymous
     /// function/arrow assigned to a binding (`const f = () => {}` ⇒ `f.name`
     /// === "f"). A named function expression keeps its own name.
-    pub(crate) fn compile_named_init(&mut self, dst: Reg, init: &ox::Expression, name: &str) -> R<Reg> {
+    pub(crate) fn compile_named_init(&mut self, dst: Reg, init: &ast::Expr, name: &str) -> R<Reg> {
         match init {
-            ox::Expression::ArrowFunctionExpression(a) => {
+            ast::Expr::Arrow(a) => {
                 let (id, _has_up) = self.compile_arrow(a, name)?;
                 self.emit_make_arrow(dst, id);
                 Ok(dst)
             }
-            ox::Expression::FunctionExpression(f) if f.id.is_none() => {
+            ast::Expr::Function(f) if f.name.is_none() => {
                 let (id, has_up) = self.compile_func_expr(Some(name.to_string()), f)?;
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
             // `const C = class {}` / `x = class {}` — an anonymous class takes the
             // binding name (a named `class C {}` keeps its own).
-            ox::Expression::ClassExpression(c) if c.id.is_none() => {
-                self.class_expr(c, dst, Some(name))
-            }
-            // NamedEvaluation sees through parentheses: `var f = (function(){})`.
-            ox::Expression::ParenthesizedExpression(p) => {
-                self.compile_named_init(dst, &p.expression, name)
-            }
+            ast::Expr::Class(c) if c.name.is_none() => self.class_expr(c, dst, Some(name)),
+            // NOTE: the `ParenthesizedExpression` arm is deleted, not lost.
+            // NamedEvaluation still sees through parentheses (`var f =
+            // (function(){})`) because the AST has no wrapper node at all — the
+            // arms above match the function/arrow/class directly. The one place
+            // parenthesization IS observable for NamedEvaluation, `(x) =
+            // function(){}`, is a property of the assignment TARGET
+            // (`Target::Ident { covered }`) and is handled in `assign.rs`.
             _ => self.expr_into(init, dst),
         }
     }
 
-    pub(crate) fn var_decl(&mut self, d: &ox::VariableDeclaration) -> R<()> {
+    pub(crate) fn var_decl(&mut self, d: &ast::VarDecl) -> R<()> {
         // A `const` binding is immutable: record its slot/register so a later
         // assignment throws a TypeError (initialization below never goes through
         // store_binding, so it is unaffected). `using`/`await using` bindings
         // are equally immutable (CreateImmutableBinding in the spec).
         let is_const = matches!(
             d.kind,
-            ox::VariableDeclarationKind::Const
-                | ox::VariableDeclarationKind::Using
-                | ox::VariableDeclarationKind::AwaitUsing
+            ast::VarKind::Const | ast::VarKind::Using | ast::VarKind::AwaitUsing
         );
-        for decl in &d.declarations {
+        for decl in &d.decls {
             // Destructuring declaration (`let {a,b} = o`, `let [x,...r] = arr`):
             // declare every leaf binding, evaluate the initializer once into a
             // scratch register, then extract each target from it.
-            if !matches!(decl.id, ox::BindingPattern::BindingIdentifier(_)) {
+            if !matches!(decl.id, ast::Pattern::Ident(_)) {
                 let init = decl
                     .init
                     .as_ref()
@@ -541,8 +583,8 @@ impl<'a> FnCompiler<'a> {
                 self.next_reg = save; // reclaim the source + extraction temps
                 continue;
             }
-            let name = match &decl.id {
-                ox::BindingPattern::BindingIdentifier(id) => id.name.as_str(),
+            let name: &str = match &decl.id {
+                ast::Pattern::Ident(id) => &**id,
                 _ => unreachable!("handled above"),
             };
             // Strict mode: `var eval` / `let arguments` etc. are early SyntaxErrors.
@@ -783,8 +825,8 @@ impl<'a> FnCompiler<'a> {
             // by the enclosing `compile_using_block`; it is always present for such a
             // declaration (the block/body/try that contains one is wrapped).
             let using_async = match d.kind {
-                ox::VariableDeclarationKind::Using => Some(false),
-                ox::VariableDeclarationKind::AwaitUsing => Some(true),
+                ast::VarKind::Using => Some(false),
+                ast::VarKind::AwaitUsing => Some(true),
                 _ => None,
             };
             // `await using` is only legal where `await` is (async function /
@@ -858,14 +900,13 @@ impl<'a> FnCompiler<'a> {
     /// Phase 1 of a destructuring declaration: declare every leaf binding the
     /// pattern introduces, so they occupy stable (low) registers / global slots
     /// and any captured ones are boxed before extraction writes to them.
-    pub(crate) fn declare_pattern(&mut self, pat: &ox::BindingPattern) -> R<()> {
-        use ox::BindingPattern as P;
+    pub(crate) fn declare_pattern(&mut self, pat: &ast::Pattern) -> R<()> {
+        use ast::Pattern as P;
         match pat {
-            P::BindingIdentifier(id) => {
+            P::Ident(id) => {
                 if self.is_script && !self.pattern_block_local {
-                    self.cx.global_slot(&id.name);
-                } else if self.scopes.len() == 1 && self.entry_lexicals.contains(id.name.as_str())
-                {
+                    self.cx.global_slot(id);
+                } else if self.scopes.len() == 1 && self.entry_lexicals.contains(&**id) {
                     // Pre-created as a cell at entry (a captured forward-referenced
                     // lexical); reuse it so extraction and the capturing closure
                     // share one cell rather than shadowing with a fresh binding.
@@ -874,85 +915,87 @@ impl<'a> FnCompiler<'a> {
                     // through `store_binding`, and a checked store would throw on
                     // the very cell it is initializing (`const {z} = {z:9}`).
                     if let Some(r) =
-                        self.scopes[0].iter().find(|(n, _)| n == id.name.as_str()).map(|(_, r)| *r)
+                        self.scopes[0].iter().find(|(n, _)| n == &**id).map(|(_, r)| *r)
                     {
                         self.entry_tdz_cells.remove(&r);
                     }
                 } else {
-                    self.declare_local(&id.name);
+                    self.declare_local(id);
                 }
                 Ok(())
             }
-            P::AssignmentPattern(ap) => self.declare_pattern(&ap.left),
-            P::ObjectPattern(op) => {
-                for prop in &op.properties {
+            P::Assign { left, .. } => self.declare_pattern(left),
+            P::Object { props, rest } => {
+                for prop in props {
                     self.declare_pattern(&prop.value)?;
                 }
-                if let Some(rest) = &op.rest {
-                    self.declare_pattern(&rest.argument)?;
+                if let Some(rest) = rest {
+                    self.declare_pattern(rest)?;
                 }
                 Ok(())
             }
-            P::ArrayPattern(arr) => {
-                for el in arr.elements.iter().flatten() {
-                    self.declare_pattern(el)?;
-                }
-                if let Some(rest) = &arr.rest {
-                    self.declare_pattern(&rest.argument)?;
+            // oxc kept `...r` in its own `rest` field beside `elements`; ours
+            // appends it to the element list as a trailing `Pattern::Rest`, so
+            // one pass over the elements covers both and still declares the rest
+            // binding LAST, exactly as before.
+            P::Array(elems) => {
+                for el in elems.iter().flatten() {
+                    self.declare_pattern(&el.pat)?;
                 }
                 Ok(())
             }
+            // Reached for a rest element (array or parameter list). The binding
+            // it introduces is the inner pattern's.
+            P::Rest(inner) => self.declare_pattern(inner),
         }
     }
 
     /// Phase 2: extract values from `src` (the initializer's value) into the
     /// already-declared bindings. Every temp this allocates sits above the
     /// declared locals, so callers reclaim them with a single `next_reg` reset.
-    pub(crate) fn extract_pattern(&mut self, pat: &ox::BindingPattern, src: Reg) -> R<()> {
-        use ox::BindingPattern as P;
+    pub(crate) fn extract_pattern(&mut self, pat: &ast::Pattern, src: Reg) -> R<()> {
+        use ast::Pattern as P;
         match pat {
-            P::BindingIdentifier(id) => {
-                let b = self.resolve(&id.name);
+            P::Ident(id) => {
+                let b = self.resolve(id);
                 self.store_binding(&b, src);
                 Ok(())
             }
             // `target = default`: `src` is our scratch temp, so patch the default
             // into it in place when it came out undefined, then bind the target.
-            P::AssignmentPattern(ap) => {
+            P::Assign { left, right } => {
                 // `[x = function(){}]` ⇒ the default function takes the name "x".
-                let name = match &ap.left {
-                    ox::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                let name = match &**left {
+                    P::Ident(id) => Some(id.to_string()),
                     _ => None,
                 };
-                self.apply_default_in_place_named(src, &ap.right, name.as_deref())?;
-                self.extract_pattern(&ap.left, src)
+                self.apply_default_in_place_named(src, right, name.as_deref())?;
+                self.extract_pattern(left, src)
             }
-            P::ObjectPattern(op) => {
+            P::Object { props, rest } => {
                 // RequireObjectCoercible(src): an object pattern with NO named
                 // properties (`{}` or `{...rest}`) never performs a member access,
                 // so without this an empty pattern would silently accept null /
                 // undefined. (A pattern WITH named properties throws via the
                 // GetProp/GetIndex below.)
-                if op.properties.is_empty() {
+                if props.is_empty() {
                     self.emit(Instr::CheckCoercible { src });
                 }
                 // With a `...rest` AND a computed sibling key, the exclusion set
                 // isn't known until runtime: evaluate each sibling key once into a
                 // contiguous block (reused for extraction + ObjectRestDyn).
-                if op.rest.is_some() && op.properties.iter().any(|p| p.computed) {
+                if rest.is_some()
+                    && props.iter().any(|p| matches!(p.key, ast::PropKey::Computed(_)))
+                {
                     let block_save = self.next_reg;
                     let keys_base = self.next_reg;
-                    let n = op.properties.len() as u16;
-                    for _ in 0..op.properties.len() {
+                    let n = props.len() as u16;
+                    for _ in 0..props.len() {
                         self.alloc_reg();
                     }
-                    for (i, prop) in op.properties.iter().enumerate() {
+                    for (i, prop) in props.iter().enumerate() {
                         let kreg = keys_base + i as Reg;
-                        if prop.computed {
-                            let e = prop
-                                .key
-                                .as_expression()
-                                .ok_or("unsupported computed destructuring key")?;
+                        if let ast::PropKey::Computed(e) = &prop.key {
                             let v = self.expr_into(e, kreg)?;
                             if v != kreg {
                                 self.emit(Instr::Move { dst: kreg, src: v });
@@ -963,7 +1006,7 @@ impl<'a> FnCompiler<'a> {
                             self.emit(Instr::LoadConst { dst: kreg, idx });
                         }
                     }
-                    for (i, prop) in op.properties.iter().enumerate() {
+                    for (i, prop) in props.iter().enumerate() {
                         let save = self.next_reg;
                         let kreg = keys_base + i as Reg;
                         let val = self.alloc_reg();
@@ -971,16 +1014,16 @@ impl<'a> FnCompiler<'a> {
                         self.extract_pattern(&prop.value, val)?;
                         self.next_reg = save;
                     }
-                    let rest = op.rest.as_ref().unwrap();
+                    let rest = rest.as_ref().unwrap();
                     let save = self.next_reg;
                     let val = self.alloc_reg();
                     self.emit(Instr::ObjectRestDyn { dst: val, src, keys_base, n });
-                    self.extract_pattern(&rest.argument, val)?;
+                    self.extract_pattern(rest, val)?;
                     self.next_reg = save;
                     self.next_reg = block_save;
                     return Ok(());
                 }
-                for prop in &op.properties {
+                for prop in props {
                     let save = self.next_reg;
                     // KeyedBindingInitialization order for an IDENTIFIER leaf
                     // inside a `with`: PropertyName evaluates first, then the
@@ -989,12 +1032,10 @@ impl<'a> FnCompiler<'a> {
                     // reads the property, then a default. The store goes to
                     // the base resolved UP FRONT (reference-record semantics —
                     // it never re-probes the chain).
-                    let leaf: Option<(String, Option<&ox::Expression>)> = match &prop.value {
-                        P::BindingIdentifier(id) => Some((id.name.to_string(), None)),
-                        P::AssignmentPattern(ap) => match &ap.left {
-                            P::BindingIdentifier(id) => {
-                                Some((id.name.to_string(), Some(&ap.right)))
-                            }
+                    let leaf: Option<(String, Option<&ast::Expr>)> = match &prop.value {
+                        P::Ident(id) => Some((id.to_string(), None)),
+                        P::Assign { left, right } => match &**left {
+                            P::Ident(id) => Some((id.to_string(), Some(&**right))),
                             _ => None,
                         },
                         _ => None,
@@ -1002,16 +1043,12 @@ impl<'a> FnCompiler<'a> {
                     if let Some((name, default)) = leaf {
                         let with_objs = self.with_obj_regs(&name);
                         if !with_objs.is_empty() {
-                            if prop.computed {
+                            if let ast::PropKey::Computed(e) = &prop.key {
                                 // Evaluate + ToPropertyKey the key NOW, so the
                                 // later GetIndex coercion is a no-op (single
                                 // observable toString) and the target probes
                                 // run between them, per spec.
                                 let kreg = self.alloc_reg();
-                                let e = prop
-                                    .key
-                                    .as_expression()
-                                    .ok_or("unsupported computed destructuring key")?;
                                 let v = self.expr_into(e, kreg)?;
                                 if v != kreg {
                                     self.emit(Instr::Move { dst: kreg, src: v });
@@ -1027,7 +1064,7 @@ impl<'a> FnCompiler<'a> {
                             } else {
                                 let target = self.with_resolve_target(&name, &with_objs);
                                 let val = self.alloc_reg();
-                                self.extract_member(src, &prop.key, false, val)?;
+                                self.extract_member(src, &prop.key, val)?;
                                 if let Some(d) = default {
                                     self.apply_default_in_place_named(val, d, Some(&name))?;
                                 }
@@ -1039,17 +1076,17 @@ impl<'a> FnCompiler<'a> {
                         self.next_reg = save;
                     }
                     let val = self.alloc_reg();
-                    self.extract_member(src, &prop.key, prop.computed, val)?;
+                    self.extract_member(src, &prop.key, val)?;
                     self.extract_pattern(&prop.value, val)?;
                     self.next_reg = save;
                 }
                 // `...rest` — a new object of `src`'s own keys minus the siblings.
-                if let Some(rest) = &op.rest {
+                if let Some(rest) = rest {
                     // Lay the excluded (sibling) names out contiguously so the op
                     // can reference them by index range.
                     let exclude_start = self.string_constants.len() as u32;
                     let mut exclude_count = 0u16;
-                    for prop in &op.properties {
+                    for prop in props {
                         let key = class_key_name(&prop.key)
                             .map_err(|_| "object-rest with a computed sibling key is not in the subset")?;
                         self.string_name(&key);
@@ -1058,12 +1095,23 @@ impl<'a> FnCompiler<'a> {
                     let save = self.next_reg;
                     let val = self.alloc_reg();
                     self.emit(Instr::ObjectRest { dst: val, src, exclude_start, exclude_count });
-                    self.extract_pattern(&rest.argument, val)?;
+                    self.extract_pattern(rest, val)?;
                     self.next_reg = save;
                 }
                 Ok(())
             }
-            P::ArrayPattern(arr) => {
+            P::Array(elems) => {
+                // oxc parked `...r` in its own field; ours appends it to the
+                // element list as a trailing `Pattern::Rest`. Split it back off so
+                // the fixed elements keep their original indices and the rest keeps
+                // its original `start` — the emitted code is unchanged.
+                let (fixed, rest): (&[Option<ast::PatternElem>], Option<&ast::Pattern>) =
+                    match elems.split_last() {
+                        Some((Some(ast::PatternElem { pat: P::Rest(inner) }), head)) => {
+                            (head, Some(&**inner))
+                        }
+                        _ => (&elems[..], None),
+                    };
                 // JS array destructuring uses the iterator protocol; positional
                 // GetIndex matches it for arrays/strings/Map/Set, so we only need
                 // to drain a generator / custom iterable into an array first.
@@ -1071,49 +1119,54 @@ impl<'a> FnCompiler<'a> {
                     let norm = self.alloc_reg();
                     // Pull only as many as the fixed elements need (unbounded with
                     // a `...rest`), so destructuring an infinite iterator is fine.
-                    let count =
-                        if arr.rest.is_some() { u32::MAX } else { arr.elements.len() as u32 };
+                    let count = if rest.is_some() { u32::MAX } else { fixed.len() as u32 };
                     self.emit(Instr::IterToArray { dst: norm, src, count });
                     norm
                 };
-                for (i, el) in arr.elements.iter().enumerate() {
+                for (i, el) in fixed.iter().enumerate() {
                     if let Some(p) = el {
                         let save = self.next_reg;
                         let val = self.alloc_reg();
                         let idx = self.alloc_reg();
                         self.emit(Instr::LoadInt { dst: idx, val: i as i32 });
                         self.emit(Instr::GetIndex { dst: val, obj: src, key: idx });
-                        self.extract_pattern(p, val)?;
+                        self.extract_pattern(&p.pat, val)?;
                         self.next_reg = save;
                     }
                     // a hole (`[, x]`) binds nothing
                 }
-                if let Some(rest) = &arr.rest {
+                if let Some(rest) = rest {
                     let save = self.next_reg;
                     let val = self.alloc_reg();
-                    self.emit(Instr::ArrayRest { dst: val, src, start: arr.elements.len() as u32 });
-                    self.extract_pattern(&rest.argument, val)?;
+                    self.emit(Instr::ArrayRest { dst: val, src, start: fixed.len() as u32 });
+                    self.extract_pattern(rest, val)?;
                     self.next_reg = save;
                 }
                 Ok(())
             }
+            // A bare rest pattern reaching here (a parameter list's `...r`, which
+            // `bind_params` extracts from an already-built array) binds its inner
+            // pattern from `src`. The array path above never routes through here —
+            // it splits the trailing rest off itself, because it also needs the
+            // element count that precedes it.
+            P::Rest(inner) => self.extract_pattern(inner, src),
         }
     }
 
     /// Read `obj[key]` into `dst` for a destructuring property. A static key
     /// (identifier / string / number) uses GetProp; a computed `[expr]` key is
     /// evaluated and read with GetIndex.
+    ///
+    /// NOTE: the `computed: bool` parameter is gone — computedness is a variant
+    /// of `PropKey`, not a sibling flag, so it can no longer disagree with the
+    /// key it describes.
     pub(crate) fn extract_member(
         &mut self,
         obj: Reg,
-        key: &ox::PropertyKey,
-        computed: bool,
+        key: &ast::PropKey,
         dst: Reg,
     ) -> R<()> {
-        if computed {
-            let e = key
-                .as_expression()
-                .ok_or("unsupported computed destructuring key")?;
+        if let ast::PropKey::Computed(e) = key {
             let save = self.next_reg; // `dst` was allocated below this
             let k = self.expr(e)?;
             self.emit(Instr::GetIndex { dst, obj, key: k });
@@ -1121,10 +1174,14 @@ impl<'a> FnCompiler<'a> {
             return Ok(());
         }
         let name = match key {
-            ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-            ox::PropertyKey::StringLiteral(s) => string_literal_key(s),
-            ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
-                                ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
+            ast::PropKey::Ident(id) => id.to_string(),
+            ast::PropKey::Str(s) => string_literal_key(s),
+            ast::PropKey::Num(n) => fmt_key_num(*n),
+            // NOTE: the former `PropertyKey::BigIntLiteral` arm (`b.value
+            // .to_string()`) has no counterpart — `ast::PropKey` has no BigInt
+            // variant, because an f64 cannot round-trip the exact decimal digits
+            // a BigInt key names. `({1n: 1})` is now rejected by the front end
+            // rather than here; a private key still lands on this arm, as before.
             _ => return Err("unsupported destructuring property key".into()),
         };
         let nidx = self.string_name(&name);
@@ -1134,7 +1191,7 @@ impl<'a> FnCompiler<'a> {
 
     /// `if (reg === undefined) reg = default` — apply a destructuring/parameter
     /// default to a scratch register in place.
-    pub(crate) fn apply_default_in_place(&mut self, reg: Reg, default: &ox::Expression) -> R<()> {
+    pub(crate) fn apply_default_in_place(&mut self, reg: Reg, default: &ast::Expr) -> R<()> {
         self.apply_default_in_place_named(reg, default, None)
     }
 
@@ -1144,7 +1201,7 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn apply_default_in_place_named(
         &mut self,
         reg: Reg,
-        default: &ox::Expression,
+        default: &ast::Expr,
         name: Option<&str>,
     ) -> R<()> {
         let save = self.next_reg;

@@ -5,17 +5,23 @@
 #![allow(unused_imports)]
 use super::*;
 
-pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
+// The AST this compiles. Imported explicitly (rather than relying on the glob
+// above) so the module qualifier is stable no matter how `mod.rs` spells its
+// own import; an explicit `use` shadows a glob, so this cannot conflict. Note
+// `Program` below is always the BYTECODE program — the AST one is `ast::Program`.
+use crate::parse::ast;
+
+pub fn compile_program(prog: &ast::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, false)
 }
 
 /// Compile a MODULE as the program entry: the top level is an async context
 /// (top-level `await`), and the VM runs func 0 as an async activation.
-pub fn compile_module(prog: &ox::Program, source: &str) -> R<Program> {
+pub fn compile_module(prog: &ast::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, true)
 }
 
-pub(crate) fn compile_program_inner(prog: &ox::Program, source: &str, module_mode: bool) -> R<Program> {
+pub(crate) fn compile_program_inner(prog: &ast::Program, source: &str, module_mode: bool) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.module_mode = module_mode;
     c.compile(prog)?;
@@ -66,16 +72,16 @@ impl Compiler {
 
 /// The top-level var + function declared names of a parsed eval body —
 /// EvalDeclarationInstantiation's varNames/functionNames for collision checks.
-pub fn eval_var_and_fn_names(prog: &ox::Program) -> Vec<String> {
+pub fn eval_var_and_fn_names(prog: &ast::Program) -> Vec<String> {
     let mut vars = std::collections::HashSet::new();
     for s in &prog.body {
         collect_hoisted_vars(s, &mut vars);
     }
     let mut out: Vec<String> = super::helpers::sorted_name_vec(&vars);
     for s in &prog.body {
-        if let ox::Statement::FunctionDeclaration(f) = s {
-            if let Some(id) = &f.id {
-                out.push(id.name.to_string());
+        if let ast::Stmt::FnDecl(f) = s {
+            if let Some(id) = &f.name {
+                out.push(id.to_string());
             }
         }
     }
@@ -83,7 +89,7 @@ pub fn eval_var_and_fn_names(prog: &ox::Program) -> Vec<String> {
 }
 
 pub fn compile_eval(
-    prog: &ox::Program,
+    prog: &ast::Program,
     source: &str,
     force_strict: bool,
     force_new_target_ok: bool,
@@ -114,27 +120,29 @@ pub fn compile_eval(
             }
             Ok(())
         };
-        let mut check_decl = |d: &ox::Declaration,
+        // `export <decl>` keeps the declaration it wraps, so the exported form
+        // goes through the same three cases as a bare one.
+        let mut check_decl = |d: &ast::Stmt,
                               lexical: &mut std::collections::HashSet<String>|
          -> Result<(), String> {
             match d {
-                ox::Declaration::VariableDeclaration(vd) if vd.kind.is_lexical() => {
+                ast::Stmt::VarDecl(vd) if vd.kind.is_lexical() => {
                     let mut names = std::collections::HashSet::new();
-                    for decl in &vd.declarations {
+                    for decl in &vd.decls {
                         capture::collect_pattern_names(&decl.id, &mut names);
                     }
                     for n in names {
                         add_lexical(n, lexical)?;
                     }
                 }
-                ox::Declaration::FunctionDeclaration(f) => {
-                    if let Some(id) = &f.id {
-                        add_lexical(id.name.to_string(), lexical)?;
+                ast::Stmt::FnDecl(f) => {
+                    if let Some(id) = &f.name {
+                        add_lexical(id.to_string(), lexical)?;
                     }
                 }
-                ox::Declaration::ClassDeclaration(cd) => {
-                    if let Some(id) = &cd.id {
-                        add_lexical(id.name.to_string(), lexical)?;
+                ast::Stmt::ClassDecl(cd) => {
+                    if let Some(id) = &cd.name {
+                        add_lexical(id.to_string(), lexical)?;
                     }
                 }
                 _ => {}
@@ -143,46 +151,45 @@ pub fn compile_eval(
         };
         for s in &prog.body {
             match s {
-                ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
                     let mut names = std::collections::HashSet::new();
-                    for decl in &d.declarations {
+                    for decl in &d.decls {
                         capture::collect_pattern_names(&decl.id, &mut names);
                     }
                     for n in names {
                         add_lexical(n, &mut lexical)?;
                     }
                 }
-                ox::Statement::FunctionDeclaration(f) => {
-                    if let Some(id) = &f.id {
-                        add_lexical(id.name.to_string(), &mut lexical)?;
+                ast::Stmt::FnDecl(f) => {
+                    if let Some(id) = &f.name {
+                        add_lexical(id.to_string(), &mut lexical)?;
                     }
                 }
-                ox::Statement::ClassDeclaration(cd) => {
-                    if let Some(id) = &cd.id {
-                        add_lexical(id.name.to_string(), &mut lexical)?;
+                ast::Stmt::ClassDecl(cd) => {
+                    if let Some(id) = &cd.name {
+                        add_lexical(id.to_string(), &mut lexical)?;
                     }
                 }
-                ox::Statement::ExportNamedDeclaration(e) => {
-                    if let Some(d) = &e.declaration {
-                        check_decl(d, &mut lexical)?;
-                    }
-                }
-                ox::Statement::ExportDefaultDeclaration(e) => {
-                    use ox::ExportDefaultDeclarationKind as K;
-                    match &e.declaration {
-                        K::FunctionDeclaration(f) => {
-                            if let Some(id) = &f.id {
-                                add_lexical(id.name.to_string(), &mut lexical)?;
+                // The named-with-declaration and default forms are one statement
+                // variant now; `export {…}` / `export * from …` declare nothing
+                // locally, so they still fall through.
+                ast::Stmt::Export(e) => match &**e {
+                    ast::ExportDecl::Decl(d) => check_decl(&**d, &mut lexical)?,
+                    ast::ExportDecl::Default(k) => match k {
+                        ast::ExportDefault::Function(f) => {
+                            if let Some(id) = &f.name {
+                                add_lexical(id.to_string(), &mut lexical)?;
                             }
                         }
-                        K::ClassDeclaration(cd) => {
-                            if let Some(id) = &cd.id {
-                                add_lexical(id.name.to_string(), &mut lexical)?;
+                        ast::ExportDefault::Class(cd) => {
+                            if let Some(id) = &cd.name {
+                                add_lexical(id.to_string(), &mut lexical)?;
                             }
                         }
-                        _ => {}
-                    }
-                }
+                        ast::ExportDefault::Expr(_) => {}
+                    },
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -214,14 +221,14 @@ pub fn compile_eval(
         let mut blockers = std::collections::HashSet::new();
         for s in &prog.body {
             match s {
-                ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
-                    for decl in &d.declarations {
+                ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    for decl in &d.decls {
                         capture::collect_pattern_names(&decl.id, &mut blockers);
                     }
                 }
-                ox::Statement::ClassDeclaration(cd) => {
-                    if let Some(id) = &cd.id {
-                        blockers.insert(id.name.to_string());
+                ast::Stmt::ClassDecl(cd) => {
+                    if let Some(id) = &cd.name {
+                        blockers.insert(id.to_string());
                     }
                 }
                 _ => {}
@@ -343,4 +350,67 @@ fn sorted_names(set: &std::collections::HashSet<String>) -> Vec<String> {
     let mut v: Vec<String> = set.iter().cloned().collect();
     v.sort_unstable();
     v
+}
+
+// ============================================================================
+// oxc entry points — temporary
+// ============================================================================
+//
+// The compiler consumes zipp's own AST; the engine still parses with oxc. These
+// lower at the boundary so exactly one thing changed in this step. They are
+// deleted with the bridge when the hand-written parser lands, and their callers
+// then pass the parser's output directly.
+
+use crate::parse::ast::Goal;
+use crate::parse::oxc_bridge::lower_program;
+use oxc_ast::ast as ox;
+
+pub fn compile_program_oxc(prog: &ox::Program, source: &str) -> R<Program> {
+    compile_program(&lower_program(prog, Goal::Script)?, source)
+}
+
+pub fn compile_module_oxc(prog: &ox::Program, source: &str) -> R<Program> {
+    compile_module(&lower_program(prog, Goal::Module)?, source)
+}
+
+pub fn eval_var_and_fn_names_oxc(prog: &ox::Program) -> Vec<String> {
+    // A lowering failure here means a construct the new AST cannot represent.
+    // Reporting no names matches the old behaviour for a program that fails to
+    // compile, and the compile itself will produce the real error.
+    match lower_program(prog, Goal::EvalScript) {
+        Ok(p) => eval_var_and_fn_names(&p),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_eval_oxc(
+    prog: &ox::Program,
+    source: &str,
+    force_strict: bool,
+    force_new_target_ok: bool,
+    inherit_super: Option<bool>,
+    ban_arguments: bool,
+    visible_privates: std::collections::HashSet<String>,
+    is_module: bool,
+    inherit_super_obj: bool,
+    caller_scope: Vec<String>,
+    fn_var_env: bool,
+    exact_src: Option<&[u8]>,
+) -> R<Program> {
+    let goal = if is_module { Goal::Module } else { Goal::EvalScript };
+    compile_eval(
+        &lower_program(prog, goal)?,
+        source,
+        force_strict,
+        force_new_target_ok,
+        inherit_super,
+        ban_arguments,
+        visible_privates,
+        is_module,
+        inherit_super_obj,
+        caller_scope,
+        fn_var_env,
+        exact_src,
+    )
 }

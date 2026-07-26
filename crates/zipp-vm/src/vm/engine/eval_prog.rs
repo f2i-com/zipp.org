@@ -526,7 +526,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = crate::compile::compile_program(&ret.program, code)
+        let prog = crate::compile::compile_program_oxc(&ret.program, code)
             .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
         // Dev aid (same flag as the main-program dump in lib.rs).
         if std::env::var_os("ZIPP_VM_DUMP").is_some() {

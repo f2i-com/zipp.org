@@ -718,7 +718,7 @@ impl<'p> Vm<'p> {
                     .iter()
                     .any(|d| d.directive.as_str() == "use strict");
             if !src_strict {
-                for n in crate::compile::eval_var_and_fn_names(&ret.program) {
+                for n in crate::compile::eval_var_and_fn_names_oxc(&ret.program) {
                     if param_collisions.as_ref().map_or(false, |c| c.iter().any(|c| *c == n)) {
                         return Err(Thrown(format!(
                             "SyntaxError: Identifier '{n}' has already been declared"
@@ -786,7 +786,7 @@ impl<'p> Vm<'p> {
             (std::collections::HashSet::new(), None)
         };
         // 2. Compile in eval mode (top-level returns its completion value).
-        let eval_prog = match crate::compile::compile_eval(
+        let eval_prog = match crate::compile::compile_eval_oxc(
             &ret.program,
             code,
             force_strict,

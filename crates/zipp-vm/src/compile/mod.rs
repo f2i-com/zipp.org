@@ -1,4 +1,4 @@
-//! Compile the oxc AST directly to register bytecode.
+//! Compile the AST directly to register bytecode.
 //!
 //! Two passes over the source:
 //!
@@ -20,7 +20,15 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use oxc_ast::ast as ox;
+// The AST, under both spellings: `ast::Expr` for code that wants the prefix and
+// a bare `Expr` for code that does not. `Program` deliberately still names
+// `crate::bytecode::Program` — an explicit import shadows a glob one, exactly as
+// it did when the AST type was `ox::Program`; the AST's is `ast::Program`.
+use crate::parse::ast::{self, *};
+// Not re-exported by `ast` (it imports them privately), so they come from the
+// token module: `Span` is what a `Function`/`Arrow`/`Class` carries for
+// `Function.prototype.toString`, and `StrVal` is every string literal's value.
+use crate::parse::token::{Span, StrVal};
 
 use crate::bytecode::{
     BitwiseOp, ClassDef, FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource,
@@ -78,14 +86,21 @@ struct Compiler {
     /// `global_index` guarded against: one `contains` scan per top-level `var`.
     hoisted_set: rustc_hash::FxHashSet<u32>,
     /// The full program source, kept so each function can record its exact
-    /// source slice (by oxc span) for `Function.prototype.toString`.
+    /// source slice (by span) for `Function.prototype.toString`.
     source: String,
     /// EXACT WTF-8 bytes of the source, present only when an eval'd code
     /// string held lone surrogates (`source` is then the LOSSY view — U+FFFD
-    /// per surrogate; both encodings are 3 bytes, so byte offsets/oxc spans
+    /// per surrogate; both encodings are 3 bytes, so byte offsets/spans
     /// in `source` index `exact_src` identically). Lets a regex literal
     /// recover its exact pattern bytes. None for well-formed sources (the
     /// overwhelmingly common case) — zero cost there.
+    ///
+    /// NOTE: the recovery in `exprs.rs` indexes this by the REGEX LITERAL's
+    /// span, and `Expr::Regex` carries none — only `Function`, `Arrow` and
+    /// `Class` do. Whoever ports that site needs either a span on the regex node
+    /// or the pattern to arrive as a `StrVal::Utf16`, which is the whole point
+    /// of `StrVal` and would retire this field. Left in place here because
+    /// removing it is a behaviour change, not a type port.
     exact_src: Option<Vec<u8>>,
     /// True when compiling an `eval` code string: the top-level script returns
     /// its *completion value* (the value of the last evaluated expression
@@ -318,15 +333,24 @@ fn placeholder(name: &str) -> FuncProto {
 
 /// True if a directive prologue opens with `"use strict"`. Per spec the match is
 /// against the directive's RAW source (so an escaped `"use strict"` does NOT
-/// count); oxc's `Directive.directive` holds exactly that unescaped-but-raw text.
-fn has_use_strict(directives: &[ox::Directive]) -> bool {
-    directives.iter().any(|d| d.directive.as_str() == "use strict")
+/// count); `Directive.raw` holds exactly that unescaped-but-raw text, which is
+/// why the cooked `Directive.value` is not what is compared.
+fn has_use_strict(directives: &[ast::Directive]) -> bool {
+    directives.iter().any(|d| &*d.raw == "use strict")
 }
 
-/// A function's directive prologue (empty when the function has no body), used to
-/// detect its own `"use strict"`.
-fn fn_directives<'a>(f: &'a ox::Function<'a>) -> &'a [ox::Directive<'a>] {
-    f.body.as_ref().map(|b| b.directives.as_slice()).unwrap_or(&[])
+/// A function's directive prologue, used to detect its own `"use strict"`.
+///
+/// NOTE: `FnBody` also carries a `strict` flag, but it is NOT a substitute here.
+/// That flag folds in INHERITED strictness (a class member's body is strict with
+/// no prologue at all), whereas every caller of this wants the body's own
+/// prologue OR'd with `cx.in_strict` itself. Reading `body.strict` would make
+/// `strict_name_err` fire on sloppy-legal parameter names inside class methods,
+/// which is a behaviour change, so the prologue scan stays.
+fn fn_directives(f: &ast::Function) -> &[ast::Directive] {
+    // A bodiless function (TypeScript declaration / overload signature) is not
+    // representable, so the `unwrap_or(&[])` the oxc shape needed is gone.
+    &f.body.directives
 }
 
 /// Per-function compilation state.
@@ -337,7 +361,7 @@ struct FnCompiler<'a> {
     string_constants: Vec<String>,
     /// BigInt literal constants beyond i128 (see `FuncProto::bigint_consts`).
     bigint_consts: Vec<num_bigint::BigInt>,
-    /// `string_constants` indices holding the oxc lone-surrogate MARKER form
+    /// `string_constants` indices holding the lone-surrogate MARKER form
     /// (see `Function::wtf8_consts`).
     wtf8_consts: Vec<u32>,
     /// Lexical scope chain: each entry is (name, register).

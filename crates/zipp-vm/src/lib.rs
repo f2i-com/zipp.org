@@ -117,7 +117,7 @@ fn compile_only(src: &str, module: bool) -> Result<bytecode::Program, String> {
         }
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
-    compile::compile_program(&ret.program, src)
+    compile::compile_program_oxc(&ret.program, src)
 }
 
 /// Like [`run`], but `base_dir` is the directory the script was loaded from, used
@@ -139,7 +139,7 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
         }
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
-    let program = compile::compile_program(&ret.program, src)?;
+    let program = compile::compile_program_oxc(&ret.program, src)?;
     // Dev aid: `ZIPP_VM_DUMP=1` prints each function's bytecode to stderr before
     // running (so the JIT-able regions can be inspected).
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
@@ -285,7 +285,7 @@ pub fn run_module_file(
     if !ret.errors.is_empty() {
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
-    compile::compile_module(&ret.program, &src)?;
+    compile::compile_module_oxc(&ret.program, &src)?;
     // The harness (if any) runs as a realm SCRIPT — its vars become realm
     // globals every module can reference — then the entry loads through the
     // module loader: imports link before evaluation and the module's own
@@ -299,7 +299,7 @@ pub fn run_module_file(
     if !host_ret.errors.is_empty() {
         return Err(format!("SyntaxError: {}", host_ret.errors[0]));
     }
-    let host = compile::compile_program(&host_ret.program, &host_src)?;
+    let host = compile::compile_program_oxc(&host_ret.program, &host_src)?;
     let mut vm = vm::Vm::new(&host);
     vm.set_module_base_dir(base_dir.clone());
     if let Err(thrown) = vm.run() {
@@ -335,7 +335,7 @@ pub fn run_module_file(
             if !ret2.errors.is_empty() {
                 return Err(format!("SyntaxError: {}", ret2.errors[0]));
             }
-            let program2 = compile::compile_module(&ret2.program, text)?;
+            let program2 = compile::compile_module_oxc(&ret2.program, text)?;
             let mut vm = vm::Vm::new(&program2);
             vm.set_module_base_dir(base_dir);
             match vm.run_module() {
@@ -361,7 +361,7 @@ pub fn run_module_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> 
     if !ret.errors.is_empty() {
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
-    let program = compile::compile_module(&ret.program, src)?;
+    let program = compile::compile_module_oxc(&ret.program, src)?;
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
             eprintln!("── fn {fid} (regs={}, params={}) ──", f.reg_count, f.param_count);
@@ -572,7 +572,7 @@ mod tests {
         let allocator = Allocator::default();
         let ret = Parser::new(&allocator, src, SourceType::unambiguous()).parse();
         assert!(ret.errors.is_empty(), "parse error: {:?}", ret.errors);
-        let program = compile::compile_program(&ret.program, src).expect("compile");
+        let program = compile::compile_program_oxc(&ret.program, src).expect("compile");
         let mut vm = vm::Vm::new(&program);
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         vm.set_jit_enabled(false);
@@ -1305,6 +1305,32 @@ mod tests {
         assert_eq!(run_ok("let a = [10, 20, 30]; console.log(a[0], a[1], a[2])"), vec!["10 20 30"]);
         assert_eq!(run_ok("let a = [1,2,3]; console.log(a.length)"), vec!["3"]);
         assert_eq!(run_ok("let a = [1,2,3]; a[1] = 99; console.log(a[1])"), vec!["99"]);
+    }
+
+    #[test]
+    fn a_parenthesized_receiver_still_guards_the_callee_get() {
+        // EvaluateCall does `func = GetValue(ref)` BEFORE ArgumentListEvaluation,
+        // so `(o.a).m(arg())` must throw on the `.m` get of a nullish `o.a`
+        // without ever calling `arg()`.
+        //
+        // This regressed silently for years because the check was gated on the
+        // receiver being one of the parser's member-expression node kinds, and a
+        // PARENTHESIZED member was not one of them — so wrapping the receiver in
+        // parentheses quietly disabled it. The AST has no parenthesized-expression
+        // node, which is what closed it.
+        assert_eq!(
+            run_ok(
+                "var evaluated = false;                  function arg() { evaluated = true; return 1; }                  var o = { a: null };                  try { (o.a).m(arg()); } catch (e) {}                  console.log(evaluated)"
+            ),
+            vec!["false"]
+        );
+        // Unparenthesized was always correct; it must stay that way.
+        assert_eq!(
+            run_ok(
+                "var evaluated = false;                  function arg() { evaluated = true; return 1; }                  var o = { a: null };                  try { o.a.m(arg()); } catch (e) {}                  console.log(evaluated)"
+            ),
+            vec!["false"]
+        );
     }
 
     #[test]

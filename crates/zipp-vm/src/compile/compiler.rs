@@ -5,6 +5,12 @@
 #![allow(unused_imports)]
 use super::*;
 
+// The AST this compiles. Imported explicitly (rather than relying on the glob
+// above) so the module qualifier is stable no matter how `mod.rs` spells its
+// own import; an explicit `use` shadows a glob, so this cannot conflict.
+use crate::parse::ast;
+use crate::parse::token::StrVal;
+
 impl Compiler {
     pub(crate) fn new(source: String) -> Compiler {
         Compiler {
@@ -101,11 +107,15 @@ impl Compiler {
         i
     }
 
-    pub(crate) fn compile(&mut self, prog: &ox::Program) -> R<()> {
+    pub(crate) fn compile(&mut self, prog: &ast::Program) -> R<()> {
         // Module code is always strict; a script is sloppy unless its directive
         // prologue says `"use strict"` (folded in by `compile_function_body`). A
         // direct eval from strict code forces strict for the whole eval program.
-        self.in_strict = prog.source_type.is_module() || self.force_strict;
+        // NOTE: `Program::strict` already ORs in the prologue, but this seeds only
+        // the INHERITED strictness — the prologue is applied one level down, per
+        // body, so `Goal::Module` (the old `source_type.is_module()`) is what is
+        // read here and the field stays deliberately unused.
+        self.in_strict = prog.goal == ast::Goal::Module || self.force_strict;
         // Reserve function id 0 for the top-level script body; fill it last so
         // nested function ids are stable as we discover them.
         self.functions.push(placeholder("<script>"));
@@ -116,15 +126,15 @@ impl Compiler {
         let binds_globals = self.script_binds_globals;
         for s in prog.body.iter().filter(|_| binds_globals) {
             match s {
-                ox::Statement::FunctionDeclaration(f) => {
-                    if let Some(id) = &f.id {
-                        let slot = self.global_slot(id.name.as_str()) as u32;
+                ast::Stmt::FnDecl(f) => {
+                    if let Some(id) = &f.name {
+                        let slot = self.global_slot(id) as u32;
                         self.decl_globals.insert(slot);
                     }
                 }
-                ox::Statement::ClassDeclaration(c) => {
-                    if let Some(id) = &c.id {
-                        let slot = self.global_slot(id.name.as_str()) as u32;
+                ast::Stmt::ClassDecl(c) => {
+                    if let Some(id) = &c.name {
+                        let slot = self.global_slot(id) as u32;
                         self.decl_globals.insert(slot);
                     }
                 }
@@ -190,9 +200,9 @@ impl Compiler {
         self_name: Option<&str>,
         params: &[String],
         rest: Option<&str>,
-        params_ast: Option<&ox::FormalParameters>,
-        body: &[ox::Statement],
-        directives: &[ox::Directive],
+        params_ast: Option<&ast::Params>,
+        body: &[ast::Stmt],
+        directives: &[ast::Directive],
         is_script: bool,
         is_generator: bool,
         is_async: bool,
@@ -235,18 +245,20 @@ impl Compiler {
         // Early errors on a generator/async FormalParameterList: a generator's
         // parameters may not contain a YieldExpression and an async function's
         // may not contain an AwaitExpression (covers `function* g(x = yield)`
-        // and the dynamic `GeneratorFunction('x = yield', '')` forms; oxc
-        // parses these but defers the error to semantic analysis).
+        // and the dynamic `GeneratorFunction('x = yield', '')` forms; the AST
+        // records no [Yield]/[Await] parameter context, so the check lives here).
+        // A parameter's DEFAULT is `Pattern::Assign`'s right side and the rest
+        // parameter is the trailing `Pattern::Rest`, so one walk over `items`
+        // covers what used to be three separate scans (initializer, pattern, rest).
+        // NOTE: that relies on `pattern_has_yield_or_await` recursing through BOTH
+        // of those variants — they are the two the old parameter shape kept outside
+        // the pattern, so they are exactly what its port must not drop.
         if is_generator || is_async {
             if let Some(pa) = params_ast {
-                let bad = pa.items.iter().any(|item| {
-                    item.initializer
-                        .as_ref()
-                        .map_or(false, |init| expr_has_yield_or_await(init, is_generator, is_async))
-                        || pattern_has_yield_or_await(&item.pattern, is_generator, is_async)
-                }) || pa.rest.as_ref().map_or(false, |r| {
-                    pattern_has_yield_or_await(&r.rest.argument, is_generator, is_async)
-                });
+                let bad = pa
+                    .items
+                    .iter()
+                    .any(|item| pattern_has_yield_or_await(item, is_generator, is_async));
                 if bad {
                     return Err(
                         "SyntaxError: yield/await expression not permitted in formal parameters"
@@ -353,11 +365,7 @@ impl Compiler {
             for d in directives {
                 // A directive's literal may carry lone surrogates
                 // (`eval("'\uD800'")` completes with the 1-unit string).
-                let idx = if d.expression.lone_surrogates {
-                    fc.add_string_const_wtf8(d.expression.value.as_str())
-                } else {
-                    fc.add_string_const(d.expression.value.as_str())
-                };
+                let idx = add_str_val_const(&mut fc, &d.value);
                 fc.emit(Instr::LoadConst { dst: cr, idx });
             }
         }
@@ -418,12 +426,12 @@ impl Compiler {
         // Nested names become locals, populated by a `MakeFunc` at the point
         // `func_decl` reaches them.
         for s in body {
-            if let ox::Statement::FunctionDeclaration(f) = s {
-                if let Some(id) = &f.id {
+            if let ast::Stmt::FnDecl(f) = s {
+                if let Some(id) = &f.name {
                     if is_script && fc.cx.script_binds_globals {
-                        fc.cx.global_slot(id.name.as_str());
+                        fc.cx.global_slot(id);
                     } else {
-                        fc.declare_local(id.name.as_str());
+                        fc.declare_local(id);
                     }
                 }
             }
@@ -456,21 +464,21 @@ impl Compiler {
             }
             for s in body {
                 match s {
-                    ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
-                        for decl in &d.declarations {
+                    ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                        for decl in &d.decls {
                             capture::collect_pattern_names(&decl.id, &mut blockers);
                             capture::collect_pattern_names(&decl.id, &mut protect);
                         }
                     }
-                    ox::Statement::ClassDeclaration(c) => {
-                        if let Some(id) = &c.id {
-                            blockers.insert(id.name.to_string());
-                            protect.insert(id.name.to_string());
+                    ast::Stmt::ClassDecl(c) => {
+                        if let Some(id) = &c.name {
+                            blockers.insert(id.to_string());
+                            protect.insert(id.to_string());
                         }
                     }
-                    ox::Statement::FunctionDeclaration(f) => {
-                        if let Some(id) = &f.id {
-                            blockers.insert(id.name.to_string());
+                    ast::Stmt::FnDecl(f) => {
+                        if let Some(id) = &f.name {
+                            blockers.insert(id.to_string());
                         }
                     }
                     _ => {}
@@ -486,10 +494,10 @@ impl Compiler {
                 let mut script_blockers = blockers.clone();
                 let mut fn_names = std::collections::HashSet::new();
                 for s in body {
-                    if let ox::Statement::FunctionDeclaration(f) = s {
-                        if let Some(id) = &f.id {
-                            script_blockers.remove(id.name.as_str());
-                            fn_names.insert(id.name.to_string());
+                    if let ast::Stmt::FnDecl(f) = s {
+                        if let Some(id) = &f.name {
+                            script_blockers.remove(&**id);
+                            fn_names.insert(id.to_string());
                         }
                     }
                 }
@@ -550,40 +558,36 @@ impl Compiler {
         // (Modules reach here through TWO pipelines: compile_module for the
         // entry — module_mode — and compile_eval(is_module) from the engine's
         // loader — eval_mode with module-style globals.)
+        // NOTE: the `with { … }` clause is a plain `Vec<ImportAttribute>` on the
+        // declaration now, so `with_clause_type` is called with that list —
+        // `with_clause_type(&[ast::ImportAttribute])` is the ported signature this
+        // assumes (string_accum.rs owns it).
         if is_script && (fc.cx.module_mode || (fc.cx.eval_mode && !fc.cx.eval_locals)) {
             use crate::bytecode::{ImportEntry, ImportName};
             for s in body {
                 match s {
-                    ox::Statement::ImportDeclaration(d) => {
+                    ast::Stmt::Import(d) => {
                         // `import defer * as ns` binds the module's DEFERRED
                         // namespace; `import source x` binds the target's
                         // ModuleSource object; a bindingless phase form stays
                         // load-only.
-                        if !matches!(d.phase, None) {
-                            let defer_ns_local = if matches!(d.phase, Some(ox::ImportPhase::Defer))
-                            {
-                                d.specifiers.as_ref().and_then(|specs| {
-                                    specs.iter().find_map(|sp| match sp {
-                                        ox::ImportDeclarationSpecifier::ImportNamespaceSpecifier(
-                                            i,
-                                        ) => Some(i.local.name.to_string()),
-                                        _ => None,
-                                    })
+                        if !matches!(d.phase, ast::ImportPhase::Evaluation) {
+                            let defer_ns_local = if matches!(d.phase, ast::ImportPhase::Defer) {
+                                d.specifiers.iter().find_map(|sp| match sp {
+                                    ast::ImportSpecifier::Namespace(local) => {
+                                        Some(local.to_string())
+                                    }
+                                    _ => None,
                                 })
                             } else {
                                 None
                             };
                             // `import source x from '…'` parses as phase Source
                             // with a default-shaped binding specifier.
-                            let source_local = if matches!(d.phase, Some(ox::ImportPhase::Source))
-                            {
-                                d.specifiers.as_ref().and_then(|specs| {
-                                    specs.iter().find_map(|sp| match sp {
-                                        ox::ImportDeclarationSpecifier::ImportDefaultSpecifier(
-                                            i,
-                                        ) => Some(i.local.name.to_string()),
-                                        _ => None,
-                                    })
+                            let source_local = if matches!(d.phase, ast::ImportPhase::Source) {
+                                d.specifiers.iter().find_map(|sp| match sp {
+                                    ast::ImportSpecifier::Default(local) => Some(local.to_string()),
+                                    _ => None,
                                 })
                             } else {
                                 None
@@ -595,8 +599,8 @@ impl Compiler {
                                 fc.cx.module_imports.push(ImportEntry {
                                     local_slot: slot,
                                     import: ImportName::Source,
-                                    specifier: d.source.value.to_string(),
-                                    mtype: with_clause_type(&d.with_clause),
+                                    specifier: str_val_text(&d.source),
+                                    mtype: with_clause_type(&d.attributes),
                                 });
                             } else if let Some(local) = defer_ns_local {
                                 let slot = fc.cx.global_slot(&local) as u32;
@@ -605,75 +609,78 @@ impl Compiler {
                                 fc.cx.module_imports.push(ImportEntry {
                                     local_slot: slot,
                                     import: ImportName::DeferNamespace,
-                                    specifier: d.source.value.to_string(),
-                                    mtype: with_clause_type(&d.with_clause),
+                                    specifier: str_val_text(&d.source),
+                                    mtype: with_clause_type(&d.attributes),
                                 });
                             } else {
                                 fc.cx.module_imports.push(ImportEntry {
                                     local_slot: u32::MAX,
                                     import: ImportName::LoadOnly,
-                                    specifier: d.source.value.to_string(),
-                                    mtype: with_clause_type(&d.with_clause),
+                                    specifier: str_val_text(&d.source),
+                                    mtype: with_clause_type(&d.attributes),
                                 });
                             }
                             continue;
                         }
-                        let spec = d.source.value.to_string();
-                        match &d.specifiers {
-                            Some(specs) if !specs.is_empty() => {
-                                for sp in specs {
-                                    use ox::ImportDeclarationSpecifier as IS;
-                                    let (local, import) = match sp {
-                                        IS::ImportSpecifier(i) => (
-                                            i.local.name.to_string(),
-                                            ImportName::Named(module_export_name(&i.imported)),
-                                        ),
-                                        IS::ImportDefaultSpecifier(i) => {
-                                            (i.local.name.to_string(), ImportName::Default)
-                                        }
-                                        IS::ImportNamespaceSpecifier(i) => {
-                                            (i.local.name.to_string(), ImportName::Namespace)
-                                        }
-                                    };
-                                    let slot = fc.cx.global_slot(&local) as u32;
-                                    fc.cx.decl_globals.insert(slot);
-                                    fc.cx.const_globals.insert(slot);
-                                    fc.cx.module_imports.push(ImportEntry {
-                                        local_slot: slot,
-                                        import,
-                                        specifier: spec.clone(),
-                                        mtype: with_clause_type(&d.with_clause),
-                                    });
-                                }
-                            }
-                            _ => {
+                        let spec = str_val_text(&d.source);
+                        // `import "m"` (no specifier clause at all) and
+                        // `import {} from "m"` both arrive as an empty list —
+                        // the same SideEffect entry either way, as before.
+                        if !d.specifiers.is_empty() {
+                            for sp in &d.specifiers {
+                                let (local, import) = match sp {
+                                    ast::ImportSpecifier::Named { imported, local } => (
+                                        local.to_string(),
+                                        ImportName::Named(module_export_name(imported)),
+                                    ),
+                                    ast::ImportSpecifier::Default(local) => {
+                                        (local.to_string(), ImportName::Default)
+                                    }
+                                    ast::ImportSpecifier::Namespace(local) => {
+                                        (local.to_string(), ImportName::Namespace)
+                                    }
+                                };
+                                let slot = fc.cx.global_slot(&local) as u32;
+                                fc.cx.decl_globals.insert(slot);
+                                fc.cx.const_globals.insert(slot);
                                 fc.cx.module_imports.push(ImportEntry {
-                                    local_slot: u32::MAX,
-                                    import: ImportName::SideEffect,
+                                    local_slot: slot,
+                                    import,
                                     specifier: spec.clone(),
-                                    mtype: with_clause_type(&d.with_clause),
+                                    mtype: with_clause_type(&d.attributes),
                                 });
                             }
-                        }
-                    }
-                    ox::Statement::ExportNamedDeclaration(e) => {
-                        if let Some(srcspec) = &e.source {
+                        } else {
                             fc.cx.module_imports.push(ImportEntry {
                                 local_slot: u32::MAX,
                                 import: ImportName::SideEffect,
-                                specifier: srcspec.value.to_string(),
-                                mtype: with_clause_type(&e.with_clause),
+                                specifier: spec.clone(),
+                                mtype: with_clause_type(&d.attributes),
                             });
                         }
                     }
-                    ox::Statement::ExportAllDeclaration(e) => {
-                        fc.cx.module_imports.push(ImportEntry {
-                            local_slot: u32::MAX,
-                            import: ImportName::SideEffect,
-                            specifier: e.source.value.to_string(),
-                            mtype: with_clause_type(&e.with_clause),
-                        });
-                    }
+                    // The two export forms that name a SOURCE module are one
+                    // statement variant now, so they share an arm; the order of
+                    // pushes is still source order.
+                    ast::Stmt::Export(e) => match &**e {
+                        ast::ExportDecl::Named { source: Some(srcspec), attributes, .. } => {
+                            fc.cx.module_imports.push(ImportEntry {
+                                local_slot: u32::MAX,
+                                import: ImportName::SideEffect,
+                                specifier: str_val_text(srcspec),
+                                mtype: with_clause_type(attributes),
+                            });
+                        }
+                        ast::ExportDecl::All { source, attributes, .. } => {
+                            fc.cx.module_imports.push(ImportEntry {
+                                local_slot: u32::MAX,
+                                import: ImportName::SideEffect,
+                                specifier: str_val_text(source),
+                                mtype: with_clause_type(attributes),
+                            });
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -683,30 +690,32 @@ impl Compiler {
             // ExportNamedDeclaration — same lexical binding, same TDZ.)
             for s in body {
                 let (var_decl, class_decl) = match s {
-                    ox::Statement::VariableDeclaration(d) => (Some(d), None),
-                    ox::Statement::ClassDeclaration(c) => (None, Some(c)),
-                    ox::Statement::ExportNamedDeclaration(e) => match &e.declaration {
-                        Some(ox::Declaration::VariableDeclaration(d)) => (Some(d), None),
-                        Some(ox::Declaration::ClassDeclaration(c)) => (None, Some(c)),
+                    ast::Stmt::VarDecl(d) => (Some(d), None),
+                    ast::Stmt::ClassDecl(c) => (None, Some(&**c)),
+                    ast::Stmt::Export(e) => match &**e {
+                        ast::ExportDecl::Decl(d) => match &**d {
+                            ast::Stmt::VarDecl(v) => (Some(v), None),
+                            ast::Stmt::ClassDecl(c) => (None, Some(&**c)),
+                            _ => (None, None),
+                        },
                         _ => (None, None),
                     },
                     _ => (None, None),
                 };
                 if let Some(d) = var_decl {
                     if d.kind.is_lexical() {
-                        for decl in &d.declarations {
-                            if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
+                        for decl in &d.decls {
+                            if let ast::Pattern::Ident(id) = &decl.id {
                                 // GlobalDeclarationInstantiation step 5: a top-level
                                 // lexical name colliding with a RESTRICTED global
                                 // property (the non-configurable value properties
                                 // undefined/NaN/Infinity) is a SyntaxError.
-                                if matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
+                                if matches!(&**id, "undefined" | "NaN" | "Infinity") {
                                     return Err(format!(
-                                        "SyntaxError: lexical declaration of '{}' collides with a restricted global property",
-                                        id.name
+                                        "SyntaxError: lexical declaration of '{id}' collides with a restricted global property"
                                     ));
                                 }
-                                let slot = fc.cx.global_slot(id.name.as_str()) as u32;
+                                let slot = fc.cx.global_slot(id) as u32;
                                 fc.cx.lexical_globals.insert(slot);
                             }
                         }
@@ -715,8 +724,8 @@ impl Compiler {
                 // A top-level CLASS declaration is a lexical binding with the
                 // same TDZ (typeof C before it runs is a ReferenceError).
                 if let Some(c) = class_decl {
-                    if let Some(id) = &c.id {
-                        let slot = fc.cx.global_slot(id.name.as_str()) as u32;
+                    if let Some(id) = &c.name {
+                        let slot = fc.cx.global_slot(id) as u32;
                         fc.cx.lexical_globals.insert(slot);
                     }
                 }
@@ -733,14 +742,14 @@ impl Compiler {
             let mut lex = std::collections::HashSet::new();
             for s in body {
                 match s {
-                    ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
-                        for decl in &d.declarations {
+                    ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                        for decl in &d.decls {
                             capture::collect_pattern_names(&decl.id, &mut lex);
                         }
                     }
-                    ox::Statement::ClassDeclaration(c) => {
-                        if let Some(id) = &c.id {
-                            lex.insert(id.name.to_string());
+                    ast::Stmt::ClassDecl(c) => {
+                        if let Some(id) = &c.name {
+                            lex.insert(id.to_string());
                         }
                     }
                     _ => {}
@@ -797,14 +806,14 @@ impl Compiler {
             let mut lex = std::collections::HashSet::new();
             for s in body {
                 match s {
-                    ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
-                        for decl in &d.declarations {
+                    ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                        for decl in &d.decls {
                             capture::collect_pattern_names(&decl.id, &mut lex);
                         }
                     }
-                    ox::Statement::ClassDeclaration(c) => {
-                        if let Some(id) = &c.id {
-                            lex.insert(id.name.to_string());
+                    ast::Stmt::ClassDecl(c) => {
+                        if let Some(id) = &c.name {
+                            lex.insert(id.to_string());
                         }
                     }
                     _ => {}
@@ -843,7 +852,7 @@ impl Compiler {
         let entry_fns = !is_script || !fc.cx.script_binds_globals || fc.cx.eval_mode;
         if entry_fns {
             for s in body {
-                if let ox::Statement::FunctionDeclaration(f) = s {
+                if let ast::Stmt::FnDecl(f) = s {
                     fc.func_decl(f)?;
                 }
             }
@@ -857,7 +866,7 @@ impl Compiler {
             for s in body {
                 // Top-level function declarations were materialised at entry above.
                 if entry_fns {
-                    if let ox::Statement::FunctionDeclaration(_) = s {
+                    if let ast::Stmt::FnDecl(_) = s {
                         continue;
                     }
                 }
@@ -894,7 +903,9 @@ impl Compiler {
             lexical_this: false,
             super_static: false, // a plain function is not a static class element
             is_strict,
-            simple_params: params_ast.map(params_are_simple).unwrap_or(false),
+            // IsSimpleParameterList is decided by the parser and carried on
+            // `Params`, so it is read, not recomputed.
+            simple_params: params_ast.map(|pa| pa.simple).unwrap_or(false),
             constants: fc.constants,
             string_constants: fc.string_constants,
             bigint_consts: fc.bigint_consts,
@@ -917,10 +928,10 @@ impl Compiler {
         name: &str,
         params: &[String],
         rest: Option<&str>,
-        params_ast: Option<&ox::FormalParameters>,
-        fields: &[(String, Option<&ox::Expression>)],
-        computed_inits: &[Option<&ox::Expression>],
-        body: &[ox::Statement],
+        params_ast: Option<&ast::Params>,
+        fields: &[(String, Option<&ast::Expr>)],
+        computed_inits: &[Option<&ast::Expr>],
+        body: &[ast::Stmt],
         super_class: Option<u32>,
         super_static: bool,
         is_generator: bool,
@@ -1051,9 +1062,9 @@ impl Compiler {
             fc.next_reg = save;
         }
         for s in body {
-            if let ox::Statement::FunctionDeclaration(f) = s {
-                if let Some(id) = &f.id {
-                    fc.declare_local(id.name.as_str());
+            if let ast::Stmt::FnDecl(f) = s {
+                if let Some(id) = &f.name {
+                    fc.declare_local(id);
                 }
             }
         }
@@ -1103,7 +1114,7 @@ impl Compiler {
         &mut self,
         params: &[String],
         rest: Option<&str>,
-        a: &ox::ArrowFunctionExpression,
+        a: &ast::Arrow,
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
         super_class: Option<u32>,
@@ -1111,11 +1122,34 @@ impl Compiler {
         super_home_obj: bool,
     ) -> R<FuncProto> {
         let parent_strict = self.in_strict;
-        let is_strict = parent_strict || has_use_strict(&a.body.directives);
+        // Only a BLOCK body has a directive prologue: `x => "use strict"` is a
+        // value, not a directive, and the expression form carries no directives.
+        let is_strict = parent_strict
+            || match &a.body {
+                ast::ArrowBody::Block(b) => has_use_strict(&b.directives),
+                ast::ArrowBody::Expr(_) => false,
+            };
+        // `capture::free_vars` scans a STATEMENT list, and an expression-bodied
+        // arrow no longer has one — the old AST spelled `x => e` as a body of a
+        // single ExpressionStatement, which is exactly what the scans below expect
+        // to see. Rebuild that one statement rather than give `capture` a second
+        // entry point.
+        // NOTE: this clones the body expression. `compile_arrow` (funcs.rs) needs
+        // the same list for `captured_locals` / `hoisted_var_names` /
+        // `stash_child_with_shadows`, so if a shared `ArrowBody` → `&[Stmt]` view
+        // lands, both sites should use it instead of cloning.
+        let expr_body_stmt: Vec<ast::Stmt>;
+        let body_stmts: &[ast::Stmt] = match &a.body {
+            ast::ArrowBody::Block(b) => &b.stmts,
+            ast::ArrowBody::Expr(e) => {
+                expr_body_stmt = vec![ast::Stmt::Expr((**e).clone())];
+                &expr_body_stmt
+            }
+        };
         // An arrow that references `eval` (incl. in its parameter defaults)
         // boxes its locals and records DirectEval sites like a function.
         let mut captured = captured;
-        let arrow_refs_eval = capture::free_vars(&[], &a.body.statements).contains("eval")
+        let arrow_refs_eval = capture::free_vars(&[], body_stmts).contains("eval")
             || capture::params_reference("eval", &a.params);
         if arrow_refs_eval {
             let mut all: Vec<String> = params.to_vec();
@@ -1151,92 +1185,89 @@ impl Compiler {
         // reflects the enclosing class while its method bodies (and their arrows) compile.
         fc.derived_class = fc.cx.class_derived;
         fc.in_derived_ctor = fc.cx.in_derived_ctor;
-        fc.in_async = a.r#async;
+        fc.in_async = a.is_async;
         fc.bind_params(&a.params)?;
-        if a.expression {
-            // `x => expr`: the body is a single ExpressionStatement to return.
-            let mut returned = false;
-            for s in &a.body.statements {
-                if let ox::Statement::ExpressionStatement(es) = s {
-                    let r = fc.expr(&es.expression)?;
-                    fc.emit(Instr::Return { src: r });
-                    returned = true;
-                }
+        match &a.body {
+            // `x => expr`: the body is the single expression to return. (The old
+            // shape was a one-statement FunctionBody, so this branch also carried a
+            // `ReturnUndefined` fallback for a statement that was not an expression
+            // statement — unrepresentable now, hence gone.)
+            ast::ArrowBody::Expr(e) => {
+                let r = fc.expr(e)?;
+                fc.emit(Instr::Return { src: r });
             }
-            if !returned {
+            ast::ArrowBody::Block(b) => {
+                // hoist nested function declarations (same as a normal body)
+                for s in &b.stmts {
+                    if let ast::Stmt::FnDecl(f) = s {
+                        if let Some(id) = &f.name {
+                            fc.declare_local(id);
+                        }
+                    }
+                }
+                // Pre-declare every hoisted var at entry (mirrors the
+                // function-body pass — register accounting + with-fallback +
+                // for-head resolution; see that pass's comment).
+                {
+                    let mut hv = std::collections::HashSet::new();
+                    for s in &b.stmts {
+                        collect_hoisted_vars(s, &mut hv);
+                    }
+                    for name in &sorted_name_vec(&hv) {
+                        if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                            fc.declare_local(name);
+                        }
+                    }
+                }
+                // Pre-create cells for body-level lexical (`let`/`const`/`class`)
+                // bindings, exactly as a function body does — an arrow body is a
+                // scope like any other, and a nested function declaration hoisted
+                // above the declaration must be able to capture its cell.
+                //
+                // Without this the forward reference finds no binding and compiles
+                // to a GLOBAL load, so it fails at runtime with "x is not defined"
+                // (not the TDZ error, which is what a real forward-read reports).
+                // Webpack wraps whole bundles in `(() => { "use strict"; … })()`, so
+                // every `function f(){ …G… } … const G = …` pair in a bundle hit
+                // this — it is why react-router could not resolve its own helpers.
+                {
+                    let mut lex = std::collections::HashSet::new();
+                    for s in &b.stmts {
+                        match s {
+                            ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                                for decl in &d.decls {
+                                    capture::collect_pattern_names(&decl.id, &mut lex);
+                                }
+                            }
+                            ast::Stmt::ClassDecl(c) => {
+                                if let Some(id) = &c.name {
+                                    lex.insert(id.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
+                    for name in &crate::compile::helpers::sorted_name_vec(&lex) {
+                        if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                            let r = fc.alloc_reg();
+                            fc.scopes[0].push((name.clone(), r));
+                            fc.emit(Instr::MakeCellTdz { reg: r });
+                            fc.cell_regs.insert(r);
+                            fc.entry_lexicals.insert(name.clone());
+                            // The cell now EXISTS, so an assignment before the
+                            // textual declaration resolves to it and would emit a
+                            // plain `CellSet`, writing straight through the TDZ.
+                            // A read always threw, which is why this looked fine.
+                            fc.entry_tdz_cells.insert(r);
+                        }
+                    }
+                }
+                for s in &b.stmts {
+                    fc.stmt(s)?;
+                }
                 fc.emit(Instr::ReturnUndefined);
             }
-        } else {
-            // hoist nested function declarations (same as a normal body)
-            for s in &a.body.statements {
-                if let ox::Statement::FunctionDeclaration(f) = s {
-                    if let Some(id) = &f.id {
-                        fc.declare_local(id.name.as_str());
-                    }
-                }
-            }
-            // Pre-declare every hoisted var at entry (mirrors the
-            // function-body pass — register accounting + with-fallback +
-            // for-head resolution; see that pass's comment).
-            {
-                let mut hv = std::collections::HashSet::new();
-                for s in &a.body.statements {
-                    collect_hoisted_vars(s, &mut hv);
-                }
-                for name in &sorted_name_vec(&hv) {
-                    if !fc.scopes[0].iter().any(|(n, _)| n == name) {
-                        fc.declare_local(name);
-                    }
-                }
-            }
-            // Pre-create cells for body-level lexical (`let`/`const`/`class`)
-            // bindings, exactly as a function body does — an arrow body is a
-            // scope like any other, and a nested function declaration hoisted
-            // above the declaration must be able to capture its cell.
-            //
-            // Without this the forward reference finds no binding and compiles
-            // to a GLOBAL load, so it fails at runtime with "x is not defined"
-            // (not the TDZ error, which is what a real forward-read reports).
-            // Webpack wraps whole bundles in `(() => { "use strict"; … })()`, so
-            // every `function f(){ …G… } … const G = …` pair in a bundle hit
-            // this — it is why react-router could not resolve its own helpers.
-            {
-                let mut lex = std::collections::HashSet::new();
-                for s in &a.body.statements {
-                    match s {
-                        ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
-                            for decl in &d.declarations {
-                                capture::collect_pattern_names(&decl.id, &mut lex);
-                            }
-                        }
-                        ox::Statement::ClassDeclaration(c) => {
-                            if let Some(id) = &c.id {
-                                lex.insert(id.name.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
-                for name in &crate::compile::helpers::sorted_name_vec(&lex) {
-                    if !fc.scopes[0].iter().any(|(n, _)| n == name) {
-                        let r = fc.alloc_reg();
-                        fc.scopes[0].push((name.clone(), r));
-                        fc.emit(Instr::MakeCellTdz { reg: r });
-                        fc.cell_regs.insert(r);
-                        fc.entry_lexicals.insert(name.clone());
-                        // The cell now EXISTS, so an assignment before the
-                        // textual declaration resolves to it and would emit a
-                        // plain `CellSet`, writing straight through the TDZ.
-                        // A read always threw, which is why this looked fine.
-                        fc.entry_tdz_cells.insert(r);
-                    }
-                }
-            }
-            for s in &a.body.statements {
-                fc.stmt(s)?;
-            }
-            fc.emit(Instr::ReturnUndefined);
         }
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
         fc.cx.dyn_global_zone = saved_dyn_zone_arrow;
@@ -1252,7 +1283,7 @@ impl Compiler {
             rest_reg: fc.rest_reg,
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator: false,
-            is_async: a.r#async,
+            is_async: a.is_async,
             non_constructable: true, // arrow functions have no [[Construct]]
             lexical_this: true, // arrows capture `this` lexically (see FuncProto)
             super_static, // inherited from the enclosing method/block
@@ -1267,5 +1298,45 @@ impl Compiler {
             eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by compile_arrow from the arrow's span
         })
+    }
+}
+
+/// The literal TEXT a string value carries into the constant pool / the module
+/// tables: well-formed text verbatim, and a value holding lone surrogates
+/// re-spelled in the MARKER form (`\u{FFFD}XXXX` per code unit, `\u{FFFD}fffd`
+/// for a literal U+FFFD).
+///
+/// The marker spelling is not decoration: `resolve_const` decodes it back to
+/// WTF-8 at intern time, and it is exactly the text the parser used to hand over
+/// for a literal it flagged `lone_surrogates` — so keeping it keeps the emitted
+/// `string_constants` byte-identical.
+fn str_val_text(s: &StrVal) -> String {
+    match s {
+        StrVal::Utf8(t) => t.clone(),
+        StrVal::Utf16(units) => {
+            let mut wtf8: Vec<u8> = Vec::with_capacity(units.len() * 3);
+            for r in char::decode_utf16(units.iter().copied()) {
+                let cp = match r {
+                    Ok(c) => c as u32,
+                    Err(e) => e.unpaired_surrogate() as u32,
+                };
+                crate::heap::wtf8_push_cp(&mut wtf8, cp);
+            }
+            crate::heap::encode_lone_surrogate_markers(&wtf8)
+        }
+    }
+}
+
+/// Intern a [`StrVal`] as a string CONSTANT, routing a lone-surrogate value
+/// through the WTF-8-decoding slot — the same choice the parser's
+/// `lone_surrogates` flag used to drive.
+///
+/// NOTE: the representation IS the flag. `StrVal::from_utf16` collapses to
+/// `Utf8` only when every unit pairs up, and a literal is flagged precisely when
+/// one does not, so `Utf16` ⇔ the old `lone_surrogates == true`.
+fn add_str_val_const(fc: &mut FnCompiler<'_>, s: &StrVal) -> u32 {
+    match s {
+        StrVal::Utf8(t) => fc.add_string_const(t),
+        StrVal::Utf16(_) => fc.add_string_const_wtf8(&str_val_text(s)),
     }
 }
