@@ -3735,7 +3735,20 @@ impl<'p> Vm<'p> {
                             }
                             GetAct::None => {}
                         }
-                        let r = self.get_prop(o, &key)?;
+                        // Name the enclosing function when a property read
+                        // fails. "Cannot read properties of undefined (reading
+                        // 'x')" with an empty Error.stack gives an embedder no
+                        // way to find the site; the function name usually does,
+                        // and it is built only on the throw path.
+                        let r = match self.get_prop(o, &key) {
+                            Ok(v) => v,
+                            Err(Thrown(msg)) => {
+                                let f = self.func(func_id as usize);
+                                let name: &str =
+                                    if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                                Err(Thrown(format!("{msg} (in {name})")))?
+                            }
+                        };
                         self.set(base, dst, r);
                         ip += 1;
                     }
@@ -4613,7 +4626,19 @@ impl<'p> Vm<'p> {
                         // with `this = recv`.
                         let prop = match private_callee {
                             Some(f) => f,
-                            None => self.get_prop(recv, key)?,
+                            // Name the enclosing function: `x.foo()` where `x`
+                            // is undefined is the most common runtime failure in
+                            // page code, and the bare message says nothing about
+                            // where it happened.
+                            None => match self.get_prop(recv, key) {
+                                Ok(v) => v,
+                                Err(Thrown(msg)) => {
+                                    let f = self.func(func_id as usize);
+                                    let name: &str =
+                                        if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                                    Err(Thrown(format!("{msg} (in {name})")))?
+                                }
+                            },
                         };
                         // A built-in constructor object used as a method value
                         // (e.g. `Intl.NumberFormat(...)` without `new`): route via

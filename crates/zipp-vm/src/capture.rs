@@ -89,6 +89,37 @@ fn pattern_init_refs(pat: &ox::BindingPattern, out: &mut HashSet<String>) {
     }
 }
 
+/// Names a parameter list's DEFAULT VALUES reference freely.
+///
+/// A default is evaluated in the callee's own scope but can close over the
+/// ENCLOSING one, so `function outer(){ const G=1; function i(r=G){} }` makes
+/// `G` a captured variable of `outer` just as surely as reading it in the body
+/// would. `fn_node_free`/`arrow_free` used to scan only the body, so a name
+/// referenced ONLY from a default was never boxed into a cell, the nested
+/// function had nothing to capture, and the default threw "G is not defined" at
+/// runtime. Minified bundles hit this constantly — `function J(r=G){...}` is a
+/// standard shape for a defaulted config argument.
+///
+/// The parameter names themselves are treated as bound: a default referring to
+/// an earlier parameter is not a capture of anything outer.
+fn params_free(p: &ox::FormalParameters, bound: &[String], out: &mut HashSet<String>) {
+    let mut refs = HashSet::new();
+    for item in &p.items {
+        if let Some(init) = &item.initializer {
+            expr_refs(init, &mut refs);
+        }
+        pattern_init_refs(&item.pattern, &mut refs);
+    }
+    if let Some(r) = &p.rest {
+        pattern_init_refs(&r.rest.argument, &mut refs);
+    }
+    for name in refs {
+        if !bound.iter().any(|b| *b == name) {
+            out.insert(name);
+        }
+    }
+}
+
 /// The function's own bindings that some directly-nested function captures.
 pub fn captured_locals(params: &[String], body: &[ox::Statement]) -> HashSet<String> {
     let mut bound: HashSet<String> = params.iter().cloned().collect();
@@ -501,12 +532,14 @@ fn fn_node_free(
     };
     let inner = free_vars(&param_names, stmts);
     out.extend(inner);
+    params_free(params, &param_names, out);
 }
 
 fn arrow_free(a: &ox::ArrowFunctionExpression, out: &mut HashSet<String>) {
     let param_names = param_names(&a.params);
     let inner = free_vars(&param_names, &a.body.statements);
     out.extend(inner);
+    params_free(&a.params, &param_names, out);
 }
 
 /// The operand expression of a call/new argument, including the spread case

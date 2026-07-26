@@ -415,6 +415,67 @@ mod tests {
     /// React's minified `createContext` is exactly this shape —
     /// `e = {_currentValue: e, …}` — so a regression here makes every React
     /// context self-referential and takes the whole library down with it.
+    /// A parameter DEFAULT can close over the enclosing scope, so a name it
+    /// references has to be boxed like any other captured variable.
+    ///
+    /// The free-variable scan used to look only at a nested function's BODY. A
+    /// name referenced ONLY from a default was therefore never captured, and
+    /// the default threw "not defined" at runtime while the identical
+    /// reference in the body worked. `function J(r=G){...}` is a stock shape in
+    /// minified bundles for a defaulted config argument, so this took out whole
+    /// applications.
+    #[test]
+    fn param_default_captures_enclosing() {
+        // Every binding kind, since the scan is what fails, not the kind.
+        for kw in ["const", "let", "var"] {
+            assert_eq!(
+                run_ok(&format!(
+                    "console.log((function(){{ {kw} G='ok';                      function i(r=G){{return r}} return i() }})())"
+                )),
+                vec!["ok"],
+                "{kw}"
+            );
+        }
+        // Function expression, arrow, and a default declared before the binding.
+        assert_eq!(
+            run_ok(
+                "console.log((function(){ const G='ok';                  var i=function(r=G){return r}; return i() })())"
+            ),
+            vec!["ok"]
+        );
+        assert_eq!(
+            run_ok("console.log((function(){ const G='ok'; var i=(r=G)=>r; return i() })())"),
+            vec!["ok"]
+        );
+        assert_eq!(
+            run_ok(
+                "console.log((function(){ function i(r=G){return r} const G='ok'; return i() })())"
+            ),
+            vec!["ok"]
+        );
+        // Through an intervening function, and via a destructuring default.
+        assert_eq!(
+            run_ok(
+                "console.log((function(){ const G='ok'; return (function(){                  function i(r=G){return r} return i() })() })())"
+            ),
+            vec!["ok"]
+        );
+        assert_eq!(
+            run_ok(
+                "console.log((function(){ const G='ok';                  function i({r=G}={}){return r} return i() })())"
+            ),
+            vec!["ok"]
+        );
+        // A default referring to an EARLIER PARAMETER is not a capture, and must
+        // keep resolving to the parameter rather than leaking outward.
+        assert_eq!(
+            run_ok(
+                "var a='outer'; console.log((function(){                  function i(a,b=a){return b} return i('inner') })())"
+            ),
+            vec!["inner"]
+        );
+    }
+
     #[test]
     fn assign_reads_target() {
         // The two forms that build incrementally.
