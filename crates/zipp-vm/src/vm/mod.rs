@@ -354,6 +354,20 @@ pub struct Vm<'p> {
     /// per source call site, keyed by (function id, per-function site index). The
     /// cached objects are permanent GC roots (they live as long as the realm).
     template_cache: std::collections::HashMap<(u32, u32), Value>,
+    /// `(JIT ic site, receiver shape) -> slot`, for the JIT's GetProp MISS path.
+    ///
+    /// The JIT's cache ways are keyed on receiver IDENTITY, so a site reading one
+    /// property from many objects of the SAME shape thrashes all eight ways and
+    /// misses every time — measured as a cliff at exactly 9 receivers, flat and
+    /// 100% miss thereafter. Every one of those misses then re-ran `map.pos(key)`,
+    /// a string scan, to rediscover a slot the shape already determines.
+    ///
+    /// Sound for the same reason the interpreter's shape guard is: a JIT GetProp
+    /// site's key is a compile-time constant (`string_constants[name]`), and a
+    /// shape fixes the whole key -> slot mapping, so `(site, shape)` names one
+    /// slot for all time. Bounded, because shapes are bounded (`shape::SHAPE_MAX`)
+    /// and sites are finite; entries are pure memo and may be dropped freely.
+    jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
     /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index:
     /// (matcher regexp heap idx, subject string, flag bits — bit0 global, bit1
     /// fullUnicode (`u`/`v`, captured at creation per CreateRegExpStringIterator),

@@ -1074,6 +1074,47 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    // ── shape memo ──────────────────────────────────────────────────────────
+    // Before the key scan: if this site has already resolved this SHAPE, the slot
+    // is known. That is the whole cost of a site whose receivers share a layout
+    // but not an identity — the ways thrash, every access misses, and every miss
+    // re-scans the key list to rediscover the same slot.
+    if let HeapObj::Object(map) = vm.heap.get(idx) {
+        let sh = map.shape();
+        if sh != crate::shape::DICT {
+            if let Some(&slot) = vm.jit_shape_slot.get(&(site_idx, sh)) {
+                let s = slot as usize;
+                // The memo names a slot; the ACCESSOR flag is per-object state
+                // that a shape does carry, but re-checking is one load and keeps
+                // this independent of that argument.
+                if !map.attr_at(s).accessor {
+                    let val = map.val_at(s);
+                    // Refill only while the site still has ways to give. Once it
+                    // has evicted a full round (`ic_thrashing`), it is
+                    // megamorphic by IDENTITY while monomorphic by SHAPE, and a
+                    // fresh identity-keyed way is evicted before it is ever hit
+                    // — the write is wasted and it displaces a way that may
+                    // still be serving someone.
+                    //
+                    // Skipping the refill UNCONDITIONALLY was measurably wrong:
+                    // a site with 2-8 receivers fills its ways one miss at a
+                    // time, so refusing the first refill for receiver 2 means
+                    // receiver 2 never gets a way at all. That took the 2-8
+                    // receiver case from ~5.5ns to ~12ns.
+                    if !vm.jit.ic_thrashing(site_idx) {
+                        let vals_ptr = map.vals_ptr() as u64;
+                        let version = vm.heap.version_of(idx);
+                        if let Some(e) =
+                            crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot)
+                        {
+                            vm.jit.set_ic(site_idx, e);
+                        }
+                    }
+                    return val.bits();
+                }
+            }
+        }
+    }
     let (val, vals_ptr, slot) = match vm.heap.get(idx) {
         HeapObj::Object(map) => match map.pos(key) {
             // An accessor slot stores the GETTER, not a data value — route to
@@ -1193,8 +1234,25 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     if let Some(e) = crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot) {
         vm.jit.set_ic(site_idx, e);
     }
+    // Record the resolution against the receiver's shape, so the next receiver
+    // of the same layout skips the scan above. Only for an OWN data property on
+    // a shaped object — a proto-chain or class resolution depends on more than
+    // the receiver's own layout and is already guarded by hop versions.
+    if let HeapObj::Object(map) = vm.heap.get(idx) {
+        let sh = map.shape();
+        if sh != crate::shape::DICT
+            && map.attr_get(slot as usize).is_some_and(|a| !a.accessor)
+            && vm.jit_shape_slot.len() < JIT_SHAPE_SLOT_MAX
+        {
+            vm.jit_shape_slot.insert((site_idx, sh), slot);
+        }
+    }
     val.bits()
 }
+
+/// Ceiling on the `(site, shape) -> slot` memo. Pure memo, so overflowing it
+/// only costs the key scan it was avoiding.
+const JIT_SHAPE_SLOT_MAX: usize = 1 << 16;
 
 /// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `SetProp`. Performs
 /// `obj.<key> = val`, then (for a plain Object) fills inline-cache slot `site` so

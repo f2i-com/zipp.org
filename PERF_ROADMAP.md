@@ -1316,6 +1316,56 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B44 — Hidden classes, part 2: the JIT cliff, without touching codegen
+
+The 8 -> 9 receiver cliff, re-measured with an explicit wrap counter (see the
+trap below):
+
+| receivers | 1 | 2 | 8 | **9** | 16 | 1024 |
+|---|---|---|---|---|---|---|
+| before | 4.00 | 5.00 | 5.67 | **17.33** | 17.00 | 16.67 |
+| after | 4.67 | 5.00 | 5.67 | **11.67** | 11.67 | 11.67 |
+| node | 1.67 | 0.67 | 0.67 | 0.33 | 0.33 | 0.67 |
+
+**-33% past the cliff, nothing worse before it, and no codegen change at all.**
+The plan in B43 was a shape-keyed guard in the emitted probe, which needs the
+receiver's `vals_ptr` loaded rather than baked, i.e. a heap-index-parallel
+`ObjMeta` array — and that runs into a design problem: `ObjMap` does not know its
+own heap index, so it cannot maintain such an array. That is still the route to a
+CALL-FREE shape hit and it is still unbuilt.
+
+But the cliff is not the hit path. Past 9 receivers the site misses **100%** of
+the time, so all of its cost is `jit_get_prop_miss` — plain Rust. Two changes
+there:
+
+1. **A `(site, shape) -> slot` memo**, so a miss stops re-running `map.pos(key)`
+   to rediscover a slot the shape already fixes. Sound for the same reason as the
+   interpreter guard: a JIT GetProp site's key is a compile-time constant, and a
+   shape fixes the whole key -> slot mapping. Worth only 14.5 -> 13.75ns — the
+   key scan was never the cost.
+2. **Stop refilling ways once the site is thrashing.** `ic_rot` only advances
+   when every way is full and one must be evicted, so a full round of rotations
+   proves the site is megamorphic by IDENTITY. Filling another identity-keyed way
+   then costs the write AND displaces a way that may still be serving someone.
+   This is the -33%.
+
+**The mistake worth recording**, because it inverts the obvious reasoning:
+skipping the refill UNCONDITIONALLY looked strictly better and was much worse —
+2-8 receivers went 5.5ns -> 12ns. A site fills its ways one MISS at a time, so
+refusing the first refill for receiver 2 means receiver 2 never gets a way at
+all. The gate on `ic_thrashing` is what makes it safe.
+
+**And a measurement trap that caught me twice.** §1b warns not to index receivers
+with `i & (n - 1)` for non-power-of-two `n`; at `n = 9` that cycles TWO objects.
+My first cliff measurement reported the step "between 12 and 16" because of it,
+and the second reported a phantom regression at 9. Use an explicit wrap counter.
+The corrected numbers put the cliff at exactly 8 -> 9, flat thereafter, which is
+`JIT_IC_WAYS` precisely.
+
+Suite effect **+0.4% mean**, i.e. nothing — no bench in `bench/real/` is
+megamorphic by identity while monomorphic by shape. Real code frequently is
+(every `for (const o of manyObjectsOfOneKind)`), which is why this is kept.
+
 ### B43 — Hidden classes, part 1: the shape tree and a shape-keyed interpreter IC
 
 **What landed.** `crates/zipp-vm/src/shape.rs` — a transition tree in which each

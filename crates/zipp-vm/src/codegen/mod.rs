@@ -1181,6 +1181,17 @@ impl Jit {
     /// Never grows the table (the site was reserved at compile time), so a
     /// pinned base pointer in a running region stays valid. `site == u32::MAX`
     /// (the hoisted-`.length` pseudo-site) is ignored.
+    /// Has this site evicted a full round of ways?
+    ///
+    /// `ic_rot` only advances when every way is occupied and one has to be
+    /// thrown out, so a non-trivial count means the site has seen more distinct
+    /// RECEIVERS than it has ways — the megamorphic-by-identity case. Callers
+    /// use it to stop refilling ways that will be evicted before they are hit.
+    #[inline]
+    pub fn ic_thrashing(&self, site: u32) -> bool {
+        self.ic_rot.get(site as usize).is_some_and(|&r| r >= JIT_IC_WAYS as u8)
+    }
+
     pub fn set_ic(&mut self, site: u32, e: IcEntry) {
         let base = (site as usize).wrapping_mul(JIT_IC_WAYS);
         let Some(ways) = self.ic_table.get_mut(base..base + JIT_IC_WAYS) else {
