@@ -1047,7 +1047,9 @@ impl<'a> FnCompiler<'a> {
             if head_lexical {
                 let mut names = std::collections::HashSet::new();
                 capture::collect_pattern_names(p, &mut names);
-                for n in &names {
+                // Sorted: this loop EMITS, so raw HashSet order would permute
+                // the instruction stream even though the registers already exist.
+                for n in &crate::compile::helpers::sorted_name_vec(&names) {
                     let found = self
                         .scopes
                         .iter()

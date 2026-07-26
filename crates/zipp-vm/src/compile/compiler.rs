@@ -74,6 +74,10 @@ impl Compiler {
                 v.push(i as u32);
             }
         }
+        // Sorted for the same reason the emitted Program fields are: these come
+        // from HashSets, and `RandomState` reseeds per INSTANCE, so the order
+        // differs between two sets in one process, not merely between runs.
+        v.sort_unstable();
         v
     }
 
@@ -742,7 +746,8 @@ impl Compiler {
                     _ => {}
                 }
             }
-            for name in &lex {
+            // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
+            for name in &crate::compile::helpers::sorted_name_vec(&lex) {
                 if !fc.scopes[0].iter().any(|(n, _)| n == name) {
                     let r = fc.alloc_reg();
                     fc.scopes[0].push((name.clone(), r));
@@ -805,7 +810,9 @@ impl Compiler {
                     _ => {}
                 }
             }
-            for name in &lex {
+            // Sorted: this loop calls alloc_reg(), so raw HashSet order would
+            // hand out CELL REGISTERS in a different order per compile.
+            for name in &crate::compile::helpers::sorted_name_vec(&lex) {
                 if fc.captured.contains(name) && !fc.scopes[0].iter().any(|(n, _)| n == name) {
                     // Box a TDZ cell: a read before the textual declaration runs
                     // (e.g. via a forward-materialised function) throws a
@@ -1210,7 +1217,8 @@ impl Compiler {
                         _ => {}
                     }
                 }
-                for name in &lex {
+                // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
+                for name in &crate::compile::helpers::sorted_name_vec(&lex) {
                     if !fc.scopes[0].iter().any(|(n, _)| n == name) {
                         let r = fc.alloc_reg();
                         fc.scopes[0].push((name.clone(), r));

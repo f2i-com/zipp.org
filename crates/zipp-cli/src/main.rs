@@ -75,16 +75,114 @@ fn run(args: &[String]) -> Result<(), String> {
                 harness.map(|s| s.as_str()),
             )?)
         }
+        Some("bc") => {
+            // Compile only, print the canonical Program. No VM is constructed,
+            // so this works on a script that would loop or throw.
+            let mut path = None;
+            let mut module = false;
+            for a in it {
+                match a.as_str() {
+                    "--module" => module = true,
+                    other => path = Some(other.to_string()),
+                }
+            }
+            let path = path.ok_or("usage: zipp bc <file.js> [--module]")?;
+            let src =
+                std::fs::read_to_string(&path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            println!("{}", zipp_vm::compile_to_text(&src, module)?);
+            Ok(())
+        }
+        Some("bcdiff") => {
+            // The differential gate. Compiles every file in the corpus TWICE
+            // and compares the canonical Programs.
+            //
+            // Today both compiles go through the same front end, so this
+            // measures determinism — which is the precondition for the gate,
+            // and was violated until recently (the same source produced
+            // different bytecode on every run). When a second front end lands,
+            // only the second call changes, and the same command becomes the
+            // parity gate.
+            let paths: Vec<String> = it.cloned().collect();
+            if paths.is_empty() {
+                return Err("usage: zipp bcdiff <file-or-dir>...".into());
+            }
+            let mut files = Vec::new();
+            for p in &paths {
+                collect_js(std::path::Path::new(p), &mut files);
+            }
+            files.sort();
+            let (mut same, mut differ, mut rejected) = (0usize, 0usize, 0usize);
+            for f in &files {
+                let Ok(src) = std::fs::read_to_string(f) else { continue };
+                let module = f.extension().is_some_and(|e| e == "mjs");
+                let a = zipp_vm::compile_to_text(&src, module);
+                let b = zipp_vm::compile_to_text(&src, module);
+                match (a, b) {
+                    (Ok(a), Ok(b)) if a == b => same += 1,
+                    (Ok(a), Ok(b)) => {
+                        differ += 1;
+                        let at = a
+                            .lines()
+                            .zip(b.lines())
+                            .position(|(x, y)| x != y)
+                            .map(|n| n + 1)
+                            .unwrap_or(0);
+                        println!("DIFFER  {}  (first at line {at})", f.display());
+                    }
+                    // A file both front ends reject the same way is not a
+                    // mismatch — it is agreement about invalid input.
+                    (Err(a), Err(b)) if a == b => rejected += 1,
+                    (a, b) => {
+                        differ += 1;
+                        println!(
+                            "DIFFER  {}  accept/reject: {:?} vs {:?}",
+                            f.display(),
+                            a.err(),
+                            b.err()
+                        );
+                    }
+                }
+            }
+            println!(
+                "\n{} files: {same} identical, {rejected} rejected by both, {differ} MISMATCH",
+                files.len()
+            );
+            if differ == 0 {
+                println!("BCDIFF_OK=1");
+                Ok(())
+            } else {
+                Err(format!("{differ} mismatches"))
+            }
+        }
         Some("--help") | Some("-h") | None => {
             println!("zipp — a clean-sheet JavaScript engine\n");
             println!("usage:");
             println!("  zipp js  <file.js>              run a script");
             println!("  zipp mjs <file.mjs>             run a file as an ES module");
+            println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
+            println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");
             println!("\nenvironment:");
             println!("  ZIPP_NOJIT=1                    interpreter only (no native codegen)");
             println!("  ZIPP_GC_STRESS=1                collect on every allocation");
             Ok(())
         }
         Some(other) => Err(format!("unknown command '{other}' (try `zipp js <file.js>`)")),
+    }
+}
+
+/// Every `.js`/`.mjs` file under `p` (or `p` itself if it is a file).
+fn collect_js(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    if p.is_file() {
+        out.push(p.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(p) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            collect_js(&path, out);
+        } else if path.extension().is_some_and(|x| x == "js" || x == "mjs") {
+            out.push(path);
+        }
     }
 }

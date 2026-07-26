@@ -70,6 +70,39 @@ pub fn run(src: &str) -> Result<Outcome, String> {
     run_with_base(src, None)
 }
 
+/// Compile `src` and return a canonical text form of the resulting `Program`,
+/// WITHOUT running it.
+///
+/// This is the comparison medium for swapping in a second front end: if two
+/// front ends produce the same string for every file in a corpus, they compile
+/// to the same program, and the swap cannot change behaviour. It is also the
+/// only way to inspect bytecode without executing the script — `ZIPP_VM_DUMP`
+/// prints as a side effect of running, which is useless for a program that
+/// loops or throws.
+///
+/// The canonical form is `{:#?}`, deliberately: it covers every field of
+/// `Program` by construction, so a field added later cannot silently escape
+/// the comparison the way a hand-written formatter would let it.
+pub fn compile_to_text(src: &str, module: bool) -> Result<String, String> {
+    let program = compile_only(src, module)?;
+    Ok(format!("{program:#?}"))
+}
+
+/// Parse + compile, no VM. Shares `run_with_base`'s Annex B parse-retry so the
+/// dump reflects what would actually run.
+fn compile_only(src: &str, module: bool) -> Result<bytecode::Program, String> {
+    let allocator = Allocator::default();
+    let source_type = if module { SourceType::mjs() } else { SourceType::cjs() };
+    let ret = Parser::new(&allocator, src, source_type).parse();
+    if !ret.errors.is_empty() {
+        if let Some(fixed) = annexb_call_target_rewrite(src) {
+            return compile_only(&fixed, module);
+        }
+        return Err(format!("SyntaxError: {}", ret.errors[0]));
+    }
+    compile::compile_program(&ret.program, src)
+}
+
 /// Like [`run`], but `base_dir` is the directory the script was loaded from, used
 /// to resolve a dynamic `import(specifier)` against the filesystem. `None` (the
 /// `run` default) means no host module loader, so `import()` rejects.

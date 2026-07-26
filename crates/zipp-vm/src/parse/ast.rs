@@ -99,7 +99,6 @@ pub enum Stmt {
     /// `await` is set for `for await (… of …)`.
     ForOf { left: ForTarget, right: Expr, body: Box<Stmt>, is_await: bool },
     Switch { disc: Expr, cases: Vec<SwitchCase> },
-    /// `test: None` is the `default:` clause.
     Return(Option<Expr>),
     Throw(Expr),
     Try { block: Vec<Stmt>, handler: Option<CatchClause>, finalizer: Option<Vec<Stmt>> },
@@ -356,9 +355,11 @@ pub struct PatternProp {
 pub enum PropKey {
     Ident(Name),
     Str(StrVal),
-    /// A numeric key. The canonical string form is what the object model uses,
-    /// and it is not `format!("{}", n)` for every value, so the parser computes
-    /// it once rather than leaving each consumer to get it wrong.
+    /// A numeric key, as its numeric value. The property key it becomes is the
+    /// CANONICAL string (`1e21` keys as `"1e+21"`, `-0` as `"0"`), which is not
+    /// `format!("{n}")` — conversion stays with the consumer that already owns
+    /// the engine's number-to-string, so this variant deliberately carries only
+    /// the value and no precomputed spelling.
     Num(f64),
     Computed(Expr),
     /// `#x` in a class body.
@@ -372,7 +373,24 @@ pub enum PropKey {
 #[derive(Debug, Clone)]
 pub enum ObjectMember {
     /// `k: v`, or shorthand `k`.
-    Prop { key: PropKey, value: Expr, shorthand: bool },
+    Prop {
+        key: PropKey,
+        value: Expr,
+        shorthand: bool,
+        /// CoverInitializedName — the `= 1` in `{a = 1}`.
+        ///
+        /// This is not a valid object literal: `({a = 1})` is a SyntaxError.
+        /// But `({a = 1} = {})` IS valid, so the literal has to be
+        /// representable long enough to be reinterpreted as a destructuring
+        /// target. Without somewhere to park the initializer, the parser would
+        /// have to look ahead past the matching `}` for an `=`, or backtrack,
+        /// at EVERY `{`.
+        ///
+        /// So it parses, and is an error unless converted: the parser records
+        /// the position when it sets this, and raises that error when the
+        /// literal resolves as an expression rather than a target.
+        init: Option<Expr>,
+    },
     /// `m() {}`
     Method { key: PropKey, func: Box<Function> },
     Get { key: PropKey, func: Box<Function> },
@@ -655,6 +673,42 @@ mod tests {
                 assert!(items[1].is_none(), "a hole is not `undefined`");
                 assert!(matches!(items[2], Some(ArrayElem::Spread(_))));
             }
+            _ => unreachable!(),
+        }
+    }
+
+    /// `{a = 1}` is only legal once reinterpreted as a destructuring target, so
+    /// the literal has to carry the initializer until that is decided. This is
+    /// the cover grammar that makes hand-written JS parsers hard, and the shape
+    /// here is what lets the parser avoid unbounded lookahead at every `{`.
+    #[test]
+    fn cover_initialized_name_is_representable() {
+        // `{a = 1}` as parsed: a shorthand property whose initializer is parked.
+        let member = ObjectMember::Prop {
+            key: PropKey::Ident("a".into()),
+            value: Expr::Ident("a".into()),
+            shorthand: true,
+            init: Some(Expr::Num(1.0)),
+        };
+        match &member {
+            ObjectMember::Prop { init: Some(Expr::Num(n)), shorthand: true, .. } => {
+                assert_eq!(*n, 1.0)
+            }
+            other => panic!("initializer had nowhere to go: {other:?}"),
+        }
+
+        // Reinterpreted for `({a = 1} = {})`, it becomes a target with a default.
+        let target = Target::Object {
+            props: vec![TargetProp {
+                key: PropKey::Ident("a".into()),
+                target: Target::Ident { name: "a".into(), covered: false },
+                default: Some(Expr::Num(1.0)),
+                shorthand: true,
+            }],
+            rest: None,
+        };
+        match &target {
+            Target::Object { props, .. } => assert!(props[0].default.is_some()),
             _ => unreachable!(),
         }
     }
