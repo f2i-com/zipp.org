@@ -967,6 +967,57 @@ and output compared as EXACT BYTES with a non-zero exit treated as a failure.
 
 First authoritative reading: **geomean 2.60x**, ALL_CORRECT=1 on exact bytes.
 
+### B22 — DataView reads on the INT tier: prize measured at ~240ms, BLOCKED in the planner
+
+`typedarray-math` decomposes into eight phases. Two are at parity already (axpy
+17ms vs 12, dot 11 vs 10 — the DOUBLE tier works), and one dominates:
+
+    8-dataview     363ms vs node 94ms   (3.9x, 269ms of the bench's 513ms gap)
+    1-f64-fill     128ms vs        26ms
+    4-normalize     53ms vs        12ms
+    5-xorshift      56ms vs        16ms
+
+The DataView loop is `dv.getUint32/getUint16/getInt8` plus integer arithmetic.
+The memory path ALREADY inlines the loads (full `DV_PIN_KIND` emitter with
+dynamic endianness); what costs is the boxed arithmetic around them.
+
+The prize is measured, not estimated. The same arithmetic shape reading an
+`Int32Array` element — which IS on the integer tier — runs at **parity**:
+
+    A  dataview loop      zipp 352ms   node 90ms   3.9x
+    B  int32 elem loop    zipp 100ms   node 92ms   1.09x   <-- parity
+    C  single getUint32   zipp 134ms   node 71ms   1.9x
+
+So getting the loop onto the INT tier is worth ~240ms of the 269ms gap, which
+is ~5% of the suite geomean.
+
+**Built and reverted, unfinished.** The emitter works and was verified
+byte-identical to node and to the interpreter: pinned-receiver identity guard,
+`pos >= 0` and `pos <= byteLength - size` bounds, both endianness branches, and
+the unbox into an i64 home (sign-extend for Int8/16/32; the unsigned kinds are
+already correct because a 32-bit write zeroes the upper half, and a getUint32
+result up to 2^32-1 is well inside i53). Float32/Float64 decline — an i64 home
+cannot hold them. The endianness flag is SIMPLER here than on the memory path: a
+Bool on the integer tier lives in a GPR home holding 0/1, so `test/jz` is exactly
+ToBoolean with no tag test.
+
+What blocks it is `plan_region`'s receiver-exclusion path, not the emitter:
+
+  * `dv.getUint32(…)` three times in one body emits three `LoadGlobal dv` into
+    the SAME register, and the exclusion required EXACTLY ONE def. Relaxing that
+    to "every def is a LoadGlobal of the same slot" (sound — the register holds
+    that global at every pinned access, and the emitter reads the receiver via
+    the pin's `Global(g)` source anyway) was tried and did not finish the job.
+  * `pinned receiver reg not cleanly excludable` still fires, and
+    `dv.getUint32(o, true)` additionally needs `LoadBool` admitted on the INT
+    path (it is not in `int_unadmitted_ips`).
+
+Reverted rather than left in: admission code that never fires is unexercised
+codegen reachable by some future region shape, which is precisely the B9 failure
+mode. The next attempt should start by instrumenting WHICH receiver register and
+which use makes `used_elsewhere` true, rather than fixing gates one at a time —
+three were opened in sequence here and a fourth remained.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
