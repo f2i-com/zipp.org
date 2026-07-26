@@ -55,6 +55,13 @@ pub(crate) fn int_unadmitted_ips(
     let pinned_str = |ip: usize| -> bool {
         ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
     };
+    // A dense Array observed all-Int (kind 252): `arr[i]` loads the element and
+    // unboxes it into an i64 home under a per-access tag guard. READS only —
+    // a store would have to re-box and can grow/realloc the Vec, so `SetIndex`
+    // still falls to the memory path (see the catch-all below).
+    let pinned_int_arr = |ip: usize| -> bool {
+        ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND)
+    };
     for (off, instr) in proto.code[s..=e].iter().enumerate() {
         match *instr {
             Instr::LoadInt { .. }
@@ -89,10 +96,19 @@ pub(crate) fn int_unadmitted_ips(
             // A kind-5 (Int32) pinned element op is admissible; any other index op
             // (non-pinned, or a different element kind) declines to the mem path.
             Instr::GetIndex { .. } | Instr::SetIndex { .. } if pinned_i32(s + off) => {}
+            // Dense all-Int Array READ (see `pinned_int_arr`); the write is not
+            // admitted and falls through to the catch-all.
+            Instr::GetIndex { .. } if pinned_int_arr(s + off) => {}
             // Pinned flat-ASCII STRING `str.length` (GetProp) + `str.charCodeAt(i)`
             // (CallMethod). A non-length GetProp / non-charCodeAt or unpinned call
             // still hits the catch-all reject below.
             Instr::GetProp { .. } if pinned_str(s + off) => {}
+            // Dense all-Int Array `.length` — read straight from the pin snapshot.
+            // The name is re-checked (the pin planner registers a GetProp only for
+            // `length`, but this keeps that an assertion rather than an assumption).
+            Instr::GetProp { name, .. }
+                if pinned_int_arr(s + off)
+                    && proto.string_constants.get(name as usize).is_some_and(|k| k == "length") => {}
             Instr::CallMethod { .. } if pinned_str(s + off) => {}
             // `Math.imul(a, b)` — a 2-arg int32 multiply (ToInt32 of the low 32 of
             // the product); the int path emits a native `imul eax, ecx`.
@@ -281,7 +297,8 @@ pub(crate) fn compile_region_int_maybe_cold(
             ; call rax
         );
     }
-    // Live-in globals/regs: guard Int-tagged, sign-extend payload, into the home.
+    // Live-in globals/regs into i64 homes: an Int-tagged Value sign-extends, an
+    // integral double in [-2^53, 2^53] converts, anything else takes entry_bail.
     for &(gi, x) in &plan.live_in_globs {
         dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]);
         emit_int_entry_load(&mut ops, x, entry_bail);
@@ -662,7 +679,28 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; cmp rcx, [rsp + off + 16]          // unsigned: i < len (catches <0)
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]           // pinned base
-                    ; movsxd rax, DWORD [rdx + rcx * 4]  // sign-extend i32 element → home
+                );
+                if ta_plan.pins[j].kind == ARR_INT_PIN_KIND {
+                    // Dense Array: the element is a NaN-boxed `Value` (stride 8),
+                    // so unlike a TypedArray's raw i32 it must be tag-checked
+                    // before it can inhabit an i64 home. Anything not Int-tagged
+                    // — a double, a HOLE (0x7FFC…), a heap value — deopts to the
+                    // interpreter AT this ip. That single guard is what makes the
+                    // all-Int sample at plan time a hint and not a soundness gate.
+                    dynasm!(ops
+                        ; mov rax, [rdx + rcx * 8]       // items[i] (Value bits)
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => deopt                   // double / HOLE / heap → deopt
+                        ; movsxd rax, eax                // Int payload, sign-extended
+                    );
+                } else {
+                    dynasm!(ops
+                        ; movsxd rax, DWORD [rdx + rcx * 4] // sign-extend i32 element → home
+                    );
+                }
+                dynasm!(ops
                     ; movq Rx(d), rax
                     ; jmp => done
                     ; => deopt
@@ -767,13 +805,17 @@ pub(crate) fn compile_region_int_maybe_cold(
                 copy_clobber(&mut lc, d);
                 lc = None;
             }
-            // ── pinned-STRING length ── str.length → the snapshot `units` (==
-            // str.length for the flat-ASCII pin). Identity-guarded; a miss deopts.
+            // ── pinned length ── `str.length` → the snapshot `units`, `arr.length`
+            // → the snapshot `len`. Both pin families keep the length in the SAME
+            // third slot, so one emitter serves both. Identity-guarded; a miss
+            // deopts. Sound for an Array because the snapshot is declined outright
+            // when the array carries an `arr_props` overlay (so `length` is exactly
+            // `items.len()`), and nothing admitted on the integer tier can grow a
+            // Vec — there are no calls, and dense-Array stores are not admitted.
             Instr::GetProp { dst, .. }
-                if ta_plan
-                    .access
-                    .get(&ip)
-                    .map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND) =>
+                if ta_plan.access.get(&ip).map_or(false, |&j| {
+                    matches!(ta_plan.pins[j as usize].kind, STR_PIN_KIND | ARR_INT_PIN_KIND)
+                }) =>
             {
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;

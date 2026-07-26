@@ -756,7 +756,7 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
                 _ => None,
             };
         }
-        if kind == crate::codegen::ARR_PIN_KIND as u32 {
+        if crate::codegen::is_arr_pin(kind as u8) {
             // Dense-Array pin: base = the `Vec<Value>` storage pointer, len =
             // its element count. DECLINE (→ None → all-zero slot → the region's
             // per-access identity guard misses → generic helper) when the array

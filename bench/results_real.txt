@@ -4,8 +4,6 @@ json-large: OK
 markdown-render: OK
 map-set-heavy: OK
 typedarray-math: OK
-sparse-array               90ms    107ms     92ms    211ms        677ms      2.34x
-DONE
 regex-log-scan: OK
 class-prototype-hot: OK
 async-promise-chain: OK
@@ -13,18 +11,18 @@ polymorphic-objects: OK
 sparse-array: OK
 ALL_CORRECT=1
 
-startup(ms): node=53 bun=152 deno=71 zipp=25 zipp_nojit=25   (best of 5)
+startup(ms): node=54 bun=145 deno=79 zipp=24 zipp_nojit=25   (best of 5)
 
 bench                      node      bun     deno     zipp   zipp_nojit  zipp/node
 ----------------------   ------   ------   ------   ------   ----------  ---------
-parse-large-js            237ms    183ms    201ms    610ms       3166ms      2.57x
-json-large                235ms    144ms    226ms    571ms       1306ms      2.43x
-markdown-render           234ms    181ms    231ms    672ms       1822ms      2.87x
-map-set-heavy             608ms    700ms   1081ms    728ms        842ms      1.20x
-typedarray-math           171ms    862ms     93ms    676ms       7719ms      3.95x
-regex-log-scan            417ms    512ms    391ms   1722ms       3641ms      4.13x
-class-prototype-hot       261ms    283ms    242ms    757ms       5496ms      2.90x
-async-promise-chain       295ms    323ms    269ms    714ms        760ms      2.42x
-polymorphic-objects       293ms    286ms    252ms    717ms       1499ms      2.45x
-sparse-array               49ms     52ms     44ms    160ms        630ms      3.27x
+parse-large-js            231ms    187ms    206ms    603ms       3210ms      2.61x
+json-large                228ms    155ms    243ms    559ms       1299ms      2.45x
+markdown-render           234ms    172ms    221ms    668ms       1821ms      2.85x
+map-set-heavy             617ms    695ms   1035ms    743ms        842ms      1.20x
+typedarray-math           168ms    865ms     78ms    679ms       7634ms      4.04x
+regex-log-scan            417ms    527ms    355ms   1717ms       3596ms      4.12x
+class-prototype-hot       259ms    302ms    232ms    759ms       5253ms      2.93x
+async-promise-chain       298ms    324ms    262ms    710ms        754ms      2.38x
+polymorphic-objects       288ms    290ms    243ms    718ms       1491ms      2.49x
+sparse-array               48ms     64ms     36ms    164ms        633ms      3.42x
 DONE

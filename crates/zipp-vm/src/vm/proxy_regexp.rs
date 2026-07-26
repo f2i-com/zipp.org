@@ -944,7 +944,8 @@ impl<'p> Vm<'p> {
             }
         };
         let whole = mk(self, mstart..mend);
-        let mut elems = vec![whole];
+        let mut elems = Vec::with_capacity(1 + m.captures.len());
+        elems.push(whole);
         for cap in &m.captures {
             let v = match cap {
                 Some(r) => mk(self, r.clone()),
@@ -957,7 +958,7 @@ impl<'p> Vm<'p> {
         let groups = if named.is_empty() {
             Value::UNDEFINED
         } else {
-            let mut gm = ObjMap::new();
+            let mut gm = ObjMap::with_capacity(named.len());
             for (name, r) in &named {
                 let v = match r {
                     Some(r) => mk(self, r.clone()),
@@ -1022,12 +1023,27 @@ impl<'p> Vm<'p> {
         } else {
             Value::UNDEFINED
         };
-        let m = self.arr_props.entry(arr_idx).or_insert_with(ObjMap::new);
-        m.define("index", index_v, attr);
-        m.define("input", input_sv, attr);
-        m.define("groups", groups, attr);
-        if has_indices {
-            m.define("indices", indices_v, attr);
+        // index/input/groups (+ indices) are always ABSENT here: `arr_idx` is a
+        // heap slot allocated a few lines above, and GC `retain`s `arr_props`
+        // against the mark bits, so a recycled slot cannot carry a stale entry.
+        // The `is_empty` test keeps that an assertion rather than an assumption
+        // — when it holds, append straight past `define`'s per-key hash probe.
+        let n = 3 + has_indices as usize;
+        let m = self.arr_props.entry(arr_idx).or_insert_with(|| ObjMap::with_capacity(n));
+        if m.keys.is_empty() {
+            m.push_data("index".to_string(), index_v);
+            m.push_data("input".to_string(), input_sv);
+            m.push_data("groups".to_string(), groups);
+            if has_indices {
+                m.push_data("indices".to_string(), indices_v);
+            }
+        } else {
+            m.define("index", index_v, attr);
+            m.define("input", input_sv, attr);
+            m.define("groups", groups, attr);
+            if has_indices {
+                m.define("indices", indices_v, attr);
+            }
         }
         Ok(Value::heap(arr_idx))
     }

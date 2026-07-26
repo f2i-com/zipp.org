@@ -60,10 +60,15 @@ pub(crate) fn plan_region_cold(
     // typing/homing passes below bypass the receivers.
     let pin_kind: u8 = if admit_bitwise { 5 } else { 8 };
     let pinned_elem = |ip: usize| -> bool {
-        ta_plan
-            .access
-            .get(&ip)
-            .map_or(false, |&j| ta_plan.pins[j as usize].kind == pin_kind)
+        ta_plan.access.get(&ip).map_or(false, |&j| {
+            let k = ta_plan.pins[j as usize].kind;
+            // A dense all-Int ARRAY read joins the int path on the same terms as a
+            // kind-5 TypedArray: receiver via the pin, index via `key`'s home, the
+            // element unboxed into an i64 home under a per-access tag guard. This is
+            // what admits `for (i < a.length) s += a[i]` — the most common hot loop
+            // in JS, and previously demoted to the boxed memory path in full.
+            k == pin_kind || (admit_bitwise && k == ARR_INT_PIN_KIND)
+        })
     };
     // A pinned flat-ASCII STRING access (kind 254): `str.charCodeAt(i)` (CallMethod)
     // and `str.length` (GetProp), both on the int path only (admit_bitwise). The
@@ -75,6 +80,16 @@ pub(crate) fn plan_region_cold(
                 .access
                 .get(&ip)
                 .map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
+    };
+    // `arr.length` on a dense all-Int Array pin — like `str.length`, the receiver is
+    // read from the pin snapshot rather than a register, so its reg must be excluded
+    // from typing/homing too.
+    let pinned_arr_len = |ip: usize| -> bool {
+        admit_bitwise
+            && ta_plan
+                .access
+                .get(&ip)
+                .map_or(false, |&j| ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND)
     };
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
     {
@@ -88,7 +103,7 @@ pub(crate) fn plan_region_cold(
                     recv.insert(obj);
                 }
             }
-            if pinned_str(s + off) {
+            if pinned_str(s + off) || pinned_arr_len(s + off) {
                 if let Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. } = *instr {
                     recv.insert(obj);
                 }
@@ -117,18 +132,25 @@ pub(crate) fn plan_region_cold(
                 // invisible to instr_uses today (CallMethod→vec![]; GetProp→[obj]),
                 // so the CallMethod half is forward-defensive; the GetProp half is
                 // the one that actually exempts a dual-use string receiver.
-                let idx_obj = if pinned_elem(s + off) {
-                    match *instr {
-                        Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => Some(obj),
-                        _ => None,
+                // Match on the INSTRUCTION first, then the predicate. The
+                // predicates are keyed by ip alone, so on a receiver that carries
+                // BOTH an element access and a `.length` read (`for (i < a.length)
+                // s += a[i]`) `pinned_elem` is also true at the GetProp ip — an
+                // `if pinned_elem { GetIndex|SetIndex => .. , _ => None }` chain
+                // then swallowed the GetProp and exempted nothing, so the receiver
+                // looked used-elsewhere and the whole region declined.
+                let idx_obj = match *instr {
+                    Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. }
+                        if pinned_elem(s + off) =>
+                    {
+                        Some(obj)
                     }
-                } else if pinned_str(s + off) {
-                    match *instr {
-                        Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. } => Some(obj),
-                        _ => None,
+                    Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
+                        if pinned_str(s + off) || pinned_arr_len(s + off) =>
+                    {
+                        Some(obj)
                     }
-                } else {
-                    None
+                    _ => None,
                 };
                 for u in instr_uses(instr) {
                     if Some(u) != idx_obj && recv.contains(&u) {
@@ -155,7 +177,7 @@ pub(crate) fn plan_region_cold(
                     // (Generalizing this needs SSA-like per-use disambiguation; it
                     // currently blocks e.g. the xorshift-fill `iv[i] = st|0` loop whose
                     // bytecode reuses the `iv` register for bitwise temps.)
-                    return None;
+                    decline!("pinned receiver reg not cleanly excludable");
                 }
             }
         }

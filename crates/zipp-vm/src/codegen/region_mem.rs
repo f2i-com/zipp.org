@@ -696,7 +696,7 @@ pub(crate) fn compile_region_mem(
                     .access
                     .get(&ip)
                     .map(|&j| (j as usize, ta_plan.pins[j as usize].kind))
-                    .filter(|&(_, kind)| kind == ARR_PIN_KIND);
+                    .filter(|&(_, kind)| is_arr_pin(kind));
                 let hp_slow = ops.new_dynamic_label();
                 let hp_done = ops.new_dynamic_label();
                 if let Some((slot, _)) = pinned {
@@ -1037,7 +1037,7 @@ pub(crate) fn compile_region_mem(
                 let (ta_slow, ta_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
                 if let Some((slot, kind)) = pinned {
                     let off = ta_slot_off(slot);
-                    if kind == ARR_PIN_KIND {
+                    if is_arr_pin(kind) {
                         // ── pinned dense-Array fast path ── identity guard, int
                         // key, bounds check against the snapshot len (==
                         // items.len()), then a DIRECT `Value` load (8 bytes — the
@@ -1169,7 +1169,7 @@ pub(crate) fn compile_region_mem(
                     .access
                     .get(&ip)
                     .map(|&j| (j as usize, ta_plan.pins[j as usize].kind))
-                    .filter(|&(_, kind)| kind != ARR_PIN_KIND);
+                    .filter(|&(_, kind)| !is_arr_pin(kind));
                 let (ta_slow, ta_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
                 if let Some((slot, kind)) = pinned {
                     let off = ta_slot_off(slot);

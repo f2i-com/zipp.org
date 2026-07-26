@@ -163,6 +163,28 @@ pub const STR_PIN_KIND: u8 = 254;
 /// helper (full prototype-walk / `in` semantics) — never a new answer.
 pub const ARR_PIN_KIND: u8 = 253;
 
+/// `TaPin::kind` for a dense Array **observed to hold only Int-tagged elements**
+/// at OSR compile time. Identical to `ARR_PIN_KIND` in layout, snapshotting and
+/// every memory-path use — the separate kind exists ONLY so the INTEGER tier can
+/// admit `arr[i]` (`region_is_int`), unboxing the element straight into an i64
+/// home instead of demoting the whole loop to the boxed memory path. That demotion
+/// is what made `for (i…) s += a[i]` — the single most common hot loop in JS —
+/// run at 12 ns/element against V8's 0.5 ns.
+///
+/// The observation is a HEURISTIC (a bounded prefix+stride sample, and the array
+/// can hold a double a moment later); it decides only whether the integer tier is
+/// worth ATTEMPTING. Soundness rests entirely on the per-access guard, which
+/// re-checks the Int tag of the actual element loaded and deopts on any miss —
+/// so a double, a HOLE, a heap value or a shrunk array is always correct, merely
+/// slow. Sampling keeps a known-double array from compiling INT and then
+/// deopt-thrashing to eviction.
+pub const ARR_INT_PIN_KIND: u8 = 252;
+
+/// Both dense-Array pin kinds — same snapshot and same memory-path treatment.
+pub fn is_arr_pin(kind: u8) -> bool {
+    kind == ARR_PIN_KIND || kind == ARR_INT_PIN_KIND
+}
+
 /// Compile-time plan for inline TypedArray element access in a memory-path
 /// region: the pins (each gets a 32-byte stack snapshot slot `{obj_bits, base,
 /// len}` filled by `jit_ta_snapshot`) and, per GetIndex/SetIndex ip, which pin

@@ -82,6 +82,10 @@ impl<'p> Vm<'p> {
             Ta,
             Dv,
             Str,
+            /// A `.length` read — resolves against whatever the receiver LIVES
+            /// as: a flat-ASCII string (pin `units`) or a dense Array (pin
+            /// `len`). Both snapshots already carry the length in the same slot.
+            Len,
         }
         for aip in s..=e {
             let (obj, recv) = match proto.code[aip] {
@@ -117,17 +121,21 @@ impl<'p> Vm<'p> {
                 {
                     (obj, Recv::Str)
                 }
-                // `str.length` on the SAME receiver coalesces onto the charCodeAt
-                // STR pin (the snapshot's `units` IS the length), so a `for (i <
-                // str.length) str.charCodeAt(i)` loop guard resolves via the pin
-                // instead of a GetProp IC — letting the whole loop run unboxed.
+                // `.length` on the SAME receiver coalesces onto that receiver's pin
+                // — the snapshot's third word IS the length for both pin families
+                // (a string's `units`, a dense Array's `items.len()`). So the
+                // guard of `for (i < str.length) str.charCodeAt(i)` AND of
+                // `for (i < a.length) s += a[i]` each resolve via the pin instead
+                // of a GetProp inline cache, which is what lets the whole loop
+                // run unboxed on the integer tier rather than demoting to the
+                // boxed memory path over one property read.
                 Instr::GetProp { obj, name, .. }
                     if proto
                         .string_constants
                         .get(name as usize)
                         .is_some_and(|k| k == "length") =>
                 {
-                    (obj, Recv::Str)
+                    (obj, Recv::Len)
                 }
                 _ => continue,
             };
@@ -165,18 +173,38 @@ impl<'p> Vm<'p> {
                 // wasted (the snapshot helper also declines at runtime → all-zero
                 // → identity miss → generic helper, so this is an optimisation,
                 // never a soundness gate).
-                (HeapObj::Array(_), Recv::Ta)
+                (HeapObj::Array(items), Recv::Ta | Recv::Len)
                     if !self.arr_props.contains_key(&live.heap_index())
                         && !self.arguments_objs.contains_key(&live.heap_index()) =>
                 {
-                    crate::codegen::ARR_PIN_KIND
+                    // All-Int (sampled) ⇒ offer the array to the INTEGER tier, which
+                    // unboxes `arr[i]` into an i64 home. Purely an admission hint —
+                    // the emitted code re-checks every element's tag — so the sample
+                    // may be bounded: a 200k-element array must not cost a full scan
+                    // at every OSR compile. 64 from the front (the loop's first
+                    // iterations, and where a mixed array usually reveals itself)
+                    // plus a 64-point stride across the rest.
+                    let n = items.len();
+                    let head = n.min(64);
+                    let all_int = items[..head].iter().all(|v| v.is_int())
+                        && (n <= head || {
+                            let step = (n - head).div_ceil(64).max(1);
+                            items[head..].iter().step_by(step).all(|v| v.is_int())
+                        });
+                    if all_int {
+                        crate::codegen::ARR_INT_PIN_KIND
+                    } else {
+                        crate::codegen::ARR_PIN_KIND
+                    }
                 }
                 (HeapObj::DataView { .. }, Recv::Dv) => crate::codegen::DV_PIN_KIND,
                 // Pin only a FLAT ASCII string — the inline byte load needs
                 // byte i == UTF-16 unit i (a rope/non-ASCII string snapshots
                 // zero and falls to the generic helper, so a wrong pin is safe;
                 // we just skip pinning it here when it can't help).
-                (HeapObj::Str(js), Recv::Str) if js.is_ascii() => crate::codegen::STR_PIN_KIND,
+                (HeapObj::Str(js), Recv::Str | Recv::Len) if js.is_ascii() => {
+                    crate::codegen::STR_PIN_KIND
+                }
                 _ => continue,
             };
             let slot = match plan.pins.iter().position(|p| p.src == src && p.kind == kind) {

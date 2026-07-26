@@ -5,16 +5,64 @@
 #![allow(unused_imports)]
 use super::*;
 
-/// Entry load for the int path: the Value bits are in `rax`. Guard Int-tagged
-/// (else `entry_bail`), SIGN-EXTEND the i32 payload to i64, store into the home.
+/// Entry load for the int path: the Value bits are in `rax`. An Int-tagged Value
+/// sign-extends its i32 payload; a DOUBLE holding an exact integer in
+/// [-2^53, 2^53] is also admitted, converted with `cvttsd2si`. Anything else
+/// takes `entry_bail`.
+///
+/// Admitting the integral double is what lets a loop RE-ENTER the integer tier
+/// after its accumulator crosses 2^31. Region exit boxes an i64 home as Int only
+/// when it fits i32 and as a double otherwise — so `for (k…) for (i…) s += a[i]`
+/// over a large array would exit the inner region with `s` boxed as a double, and
+/// an Int-only entry guard then rejected every subsequent entry: 64 deopts, then
+/// eviction to the boxed memory path for the rest of the run. Measured on a
+/// 40M-iteration nested sum, that was 425ms against 50ms for the same loop whose
+/// accumulator happened to stay under 2^31.
+///
+/// The round-trip (`cvttsd2si` then back, compare equal) is what makes this
+/// sound, and it needs no separate "is this really a double" test: every
+/// non-double Value is NaN-boxed, so reading its bits as f64 gives a NaN, the
+/// comparison is unordered, and `jp` bails. It also rejects a fractional double
+/// (unequal) and ±Inf (`cvttsd2si` yields the i64::MIN sentinel, which fails both
+/// the round-trip and the range check). Entry code runs once per region entry, so
+/// the extra ~8 instructions never touch the loop body.
 pub(crate) fn emit_int_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, entry_bail: dynasmrt::DynamicLabel) {
+    let as_double = ops.new_dynamic_label();
+    let store = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
     dynasm!(ops
         ; mov r10, rax
         ; shr r10, 48
         ; cmp r10d, INT_TAG_HI as i32
-        ; jne => entry_bail        // not Int-tagged (double/bool/null/undef/heap)
+        ; jne => as_double         // not Int-tagged — try the integral-double form
         ; movsxd rax, eax          // sign-extend the i32 payload to i64
         ; movq Rx(home), rax
+        ; jmp => done
+        ; => as_double
+        ; movq xmm0, rax
+        ; cvttsd2si rcx, xmm0      // truncate toward zero (i64::MIN on NaN/Inf/overflow)
+        ; cvtsi2sd xmm1, rcx
+        ; ucomisd xmm0, xmm1
+        ; jp => entry_bail         // unordered ⇒ NaN ⇒ a NaN-boxed non-double
+        ; jne => entry_bail        // not exactly integral
+        ; mov r10, QWORD 1i64 << 53
+        ; cmp rcx, r10
+        ; jg => entry_bail
+        ; neg r10
+        ; cmp rcx, r10
+        ; jl => entry_bail         // outside [-2^53, 2^53] — an i64 home is exact only there
+        // `ucomisd` reports -0.0 == +0.0, so the round-trip above ACCEPTS -0.0 and
+        // would land it in the home as 0 — which exits boxed as Int +0, turning
+        // `1/s` from -Infinity into +Infinity. An i64 home cannot represent -0 at
+        // all (the same reason `Neg` bails on a zero operand), so reject it here
+        // and keep that invariant true of every value entering the tier.
+        ; test rcx, rcx
+        ; jnz => store
+        ; test rax, rax            // rax still holds the original Value bits
+        ; js => entry_bail         // sign bit set with a zero magnitude ⇒ -0.0
+        ; => store
+        ; movq Rx(home), rcx
+        ; => done
     );
 }
 

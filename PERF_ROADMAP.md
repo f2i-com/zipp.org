@@ -795,6 +795,65 @@ The `IterNext` admission was reverted rather than kept: it is inert for the shap
 it was written for, and unexercised codegen that some future region shape reaches
 is exactly the B9 failure mode.
 
+### B18 — `s += a[i]` over a plain Array now reaches the INT tier (24x → 1.5x)
+
+The most common hot loop in all of JavaScript was running on the boxed memory
+path. `for (i < a.length) s += a[i]` over a 200k `Array` measured **12 ns per
+element against V8's 0.5 ns — 24x**, worse than any bench in the suite, and it
+was invisible because no bench in `bench/real/` is dominated by that shape.
+
+Three separate gates had to fall, and each was only visible after the previous
+one was removed — worth recording, because "the tier declined" is one log line
+that can mean four different things:
+
+1. `region_is_int` had no arm for `GetIndex` on a dense Array. The pin machinery
+   (`ARR_PIN_KIND`) already existed for the memory path; what was missing was an
+   INT arm that tag-checks the element and unboxes it into an i64 home. Added
+   `ARR_INT_PIN_KIND` (252) — the same snapshot and the same memory-path
+   treatment, taken when the array is OBSERVED all-Int at OSR compile time, so a
+   known-double array does not compile INT and then deopt-thrash to eviction.
+   The observation is a bounded sample and only an admission hint: the emitted
+   per-access tag guard is what makes it sound.
+2. `a.length` was still a `GetProp`, admitted only for string pins, so ONE
+   property read demoted the whole loop. `.length` now resolves against the LIVE
+   receiver (`Recv::Len`) and coalesces onto whichever pin the receiver already
+   has — both pin families keep the length in the same third snapshot word, so
+   the existing `str.length` emitter serves an Array unchanged.
+3. `plan_region` then declined silently (`return None`, no reason logged) because
+   its receiver-exemption chain tested the ip-keyed `pinned_elem` predicate FIRST
+   and only then matched the instruction. On a receiver carrying both an element
+   access and a `.length` read, `pinned_elem` is true at the GetProp ip too, so
+   the `GetIndex | SetIndex => .., _ => None` arm swallowed it and exempted
+   nothing — the receiver looked "used elsewhere" and the region died. Now it
+   matches the instruction first and the predicate second. That silent `return
+   None` is now a named decline.
+
+**A fourth gate was not about arrays at all**, and is the more valuable find: the
+INT tier's entry guard demanded an Int TAG of every live-in, while region exit
+boxes an i64 home as Int only when it fits i32 and as a double otherwise. So any
+accumulator crossing 2^31 exited as a double and could never re-enter — 64 deopts
+then permanent eviction to the boxed path. `emit_int_entry_load` now also admits
+a double holding an exact integer in [-2^53, 2^53]. Measured on a 40M-iteration
+nested sum: **425ms → 37ms** (node 22ms). The same loop whose accumulator
+happened to stay under 2^31 had always run at 50ms — the two differed by nothing
+but the magnitude of the data, which is exactly the kind of cliff that never
+shows up in a benchmark suite and always shows up in someone's real program.
+
+The `-0` trap is worth stating explicitly: `ucomisd` reports `-0.0 == +0.0`, so
+the round-trip check ACCEPTS `-0.0` and lands 0 in the home, which exits boxed as
+Int `+0` and turns `1/s` from `-Infinity` into `+Infinity`. An i64 home cannot
+represent `-0` at all — the same reason `Neg` bails on a zero operand — so the
+entry load rejects it and keeps that invariant true of every value entering the
+tier. Caught while writing the code, not by a test; the differential case that
+pins it is a zero-iteration inner loop over a `-0` accumulator.
+
+    20M-element single sum      18ms   (node 12ms)   was ~250ms
+    40M nested, acc > 2^31      37ms   (node 22ms)   was 425ms
+
+Suite geomean is UNCHANGED — `bench/real/` is dominated by objects, strings and
+regex, not int-array loops. That is a gap in the bench set, not evidence the fix
+does not matter; see §1b.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
