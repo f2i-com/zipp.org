@@ -413,6 +413,7 @@ impl<'p> Vm<'p> {
                             if v.is_uninitialized()
                                 || is_hidden_key(name)
                                 || name == crate::vm::native::ANNEXB_REF_ERROR_NAME
+                                || name == crate::vm::native::HOST_CALL_NAME
                                 || self.program.lexical_globals.contains(&(i as u32))
                                 || self.deleted_globals.contains(name)
                             {
@@ -432,6 +433,7 @@ impl<'p> Vm<'p> {
                                 !self.deleted_globals.contains(*n)
                                     && !seen.contains(*n)
                                     && *n != crate::vm::native::ANNEXB_REF_ERROR_NAME
+                                    && *n != crate::vm::native::HOST_CALL_NAME
                             })
                             .cloned()
                             .collect();

@@ -85,6 +85,7 @@ impl<'p> Vm<'p> {
             frames: Vec::new(),
             output: Vec::new(),
             errput: Vec::new(),
+            host: None,
             start: std::time::Instant::now(),
             pending_throw: None,
             pending_new_target: Value::UNDEFINED,

@@ -292,6 +292,12 @@ pub struct Vm<'p> {
     pub output: Vec<String>,
     /// Lines produced by `console.error`/`console.warn` (→ stderr in node).
     pub errput: Vec<String>,
+    /// Embedder host hook, backing the `HOST_CALL` native. `None` in every
+    /// engine-internal path (`run`, `run_module_file`, the CLI, test262), so a
+    /// stock build has no host surface at all; only `crate::embed` installs one.
+    /// Taken out of the `Vm` for the duration of the call so the closure may
+    /// re-enter the VM (a host that evaluates JS re-borrows `&mut self`).
+    pub(crate) host: Option<Box<dyn FnMut(&str, &[String]) -> Result<String, String>>>,
     /// VM start instant — the zero point for `performance.now()` (which reports
     /// fractional milliseconds elapsed since the program began).
     start: std::time::Instant,

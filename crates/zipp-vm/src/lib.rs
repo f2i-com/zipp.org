@@ -23,6 +23,9 @@ mod capture;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod codegen;
 mod compile;
+/// Persistent-VM embedding API, for hosts that keep a script alive across many
+/// re-entries rather than running it once (see the module docs).
+pub mod embed;
 mod heap;
 pub mod value;
 mod vm;

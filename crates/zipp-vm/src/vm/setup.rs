@@ -2351,6 +2351,13 @@ impl<'p> Vm<'p> {
         // only; hidden from globalThis own-keys reflection (props.rs).
         let annexb_ref_error_fn =
             self.heap.alloc(HeapObj::Native(native::ANNEXB_REF_ERROR));
+        // The embedder trampoline (`crate::embed`). Like the Annex-B helper it is
+        // a RESERVED internal name, not a spec global: resolvable when named, but
+        // hidden from globalThis own-keys reflection so `Object.keys(globalThis)`
+        // and the test262 global-property tests are unaffected. With no host
+        // installed the native itself throws, so a stock `zipp js` run cannot
+        // reach anything through it.
+        let host_call_fn = self.heap.alloc(HeapObj::Native(native::HOST_CALL));
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
@@ -2472,6 +2479,7 @@ impl<'p> Vm<'p> {
             ("globalThis", global_this),
             ("$262", self.dollar262),
             (native::ANNEXB_REF_ERROR_NAME, annexb_ref_error_fn),
+            (native::HOST_CALL_NAME, host_call_fn),
         ];
         // The 11 TypedArray constructors (Int8Array … BigUint64Array).
         for (k, t) in native::TA_KINDS.iter().enumerate() {

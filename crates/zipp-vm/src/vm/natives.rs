@@ -3840,6 +3840,36 @@ impl<'p> Vm<'p> {
             NUM_IS_NAN => Value::bool(a0.is_double() && a0.as_f64().is_nan()),
             NUM_IS_FINITE => Value::bool(num_is_finite(a0)),
             NUM_IS_SAFE_INTEGER => Value::bool(num_is_safe_integer(a0)),
+            // Embedder trampoline. `__zippHostCall(kind, ...args)`: every argument
+            // is ToString'd (so the host contract is plain strings both ways —
+            // structured data crosses as JSON, which both sides already have), the
+            // host closure runs, and its reply comes back as a JS string. A host
+            // `Err` becomes an ordinary JS throw the script can `try`/`catch`.
+            //
+            // The closure is MOVED OUT of `self` for the duration of the call and
+            // put back after: a host that re-enters the VM (evaluating JS, reading
+            // a global) needs `&mut Vm`, which it cannot have while the closure is
+            // still borrowed from it. Re-entrant `__zippHostCall` therefore sees
+            // `host == None` and throws rather than aliasing — the honest failure.
+            HOST_CALL => {
+                let kind = self.to_js_string(a0)?;
+                let mut rest: Vec<String> = Vec::with_capacity(args.len().saturating_sub(1));
+                for &a in args.iter().skip(1) {
+                    rest.push(self.to_js_string(a)?);
+                }
+                let Some(mut host) = self.host.take() else {
+                    return Err(Thrown(format!(
+                        "TypeError: {HOST_CALL_NAME}(\"{kind}\") with no host installed \
+                         (or called re-entrantly from within a host call)"
+                    )));
+                };
+                let reply = host(&kind, &rest);
+                self.host = Some(host);
+                match reply {
+                    Ok(s) => self.alloc_str(s),
+                    Err(e) => return Err(Thrown(e)),
+                }
+            }
             // Global functions as values.
             GLOBAL_PARSE_INT => {
                 // ToString(string) — observable (calls toString, not valueOf) and

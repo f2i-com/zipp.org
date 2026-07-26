@@ -295,6 +295,16 @@ pub const MODULE_DYN_IMPORT: u16 = 916;
 /// from globalThis reflection (own-keys listing skips it; see props.rs).
 pub const ANNEXB_REF_ERROR: u16 = 917;
 pub const ANNEXB_REF_ERROR_NAME: &str = "__zipp_annexb_ref_error__";
+/// Embedder trampoline: `__zippHostCall(kind, ...args)` hands a string `kind`
+/// and its stringified arguments to the host closure installed via
+/// [`crate::embed::ScriptState::set_host_call`], and returns the host's string
+/// reply. This is the ONLY channel from JS into embedder-supplied Rust; the
+/// engine itself never installs a host, so in a plain `zipp js` run the global
+/// is absent and calling it is a ReferenceError like any other undeclared name.
+/// Numbered well clear of the allocated range so it does not collide with
+/// natives added by ongoing engine work.
+pub const HOST_CALL: u16 = 950;
+pub const HOST_CALL_NAME: &str = "__zippHostCall";
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -1065,6 +1075,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         REGEXP_LEGACY_SET => ("set", 1),
         GLOBAL_ESCAPE => ("escape", 1),
         GLOBAL_UNESCAPE => ("unescape", 1),
+        HOST_CALL => (HOST_CALL_NAME, 1),
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),
