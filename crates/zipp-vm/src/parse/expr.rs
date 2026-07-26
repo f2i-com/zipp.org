@@ -487,7 +487,7 @@ impl<'s> Parser<'s> {
 
     /// `LeftHandSideExpression`: member accesses, calls, `new`, and optional
     /// chains.
-    fn parse_lhs(&mut self) -> PResult<Expr> {
+    pub(crate) fn parse_lhs(&mut self) -> PResult<Expr> {
         let mut e = if self.at_kw(Keyword::New) {
             self.parse_new()?
         } else {
@@ -713,6 +713,7 @@ impl<'s> Parser<'s> {
                 Ok(Expr::BigInt(d.into_boxed_str()))
             }
             TokenKind::Str(_) => {
+                self.check_legacy_escape()?;
                 let tok = self.bump_after_operand()?;
                 let TokenKind::Str(v) = tok.kind else { unreachable!() };
                 Ok(Expr::Str(v))
@@ -886,6 +887,20 @@ impl<'s> Parser<'s> {
         }
     }
 
+    /// `""` (LegacyOctalEscapeSequence) and `"\8"` (NonOctalDecimalEscape)
+    /// are Annex B, and a Syntax Error in strict code. The LEXER records the
+    /// spelling because it cannot know the strictness; this is where it is
+    /// judged, once the current token is a string literal about to be used.
+    pub(crate) fn check_legacy_escape(&self) -> PResult<()> {
+        if self.ctx.strict && self.cur().legacy_escape {
+            return Err(SyntaxError::new(
+                "SyntaxError: legacy octal escape sequences are not allowed in strict mode",
+                self.cur().span.start,
+            ));
+        }
+        Ok(())
+    }
+
     /// An IdentifierReference. Looser than a binding: `eval`/`arguments` may be
     /// READ in strict mode, only bound-to is an error.
     fn binding_ident_or_reference(&mut self) -> PResult<(Name, u32)> {
@@ -904,6 +919,35 @@ impl<'s> Parser<'s> {
         }
         if self.ctx.strict && kw.is_strict_reserved() {
             return Err(self.err_here("SyntaxError: reserved word in strict mode"));
+        }
+        // `yield` and `await` are reserved by CONTEXT, not by strictness, and
+        // reaching here means the token was not consumed as a YieldExpression or
+        // an AwaitExpression — which for an unescaped spelling cannot happen, so
+        // in practice this is the ESCAPED spelling. `yield` is still the
+        // reserved word (ReservedWord matches on StringValue) but it is not the
+        // KEYWORD, so it can be neither the operator nor an identifier: it is
+        // simply an error, and without these two lines it silently became a
+        // variable reference.
+        // `ContainsArguments` — a class field initializer and a static block have
+        // no `arguments` binding of their own and may not reach the enclosing
+        // one, so the mere IDENTIFIER is an early error. `ctx.in_field_init` is
+        // cleared by `parse_fn_tail` (a nested function has its own `arguments`)
+        // and inherited by arrows (which do not), which is exactly the spec's
+        // split. The compiler has the same check, but loses the flag on the
+        // static-field, static-block and computed-key paths.
+        if self.ctx.in_field_init && name == "arguments" {
+            return Err(self.err_here(
+                "SyntaxError: 'arguments' is not allowed in a class field initializer \
+                 or static block",
+            ));
+        }
+        if self.ctx.yield_ && kw == Keyword::Yield {
+            return Err(self.err_here("SyntaxError: 'yield' is reserved inside a generator"));
+        }
+        if self.ctx.await_ && kw == Keyword::Await {
+            return Err(self.err_here(
+                "SyntaxError: 'await' is reserved inside an async function or module",
+            ));
         }
         let pos = self.cur().span.start;
         let tok = self.bump_after_operand()?;
@@ -1066,6 +1110,14 @@ impl<'s> Parser<'s> {
             return Ok((ObjectMember::Method { key, func: Box::new(func) }, false, start));
         }
 
+        // A PropertyName is unrestricted — `{ break: 1 }`, `{ if: 1 }`,
+        // `{ break: 1 }` are all fine, because a reserved word is still a
+        // perfectly good property NAME. Shorthand re-reads the very same token
+        // as an IdentifierReference, where it is not. `parse_prop_key` has
+        // consumed the keyword classification by the time that is known, so
+        // settle the question here, before the token is gone.
+        let key_is_ident_ref = self.is_binding_ident();
+        let key_pos = self.cur().span.start;
         let key = self.parse_prop_key()?;
         // `m() {}`
         if self.at(Punct::LParen) {
@@ -1087,6 +1139,12 @@ impl<'s> Parser<'s> {
         let PropKey::Ident(name) = &key else {
             return Err(self.err_here("SyntaxError: expected ':' after property name"));
         };
+        if !key_is_ident_ref {
+            return Err(SyntaxError::new(
+                format!("SyntaxError: '{name}' is not a valid shorthand property name"),
+                key_pos,
+            ));
+        }
         let name = name.clone();
         let mut init = None;
         if self.at(Punct::Eq) {
@@ -1117,6 +1175,7 @@ impl<'s> Parser<'s> {
     pub(crate) fn parse_prop_key(&mut self) -> PResult<PropKey> {
         match self.cur().kind.clone() {
             TokenKind::Str(s) => {
+                self.check_legacy_escape()?;
                 self.bump_after_operand()?;
                 Ok(PropKey::Str(s))
             }

@@ -153,6 +153,9 @@ impl<'s> Parser<'s> {
         is_async: bool,
         start: u32,
     ) -> PResult<Expr> {
+        // `ArrowFormalParameters : ( UniqueFormalParameters )` -- an arrow's
+        // parameters may never repeat a name, in any mode.
+        self.check_unique_params(&params, true, start)?;
         let saved = self.ctx;
         let saved_labels = std::mem::take(&mut self.labels);
         // An arrow inherits `this`, `arguments`, `new.target` and the enclosing
@@ -165,7 +168,7 @@ impl<'s> Parser<'s> {
         self.ctx.in_loop = false;
         self.ctx.in_switch = false;
         let body = if self.at(Punct::LBrace) {
-            ArrowBody::Block(self.parse_fn_body()?)
+            ArrowBody::Block(self.parse_fn_body_with_params(Some(&params))?)
         } else {
             ArrowBody::Expr(Box::new(self.parse_assign_full()?))
         };

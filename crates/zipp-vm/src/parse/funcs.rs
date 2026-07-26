@@ -8,7 +8,21 @@
 
 use super::ast::*;
 use super::parser::{BindKind, PResult, Parser, ScopeKind, SyntaxError};
-use super::token::{Keyword, Punct, Span};
+use super::token::{Keyword, Punct, Span, StrVal};
+
+/// The spec's `PropName`, for the two names the class rules care about
+/// (`"constructor"` and `"prototype"`). A computed key has no PropName, and a
+/// numeric one can never spell either word, so both answer `None` — which is
+/// exactly the exemption `class C { static ['prototype'](){} }` relies on.
+fn prop_name(key: &PropKey) -> Option<&str> {
+    match key {
+        PropKey::Ident(n) => Some(n),
+        PropKey::Str(StrVal::Utf8(s)) => Some(s),
+        // A lone-surrogate key is not a name any of these rules match.
+        PropKey::Str(StrVal::Utf16(_)) | PropKey::Num(_) => None,
+        PropKey::Computed(_) | PropKey::Private(_) => None,
+    }
+}
 
 impl<'s> Parser<'s> {
     /// A function after its `function` keyword has been consumed. `start` is the
@@ -24,7 +38,7 @@ impl<'s> Parser<'s> {
         } else {
             None
         };
-        let (params, body) = self.parse_fn_tail(is_async, is_generator)?;
+        let (params, body) = self.parse_fn_tail(is_async, is_generator, false)?;
         Ok(Function { name, params, body, is_async, is_generator, span: Span::new(start, self.prev_end()) })
     }
 
@@ -37,7 +51,17 @@ impl<'s> Parser<'s> {
     }
 
     /// Parameters + body, with the context switched to the function's own.
-    fn parse_fn_tail(&mut self, is_async: bool, is_generator: bool) -> PResult<(Params, FnBody)> {
+    /// `unique` selects the spec's `UniqueFormalParameters` over plain
+    /// `FormalParameters`: every METHOD (object literal or class, plain or
+    /// generator or async, constructor included) takes the unique form, while a
+    /// FunctionDeclaration/Expression -- generator and async ones too -- takes
+    /// the permissive one and forbids duplicates only when strict or non-simple.
+    fn parse_fn_tail(
+        &mut self,
+        is_async: bool,
+        is_generator: bool,
+        unique: bool,
+    ) -> PResult<(Params, FnBody)> {
         let saved = self.ctx;
         let saved_labels = std::mem::take(&mut self.labels);
         // A function body resets these from its OWN flags — unlike an arrow,
@@ -53,7 +77,8 @@ impl<'s> Parser<'s> {
 
         let params_at = self.cur().span.start;
         let params = self.parse_params()?;
-        let body = self.parse_fn_body()?;
+        self.check_unique_params(&params, unique, params_at)?;
+        let body = self.parse_fn_body_with_params(Some(&params))?;
 
         self.ctx = saved;
         self.labels = saved_labels;
@@ -98,7 +123,7 @@ impl<'s> Parser<'s> {
         let saved_super = self.ctx.super_prop;
         // A method — object literal or class — may use `super.x`.
         self.ctx.super_prop = true;
-        let (params, body) = self.parse_fn_tail(is_async, is_generator)?;
+        let (params, body) = self.parse_fn_tail(is_async, is_generator, true)?;
         self.ctx.super_prop = saved_super;
         Ok(Function {
             name: None,
@@ -108,6 +133,44 @@ impl<'s> Parser<'s> {
             is_generator,
             span: Span::new(start, self.prev_end()),
         })
+    }
+
+    /// 15.1.1: duplicate `BoundNames` in a parameter list are an error when the
+    /// production is `UniqueFormalParameters` (every method and every arrow),
+    /// when the list is not simple, or when the code is strict. `function
+    /// f(a,a){}` stays legal in sloppy code -- and so, deliberately, do the
+    /// GENERATOR and ASYNC declaration forms, which take plain
+    /// `FormalParameters` despite looking like methods.
+    ///
+    /// A body-level `"use strict"` also triggers it, but that is not knowable
+    /// here (the body has not been read yet) and a non-simple list already makes
+    /// the directive itself an error, so the simple-list case is left to the
+    /// compiler's own check.
+    pub(crate) fn check_unique_params(
+        &self,
+        params: &Params,
+        unique: bool,
+        pos: u32,
+    ) -> PResult<()> {
+        if !(unique || !params.simple || self.ctx.strict) {
+            return Ok(());
+        }
+        let mut names = Vec::new();
+        for item in &params.items {
+            super::stmt::collect_pattern_names(item, &mut names);
+        }
+        for i in 1..names.len() {
+            if names[..i].contains(&names[i]) {
+                return Err(SyntaxError::new(
+                    format!(
+                        "SyntaxError: duplicate parameter name '{}' not allowed in this context",
+                        names[i]
+                    ),
+                    pos,
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn parse_params(&mut self) -> PResult<Params> {
@@ -146,6 +209,21 @@ impl<'s> Parser<'s> {
 
     /// A `{ … }` function body, with its own directive prologue.
     pub(crate) fn parse_fn_body(&mut self) -> PResult<FnBody> {
+        self.parse_fn_body_with_params(None)
+    }
+
+    /// The body, with the enclosing parameter list's `BoundNames` seeded into
+    /// its scope as VAR-like bindings.
+    ///
+    /// That placement is the whole point: a parameter collides with the body's
+    /// `LexicallyDeclaredNames` (`function f(a){ let a; }` is an error) but not
+    /// with its `VarDeclaredNames` (`function f(a){ var a; }` is fine, and so is
+    /// a body-level `function a(){}`). Recording them in `Scope::var` is exactly
+    /// that asymmetry, and it is why they are not `BindKind::Param` in `lex`.
+    pub(crate) fn parse_fn_body_with_params(
+        &mut self,
+        params: Option<&Params>,
+    ) -> PResult<FnBody> {
         self.expect(Punct::LBrace, true)?;
         let saved_strict = self.ctx.strict;
         let (directives, strict) = self.directive_prologue()?;
@@ -153,6 +231,15 @@ impl<'s> Parser<'s> {
             self.ctx.strict = true;
         }
         self.scopes.push(ScopeKind::Function);
+        if let Some(p) = params {
+            let mut names = Vec::new();
+            for item in &p.items {
+                super::stmt::collect_pattern_names(item, &mut names);
+            }
+            for n in names {
+                self.scopes.declare_param(&n);
+            }
+        }
         let mut stmts = Vec::new();
         while !self.at(Punct::RBrace) && !self.at_eof() {
             stmts.push(self.parse_stmt_list_item()?);
@@ -288,17 +375,124 @@ impl<'s> Parser<'s> {
             }
             body.push(m);
         }
+        let body_end = self.cur().span.start;
         self.expect(Punct::RBrace, false)?;
         self.ctx.strict = saved_strict;
+        Self::check_class_body(&body, body_end)?;
         Ok(Class { name, superclass, body, span: Span::new(start, self.prev_end()) })
     }
 
-    /// `parse_lhs` is private to the expression module; classes need it for
-    /// `extends`.
+    /// §15.7.1 ClassBody early errors, plus §15.4.1's constructor rules. All of
+    /// them read only the finished member list, so they run once here rather
+    /// than being smeared across `parse_class_member`.
+    ///
+    /// The three that are easy to get subtly wrong:
+    ///
+    ///   * PropName is the STRING VALUE of the key, so `'prototype'` and
+    ///     `prototype` are the same name. A computed key has no PropName and is
+    ///     exempt — `class C { static ['prototype'](){} }` is legal.
+    ///   * A private name may repeat exactly once, and only as a getter/setter
+    ///     PAIR of matching staticness. Any other repeat — two getters, a getter
+    ///     and a method, an instance/static pair — is an error.
+    ///   * `#constructor` is banned as a ClassElementName even though
+    ///     `constructor` is fine, and even though the two never collide.
+    fn check_class_body(body: &[ClassMember], pos: u32) -> PResult<()> {
+        let err = |msg: String| Err(SyntaxError::new(msg, pos));
+
+        // PrivateBoundIdentifiers, in source order: (name, is_static, kind).
+        let mut privates: Vec<(&str, bool, MethodKind)> = Vec::new();
+        let mut ctor_count = 0usize;
+
+        for m in body {
+            let (key, is_static, kind, special) = match m {
+                ClassMember::Method(cm) => (
+                    &cm.key,
+                    cm.is_static,
+                    cm.kind,
+                    // SpecialMethod: a getter, a setter, a generator or an async
+                    // function. Only a plain method may be named `constructor`.
+                    cm.kind == MethodKind::Get
+                        || cm.kind == MethodKind::Set
+                        || cm.func.is_generator
+                        || cm.func.is_async,
+                ),
+                ClassMember::Field(cf) => (&cf.key, cf.is_static, MethodKind::Method, false),
+                ClassMember::StaticBlock(_) => continue,
+            };
+            let is_field = matches!(m, ClassMember::Field(_));
+
+            if let PropKey::Private(n) = key {
+                if &**n == "constructor" {
+                    return err(
+                        "SyntaxError: '#constructor' is not a valid private name".into()
+                    );
+                }
+                privates.push((n, is_static, if is_field { MethodKind::Method } else { kind }));
+                continue;
+            }
+
+            let Some(name) = prop_name(key) else { continue };
+            if is_static && name == "prototype" {
+                return err(
+                    "SyntaxError: a class may not have a static member named 'prototype'".into()
+                );
+            }
+            if is_field {
+                // A field named `constructor` is banned in both placements; a
+                // STATIC field additionally may not be named `prototype` (caught
+                // above, which covers methods too).
+                if name == "constructor" {
+                    return err(
+                        "SyntaxError: a class field may not be named 'constructor'".into()
+                    );
+                }
+                continue;
+            }
+            if !is_static && name == "constructor" {
+                if special {
+                    return err(
+                        "SyntaxError: the class constructor may not be a getter, setter, \
+                         generator or async method".into()
+                    );
+                }
+                ctor_count += 1;
+            }
+        }
+
+        if ctor_count > 1 {
+            return err("SyntaxError: a class may only have one constructor".into());
+        }
+
+        for (i, (n, st, k)) in privates.iter().enumerate() {
+            let mut others = privates
+                .iter()
+                .enumerate()
+                .filter(|(j, (m, _, _))| *j != i && m == n)
+                .map(|(_, e)| e);
+            let Some((_, ost, ok)) = others.next() else { continue };
+            // More than two entries, or a second entry that does not complete a
+            // same-staticness accessor pair.
+            let paired = others.next().is_none()
+                && ost == st
+                && matches!(
+                    (k, ok),
+                    (MethodKind::Get, MethodKind::Set) | (MethodKind::Set, MethodKind::Get)
+                );
+            if !paired {
+                return err(format!(
+                    "SyntaxError: private name '#{n}' has already been declared"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// ClassHeritage is a `LeftHandSideExpression`, so `extends a.b` binds the
+    /// member, while `extends a + b` and `extends a => a` are syntax errors.
+    /// Parsing it as an AssignmentExpression accepted both, and turned
+    /// `class C extends () => {} {}` into a runtime TypeError instead.
     fn parse_lhs_public(&mut self) -> PResult<Expr> {
-        // `extends` takes a LeftHandSideExpression, so `extends a.b` binds the
-        // member but `extends a + b` is a syntax error.
-        self.parse_assign()
+        self.parse_lhs()
     }
 
     fn parse_class_member(&mut self, derived: bool) -> PResult<ClassMember> {
@@ -386,10 +580,13 @@ impl<'s> Parser<'s> {
         let key = self.parse_prop_key()?;
 
         if self.at(Punct::LParen) {
+            // PropName, not spelling: `class C { 'constructor'(){} }` defines the
+            // constructor exactly as the bare identifier does, so `super()` is
+            // legal in it and a second `constructor` beside it is a duplicate.
             let is_ctor = !is_static
                 && !is_async
                 && !is_generator
-                && matches!(&key, PropKey::Ident(n) if &**n == "constructor");
+                && prop_name(&key) == Some("constructor");
             let saved_call = self.ctx.super_call;
             if is_ctor {
                 // `super()` is legal only in a DERIVED constructor.
@@ -448,12 +645,15 @@ impl<'s> Parser<'s> {
             // inner `f` is block-scoped, and Annex B simply skips the
             // var-hoisting when it would collide — which is exactly what the
             // `*-skip-early-err*` test family asserts), and it was rejected.
-            BindKind::Function if self.scopes.fn_decl_is_var_scoped() => {
+            BindKind::Function | BindKind::GenFunction
+                if self.scopes.fn_decl_is_var_scoped() =>
+            {
                 self.scopes.declare_var(name, pos)
             }
             // Annex B.3.2.4/B.3.2.5: in a Block or CaseBlock, two
             // FunctionDeclarations of the same name are legal in SLOPPY code and
-            // an error under strict.
+            // an error under strict. A generator/async declaration is not a
+            // FunctionDeclaration, so it never opts in.
             BindKind::Function => {
                 self.scopes.declare_lexical(name, kind, pos, !self.ctx.strict)
             }

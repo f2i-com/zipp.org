@@ -154,7 +154,16 @@ pub(crate) enum BindKind {
     Let,
     Const,
     Class,
+    /// A plain `FunctionDeclaration` — the ONLY shape Annex B B.3.2.4/B.3.2.5
+    /// let repeat inside a Block or a CaseBlock.
     Function,
+    /// A `GeneratorDeclaration`, `AsyncFunctionDeclaration` or
+    /// `AsyncGeneratorDeclaration`. Scoped exactly like `Function` (its name is
+    /// var-scoped where `TopLevelVarDeclaredNames` applies), but held apart
+    /// because the Annex B duplicate carve-out names `FunctionDeclaration`
+    /// specifically: `{ function* f(){} function* f(){} }` is an error in every
+    /// mode, and so is a plain/generator PAIR in either order.
+    GenFunction,
     Param,
     CatchParam,
     Import,
@@ -164,6 +173,29 @@ impl BindKind {
     fn is_lexical(self) -> bool {
         matches!(self, BindKind::Let | BindKind::Const | BindKind::Class | BindKind::Import)
     }
+}
+
+/// Where a Statement sits. Three Annex B / §14.x rules read this, and they
+/// disagree with each other, so the position has to be carried rather than
+/// inferred:
+///
+///   * B.3.2 lets a bare `FunctionDeclaration` be a `LabelledItem`
+///     (`l: function f(){}`) in sloppy code.
+///   * B.3.4 lets one be an `IfStatement` clause (`if (x) function f(){}`).
+///   * Every other Statement position — a loop body, a `with` body — takes no
+///     declaration at all.
+///   * And §14.6.1/§14.7.x add `IsLabelledFunction(Statement) is false` to
+///     if/else and to every loop, so `if (x) l: function f(){}` is an error
+///     even though both halves are individually legal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StmtPos {
+    /// A `StatementListItem`'s Statement, or a LabelledStatement body that
+    /// itself sits at statement-list level.
+    ListItem,
+    /// An `if`/`else` clause.
+    IfClause,
+    /// A loop body or a `with` body.
+    Nested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +270,12 @@ impl ScopeStack {
     /// is NOT strict and BOTH entries come from FunctionDeclarations — which is
     /// what makes `{ function f(){} function f(){} }` legal in sloppy code and
     /// an error under `"use strict"`.
+    ///
+    /// BOTH is the load-bearing word. The carve-out names `FunctionDeclaration`,
+    /// so a generator or async declaration on EITHER side re-arms the error:
+    /// `{ function f(){} function* f(){} }` is a SyntaxError in every mode. The
+    /// caller passes `annexb_dup_ok = false` for the new entry's side and
+    /// [`BindKind::GenFunction`] keeps the existing entry's side honest.
     pub(crate) fn declare_lexical(
         &mut self,
         name: &str,
@@ -271,6 +309,18 @@ impl ScopeStack {
             self.scopes.last().map(|s| s.kind),
             Some(ScopeKind::Script | ScopeKind::Function | ScopeKind::ClassStaticBlock)
         )
+    }
+
+    /// Seed a parameter name into the CURRENT scope's var list. Unlike
+    /// `declare_var` this raises nothing: the parameter list's own duplicate
+    /// rules are checked separately, and a parameter cannot conflict with a
+    /// binding that does not exist yet.
+    pub(crate) fn declare_param(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            if !scope.var.iter().any(|(n, _)| &**n == name) {
+                scope.var.push((name.into(), 0));
+            }
+        }
     }
 
     /// A `var` conflicts with any lexical binding between here and the nearest
@@ -373,11 +423,16 @@ pub struct Parser<'s> {
     /// The grammar goal. `import`/`export` are declarations only in a module;
     /// in a script they are ordinary identifiers.
     pub(crate) goal: Goal,
+    /// Where the Statement about to be parsed sits — see [`StmtPos`]. Reset to
+    /// `ListItem` by every `parse_stmt_list_item`, so a braced body restores it
+    /// automatically and only the unbraced single-statement forms have to set it.
+    pub(crate) stmt_pos: StmtPos,
 }
 
 impl<'s> Parser<'s> {
     pub fn new(src: &'s str, opts: ParseOptions) -> PResult<Parser<'s>> {
         let mut lx = Lexer::new(src);
+        lx.set_html_comments(opts.goal != Goal::Module);
         // A program starts in operand position, so a leading `/` is a regex.
         let tok = lx.next_token(true)?;
         let ctx = Ctx {
@@ -403,6 +458,7 @@ impl<'s> Parser<'s> {
             labels: Vec::new(),
             parenthesized: false,
             goal,
+            stmt_pos: StmtPos::ListItem,
         })
     }
 
@@ -667,8 +723,17 @@ impl<'s> Parser<'s> {
     pub(crate) fn directive_prologue(&mut self) -> PResult<(Vec<Directive>, bool)> {
         let mut out = Vec::new();
         let mut strict = false;
+        // A prologue directive is a string literal too, and a legacy escape in
+        // one is a Syntax Error under the very strictness the prologue is still
+        // deciding — in EITHER order, since `"use strict"` makes the whole
+        // production strict retroactively. So collect the offending positions
+        // and judge them once the prologue is closed.
+        let mut legacy_at: Option<u32> = None;
         loop {
             let TokenKind::Str(_) = &self.tok.kind else { break };
+            if legacy_at.is_none() && self.tok.legacy_escape {
+                legacy_at = Some(self.tok.span.start);
+            }
             // A string is only a directive if the whole statement is just that
             // string — `"use strict" + x` is an expression.
             let start = self.tok.span.start as usize;
@@ -696,6 +761,14 @@ impl<'s> Parser<'s> {
             }
             out.push(Directive { raw: inner.into(), value });
             let _ = self.eat(Punct::Semi, true)?;
+        }
+        if let Some(pos) = legacy_at {
+            if strict || self.ctx.strict {
+                return Err(SyntaxError::new(
+                    "SyntaxError: legacy octal escape sequences are not allowed in strict mode",
+                    pos,
+                ));
+            }
         }
         Ok((out, strict))
     }

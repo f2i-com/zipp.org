@@ -45,11 +45,31 @@ pub struct Lexer<'s> {
     pos: usize,
     /// A LineTerminator has been seen since the last token was produced.
     saw_newline: bool,
+    /// The token being produced used an Annex B legacy string escape. See
+    /// [`Token::legacy_escape`] — set by the escape reader, consumed once by
+    /// `next_token`, so it describes exactly one token.
+    legacy_escape: bool,
+    /// The grammar goal. `<!--` and `-->` are Annex B HTML-like comments, which
+    /// exist ONLY in a Script: in a Module `-->` is a decrement followed by `>`
+    /// and `<!--` is a comparison, both of which fail to parse — which is the
+    /// SyntaxError the module tests want.
+    html_comments: bool,
 }
 
 impl<'s> Lexer<'s> {
+    /// Turn Annex B HTML-like comments off — the Module goal has none.
+    pub fn set_html_comments(&mut self, on: bool) {
+        self.html_comments = on;
+    }
+
     pub fn new(src: &'s str) -> Lexer<'s> {
-        let mut lx = Lexer { src: src.as_bytes(), pos: 0, saw_newline: false };
+        let mut lx = Lexer {
+            src: src.as_bytes(),
+            pos: 0,
+            saw_newline: false,
+            legacy_escape: false,
+            html_comments: true,
+        };
         // A leading BOM is whitespace, not part of the first token.
         if lx.src.starts_with(&[0xEF, 0xBB, 0xBF]) {
             lx.pos = 3;
@@ -208,12 +228,17 @@ impl<'s> Lexer<'s> {
                     // Annex B HTML-like comments. `<!--` is a line comment
                     // anywhere; `-->` only when it opens a line (i.e. only
                     // trivia precedes it on that line).
-                    b'<' if self.peek_at(1) == b'!' && self.peek_at(2) == b'-' && self.peek_at(3) == b'-' => {
+                    b'<' if self.html_comments
+                        && self.peek_at(1) == b'!'
+                        && self.peek_at(2) == b'-'
+                        && self.peek_at(3) == b'-' =>
+                    {
                         self.pos += 4;
                         self.skip_to_line_end();
                         continue;
                     }
-                    b'-' if self.saw_newline
+                    b'-' if self.html_comments
+                        && self.saw_newline
                         && self.peek_at(1) == b'-'
                         && self.peek_at(2) == b'>' =>
                     {
@@ -291,6 +316,7 @@ impl<'s> Lexer<'s> {
     /// regular expression literal (the parser knows; the lexer cannot).
     pub fn next_token(&mut self, regex_allowed: bool) -> LResult<Token> {
         self.saw_newline = false;
+        self.legacy_escape = false;
         self.skip_trivia()?;
         let newline_before = self.saw_newline;
         let start = self.pos;
@@ -300,6 +326,7 @@ impl<'s> Lexer<'s> {
                 kind: TokenKind::Eof,
                 span: Span::new(start as u32, start as u32),
                 newline_before,
+                legacy_escape: false,
             });
         }
 
@@ -330,7 +357,12 @@ impl<'s> Lexer<'s> {
             }
         };
 
-        Ok(Token { kind, span: Span::new(start as u32, self.pos as u32), newline_before })
+        Ok(Token {
+            kind,
+            span: Span::new(start as u32, self.pos as u32),
+            newline_before,
+            legacy_escape: self.legacy_escape,
+        })
     }
 
     // ---- identifiers -------------------------------------------------------
@@ -492,6 +524,7 @@ impl<'s> Lexer<'s> {
                 } else if template {
                     return Err(LexError::new("octal escape in template literal", at));
                 } else {
+                    self.legacy_escape = true;
                     let mut v: u32 = 0;
                     let max = if b <= b'3' { 3 } else { 2 };
                     let mut n = 0;
@@ -513,6 +546,7 @@ impl<'s> Lexer<'s> {
                 if template {
                     return Err(LexError::new("invalid escape in template literal", at));
                 }
+                self.legacy_escape = true;
                 out.push(b as u16);
                 self.pos += 1;
             }
@@ -640,7 +674,12 @@ impl<'s> Lexer<'s> {
     pub fn read_template_continue(&mut self) -> LResult<Token> {
         let start = self.pos;
         let kind = self.read_template(false)?;
-        Ok(Token { kind, span: Span::new(start as u32, self.pos as u32), newline_before: false })
+        Ok(Token {
+            kind,
+            span: Span::new(start as u32, self.pos as u32),
+            newline_before: false,
+            legacy_escape: false,
+        })
     }
 
     // ---- regex -------------------------------------------------------------
@@ -727,6 +766,13 @@ impl<'s> Lexer<'s> {
                 b'o' => return self.read_radix(8, start),
                 b'b' => return self.read_radix(2, start),
                 _ => {}
+            }
+            // `DecimalIntegerLiteral` allows a separator only after a
+            // NonZeroDigit, so `0_0` is an error while `1_0` is fine. Without
+            // this the digit reader saw `0`, `_`, `0` — each individually legal
+            // — and quietly produced 0.
+            if self.peek_at(1) == b'_' {
+                return Err(LexError::new("numeric separator after a leading zero", start));
             }
             // Legacy forms: `0123` is octal (Annex B), `08`/`09` is decimal.
             let next = self.peek_at(1);

@@ -1,8 +1,25 @@
 //! Statements, and the program entry point.
 
 use super::ast::*;
-use super::parser::{BindKind, PResult, ParseOptions, Parser, ScopeKind, SyntaxError};
+use super::parser::{BindKind, PResult, ParseOptions, Parser, ScopeKind, StmtPos, SyntaxError};
 use super::token::{Keyword, Punct, StrVal, TokenKind};
+
+/// Which duplicate rule a function DECLARATION's name plays by. Only a plain
+/// `FunctionDeclaration` gets the Annex B B.3.2.4/B.3.2.5 carve-out; a generator
+/// or async declaration is a different production and keeps the error.
+fn fn_bind_kind(f: &Function) -> BindKind {
+    if f.is_generator || f.is_async { BindKind::GenFunction } else { BindKind::Function }
+}
+
+/// The spec's `IsLabelledFunction`: a Statement that is a FunctionDeclaration
+/// under one or more labels. Recurses, because `l1: l2: function f(){}` is one.
+fn is_labelled_function(s: &Stmt) -> bool {
+    match s {
+        Stmt::FnDecl(_) => true,
+        Stmt::Labeled { body, .. } => is_labelled_function(body),
+        _ => false,
+    }
+}
 
 /// Parse a complete program.
 pub fn parse(src: &str, opts: ParseOptions) -> PResult<Program> {
@@ -325,6 +342,12 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_stmt_list_item_inner(&mut self) -> PResult<Stmt> {
+        // A StatementListItem is the one position where every declaration form is
+        // legal, so it is also the position that CLEARS any restriction an
+        // enclosing unbraced body left behind: `if (x) { function f(){} }` reaches
+        // here through the Block, and the brace is what makes it a declaration
+        // again rather than an Annex B clause.
+        self.stmt_pos = StmtPos::ListItem;
         if let Some(m) = self.parse_module_decl()? {
             return Ok(m);
         }
@@ -333,7 +356,8 @@ impl<'s> Parser<'s> {
             self.bump_after_operand()?;
             let f = self.parse_function_rest(false, start)?;
             if let Some(n) = &f.name {
-                self.declare(&n.clone(), BindKind::Function, start)?;
+                let bk = fn_bind_kind(&f);
+                self.declare(&n.clone(), bk, start)?;
             }
             return Ok(Stmt::FnDecl(Box::new(f)));
         }
@@ -346,7 +370,7 @@ impl<'s> Parser<'s> {
                 self.bump_after_operand()?;
                 let f = self.parse_function_rest(true, start)?;
                 if let Some(n) = &f.name {
-                    self.declare(&n.clone(), BindKind::Function, start)?;
+                    self.declare(&n.clone(), BindKind::GenFunction, start)?;
                 }
                 return Ok(Stmt::FnDecl(Box::new(f)));
             }
@@ -601,7 +625,7 @@ impl<'s> Parser<'s> {
                     self.expect(Punct::LParen, true)?;
                     let object = self.parse_expr_full()?;
                     self.expect(Punct::RParen, true)?;
-                    let body = self.parse_stmt()?;
+                    let body = self.in_nested_body(|p| p.parse_stmt())?;
                     Ok(Stmt::With { object, body: Box::new(body) })
                 }
                 // `var` is a VariableStatement, which IS a Statement, so it is
@@ -619,12 +643,25 @@ impl<'s> Parser<'s> {
                     self.semicolon()?;
                     Ok(Stmt::VarDecl(d))
                 }
-                // Annex B B.3.4: a function DECLARATION as a bare statement
-                // body (`if (x) function f() {}`, `l: function f() {}`) is
-                // web-compat sloppy-mode legality. Strict code keeps the error.
-                Keyword::Function if !self.ctx.strict => {
+                // Annex B B.3.4 / B.3.2: a function DECLARATION as a bare
+                // statement body (`if (x) function f() {}`, `l: function f() {}`)
+                // is web-compat sloppy-mode legality. Strict code keeps the
+                // error, and so does every OTHER statement position — there is no
+                // Annex B production for `while (x) function f(){}` or
+                // `with (o) function f(){}`, which is what `StmtPos::Nested`
+                // records. The generator/async forms are never covered: B.3.4
+                // names `FunctionDeclaration`, and `function*` reaches here
+                // through the same keyword, so the shape has to be re-checked
+                // after parsing.
+                Keyword::Function if !self.ctx.strict && self.stmt_pos != StmtPos::Nested => {
                     self.bump_after_operand()?;
                     let f = self.parse_function_rest(false, start)?;
+                    if f.is_generator {
+                        return Err(SyntaxError::new(
+                            "SyntaxError: declaration not allowed in this position",
+                            start,
+                        ));
+                    }
                     if let Some(n) = &f.name {
                         self.declare(&n.clone(), BindKind::Function, start)?;
                     }
@@ -636,10 +673,31 @@ impl<'s> Parser<'s> {
                     "SyntaxError: declaration not allowed in this position",
                     start,
                 )),
+                // `async [no LineTerminator here] function` is in
+                // ExpressionStatement's lookahead restriction, and there is no
+                // Annex B carve-out for it, so in a Statement position it is an
+                // error rather than an async function EXPRESSION. Reading it as
+                // an expression made `for (;;) async function f(){}` a legal
+                // infinite loop instead of a SyntaxError.
+                Keyword::Async if self.async_function_ahead()? => Err(SyntaxError::new(
+                    "SyntaxError: declaration not allowed in this position",
+                    start,
+                )),
                 _ => self.parse_expr_or_labeled(),
             },
             _ => self.parse_expr_or_labeled(),
         }
+    }
+
+    /// Does `async [no LineTerminator here] function` start here? Peeks without
+    /// consuming — the caller is deciding whether this Statement position is
+    /// legal at all, not parsing it.
+    fn async_function_ahead(&mut self) -> PResult<bool> {
+        let save = self.save();
+        self.bump_after_operand()?;
+        let hit = self.at_kw(Keyword::Function) && !self.cur().newline_before;
+        self.restore(save);
+        Ok(hit)
     }
 
     /// An expression statement, or a labelled statement.
@@ -663,8 +721,24 @@ impl<'s> Parser<'s> {
                     ));
                 }
                 self.labels.push(name.clone());
+                // The body inherits this label's position: a LabelledStatement at
+                // statement-list level may wrap a FunctionDeclaration, and so may
+                // one nested inside it (`l1: l2: function f(){}`).
                 let body = self.parse_stmt()?;
                 self.labels.pop();
+                // §14.6.1 and §14.7.x: `IsLabelledFunction(Statement) is false`
+                // for an if/else clause and for every loop body. So the two
+                // Annex B allowances do not compose — `l: function f(){}` is
+                // legal on its own and an error the moment it is the clause of an
+                // `if`, which is why this is checked HERE (where the label is
+                // known) rather than at the clause.
+                if self.stmt_pos != StmtPos::ListItem && is_labelled_function(&body) {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: a labelled function declaration is not allowed \
+                         in this position",
+                        start,
+                    ));
+                }
                 return Ok(Stmt::Labeled { label: name, body: Box::new(body) });
             }
             self.restore(save);
@@ -678,11 +752,22 @@ impl<'s> Parser<'s> {
     /// Pops even on error so the scope stack can never be left unbalanced.
     fn in_annexb_clause<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
         self.scopes.push(ScopeKind::Block);
+        let saved = std::mem::replace(&mut self.stmt_pos, StmtPos::IfClause);
         let r = f(self);
+        self.stmt_pos = saved;
         let popped = self.scopes.pop();
         let v = r?;
         popped?;
         Ok(v)
+    }
+
+    /// Run `f` with the Statement position set to `Nested` — a loop body or a
+    /// `with` body, where no declaration of any kind is a legal Statement.
+    fn in_nested_body<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        let saved = std::mem::replace(&mut self.stmt_pos, StmtPos::Nested);
+        let r = f(self);
+        self.stmt_pos = saved;
+        r
     }
 
     fn parse_if(&mut self) -> PResult<Stmt> {
@@ -712,13 +797,13 @@ impl<'s> Parser<'s> {
         self.expect(Punct::LParen, true)?;
         let test = self.parse_expr_full()?;
         self.expect(Punct::RParen, true)?;
-        let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
+        let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
         Ok(Stmt::While { test, body })
     }
 
     fn parse_do_while(&mut self) -> PResult<Stmt> {
         self.bump_before_operand()?;
-        let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
+        let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
         if !self.eat_kw(Keyword::While, true)? {
             return Err(self.err_here("SyntaxError: expected 'while'"));
         }
@@ -764,7 +849,7 @@ impl<'s> Parser<'s> {
                 self.ctx.in_ = saved_in;
                 let right = if of { self.parse_assign_full()? } else { self.parse_expr_full()? };
                 self.expect(Punct::RParen, true)?;
-                let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
+                let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
                 let left = ForTarget::Var(VarDecl {
                     kind,
                     decls: vec![Declarator { id: pat, init: None }],
@@ -809,7 +894,7 @@ impl<'s> Parser<'s> {
                 let target = self.expr_to_target(e, true, pos)?;
                 let right = if of { self.parse_assign_full()? } else { self.parse_expr_full()? };
                 self.expect(Punct::RParen, true)?;
-                let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
+                let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
                 let left = ForTarget::Target(target);
                 if of {
                     Stmt::ForOf { left, right, body, is_await }
@@ -832,7 +917,7 @@ impl<'s> Parser<'s> {
         self.expect(Punct::Semi, true)?;
         let update = if self.at(Punct::RParen) { None } else { Some(self.parse_expr_full()?) };
         self.expect(Punct::RParen, true)?;
-        let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
+        let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
         Ok(Stmt::For { init, test, update, body })
     }
 

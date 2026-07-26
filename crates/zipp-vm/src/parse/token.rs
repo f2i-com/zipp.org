@@ -267,6 +267,14 @@ pub struct Token {
     /// the no-LineTerminator-here restrictions (`return`/`throw`/`break`/
     /// `continue` operands, `++`/`--` postfix, `=>`, `async` before a function).
     pub newline_before: bool,
+    /// This token is a string literal that used a `LegacyOctalEscapeSequence`
+    /// (``) or a `NonOctalDecimalEscapeSequence` (`\8`, `\9`). Both are
+    /// Annex B, and both are a Syntax Error in strict code — but STRICTNESS IS
+    /// NOT KNOWN TO THE LEXER: a `"use strict"` directive earlier in the same
+    /// prologue turns it on, and the lexer has already produced this token by
+    /// then. So the spelling is recorded and the parser, which does know, is
+    /// what rejects it.
+    pub legacy_escape: bool,
 }
 
 impl TokenKind {

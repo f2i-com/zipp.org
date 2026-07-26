@@ -366,7 +366,18 @@ impl<'a> FnCompiler<'a> {
                 self.cx.heritage_classes.push((n.clone(), class_id));
                 self.heritage_class = Some((n.clone(), class_id));
             }
+            // ClassHeritage is evaluated OUTSIDE this class's PrivateEnvironment
+            // (§15.7.14 creates it only after the heritage), so `class C extends
+            // (this.#x) {}` is a SyntaxError even when `#x` is declared right
+            // below. `compile_class` above has already pushed this class's names,
+            // so lift them for the duration — a nested class inside the heritage
+            // still pushes and sees its OWN names, which is what keeps
+            // `class C extends (class { #y; m(){ return this.#y } }) {}` legal.
+            let own_privates = self.cx.private_names_stack.pop();
             let r = self.expr_into(sc, t);
+            if let Some(p) = own_privates {
+                self.cx.private_names_stack.push(p);
+            }
             if heritage_named.is_some() {
                 self.cx.heritage_classes.pop();
             }
