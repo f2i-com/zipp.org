@@ -5,6 +5,45 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Does compiling this expression into a destination register WRITE that
+/// register before it has finished READING its operands?
+///
+/// Almost every form computes its operands into temporaries and only then
+/// writes the destination, so `x = f(x)` and `x = [x]` are safe to compile
+/// straight into `x`'s register. Two forms are not: an object literal emits
+/// `NewObject{dst}` and then evaluates each property value, and a template
+/// literal builds its result in the destination across the interpolations. For
+/// those, an operand that reads the target variable would observe the
+/// half-built value rather than the variable's old one, so the caller must
+/// route them through a temporary.
+///
+/// Conditionals, logicals and sequences are transparent: their value comes from
+/// a sub-expression compiled into the same destination, so they inherit the
+/// property. This is deliberately a whitelist of what is SAFE-by-omission — a
+/// new in-place-building form must be added here, and `assign_reads_target` in
+/// the tests covers each shape.
+fn builds_into_dst_incrementally(e: &ox::Expression) -> bool {
+    use ox::Expression as E;
+    match e {
+        E::ObjectExpression(_) => true,
+        // A template with no interpolations is a plain constant string.
+        E::TemplateLiteral(t) => !t.expressions.is_empty(),
+        E::ConditionalExpression(c) => {
+            builds_into_dst_incrementally(&c.consequent)
+                || builds_into_dst_incrementally(&c.alternate)
+        }
+        E::LogicalExpression(l) => {
+            builds_into_dst_incrementally(&l.left) || builds_into_dst_incrementally(&l.right)
+        }
+        E::SequenceExpression(s) => {
+            s.expressions.last().is_some_and(builds_into_dst_incrementally)
+        }
+        E::ParenthesizedExpression(p) => builds_into_dst_incrementally(&p.expression),
+        E::AssignmentExpression(a) => builds_into_dst_incrementally(&a.right),
+        _ => false,
+    }
+}
+
 impl<'a> FnCompiler<'a> {
     /// Assign `src` to a destructuring-assignment target (existing binding or
     /// member, or a nested array/object pattern). Counterpart to `extract_pattern`
@@ -798,11 +837,26 @@ impl<'a> FnCompiler<'a> {
                 // (side effects) and the assignment then throws a TypeError.
                 if let Binding::Local(r) = binding {
                     if !self.const_regs.contains(&r) && !self.is_self_name_reg(r) {
-                        // Plain mutable local: evaluate the RHS directly into its reg.
-                        let v = if lhs_covered {
-                            self.expr_into(&a.right, r)?
+                        // Plain mutable local: evaluate the RHS directly into its
+                        // reg, saving a Move — but ONLY when the RHS finishes
+                        // reading its operands before anything is written to the
+                        // destination. An object literal and a template literal
+                        // both materialise into the destination FIRST and fill it
+                        // in afterwards, so compiling `e = { v: e }` in place makes
+                        // the property read the half-built object instead of `e`'s
+                        // old value (and `` e = `${e}` `` splice its own accumulator).
+                        // React's minified `createContext` is exactly this shape —
+                        // `e = {_currentValue: e, …}` — so getting it wrong makes
+                        // every context self-referential.
+                        let into = if builds_into_dst_incrementally(&a.right) {
+                            self.temp()
                         } else {
-                            self.compile_named_init(r, &a.right, &name)?
+                            r
+                        };
+                        let v = if lhs_covered {
+                            self.expr_into(&a.right, into)?
+                        } else {
+                            self.compile_named_init(into, &a.right, &name)?
                         };
                         if v != r {
                             self.emit(Instr::Move { dst: r, src: v });

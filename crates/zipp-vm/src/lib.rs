@@ -340,6 +340,51 @@ mod tests {
         assert_eq!(run_ok("console.log(7 / 2)"), vec!["3.5"]);
     }
 
+    /// `x = <expr that reads x>` must read x's OLD value. The assignment
+    /// compiler builds the RHS straight into x's own register to save a Move,
+    /// which is only sound for forms that finish reading before they write.
+    /// Object and template literals materialise into the destination and fill
+    /// it in afterwards, so in place they would read their own half-built value.
+    ///
+    /// React's minified `createContext` is exactly this shape —
+    /// `e = {_currentValue: e, …}` — so a regression here makes every React
+    /// context self-referential and takes the whole library down with it.
+    #[test]
+    fn assign_reads_target() {
+        // The two forms that build incrementally.
+        assert_eq!(run_ok("let e = 'old'; e = {v: e}; console.log(e.v)"), vec!["old"]);
+        assert_eq!(run_ok("let e = 'old'; e = `<${e}>`; console.log(e)"), vec!["<old>"]);
+        // Reached through the transparent forms.
+        assert_eq!(run_ok("let e = 'old'; e = e ? {v: e} : 0; console.log(e.v)"), vec!["old"]);
+        assert_eq!(run_ok("let e = 'old'; e = e && {v: e}; console.log(e.v)"), vec!["old"]);
+        assert_eq!(run_ok("let e = 'old'; e = (0, {v: e}); console.log(e.v)"), vec!["old"]);
+        assert_eq!(run_ok("let e = 'old'; e = {a: {b: e}}; console.log(e.a.b)"), vec!["old"]);
+        assert_eq!(run_ok("let e = 'old'; e = {...{}, v: e}; console.log(e.v)"), vec!["old"]);
+        // Forms that were already correct must stay correct (and keep compiling
+        // in place — this asserts behaviour, not codegen, but pins the semantics).
+        assert_eq!(run_ok("let e = 'old'; e = [e]; console.log(e[0])"), vec!["old"]);
+        assert_eq!(run_ok("let e = 1; e = e + 1; console.log(e)"), vec!["2"]);
+        assert_eq!(
+            run_ok("function f(x){return x} let e = 'old'; e = f(e); console.log(e)"),
+            vec!["old"]
+        );
+        // A parameter is a local too.
+        assert_eq!(
+            run_ok("function f(e){ e = {v: e}; return e.v } console.log(f('old'))"),
+            vec!["old"]
+        );
+        // The whole React shape, end to end.
+        assert_eq!(
+            run_ok(
+                "function createContext(e){ return (e = {_currentValue: e, _currentValue2: e, \
+                 Provider: null, Consumer: null}).Provider = {_context: e}, e.Consumer = e, e } \
+                 var c = createContext(null); \
+                 console.log(c._currentValue === null, c._currentValue2 === null, c.Consumer === c)"
+            ),
+            vec!["true true true"]
+        );
+    }
+
     #[test]
     fn let_and_reassign() {
         assert_eq!(run_ok("let x = 5; x = x + 1; console.log(x)"), vec!["6"]);
