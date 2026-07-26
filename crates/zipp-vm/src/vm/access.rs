@@ -606,6 +606,117 @@ impl<'p> Vm<'p> {
     /// JS `[[Set]]` (OrdinarySet + the exotic receivers). Returns the spec
     /// success BOOLEAN: `Ok(false)` is a rejected sloppy write (Reflect.set
     /// reports it); strict-mode rejections throw.
+    /// Can `key` be written on plain object `oi` by a direct slot store or
+    /// append, skipping every special case in `set_prop`?
+    ///
+    /// Each condition here corresponds to one branch further down that could
+    /// otherwise apply. Deliberately conservative: anything unusual — an exotic
+    /// receiver, a side table, an index-like or private/symbol key, a
+    /// non-extensible object — returns false and takes the full path.
+    ///
+    /// Motivation: `this.x = v` in a constructor measured ~145ns for the first
+    /// field and ~51ns after, against ~34ns/13ns for the same fields written as
+    /// an object literal. Almost all of that is `set_prop`'s preamble (realm and
+    /// global probes, `note_array_proto_index`, the `%Array.prototype%.length`
+    /// case, proxy parts, `__proto__`), none of which can apply here.
+    /// Receiver half of the test — checked FIRST so a non-qualifying receiver
+    /// (a class instance above all) costs one heap load and nothing else.
+    #[inline]
+    fn ordinary_set_recv_ok(&self, oi: u32) -> bool {
+        // `m.class.is_some()` is load-bearing: a class instance resolves
+        // accessors through its ClassData, which `proto_chain_blocks_set` does
+        // not walk, so `class C { set x(v){…} }` would be appended over.
+        matches!(
+            self.heap.get(oi),
+            HeapObj::Object(m) if m.extensible && !m.is_ctor && m.class.is_none()
+        )
+    }
+
+    #[inline]
+    fn ordinary_set_ok(&self, oi: u32, key: &str) -> bool {
+        if key.is_empty() {
+            return false;
+        }
+        let b0 = key.as_bytes()[0];
+        // Private (`#x`), well-known-symbol (`@@x`), `__proto__`, and anything
+        // index-like (length bookkeeping) go the slow way.
+        if b0 == b'#' || b0 == b'@' || key == "__proto__" || key == "length" {
+            return false;
+        }
+        if b0.is_ascii_digit() || b0 == b'-' {
+            return false;
+        }
+        if oi == self.global_this || oi == self.arr_proto || oi == self.obj_proto {
+            return false;
+        }
+        if !self.realm_global_objs.is_empty() && self.realm_global_objs.contains_key(&oi) {
+            return false;
+        }
+        if !self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oi) {
+            return false;
+        }
+        if !self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oi) {
+            return false;
+        }
+        if !self.arr_props.is_empty() && self.arr_props.contains_key(&oi) {
+            return false;
+        }
+        true
+    }
+
+    /// Does any prototype of `oi` carry `key` as an accessor or a non-writable
+    /// data property? Either would make a plain append wrong (`OrdinarySet`
+    /// defers to an inherited setter, and an inherited non-writable data
+    /// property makes the write fail). `None` means the chain is not walkable
+    /// cheaply (a proxy or exotic link) and the caller must take the slow path.
+    fn proto_chain_blocks_set(&self, oi: u32, key: &str) -> Option<bool> {
+        let mut cur = self.proto_of.get(&oi).copied();
+        let mut hops = 0;
+        while let Some(p) = cur {
+            if p.is_null() || !p.is_heap() {
+                return Some(false);
+            }
+            hops += 1;
+            if hops > 8 {
+                return None; // unusually deep: let the general path handle it
+            }
+            let pi = p.heap_index();
+            match self.heap.get(pi) {
+                HeapObj::Object(m) => {
+                    if m.class.is_some() {
+                        return None; // accessors resolve via ClassData
+                    }
+                    if let Some(i) = m.pos(key) {
+                        return Some(m.attrs[i].accessor || !m.attrs[i].writable);
+                    }
+                }
+                _ => return None, // array/proxy/class/exotic prototype
+            }
+            if !self.arr_props.is_empty() && self.arr_props.contains_key(&pi) {
+                return None;
+            }
+            cur = self.proto_of.get(&pi).copied();
+        }
+        // No recorded prototype means the DEFAULT %Object.prototype%, which must
+        // actually be consulted — a test (or a program) can install a
+        // non-writable or accessor property on it, and then an ordinary write
+        // through it has to fail rather than shadow.
+        if self.obj_proto != 0 {
+            match self.heap.get(self.obj_proto) {
+                HeapObj::Object(m) => {
+                    if let Some(i) = m.pos(key) {
+                        return Some(m.attrs[i].accessor || !m.attrs[i].writable);
+                    }
+                }
+                _ => return None,
+            }
+            if !self.arr_props.is_empty() && self.arr_props.contains_key(&self.obj_proto) {
+                return None;
+            }
+        }
+        Some(false)
+    }
+
     pub(crate) fn set_prop(
         &mut self,
         obj: Value,
@@ -613,6 +724,38 @@ impl<'p> Vm<'p> {
         val: Value,
         strict: bool,
     ) -> Result<bool, Thrown> {
+        // ── ordinary data write on a plain object ──
+        if obj.is_heap() {
+            let oi = obj.heap_index();
+            if self.ordinary_set_recv_ok(oi) && self.ordinary_set_ok(oi, key) {
+                // Existing own writable data slot: store in place. No shape
+                // change, so no version bump (the JIT addresses values through
+                // `vals_ptr + slot`, which stays valid).
+                let existing = match self.heap.get(oi) {
+                    HeapObj::Object(m) => m.pos(key).map(|i| (i, m.attrs[i].accessor, m.attrs[i].writable)),
+                    _ => None,
+                };
+                match existing {
+                    Some((i, false, true)) => {
+                        if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                            m.vals[i] = val;
+                        }
+                        return Ok(true);
+                    }
+                    Some(_) => {} // accessor / non-writable → general path
+                    None => {
+                        // New key: only safe when nothing inherited intercepts.
+                        if self.proto_chain_blocks_set(oi, key) == Some(false) {
+                            if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                                m.push_data(key.to_string(), val);
+                            }
+                            self.heap.bump_version(oi); // key add reallocs vals (IC)
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
         if !obj.is_heap() {
             if obj.is_nullish() {
                 return Err(Thrown("TypeError: cannot set property of non-object".into()));
