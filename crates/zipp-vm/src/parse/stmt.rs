@@ -674,14 +674,33 @@ impl<'s> Parser<'s> {
         Ok(Stmt::Expr(e))
     }
 
+    /// Run `f` inside a Block scope, for an IfStatement clause (Annex B B.3.4).
+    /// Pops even on error so the scope stack can never be left unbalanced.
+    fn in_annexb_clause<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        self.scopes.push(ScopeKind::Block);
+        let r = f(self);
+        let popped = self.scopes.pop();
+        let v = r?;
+        popped?;
+        Ok(v)
+    }
+
     fn parse_if(&mut self) -> PResult<Stmt> {
         self.bump_before_operand()?;
         self.expect(Punct::LParen, true)?;
         let test = self.parse_expr_full()?;
         self.expect(Punct::RParen, true)?;
-        let cons = Box::new(self.parse_stmt()?);
+        // B.3.4 says a FunctionDeclaration in an IfStatement clause behaves as
+        // if it were the sole StatementListItem of a BlockStatement, so its name
+        // is BLOCK-scoped: `let f = 1; if (true) function f(){}` is legal.
+        // Scoping the clause (rather than the declaration) is what the spec
+        // actually says, and it keeps a LABELLED function — B.3.2, which is NOT
+        // block-wrapped — colliding with an outer `let` as node does. A braced
+        // clause just gets a redundant scope, and a `var` still hoists straight
+        // through to its var boundary.
+        let cons = Box::new(self.in_annexb_clause(|p| p.parse_stmt())?);
         let alt = if self.eat_kw(Keyword::Else, true)? {
-            Some(Box::new(self.parse_stmt()?))
+            Some(Box::new(self.in_annexb_clause(|p| p.parse_stmt())?))
         } else {
             None
         };

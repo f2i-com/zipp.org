@@ -51,12 +51,40 @@ impl<'s> Parser<'s> {
         self.ctx.in_switch = false;
         self.ctx.in_field_init = false;
 
+        let params_at = self.cur().span.start;
         let params = self.parse_params()?;
         let body = self.parse_fn_body()?;
 
         self.ctx = saved;
         self.labels = saved_labels;
+        self.check_use_strict_with_non_simple_params(&params, &body, params_at)?;
         Ok((params, body))
+    }
+
+    /// It is a Syntax Error if `FunctionBodyContainsUseStrict` is true and
+    /// `IsSimpleParameterList` of the FormalParameters is false.
+    ///
+    /// The reason the spec forbids it: a non-simple parameter list is evaluated
+    /// in its own scope with its own semantics, and a body directive would have
+    /// to retroactively change how the parameters were already parsed — so
+    /// `function f(a = 1) { "use strict"; }` is an error even though both halves
+    /// are individually fine. Note this is about the DIRECTIVE, not about being
+    /// strict: the same function inside already-strict code is legal, because
+    /// there is no directive to apply retroactively.
+    pub(crate) fn check_use_strict_with_non_simple_params(
+        &self,
+        params: &Params,
+        body: &FnBody,
+        pos: u32,
+    ) -> PResult<()> {
+        if !params.simple && body.directives.iter().any(|d| &*d.raw == "use strict") {
+            return Err(SyntaxError::new(
+                "SyntaxError: illegal 'use strict' directive in a function with a \
+                 non-simple parameter list",
+                pos,
+            ));
+        }
+        Ok(())
     }
 
     /// A method's parameters and body. `start` is the offset of the whole

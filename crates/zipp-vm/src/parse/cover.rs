@@ -171,6 +171,13 @@ impl<'s> Parser<'s> {
         };
         self.ctx = saved;
         self.labels = saved_labels;
+        // An arrow's ConciseBody carries the same restriction as a FunctionBody:
+        // `(a = 1) => { "use strict"; }` is a SyntaxError. Only a BLOCK body can
+        // have a directive prologue at all, so the expression form never trips
+        // it.
+        if let ArrowBody::Block(b) = &body {
+            self.check_use_strict_with_non_simple_params(&params, b, start)?;
+        }
         let span = Span::new(start, self.prev_end());
         Ok(Expr::Arrow(Box::new(Arrow { params, body, is_async, span })))
     }

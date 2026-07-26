@@ -1109,6 +1109,16 @@ impl<'s> Parser<'s> {
                 self.bump_after_operand()?;
                 Ok(PropKey::Num(n.value))
             }
+            // A BigInt literal is a legal PropertyName: `{1n: "a"}` has the key
+            // "1", because the key is `ToString(NumericValue)` and a BigInt's
+            // string form carries no `n` suffix. `{1n: x}` and `{1: x}` are
+            // therefore the SAME property, which is why this reuses the numeric
+            // key rather than inventing a BigInt one.
+            TokenKind::BigInt(digits) => {
+                self.bump_after_operand()?;
+                let n: f64 = digits.parse().unwrap_or(f64::NAN);
+                Ok(PropKey::Num(n))
+            }
             TokenKind::Ident { private: true, name, .. } => {
                 self.bump_after_operand()?;
                 Ok(PropKey::Private(name.into_boxed_str()))
