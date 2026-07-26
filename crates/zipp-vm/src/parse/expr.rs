@@ -679,7 +679,23 @@ impl<'s> Parser<'s> {
             TokenKind::Regex { .. } => {
                 let tok = self.bump_after_operand()?;
                 let TokenKind::Regex { pattern, flags } = tok.kind else { unreachable!() };
-                Ok(Expr::Regex { pattern, flags: flags.into_boxed_str() })
+                // Canonical flag order, not source order: `/re/yu` reports its
+                // flags as "uy" (the `flags` getter enumerates in a fixed
+                // order, and `toString` goes through it), and the engine
+                // stores what it reports. Unknown letters keep their relative
+                // order at the end so the validator still names them.
+                let mut canon = String::with_capacity(flags.len());
+                for c in "dgimsuvy".chars() {
+                    if flags.contains(c) {
+                        canon.push(c);
+                    }
+                }
+                for c in flags.chars() {
+                    if !"dgimsuvy".contains(c) {
+                        canon.push(c);
+                    }
+                }
+                Ok(Expr::Regex { pattern, flags: canon.into_boxed_str() })
             }
             TokenKind::Template { .. } => Ok(Expr::Template(Box::new(self.parse_template()?))),
             TokenKind::Punct(Punct::LParen) => match self.parse_paren_or_arrow(false, start)? {
