@@ -3,3 +3,6 @@
 # Cargo.lock is committed — zipp-lang ships a binary (the `zipp` CLI), so a
 # locked dependency set keeps builds reproducible.
 
+
+# Generated wasm-bindgen glue for the node harnesses (see crates/zipp-wasm/tests/node/README.md)
+crates/zipp-wasm/tests/node/pkg/

@@ -9,10 +9,15 @@ cargo build --release
 ./target/release/zipp mjs file.mjs      # ES module entry (top-level await)
 ```
 
-The project is `crates/zipp-vm`. `zipp-cli` is a thin front end over it, and
+The project is `crates/zipp-vm`. `zipp-cli` is a thin front end over it,
+`crates/zipp-wasm` embeds it in WebAssembly for browser hosts, and
 `crates/regress-fork` is the ECMAScript regex engine — our fork of regress
 0.11.1, which adds an API the engine needs plus three test262 correctness
 fixes (see its `FORK.md`).
+
+The JIT is x86-64 only and feature-gated; every other target builds a pure
+interpreter (`--no-default-features` does the same on x86-64). aarch64 and
+wasm32 are built and tested.
 
 > The workspace used to carry a separate ahead-of-time language (`zippc`, plus
 > Cranelift/LLVM/WASM/zk back ends and a TypeScript frontend). That predates the
@@ -177,15 +182,59 @@ crates/zipp-vm/src/
   compile/     AST -> register bytecode (14 modules)
   codegen/     native x86-64 JIT, dynasm (15 modules)
   vm/          the runtime: dispatch, natives, props, construct, temporal, …
+  vm/clock.rs  the platform time boundary (see Embedding)
+  vm/host_api.rs  structural marshalling + slot-addressed globals
   heap.rs      object model, ObjMap, GC
   value.rs     NaN-boxed Value
   bytecode.rs  instruction set
+  embed.rs     the embedding API
+crates/zipp-wasm/  wasm-bindgen layer: a persistent VM for browser hosts
 ```
 
 Oversized files are split into module directories by `tools/split_rs.py`, a
 lossless splitter that verifies the emitted pieces concatenate byte-identically
 to what they replaced. `tools/remap_anchors.py` rewrites doc `file.rs:N` anchors
 after a split.
+
+## Embedding
+
+`zipp js file.js` runs a program and exits. A host that keeps talking to a
+script — a UI runtime that renders, waits, then calls a click handler and asks
+what changed — needs the VM to outlive the run. `embed::ScriptState` is that:
+compile once, then call functions, evaluate in the live global context, and
+read or write top-level bindings by slot index.
+
+Two things in it are worth knowing before using it.
+
+**Values cross as data, never as references.** A `Value` is a NaN-boxed heap
+*index* whose meaning depends on the live VM, so handing one to a host would be
+handing out a dangling reference the moment the collector moves. `HostValue`
+is therefore an owned tree — nested arrays and plain objects included — and
+anything that cannot be data (functions, classes, `Map`, `Date`, proxies) crosses
+as `Opaque`. Writes then *decline* to overwrite an opaque slot, and the same rule
+applies one level deeper to object properties: a host that reads an object,
+spreads it, and writes it back is echoing the methods it could not see, not
+deleting them. Doing this with JSON is not an option — `JSON.stringify` drops
+function-valued properties and throws on a cycle, so it cannot express either
+rule.
+
+**Prefer `call_slot` to `call_global`.** `call_global` resolves its callee by
+compiling the name as a fresh program, and compiled functions are interned for
+the VM's lifetime (the JIT holds raw pointers into them). That is fine once and
+a leak at 60 Hz. `call_slot` compiles nothing.
+
+`crates/zipp-wasm` is this API over wasm-bindgen, plus a JS preamble supplying
+host bridges. Its `README.md` covers the two host channels and why they differ.
+
+### wasm32 has no clock
+
+`Instant::now()` and `SystemTime::now()` on `wasm32-unknown-unknown` are std
+stubs that **panic**, and `Vm::new` records a start instant — so an un-shimmed
+engine traps on construction, before running a line of JS. `vm/clock.rs` is the
+boundary: native targets re-export `std::time` unchanged, and wasm reads clocks
+the host installs via `install_clock` (a no-op elsewhere, so an embedder can call
+it unconditionally). A hook rather than a `[target.wasm32]` js-sys dependency,
+because the engine should not have to assume its wasm host is a browser.
 
 ## Development
 
@@ -198,6 +247,21 @@ python tools/run_test262.py --t262 <path> --dump-fails fails.txt
 diff <(sort fails.txt) <(sort tools/test262-expected-failures.txt)   # REG=0
 ZIPP_NOJIT=1 python tools/run_test262.py …             # and again, interpreter only
 bash bench/run_real.sh                                 # ALL_CORRECT=1
+```
+
+Anything touching the embedding API or the wasm layer also has to clear the node
+harnesses in `crates/zipp-wasm/tests/node/` — `cargo test` covers the Rust side
+but not the wasm-bindgen boundary (marshalling, the bridge closures, the host
+queue), and that boundary is where the interesting bugs live. One of them drives
+a real third-party bundle unmodified.
+
+A change that builds on x86-64 can still break every other target: the `jit`
+feature and `target_arch = "x86_64"` gate ~120 sites, so an attribute that drifts
+onto the wrong item takes aarch64 and wasm32 down without x86-64 noticing. Cheap
+insurance:
+
+```sh
+cargo build --target wasm32-unknown-unknown -p zipp-vm --no-default-features
 ```
 
 `ZIPP_NOJIT=1` disables native codegen (it is **presence**-checked, so
