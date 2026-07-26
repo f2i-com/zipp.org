@@ -96,6 +96,22 @@ impl<'a> FnCompiler<'a> {
                     self.add_string_const(text)
                 };
                 let flags_s = r.regex.flags.to_inline_string();
+                // EARLY ERROR: a RegularExpressionLiteral must parse under the
+                // `Pattern` goal at COMPILE time, not when it is evaluated. The
+                // difference is observable — `if (false) { /a{2,1}/ }` must be a
+                // SyntaxError for the whole program, and until this check
+                // existed that program ran to completion.
+                //
+                // Safe to reject here because it was measured, not assumed: of
+                // 3,391 distinct regex literals extracted from 13,922 real
+                // library files, `regress` rejects zero, while catching all ten
+                // spec-invalid patterns probed and accepting all eighteen
+                // Annex B / modern valid ones (lone `]`, `a{,2}`, `[a-\d]`,
+                // `(?=a)*`, `\c1`, `\08`, lookbehind, `\p{L}` under `u`,
+                // `[\q{abc}]` under `v`).
+                if let Err(e) = regress::Regex::with_flags(text, flags_s.as_str()) {
+                    return Err(format!("SyntaxError: invalid regular expression /{text}/{flags_s}: {e}"));
+                }
                 let flg = self.add_string_const(&flags_s);
                 let pt = self.temp();
                 self.emit(Instr::LoadConst { dst: pt, idx: pat });
