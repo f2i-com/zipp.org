@@ -53,8 +53,18 @@ struct EnclosingFn {
 
 struct Compiler {
     functions: Vec<FuncProto>,
-    /// Global name → slot.
+    /// Global name → slot. Ordered: the index IS the slot, and the VM indexes
+    /// this directly, so entries are only ever appended.
     globals: Vec<String>,
+    /// Reverse of `globals`, kept in step with it. Resolving a name used to be
+    /// a linear scan with a string compare per entry, which is quadratic in the
+    /// number of distinct globals — a program with 12k top-level functions spent
+    /// ~70M string compares here, and compile time per megabyte tripled between
+    /// a 0.4 MB and a 3.2 MB source. (Not to be confused with the property-name
+    /// interning that PERF_ROADMAP records as a measured loss: that one sat on
+    /// the runtime hot path, where the hash costs more than the small malloc it
+    /// replaced. This is a compile-time lookup that was O(n).)
+    global_index: rustc_hash::FxHashMap<String, u16>,
     /// Compiled class descriptors, indexed by the `MakeClass` class_id.
     classes: Vec<ClassDef>,
     /// Class name → class_id, for resolving `extends <Name>` and `super`.
@@ -63,6 +73,10 @@ struct Compiler {
     /// startup (var hoisting), so a read before the textual decl isn't a
     /// never-declared ReferenceError.
     hoisted_globals: Vec<u32>,
+    /// Membership index for `hoisted_globals`, which is an ORDERED dedup list
+    /// (the VM replays it in declaration order). Same quadratic as
+    /// `global_index` guarded against: one `contains` scan per top-level `var`.
+    hoisted_set: rustc_hash::FxHashSet<u32>,
     /// The full program source, kept so each function can record its exact
     /// source slice (by oxc span) for `Function.prototype.toString`.
     source: String,

@@ -10,9 +10,11 @@ impl Compiler {
         Compiler {
             functions: Vec::new(),
             globals: Vec::new(),
+            global_index: rustc_hash::FxHashMap::default(),
             classes: Vec::new(),
             class_names: Vec::new(),
             hoisted_globals: Vec::new(),
+            hoisted_set: rustc_hash::FxHashSet::default(),
             source,
             exact_src: None,
             eval_mode: false,
@@ -86,11 +88,12 @@ impl Compiler {
     }
 
     pub(crate) fn global_slot(&mut self, name: &str) -> u16 {
-        if let Some(i) = self.globals.iter().position(|g| g == name) {
-            return i as u16;
+        if let Some(&i) = self.global_index.get(name) {
+            return i;
         }
         let i = self.globals.len() as u16;
         self.globals.push(name.to_string());
+        self.global_index.insert(name.to_string(), i);
         i
     }
 
@@ -143,7 +146,7 @@ impl Compiler {
                     continue;
                 }
                 let slot = self.global_slot(&name) as u32;
-                if !self.hoisted_globals.contains(&slot) {
+                if self.hoisted_set.insert(slot) {
                     self.hoisted_globals.push(slot);
                 }
             }
@@ -506,7 +509,7 @@ impl Compiler {
                     }
                     if !fn_names.contains(name) {
                         let slot = fc.cx.global_slot(name) as u32;
-                        if !fc.cx.hoisted_globals.contains(&slot) {
+                        if fc.cx.hoisted_set.insert(slot) {
                             fc.cx.hoisted_globals.push(slot);
                         }
                     }
