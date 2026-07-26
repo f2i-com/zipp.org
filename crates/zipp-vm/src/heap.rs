@@ -173,6 +173,33 @@ impl PropIndex {
     }
 }
 
+/// The canonical decimal spelling of an array index, written into a caller-owned
+/// stack buffer.
+///
+/// Exists because the hot indexed-read path looks a numeric index up in a
+/// string-keyed side table, and `i.to_string()` there allocates and frees a
+/// `String` for every element read of every array that has ANY non-index
+/// property. Measured: `a[2]` costs 2.3ns on a plain array and 36.9ns on the
+/// identical array after `a.tag = "x"` — and a RegExp match array always has
+/// `index`/`input`/`groups`, so every `m[i]` paid it.
+///
+/// 20 bytes holds `usize::MAX`.
+#[inline]
+pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
+    let mut n = i;
+    let mut p = buf.len();
+    loop {
+        p -= 1;
+        buf[p] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    // Every byte written is ASCII, so this cannot fail.
+    std::str::from_utf8(&buf[p..]).unwrap_or("")
+}
+
 /// A JS object: insertion-ordered string-keyed properties.
 #[derive(Clone, Debug, Default)]
 pub struct ObjMap {

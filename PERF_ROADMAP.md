@@ -969,6 +969,10 @@ First authoritative reading: **geomean 2.60x**, ALL_CORRECT=1 on exact bytes.
 
 ### B22 — DataView reads on the INT tier: prize measured at ~240ms, BLOCKED in the planner
 
+> **SUPERSEDED — see B32.** The ~240ms figure does not reproduce. Re-run with
+> the same arithmetic in every control, the DataView getters are 54ms and the
+> other 174ms is the boxed arithmetic. Do not restart this as written.
+
 `typedarray-math` decomposes into eight phases. Two are at parity already (axpy
 17ms vs 12, dot 11 vs 10 — the DOUBLE tier works), and one dominates:
 
@@ -1294,6 +1298,91 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B32 — Where typedarray-math and sparse-array actually spend the gap
+
+Phase tables, min of 5, with the tier each region reaches decoded from
+`ZIPP_JITLOG=1 ZIPP_JITDECLINE=1`. (Reading that log: `[jit] DOUBLE/MEM …
+compiled` covers BOTH the regalloc path and the boxed mem path. What tells them
+apart is whether a `[decline-reason]` line appears between the `INT decline` and
+the `DOUBLE/MEM … compiled` — that reason is `compile_region_regalloc`'s
+`plan_region` failing.)
+
+**typedarray-math — 706ms vs node 202ms.**
+
+| phase | zipp | node | tier | why |
+|---|---|---|---|---|
+| f64-fill | 148ms | 37ms | MEM | `Bitwise on the double path` — **this is B23 verbatim, refuted** |
+| axpy | 17ms | 14ms | REGALLOC | parity |
+| dot | 12ms | 12ms | REGALLOC | parity |
+| normalize | 55ms | 12ms | MEM | receiver multi-def (B30), then `ToPropKey` in `ro_live_in` |
+| xorshift | 60ms | 14ms | MEM | receiver multi-def — the collision `plan_region.rs` already names in a comment |
+| prefix-sum | 31ms | 9ms | **INT** | already on the best tier and still 3.4x |
+| **dataview** | **376ms** | **97ms** | MEM | **55% of the whole gap** |
+
+Two framing points that stop wasted work:
+
+* **prefix-sum is on the best tier and is still 3.4x.** 3.9ns/iter against node's
+  1.1, for ~22 ops with an identity guard plus an unsigned bounds check per
+  pinned element access. No tier admission can move this row — it is the INT
+  tier's own per-op cost, i.e. B7.
+* **f64-fill is B23's exact loop.** Do not re-attempt. Note additionally that
+  `i * 2654435761` reaches 2.1e16 > 2^53, so an i64-home INT tier would be
+  *unsound* there without double-rounding semantics.
+
+**B22's "~240ms DataView prize" does not reproduce — correcting it here.**
+Re-running B22's own three controls with the SAME arithmetic in each (24.6M
+iterations, so the only variable is the memory op):
+
+| control | zipp | node |
+|---|---|---|
+| A the bench's DataView loop verbatim | 326ms | 98ms |
+| B same shape, three Int32Array element reads | 304ms | 100ms |
+| C same shape, no memory reads at all | **272ms** | 98ms |
+
+The three `getUint32`/`getUint16`/`getInt8` calls are **A−C = 54ms**, not 240.
+The other **174ms is the boxed arithmetic itself** — 43 bytecode ops per
+iteration on the mem path against node's 4.0ns/iter for the same expression.
+B22's control B must have been a simpler loop, so it removed the arithmetic
+along with the getters and credited all of it to the DataView. The prize is
+gated twice more even if a DV-pinned `CallMethod` were admitted: the receiver
+multi-def blocker, and `xmm pool exhausted even with home reuse` (a
+43-instruction region exceeds the 14-home pool). **Do not restart B22 as
+written** — the DataView phase is op-count bound, which is B7, not tier
+admission.
+
+**sparse-array — 161ms vs node 55ms**, and the file's own CALIBRATION NOTE is
+right that it no longer measures what it was written to measure:
+
+| phase | zipp | node | share of gap |
+|---|---|---|---|
+| for-in key walk | 47ms | 9ms | **36%** |
+| holey `in` loop | 36ms | 10ms | **25%** |
+| `in`/hasOwn probes | 24ms | 7ms | 16% |
+| slice/concat over holey windows | 12ms | 2ms | 9% |
+| everything else | 42ms | 27ms | 14% |
+
+Two thirds of it is key/`in` machinery, not sparseness. See B29 for what is
+*not* the cause of the for-in cost.
+
+**Still open, with the specs measured.** In rough order of prize per unit risk:
+
+1. `plan_region`'s "pinned receiver reg must have exactly one def" — B30 removed
+   the postfix-update cause; the remaining cases (xorshift's genuine register
+   reuse, ~35ms inferred) need the narrow generalisation: allow multiple defs
+   when every def reaching a pinned-receiver use is a `LoadGlobal` of the same
+   slot, and retarget that access's deopt ip to the `LoadGlobal` so the
+   interpreter re-executes the load rather than reading a flushed numeric home
+   as an object pointer.
+2. `Instr::ToPropKey` is missing from `writes_reg` (`codegen/fn_int.rs`), so its
+   destination looks never-defined, lands in `ro_live_in`, and declines
+   `normalize`. Fixing the analysis alone is not enough — the tier needs a
+   `ToPropKey` arm, which on a pinned receiver with a numeric key is a plain
+   home-to-home copy, so it does satisfy B23.
+3. `int_unadmitted_ips`'s `LoadConst` arm rejects any constant that is not
+   `is_int()`, though a constant in [2^31, 2^53] is exactly representable in an
+   i64 home. Measured: `(o * 2654435761)|0` MEM 156ms vs `(o * 65537)|0` INT
+   123ms.
 
 ### B29 — Property-name interning for enumeration: measured a NO-OP, reverted
 

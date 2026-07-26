@@ -31,7 +31,8 @@ impl<'p> Vm<'p> {
     /// HashMap probe.
     pub(crate) fn array_index_override(&self, arr_idx: u32, i: usize) -> Option<(PropAttr, Value)> {
         let m = self.arr_props.get(&arr_idx)?;
-        let p = m.pos(&i.to_string())?;
+        let mut buf = [0u8; 20];
+        let p = m.pos(crate::heap::index_key(&mut buf, i))?;
         Some((m.attrs[p], m.vals[p]))
     }
 
