@@ -1316,6 +1316,51 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B36 — Property READS are at parity on a 60-key object. Compact object
+storage is not this suite's lever, and here is the measurement that settles it
+
+`polymorphic-objects` (2.44x) is the bench the "compact object storage"
+hypothesis is aimed at. Phase-split, with `Date.now()` marks at the file's own
+section boundaries:
+
+| phase | zipp | node |
+|---|---|---|
+| 8 megamorphic layouts + writes | 108ms | 32ms |
+| **dictionary churn (add 60 / delete 30 / re-add 30 / read 60 / for-in)** | **564ms** | **255ms** |
+| proto-chain walks | 29ms | 6ms |
+
+So 80% of the bench is the dictionary phase, not the megamorphic reads. Isolated
+per-operation, 30,000 objects of 60 dynamic-string keys:
+
+| op | zipp | node | ratio |
+|---|---|---|---|
+| add | 103.9ns | 44.4 | 2.3x |
+| delete | 125.6ns | 101.1 | 1.24x |
+| re-add after delete | 282.2ns | 64.4 | 4.4x |
+| **read** | **55.0ns** | **56.1** | **1.00x** |
+| for-in | 183.3ns/key | 17.8 | 10.3x |
+
+**Reading a property out of a 60-key dictionary object is at PARITY with V8.**
+That is the whole case against Option A (atoms) for this suite: `pos()` is not
+where the time is, so making the key scan 10x cheaper buys nothing here. It
+remains a real win for megamorphic sites and for construction — but not a
+geomean lever, and B29 already showed the enumeration half measuring +0.1%.
+
+Also checked and NOT true, so nobody re-derives them: for-in is not superlinear
+in key count (flat 64ns/key at 4 keys down to 31.5ns at 128 — the small-object
+ratio is a FIXED per-call cost, not a scan), and delete+re-add is flat in key
+count too (181ns at n=16, 200ns at n=64).
+
+**What the for-in fixed cost is.** Fitting `cost(n) = A + B·n` over n = 4..128
+gives **A = 134ns, B = 30.5ns/key**, against node's A ≈ 0. An
+`Object.create(null)` receiver removes only 37ns of it, so the `Object.prototype`
+level is not the bulk. The 134ns is ~10 heap allocations per call: `out`,
+`plain_levels`, the final result `Array` and its `Vec`, plus `emit` +
+`spec_key_order`'s `ints`/`rest` for each of the two levels. Reusing Vm-owned
+scratch buffers for all of them is the obvious fix and is UNTRIED — note only
+that B29 is the cautionary tale (removing 7 allocations per 8-key enumeration
+moved nothing), so it must be measured before it is believed.
+
 ### B35 — Sloppy leaf calls were declined for a `this` that is a constant: 7.7x
 
 `plain function f(a,b){ return a+b; }` called in a hot loop cost **26.7ns**
