@@ -278,8 +278,15 @@ impl<'s> Parser<'s> {
         let is_static = if self.at_kw(Keyword::Static) {
             let save = self.save();
             self.bump_after_operand()?;
-            // `static` alone is a field name: `class C { static = 1 }`.
-            if self.at(Punct::Eq) || self.at(Punct::Semi) || self.at(Punct::RBrace) {
+            // `static` may itself be the member NAME: a field
+            // (`static = 1`, `static;`) or a method (`static() {}` —
+            // fast-glob ships one). Only when something member-shaped
+            // FOLLOWS is it the modifier.
+            if self.at(Punct::Eq)
+                || self.at(Punct::Semi)
+                || self.at(Punct::RBrace)
+                || self.at(Punct::LParen)
+            {
                 self.restore(save);
                 false
             } else {
