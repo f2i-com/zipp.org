@@ -38,7 +38,13 @@ impl<'a> FnCompiler<'a> {
         use ast::Stmt as S;
         match s {
             S::Expr(e) => {
-                let r = self.expr(e)?;
+                // Discarded — UNLESS this is an eval program, where the value
+                // becomes the completion and `i++` must still yield the old one.
+                let r = if self.completion_reg.is_none() {
+                    self.expr_discarded(e)?
+                } else {
+                    self.expr(e)?
+                };
                 // eval completion: remember this expression's value (the last one
                 // executed wins, matching the spec's expression-completion value).
                 if let Some(cr) = self.completion_reg {

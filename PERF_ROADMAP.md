@@ -1295,6 +1295,98 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B29 — Property-name interning for enumeration: measured a NO-OP, reverted
+
+`for-in` over an 8-key object is 66ns/key against node's 1.3, and `Object.keys`
+46ns against 1.7 — the largest ratios anywhere in the engine. The obvious
+culprit: `for_in_keys` (`vm/props/enumerate.rs`) hands out a FRESH heap string
+per key per call, so every iteration allocates a `String` clone, a `Vec<u8>` and
+a heap slot for a name that has not changed since the object was built.
+
+Built the fix: a `key_strs` interner (name text → one shared `Str` heap index),
+rooted permanently in GC and capped at 16k entries so an `obj["k" + i]` loop
+cannot pin the heap. Correct — for-in order, shadowing, `Object.keys`, deletion
+holes and `JSON.stringify` all matched node exactly.
+
+Result: **+0.1%** on the for-in microbench and **+0.6%** on `json-large`, paired
+medians of 9 and 7. Reverted; a permanent GC root and a cap are not worth zero.
+
+The lesson is the same one B28 recorded, and it is worth stating in the positive:
+counting allocations does not locate time. Seven of the ~13 allocations a for-in
+over an 8-key object performs are the per-key JsStr, and removing all seven moved
+nothing — so the 66ns lives in the surrounding machinery (the `Vec<usize>` emit
+plan, the shadow set, the result Array, and the iteration protocol that consumes
+it), not in the allocator. The next attempt on this should START by timing those
+four separately.
+
+Kept from the attempt: `canonical_u32_key` in `vm/helpers_numeric.rs`. The old
+`spec_key_order` decided integer-key canonicality with `k.parse::<u32>()` then
+`n.to_string() == *k`, allocating a String per numeric key to re-derive text it
+already had. The byte-level test is strictly less work and holds no state, so it
+stays regardless of the measurement.
+
+### B30 — A discarded `i++` is `++i`, and the difference was a whole JIT tier
+
+`plan_region` requires a pinned TypedArray receiver register to have exactly ONE
+in-region definition (`codegen/plan_region.rs`, `"pinned receiver reg not cleanly
+excludable"`). The bytecode for a POSTFIX update emits two `AddInt`s and takes an
+extra temp (`compile/exprs.rs`); the prefix form emits one. That extra temp
+shifts register allocation by one and lands on the receiver, so the whole loop
+declines from REGALLOC to the boxed MEM tier.
+
+Measured on a Float64Array read loop: `for (i = 0; i < n; i++)` **27ms** against
+**7ms** for the byte-identical `while (i < n) { …; ++i; }` — 3.9x, decided
+entirely by which spelling of increment the author happened to use.
+
+Postfix and prefix perform the same single `ToNumeric` and the same single store
+and differ only in which value they hand back, so where the result is discarded
+they are the same program. `expr_discarded` now compiles the postfix form as the
+prefix form in the two positions where nothing can read it: a `for` head's update
+expression, and an expression statement in a non-eval program. (An eval program
+keeps the postfix form — there the statement's value IS the completion value.)
+
+Suite effect: **−0.2% mean** over 7 paired reps — typedarray-math −2.2%,
+markdown-render −2.4%, parse-large-js −2.3%, class-prototype-hot −2.0%, against
+map-set-heavy +4.9% on a wide p10/p90 spread. Kept, because it emits strictly
+less code for every counted `for` loop in the language and the one regression is
+not distinguishable from this box's drift. It does NOT collect the typedarray
+loops' full prize: `normalize` and `xorshift` decline for two further reasons
+(`ToPropKey` missing from `writes_reg`, and Bitwise on the double path — the
+latter is B23 and stays refuted).
+
+### B31 — RegExp property reads cloned the pattern text; matchAll dropped the twin
+
+Two independent allocation bugs on the RegExp path, both found by differential
+measurement against pattern LENGTH — the giveaway that a memcpy is in the loop.
+
+**(a)** `vm/props/member.rs` cloned `source` AND `flags` out of the heap before
+looking at the key, because `regexp_get_prop` needs `&mut self`. So every
+property read on a RegExp — including the `test`/`exec` method lookup in a hot
+loop — cost two heap allocations sized by the pattern text: 31ns for a one-char
+pattern against 120ns for a 20,000-char one, on a read that returns an integer.
+`re.flags` is specified to read the eight per-flag accessors off the receiver, so
+it performed NINE such reads and cost 227ns against node's 3ns.
+
+`lastIndex` and the eight flag booleans are now answered inside the heap borrow,
+and so is every other key, which is a prototype walk. Only `source` still needs
+owned text.
+
+**(b)** `String.prototype.matchAll` builds an independent matcher RegExp so the
+iterator can advance its own `lastIndex`. It built it with `ascii_twin: None`,
+so the first `exec` on the matcher rebuilt the pattern's code-point vector and
+hashed a two-String cache key — 3.2us per call on a 2,000-char pattern, against
+a flat 13ns for the same work on the original object, whose twin caching worked
+perfectly. The clone copies `source` and `flags` verbatim, so the twin is
+provably the same program and is now carried over.
+
+Neither is the main term in `regex-log-scan`. That bench is 59% regex, and 25% of
+the whole is regress's backtracking inner loop at **6.9ns per failed match
+attempt against node's 0.37** — a `\d` or `[a-z]` start predicate yields dozens
+of candidate positions per line and each is a full interpreted attempt. A further
+41% of the bench is not regex at all (corpus generation 34%, `fnv1a` over 23MB
+5%), so even an infinitely fast matcher leaves it at 2.9x. Recorded so the next
+person does not start with the result objects.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:

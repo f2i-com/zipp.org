@@ -320,6 +320,20 @@ impl ScopeStack {
         })
     }
 
+    /// May a `using` / `await using` declaration appear in the current scope?
+    ///
+    /// Explicit resource management scopes disposal to a BLOCK, so the proposal
+    /// bans the declaration exactly where there is no block to hang it on: a
+    /// Script's top level, an eval's top level (which is a Script here), and
+    /// directly in a CaseClause or DefaultClause. A Module's top level IS
+    /// allowed — it has a proper environment record — and so is a `for`-of head.
+    pub(crate) fn using_decl_allowed(&self) -> bool {
+        !matches!(
+            self.scopes.last().map(|s| s.kind),
+            Some(ScopeKind::Script) | Some(ScopeKind::Switch) | None
+        )
+    }
+
     pub(crate) fn fn_decl_is_var_scoped(&self) -> bool {
         matches!(
             self.scopes.last().map(|s| s.kind),

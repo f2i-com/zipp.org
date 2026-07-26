@@ -225,6 +225,33 @@ pub(crate) fn parse_float(s: &str) -> f64 {
 /// non-numeric key (those address no dense element → `undefined`). The JIT region
 /// computes loop counters as f64, so `a[i]` arrives here with a double key.
 #[inline]
+/// The array-index value of a canonical integer key -- `"0"`, `"1"`, `"10"`,
+/// but not `"00"`, `"01"`, `"-1"`, `"1.5"`, `""` or `" 1"`, and not `u32::MAX`
+/// (which is not a valid array index).
+///
+/// Decided on the BYTES. The old spelling was `k.parse::<u32>()` followed by
+/// `n.to_string() == *k`, which allocated a String for every numeric key just
+/// to re-derive the text it already had -- once per key per enumeration.
+#[inline]
+fn canonical_u32_key(k: &str) -> Option<u32> {
+    let b = k.as_bytes();
+    if b.is_empty() || b.len() > 10 {
+        return None;
+    }
+    // A leading zero is canonical only as the whole key.
+    if b[0] == b'0' {
+        return (b.len() == 1).then_some(0);
+    }
+    let mut n: u64 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + (c - b'0') as u64;
+    }
+    (n < u32::MAX as u64).then_some(n as u32)
+}
+
 /// Indices into `keys` in spec **OrdinaryOwnPropertyKeys** order: integer-index
 /// keys (canonical array indices `0..2^32-1`, e.g. "0"/"7" but not "01"/"-1")
 /// first in ascending numeric order, then every other key in its original
@@ -234,9 +261,9 @@ pub(crate) fn spec_key_order(keys: &[String]) -> Vec<usize> {
     let mut ints: Vec<(u32, usize)> = Vec::new();
     let mut rest: Vec<usize> = Vec::new();
     for (i, k) in keys.iter().enumerate() {
-        match k.parse::<u32>() {
-            Ok(n) if n != u32::MAX && n.to_string() == *k => ints.push((n, i)),
-            _ => rest.push(i),
+        match canonical_u32_key(k) {
+            Some(n) => ints.push((n, i)),
+            None => rest.push(i),
         }
     }
     if ints.is_empty() {

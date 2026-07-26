@@ -96,6 +96,29 @@ impl<'a> FnCompiler<'a> {
         self.expr_into(e, dst)
     }
 
+    /// Compile `e` for its EFFECTS only — the caller will not read the result.
+    ///
+    /// The one rewrite this enables: a POSTFIX update whose value nobody reads
+    /// IS the prefix update. Both perform exactly one `ToNumeric` of the old
+    /// value and one store, and differ only in which value they hand back, so
+    /// with the result discarded the prefix form is the same program minus one
+    /// `AddInt` and one temp register.
+    ///
+    /// That temp is not free. `plan_region` requires a pinned TypedArray
+    /// receiver to have exactly ONE in-region definition; the extra temp shifts
+    /// register allocation by one, lands on the receiver, and demotes the whole
+    /// loop from the unboxed tiers to the boxed MEM tier. Measured on a
+    /// Float64Array read loop: `for (i = 0; i < n; i++)` 27ms against 7ms for
+    /// the byte-identical `while (i < n) { …; ++i; }` — 3.9x, for the choice of
+    /// `i++` over `++i` in a position where the two cannot be told apart.
+    pub(crate) fn expr_discarded(&mut self, e: &ast::Expr) -> R<Reg> {
+        if let ast::Expr::Update { op, prefix: false, target } = e {
+            let dst = self.temp();
+            return self.update(*op, true, target, dst);
+        }
+        self.expr(e)
+    }
+
     /// Intern a string LITERAL's value and return its CONSTANT-POOL index,
     /// picking the slot its encoding needs: well-formed text goes to
     /// `add_string_const`; a value holding a lone surrogate goes to the

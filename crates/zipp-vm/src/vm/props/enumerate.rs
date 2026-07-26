@@ -6,7 +6,7 @@
 use super::*;
 
 impl<'p> Vm<'p> {
-    pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
+        pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
         self.defer_check_all(obj)?;
         // A namespace with a still-uninitialized export throws from the per-key
         // [[GetOwnProperty]] walk (Object.keys/values/entries + for-in).

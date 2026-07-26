@@ -477,8 +477,10 @@ impl<'s> Parser<'s> {
         if matches!(&self.cur().kind, TokenKind::Ident { name, kw: Keyword::None, had_escape: false, private: false } if name == "using")
         {
             let save = self.save();
+            let at = self.cur().span.start;
             self.bump_after_operand()?;
             if !self.cur().newline_before && self.is_binding_ident() {
+                self.check_using_position(at)?;
                 return Ok(Some(VarKind::Using));
             }
             self.restore(save);
@@ -490,8 +492,10 @@ impl<'s> Parser<'s> {
             let is_using = !self.cur().newline_before
                 && matches!(&self.cur().kind, TokenKind::Ident { name, kw: Keyword::None, had_escape: false, private: false } if name == "using");
             if is_using {
+                let at = self.cur().span.start;
                 self.bump_after_operand()?;
                 if !self.cur().newline_before && self.is_binding_ident() {
+                    self.check_using_position(at)?;
                     return Ok(Some(VarKind::AwaitUsing));
                 }
             }
@@ -500,11 +504,38 @@ impl<'s> Parser<'s> {
         Ok(None)
     }
 
+    /// See `ScopeStack::using_decl_allowed`.
+    fn check_using_position(&self, pos: u32) -> PResult<()> {
+        if self.scopes.using_decl_allowed() {
+            return Ok(());
+        }
+        Err(SyntaxError::new(
+            "SyntaxError: a 'using' declaration may not appear here — it needs a \
+             block to scope its disposal to",
+            pos,
+        ))
+    }
+
     pub(crate) fn parse_var_decl(&mut self, kind: VarKind) -> PResult<VarDecl> {
         let mut decls = Vec::new();
         loop {
             let pos = self.cur().span.start;
             let id = self.parse_binding_pattern()?;
+            // `using` binds resources by NAME so it can dispose them in reverse
+            // declaration order; a pattern has no single name to record, so the
+            // grammar takes a BindingIdentifier and nothing else. The FIRST
+            // declarator is settled by the contextual-keyword lookahead
+            // (`using [` is an element access, not a declaration) — it is the
+            // second and later ones that reach here.
+            if matches!(kind, VarKind::Using | VarKind::AwaitUsing)
+                && !matches!(id, Pattern::Ident(_))
+            {
+                return Err(SyntaxError::new(
+                    "SyntaxError: a 'using' declaration binds a plain identifier, \
+                     not a destructuring pattern",
+                    pos,
+                ));
+            }
             self.declare_pattern(&id, kind, pos)?;
             let init = if self.eat(Punct::Eq, true)? { Some(self.parse_assign_full()?) } else { None };
             // `using` requires an initializer wherever it appears.
@@ -896,6 +927,15 @@ impl<'s> Parser<'s> {
             self.declare_pattern(&pat, kind, pos)?;
             if self.at_kw(Keyword::In) || self.at_kw(Keyword::Of) {
                 let of = self.at_kw(Keyword::Of);
+                // `for (using x of …)` disposes at the end of each iteration;
+                // for-IN has no such form in the proposal.
+                if !of && matches!(kind, VarKind::Using | VarKind::AwaitUsing) {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: a 'using' declaration is not allowed in a \
+                         for-in head",
+                        pos,
+                    ));
+                }
                 self.bump_before_operand()?;
                 self.ctx.in_ = saved_in;
                 let right = if of { self.parse_assign_full()? } else { self.parse_expr_full()? };

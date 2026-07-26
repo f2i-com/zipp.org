@@ -255,7 +255,10 @@ impl<'a> FnCompiler<'a> {
         // value and the update mutates the new binding.
         self.emit_freshen_cells(&fresh_regs);
         if let Some(update) = update {
-            self.expr(update)?;
+            // A `for` head's update expression is evaluated for effect only —
+            // even in an eval program, where the completion value comes from the
+            // BODY. See `expr_discarded`.
+            self.expr_discarded(update)?;
         }
         self.emit(Instr::Jump { target: top });
         let end = self.here();
