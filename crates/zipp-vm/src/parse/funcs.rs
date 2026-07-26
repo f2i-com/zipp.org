@@ -397,8 +397,29 @@ impl<'s> Parser<'s> {
     /// rules.
     pub(crate) fn declare(&mut self, name: &str, kind: BindKind, pos: u32) -> PResult<()> {
         match kind {
-            BindKind::Var | BindKind::Function => self.scopes.declare_var(name, pos),
-            _ => self.scopes.declare_lexical(name, kind, pos),
+            BindKind::Var => self.scopes.declare_var(name, pos),
+            // A FunctionDeclaration is VAR-scoped only where the spec's
+            // TopLevelVarDeclaredNames applies — a Script, a FunctionBody or a
+            // ClassStaticBlock. In a Block, a CaseBlock, a catch body, or at a
+            // MODULE's top level it is a LEXICAL declaration of the current
+            // scope.
+            //
+            // Routing it to `declare_var` everywhere made it walk outward to the
+            // nearest var boundary and collide with lexical bindings it can
+            // never actually reach: `let f; { function f(){} }` is legal (the
+            // inner `f` is block-scoped, and Annex B simply skips the
+            // var-hoisting when it would collide — which is exactly what the
+            // `*-skip-early-err*` test family asserts), and it was rejected.
+            BindKind::Function if self.scopes.fn_decl_is_var_scoped() => {
+                self.scopes.declare_var(name, pos)
+            }
+            // Annex B.3.2.4/B.3.2.5: in a Block or CaseBlock, two
+            // FunctionDeclarations of the same name are legal in SLOPPY code and
+            // an error under strict.
+            BindKind::Function => {
+                self.scopes.declare_lexical(name, kind, pos, !self.ctx.strict)
+            }
+            _ => self.scopes.declare_lexical(name, kind, pos, false),
         }
     }
 }

@@ -67,6 +67,7 @@ impl<'s> Parser<'s> {
                 phase: ImportPhase::Evaluation,
             });
         }
+        let phase = self.import_phase_prefix()?;
         let mut specifiers = Vec::new();
         // `import d from`, `import d, {…} from`, `import d, * as ns from`
         if self.is_binding_ident() {
@@ -88,7 +89,53 @@ impl<'s> Parser<'s> {
         self.bump_after_operand()?;
         let attributes = self.parse_import_attributes()?;
         self.semicolon()?;
-        Ok(ImportDecl { specifiers, source, attributes, phase: ImportPhase::Evaluation })
+        Ok(ImportDecl { specifiers, source, attributes, phase })
+    }
+
+    /// The current token is the UNESCAPED contextual keyword `want`.
+    fn at_contextual(&self, want: &str) -> bool {
+        matches!(&self.cur().kind,
+            TokenKind::Ident { name, had_escape: false, private: false, .. } if name == want)
+    }
+
+    /// Consume a `defer` / `source` phase modifier if that is really what it is;
+    /// consume nothing and return `Evaluation` otherwise.
+    ///
+    /// Both words are CONTEXTUAL and the ambiguity is real:
+    ///
+    /// ```text
+    /// import defer from "m"          — a default binding NAMED `defer`
+    /// import defer * as ns from "m"  — the DEFER phase (only a NameSpaceImport
+    ///                                  may follow `defer`, so `*` settles it)
+    /// import source from "m"         — a default binding NAMED `source`
+    /// import source from from "m"    — the SOURCE phase, binding `from`
+    /// ```
+    ///
+    /// so `source` needs two tokens of lookahead: it is the phase only when an
+    /// ImportedBinding follows AND `from` follows that. This is the same bounded
+    /// rewind `Parser::save`/`restore` already exists for.
+    fn import_phase_prefix(&mut self) -> PResult<ImportPhase> {
+        let defer = self.at_contextual("defer");
+        if !defer && !self.at_contextual("source") {
+            return Ok(ImportPhase::Evaluation);
+        }
+        let save = self.save();
+        self.bump_after_operand()?;
+        if defer {
+            if self.at(Punct::Star) {
+                return Ok(ImportPhase::Defer);
+            }
+        } else if self.is_binding_ident() {
+            let after_binding = self.save();
+            self.bump_after_operand()?;
+            let at_from = self.at_kw(Keyword::From);
+            self.restore(after_binding);
+            if at_from {
+                return Ok(ImportPhase::Source);
+            }
+        }
+        self.restore(save);
+        Ok(ImportPhase::Evaluation)
     }
 
     /// `* as ns` or `{ a, b as c }`.
@@ -268,6 +315,16 @@ impl<'s> Parser<'s> {
     /// legal here and NOT in the Statement-only positions (an `if` body, a loop
     /// body), which is why the two entry points are distinct.
     pub(crate) fn parse_stmt_list_item(&mut self) -> PResult<Stmt> {
+        let s = self.parse_stmt_list_item_inner()?;
+        // The token after a StatementListItem opens a new statement, so a `/`
+        // there is a REGEX — but the `}` that ended this item was scanned before
+        // that was knowable (the same helper closes a function/class expression,
+        // where the same `/` is division).
+        self.reinterpret_slash_as_regex()?;
+        Ok(s)
+    }
+
+    fn parse_stmt_list_item_inner(&mut self) -> PResult<Stmt> {
         if let Some(m) = self.parse_module_decl()? {
             return Ok(m);
         }
@@ -435,6 +492,14 @@ impl<'s> Parser<'s> {
     // ---- statements --------------------------------------------------------
 
     pub(crate) fn parse_stmt(&mut self) -> PResult<Stmt> {
+        let s = self.parse_stmt_inner()?;
+        // Same correction for an unbraced body (`if (c) { … } /re/.test(x)`) and
+        // for the `)` of `do … while (…)`, after which §14.7.2 inserts the `;`.
+        self.reinterpret_slash_as_regex()?;
+        Ok(s)
+    }
+
+    fn parse_stmt_inner(&mut self) -> PResult<Stmt> {
         let start = self.cur().span.start;
         match self.cur().kind.clone() {
             TokenKind::Punct(Punct::LBrace) => {

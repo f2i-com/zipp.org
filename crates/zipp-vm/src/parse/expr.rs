@@ -568,7 +568,9 @@ impl<'s> Parser<'s> {
 
     fn parse_new(&mut self) -> PResult<Expr> {
         let pos = self.cur().span.start;
-        self.bump_after_operand()?; // `new`
+        // `new` is followed by a MemberExpression — an OPERAND — so `new /re/`
+        // is a regex literal (a runtime TypeError, not a syntax error).
+        self.bump_before_operand()?; // `new`
         // `new.target`
         if self.at(Punct::Dot) {
             self.bump_after_operand()?;
@@ -588,6 +590,17 @@ impl<'s> Parser<'s> {
         // calls, so `new a.b()` applies `new` to `a.b`, not to `a.b()`.
         let mut callee =
             if self.at_kw(Keyword::New) { self.parse_new()? } else { self.parse_primary()? };
+        // `new import(…)` / `new import.defer(…)`: an ImportCall is a
+        // CallExpression, and `new` takes a MemberExpression, so it can never be
+        // the callee. Checked BEFORE the member loop so `new import('m').p` is
+        // caught too. (`new import.meta` stays legal — that is a MetaProperty,
+        // a runtime TypeError rather than a SyntaxError.)
+        if matches!(callee, Expr::ImportCall { .. }) {
+            return Err(SyntaxError::new(
+                "SyntaxError: 'new' cannot be applied to an import call",
+                pos,
+            ));
+        }
         loop {
             if self.at(Punct::Dot) {
                 self.bump_after_operand()?;
@@ -613,6 +626,31 @@ impl<'s> Parser<'s> {
         }
         let args = if self.at(Punct::LParen) { self.parse_args()? } else { Vec::new() };
         Ok(Expr::New { callee: Box::new(callee), args })
+    }
+
+    /// An ImportCall's argument list, from the `(` on.
+    ///
+    /// ```text
+    /// ImportCall : import ( AssignmentExpression ,opt )
+    ///            | import ( AssignmentExpression , AssignmentExpression ,opt )
+    /// ```
+    ///
+    /// and the same two shapes after `import.defer` / `import.source`. This is
+    /// NOT `Arguments`: the specifier is required and `...spread` is not allowed.
+    /// Requiring the `(` here is also what keeps `typeof import.source`,
+    /// `import.source.UNKNOWN` and `import.defer()` erroring as they must.
+    fn parse_import_call(&mut self, phase: ImportPhase) -> PResult<Expr> {
+        self.expect(Punct::LParen, true)?;
+        let spec = self.parse_assign_full()?;
+        let options = if self.eat(Punct::Comma, true)? && !self.at(Punct::RParen) {
+            let o = self.parse_assign_full()?;
+            let _ = self.eat(Punct::Comma, true)?;
+            Some(Box::new(o))
+        } else {
+            None
+        };
+        self.expect(Punct::RParen, false)?;
+        Ok(Expr::ImportCall { spec: Box::new(spec), options, phase })
     }
 
     fn parse_args(&mut self) -> PResult<Vec<Arg>> {
@@ -786,30 +824,38 @@ impl<'s> Parser<'s> {
                         self.bump_after_operand()?;
                         if self.at(Punct::Dot) {
                             self.bump_after_operand()?;
-                            let n = self.ident_name()?;
-                            if &*n != "meta" {
-                                return Err(SyntaxError::new(
-                                    "SyntaxError: expected 'import.meta'",
-                                    start,
-                                ));
-                            }
-                            return Ok(Expr::ImportMeta);
+                            // `import .` is followed by `meta`, `defer` or
+                            // `source`. Matched by SPELLING: a fixed token of a
+                            // production may not be written with an escape, so
+                            // `import.meta` is an error, not `import.meta`.
+                            // `None` = the meta-property; `Some(p)` = a phased
+                            // ImportCall, which still requires its `(`.
+                            let phase: Option<ImportPhase> = match &self.cur().kind {
+                                TokenKind::Ident { name, had_escape: false, private: false, .. } => {
+                                    match name.as_str() {
+                                        "meta" => None,
+                                        "defer" => Some(ImportPhase::Defer),
+                                        "source" => Some(ImportPhase::Source),
+                                        _ => {
+                                            return Err(SyntaxError::new(
+                                                "SyntaxError: expected 'import.meta'",
+                                                start,
+                                            ))
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    return Err(SyntaxError::new(
+                                        "SyntaxError: expected 'import.meta'",
+                                        start,
+                                    ))
+                                }
+                            };
+                            self.bump_after_operand()?;
+                            let Some(phase) = phase else { return Ok(Expr::ImportMeta) };
+                            return self.parse_import_call(phase);
                         }
-                        self.expect(Punct::LParen, true)?;
-                        let spec = self.parse_assign_full()?;
-                        let options = if self.eat(Punct::Comma, true)? && !self.at(Punct::RParen) {
-                            let o = self.parse_assign_full()?;
-                            let _ = self.eat(Punct::Comma, true)?;
-                            Some(Box::new(o))
-                        } else {
-                            None
-                        };
-                        self.expect(Punct::RParen, false)?;
-                        Ok(Expr::ImportCall {
-                            spec: Box::new(spec),
-                            options,
-                            phase: ImportPhase::Evaluation,
-                        })
+                        self.parse_import_call(ImportPhase::Evaluation)
                     }
                     _ => {
                         let (name, _) = self.binding_ident_or_reference()?;
@@ -828,16 +874,21 @@ impl<'s> Parser<'s> {
     /// An IdentifierReference. Looser than a binding: `eval`/`arguments` may be
     /// READ in strict mode, only bound-to is an error.
     fn binding_ident_or_reference(&mut self) -> PResult<(Name, u32)> {
-        let TokenKind::Ident { kw, had_escape, private: false, .. } = &self.cur().kind else {
+        let TokenKind::Ident { kw, had_escape, private: false, name } = &self.cur().kind else {
             return Err(self.err_here("SyntaxError: expected an identifier"));
         };
-        if !*had_escape {
-            if kw.is_always_reserved() {
-                return Err(self.err_here("SyntaxError: unexpected reserved word"));
-            }
-            if self.ctx.strict && kw.is_strict_reserved() {
-                return Err(self.err_here("SyntaxError: reserved word in strict mode"));
-            }
+        // A ReservedWord is matched by STRING VALUE, so an escaped spelling is
+        // still reserved here — `var = 1` is a SyntaxError. The lexer
+        // reports `Keyword::None` for an escaped identifier (which is what stops
+        // `if` being an `if` statement), so re-classify from the name;
+        // skipping the checks for escaped spellings is what let every reserved
+        // word through in every identifier position.
+        let kw = if *had_escape { Keyword::classify(name) } else { *kw };
+        if kw.is_always_reserved() {
+            return Err(self.err_here("SyntaxError: unexpected reserved word"));
+        }
+        if self.ctx.strict && kw.is_strict_reserved() {
+            return Err(self.err_here("SyntaxError: reserved word in strict mode"));
         }
         let pos = self.cur().span.start;
         let tok = self.bump_after_operand()?;
@@ -855,7 +906,9 @@ impl<'s> Parser<'s> {
         };
         quasis.push(TemplateElement { cooked, raw: raw.into_boxed_str() });
         let mut done = tail;
-        self.bump_after_operand()?;
+        // A head chunk ending in `${` is followed by an Expression, so a `/`
+        // there is a regex; a TemplateTail is an operand, so it is division.
+        self.bump(!done)?;
         while !done {
             exprs.push(self.parse_expr_full()?);
             // The `}` that closes a substitution is not a punctuator here — the

@@ -233,16 +233,23 @@ impl ScopeStack {
         Ok(())
     }
 
+    /// `annexb_dup_ok`: Annex B.3.2.4/B.3.2.5 drop the duplicate-
+    /// `LexicallyDeclaredNames` error in a Block or a CaseBlock when the source
+    /// is NOT strict and BOTH entries come from FunctionDeclarations — which is
+    /// what makes `{ function f(){} function f(){} }` legal in sloppy code and
+    /// an error under `"use strict"`.
     pub(crate) fn declare_lexical(
         &mut self,
         name: &str,
         kind: BindKind,
         pos: u32,
+        annexb_dup_ok: bool,
     ) -> PResult<()> {
         let Some(scope) = self.scopes.last_mut() else { return Ok(()) };
-        if scope.lex.iter().any(|(n, _, _)| &**n == name)
-            || scope.var.iter().any(|(n, _)| &**n == name)
-        {
+        let dup_lex = scope.lex.iter().any(|(n, k, _)| {
+            &**n == name && !(annexb_dup_ok && *k == BindKind::Function)
+        });
+        if dup_lex || scope.var.iter().any(|(n, _)| &**n == name) {
             return Err(SyntaxError::new(
                 format!("SyntaxError: Identifier '{name}' has already been declared"),
                 pos,
@@ -250,6 +257,20 @@ impl ScopeStack {
         }
         scope.lex.push((name.into(), kind, pos));
         Ok(())
+    }
+
+    /// A FunctionDeclaration's name is VAR-scoped only at the top level of a
+    /// Script, a FunctionBody or a ClassStaticBlock (the spec's
+    /// `TopLevelVarDeclaredNames`). At a MODULE's top level it is lexical
+    /// (`ModuleItemList` uses the plain `LexicallyDeclaredNames`), and inside a
+    /// Block, a CaseBlock or a catch body it is block-scoped — so it must not be
+    /// walked out to the nearest var boundary and checked against bindings it
+    /// can never actually collide with.
+    pub(crate) fn fn_decl_is_var_scoped(&self) -> bool {
+        matches!(
+            self.scopes.last().map(|s| s.kind),
+            Some(ScopeKind::Script | ScopeKind::Function | ScopeKind::ClassStaticBlock)
+        )
     }
 
     /// A `var` conflicts with any lexical binding between here and the nearest
@@ -414,6 +435,36 @@ impl<'s> Parser<'s> {
         self.bump(false)
     }
 
+    /// Re-decide a `/` (or `/=`) that has already been lexed as an OPERATOR: at
+    /// this point it starts a regular expression.
+    ///
+    /// `regex_allowed` must be supplied when a token is PRODUCED, but the `}`
+    /// closing a function or class body is scanned by code shared between a
+    /// DECLARATION (a statement — a regex may follow) and an EXPRESSION (an
+    /// operand — a division may follow). That site cannot know which it is, so
+    /// rather than thread the answer through every helper, the statement layer
+    /// corrects the single offending token afterwards.
+    ///
+    /// Seeking to `prev_end` — the end of the `}` — rather than to the token's
+    /// own start makes the lexer re-skip the intervening trivia, so
+    /// `saw_newline`, which ASI reads, is recomputed rather than lost.
+    pub(crate) fn reinterpret_slash_as_regex(&mut self) -> PResult<()> {
+        if !(self.at(Punct::Slash) || self.at(Punct::SlashEq)) {
+            return Ok(());
+        }
+        // Only a `}`, or the `)` of a `do … while (…)`, can end a statement and
+        // still leave a `/` pending; after any other statement the expression
+        // parser has already consumed the `/` as an operator. Guarding on the
+        // preceding byte keeps this from ever re-reading a genuine division.
+        let prev = self.prev_end as usize;
+        if prev == 0 || !matches!(self.src.as_bytes()[prev - 1], b'}' | b')') {
+            return Ok(());
+        }
+        self.lx.seek(self.prev_end);
+        self.tok = self.lx.next_token(true)?;
+        Ok(())
+    }
+
     pub(crate) fn at(&self, p: Punct) -> bool {
         self.tok.is_punct(p)
     }
@@ -487,7 +538,11 @@ impl<'s> Parser<'s> {
         // arrow or function whose body ENDS in a template gets its span's end
         // from here, and a stale value truncated it by the tail chunk's length.
         self.prev_end = t.span.end;
-        self.tok = self.lx.next_token(false)?;
+        // A TemplateMiddle (`}…${`) is followed by an Expression — the spec's
+        // InputElementRegExpOrTemplateTail position — so a `/` there is a regex.
+        // After a TemplateTail the whole literal is an operand: division.
+        let more = matches!(t.kind, TokenKind::Template { tail: false, .. });
+        self.tok = self.lx.next_token(more)?;
         Ok(t)
     }
 
@@ -547,25 +602,28 @@ impl<'s> Parser<'s> {
         if *private {
             return false;
         }
-        if !*had_escape {
-            if kw.is_always_reserved() {
-                return false;
-            }
-            if self.ctx.strict && kw.is_strict_reserved() {
-                return false;
-            }
-            if self.ctx.yield_ && *kw == Keyword::Yield {
-                return false;
-            }
-            if self.ctx.await_ && *kw == Keyword::Await {
-                return false;
-            }
-        } else if kw.is_always_reserved() {
-            // An escaped reserved word is still rejected: the spec compares the
-            // STRING VALUE for ReservedWord, so `var` may not be a binding.
+        // A ReservedWord is matched by its STRING VALUE, so an escaped spelling
+        // is still the reserved word for this purpose: `var var = 1` is a
+        // SyntaxError even though `var` is not the `var` KEYWORD.
+        //
+        // The lexer deliberately reports `kw = Keyword::None` for an escaped
+        // identifier — that is what stops `if (x)` being an `if` statement,
+        // and it is asserted by a test. So the classification has to be redone
+        // HERE from the name, or every check below is structurally unreachable
+        // for exactly the inputs it exists to reject (which is what it was).
+        let kw = if *had_escape { Keyword::classify(name) } else { *kw };
+        if kw.is_always_reserved() {
             return false;
         }
-        let _ = name;
+        if self.ctx.strict && kw.is_strict_reserved() {
+            return false;
+        }
+        if self.ctx.yield_ && kw == Keyword::Yield {
+            return false;
+        }
+        if self.ctx.await_ && kw == Keyword::Await {
+            return false;
+        }
         true
     }
 
@@ -728,10 +786,10 @@ mod tests {
         let mut s = ScopeStack::default();
         s.push(ScopeKind::Script);
         // let x; let x;
-        s.declare_lexical("x", BindKind::Let, 0).unwrap();
-        assert!(s.declare_lexical("x", BindKind::Let, 5).is_err());
+        s.declare_lexical("x", BindKind::Let, 0, false).unwrap();
+        assert!(s.declare_lexical("x", BindKind::Let, 5, false).is_err());
         // let y; var y;
-        s.declare_lexical("y", BindKind::Let, 0).unwrap();
+        s.declare_lexical("y", BindKind::Let, 0, false).unwrap();
         assert!(s.declare_var("y", 5).is_err());
         // var z; var z; is fine.
         s.declare_var("z", 0).unwrap();
@@ -742,7 +800,7 @@ mod tests {
         // the block pops and hoists its vars outward.
         let mut t = ScopeStack::default();
         t.push(ScopeKind::Script);
-        t.declare_lexical("a", BindKind::Let, 0).unwrap();
+        t.declare_lexical("a", BindKind::Let, 0, false).unwrap();
         t.push(ScopeKind::Block);
         t.declare_var("a", 10).unwrap_err();
     }
@@ -752,9 +810,9 @@ mod tests {
         let mut s = ScopeStack::default();
         s.push(ScopeKind::Script);
         s.push(ScopeKind::Block);
-        s.declare_lexical("b", BindKind::Let, 0).unwrap();
+        s.declare_lexical("b", BindKind::Let, 0, false).unwrap();
         s.pop().unwrap();
         // The inner `let b` is gone, so this is a fresh declaration.
-        assert!(s.declare_lexical("b", BindKind::Let, 20).is_ok());
+        assert!(s.declare_lexical("b", BindKind::Let, 20, false).is_ok());
     }
 }
