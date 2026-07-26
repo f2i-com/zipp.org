@@ -345,6 +345,10 @@ pub struct Parser<'s> {
     /// Labels in scope, for duplicate-label and `break`/`continue` target
     /// checks. Reset at every function boundary.
     pub(crate) labels: Vec<Box<str>>,
+    /// The expression just parsed was parenthesized. A one-slot flag rather
+    /// than a wrapper node: parenthesization is observable in exactly two
+    /// places, and both consume it immediately.
+    pub(crate) parenthesized: bool,
 }
 
 impl<'s> Parser<'s> {
@@ -372,6 +376,7 @@ impl<'s> Parser<'s> {
             cover: Cover::default(),
             opts,
             labels: Vec::new(),
+            parenthesized: false,
         })
     }
 
@@ -447,6 +452,56 @@ impl<'s> Parser<'s> {
 
     pub(crate) fn prev_end(&self) -> u32 {
         self.prev_end
+    }
+
+    /// A rewind point.
+    ///
+    /// Used ONLY for the bounded, single-token lookaheads the grammar genuinely
+    /// needs — is `get` an accessor or a property name, is `async` a modifier or
+    /// an identifier. The unbounded ambiguities are handled by the cover
+    /// grammar, which never rewinds, so this can never walk back over an
+    /// arbitrary amount of input.
+    pub(crate) fn save(&self) -> (u32, Token) {
+        (self.lx.pos(), self.tok.clone())
+    }
+
+    pub(crate) fn restore(&mut self, s: (u32, Token)) {
+        self.lx.seek(s.0);
+        self.tok = s.1;
+    }
+
+    /// Resume template scanning at the `}` that closes a substitution.
+    ///
+    /// The `}` is not a punctuator in this position — it is the start of the
+    /// next template chunk — so the lexer has to be re-entered AT it rather
+    /// than after it.
+    pub(crate) fn resume_template(&mut self) -> PResult<Token> {
+        self.lx.seek(self.tok.span.start);
+        let t = self.lx.read_template_continue()?;
+        self.tok = self.lx.next_token(false)?;
+        Ok(t)
+    }
+
+    pub(crate) fn cover_pattern_only(&mut self, e: SyntaxError) {
+        if self.cover.pattern_only.is_none() {
+            self.cover.pattern_only = Some(e);
+        }
+    }
+
+    pub(crate) fn cover_expr_only(&mut self, e: SyntaxError) {
+        if self.cover.expr_only.is_none() {
+            self.cover.expr_only = Some(e);
+        }
+    }
+
+    pub(crate) fn mark_parenthesized(&mut self) {
+        self.parenthesized = true;
+    }
+
+    /// Consume the flag. Reading it clears it, so it can never leak onto a
+    /// later, unparenthesized expression.
+    pub(crate) fn take_parenthesized(&mut self) -> bool {
+        std::mem::take(&mut self.parenthesized)
     }
 
     // ---- automatic semicolon insertion -------------------------------------

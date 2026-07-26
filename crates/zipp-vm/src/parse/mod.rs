@@ -27,6 +27,10 @@
 pub mod ast;
 pub mod lexer;
 pub mod oxc_bridge;
+pub mod cover;
+pub mod stmt;
+pub mod expr;
+pub mod funcs;
 pub mod parser;
 pub mod token;
 
@@ -323,5 +327,113 @@ mod tests {
             assert!(!k.is_always_reserved() && !k.is_strict_reserved(), "{w} is contextual");
         }
         assert_eq!(Keyword::classify("notakeyword"), Keyword::None);
+    }
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::parser::ParseOptions;
+    use super::stmt::parse;
+
+    fn ok(src: &str) -> String {
+        match parse(src, ParseOptions::script()) {
+            Ok(p) => format!("{p:?}"),
+            Err(e) => panic!("failed to parse {src:?}: {} at {}", e.msg, e.pos),
+        }
+    }
+
+    fn err(src: &str) -> String {
+        match parse(src, ParseOptions::script()) {
+            Ok(_) => panic!("expected {src:?} to be rejected"),
+            Err(e) => e.msg,
+        }
+    }
+
+    #[test]
+    fn parses_the_ordinary_shapes() {
+        for src in [
+            "1 + 2 * 3;",
+            "let x = 1, y = 2;",
+            "const {a, b: [c] = []} = o;",
+            "function f(a, b = 1, ...r) { return a; }",
+            "class C extends B { #x = 1; static s = 2; get v() { return 1 } static { } }",
+            "for (const k in o) {}",
+            "for (const v of xs) {}",
+            "try { } catch { } finally { }",
+            "switch (x) { case 1: break; default: }",
+            "a?.b?.[c]?.();",
+            "label: for (;;) { break label; }",
+            "x = a ? b : c;",
+            "`a${1}b`;",
+            "var re = /ab+c/gi;",
+            "(a, b) => a + b;",
+            "async (a) => await a;",
+            "new Foo(1, 2).bar();",
+            "o = { m() {}, get g() { return 1 }, [k]: v, ...rest };",
+            "x **= 2 ** 3 ** 4;",
+            "a ??= b;",
+        ] {
+            let _ = ok(src);
+        }
+    }
+
+    #[test]
+    fn cover_grammar_resolves_both_ways() {
+        // `(a, b)` as a sequence expression, and as arrow parameters.
+        assert!(ok("(a, b);").contains("Seq"));
+        assert!(ok("(a, b) => a;").contains("Arrow"));
+        // `{a = 1}` is a SyntaxError as a literal...
+        assert!(err("({a = 1});").contains("shorthand"));
+        // ...and legal as a destructuring target.
+        assert!(ok("({a = 1} = {});").contains("Assign"));
+        // `...rest` is only valid as a parameter list.
+        assert!(err("(...a);").contains("rest"));
+        assert!(ok("(...a) => a;").contains("Arrow"));
+        // `async(1)` is a CALL, not an arrow.
+        assert!(ok("async(1);").contains("Call"));
+        assert!(ok("async (a) => a;").contains("Arrow"));
+    }
+
+    #[test]
+    fn annex_b_call_assignment_target_parses() {
+        // The case oxc's AST could not represent, which forced a source rewrite
+        // and reparse. It must PARSE in sloppy code and throw at runtime.
+        assert!(ok("f() = 1;").contains("Call"));
+        // ...and be an early error in strict code.
+        assert!(parse("'use strict'; f() = 1;", ParseOptions::script()).is_err());
+    }
+
+    #[test]
+    fn early_errors_the_old_front_end_could_not_raise() {
+        assert!(err("let x; let x;").contains("already been declared"));
+        assert!(err("let y; var y;").contains("already been declared"));
+        assert!(err("let a; { var a; }").contains("already been declared"));
+        assert!(err("class C { constructor(){} constructor(){} }").contains("one constructor"));
+        assert!(err("a: b: a: ;").contains("already been declared"));
+        assert!(err("switch (x) { default: ; default: ; }").contains("default"));
+        assert!(err("'use strict'; with (o) {}").contains("strict"));
+        assert!(err("'use strict'; delete x;").contains("delete"));
+        assert!(err("'use strict'; var eval;").contains("eval"));
+        assert!(err("const c;").contains("missing initializer"));
+        assert!(err("break;").contains("break"));
+        assert!(err("continue;").contains("continue"));
+        assert!(err("return 1;").contains("return"));
+        assert!(err("a ?? b || c;").contains("mixed"));
+        assert!(err("-a ** b;").contains("parentheses"));
+    }
+
+    #[test]
+    fn asi_and_restricted_productions() {
+        // A newline after `return` ends the statement.
+        assert!(ok("function f() { return
+1; }").contains("Return"));
+        // A newline before `++` means ASI, not a postfix operator.
+        let _ = ok("a
+++b;");
+        // `async` followed by a newline is NOT an async arrow — the production
+        // has a [no LineTerminator here] restriction — so this reads as a call
+        // to `async` followed by `=>`, which is a SyntaxError. node agrees.
+        assert!(parse("async
+() => {};", ParseOptions::script()).is_err());
     }
 }

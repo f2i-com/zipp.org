@@ -88,6 +88,23 @@ pub fn compile_to_text(src: &str, module: bool) -> Result<String, String> {
     Ok(format!("{program:#?}"))
 }
 
+/// Parse with OUR parser and return the AST's canonical text form.
+///
+/// The gate for the hand-written front end: this and `lower_to_text` should
+/// agree for every file in a corpus, because the bridge's output is already
+/// known to compile byte-identically.
+pub fn parse_to_text(src: &str, module: bool) -> Result<String, String> {
+    let opts = if module {
+        parse::parser::ParseOptions::module()
+    } else {
+        parse::parser::ParseOptions::script()
+    };
+    match parse::stmt::parse(src, opts) {
+        Ok(p) => Ok(format!("{p:#?}")),
+        Err(e) => Err(format!("{} (at {})", e.msg, e.pos)),
+    }
+}
+
 /// Parse with oxc, lower to zipp's own AST, and return a canonical text form.
 ///
 /// The bridge's own gate: an `Err` here is a construct the new AST cannot yet

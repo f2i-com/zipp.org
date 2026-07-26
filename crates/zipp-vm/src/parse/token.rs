@@ -269,6 +269,17 @@ pub struct Token {
     pub newline_before: bool,
 }
 
+impl TokenKind {
+    /// The punctuator this token is, if any. Lets the expression parser look up
+    /// a precedence without matching the whole enum.
+    pub fn as_punct(&self) -> Option<Punct> {
+        match self {
+            TokenKind::Punct(p) => Some(*p),
+            _ => None,
+        }
+    }
+}
+
 impl Token {
     pub fn is_punct(&self, p: Punct) -> bool {
         matches!(self.kind, TokenKind::Punct(x) if x == p)
