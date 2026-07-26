@@ -738,7 +738,22 @@ impl<'s> Parser<'s> {
                 }
                 Ok(Expr::Regex { pattern, flags: canon.into_boxed_str() })
             }
-            TokenKind::Template { .. } => Ok(Expr::Template(Box::new(self.parse_template()?))),
+            TokenKind::Template { .. } => {
+                let pos = self.cur().span.start;
+                let t = self.parse_template()?;
+                // An invalid escape makes a chunk's COOKED value undefined. That
+                // is legal only in a TAGGED template, where the tag can still
+                // read `.raw`; an untagged one needs the cooked value, so it is
+                // an early error. The lexer already records this as
+                // `cooked: None` — nothing was checking it on this path.
+                if t.quasis.iter().any(|q| q.cooked.is_none()) {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: invalid escape in an untagged template literal",
+                        pos,
+                    ));
+                }
+                Ok(Expr::Template(Box::new(t)))
+            }
             TokenKind::Punct(Punct::LParen) => match self.parse_paren_or_arrow(false, start)? {
                 Some(e) => Ok(e),
                 None => Err(self.err_here("SyntaxError: unexpected token")),

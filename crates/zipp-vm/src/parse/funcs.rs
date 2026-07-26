@@ -331,6 +331,16 @@ impl<'s> Parser<'s> {
             self.ctx.in_field_init = true;
             self.ctx.return_ = false;
             self.ctx.super_prop = true;
+            // `await` is RESERVED inside a ClassStaticBlock — both as an
+            // expression and as a binding — even though the block is not async
+            // and cannot await anything. Setting `await_` is what makes both
+            // `await;` and `var await;` the SyntaxErrors they must be; without
+            // it the first became a ReferenceError at runtime and the second was
+            // silently accepted.
+            self.ctx.await_ = true;
+            // A static block is not a generator, so `yield` is an ordinary
+            // identifier there unless the enclosing code is strict.
+            self.ctx.yield_ = false;
             self.scopes.push(ScopeKind::ClassStaticBlock);
             let mut stmts = Vec::new();
             while !self.at(Punct::RBrace) && !self.at_eof() {
