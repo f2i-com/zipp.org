@@ -1209,6 +1209,51 @@ interning: the `Rc<str>` intern table was 5-8% slower, the regex-result
 decomposition put the three keys at 42ns of 316, and now direct ablation puts
 them at ~5% of literal construction.
 
+### B27 — Plain-object method inlining, and a measurement trap in the call microbenches
+
+`build_method_shape` required `m.class`, so a method held as an own property —
+`{ m() {…} }`, the module/callback/vtable shape — never inlined, while the
+identical method on a class did:
+
+    call add2(i,1)         3.8ns      method obj.m(i)        21.1 -> 3.8ns
+    class  c.mm(i)         3.8ns      polymorphic o4[i&3].k  25.4 -> 5.4ns
+
+The polymorphic case now beats node (9.2ns). Suite impact is +0.3% over 11
+paired reps, i.e. not a win there — the ten benches do not call plain-object
+methods in their hot loops. Kept on the `fmt_f24`/`fmt_f64` precedent (strictly
+faster in isolation, correct, suite-neutral within noise) rather than the
+tier-admission precedent (clear regression).
+
+The guard that makes it sound is worth remembering: a class method is covered by
+the receiver-version guard, but an own property is a `vals` SLOT, and
+`o.m = other` overwrites that slot in place WITHOUT bumping the version —
+deliberately, since the ordinary-set fast path keeps the shape stable so JIT
+caches survive. Each plain-object arm therefore also guards
+`vals_ptr[slot] == baked_bits`.
+
+**The measurement trap.** Several call/regex microbenchmarks in this file are
+measured in loops the JIT DECLINES, so their numbers include interpretation:
+
+    [jit] region fnN [2] DECLINED (call-mix gate)
+
+That gate is deliberate and already tuned — a call site whose interpreter IC
+stayed empty (a native callee) pays ~10ns of FFI per iteration in compiled code,
+so a region compiles only when it has ≥ 20 other ops per such site, and its
+comment records that loosening the ratio cost async-promise-chain 8%. A bare
+`for (…) re.test(lines[i])` therefore runs interpreted BY DESIGN.
+
+So `/a/.test("a")` measuring 100ns flat in subject length (100ns at 1 char,
+107ns at 200) does NOT mean 95ns of regex setup — it is interpreted loop
+overhead plus native dispatch plus setup, and the three were not separated.
+What the flatness DOES establish is that matching itself is cheap and the cost
+is per-call, which is consistent with `MatchAttempter::new` building three
+`Vec`s (`bts`, `loops`, `groups`) on every call — regress's own source says
+`// TODO: avoid allocating so much`. Making those `SmallVec` in the fork is the
+obvious next probe, worth an estimated 20-30ns per regex call.
+
+Before quoting any microbenchmark in this file, check with `ZIPP_JITLOG=1`
+whether its loop actually compiled.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
