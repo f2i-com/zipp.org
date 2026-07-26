@@ -424,6 +424,42 @@ mod tests {
     /// reference in the body worked. `function J(r=G){...}` is a stock shape in
     /// minified bundles for a defaulted config argument, so this took out whole
     /// applications.
+    /// A name used only inside an OPTIONAL CHAIN is still captured.
+    ///
+    /// `Expr::Chain` wraps the whole chain, so without an arm in the capture
+    /// walkers every name inside `r()?.getItem(k)` was invisible: never boxed,
+    /// nothing for a nested function to capture, ReferenceError at runtime.
+    /// Under-inclusion in that scan is not a slower lookup, it is a throw.
+    #[test]
+    fn optional_chain_captures_enclosing() {
+        assert_eq!(
+            run_ok(
+                "console.log((function(){ const r=()=>({x:'ok'}), o={f:()=>r()?.x};                  return o.f() })())"
+            ),
+            vec!["ok"]
+        );
+        assert_eq!(
+            run_ok(
+                "console.log((function(){ const r=()=>'ok', o={f:()=>r?.()}; return o.f() })())"
+            ),
+            vec!["ok"]
+        );
+        assert_eq!(
+            run_ok(
+                "console.log((function(){ const k='x', r={x:'ok'}, o={f:()=>r?.[k]};                  return o.f() })())"
+            ),
+            vec!["ok"]
+        );
+        // The real shape: a storage adapter reaching a captured accessor
+        // through a chain from every method.
+        assert_eq!(
+            run_ok(
+                "var store={_d:{},setItem:function(k,v){this._d[k]=v},getItem:function(k){return this._d[k]||null}};                  function mk(){ const r=()=>store, t={ set:(k,v)=>{r()?.setItem(k,v)},                  get:k=>r()?.getItem(k)??null }; return t }                  var a=mk(); a.set('k','ok'); console.log(a.get('k'))"
+            ),
+            vec!["ok"]
+        );
+    }
+
     #[test]
     fn param_default_captures_enclosing() {
         // Every binding kind, since the scan is what fails, not the kind.

@@ -530,13 +530,18 @@ fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
         Expr::Function(f) => fn_node_free(f, out),
         Expr::Arrow(a) => arrow_free(a, out),
         Expr::Class(c) => class_free(c, out),
-        // NOTE: `Expr::Chain` (`a?.b`), `Expr::PrivateIn` (`#x in o`) and
-        // `Expr::ImportCall` fall into this catch-all and contribute nothing.
-        // Each had an oxc node (`ChainExpression`, `PrivateInExpression`,
-        // `ImportExpression`) with no arm here, so this is exactly the
-        // pre-port behaviour — under-inclusion is conservative-safe (resolution
-        // falls back to a global lookup), and widening it would change which
-        // locals get boxed, i.e. the emitted bytecode.
+        // An optional chain wraps the whole chain, so without this arm every
+        // name inside `r()?.getItem(k)` is invisible to the scan.
+        //
+        // Under-inclusion here is NOT safe. A missed name is not boxed into a
+        // cell, so a nested function has nothing to capture and the reference
+        // falls back to a global that does not exist — a ReferenceError, not a
+        // slower lookup. That is what "r is not defined" was, thrown from a
+        // storage adapter whose methods all reached their captured accessor
+        // through `?.`.
+        Expr::Chain(inner) => expr_refs(inner, out),
+        // NOTE: `Expr::PrivateIn` (`#x in o`) and `Expr::ImportCall` still fall
+        // into this catch-all, as they did pre-port.
         _ => {}
     }
 }
@@ -853,9 +858,11 @@ fn collect_nested_free_expr(e: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
-        // NOTE: as in `expr_refs`, `Expr::Chain` / `Expr::PrivateIn` /
-        // `Expr::ImportCall` (and `Expr::Update`) land here and contribute
-        // nothing — unchanged from the oxc walk, which had no arm for them.
+        // Same as in `expr_refs`: a nested function inside an optional chain
+        // must still be scanned, or the names it captures go unseen.
+        Expr::Chain(inner) => collect_nested_free_expr(inner, out),
+        // NOTE: `Expr::PrivateIn` / `Expr::ImportCall` still fall into this
+        // catch-all, as they did pre-port.
         _ => {}
     }
 }
