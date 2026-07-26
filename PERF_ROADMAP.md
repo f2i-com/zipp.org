@@ -1001,7 +1001,35 @@ cannot hold them. The endianness flag is SIMPLER here than on the memory path: a
 Bool on the integer tier lives in a GPR home holding 0/1, so `test/jz` is exactly
 ToBoolean with no tag test.
 
-What blocks it is `plan_region`'s receiver-exclusion path, not the emitter:
+**ROOT CAUSE (second attempt, instrumented rather than guessed).** Not the
+emitter, and not the sequence of admission gates — those all pass now. The
+receiver enumeration is CORRECT: for `bsum = (b + dv.getUint32(o,le===1) + … +
+dv.getUint16(o,le===0) + dv.getInt8(o+2)) | 0` it finds exactly three receivers,
+r96/r108/r112, one per call, each written by its own `LoadGlobal dv` immediately
+before its call. The blocker is that **r96 is ALSO reused as a numeric temp**
+inside the same region:
+
+    [recv+] ip=245 r96  dv=true  CallMethod { dst:95, obj:96, argc:2 }   <- dv
+    [excl]  r96 used_elsewhere at ip=238 by Bitwise { dst:95, a:96, op:And }
+    [excl]  r96 used_elsewhere at ip=274 by Add { dst:96, a:96, b:97 }
+    [excl]  r96 used_elsewhere at ip=275 by StoreGlobalStrict { idx:20, src:96 }
+
+So one register holds the DataView at ip 245 and a number at 238/274/275. The
+planner's whole receiver mechanism assumes a receiver register is ONLY ever a
+receiver — it excludes the register from typing and homing entirely — which is
+exactly the limitation its own comment already names ("a receiver register
+reused for other numeric values can't be cleanly excluded under the non-SSA
+register model; generalizing this needs SSA-like per-use disambiguation").
+
+The promising narrow form, for whoever picks this up: the pin's source here is
+`Global(g)`, so the emitted code NEVER reads the receiver register — the
+`LoadGlobal dv` feeding it is dead for every purpose except satisfying the
+planner. If those defs are proven to feed only pinned-receiver uses and are then
+elided, the register keeps its numeric home and the conflict disappears without
+any general SSA pass. `instr_uses(CallMethod)` already returns `vec![]`, so the
+def may already look unused to the existing DCE.
+
+Superseded detail from the first attempt (the gates, all now passing):
 
   * `dv.getUint32(…)` three times in one body emits three `LoadGlobal dv` into
     the SAME register, and the exclusion required EXACTLY ONE def. Relaxing that
