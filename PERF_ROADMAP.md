@@ -6,8 +6,14 @@
 > per-call-site inline caches, a native x86-64 OSR JIT (dynasm), and a
 > whole-heap mark-sweep GC.
 >
-> Last re-measured **2026-07-25**. Every number below was measured on this repo;
+> Last re-measured **2026-07-26**. Every number below was measured on this repo;
 > nothing here is an estimate unless it says "inferred".
+>
+> **Sections 1 and 3 below were written at 3.31x and several of their
+> conclusions have since been REFUTED by measurement.** The corrections live in
+> B8 (the regex engine is not the bottleneck — we beat V8 at scanning), B17 (key
+> interning and inline storage both measured slower), and B16 (which loops the
+> JIT never reaches). Read those before acting on anything here.
 
 ---
 
@@ -32,7 +38,7 @@ The failures are extremely concentrated — this is a short list, not a long tai
 `tools/test262-expected-failures.txt` is the checked-in baseline; a regression
 is a `diff`, not a remembered number.
 
-### Performance — geomean 3.31× slower than node
+### Performance — geomean 2.80× slower than node (was 3.31×)
 
 `bench/real/*.js`, best-of-7, output byte-identical to node.
 
@@ -66,6 +72,28 @@ per-element call. None of this carries to the ten benches above, which are
 bound by property access, allocation and enumeration.
 
 ---
+
+## 1b. Benchmark-harness debts (found by external review, VERIFIED)
+
+Both of these are confirmed in the source, and both mean a headline number is
+measuring something other than its name:
+
+- **`parse-large-js` does not measure zipp parsing.** Its own header says it
+  builds ~2MB of synthetic source and then "tokenize[s] it with a hand-written
+  charCodeAt scanner" plus a recursive-descent parser written IN JAVASCRIPT. It
+  is a fine JS-execution benchmark; it is not a parser benchmark, and no result
+  from it says anything about `oxc_parser` or our bytecode emitter.
+- **`polymorphic-objects` never reaches the IC cliff.** It indexes
+  `shapes[i & 7]` — exactly 8 receivers — and `JIT_IC_WAYS == 8`. It therefore
+  sits precisely AT capacity and never exercises the ninth-receiver fall-off
+  that §3 blames it for. Any claim about megamorphic behaviour needs a 9th
+  shape.
+
+Harness gaps that keep costing real time (±10% run-to-run variance has already
+produced at least two false readings this cycle): no raw samples retained, no
+engine interleaving, mean-of-best rather than median with an interval, and no
+separation of cold start / warm steady state / GC / RSS. A change under ~10% on
+one row currently cannot be distinguished from noise without hand-repeating it.
 
 ## 2. The standing gate
 
@@ -140,7 +168,13 @@ takes 50ms matters less than a 3x bench that takes 900ms:
 | json-large | 324ms | 4.6% |
 | sparse-array | 234ms | 3.3% |
 
-**Regex is 41.8% of everything left, and it is the MATCHER, not the wrapper.**
+**REFUTED — see B8.** This section claimed regex was 41.8% of the gap and
+that the MATCHER was at fault. Matching cost is flat in subject length and zipp
+is FASTER than V8 on a 2000-char scan (25ms vs 42ms); the cost is per-call
+dispatch and result construction. The paragraph below is kept for the history of
+how the wrong conclusion was reached.
+
+**Superseded claim:**
 Measured per call:
 
 | | zipp | node |
