@@ -19,53 +19,69 @@
 
 ## 1. Where the project actually is
 
-### Conformance — 96.97%
+### Conformance — 99.0%
 
 | slice | executions | pass | fail |
 |---|---|---|---|
-| ECMA-262 + `staging`, sloppy **and** strict | 96,029 | 93,122 (96.97%) | 2,907 |
+| ECMA-262 + `staging`, sloppy **and** strict | 96,029 | 95,091 (99.0%) | 938 |
 | `intl402` (opt-in) | 3,341 | 563 (16.9%) | 2,778 |
 
-The failures are extremely concentrated — this is a short list, not a long tail:
+Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
 
-| cause | failures | note |
+The static-semantics cluster that was 76% of everything is gone: parse-phase
+negatives are now **80 files** of the 552 that fail, down from 607. What is left
+is a long tail plus two deliberate items:
+
+| cause | executions | note |
 |---|---|---|
-| static-semantics early errors never raised | **2,214** | 76% of everything |
-| `staging` (SpiderMonkey-derived) | ~430 | |
-| everything else in ECMA-262 | ~260 | |
-| `intl402`: non-ISO calendars, `DateTimeFormat` | 2,778 | separate baseline |
+| positive tests failing at runtime | 774 | the long tail — no cluster over ~30 |
+| parse-phase negatives not raised | 135 | incl. 20 for top-level `return` (deliberate) |
+| decorators | 26 | not implemented |
+| wrong error TYPE / runtime negatives | 29 | |
 
 `tools/test262-expected-failures.txt` is the checked-in baseline; a regression
-is a `diff`, not a remembered number.
+is a `diff`, not a remembered number. It was stale for a long stretch (the
+2,194-line oxc-era list against a 938-failure run), which made that diff
+meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — geomean 2.72× slower than node (was 3.31×)
+### Performance — geomean 2.56× slower than node (was 3.31×)
 
-`bench/real/*.js`, best-of-5, output compared against node.
+`bench/real/*.js` via `tools/bench.py`, paired medians of 7, output compared as
+exact bytes.
 
 | bench | node | zipp | ratio |
 |---|---|---|---|
-| map-set-heavy | 625ms | 783ms | 1.25× |
-| json-large | 265ms | 631ms | 2.38× |
-| parse-large-js | 255ms | 617ms | 2.42× |
-| polymorphic-objects | 294ms | 715ms | 2.43× |
-| async-promise-chain | 297ms | 731ms | 2.46× |
-| markdown-render | 240ms | 676ms | 2.82× |
-| class-prototype-hot | 253ms | 753ms | 2.98× |
-| sparse-array | 43ms | 156ms | 3.63× |
-| typedarray-math | 174ms | 688ms | 3.95× |
-| regex-log-scan | 408ms | 1745ms | 4.28× |
+| map-set-heavy | 579ms | 699ms | 1.21× |
+| json-large | 227ms | 468ms | 2.06× |
+| async-promise-chain | 299ms | 688ms | 2.30× |
+| parse-large-js | 241ms | 582ms | 2.42× |
+| polymorphic-objects | 293ms | 716ms | 2.44× |
+| markdown-render | 238ms | 633ms | 2.66× |
+| class-prototype-hot | 266ms | 740ms | 2.78× |
+| sparse-array | 50ms | 151ms | 3.02× |
+| typedarray-math | 171ms | 667ms | 3.89× |
+| regex-log-scan | 422ms | 1725ms | 4.09× |
 
 **Run-to-run variance is ±10–17%** — node's own `map-set` time has ranged
-609–966ms and `markdown` 231–416ms across runs on the same machine. A
-single-row move under ~10% is noise; re-run before attributing it to a change.
-Track the geomean, which has moved 4.77× → 4.20× → 3.31× → 2.82× → **2.72×**.
+609–966ms on this machine. A single-row move under ~10% is noise; use
+`tools/bench.py --ab old.exe new.exe` for anything under a few percent. Track
+the geomean, which has moved 4.77× → 4.20× → 3.31× → 2.82× → 2.72× → **2.56×**.
 
-⚠️ **These three tables drift.** README, this file and `bench/results_real.txt`
-are maintained by hand from separate runs and have disagreed by up to 0.1×.
-Treat `bench/results_real.txt` as authoritative; the fix is to generate both
-tables from structured output (see §1b).
+**What it would take to reach 2×**, from the phase-level measurements in B31–B33
+— none of these is a tuning change:
 
-Startup is ~2× faster than node (26ms vs 53ms).
+1. **Hidden classes / shapes.** The property fast path is keyed to object
+   IDENTITY, not shape, with a cliff at exactly `IC_WAYS = 8`: the same
+   `{alpha,beta,gamma}` read costs 4.2ns at 8 distinct receivers and 18.9ns at
+   16, where node is flat at 0.6ns. This is the only fix for that cliff and for
+   the unconditional `pos()` the interpreter IC pays on every access.
+2. **A compiled regex backend.** `regress` is a backtracking interpreter at
+   6.9ns per failed match attempt against Irregexp's 0.37ns.
+3. **An optimizing tier with SSA.** `typedarray-math`'s DataView phase and its
+   prefix-sum phase are both op-count bound on a register machine with no such
+   tier (B32, B7) — prefix-sum is already on the BEST tier and is still 3.4×.
+
+Startup is ~4× faster than node (7ms vs 30ms).
 
 ### What the engine already wins
 
@@ -245,19 +261,20 @@ This track did not exist in the previous roadmap; test262 was only a gate. It is
 now the shorter of the two tracks and should go first — the work is bounded and
 the payoff is a headline number.
 
-- [ ] **A1 — Static-semantics early errors (2,214 failures, 76% of the total).**
-  `crates/zipp-vm/Cargo.toml` pulls `oxc_parser` but not `oxc_semantic`, so the
-  engine happily runs programs that must be a `SyntaxError`:
-  `let x; let x;`, `let x; var x;`, `class C{constructor(){}constructor(){}}`,
-  `a: a: ;`, script-level `export`, and invalid regexp literals in dead code.
-  Add `oxc_semantic` (or an equivalent validation pass) between parse and
-  compile, and map its diagnostics onto the engine's `SyntaxError` path.
-  Concentrations: `language/statements/class` 274, `language/expressions/class`
-  244, `language/block-scope/syntax` 201, `language/statements/switch` 127,
-  `language/expressions/dynamic-import` 120, `literals/regexp` 165,
-  `RegExp/property-escapes` 163.
-  **Effort:** M–L. **Risk:** med — it must not reject valid programs; the
-  expected-failures diff is the backstop.
+- [x] **A1 — Static-semantics early errors. DONE: 2,214 → 135.** Not by adding
+  `oxc_semantic` as this entry proposed, but by the engine growing its own front
+  end (`src/parse/`), which is the only arrangement that has the binding,
+  strictness and positional state these rules need *while parsing*. The rules
+  that took the longest are listed in the README's front-end section; the
+  clusters that fell were Annex B function-declaration positions, ClassBody
+  static semantics (private-name duplicates, `#constructor`, static
+  `prototype`, special-method `constructor`), `UniqueFormalParameters`,
+  parameter-vs-body lexical collisions, object-shorthand IdentifierReferences,
+  escaped `yield`/`await`, `ContainsArguments`, block-scoped `var`/`let`,
+  module-goal early errors, and three lexer rules (`0_0`, `""` under strict,
+  HTML-like comments in a module).
+  Remaining: 135 executions across a long tail, of which 20 are the deliberate
+  top-level-`return` trade and 26 are decorators (unimplemented).
 
 - [ ] **A2 — `Intl.DateTimeFormat` is unconstructable.** `vm/intl.rs:436` reads
   each component option with `opt_string(options, name, "", allowed)`, passing
@@ -1298,6 +1315,67 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B33 — Result-object allocation: the five sites, measured and priced
+
+The unit prices, from 20M-iteration loops (`{}` 44ns, `{value:i}` 70ns,
+`{value,done}` **90ns**, a full property descriptor **151ns**, `[i,i]` 34ns —
+against ~0 for all of them in node). Every finding below is one of those five
+constants multiplied by a call count.
+
+**A. `{value,done}` from the built-in iterators — the largest single win, and it
+does not touch the bench suite.** `natives.rs` `ITER_NEXT` builds one at four
+sites; `dispatch.rs`'s `IterNext` then does `get_prop(res,"done")` and
+`get_prop(res,"value")` and drops it.
+
+| loop | zipp ns/step | node | ratio |
+|---|---|---|---|
+| `for (v of a)` — existing fast path | 18.8 | 0.6 | 31x |
+| `for (v of a.values())` | **143** | 0.55 | 260x |
+| `for (k of map.keys())` | **133** | 1.65 | 81x |
+| `for (v of gen())` | **174** | 8.3 | 21x |
+| `for (v of a.values().map(f))` | **324** | 14 | 23x |
+
+`a.values()` costs **7.6x** what `for (v of a)` costs on the identical data: 90ns
+object + ~3ns for the two Gets + ~50ns dispatch.
+
+It is **elidable outright**, and the precedent is already in the tree.
+7.4.14 CreateIterResultObject makes an ordinary object with two own DATA
+properties; 7.4.5/7.4.6 read them with plain `Get`. Own data properties shadow
+`Object.prototype`, so neither Get can run user code and the object's identity
+never escapes the loop. `dispatch.rs` already skips it for
+%RegExpStringIterator% with exactly this argument — extend that arm to
+`HeapObj::Iterator`/`IterHelper` stepped by the PRISTINE `ITER_NEXT` native.
+Predicted 143 → ~45ns. Verified the guards that keep it honest: a patched
+`%ArrayIteratorPrototype%.next` is still honoured, `a.values().next.call({})`
+still throws, done still latches.
+
+**Do not schedule this expecting a geomean move** — no bench in `bench/real/`
+iterates via `.values()`/`.keys()`/`.entries()` or a generator. It is a
+real-world win (every iterator-helper chain, every `map.entries()`), not a suite
+win. Same for the generator case (`async_runtime.rs` `iter_result`), where the
+`yield*` verbatim return must stay an object.
+
+**C. The RegExp match result's `index`/`input`/`groups`.** ~150ns of the 367ns
+per match, and **not elidable** — they are spec-required own data properties
+that must appear in `Object.keys` after the numeric indices. Needs a cheaper
+representation (lazy materialisation from a side table), not removal. Worth
+~68ms in `regex-log-scan`'s matchAll phase and ~22ms in its exec phase.
+
+**D. DONE** — see the `index_key` commit. `array_index_override` allocated a
+`String` per indexed read of any array carrying a side table, which every match
+result does. `a[2]` was 2.3ns plain and 36.9ns after `a.tag = "x"`.
+
+**E. A property descriptor per key in object spread / `Object.assign`.** 151ns
+each, purely internal at those callers (built by the engine, consumed by the
+engine one line later); observable only as the return value of
+`getOwnPropertyDescriptor`. `{...src}` 276 → ~90ns/key predicted, matching what
+`ObjectRest` already achieves.
+
+**F. `[k,v]` entry arrays for Map/Set/TypedArray.** 34ns each. Observable in
+`for (const e of map)` where the user holds the array; purely internal in
+`for (const [k,v] of map)`, where the compiler emits `IterNext` followed
+immediately by the destructure that drops it.
 
 ### B32 — Where typedarray-math and sparse-array actually spend the gap
 
