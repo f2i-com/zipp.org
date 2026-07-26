@@ -1012,6 +1012,46 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// An array's elements as ITERATION produces them, which is not the same as
+    /// its backing store.
+    ///
+    /// The array iterator reads each index with `Get`, so a hole is not carried
+    /// through as a hole: it resolves against the prototype chain (`undefined`
+    /// unless someone installed an indexed property on `Array.prototype`) and
+    /// the consumer stores it with CreateDataProperty. Cloning the dense store
+    /// verbatim instead propagates the hole SENTINEL, and the result is a sparse
+    /// array where the spec requires a dense one — observable through `in`,
+    /// `hasOwnProperty`, and every method that skips holes, which is why
+    /// `[...Array(3)].map((_, i) => i)` returned three holes rather than
+    /// `[0,1,2]`.
+    ///
+    /// The scan is the whole cost in the common case: a dense array (no hole
+    /// anywhere) clones and returns, exactly as before.
+    pub(crate) fn spread_array_elements(&mut self, arr_idx: u32) -> Result<Vec<Value>, Thrown> {
+        let items = match self.heap.get(arr_idx) {
+            HeapObj::Array(items) => items.clone(),
+            _ => return Ok(Vec::new()),
+        };
+        if !items.iter().any(|x| x.is_hole()) {
+            return Ok(items);
+        }
+        // Resolving a hole can run a getter installed on `Array.prototype`, i.e.
+        // user code that re-enters the VM while `out` holds values no root can
+        // reach yet.
+        let _gc = self.gc_lock_guard();
+        let arr = Value::heap(arr_idx);
+        let mut out = Vec::with_capacity(items.len());
+        for (i, x) in items.iter().enumerate() {
+            out.push(if x.is_hole() {
+                // `i` is bounded by MAX_DENSE_ARRAY_LEN (2^20), so it fits an i32.
+                self.get_index(arr, Value::int(i as i32))?
+            } else {
+                *x
+            });
+        }
+        Ok(out)
+    }
+
     pub(crate) fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
         // The accumulating result Vec holds values yielded by `.next()` that are
         // not yet reachable from the GC roots, while `.next()` (user code) keeps
@@ -1080,10 +1120,13 @@ impl<'p> Vm<'p> {
             Vals(Vec<Value>),
             Chars(Vec<char>),
             Pairs(Vec<(Value, Value)>),
+            /// Deferred: materializing an array's elements can run a prototype
+            /// getter for a hole, so it must happen outside the heap borrow.
+            ArrayAt(u32),
         }
         let plan = if v.is_heap() {
             match self.heap.get(v.heap_index()) {
-                HeapObj::Array(items) => Plan::Vals(items.clone()),
+                HeapObj::Array(_) => Plan::ArrayAt(v.heap_index()),
                 // A Set's tombstoned (deleted) slots are skipped.
                 HeapObj::Set(items) => {
                     Plan::Vals(items.iter().copied().filter(|v| !v.is_hole()).collect())
@@ -1105,6 +1148,7 @@ impl<'p> Vm<'p> {
         };
         Ok(match plan {
             Plan::Vals(v) => v,
+            Plan::ArrayAt(idx) => self.spread_array_elements(idx)?,
             Plan::Chars(cs) => cs.into_iter().map(|c| self.alloc_str(c.to_string())).collect(),
             Plan::Pairs(ps) => ps
                 .into_iter()

@@ -990,14 +990,14 @@ impl<'p> Vm<'p> {
                             // holding a heap borrow across the fresh allocations.
                             let mut chars: Option<Vec<char>> = None;
                             let mut map_pairs: Option<Vec<(Value, Value)>> = None;
+                            let mut array_src: Option<u32> = None;
                             if vv.is_heap() {
                                 match self.heap.get(vv.heap_index()) {
-                                    HeapObj::Array(items) => {
-                                        let elems = items.clone();
-                                        if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
-                                            d.extend(elems);
-                                        }
-                                    }
+                                    // Deferred like the cases below: a hole in the
+                                    // source resolves through the prototype chain,
+                                    // which can run a getter, so it must not happen
+                                    // under this borrow.
+                                    HeapObj::Array(_) => array_src = Some(vv.heap_index()),
                                     HeapObj::Set(items) => {
                                         // Skip tombstoned (deleted) slots.
                                         let elems: Vec<Value> =
@@ -1023,6 +1023,12 @@ impl<'p> Vm<'p> {
                                 }
                             } else {
                                 return Err(Thrown("TypeError: spread value is not iterable".into()));
+                            }
+                            if let Some(src_idx) = array_src {
+                                let elems = self.spread_array_elements(src_idx)?;
+                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                                    dst_items.extend(elems);
+                                }
                             }
                             if let Some(chars) = chars {
                                 let elems: Vec<Value> =

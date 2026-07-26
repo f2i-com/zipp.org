@@ -1199,6 +1199,57 @@ mod tests {
     }
 
     #[test]
+    fn spreading_an_array_densifies_its_holes() {
+        // The array iterator reads each index with Get, so a hole never crosses
+        // as a hole: the result is DENSE. Copying the backing store verbatim
+        // instead made `[...Array(3)]` sparse, and every hole-skipping method
+        // then silently did nothing — `.map` returned three holes, not [0,1,2].
+        assert_eq!(run_ok("let a = [...Array(3)]; console.log(0 in a, a.length)"), vec!["true 3"]);
+        assert_eq!(
+            run_ok("console.log(JSON.stringify([...Array(3)].map((_, i) => i)))"),
+            vec!["[0,1,2]"]
+        );
+        assert_eq!(run_ok("let b = [...[1, , 3]]; console.log(1 in b)"), vec!["true"]);
+
+        // Every construct that materializes an array by iterating it.
+        assert_eq!(run_ok("let [, ...r] = [1, , 3]; console.log(0 in r)"), vec!["true"]);
+        assert_eq!(run_ok("console.log(1 in [...[...[1, , 3]]])"), vec!["true"]);
+        assert_eq!(run_ok("console.log(2 in [9, ...[1, , 3]])"), vec!["true"]);
+        assert_eq!(run_ok("console.log(0 in Array.from(Array(2)))"), vec!["true"]);
+
+        // The hole resolves THROUGH the prototype chain, and the consumer stores
+        // the result as an own property — so it outlives the prototype entry.
+        // Getting this wrong still prints "P" (the lookup just happens later, at
+        // stringify time), which is what made the original bug look correct.
+        assert_eq!(
+            run_ok(
+                "Array.prototype[1] = 'P'; let r = [...[1, , 3]]; delete Array.prototype[1]; \
+                 console.log(JSON.stringify(r), 1 in r)"
+            ),
+            vec![r#"[1,"P",3] true"#]
+        );
+
+        // A getter on the prototype is user code, and it runs during the spread.
+        assert_eq!(
+            run_ok(
+                "let n = 0; Object.defineProperty(Array.prototype, 0, { configurable: true, \
+                 get() { n++; return 'G'; } }); \
+                 let r = [...[, 'b']]; delete Array.prototype[0]; \
+                 console.log(JSON.stringify(r), n)"
+            ),
+            vec![r#"["G","b"] 1"#]
+        );
+
+        // Holes are still holes where no iteration happens: an array literal
+        // keeps them, and `for-of` reads them as undefined without densifying.
+        assert_eq!(run_ok("console.log(0 in [, 1])"), vec!["false"]);
+        assert_eq!(
+            run_ok("let s = ''; for (const v of [1, , 3]) s += (v === undefined ? 'u' : 'v'); console.log(s)"),
+            vec!["vuv"]
+        );
+    }
+
+    #[test]
     fn array_inspect_matches_node() {
         // node renders arrays with spaced brackets.
         assert_eq!(run_ok("console.log([1, 2, 3])"), vec!["[ 1, 2, 3 ]"]);
