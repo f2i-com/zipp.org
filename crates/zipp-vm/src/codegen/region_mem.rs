@@ -948,7 +948,17 @@ pub(crate) fn compile_region_mem(
                     ; cmp edx, [r9 + 16]
                     ; jne => next
                     ; mov rcx, [r9 + 8]                   // vals_ptr
-                    ; mov edx, [r9 + 20]                  // slot
+                    // `slot_nhops` packs the slot in the low 24 bits and the hop
+                    // count above it, so the mask is part of reading a slot —
+                    // GetProp applies it at both its sites. Here it was missing,
+                    // and safe only by the accident that a SetProp site's ways
+                    // are never filled with `nhops != 0` (`helpers_misc.rs` only
+                    // ever calls `IcEntry::own` for them). Nothing enforces that,
+                    // and an unmasked hop count would turn this into a store at
+                    // `vals + nhops*2^24*8` — a wild write, not a wrong read.
+                    // Costs one ALU op on a path that already does two loads.
+                    ; mov edx, [r9 + 20]
+                    ; and edx, 0x00FF_FFFF                // slot (low 24)
                     ; mov r10, [rbx + dreg(val)]          // val_bits
                     ; mov [rcx + rdx*8], r10              // vals[slot] = val (CALL-FREE)
                     ; jmp => cont
