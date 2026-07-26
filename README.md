@@ -30,20 +30,23 @@ wasm32 are built and tested.
 Both figures are measured on this repo, not estimated. Neither is finished —
 they are the current state.
 
-**Conformance — 98.1% of test262**, 94,217 of 96,029 required executions
+**Conformance — 99.0% of test262**, 95,091 of 96,029 required executions
 (ECMA-262 + `staging`, run in both sloppy and strict mode as `INTERPRETING.md`
-requires):
+requires). Both tiers produce a **byte-identical** failure set, which is the
+cheapest evidence that a JIT change has not quietly diverged:
 
 | slice | executions | pass |
 |---|---|---|
-| ECMA-262 + staging, both modes | 96,029 | 94,217 (98.1%) |
+| ECMA-262 + staging, both modes | 96,029 | 95,091 (99.0%) |
 | intl402 (opt-in, `--include-intl402`) | 3,341 | 563 (16.9%) |
 
 That is up from 96.97% under `oxc_parser`, and the increase is the whole reason
-the engine grew its own front end. 1,812 executions still fail, across 1,088
-distinct files; **607 of those files are parse-phase negative tests** — static
-semantics the parser does not yet enforce. It is still the largest single
-category, but it used to be all of it.
+the engine grew its own front end. 938 executions still fail, across 552
+distinct files. The parse-phase negatives that used to dominate are now a
+minority: **80 files**, down from 607, after the static-semantics work described
+below. The largest remaining single item is deliberate — 20 executions want
+top-level `return` in a Script to be a SyntaxError, and `zipp js` allows it
+because node wraps a `.js` file in a function and real packages rely on it.
 
 The dominant intl402 cause is unrelated: `Intl.DateTimeFormat` cannot be
 constructed at all (`vm/intl.rs:436`).
@@ -52,22 +55,22 @@ constructed at all (`vm/intl.rs:436`).
 regression is a diff rather than a remembered number. Run both tiers — a JIT
 change that only *appears* correct is the common failure mode here.
 
-**Performance — geomean 2.59× slower than node (V8)** on the ten real-world
-benchmarks in `bench/real/`, paired medians of 5, every output byte-identical
+**Performance — geomean 2.56× slower than node (V8)** on the ten real-world
+benchmarks in `bench/real/`, paired medians of 7, every output byte-identical
 to node:
 
 | bench | node | zipp | ratio |
 |---|---|---|---|
-| map-set-heavy | 606ms | 726ms | 1.20× |
-| json-large | 230ms | 472ms | 2.05× |
-| async-promise-chain | 301ms | 695ms | 2.31× |
-| polymorphic-objects | 297ms | 712ms | 2.40× |
-| parse-large-js | 243ms | 591ms | 2.43× |
-| markdown-render | 239ms | 631ms | 2.63× |
-| class-prototype-hot | 263ms | 762ms | 2.90× |
-| sparse-array | 50ms | 156ms | 3.10× |
-| typedarray-math | 172ms | 681ms | 3.97× |
-| regex-log-scan | 408ms | 1754ms | 4.30× |
+| map-set-heavy | 579ms | 699ms | 1.21× |
+| json-large | 227ms | 468ms | 2.06× |
+| async-promise-chain | 299ms | 688ms | 2.30× |
+| parse-large-js | 241ms | 582ms | 2.42× |
+| polymorphic-objects | 293ms | 716ms | 2.44× |
+| markdown-render | 238ms | 633ms | 2.66× |
+| class-prototype-hot | 266ms | 740ms | 2.78× |
+| sparse-array | 50ms | 151ms | 3.02× |
+| typedarray-math | 171ms | 667ms | 3.89× |
+| regex-log-scan | 422ms | 1725ms | 4.09× |
 
 Startup is ~4× faster than node (7ms vs 30ms — no snapshot to load).
 
@@ -100,7 +103,13 @@ said. `PERF_ROADMAP.md` has the numbers and, deliberately, the negative results.
 2. **The regex matcher is an interpreter.** Matching costs 234ns where V8's
    Irregexp, which compiles each pattern to native code, takes 22ns. Note this
    is the opposite of the scanning win above: we are faster at *not* matching
-   (the memchr prefilter) and 10× slower at matching.
+   (the memchr prefilter) and 10× slower at matching. Decomposed:
+   `regex-log-scan` is 59% regex, and half of *that* is the backtracking inner
+   loop at 6.9ns per failed match attempt against node's 0.37 — a `\d` or
+   `[a-z]` start predicate yields dozens of candidate positions per log line and
+   each is a full interpreted attempt. The other 41% of that bench is not regex
+   at all (corpus generation 34%), so even an infinitely fast matcher leaves it
+   at 2.9×.
 3. **Boxed values in the general JIT tier.** Every non-integer loop round-trips
    through NaN-boxing with a tag guard per operation.
 4. **GC sweep is proportional to the heap, not the garbage.** Timing the phases:
@@ -109,10 +118,12 @@ said. `PERF_ROADMAP.md` has the numbers and, deliberately, the negative results.
 
 **What is NOT the problem**, each ruled out by measurement:
 
-- *Property-name interning.* Refuted three independent ways: an `Rc<str>` intern
+- *Property-name interning.* Refuted four independent ways: an `Rc<str>` intern
   table measured 5–8% slower, the regex-result decomposition put the three keys
-  at 42ns of 316, and ablating the per-key `String` moved a 3-property literal
-  114 → 108ns.
+  at 42ns of 316, ablating the per-key `String` moved a 3-property literal
+  114 → 108ns, and interning the strings `for-in` hands out — which removes 7 of
+  the ~13 allocations an 8-key enumeration performs — measured +0.1%. Counting
+  allocations does not locate time in this engine.
 - *Allocation admitted into JIT regions.* Built and measured: `{}` went 35 → 62ns
   **slower**, because one win64 call costs more than the interpreter's own
   `NewObject` arm. Four consecutive tier-admission attempts confirmed the rule —
@@ -194,6 +205,46 @@ re-lexes that single token afterwards.
 **Templates nest.** `` `a${ `b${c}` }d` `` cannot be scanned in one pass, so the
 lexer hands control back at each `${` and is resumed by the parser at the
 matching `}`.
+
+### The early errors that took the longest to get right
+
+Each of these was wrong in a way that ordinary code never notices, and each was
+settled by diffing against node rather than by reading the spec alone:
+
+- **Where a bare `FunctionDeclaration` is a Statement.** Annex B B.3.2 allows it
+  as a `LabelledItem` and B.3.4 as an `if` clause — and nowhere else, so
+  `while (x) function f(){}` is an error. The two allowances do not compose:
+  §14.6.1 adds `IsLabelledFunction(Statement) is false`, so `if (x) l: function
+  f(){}` is an error although both halves are legal alone. `StmtPos` carries
+  which of the three positions a Statement sits in.
+- **`async function` in a Statement position** was read as an async function
+  EXPRESSION, which made `for (;;) async function f(){}` a legal infinite loop
+  instead of a SyntaxError.
+- **The Annex B duplicate carve-out names `FunctionDeclaration`,** so a
+  generator or async declaration on *either* side re-arms the error:
+  `{ function f(){} function* f(){} }` is a SyntaxError in every mode.
+- **PropName is the key's STRING VALUE.** `class C { 'constructor'(){} }` IS the
+  constructor, and `class C { static 'prototype'(){} }` is the banned name — but
+  a computed key has no PropName, so `static ['prototype'](){}` is legal.
+- **A private name may repeat exactly once,** and only as a getter/setter pair
+  of matching staticness.
+- **ClassHeritage is evaluated outside the class's PrivateEnvironment**, so
+  `class C extends (this.#x) {}` is an error even when `#x` is declared right
+  below — while a nested class inside the heritage still sees its own names.
+- **`{ var f; let f }` is an error but `var f; { let f }` is not.** The Block
+  rule compares that block's `LexicallyDeclaredNames` against the
+  `VarDeclaredNames` of the SAME StatementList, so a `var` has to stay visible
+  in the block it was written in on its way out to the function scope.
+- **A parameter collides with the body's lexical names, not its var names.**
+  `function f(a){ let a; }` is an error; `function f(a){ var a; }` is not.
+- **Generator and async DECLARATIONS take plain `FormalParameters`,** so
+  `async function f(a,a){}` is legal in sloppy code — the shape that looks most
+  like a method is the exception. Methods and arrows take
+  `UniqueFormalParameters` and never allow a repeat.
+- **Annex B legacy string escapes cannot be judged by the lexer.** `""` is a
+  strict-mode error, but a `"use strict"` directive later in the same prologue
+  turns strictness on retroactively, by which time the token exists. The
+  spelling is recorded on the `Token` and the parser decides.
 
 ## How the JIT is organised
 
