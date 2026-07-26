@@ -112,25 +112,54 @@ impl<'s> Lexer<'s> {
         )
     }
 
-    /// IdentifierStart.
+    /// IdentifierStart — `UnicodeIDStart`, which is the real `ID_Start` property.
     ///
-    /// NOTE: non-ASCII uses `is_alphabetic()` as an approximation of ID_Start.
-    /// It accepts a small number of code points the spec excludes (and the
-    /// reverse for a few Other_ID_Start characters). Closing this needs a real
-    /// ID_Start/ID_Continue table; it is tracked as a known gap rather than
-    /// silently pretended-correct.
+    /// This used to approximate it with Rust's `char::is_alphabetic()`. That is a
+    /// DIFFERENT Unicode property, and the two disagree in both directions:
+    ///
+    /// * too strict — `Other_ID_Start` (U+2118 SCRIPT CAPITAL P, U+212E, U+309B,
+    ///   U+309C) is `ID_Start` but not Alphabetic, so `var ℘` was rejected;
+    /// * too loose — `Other_Alphabetic` combining marks (U+05B0, U+0345, U+0903)
+    ///   are Alphabetic but NOT `ID_Start` and were accepted, as was U+2E2F,
+    ///   which is `Lm` but excluded from `ID_Start` by `Pattern_Syntax`.
+    ///
+    /// The ASCII arm stays explicit rather than deferring to the crate: its
+    /// `ASCII_START` table excludes both `$` and `_`, so bailing out here first
+    /// and calling the `_unicode` variant is both correct and one lookup cheaper
+    /// on the hot path.
     fn is_id_start(c: char) -> bool {
-        c.is_ascii_alphabetic() || c == '$' || c == '_' || (!c.is_ascii() && c.is_alphabetic())
+        if c.is_ascii() {
+            return c.is_ascii_alphabetic() || c == '$' || c == '_';
+        }
+        unicode_id_start::is_id_start_unicode(c)
     }
 
-    /// IdentifierPart. ZWNJ/ZWJ are explicitly included per the spec.
+    /// IdentifierPart — `ID_Continue`, plus ZWNJ/ZWJ which the spec adds
+    /// explicitly.
+    ///
+    /// `is_alphanumeric()` was wrong the same way: it missed the `Mn`/`Mc`
+    /// combining marks (U+0300), the `Pc` connectors (U+203F, U+2040, U+FF3F)
+    /// and `Other_ID_Continue` (U+0387, U+19DA), while over-accepting `No`
+    /// (U+00B2 SUPERSCRIPT TWO). U+00B7 was hand-special-cased below precisely
+    /// because the approximation could not express `Other_ID_Continue`; the real
+    /// table covers it and the special case is gone.
     fn is_id_part(c: char) -> bool {
-        c.is_ascii_alphanumeric()
-            || c == '$'
-            || c == '_'
-            || c == '\u{200C}'
-            || c == '\u{200D}'
-            || (!c.is_ascii() && (c.is_alphanumeric() || c == '\u{00B7}'))
+        if c.is_ascii() {
+            return c.is_ascii_alphanumeric() || c == '$' || c == '_';
+        }
+        c == '\u{200C}' || c == '\u{200D}' || unicode_id_start::is_id_continue_unicode(c)
+    }
+
+    /// Test-only windows onto the identifier predicates, so the unit test can
+    /// assert the REJECTED side too (a rejected char never reaches `names()`).
+    #[cfg(test)]
+    pub(crate) fn id_start_for_test(c: char) -> bool {
+        Self::is_id_start(c)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn id_part_for_test(c: char) -> bool {
+        Self::is_id_part(c)
     }
 
     // ---- trivia ------------------------------------------------------------

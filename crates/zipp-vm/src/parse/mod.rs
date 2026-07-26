@@ -62,6 +62,42 @@ mod tests {
             .collect()
     }
 
+    /// `UnicodeIDStart`/`UnicodeIDContinue` are the real `ID_Start`/`ID_Continue`
+    /// properties, NOT Rust's `is_alphabetic`/`is_alphanumeric`. Those disagree in
+    /// BOTH directions, and each direction was a bug: the approximation rejected
+    /// `Other_ID_Start` and the `Pc`/`Mn`/`Other_ID_Continue` classes, and accepted
+    /// `Other_Alphabetic` marks, `No` digits and `Pattern_Syntax`.
+    ///
+    /// Worth 2131 test262 executions, because private names lex through the very
+    /// same predicate — "expected a private name after '#'" was this bug wearing a
+    /// different error message.
+    #[test]
+    fn identifier_chars_follow_id_start_and_id_continue() {
+        // ACCEPTED: Other_ID_Start, and the continue-only classes.
+        for c in ['\u{2118}', '\u{212E}', '\u{309B}', '\u{309C}'] {
+            assert!(Lexer::id_start_for_test(c), "Other_ID_Start must start: {c:?}");
+        }
+        for c in ['\u{0300}', '\u{0903}', '\u{203F}', '\u{2040}', '\u{FF3F}', '\u{0387}'] {
+            assert!(Lexer::id_part_for_test(c), "must continue: {c:?}");
+        }
+        // ZWNJ/ZWJ are added by the spec on top of ID_Continue.
+        assert!(Lexer::id_part_for_test('\u{200C}'));
+        assert!(Lexer::id_part_for_test('\u{200D}'));
+        // U+00B7 was hand-special-cased before; the real table still admits it.
+        assert!(Lexer::id_part_for_test('\u{00B7}'));
+
+        // REJECTED: Alphabetic/alphanumeric but NOT ID_Start / ID_Continue.
+        for c in ['\u{05B0}', '\u{0345}', '\u{0903}', '\u{2E2F}'] {
+            assert!(!Lexer::id_start_for_test(c), "must not start: {c:?}");
+        }
+        assert!(!Lexer::id_part_for_test('\u{00B2}'), "No is not ID_Continue");
+        assert!(!Lexer::id_part_for_test('\u{2E2F}'), "Pattern_Syntax is excluded");
+
+        // And they really do lex, escaped and raw.
+        assert_eq!(names(r"var \u2118 = 1;"), vec!["var".to_string(), "\u{2118}".to_string()]);
+        assert_eq!(names("var a\u{0300} = 1;"), vec!["var".to_string(), "a\u{0300}".to_string()]);
+    }
+
     fn nums(src: &str) -> Vec<f64> {
         lex_all(src)
             .into_iter()

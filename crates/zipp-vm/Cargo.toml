@@ -6,6 +6,10 @@ license.workspace = true
 description = "ZIPP dynamic JavaScript engine v2 — explicit-frame register VM with a NaN-boxed value model, designed from the ground up so a JIT can keep unboxed values in registers across call boundaries (the property V8 wins on)."
 
 [dependencies]
+# Real `ID_Start` / `ID_Continue` tables for the lexer's identifier predicates.
+# Rust's `is_alphabetic`/`is_alphanumeric` are DIFFERENT Unicode properties and
+# disagree with these in both directions — see `Lexer::is_id_start`.
+unicode-id-start = "1.4"
 rustc-hash = { workspace = true }
 # The regex engine. A DIRECT path dependency on our fork rather than a
 # crates.io version rewritten by `[patch.crates-io]`: zipp-vm calls
