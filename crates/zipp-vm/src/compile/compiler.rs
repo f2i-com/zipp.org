@@ -136,7 +136,7 @@ impl Compiler {
             for s in &prog.body {
                 collect_hoisted_vars(s, &mut vars);
             }
-            for name in vars {
+            for name in sorted_name_vec(&vars) {
                 // A name the CALLER binds is not a global var of the eval —
                 // the declaration is a no-op and assignments write the cell.
                 // A dynamic (EvalScope) name is never a global either.
@@ -773,7 +773,7 @@ impl Compiler {
             // (2) the with-chain's static fallback must resolve a `var`
             // textually after the `with` (unscopables-with); (3) `for (var k
             // in …)` heads resolve the hoisted binding instead of minting one.
-            for name in &hv {
+            for name in &sorted_name_vec(&hv) {
                 if !fc.scopes[0].iter().any(|(n, _)| n == name) {
                     fc.declare_local(name); // boxes a cell if captured (undefined)
                 }
@@ -1176,7 +1176,7 @@ impl Compiler {
                 for s in &a.body.statements {
                     collect_hoisted_vars(s, &mut hv);
                 }
-                for name in &hv {
+                for name in &sorted_name_vec(&hv) {
                     if !fc.scopes[0].iter().any(|(n, _)| n == name) {
                         fc.declare_local(name);
                     }

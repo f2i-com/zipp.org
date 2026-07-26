@@ -29,10 +29,17 @@ pub(crate) fn compile_program_inner(prog: &ox::Program, source: &str, module_mod
         classes: c.classes,
         global_names: c.globals,
         hoisted_globals: c.hoisted_globals,
-        decl_globals: c.decl_globals.iter().copied().collect(),
-        lexical_globals: c.lexical_globals.iter().copied().collect(),
-        const_globals: c.const_globals.iter().copied().collect(),
-        eval_dynamic_names: c.eval_dynamic_names.iter().cloned().collect(),
+        // SORTED, not raw HashSet iteration order. std's HashSet reseeds its
+        // hasher per process, so these came out in a different order on every
+        // run — and the VM creates global-object properties by walking them, so
+        // `Object.getOwnPropertyNames(globalThis)` permuted run to run. It also
+        // made the compiler nondeterministic, which rules out comparing
+        // bytecode between two front ends. Slots are handed out in order of
+        // first mention, so sorting by slot is a stable, source-derived order.
+        decl_globals: sorted_slots(&c.decl_globals),
+        lexical_globals: sorted_slots(&c.lexical_globals),
+        const_globals: sorted_slots(&c.const_globals),
+        eval_dynamic_names: sorted_names(&c.eval_dynamic_names),
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
@@ -64,7 +71,7 @@ pub fn eval_var_and_fn_names(prog: &ox::Program) -> Vec<String> {
     for s in &prog.body {
         collect_hoisted_vars(s, &mut vars);
     }
-    let mut out: Vec<String> = vars.into_iter().collect();
+    let mut out: Vec<String> = super::helpers::sorted_name_vec(&vars);
     for s in &prog.body {
         if let ox::Statement::FunctionDeclaration(f) = s {
             if let Some(id) = &f.id {
@@ -300,10 +307,17 @@ pub fn compile_eval(
         classes: c.classes,
         global_names: c.globals,
         hoisted_globals: c.hoisted_globals,
-        decl_globals: c.decl_globals.iter().copied().collect(),
-        lexical_globals: c.lexical_globals.iter().copied().collect(),
-        const_globals: c.const_globals.iter().copied().collect(),
-        eval_dynamic_names: c.eval_dynamic_names.iter().cloned().collect(),
+        // SORTED, not raw HashSet iteration order. std's HashSet reseeds its
+        // hasher per process, so these came out in a different order on every
+        // run — and the VM creates global-object properties by walking them, so
+        // `Object.getOwnPropertyNames(globalThis)` permuted run to run. It also
+        // made the compiler nondeterministic, which rules out comparing
+        // bytecode between two front ends. Slots are handed out in order of
+        // first mention, so sorting by slot is a stable, source-derived order.
+        decl_globals: sorted_slots(&c.decl_globals),
+        lexical_globals: sorted_slots(&c.lexical_globals),
+        const_globals: sorted_slots(&c.const_globals),
+        eval_dynamic_names: sorted_names(&c.eval_dynamic_names),
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
@@ -314,3 +328,19 @@ pub fn compile_eval(
     })
 }
 
+/// Global slots as a sorted `Vec`, so a `HashSet`'s per-process iteration order
+/// never reaches the emitted `Program`. Slots are assigned in order of first
+/// mention, so slot order is a deterministic, source-derived order.
+fn sorted_slots(set: &std::collections::HashSet<u32>) -> Vec<u32> {
+    let mut v: Vec<u32> = set.iter().copied().collect();
+    v.sort_unstable();
+    v
+}
+
+/// As `sorted_slots`, for the name-keyed set. These are looked up, never
+/// replayed in order, so alphabetical is only about determinism.
+fn sorted_names(set: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = set.iter().cloned().collect();
+    v.sort_unstable();
+    v
+}

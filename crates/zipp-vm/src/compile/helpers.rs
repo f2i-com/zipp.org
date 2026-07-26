@@ -120,8 +120,31 @@ pub(crate) fn hoisted_var_names(body: &[ox::Statement]) -> Vec<String> {
     for s in body {
         collect_hoisted_vars(s, &mut set);
     }
-    set.into_iter().collect()
+    sorted_name_vec(&set)
 }
+
+/// A name set as a sorted `Vec`.
+///
+/// `std::collections::HashSet` reseeds its hasher every process, so iterating
+/// one to assign global slots or registers made the COMPILER nondeterministic:
+/// the same source produced different bytecode on every run (measured: 5 runs,
+/// 5 distinct dumps, 474 of 889 lines differing), and
+/// `Object.getOwnPropertyNames(globalThis)` permuted run to run. Any iteration
+/// whose order reaches a slot number, a register, or emitted code goes through
+/// here.
+///
+/// Sorted, not source-ordered: source order would have to be threaded through
+/// `collect_pattern_names` and its 36 call sites. Sorting is deterministic,
+/// which is what the bytecode-differential gate needs. (zipp's global property
+/// order already differs from V8's for an unrelated reason — hoisted function
+/// declarations take slots before top-level vars — so this does not trade away
+/// a conformance property it currently has.)
+pub(crate) fn sorted_name_vec(set: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = set.iter().cloned().collect();
+    v.sort_unstable();
+    v
+}
+
 
 /// Add a block's DIRECT lexical declaration names (top-level `let`/`const`/
 /// `class` of the block) to `out` — the names that block Annex B B.3.3 for a
