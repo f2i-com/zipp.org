@@ -1578,6 +1578,29 @@ pub struct Heap {
 /// trivially small and collecting would be pure overhead.
 pub const GC_MIN_THRESHOLD: usize = 1 << 16;
 
+/// Allocations between collections, as a multiple of the live count after the
+/// last one. Collecting at `GC_GROWTH * live` means each collection traces `live`
+/// objects per `(GC_GROWTH - 1) * live` allocations, so this is directly the
+/// amortised tracing cost per allocation.
+///
+/// Was 2 — one full trace per allocation — which measured as 17-22% of three
+/// benches' total wall time (json-large 122ms of 558, markdown-render 141 of 697,
+/// regex-log-scan 324 of 1853). Those workloads keep a large live set (a parsed
+/// document, 150k retained log lines) and allocate garbage against it, so the
+/// same live objects were being retraced continuously.
+///
+/// 3, not more. Swept 2/3/4/6 by wall time: 3 is -1.4% overall (json-large -8.4%,
+/// markdown-render -4.1%) while 4 is only -0.9% and 6 worse still, even though
+/// both keep cutting GC time — past 3 the larger slot array costs more in cache
+/// misses than the skipped tracing saves. That crossover is the same effect that
+/// made disabling GC entirely SLOWER than leaving it on (a 3M-object run grew
+/// `objs` to 240MB and went 35ns -> 64ns per `{}`).
+///
+/// The cost is peak slots: regex-log-scan goes 496k -> 804k (~40MB -> 64MB at 80
+/// bytes each). The `objs.len() / 2` floor below is unchanged, so a heap that has
+/// already grown still collects on the same schedule it did.
+const GC_GROWTH: usize = 3;
+
 impl Default for Heap {
     fn default() -> Self {
         Heap::new()
@@ -1670,7 +1693,7 @@ impl Heap {
     #[inline]
     pub fn note_gc_done(&mut self, live: usize) {
         self.live = live;
-        self.gc_threshold = (live.saturating_mul(2))
+        self.gc_threshold = (live.saturating_mul(GC_GROWTH))
             .max(GC_MIN_THRESHOLD)
             .max(self.objs.len() / 2);
         self.gc_requested = false;

@@ -1130,6 +1130,64 @@ admitted to a region. It becomes cheaper by allocating less, or by allocating
 into something cheaper than the current heap-slot-plus-Box-plus-three-Vecs — the
 substrate work — and only then is admitting it worth revisiting.
 
+### B25 — GC was 17-22% of three benches; collecting a third as often is -1.0%
+
+Instrumenting `Vm::gc` with a wall clock (rather than reasoning about it) gave
+the first per-bench GC numbers this project has had:
+
+    json-large       122ms of 558   22%      map-set-heavy    79ms of 869    9%
+    markdown-render  141ms of 697   20%      async-promise    67ms of 723    9%
+    regex-log-scan   324ms of 1853  17%      polymorphic      34ms of 731    5%
+                                             parse-large-js    5ms of 599    1%
+                                             class-prototype   0ms           0%
+
+The threshold collected at `2 * live`, i.e. one full trace per allocation. The
+three expensive benches all keep a LARGE live set (a parsed document, 150k
+retained log lines) and allocate garbage against it, so the same live objects
+were retraced continuously. `GC_GROWTH = 3` traces them once per two
+allocations instead.
+
+Paired medians of 7: **-1.0% mean**, json-large -7.6%, markdown-render -2.9%,
+map-set-heavy -2.0%, everything else inside noise.
+
+3 and not more, swept by WALL TIME rather than by GC time — the two disagree,
+which is the point. GC time keeps falling at 4 and 6 (json-large 56ms then
+36ms), but total time stops improving: 3 is -1.4% on the swept subset, 4 only
+-0.9%, 6 worse. Past 3 the larger slot array costs more in cache misses than the
+skipped tracing saves.
+
+That crossover was visible in an earlier ablation and is worth keeping: setting
+the GC to NEVER collect made a 3M-object allocation loop SLOWER, `{}` going
+35ns -> 64ns, because `objs` grew to 240MB and every allocation touched cold
+memory. Non-moving mark-sweep with slot recycling is doing useful cache work,
+not only reclaiming memory — so "collect less" has an optimum, and it is near.
+
+Cost: peak slots, regex-log-scan 496k -> 804k (~40MB -> 64MB). The
+`objs.len() / 2` floor is unchanged, so an already-grown heap keeps its schedule.
+
+**The remaining GC cost needs a generational nursery, not more tuning.** 17% of
+regex-log-scan is still GC at this setting, and the reason is structural: every
+collection traces the whole live set to reclaim a young garbage set. That is
+B6, and this measurement is the case for it.
+
+### B26 — Where the object-construction gap ISN'T: escape analysis, not allocation
+
+Two measurements that correct the framing this file has used throughout.
+
+**The microbenchmark gap is mostly escape analysis.** node reports `{}` at 0.2ns
+and `[]` at 0.6ns per iteration — that is not fast allocation, it is NO
+allocation: the object does not escape the loop and V8 removes it. Comparing our
+35ns against it and calling the difference "allocation cost" is wrong. In the
+real benches, where objects DO escape (an AST, a JSON document, a component
+tree), V8 allocates too, and the gap there is the 2.2-2.9x the suite shows.
+
+**The per-key `String` is not the cost either.** Ablating it (push an empty key
+instead) moved `{a,b,c}` only 114 -> 108ns and `{a..f}` not at all — about 2ns
+per property. This is the third independent refutation of property-key
+interning: the `Rc<str>` intern table was 5-8% slower, the regex-result
+decomposition put the three keys at 42ns of 316, and now direct ablation puts
+them at ~5% of literal construction.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
