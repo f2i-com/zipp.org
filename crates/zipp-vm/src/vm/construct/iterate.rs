@@ -376,6 +376,44 @@ impl<'p> Vm<'p> {
 
     /// `obj.hasOwnProperty(key)` — own data/accessor property, array index/length,
     /// or string index/length.
+    /// `hasOwnProperty` for an ARRAY receiver with a NUMERIC key, answered
+    /// without ever spelling the index. `None` means "not this shape — use the
+    /// general path".
+    ///
+    /// The general path is `to_property_key` (which allocates a `String` for
+    /// the index) followed by `has_own_property` (which parses it straight
+    /// back), and that round trip IS the cost of the probe: a
+    /// `hasOwn.call(a, i)` loop over a 1000-element array measured 204ms
+    /// against node's 16ms, while `i in a` over the same array — which never
+    /// spells the key — was 17ms.
+    ///
+    /// Mirrors the `HeapObj::Array` arm of `has_own_property` exactly: a hole is
+    /// an absent element, and the `arr_props` side table can still carry an
+    /// index the dense storage does not.
+    pub(crate) fn has_own_index_fast(&self, obj: Value, key: Value) -> Option<bool> {
+        if !obj.is_heap() {
+            return None;
+        }
+        let idx = obj.heap_index();
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        // A non-integral or negative key spells something `has_own_property`'s
+        // `parse::<usize>()` would reject; leave those to the general path
+        // rather than duplicate the rejection.
+        let i = crate::vm::array_index(key)?;
+        if i < items.len() && !items[i].is_hole() {
+            return Some(true);
+        }
+        match self.arr_props.get(&idx) {
+            Some(m) => {
+                let mut buf = [0u8; 20];
+                Some(m.pos(crate::heap::index_key(&mut buf, i)).is_some())
+            }
+            None => Some(false),
+        }
+    }
+
     pub(crate) fn has_own_property(&self, obj: Value, key: &str) -> bool {
         // (Real private fields live in the side table and are invisible here;
         // a PUBLIC computed "#..." string key is an ordinary reflectable prop.)
@@ -399,14 +437,16 @@ impl<'p> Vm<'p> {
                 // arr_props prop — covered by the arr_props clause below.
                 (key == "length" && !self.arguments_objs.contains_key(&obj.heap_index()))
                     // A hole is an absent element — not an own property.
-                    || key.parse::<usize>().map_or(false, |i| i < items.len() && !items[i].is_hole())
+                    || // A canonical index only: `"02"` parses to 2 but is an ordinary
+                    // string key, and no element answers it.
+                    canonical_index_str(key).is_some_and(|i| i < items.len() && !items[i].is_hole())
                     || self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
             }
             HeapObj::Str(s) => {
-                key == "length" || key.parse::<usize>().map_or(false, |i| i < s.units())
+                key == "length" || canonical_index_str(key).is_some_and(|i| i < s.units())
             }
             HeapObj::Cons { len, .. } => {
-                key == "length" || key.parse::<usize>().map_or(false, |i| i < *len)
+                key == "length" || canonical_index_str(key).is_some_and(|i| i < *len)
             }
             // A class value: own statics (data + `static get`/`set`) + name/length
             // + the synthesized `prototype` (a class always has one).

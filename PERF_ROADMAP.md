@@ -1316,6 +1316,32 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B34 — `hasOwnProperty(i)` spelled the index; `"02"` was an array index
+
+`Object.prototype.hasOwnProperty` ran `to_property_key` (which allocates a
+`String` for a numeric key) and then `has_own_property`, which parsed it
+straight back. That round trip IS the probe: `hasOwn.call(a, i)` over a
+1000-element array measured **204ms against node's 16ms**, while `i in a` over
+the same array — which never spells the key — was 17ms against 3ms.
+
+`has_own_index_fast` answers an Array receiver with a numeric key directly,
+mirroring the `HeapObj::Array` arm exactly (a hole is absent; the `arr_props`
+side table can still carry an index the dense storage does not). Wired into both
+routes: the `PROTO_HAS_OWN` native (`hasOwn.call(a, i)`) and the builtin-method
+dispatch (`a.hasOwnProperty(i)`). **−27.6%** on the probe microbench, paired
+medians of 7.
+
+Suite effect **+0.3% mean** — i.e. nothing, except `sparse-array` at −2.2%,
+which is the only bench that probes this way. Kept because it is strictly less
+work and because of what the correctness check turned up:
+
+`has_own_property` decided array-index-ness with `key.parse::<usize>()`, so
+`hasOwn.call([1,2,3], "02")` reported **true** — `"02"` parses to 2, but it is
+an ordinary string key that no element answers. Same bug in the `Str` and `Cons`
+arms. Now `canonical_index_str`, which is the check the rest of the engine
+already uses. Verified against node across 24 shapes including holes,
+`defineProperty` overrides, `arguments`, a Proxy and `-0`.
+
 ### B33 — Result-object allocation: the five sites, measured and priced
 
 The unit prices, from 20M-iteration loops (`{}` 44ns, `{value:i}` 70ns,

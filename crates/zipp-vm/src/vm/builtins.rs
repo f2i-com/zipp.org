@@ -167,7 +167,11 @@ impl<'p> Vm<'p> {
         // ── Object.prototype methods (available on every object) ──
         match name {
             "hasOwnProperty" => {
-                let key = self.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if let Some(b) = self.has_own_index_fast(recv, a0) {
+                    return Ok(Some(Value::bool(b)));
+                }
+                let key = self.to_property_key(a0)?;
                 return Ok(Some(Value::bool(self.has_own_property(recv, &key))));
             }
             "propertyIsEnumerable" => {
