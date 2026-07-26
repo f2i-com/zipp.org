@@ -1338,6 +1338,13 @@ mod tests {
     }
 
     #[test]
+    fn front_parse_script_raises_early_errors() {
+        assert!(crate::front::parse_script("let x; let x;").is_err(), "dup lexical");
+        assert!(crate::front::parse_auto("let x; let x;").is_err(), "dup via auto");
+        assert!(run("let x; let x;").is_err(), "dup via run()");
+    }
+
+    #[test]
     fn spreading_an_array_densifies_its_holes() {
         // The array iterator reads each index with Get, so a hole never crosses
         // as a hole: the result is DENSE. Copying the backing store verbatim

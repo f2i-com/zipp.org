@@ -135,10 +135,6 @@ impl<'s> Parser<'s> {
         if self.ctx.yield_ && self.at_kw(Keyword::Yield) {
             return self.parse_yield();
         }
-        // A lone identifier followed by `=>` is the shortest arrow.
-        if let Some(arrow) = self.try_ident_arrow()? {
-            return Ok(arrow);
-        }
         if self.at_kw(Keyword::Async) {
             if let Some(e) = self.try_async_prefixed()? {
                 return Ok(e);
@@ -150,6 +146,28 @@ impl<'s> Parser<'s> {
         // cannot be mistaken for it, and vice versa.
         let outer_po = self.cover.pattern_only.take();
         let lhs = self.parse_conditional()?;
+
+        // `x => …`, detected AFTER the LHS parse: a lone identifier followed by
+        // `=>` on the same line. Probing BEFORE the parse needed a save/restore
+        // — a Token clone, String and all, for every identifier-initial
+        // expression, which is the hottest path in the parser. The precedence
+        // tower stops at `=>` (it is no operator), so the identifier arrives
+        // here intact and the conversion is free.
+        if self.at(Punct::Arrow) && !self.cur().newline_before {
+            if let Expr::Ident(name) = &lhs {
+                let name = name.clone();
+                if self.ctx.strict && (&*name == "eval" || &*name == "arguments") {
+                    return Err(SyntaxError::new(
+                        format!("SyntaxError: '{name}' cannot be a parameter name in strict mode"),
+                        start,
+                    ));
+                }
+                self.cover.pattern_only = outer_po;
+                self.bump_before_operand()?; // `=>`
+                let params = Params { items: vec![Pattern::Ident(name)], simple: true };
+                return self.finish_arrow(params, false, start);
+            }
+        }
 
         let Some(op) = self.cur().kind.as_punct().and_then(assign_op) else {
             // No `=` follows here — but the expression may STILL become a
@@ -204,36 +222,6 @@ impl<'s> Parser<'s> {
             || self.at(Punct::Colon)
     }
 
-    /// `x => …` / `async x => …`. Returns `None` without consuming anything if
-    /// this is not that shape.
-    fn try_ident_arrow(&mut self) -> PResult<Option<Expr>> {
-        if !self.is_binding_ident() {
-            return Ok(None);
-        }
-        let save = self.save();
-        let start = self.cur().span.start;
-        // Read WITHOUT the strict-mode eval/arguments check: until the `=>` is
-        // seen this identifier may be an ordinary REFERENCE, and
-        // `arguments.length` in strict code is perfectly legal. Erroring here
-        // rejected real programs.
-        let tok = self.bump_after_operand()?;
-        let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
-        // The `=>` of an arrow may not be preceded by a LineTerminator.
-        if !self.at(Punct::Arrow) || self.cur().newline_before {
-            self.restore(save);
-            return Ok(None);
-        }
-        // NOW it is a binding, so the check applies.
-        if self.ctx.strict && (name == "eval" || name == "arguments") {
-            return Err(SyntaxError::new(
-                format!("SyntaxError: '{name}' cannot be a parameter name in strict mode"),
-                start,
-            ));
-        }
-        self.bump_before_operand()?; // `=>`
-        let params = Params { items: vec![Pattern::Ident(name.into_boxed_str())], simple: true };
-        Ok(Some(self.finish_arrow(params, false, start)?))
-    }
 
     /// Everything `async` can begin. Returns `None` if it is just an identifier.
     fn try_async_prefixed(&mut self) -> PResult<Option<Expr>> {
@@ -645,8 +633,13 @@ impl<'s> Parser<'s> {
         // The `(` branch re-sets it after its contents are parsed.
         self.parenthesized = false;
         let start = self.cur().span.start;
-        match self.cur().kind.clone() {
+        // Dispatch on a BORROW of the token; the taking arms consume it through
+        // `bump`, which returns the old token, so payloads MOVE. The previous
+        // shape cloned the whole TokenKind — String contents included — for
+        // every primary, which was the hottest allocation in the parser.
+        match &self.cur().kind {
             TokenKind::Num(n) => {
+                let n = *n;
                 // Legacy octal spellings are a SyntaxError in strict code, and
                 // the SPELLING is only available here — the AST carries the
                 // value alone.
@@ -661,120 +654,125 @@ impl<'s> Parser<'s> {
                 self.bump_after_operand()?;
                 Ok(Expr::Num(n.value))
             }
-            TokenKind::BigInt(d) => {
-                self.bump_after_operand()?;
+            TokenKind::BigInt(_) => {
+                let tok = self.bump_after_operand()?;
+                let TokenKind::BigInt(d) = tok.kind else { unreachable!() };
                 Ok(Expr::BigInt(d.into_boxed_str()))
             }
-            TokenKind::Str(s) => {
-                self.bump_after_operand()?;
-                Ok(Expr::Str(s))
+            TokenKind::Str(_) => {
+                let tok = self.bump_after_operand()?;
+                let TokenKind::Str(v) = tok.kind else { unreachable!() };
+                Ok(Expr::Str(v))
             }
-            TokenKind::Regex { pattern, flags } => {
-                self.bump_after_operand()?;
+            TokenKind::Regex { .. } => {
+                let tok = self.bump_after_operand()?;
+                let TokenKind::Regex { pattern, flags } = tok.kind else { unreachable!() };
                 Ok(Expr::Regex { pattern, flags: flags.into_boxed_str() })
             }
             TokenKind::Template { .. } => Ok(Expr::Template(Box::new(self.parse_template()?))),
-            TokenKind::Punct(Punct::LParen) => {
-                match self.parse_paren_or_arrow(false, start)? {
-                    Some(e) => Ok(e),
-                    None => Err(self.err_here("SyntaxError: unexpected '('")),
-                }
-            }
+            TokenKind::Punct(Punct::LParen) => match self.parse_paren_or_arrow(false, start)? {
+                Some(e) => Ok(e),
+                None => Err(self.err_here("SyntaxError: unexpected token")),
+            },
             TokenKind::Punct(Punct::LBracket) => self.parse_array_literal(),
             TokenKind::Punct(Punct::LBrace) => self.parse_object_literal(),
-            TokenKind::Ident { private: true, name, .. } => {
+            TokenKind::Ident { private: true, .. } => {
                 // A private name is only a primary in `#x in obj`.
-                self.bump_after_operand()?;
+                let tok = self.bump_after_operand()?;
+                let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
                 if !self.at_kw(Keyword::In) {
-                    return Err(SyntaxError::new(
-                        "SyntaxError: unexpected private name",
-                        start,
-                    ));
+                    return Err(SyntaxError::new("SyntaxError: unexpected private name", start));
                 }
                 self.bump_before_operand()?;
                 let object = self.parse_binary(10)?;
                 Ok(Expr::PrivateIn { name: name.into_boxed_str(), object: Box::new(object) })
             }
-            TokenKind::Ident { kw, .. } => match kw {
-                Keyword::This => {
-                    self.bump_after_operand()?;
-                    Ok(Expr::This)
-                }
-                Keyword::Null => {
-                    self.bump_after_operand()?;
-                    Ok(Expr::Null)
-                }
-                Keyword::True => {
-                    self.bump_after_operand()?;
-                    Ok(Expr::Bool(true))
-                }
-                Keyword::False => {
-                    self.bump_after_operand()?;
-                    Ok(Expr::Bool(false))
-                }
-                Keyword::Function => {
-                    self.bump_after_operand()?;
-                    let f = self.parse_function_rest(false, start)?;
-                    Ok(Expr::Function(Box::new(f)))
-                }
-                Keyword::Class => {
-                    self.bump_after_operand()?;
-                    let c = self.parse_class_rest(start)?;
-                    Ok(Expr::Class(Box::new(c)))
-                }
-                Keyword::Super => {
-                    self.bump_after_operand()?;
-                    if self.at(Punct::LParen) {
-                        if !self.ctx.super_call {
-                            return Err(SyntaxError::new(
-                                "SyntaxError: 'super()' is only valid in a derived constructor",
-                                start,
-                            ));
-                        }
-                    } else if !self.ctx.super_prop {
-                        return Err(SyntaxError::new(
-                            "SyntaxError: 'super' property access is only valid in a method",
-                            start,
-                        ));
-                    }
-                    Ok(Expr::Super)
-                }
-                Keyword::Import => {
-                    self.bump_after_operand()?;
-                    if self.at(Punct::Dot) {
+            TokenKind::Ident { kw, had_escape, .. } => {
+                // Escaped spellings are identifiers, never keywords, so they
+                // skip the keyword dispatch entirely.
+                let kw = if *had_escape { Keyword::None } else { *kw };
+                match kw {
+                    Keyword::This => {
                         self.bump_after_operand()?;
-                        let n = self.ident_name()?;
-                        if &*n != "meta" {
+                        Ok(Expr::This)
+                    }
+                    Keyword::Null => {
+                        self.bump_after_operand()?;
+                        Ok(Expr::Null)
+                    }
+                    Keyword::True => {
+                        self.bump_after_operand()?;
+                        Ok(Expr::Bool(true))
+                    }
+                    Keyword::False => {
+                        self.bump_after_operand()?;
+                        Ok(Expr::Bool(false))
+                    }
+                    Keyword::Function => {
+                        self.bump_after_operand()?;
+                        let f = self.parse_function_rest(false, start)?;
+                        Ok(Expr::Function(Box::new(f)))
+                    }
+                    Keyword::Class => {
+                        self.bump_after_operand()?;
+                        let c = self.parse_class_rest(start)?;
+                        Ok(Expr::Class(Box::new(c)))
+                    }
+                    Keyword::Super => {
+                        self.bump_after_operand()?;
+                        if self.at(Punct::LParen) {
+                            if !self.ctx.super_call {
+                                return Err(SyntaxError::new(
+                                    "SyntaxError: 'super()' is only valid in a derived constructor",
+                                    start,
+                                ));
+                            }
+                        } else if !self.ctx.super_prop {
                             return Err(SyntaxError::new(
-                                "SyntaxError: expected 'import.meta'",
+                                "SyntaxError: 'super' property access is only valid in a method",
                                 start,
                             ));
                         }
-                        return Ok(Expr::ImportMeta);
+                        Ok(Expr::Super)
                     }
-                    self.expect(Punct::LParen, true)?;
-                    let spec = self.parse_assign()?;
-                    let options = if self.eat(Punct::Comma, true)? && !self.at(Punct::RParen) {
-                        let o = self.parse_assign()?;
-                        let _ = self.eat(Punct::Comma, true)?;
-                        Some(Box::new(o))
-                    } else {
-                        None
-                    };
-                    self.expect(Punct::RParen, false)?;
-                    Ok(Expr::ImportCall {
-                        spec: Box::new(spec),
-                        options,
-                        phase: ImportPhase::Evaluation,
-                    })
+                    Keyword::Import => {
+                        self.bump_after_operand()?;
+                        if self.at(Punct::Dot) {
+                            self.bump_after_operand()?;
+                            let n = self.ident_name()?;
+                            if &*n != "meta" {
+                                return Err(SyntaxError::new(
+                                    "SyntaxError: expected 'import.meta'",
+                                    start,
+                                ));
+                            }
+                            return Ok(Expr::ImportMeta);
+                        }
+                        self.expect(Punct::LParen, true)?;
+                        let spec = self.parse_assign_full()?;
+                        let options = if self.eat(Punct::Comma, true)? && !self.at(Punct::RParen) {
+                            let o = self.parse_assign_full()?;
+                            let _ = self.eat(Punct::Comma, true)?;
+                            Some(Box::new(o))
+                        } else {
+                            None
+                        };
+                        self.expect(Punct::RParen, false)?;
+                        Ok(Expr::ImportCall {
+                            spec: Box::new(spec),
+                            options,
+                            phase: ImportPhase::Evaluation,
+                        })
+                    }
+                    _ => {
+                        let (name, _) = self.binding_ident_or_reference()?;
+                        Ok(Expr::Ident(name))
+                    }
                 }
-                _ => {
-                    let (name, _) = self.binding_ident_or_reference()?;
-                    Ok(Expr::Ident(name))
-                }
-            },
+            }
             TokenKind::Eof => Err(self.err_here("SyntaxError: unexpected end of input")),
             TokenKind::Punct(p) => {
+                let p = *p;
                 Err(self.err_here(format!("SyntaxError: unexpected token {p:?}")))
             }
         }
