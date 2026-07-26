@@ -1316,6 +1316,49 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B38 — One allocation in a loop body costs the OTHER ops 3x. B24 measured
+the wrong thing.
+
+B37's `{}` = 33.2ns is not the price of a malloc. `ZIPP_JITLOG` on that exact
+loop says:
+
+```
+[jit] region fn0 [6,15] DECLINED (blacklisted)      -> 33.4ns/iter
+[jit] INT region fn0 [6,17] compiled                -> 0.4ns/iter   (same loop, no `{}`)
+```
+
+The allocation does not cost 33ns; it **blacklists the region**, and the whole
+loop drops to the interpreter. Isolating that with five integer ops in the body:
+
+| loop body | zipp | node |
+|---|---|---|
+| 5 int ops | **15.2ns** (INT tier) | 1.2ns |
+| the same 5 ops **+ one `{}`** | **80.0ns** | 1.4ns |
+| the same 5 ops + one `[]` | 63.4ns | 1.2ns |
+
+The arithmetic did not change. It went from 15.2ns compiled to ~47ns
+interpreted, and the allocation added ~33 on top. **Adding one allocation to a
+loop costs ~3x on everything else in that loop.**
+
+**This corrects B24.** That entry refuted "admit allocation into JIT regions"
+because `{}` went 35 -> 62ns when emitted as a win64 call. But it measured `{}`
+IN ISOLATION, where the comparison is an interpreted allocation against a
+compiled one — and there the call overhead is the whole story. The measurement
+that matters is the loop: 80ns today against `15.2 + call`. At B24's 62ns call
+that is 77ns, i.e. still nothing — which is why the right conclusion is not
+"admit allocation" but **"make the JIT-side allocation cheap"**: 15.2 + ~10ns of
+inline bump allocation would be 25ns, a 3.2x on the shape. That is a nursery,
+i.e. the generational-GC project, and it is a PREREQUISITE for admission rather
+than an alternative to it.
+
+**Scope, measured, so this is not oversold.** Blacklisted regions per bench:
+polymorphic-objects 2 (of 7 compiled), regex-log-scan 2 (of 5), and **zero** in
+json-large, markdown-render, parse-large-js and class-prototype-hot. So this is
+not a suite-wide lever — but polymorphic-objects' two are its dictionary-churn
+loops, which B36 measured at 564ms of that bench's 701ms. The benches that
+allocate inside FUNCTIONS called from a loop are unaffected, because the loop
+region itself stays clean.
+
 ### B37 — node's `{}` is 0.4ns because it does not allocate. That is the gap.
 
 The last measurement needed to close the "compact object storage" question, and
