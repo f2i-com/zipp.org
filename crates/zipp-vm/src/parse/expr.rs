@@ -234,10 +234,13 @@ impl<'s> Parser<'s> {
             self.restore(save);
             return Ok(None);
         }
+        // `async function` is NOT handled here: a function expression is a
+        // PRIMARY, and returning it from assignment level bypassed the
+        // member/call tail — `async function () {…}()` lost its call and died
+        // on the orphaned parens. parse_primary owns it now.
         if self.at_kw(Keyword::Function) {
-            self.bump_after_operand()?;
-            let f = self.parse_function_rest(true, start)?;
-            return Ok(Some(Expr::Function(Box::new(f))));
+            self.restore(save);
+            return Ok(None);
         }
         // `async x => …` — same permissive read as `try_ident_arrow`: the name
         // is only a binding once the `=>` is confirmed.
@@ -740,6 +743,22 @@ impl<'s> Parser<'s> {
                         self.bump_after_operand()?;
                         let f = self.parse_function_rest(false, start)?;
                         Ok(Expr::Function(Box::new(f)))
+                    }
+                    Keyword::Async => {
+                        // `async function` as a primary, so the member/call
+                        // tail applies (`async function () {…}()` is an IIFE).
+                        // Anything else async-shaped was handled by
+                        // parse_assign; a bare `async` here is an identifier.
+                        let save = self.save();
+                        self.bump_after_operand()?;
+                        if self.at_kw(Keyword::Function) && !self.cur().newline_before {
+                            self.bump_after_operand()?;
+                            let f = self.parse_function_rest(true, start)?;
+                            return Ok(Expr::Function(Box::new(f)));
+                        }
+                        self.restore(save);
+                        let (name, _) = self.binding_ident_or_reference()?;
+                        Ok(Expr::Ident(name))
                     }
                     Keyword::Class => {
                         self.bump_after_operand()?;
