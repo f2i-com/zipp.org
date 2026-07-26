@@ -389,6 +389,49 @@ mod tests {
             run_ok("function f(e){ e = {v: e}; return e.v } console.log(f('old'))"),
             vec!["old"]
         );
+        // `x = x.p = v`: the inner store resolves its base to a register, and
+        // for a plain local that IS the destination — no copy is made — so
+        // evaluating `v` into it clobbered the object and `.p` landed on `v`.
+        assert_eq!(
+            run_ok(
+                "function f(){ var e = {p: null}, keep = e; e = e.p = 'V'; \
+                 return keep.p + ',' + e } console.log(f())"
+            ),
+            vec!["V,V"]
+        );
+        // Same through a computed key, a parameter, and a three-deep chain.
+        assert_eq!(
+            run_ok(
+                "function f(e){ var keep = e; e = e['p'] = 'V'; return keep.p } \
+                 console.log(f({p: null}))"
+            ),
+            vec!["V"]
+        );
+        assert_eq!(
+            run_ok(
+                "function f(){ var e = {p: null, q: null}, keep = e; e = e.p = e.q = 'V'; \
+                 return keep.p + keep.q } console.log(f())"
+            ),
+            vec!["VV"]
+        );
+        // React's minified `useState` mount, which is where this surfaced: the
+        // queue's `dispatch` must be the bound setter, not stay null. Reading it
+        // back is what every re-render does, so a regression makes the SECOND
+        // interaction with any stateful control throw.
+        assert_eq!(
+            run_ok(
+                "function K(){ return 'set' } \
+                 function mountState(e){ var t = {queue: null}; \
+                 t.memoizedState = e; \
+                 e = {pending: null, dispatch: null, lastRenderedState: e}; \
+                 t.queue = e; \
+                 e = e.dispatch = K.bind(null, 0, e); \
+                 return [t.queue.dispatch, e] } \
+                 var r = mountState(false); \
+                 console.log(typeof r[0], typeof r[1], r[0] === r[1])"
+            ),
+            vec!["function function true"]
+        );
         // The whole React shape, end to end.
         assert_eq!(
             run_ok(

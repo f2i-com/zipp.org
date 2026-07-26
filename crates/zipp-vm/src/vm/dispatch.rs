@@ -4406,7 +4406,35 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let (fid, closure) = self.resolve_callable_realm(callee_v)?;
+                        // Name the CALLING function when a plain `f()` callee is
+                        // not callable. `Error.prototype.stack` is empty, so
+                        // without this a host embedder gets "null is not a
+                        // function" with nothing to locate it by. The enclosing
+                        // name is cheap and is only ever built on the throw path.
+                        let (fid, closure) = match self.resolve_callable_realm(callee_v) {
+                            Ok(v) => v,
+                            Err(Thrown(msg)) => {
+                                let f = self.func(func_id as usize);
+                                let name: &str =
+                                    if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                                // Minified code names everything `t`/`e`, so the
+                                // enclosing function's string literals are what
+                                // actually identify it. Opt-in: they are long.
+                                let strings = if std::env::var_os("ZIPP_TRACE_CALLS").is_some() {
+                                    let sample: Vec<&str> = f
+                                        .string_constants
+                                        .iter()
+                                        .map(|s| s.as_str())
+                                        .filter(|s| s.len() > 3)
+                                        .take(8)
+                                        .collect();
+                                    format!(" strings={sample:?}")
+                                } else {
+                                    String::new()
+                                };
+                                Err(Thrown(format!("{msg} (in {name}){strings}")))?
+                            }
+                        };
                         // An `async function*` returns an AsyncGenerator (checked
                         // before the plain-generator/async cases since it is both).
                         if self.func(fid as usize).is_generator
@@ -4627,7 +4655,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let (fid, closure) = self.resolve_callable(prop)?;
+                        let (fid, closure) = self.resolve_callable_named(prop, key)?;
                         // An `async function*` method returns an AsyncGenerator.
                         if self.func(fid as usize).is_generator
                             && self.func(fid as usize).is_async
@@ -4697,7 +4725,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let (fid, closure) = self.resolve_callable(method)?;
+                        let (fid, closure) = self.resolve_callable_named(method, &kstr)?;
                         if self.func(fid as usize).is_generator
                             && self.func(fid as usize).is_async
                         {
@@ -6261,6 +6289,25 @@ impl<'p> Vm<'p> {
             }
         }
         Err(Thrown(format!("TypeError: {} is not a function", self.display(v))))
+    }
+
+    /// `resolve_callable`, but naming the property that was called.
+    ///
+    /// A bare "null is not a function" says what went wrong and never where,
+    /// and with an empty `Error.prototype.stack` that is the whole of what a
+    /// host embedder gets. Naming the property is usually enough to locate the
+    /// call in minified code, where a line number would not be.
+    ///
+    /// The prefix is left exactly as `resolve_callable` writes it and the name
+    /// is appended, so anything matching on the existing text still matches.
+    pub(crate) fn resolve_callable_named(
+        &self,
+        v: Value,
+        name: &str,
+    ) -> Result<(u32, u32), Thrown> {
+        self.resolve_callable(v).map_err(|Thrown(msg)| {
+            Thrown(format!("{msg} (property \"{name}\")"))
+        })
     }
 
     /// `resolve_callable`, except a NON-callable born in a createRealm child (a

@@ -17,6 +17,16 @@ use super::*;
 /// half-built value rather than the variable's old one, so the caller must
 /// route them through a temporary.
 ///
+/// A nested assignment to a MEMBER is the third: `x = x.p = v` compiles the
+/// inner store by resolving its base object to a register and then evaluating
+/// `v` into the destination. When `x` is a local, the base "register" IS the
+/// destination — no copy is made for a plain identifier — so writing `v` there
+/// clobbers the object before the store, and `.p` lands on `v` itself. React's
+/// minified `useState` mount is exactly this shape
+/// (`e = e.dispatch = K.bind(null, fiber, e)`), which left every state setter
+/// null on re-render: the first click of any control worked and the second
+/// threw "null is not a function".
+///
 /// Conditionals, logicals and sequences are transparent: their value comes from
 /// a sub-expression compiled into the same destination, so they inherit the
 /// property. This is deliberately a whitelist of what is SAFE-by-omission — a
@@ -39,7 +49,15 @@ fn builds_into_dst_incrementally(e: &ox::Expression) -> bool {
             s.expressions.last().is_some_and(builds_into_dst_incrementally)
         }
         E::ParenthesizedExpression(p) => builds_into_dst_incrementally(&p.expression),
-        E::AssignmentExpression(a) => builds_into_dst_incrementally(&a.right),
+        E::AssignmentExpression(a) => {
+            use ox::AssignmentTarget as T;
+            matches!(
+                a.left,
+                T::StaticMemberExpression(_)
+                    | T::ComputedMemberExpression(_)
+                    | T::PrivateFieldExpression(_)
+            ) || builds_into_dst_incrementally(&a.right)
+        }
         _ => false,
     }
 }
