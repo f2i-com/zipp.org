@@ -1316,6 +1316,32 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B46 — B33-B is REFUTED as written: the generator result object is not the cost
+
+B33 priced `for (v of gen())` at 174ns/step against node's 8.3 and attributed it
+to the `{value, done}` object, predicting 174 -> ~85. Tested the cheap half of
+that — reading the pair straight out of the result map instead of through two
+full `get_prop`s — and it is worth **215.5 -> 211.0ns, about 2%**, i.e. noise.
+
+So the two property reads are not the cost, and by extension neither is the
+object: allocating it is ~13ns of a 211ns step. **The generator gap (20x) is the
+suspend/resume machinery** — activation frames, state save/restore — not the
+result protocol. Anyone picking up B33-B should measure `gen.next()` against a
+bare function call before extracting anything.
+
+Kept anyway, because it is strictly less work and the guard it needs is
+interesting in its own right: `iter_result_unwrap` verifies the map is EXACTLY
+two own data properties named `value` then `done`, rather than assuming, because
+`yield*` returns the inner iterator's result VERBATIM (spec GeneratorYield). A
+generator's `next` can therefore hand back an arbitrary user object whose
+`value`/`done` are accessors, inherited, or in the other order — all three are
+in the regression check, along with throw/return completions.
+
+Contrast with B45, where the same idea was worth 3.8x. The difference is what
+surrounds the object: an array iterator's step is otherwise trivial, so the
+object dominated; a generator's step suspends and resumes a frame, so it does
+not. Same optimisation, opposite verdicts, decided by measurement in both cases.
+
 ### B45 — B33-A landed: the array-iterator result object is elided
 
 | loop | before | after | node |

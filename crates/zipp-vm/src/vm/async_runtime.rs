@@ -383,6 +383,33 @@ impl<'p> Vm<'p> {
 
     /// Build an iterator-result object `{ value, done }` (insertion order matches
     /// the spec / node).
+    /// Read `(value, done)` straight out of a result object that is EXACTLY the
+    /// one `iter_result` builds — two own data properties, `value` then `done`,
+    /// no accessors, no prototype involvement.
+    ///
+    /// `None` for anything else, and the caller falls back to two `get_prop`s.
+    /// The check is against the map, not an assumption about the caller: `yield*`
+    /// returns the inner iterator's result VERBATIM (spec GeneratorYield), so a
+    /// generator's `next` can hand back an arbitrary user object whose `value`
+    /// and `done` may be accessors, inherited, or in the other order.
+    pub(crate) fn iter_result_unwrap(&self, res: Value) -> Option<(Value, Value)> {
+        if !res.is_heap() {
+            return None;
+        }
+        let HeapObj::Object(m) = self.heap.get(res.heap_index()) else {
+            return None;
+        };
+        if m.len() != 2
+            || m.key_at(0) != "value"
+            || m.key_at(1) != "done"
+            || m.attr_at(0).accessor
+            || m.attr_at(1).accessor
+        {
+            return None;
+        }
+        Some((m.val_at(0), m.val_at(1)))
+    }
+
     pub(crate) fn iter_result(&mut self, value: Value, done: bool) -> Value {
         let mut map = ObjMap::new();
         map.set("value", value);

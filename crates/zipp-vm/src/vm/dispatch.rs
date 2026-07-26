@@ -5617,6 +5617,19 @@ impl<'p> Vm<'p> {
                             let res = self
                                 .generator_method(it.heap_index(), "next", &[])?
                                 .unwrap_or(Value::UNDEFINED);
+                            // `iter_result` builds `{value, done}` in that order
+                            // and nothing else, so when the result is exactly
+                            // that shape its slots can be read directly instead
+                            // of through two full `get_prop`s. Verified against
+                            // the map rather than assumed, because `yield*`
+                            // returns the INNER result verbatim and that may be
+                            // any user object.
+                            if let Some((val, done)) = self.iter_result_unwrap(res) {
+                                self.set(base, value_dst, val);
+                                self.set(base, done_dst, done);
+                                ip += 1;
+                                continue;
+                            }
                             let done = self.get_prop(res, "done")?;
                             let val = self.get_prop(res, "value")?;
                             self.set(base, value_dst, val);
