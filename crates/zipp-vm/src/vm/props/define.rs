@@ -318,7 +318,7 @@ impl<'p> Vm<'p> {
                         }
                         self.arr_props
                             .entry(idx)
-                            .or_insert_with(ObjMap::new)
+                            .or_insert_with(ObjMap::new_side_table)
                             .define(&key_i, stored, attr);
                         if sparse_target {
                             self.array_grow_js_len(idx, i);
@@ -365,7 +365,7 @@ impl<'p> Vm<'p> {
                 } else {
                     value.unwrap_or(cur.map_or(Value::UNDEFINED, |(_, v)| v))
                 };
-                let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+                let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
                 m.define("length", stored, new_attr);
                 if !new_attr.accessor {
                     if let Some(v) = value {
@@ -645,10 +645,10 @@ impl<'p> Vm<'p> {
                 }
             }
             3 => {
-                self.arr_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
+                self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).define(key, stored, attr);
             }
             _ => {
-                self.fn_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
+                self.fn_props.entry(idx).or_insert_with(ObjMap::new_side_table).define(key, stored, attr);
             }
         }
         // Write a defined `lastIndex` VALUE through to the RegExp slot (the

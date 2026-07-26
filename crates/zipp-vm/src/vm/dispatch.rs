@@ -5045,9 +5045,9 @@ impl<'p> Vm<'p> {
                                 accessor: false,
                                 setter: Value::UNDEFINED,
                             };
-                            self.arr_props.entry(cooked).or_insert_with(ObjMap::new).define("raw", r, attr);
+                            self.arr_props.entry(cooked).or_insert_with(ObjMap::new_side_table).define("raw", r, attr);
                             for idx in [raw_idx, cooked] {
-                                self.arr_props.entry(idx).or_insert_with(ObjMap::new).freeze();
+                                self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).freeze();
                                 self.array_length_nonwritable.insert(idx);
                             }
                         }

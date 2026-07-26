@@ -1014,7 +1014,7 @@ impl<'p> Vm<'p> {
                 Value::heap(gidx)
             };
             let indices_arr = self.heap.alloc(HeapObj::Array(idx_elems));
-            self.arr_props.entry(indices_arr).or_insert_with(ObjMap::new).define(
+            self.arr_props.entry(indices_arr).or_insert_with(ObjMap::new_side_table).define(
                 "groups",
                 idx_groups,
                 attr,

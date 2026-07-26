@@ -1206,7 +1206,7 @@ impl<'p> Vm<'p> {
         if obj_proto != 0 {
             self.proto_of.insert(idx, Value::heap(obj_proto));
         }
-        let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+        let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
         // `length` is an ORDINARY data property of an arguments object
         // (writable, non-enumerable, configurable — it can hold any value and
         // be deleted), not the Array exotic length. Every Array-length special

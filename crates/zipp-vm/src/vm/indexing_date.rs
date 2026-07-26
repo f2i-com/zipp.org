@@ -540,7 +540,7 @@ impl<'p> Vm<'p> {
                 && matches!(self.heap.get(idx), HeapObj::Array(items) if i >= items.len())
             {
                 let k = self.key_of(key);
-                self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(&k, val);
+                self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(&k, val);
                 self.heap.bump_version(idx);
                 return Ok(());
             }
@@ -565,7 +565,7 @@ impl<'p> Vm<'p> {
             {
                 self.arr_props
                     .entry(idx)
-                    .or_insert_with(ObjMap::new)
+                    .or_insert_with(ObjMap::new_side_table)
                     .set(&i.to_string(), val);
                 self.array_grow_js_len(idx, i);
                 self.heap.bump_version(idx);

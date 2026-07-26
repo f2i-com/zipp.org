@@ -1316,6 +1316,119 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B43 — Hidden classes, part 1: the shape tree and a shape-keyed interpreter IC
+
+**What landed.** `crates/zipp-vm/src/shape.rs` — a transition tree in which each
+edge adds one property, so objects built by the same sequence of appends share a
+`u32`. `ObjMap` carries a `shape` field maintained by the same methods that
+mutate `keys`/`attrs`, and `vm/ic.rs`'s own-property entries carry the shape they
+were filled against; a match proves the key -> slot mapping and the entry is used
+WITHOUT looking the key up.
+
+**Deliberately NOT a layout change.** The keys, values and attributes stay in the
+three parallel vectors. The shape is a redundant summary, which is what makes the
+landing safe: it can be checked against the real data (it is — see below), none
+of the 7 sites that bake `vals.as_ptr()` move, and none of the 368 external field
+uses have to be converted first. The allocation win from actually moving keys
+into the shape is worth far less than it looks (B29, B37: removing allocations
+from these paths has measured ~0 four times); the CLIFF is what is worth having.
+
+**The invariant, and why it is the whole safety story.** A shape-keyed guard
+matches on an integer and then reads the slot it recorded at fill time. A shape
+that disagreed with its object by one position would return a plausible wrong
+value — the failure mode this engine has shipped twice. So `assert_shape_agrees`
+runs inside `assert_map_consistent`, which every existing `ObjMap` test already
+calls: for a guardable map, the shape's length must equal the key vector's and
+`slot_of(shape, k)` must equal the map's own slot for every key. Three new tests
+pin the layout-changing operations — `delete`, `seal`, `freeze`, and a
+`defineProperty` that changes attributes mid-sequence all drop to `DICT`, while
+re-stating identical attributes and plain value overwrites do not.
+
+**Measured (interpreter, `ZIPP_NOJIT=1`, 4M reads):** 36.25ns -> **32.25ns**, flat
+in receiver count both before and after. That is the skipped `m.pos(key)`; ~11%.
+Suite: **+0.4% mean** over 7 paired reps, i.e. noise, with `polymorphic-objects`
+at -1.3% — the one bench whose objects share shapes well.
+
+**Getting to that +0.4% took three measured corrections, and they are the
+interesting part.**
+
+1. **First landing was +1.9% mean, `json-large` +12%.** The cause was mine:
+   `shape::add` built a `Box<str>` for the probe key on every property append —
+   a malloc on the construction path, in a session spent hunting exactly that.
+   Replaced with a `&str` scan.
+2. **Still +8.8%.** `json-large`'s transition tree has **max fan-out 313**, so
+   the scan was walking hundreds of edges per append. Added a hash index above a
+   fan-out of 8, with every hit VERIFIED against the node's real key so a
+   collision is a miss rather than a wrong shape. **Still +9.4%** — so fan-out
+   was not it either.
+3. **The bisect that settled it.** A `ZIPP_NO_SHAPES=1` kill switch (field
+   present, maintenance off) put the bench back at baseline, proving the cost was
+   maintenance rather than `ObjMap` growing by 4 bytes. And the reason
+   maintenance was so expensive is the data: `bench/real/json-large.js` builds
+   objects with `obj[WORDS[ri(256)] + "_" + j]` — **randomly-named keys** — and
+   so wants **54,390 shapes for 18,604 objects**. It is a worst case for hidden
+   classes by construction, and no guard will ever hit there.
+
+**Which produced the design's best feature, and it was not planned.** Capping the
+tree at 4,096 shapes makes the mechanism **self-tuning**: a program whose objects
+share layouts stays far below the cap (`polymorphic-objects`: 1,071 shapes for
+30,000 objects), while one whose keys are effectively unique blows through it in
+a single pass and every object thereafter is `DICT` — today's behaviour, at the
+cost of one compare per append. `json-large` went +9.5% -> **+1.7%** on that
+change alone.
+
+Side tables are exempt for the same reason: `ObjMap` doubles as the `arr_props`
+store for an Array's or RegExp's named properties, which is keyed by index
+STRINGS, so a sparse array would mint one shape per element. `ObjMap::
+new_side_table` starts them in dictionary mode. (Measured: this was NOT what
+`json-large` was hitting — the random keys were — but it is a real hazard for
+`sparse-array`-shaped work and costs nothing to close.)
+
+**A correction to two earlier claims, one of them mine.**
+
+* PERF_ROADMAP said the interpreter IC "pays a full key lookup on every access,
+  hit or miss". True — and the reason is structural rather than an oversight:
+  `IcEntry::OwnData { slot }` carried NO receiver identity, so one way already
+  served every receiver with the key at that slot. The interpreter IC was already
+  shape-polymorphic, and the unconditional `pos` was the price of it. That is why
+  it has no receiver cliff and never did.
+* **The cliff is exclusively `JIT_IC_WAYS`, and it is exactly at 8 -> 9**, 100%
+  miss thereafter. My own first measurement put it "between 12 and 16" because it
+  indexed receivers with `i & (n-1)` for non-power-of-two `n` — at `n = 9` that
+  cycles two objects and shows no cliff at all. §1b already warns about this
+  trap; it caught me anyway. Use an explicit wrap counter.
+
+**Part 2 — the JIT guard — is specified but NOT landed.** It is where the 3x
+lives, and it is a bigger change than it looks because the JIT's IC entry BAKES
+the receiver's `vals_ptr`:
+
+```text
+#[repr(C)] IcEntry { obj_bits @0, vals_ptr @8, version @16, slot_nhops @20, hops @24..64 }
+probe: cmp rax,[r9] (identity) ; version ; hops ; hit: mov rcx,[r9+8] ; mov rax,[rcx+rdx*8]
+```
+
+Shape-keying the ways means different receivers share one way, so `vals_ptr` can
+no longer be baked — the hit path has to load it from the RECEIVER. That needs a
+heap-index-parallel `ObjMeta { version, shape, vals_base }` array replacing the
+bare versions array now pinned in `r13`, which is a stride change at 10 indexing
+sites plus a new heap-wide invariant (`vals_base` must be refreshed on every
+`vals` reallocation). The emitter exists in TWO byte-identical copies
+(`region_mem.rs` Tier B and `proto_mem.rs` Tier C) — factor before editing.
+
+Predicted by the survey: the flat ~12ns miss term disappears for the
+same-shape-many-instances case, leaving ~2.5-3.0ns FLAT. It does not reach node's
+0.75ns — that residual is the NaN-box tag tax, i.e. B7.
+
+**One latent hazard to fix in the same commit**, found while surveying: the
+SetProp hit path (`region_mem.rs`) reads the slot with `mov edx,[r9+20]` and no
+`and edx, 0x00FF_FFFF` mask, where GetProp masks. It is safe only because SetProp
+ways are never filled with `nhops != 0`. A shape-keyed world that ever caches a
+chain-bearing entry at a SetProp site turns that into a wild store. Add the mask
+or a debug assertion on the fill path.
+
+Also add a `ZIPP_NO_SHAPE_IC` kill switch mirroring `ZIPP_NO_METHOD_INLINE`, so
+the standing gate can A/B without a rebuild.
+
 ### B42 — async-promise-chain, phase-split for the first time
 
 Never analysed before, and it is the last bench in the suite that had no phase

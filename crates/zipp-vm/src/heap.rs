@@ -241,6 +241,16 @@ pub struct ObjMap {
     /// `Clone` clones the table verbatim, which is valid because the clone
     /// has identical keys at identical slots.
     index: Option<Box<PropIndex>>,
+    /// This object's hidden class — see [`crate::shape`]. A redundant summary of
+    /// `keys` + `attrs`, maintained by the same methods that mutate them, so an
+    /// inline cache can ask "same layout?" with one integer compare instead of
+    /// pinning an object IDENTITY (which is what makes the current caches fall
+    /// off a cliff past a handful of instances).
+    ///
+    /// [`shape::DICT`] means "not describable as a sequence of appends" — a key
+    /// was deleted, or an existing property's attributes were redefined. Nothing
+    /// depends on a shape being present, only on it being correct when it is.
+    shape: u32,
 }
 
 /// One property's attributes — the ECMAScript property-descriptor flags plus an
@@ -265,6 +275,163 @@ impl PropAttr {
 }
 
 impl ObjMap {
+    // ---- accessors ---------------------------------------------------------
+    //
+    // The three parallel `Vec`s are still public while the hidden-class
+    // migration is in flight, but NEW code should go through these. They exist
+    // so the layout can change underneath: a shape-based object stores its keys
+    // and attributes in a SHARED descriptor rather than per-object vectors, and
+    // every read site that names `m.keys[i]` directly would otherwise have to
+    // change in the same commit that changes the layout.
+    //
+    // All of them are `#[inline]` and compile to exactly what the field access
+    // compiled to, so converting a call site is a no-op you can land and measure
+    // separately from the layout change itself.
+
+    /// Number of own properties.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The property name at `i`. Panics out of range, exactly like the indexing
+    /// it replaces — every caller has already established `i` from `pos()`.
+    #[inline]
+    pub fn key_at(&self, i: usize) -> &str {
+        &self.keys[i]
+    }
+
+    #[inline]
+    pub fn key_get(&self, i: usize) -> Option<&str> {
+        self.keys.get(i).map(|k| &**k)
+    }
+
+    /// The stored value at `i` — the data value, or the GETTER for an accessor.
+    #[inline]
+    pub fn val_at(&self, i: usize) -> Value {
+        self.vals[i]
+    }
+
+    #[inline]
+    pub fn val_get(&self, i: usize) -> Option<Value> {
+        self.vals.get(i).copied()
+    }
+
+    #[inline]
+    pub fn attr_at(&self, i: usize) -> PropAttr {
+        self.attrs[i]
+    }
+
+    #[inline]
+    pub fn attr_get(&self, i: usize) -> Option<PropAttr> {
+        self.attrs.get(i).copied()
+    }
+
+    /// Overwrite the value in an EXISTING slot. Not a structural change: the key
+    /// sequence is untouched, so no shape transition and no version bump.
+    #[inline]
+    pub fn set_val_at(&mut self, i: usize, v: Value) {
+        self.vals[i] = v;
+    }
+
+    /// Overwrite an existing slot's attributes. Under shapes this becomes a
+    /// transition, which is why it is a method rather than a field write.
+    #[inline]
+    pub fn set_attr_at(&mut self, i: usize, a: PropAttr) {
+        let old = self.attrs[i];
+        if old.writable != a.writable
+            || old.enumerable != a.enumerable
+            || old.configurable != a.configurable
+            || old.accessor != a.accessor
+        {
+            self.shape_to_dict();
+        }
+        self.attrs[i] = a;
+    }
+
+    /// Set just the setter half of an accessor slot.
+    #[inline]
+    pub fn set_setter_at(&mut self, i: usize, setter: Value) {
+        self.attrs[i].setter = setter;
+    }
+
+    /// Own property names in insertion order. NOT spec key order — callers that
+    /// need integer-first ordering go through `spec_key_order`.
+    #[inline]
+    pub fn keys_iter(&self) -> impl Iterator<Item = &str> {
+        self.keys.iter().map(|k| &**k)
+    }
+
+    /// `(name, value, attrs)` per own property, insertion order.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (&str, Value, PropAttr)> {
+        (0..self.keys.len()).map(move |i| (&*self.keys[i], self.vals[i], self.attrs[i]))
+    }
+
+    /// This object's hidden class, or [`shape::DICT`] if it has none.
+    #[inline]
+    pub fn shape(&self) -> u32 {
+        self.shape
+    }
+
+    /// Whether `shape()` may be used as a cache guard. `DICT` must never be
+    /// compared for equality — two dictionary-mode objects share the sentinel
+    /// while having nothing else in common — so this is the single place that
+    /// question is answered.
+    #[inline]
+    pub fn shape_guardable(&self) -> bool {
+        self.shape != crate::shape::DICT
+    }
+
+    /// Drop to dictionary mode: the layout stopped being a sequence of appends.
+    #[inline]
+    fn shape_to_dict(&mut self) {
+        self.shape = crate::shape::DICT;
+    }
+
+    /// As `shape_pushed`, but called BEFORE the key is moved into the vector
+    /// (so the length assertion is off by one and is skipped).
+    #[inline]
+    fn shape_pushed_owned(&mut self, key: &str, a: &PropAttr) {
+        self.shape = crate::shape::add(
+            self.shape,
+            key,
+            crate::shape::attr_bits(a.writable, a.enumerable, a.configurable, a.accessor),
+        );
+    }
+
+    /// Extend the shape by the property just appended at the end of `keys`.
+    #[inline]
+    fn shape_pushed(&mut self, key: &str, a: &PropAttr) {
+        self.shape = crate::shape::add(
+            self.shape,
+            key,
+            crate::shape::attr_bits(a.writable, a.enumerable, a.configurable, a.accessor),
+        );
+        debug_assert!(
+            self.shape == crate::shape::DICT
+                || crate::shape::len(self.shape) as usize == self.keys.len(),
+            "shape drifted from the key vector it summarises"
+        );
+    }
+
+    /// Raw base of the value vector, for the JIT to bake into a compiled load.
+    ///
+    /// NAMED rather than inlined at the call sites so the ~7 places that depend
+    /// on `vals` being a contiguous `Vec<Value>` — the codegen emits a scale-8
+    /// indexed load through this — are greppable. A shape migration must keep
+    /// `vals` exactly this shape; that constraint is why the values stay in a
+    /// per-object vector while the KEYS move into the shared descriptor.
+    #[inline]
+    pub fn vals_ptr(&self) -> *const Value {
+        self.vals.as_ptr()
+    }
+
     /// An empty map sized for `n` properties up front — one allocation per
     /// vector instead of the regrowth an object literal otherwise pays as it
     /// appends (a 6-key literal cost ~36ns/key at the tail against ~17ns
@@ -276,6 +443,23 @@ impl ObjMap {
             m.vals.reserve_exact(n);
             m.attrs.reserve_exact(n);
         }
+        m
+    }
+
+    /// A map used as an engine-internal SIDE TABLE — an Array's or RegExp's
+    /// named properties, a function's own properties — rather than as a JS
+    /// object's own storage.
+    ///
+    /// It starts in dictionary mode and stays there, because it can never be the
+    /// receiver of a shape-keyed guard (those only ever see `HeapObj::Object`)
+    /// and maintaining a shape for it is pure cost. That cost is not
+    /// hypothetical: a sparse array's side table is keyed by index STRINGS, so
+    /// every element mints a fresh shape and every append misses the transition
+    /// scan. `json-large` built 54,390 shapes with a fan-out of 313 that way,
+    /// for +9% on the bench.
+    pub fn new_side_table() -> ObjMap {
+        let mut m = ObjMap::new();
+        m.shape = crate::shape::DICT;
         m
     }
 
@@ -291,6 +475,7 @@ impl ObjMap {
             sealed: false,
             frozen: false,
             index: None,
+            shape: crate::shape::EMPTY,
         }
     }
 
@@ -306,6 +491,7 @@ impl ObjMap {
 
     /// `Object.seal`: clear extensibility and make every own property non-configurable.
     pub fn seal(&mut self) {
+        self.shape_to_dict(); // every property's `configurable` changes
         self.extensible = false;
         self.sealed = true;
         for a in &mut self.attrs {
@@ -315,6 +501,7 @@ impl ObjMap {
 
     /// `Object.freeze`: seal, and make every own data property non-writable too.
     pub fn freeze(&mut self) {
+        self.shape_to_dict(); // every property's `configurable`/`writable` changes
         self.extensible = false;
         self.sealed = true;
         self.frozen = true;
@@ -366,6 +553,7 @@ impl ObjMap {
             self.keys.push(key.to_string());
             self.vals.push(val);
             self.attrs.push(PropAttr::data());
+            self.shape_pushed(key, &PropAttr::data());
             self.index_appended();
             true
         }
@@ -376,13 +564,27 @@ impl ObjMap {
     /// `true` if a new key was appended.
     pub fn define(&mut self, key: &str, val: Value, attr: PropAttr) -> bool {
         if let Some(i) = self.pos(key) {
+            // Redefining an EXISTING property's attributes is not an append, so
+            // the transition tree cannot describe the result — unless nothing
+            // shape-relevant actually changed, which is the common case
+            // (`Object.defineProperty` re-stating the same flags, or only the
+            // setter half of an accessor moving).
+            let old = self.attrs[i];
+            let changed = old.writable != attr.writable
+                || old.enumerable != attr.enumerable
+                || old.configurable != attr.configurable
+                || old.accessor != attr.accessor;
             self.vals[i] = val;
             self.attrs[i] = attr;
+            if changed {
+                self.shape_to_dict();
+            }
             false
         } else {
             self.keys.push(key.to_string());
             self.vals.push(val);
             self.attrs.push(attr);
+            self.shape_pushed(key, &attr);
             self.index_appended();
             true
         }
@@ -392,6 +594,7 @@ impl ObjMap {
     /// `pos`); consumes the key, skipping `set`'s re-lookup and re-clone. The
     /// caller MUST bump the object's version (a key add reallocs `vals`).
     pub fn push_data(&mut self, key: String, val: Value) {
+        self.shape_pushed_owned(&key, &PropAttr::data());
         self.keys.push(key);
         self.vals.push(val);
         self.attrs.push(PropAttr::data());
@@ -403,6 +606,9 @@ impl ObjMap {
     /// may have recorded a now-stale slot index for another key).
     pub fn remove(&mut self, key: &str) -> bool {
         if let Some(i) = self.pos(key) {
+            // A hole in the middle of the sequence: every later property's slot
+            // shifts down, so no shape in the tree describes the result.
+            self.shape_to_dict();
             self.keys.remove(i);
             self.vals.remove(i);
             self.attrs.remove(i);
@@ -2067,6 +2273,111 @@ mod tests {
             assert_eq!(m.pos(k), Some(i), "key {k:?} not found at its slot");
         }
         assert_eq!(m.pos("missing-key-never-inserted"), None);
+        assert_shape_agrees(m);
+    }
+
+    /// THE invariant the whole hidden-class landing rests on: when a map claims
+    /// a shape, that shape's key -> slot mapping must be exactly the map's own.
+    ///
+    /// This is what makes a shape-keyed cache guard sound. A guard matches on the
+    /// shape id alone and then reads the slot it recorded at fill time, so a
+    /// shape that disagreed with its object by even one position would read the
+    /// wrong property and return a plausible wrong answer — the failure mode this
+    /// engine has been bitten by twice.
+    fn assert_shape_agrees(m: &ObjMap) {
+        if !m.shape_guardable() {
+            return; // dictionary mode promises nothing, and is never guarded on
+        }
+        assert_eq!(
+            crate::shape::len(m.shape()) as usize,
+            m.keys.len(),
+            "shape length disagrees with the key vector"
+        );
+        for (i, k) in m.keys.iter().enumerate() {
+            assert_eq!(
+                crate::shape::slot_of(m.shape(), k),
+                Some(i as u32),
+                "shape puts {k:?} at a different slot than the map does"
+            );
+        }
+    }
+
+    #[test]
+    fn objects_built_the_same_way_share_a_shape() {
+        // The premise: a guard on the shape of one of these matches all of them.
+        let mk = || {
+            let mut m = ObjMap::new();
+            m.set("alpha", Value::num(1.0));
+            m.set("beta", Value::num(2.0));
+            m.set("gamma", Value::num(3.0));
+            m
+        };
+        let (a, b) = (mk(), mk());
+        assert!(a.shape_guardable());
+        assert_eq!(a.shape(), b.shape());
+        assert_map_consistent(&a);
+
+        // Different ORDER is a different layout, so it must not share.
+        let mut c = ObjMap::new();
+        c.set("beta", Value::num(2.0));
+        c.set("alpha", Value::num(1.0));
+        assert_ne!(a.shape(), c.shape());
+    }
+
+    #[test]
+    fn layout_changing_operations_drop_to_dictionary() {
+        // Each of these makes the object's layout undescribable as a sequence of
+        // appends, and each must therefore stop being guardable — a stale guard
+        // here is a wrong-value read, not a slow one.
+        let base = || {
+            let mut m = ObjMap::new();
+            m.set("a", Value::num(1.0));
+            m.set("b", Value::num(2.0));
+            m
+        };
+
+        let mut deleted = base();
+        deleted.remove("a");
+        assert!(!deleted.shape_guardable(), "delete shifts later slots");
+
+        let mut resealed = base();
+        resealed.seal();
+        assert!(!resealed.shape_guardable(), "seal rewrites every attr");
+
+        let mut frozen = base();
+        frozen.freeze();
+        assert!(!frozen.shape_guardable(), "freeze rewrites every attr");
+
+        let mut redefined = base();
+        redefined.define(
+            "a",
+            Value::num(9.0),
+            PropAttr { writable: false, enumerable: true, configurable: true, accessor: false, setter: Value::UNDEFINED },
+        );
+        assert!(!redefined.shape_guardable(), "attrs changed mid-sequence");
+
+        // But re-stating the SAME attributes is not a layout change, and a plain
+        // value overwrite certainly is not.
+        let mut same = base();
+        let sh = same.shape();
+        same.define("a", Value::num(9.0), PropAttr::data());
+        assert_eq!(same.shape(), sh, "identical attrs must not cost the shape");
+        same.set("a", Value::num(10.0));
+        assert_eq!(same.shape(), sh, "a value overwrite is not a layout change");
+        assert_map_consistent(&same);
+    }
+
+    #[test]
+    fn shape_survives_the_index_threshold_and_a_clone() {
+        // Crossing PROP_INDEX_THRESHOLD changes the LOOKUP mode, not the layout.
+        let mut m = ObjMap::new();
+        for i in 0..(PROP_INDEX_THRESHOLD + 8) {
+            m.set(&format!("k{i}"), Value::num(i as f64));
+        }
+        assert_map_consistent(&m);
+        let c = m.clone();
+        assert_eq!(c.shape(), m.shape(), "a clone has identical keys at identical slots");
+        assert_map_consistent(&c);
     }
 
     #[test]

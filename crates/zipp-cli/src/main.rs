@@ -16,7 +16,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
+    let stats = std::env::var_os("ZIPP_SHAPESTATS").is_some();
+    let r = run(&args);
+    if stats {
+        let (n, mx, tot) = zipp_vm::shape_stats();
+        eprintln!("[shape] nodes={n} max_fanout={mx} edges={tot}");
+    }
+    match r {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("zipp: {e}");

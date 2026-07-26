@@ -291,7 +291,7 @@ impl<'p> Vm<'p> {
             return;
         }
         let nv = self.alloc_str(name);
-        self.fn_props.entry(fi).or_insert_with(ObjMap::new).define(
+        self.fn_props.entry(fi).or_insert_with(ObjMap::new_side_table).define(
             "name",
             nv,
             PropAttr {

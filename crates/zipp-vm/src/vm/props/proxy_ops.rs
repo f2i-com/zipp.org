@@ -168,7 +168,7 @@ impl<'p> Vm<'p> {
                     self.heap.get(ti),
                     HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
                 ) {
-                    self.arr_props.entry(ti).or_insert_with(ObjMap::new).extensible = false;
+                    self.arr_props.entry(ti).or_insert_with(ObjMap::new_side_table).extensible = false;
                 }
                 Ok(Some(true))
             }

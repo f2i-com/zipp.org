@@ -2452,7 +2452,7 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         _ => {
-                            let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+                            let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
                             match id {
                                 OBJ_FREEZE => m.freeze(),
                                 OBJ_SEAL => m.seal(),
@@ -3096,7 +3096,7 @@ impl<'p> Vm<'p> {
                     // native IcEntry guards only on the heap version).
                     self.heap.bump_version(idx);
                 } else {
-                    self.arr_props.entry(idx).or_insert_with(ObjMap::new).extensible = false;
+                    self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).extensible = false;
                 }
                 Value::bool(true)
             }

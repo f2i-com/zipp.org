@@ -94,8 +94,14 @@ pub(crate) type IcHops = ([(u32, u32); IC_MAX_HOPS], u8);
 pub(crate) enum IcEntry {
     /// `recv.key` is an own property of a plain/instance Object at `slot`
     /// (data for `OwnData`, accessor for `OwnAcc`).
-    OwnData { slot: u32 },
-    OwnAcc { slot: u32 },
+    ///
+    /// `shape` is the receiver's hidden class at fill time, or
+    /// [`crate::shape::DICT`] if it had none. When it matches, the key -> slot
+    /// mapping is proven and the key lookup is SKIPPED — see the fast path in
+    /// `ic_get_prop`. When it does not, the entry still validates the old way
+    /// (`own == Some(slot)`), so a dictionary-mode receiver loses no ground.
+    OwnData { shape: u32, slot: u32 },
+    OwnAcc { shape: u32, slot: u32 },
     /// Method (`is_getter == false`) or getter resolved on the receiver's
     /// class chain. `callee` is the materialized member function (stable for
     /// the life of the class — ClassData is immutable post-definition).
@@ -248,7 +254,7 @@ impl<'p> Vm<'p> {
                 misses: 0,
                 n: 0,
                 rot: 0,
-                entries: [IcEntry::OwnData { slot: 0 }; IC_WAYS],
+                entries: [IcEntry::OwnData { shape: crate::shape::DICT, slot: 0 }; IC_WAYS],
             })
         }))
     }
@@ -420,6 +426,18 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The receiver's hidden class, or [`crate::shape::DICT`] when it has none
+    /// (or is not the kind of object the caches guard). `DICT` never matches a
+    /// live receiver's shape, so an entry filled with it simply falls through to
+    /// the old validation.
+    #[inline]
+    fn ic_recv_shape(&self, recv: Value) -> u32 {
+        match self.ic_recv_map(recv) {
+            Some((_, m)) => m.shape(),
+            None => crate::shape::DICT,
+        }
+    }
+
     /// Validate a `Proto*` entry's first link + hop versions against `recv`
     /// (whose own map must already have missed `key`). Returns the holder's
     /// map when the chain still stands.
@@ -508,6 +526,45 @@ impl<'p> Vm<'p> {
         if let Some(site) = self.ic_site(func_id, ip) {
             if site.n > 0 {
                 if let Some((idx, m)) = self.ic_recv_map(recv) {
+                    // ── shape-keyed fast path ──────────────────────────────
+                    // A matching hidden class proves the receiver's key -> slot
+                    // mapping is the one this entry was filled against, so the
+                    // slot is usable WITHOUT looking the key up. That matters
+                    // twice over:
+                    //
+                    //   * `m.pos(key)` below is unconditional — the cache never
+                    //     avoided the key scan, only the proto/class walk, which
+                    //     is why the interpreter measured flat at ~34ns per read
+                    //     no matter how well the site was cached; and
+                    //   * shapes are shared, so a site reading a property from
+                    //     ten thousand distinct objects built the same way needs
+                    //     ONE way instead of overflowing all eight. Measured on
+                    //     identically-shaped receivers, the old identity guard
+                    //     went 4.25ns at 12 receivers to 14.75ns at 16.
+                    //
+                    // Sound because a site's key is a compile-time constant
+                    // (`Instr::GetProp` reads `string_constants[name]`), so the
+                    // key that filled the entry is the key being asked for now.
+                    // Only the FIRST way is probed by shape. Scanning all eight
+                    // was measurably worse: a site whose receivers genuinely do
+                    // not share shapes — `json-large` builds 54,390 of them, so
+                    // the guard never hits — paid eight failed compares before
+                    // every access, for +9% on that bench. Property sites are
+                    // overwhelmingly monomorphic, so way 0 is where the shape
+                    // will be if it is anywhere, and a single failed compare is
+                    // affordable when it is not.
+                    let sh = m.shape();
+                    if sh != crate::shape::DICT && site.n > 0 {
+                        match site.entries[0] {
+                            IcEntry::OwnData { shape, slot } if shape == sh => {
+                                return GetAct::Value(m.val_at(slot as usize));
+                            }
+                            IcEntry::OwnAcc { shape, slot } if shape == sh => {
+                                return self.ic_acc_get_from(m, slot as usize);
+                            }
+                            _ => {}
+                        }
+                    }
                     let own = m.pos(key);
                     for e in &site.entries[..site.n as usize] {
                         match self.ic_validate_get(e, idx, m, own, key) {
@@ -525,15 +582,16 @@ impl<'p> Vm<'p> {
             Walked::OwnData { slot } => {
                 // Deliver from the freshly-validated walk (same read the
                 // entry would perform).
-                let v = match self.ic_recv_map(recv) {
-                    Some((_, m)) => m.vals[slot],
+                let (v, shape) = match self.ic_recv_map(recv) {
+                    Some((_, m)) => (m.vals[slot], m.shape()),
                     None => return GetAct::None,
                 };
-                self.ic_install(func_id, ip, IcEntry::OwnData { slot: slot as u32 });
+                self.ic_install(func_id, ip, IcEntry::OwnData { shape, slot: slot as u32 });
                 GetAct::Value(v)
             }
             Walked::OwnAcc { slot } => {
-                self.ic_install(func_id, ip, IcEntry::OwnAcc { slot: slot as u32 });
+                let shape = self.ic_recv_shape(recv);
+                self.ic_install(func_id, ip, IcEntry::OwnAcc { shape, slot: slot as u32 });
                 self.ic_own_acc_get(recv, key, slot as u32)
             }
             Walked::ClassMethod { class, callee } => {
@@ -602,7 +660,7 @@ impl<'p> Vm<'p> {
         key: &str,
     ) -> GetAct {
         match *e {
-            IcEntry::OwnData { slot } => {
+            IcEntry::OwnData { slot, .. } => {
                 let s = slot as usize;
                 if own == Some(s) && !m.attrs[s].accessor {
                     GetAct::Value(m.vals[s])
@@ -610,7 +668,7 @@ impl<'p> Vm<'p> {
                     GetAct::None
                 }
             }
-            IcEntry::OwnAcc { slot } => {
+            IcEntry::OwnAcc { slot, .. } => {
                 let s = slot as usize;
                 if own == Some(s) && m.attrs[s].accessor {
                     self.ic_acc_get_from(m, s)
@@ -767,14 +825,16 @@ impl<'p> Vm<'p> {
         }
         match self.ic_walk(recv, key) {
             Walked::OwnData { slot } => {
-                self.ic_install(func_id, ip, IcEntry::OwnData { slot: slot as u32 });
+                let shape = self.ic_recv_shape(recv);
+                self.ic_install(func_id, ip, IcEntry::OwnData { shape, slot: slot as u32 });
                 match self.ic_own_set_plan(recv, key, slot as u32) {
                     Some(p) => self.ic_apply_set(p, val),
                     None => SetAct::None,
                 }
             }
             Walked::OwnAcc { slot } => {
-                self.ic_install(func_id, ip, IcEntry::OwnAcc { slot: slot as u32 });
+                let shape = self.ic_recv_shape(recv);
+                self.ic_install(func_id, ip, IcEntry::OwnAcc { shape, slot: slot as u32 });
                 self.ic_own_acc_set(recv, key, slot as u32)
             }
             Walked::ClassMethod { .. } | Walked::ClassGetter { .. } => {
@@ -854,7 +914,7 @@ impl<'p> Vm<'p> {
         own: Option<usize>,
     ) -> Option<SetPlan> {
         match *e {
-            IcEntry::OwnData { slot } => {
+            IcEntry::OwnData { slot, .. } => {
                 let s = slot as usize;
                 if own == Some(s) && !m.attrs[s].accessor && m.attrs[s].writable {
                     Some(SetPlan::WriteOwn { idx, slot })
@@ -862,7 +922,7 @@ impl<'p> Vm<'p> {
                     None
                 }
             }
-            IcEntry::OwnAcc { slot } => {
+            IcEntry::OwnAcc { slot, .. } => {
                 let s = slot as usize;
                 if own == Some(s) && m.attrs[s].accessor {
                     let setter = m.attrs[s].setter;
@@ -999,9 +1059,10 @@ impl<'p> Vm<'p> {
             Walked::OwnData { slot } => {
                 let (_, m) = self.ic_recv_map(recv)?;
                 let v = m.vals[slot];
+                let shape = m.shape();
                 match self.ic_plain_fn(v) {
                     Some((fid, closure)) => {
-                        self.ic_install(func_id, ip, IcEntry::OwnData { slot: slot as u32 });
+                        self.ic_install(func_id, ip, IcEntry::OwnData { shape, slot: slot as u32 });
                         Some((fid, closure, v))
                     }
                     None => {
@@ -1061,7 +1122,7 @@ impl<'p> Vm<'p> {
         key: &str,
     ) -> Option<(u32, u32, Value)> {
         match *e {
-            IcEntry::OwnData { slot } => {
+            IcEntry::OwnData { slot, .. } => {
                 let s = slot as usize;
                 if own == Some(s) && !m.attrs[s].accessor {
                     let v = m.vals[s];

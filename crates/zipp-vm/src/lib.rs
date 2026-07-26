@@ -31,6 +31,14 @@ mod heap;
 /// Hand-written front end (lexer/AST/parser) being built to replace
 /// `oxc_parser` — see the module docs for why. Not yet wired in.
 mod parse;
+mod shape;
+
+/// Transition-tree diagnostics: `(nodes, max fan-out, total edges)`. Behind
+/// `ZIPP_SHAPESTATS=1` in the CLI — fan-out is what decides whether a linear
+/// scan of a node's outgoing edges is the right structure.
+pub fn shape_stats() -> (usize, usize, usize) {
+    shape::stats()
+}
 pub mod value;
 mod vm;
 

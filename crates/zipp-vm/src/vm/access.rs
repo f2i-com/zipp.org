@@ -995,7 +995,7 @@ impl<'p> Vm<'p> {
                     return self.reject_write("length", strict);
                 }
             }
-            let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+            let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
             if attr.is_some() {
                 m.set("length", val);
             } else {
@@ -1219,7 +1219,7 @@ impl<'p> Vm<'p> {
                 if !present && self.arr_props.get(&idx).map_or(false, |m| !m.extensible) {
                     return self.reject_write(key, strict);
                 }
-                self.fn_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+                self.fn_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
             }
             return Ok(true);
         }
@@ -1266,7 +1266,7 @@ impl<'p> Vm<'p> {
                     // own_attr block above, so only a writable data index reaches
                     // here — update it in place (preserving its attributes).
                     if self.array_index_override(idx, n).is_some() {
-                        self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+                        self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
                         self.heap.bump_version(idx);
                         return Ok(true);
                     }
@@ -1292,14 +1292,14 @@ impl<'p> Vm<'p> {
                     // billions-of-holes resize). Mirrors set_index's numeric path.
                     if n >= crate::vm::MAX_DENSE_ARRAY_LEN && !present {
                         if !self.arguments_objs.contains_key(&idx) {
-                            self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+                            self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
                             self.array_grow_js_len(idx, n);
                             self.heap.bump_version(idx);
                             return Ok(true);
                         }
                         // An ARGUMENTS object's past-the-end index stays an
                         // ordinary named own property (length is argc).
-                        self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+                        self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
                         self.heap.bump_version(idx);
                         return Ok(true);
                     }
@@ -1322,7 +1322,7 @@ impl<'p> Vm<'p> {
             {
                 return self.reject_write(key, strict);
             }
-            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
             if added {
                 self.heap.bump_version(idx);
             }
@@ -1352,7 +1352,7 @@ impl<'p> Vm<'p> {
             {
                 return self.reject_write(key, strict);
             }
-            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
             if added {
                 self.heap.bump_version(idx);
             }
@@ -1387,7 +1387,7 @@ impl<'p> Vm<'p> {
                     return self.reject_write(key, strict);
                 }
             }
-            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
             if added {
                 self.heap.bump_version(idx);
             }
