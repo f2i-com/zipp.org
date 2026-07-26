@@ -1316,6 +1316,40 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B40 — What "under 2x geomean" actually costs, computed from the current ratios
+
+Not an opinion — arithmetic on the ten numbers in §1, so it can be re-derived
+whenever they move:
+
+| scenario | geomean |
+|---|---|
+| today | **2.56x** |
+| `regex-log-scan` made EXACTLY as fast as V8 (4.09 -> 1.00) | 2.22x |
+| `typedarray-math` made EXACTLY as fast as V8 (3.89 -> 1.00) | 2.23x |
+| **BOTH of the two worst at V8 parity** | **1.94x** |
+| the worst THREE at V8 parity | 1.74x |
+| uniform alternative | **every bench 21.8% faster** |
+
+So the target is reached in exactly two ways: match V8 on the two hardest
+benchmarks in the suite — a compiled regex backend on par with Irregexp AND a
+numeric tier that closes DataView and the f64 kernels — or move every one of the
+ten by ~22%.
+
+That is the scoping fact this file was missing. It means:
+
+* Beating the WORST bench alone is not enough. Taking `regex-log-scan` from
+  4.09x to parity still leaves 2.22x.
+* No stack of 1-2% items composes into it. B29 (+0.1%), B33's result-object
+  sites, B36-corrected's `key_of` (~1-2%), B34 (+0.3%), B35 (0.1%) — the entire
+  named-mechanism inventory is roughly 3-5% together against the 21.8% needed.
+* The only single change with the right SHAPE is the one in B39: the MEM tier's
+  ~3.5ns per boxed op is paid by every bench, so improving it is the only lever
+  that is uniform. A 22% cut there is a 22% cut everywhere.
+
+Record any future "get to 2x" plan against this table. A proposal that does not
+either match V8 on two benches or move the MEM tier is not a plan for 2x,
+whatever else it is worth.
+
 ### B39 — The unifying number: the MEM tier costs ~3.5ns per boxed op, and
 everything object-shaped lands there
 
