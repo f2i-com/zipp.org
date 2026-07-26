@@ -55,22 +55,22 @@ constructed at all (`vm/intl.rs:436`).
 regression is a diff rather than a remembered number. Run both tiers — a JIT
 change that only *appears* correct is the common failure mode here.
 
-**Performance — geomean 2.56× slower than node (V8)** on the ten real-world
+**Performance — geomean 2.57× slower than node (V8)** on the ten real-world
 benchmarks in `bench/real/`, paired medians of 7, every output byte-identical
 to node:
 
 | bench | node | zipp | ratio |
 |---|---|---|---|
-| map-set-heavy | 579ms | 699ms | 1.21× |
-| json-large | 227ms | 468ms | 2.06× |
-| async-promise-chain | 299ms | 688ms | 2.30× |
-| parse-large-js | 241ms | 582ms | 2.42× |
-| polymorphic-objects | 293ms | 716ms | 2.44× |
-| markdown-render | 238ms | 633ms | 2.66× |
-| class-prototype-hot | 266ms | 740ms | 2.78× |
-| sparse-array | 50ms | 151ms | 3.02× |
-| typedarray-math | 171ms | 667ms | 3.89× |
-| regex-log-scan | 422ms | 1725ms | 4.09× |
+| map-set-heavy | 594ms | 723ms | 1.22× |
+| json-large | 230ms | 484ms | 2.10× |
+| async-promise-chain | 301ms | 693ms | 2.31× |
+| polymorphic-objects | 300ms | 708ms | 2.36× |
+| parse-large-js | 241ms | 583ms | 2.42× |
+| class-prototype-hot | 275ms | 741ms | 2.69× |
+| markdown-render | 238ms | 645ms | 2.71× |
+| sparse-array | 50ms | 151ms | 3.03× |
+| typedarray-math | 172ms | 674ms | 3.93× |
+| regex-log-scan | 411ms | 1741ms | 4.24× |
 
 Startup is ~4× faster than node (7ms vs 30ms — no snapshot to load).
 
@@ -90,48 +90,86 @@ every non-ASCII byte — its "byte-identical" claim was not true. Back-to-back
 runs of the same binary drift 3–10%, so `--ab old.exe new.exe` is the only
 reliable way to judge a change under a few percent.
 
+One known blind spot in the suite: **all ten benchmarks open with
+`"use strict"`.** That is realistic for modern bundles and unrepresentative of
+the long tail — a change worth 7.7× to sloppy-mode function calls landed in this
+repo and moved the suite 0.1%, because none of the ten could see it. Read a
+0% suite delta with that in mind before concluding a change did nothing.
+
 ### Why it trails, honestly
 
-This section has been rewritten three times because measurement refuted what it
-said. `PERF_ROADMAP.md` has the numbers and, deliberately, the negative results.
+This section has been rewritten four times because measurement refuted what it
+said. `PERF_ROADMAP.md` keeps the numbers and, deliberately, the negative
+results — of the last fourteen probes, twelve were refutations, and four of
+those refuted an earlier entry in that same file.
 
-1. **Object construction and result objects.** An `ObjMap` is three parallel
-   `Vec`s plus a `String` per key, so a small object is ~6 allocations. The
-   sharpest instance: `RegExp.prototype.exec` spends **316ns attaching
-   `index`/`input`/`groups`** to its result — more than the match itself —
-   split 128ns hash insert, 146ns three `Vec` allocations, 42ns the keys.
-2. **The regex matcher is an interpreter.** Matching costs 234ns where V8's
-   Irregexp, which compiles each pattern to native code, takes 22ns. Note this
-   is the opposite of the scanning win above: we are faster at *not* matching
-   (the memchr prefilter) and 10× slower at matching. Decomposed:
-   `regex-log-scan` is 59% regex, and half of *that* is the backtracking inner
-   loop at 6.9ns per failed match attempt against node's 0.37 — a `\d` or
-   `[a-z]` start predicate yields dozens of candidate positions per log line and
-   each is a full interpreted attempt. The other 41% of that bench is not regex
-   at all (corpus generation 34%), so even an infinitely fast matcher leaves it
-   at 2.9×.
-3. **Boxed values in the general JIT tier.** Every non-integer loop round-trips
-   through NaN-boxing with a tag guard per operation.
-4. **GC sweep is proportional to the heap, not the garbage.** Timing the phases:
-   sweep dominates mark, and its cost is `free_slot` dropping each dead object's
-   `Box` and three `Vec`s. That is what a generational nursery removes.
+**Start with the scale, because it disciplines everything else.** Computed from
+the ten ratios above:
+
+| scenario | geomean |
+|---|---|
+| today | 2.57× |
+| `regex-log-scan` made *exactly* as fast as V8 | 2.22× |
+| `typedarray-math` made *exactly* as fast as V8 | 2.24× |
+| **both of the two worst at V8 parity** | **1.94×** |
+| the uniform alternative | every bench 22.1% faster |
+
+So beating the worst benchmark outright is not enough, and no stack of 1–2%
+wins closes the gap. A plan that neither matches V8 on two benchmarks nor moves
+every operation is not a plan for 2×, whatever else it is worth.
+
+**One number explains most of the rest: the general (boxed) JIT tier costs
+~3.5ns per op.** A property read measured at 21ns is not a 21ns read — it is a
+six-operation iteration where every operation pays that rate. The INT tier does
+the same arithmetic at ~1ns/op and V8's optimised code at under 0.3ns/op. This
+is why making one operation dramatically cheaper keeps not showing up: a **7.7×**
+improvement to plain-function call dispatch moved the suite **0.1%**, because it
+made one op of six cheaper.
+
+Where the time actually is:
+
+1. **The regex matcher is an interpreter.** `regress` backtracks at 6.9ns per
+   failed match attempt where V8's Irregexp, which compiles each pattern to
+   native code, takes 0.37ns. A `\d` or `[a-z]` start predicate yields dozens of
+   candidate positions per log line and each is a full interpreted attempt. Note
+   this is the opposite of the scanning win noted above: we are faster at *not*
+   matching (the memchr prefilter) and ~10× slower at matching. Decomposed,
+   `regex-log-scan` is only 59% regex — the other 41% is corpus generation and a
+   `charCodeAt` hash — so even an infinitely fast matcher leaves it at 2.9×.
+2. **One allocation deoptimises its whole loop.** A loop containing `{}` is
+   declined and runs interpreted. With five integer ops in the body: 15.2ns
+   compiled, **80.0ns** once a single `{}` is added — the arithmetic did not
+   change, it just lost its tier. This is also why `Promise.resolve(x)` measures
+   40ns against node's 8ns despite allocating one heap slot and no `Vec`s.
+3. **Numeric kernels miss the unboxed tiers for planner reasons, not
+   representation ones.** `typedarray-math`'s phases decline with *"pinned
+   receiver reg not cleanly excludable"* and *"read-only live-in used where a
+   number isn't required"*. One of those causes turned out to be the bytecode
+   for `i++` taking one register more than `++i` — fixed — and the rest are
+   specified in `PERF_ROADMAP.md` B32.
 
 **What is NOT the problem**, each ruled out by measurement:
 
-- *Property-name interning.* Refuted four independent ways: an `Rc<str>` intern
-  table measured 5–8% slower, the regex-result decomposition put the three keys
-  at 42ns of 316, ablating the per-key `String` moved a 3-property literal
-  114 → 108ns, and interning the strings `for-in` hands out — which removes 7 of
-  the ~13 allocations an 8-key enumeration performs — measured +0.1%. Counting
+- *Property-name interning.* Refuted four independent ways, most recently by
+  interning the strings `for-in` hands out — which removes 7 of the ~13
+  allocations an 8-key enumeration performs — for **+0.1%**. Counting
   allocations does not locate time in this engine.
-- *Allocation admitted into JIT regions.* Built and measured: `{}` went 35 → 62ns
-  **slower**, because one win64 call costs more than the interpreter's own
-  `NewObject` arm. Four consecutive tier-admission attempts confirmed the rule —
-  admitting an op only wins when that tier's representation makes the op cheaper
-  than the tier it displaces.
-- *The microbenchmark object gap.* node reports `{}` at 0.2ns because escape
-  analysis removes the allocation entirely. Comparing 35ns against that and
-  calling the difference allocation cost was wrong.
+- *A cheaper object layout.* `{}` costs 33.2ns here and **0.5ns** in node, flat
+  in property count. V8 is not allocating faster; V8 is not allocating. Escape
+  analysis deletes the object. A cheaper object is still an object.
+- *A naively slow compiled tier.* Audited rather than assumed: constant-key
+  property reads already use an 8-way inline cache that is call-free on a hit,
+  and pinned dense-Array and TypedArray element access, monomorphic method calls
+  and leaf calls are all inlined. Only a property access with a *non-constant*
+  key still goes through a helper.
+- *A lazier GC.* Tripling the collection threshold again (on top of an earlier
+  3× that did pay) measured **+1.2% slower** — a larger live heap costs more in
+  cache misses than the skipped collections save.
+
+The single change with the right shape is hidden classes: a shape-keyed guard
+lifts the existing inline cache off its 8-receiver identity cliff, and the same
+infrastructure gives escape analysis and inline bump allocation. Everything
+above is a symptom of its absence.
 
 ## Coverage
 
@@ -147,11 +185,16 @@ symbols, ES modules including top-level await and import attributes, `eval`,
 the modern `RegExp` surface (named groups, lookbehind, `/d` indices, `/v`
 unicode sets).
 
-Known gaps: the remaining static-semantics early errors (above), decorators
-(the parser has no `@` yet), `using`/`await using` declarations, most of `Intl`
-beyond `en-US` `NumberFormat`, `Float16Array`, and `console` is a compile-time
-pattern match rather than a real global object (so `const log = console.log`
-throws).
+`using` / `await using` declarations are supported, including the rules that
+make them awkward: disposal is scoped to a block, so the declaration is barred
+from a Script's top level, an eval's top level and a bare `CaseClause`; each
+declarator binds a plain identifier rather than a pattern; and there is no
+for-in form. 148 of 152 `using` executions and 182 of 184 `await using` pass.
+
+Known gaps: **decorators** (the parser has no `@` yet — 34 executions), the
+remaining static-semantics early errors (above), most of `Intl` beyond `en-US`
+`NumberFormat`, `Float16Array`, and `console` is a compile-time pattern match
+rather than a real global object (so `const log = console.log` throws).
 
 ## The front end
 
