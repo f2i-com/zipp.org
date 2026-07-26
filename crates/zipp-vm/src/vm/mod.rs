@@ -420,6 +420,22 @@ pub struct Vm<'p> {
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
     proto_of: rustc_hash::FxHashMap<u32, Value>,
+    /// Per-function-id LEARNED own-property count of the instances a user
+    /// constructor produces, used to pre-size the next instance's `ObjMap`.
+    ///
+    /// An object literal gets its size from `NewObject { hint }`, which the
+    /// compiler fills in by counting the literal's static keys; a constructor
+    /// has no equivalent, so `new P(a, b)` started from an EMPTY map and every
+    /// `this.x = v` paid an allocation-or-regrow of all three parallel vectors.
+    /// Measured, that made a two-field constructor 71ns/field against the same
+    /// two fields in a literal at 28ns/field.
+    ///
+    /// Learned rather than computed from the bytecode because the property count
+    /// is a runtime fact — conditional assignments, a loop over a config object,
+    /// a superclass — and getting it slightly wrong costs only capacity. It is a
+    /// pure allocation hint: it never changes which properties exist, so a stale
+    /// or absent entry is always correct.
+    ctor_field_hint: Vec<u16>,
     /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.

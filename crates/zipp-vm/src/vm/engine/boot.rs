@@ -109,6 +109,7 @@ impl<'p> Vm<'p> {
             brand_owner: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),
             proto_of: rustc_hash::FxHashMap::default(),
+            ctor_field_hint: Vec::new(),
             fn_props: rustc_hash::FxHashMap::default(),
             arr_props: rustc_hash::FxHashMap::default(),
             ab_max: std::collections::HashMap::new(),

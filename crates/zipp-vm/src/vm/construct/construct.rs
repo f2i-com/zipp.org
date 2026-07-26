@@ -711,13 +711,47 @@ impl<'p> Vm<'p> {
                     proto = Value::heap(rp);
                 }
             }
-            let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
+            // Pre-size the instance from what THIS constructor's previous
+            // instances ended up holding (see `ctor_field_hint`). Without it the
+            // map starts empty and the first `this.x = v` allocates all three
+            // parallel vectors, the second regrows them, and so on — a two-field
+            // constructor cost 71ns/field against 28ns/field for the same fields
+            // written as a literal, which gets its size from `NewObject { hint }`.
+            let fid = match self.heap.get(cv.heap_index()) {
+                HeapObj::Func(f) => Some(*f),
+                HeapObj::Closure { func, .. } => Some(*func),
+                _ => None,
+            };
+            let hint = fid
+                .and_then(|f| self.ctor_field_hint.get(f as usize).copied())
+                .unwrap_or(0);
+            let obj = Value::heap(
+                self.heap.alloc(HeapObj::Object(Box::new(ObjMap::with_capacity(hint as usize)))),
+            );
             if proto.is_heap() {
                 self.proto_of.insert(obj.heap_index(), proto);
             }
             // `new.target` for the constructor body (the next frame entered).
             self.pending_new_target = new_target;
             let ret = self.call_value(cv, obj, args)?;
+            // Learn this constructor's instance size for the next `new`. Taken as
+            // a high-water mark so a constructor with a conditional field settles
+            // on the larger shape rather than oscillating; capacity is cheap and
+            // regrowth is what we are paying to avoid.
+            if let Some(f) = fid {
+                let n = match self.heap.get(obj.heap_index()) {
+                    HeapObj::Object(m) => m.keys.len().min(u16::MAX as usize) as u16,
+                    _ => 0,
+                };
+                if n > 0 {
+                    if self.ctor_field_hint.len() <= f as usize {
+                        self.ctor_field_hint.resize(f as usize + 1, 0);
+                    }
+                    if n > self.ctor_field_hint[f as usize] {
+                        self.ctor_field_hint[f as usize] = n;
+                    }
+                }
+            }
             // A constructor that returns ANY object (TypedArray/Map/Date/… too, not
             // just a plain object/array) replaces the new instance with it.
             if self.is_object_value(ret) {
