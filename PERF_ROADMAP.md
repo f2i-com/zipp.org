@@ -1089,6 +1089,47 @@ DataView, this). The pattern is now explicit enough to state as a rule:
 makes the op cheaper than the tier it is displacing.** Blacklist counts and
 decline logs identify candidates; they do not predict the sign of the change.
 
+### B24 — B4 "admit allocation into JIT regions" is REFUTED (built, correct, slower)
+
+`region_can_compile` had no arm for `NewObject` or `AppendDataProp`, so **any
+loop containing an object literal was declined at every tier and ran wholly in
+the interpreter.** That is worth stating plainly because it invalidates how the
+object-construction numbers elsewhere in this file were read: `{}` at 34ns and
+`{a:i,b:i}` at 92ns were INTERPRETED-loop measurements, not compiled ones, and
+the "object construction is 143x off" framing conflated allocation cost with
+never being compiled at all.
+
+So it was built: `jit_new_object` / `jit_append_data_prop` win64 helpers, the
+`HeapHelpers` wiring, admission, and memory-path emitters following the
+`StrConcat` allocating-op discipline (pinned-pointer re-derivation after each
+call). Output verified identical to node and to the interpreter. Regions
+compiled, no deopts, no evictions — it worked exactly as intended.
+
+And it is SLOWER than interpreting:
+
+    {}          35 -> 62ns          {a,b,c}   111 -> 123ns
+    {a:1}       74 -> 70ns          {a..f}    167 -> 207ns
+    {a,b}       94 -> 103ns         new P2    254 -> 381ns
+
+`{}` is the clean case: that loop has no `GetProp`, so no pinned-pointer refetch
+runs, and it STILL went 35 -> 62ns. The win64 call sequence for one allocation
+costs more than the interpreter's own `NewObject` arm, and a 6-property literal
+pays it seven times.
+
+This is the B23 rule applied to allocation, and it is now the FOURTH consecutive
+confirmation: MathOp, UpvalGet, f64-path Bitwise, and now NewObject —
+**admitting an op to a tier is only a win when that tier's representation makes
+the op cheaper than the tier it displaces.** An op that lowers to a helper call
+is not cheaper in a region than it is in the interpreter; the interpreter's
+dispatch for it is already a direct match arm. Region compilation pays off on
+ARITHMETIC and register traffic, which is why the Bitwise-into-Tier-C change won
+and every helper-call admission has lost.
+
+The corollary for B4 as written: allocation will not become cheaper by being
+admitted to a region. It becomes cheaper by allocating less, or by allocating
+into something cheaper than the current heap-slot-plus-Box-plus-three-Vecs — the
+substrate work — and only then is admitting it worth revisiting.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
