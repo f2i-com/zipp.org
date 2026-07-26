@@ -1316,6 +1316,37 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B42 — async-promise-chain, phase-split for the first time
+
+Never analysed before, and it is the last bench in the suite that had no phase
+table. `Promise.all` dominates it, not the then-chain:
+
+| part | zipp | node | ratio |
+|---|---|---|---|
+| A — 1.5M-link `.then` chain | 251ms | 154ms | 1.63x |
+| B — 1.5M `await` of a resolved promise | 100ms | 30ms | 3.33x |
+| **C — 30k x `Promise.all` of 100** | **288ms** | **89ms** | **3.24x** |
+
+C is +199ms of the bench's +366ms gap. Split further, 20k batches of 100:
+
+| | zipp | node |
+|---|---|---|
+| `Promise.resolve(j)` alone | **40ns/elem** | 8ns |
+| `Promise.all` over pre-built promises | 41ns/elem | 21ns |
+| both together | 80ns/elem | 26ns |
+| array fill only (control) | 8ns/elem | 2ns |
+
+So `Promise.resolve` is the single largest term. **And it is not the promise
+allocation.** The fast path (`natives.rs` PROMISE_RESOLVE -> `to_promise` ->
+`alloc_promise` + `resolve`) is one heap slot with two EMPTY `Vec`s (no malloc),
+and `resolve` short-circuits before the thenable check for a non-heap value. The
+work is ~10ns; the measured 40ns is the loop being interpreted, because
+`a[j] = Promise.resolve(j)` allocates and B38's blacklist applies.
+
+That is the fifth independent area — objects, enumeration, calls, property
+access, and now promises — where the measured per-op figure resolves to the same
+cause. Recorded so the next person does not re-derive it from promises too.
+
 ### B41 — The MEM tier is already well optimised. There is no single missing mechanism.
 
 Checked the emitter rather than assuming. `codegen/region_mem.rs` already emits
