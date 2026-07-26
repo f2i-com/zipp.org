@@ -42,30 +42,30 @@ be constructed at all (`vm/intl.rs:436`).
 `tools/test262-expected-failures.txt` is the checked-in baseline, so a
 regression is a diff rather than a remembered number.
 
-**Performance — geomean 2.82× slower than node (V8)** on the ten real-world
+**Performance — geomean 2.73× slower than node (V8)** on the ten real-world
 benchmarks in `bench/real/`, best-of-5, every output byte-identical to node:
 
 | bench | node | zipp | ratio |
 |---|---|---|---|
-| map-set-heavy | 552ms | 790ms | 1.43× |
-| async-promise-chain | 305ms | 752ms | 2.47× |
-| json-large | 220ms | 545ms | 2.48× |
-| polymorphic-objects | 291ms | 731ms | 2.51× |
-| parse-large-js | 235ms | 609ms | 2.59× |
-| class-prototype-hot | 262ms | 750ms | 2.86× |
-| markdown-render | 231ms | 730ms | 3.16× |
-| sparse-array | 49ms | 166ms | 3.39× |
-| typedarray-math | 172ms | 677ms | 3.94× |
-| regex-log-scan | 412ms | 1909ms | 4.63× |
+| map-set-heavy | 572ms | 733ms | 1.28× |
+| polymorphic-objects | 299ms | 726ms | 2.43× |
+| async-promise-chain | 300ms | 733ms | 2.44× |
+| json-large | 223ms | 558ms | 2.50× |
+| parse-large-js | 232ms | 607ms | 2.62× |
+| markdown-render | 240ms | 669ms | 2.79× |
+| class-prototype-hot | 258ms | 762ms | 2.95× |
+| sparse-array | 47ms | 161ms | 3.43× |
+| typedarray-math | 170ms | 676ms | 3.98× |
+| regex-log-scan | 419ms | 1738ms | 4.15× |
 
-Startup is ~2× faster than node (25ms vs 51ms — no snapshot to load).
+Startup is ~2× faster than node (26ms vs 53ms — no snapshot to load).
 
 zipp does beat V8 on specific shapes: scalar-numeric kernels, self-recursive
 integer functions, `s += …` string accumulation, non-capturing arithmetic array
-pipelines, `for-of` over TypedArray elements, and — measured — **regex scanning**
-(a 2000-char no-match `test` runs 25ms against node's 42ms). Those wins do not
-carry to the benches above, which are dominated by object construction, property
-access and enumeration.
+pipelines, `for-of` over TypedArray elements, and — measured — **regex scanning
+that does not match** (a 2000-char no-match `test` runs 25ms against node's
+42ms). Those wins do not carry to the benches above, which are dominated by
+object construction, property access, and building result objects.
 
 Run `bash bench/run_real.sh` to reproduce; results land in
 `bench/results_real.txt`. Run-to-run variance is ±10%, so treat small
@@ -74,40 +74,49 @@ differences as noise — `bench/quick.sh` is a 4-bench subset for iteration and
 
 ### Why it trails, honestly
 
-This section used to list three causes. Two of them were wrong, and measuring
-them is what produced the current list. Details and the numbers are in
-`PERF_ROADMAP.md`; the short version:
+This section has been rewritten twice because measurement refuted what it said.
+Details and numbers are in `PERF_ROADMAP.md`; the short version:
 
-1. **Object construction, ~143× off.** `new Pt(x,y)` costs 287ns and
-   `{a:1,b:2,c:3}` 108ns, against roughly 2ns. Decomposed, that is ~21ns for the
-   heap slot plus ~58ns for the FIRST property and ~17ns for each one after.
-   Property *reads* are fine by comparison — 2.6ns, about 6.5× off.
-2. **Boxed values in the general JIT tier.** Every non-integer loop round-trips
+1. **Object construction, and building result objects.** `new Pt(x,y)` and
+   `{a:1,b:2,c:3}` cost tens of nanoseconds against roughly 2ns. An `ObjMap` is
+   three separate `Vec`s plus a `String` per key, so a small object is ~6
+   allocations. The clearest single instance: `RegExp.prototype.exec` spends
+   **316ns attaching `index`/`input`/`groups`** to its result — more than the
+   match itself — of which 128ns is one hash insert into the array side table and
+   146ns is those three `Vec` allocations. Property *reads* are fine by
+   comparison (~2.6ns monomorphic).
+2. **The regex matcher is an interpreter.** Matching alone costs 234ns where V8's
+   Irregexp — which compiles each pattern to native code — takes 22ns. Note this
+   is the opposite conclusion from the "regex scanning" win above: we are faster
+   at *not* matching (the memchr prefilter) and 10× slower at matching.
+3. **Boxed values in the general JIT tier.** Every non-integer loop round-trips
    values through NaN-boxing with a tag guard per operation. Only an optimizing
    tier that keeps values unboxed across operations removes it.
-3. **Regions decline `for-of` and allocation.** A `for-of` loop is declined
-   outright — not because of the iterator op, but because it desugars to a
-   try/finally and the region contains the `PushHandler`. Every `for-of` in the
-   engine therefore runs interpreted.
+4. **Regions decline `for-of`.** Not because of the iterator op — that was tried
+   and changed nothing — but because `for-of` desugars to a try/finally and the
+   region contains the per-iteration `PushHandler`. Compiled code would need
+   exception-handler state. Worth knowing before spending on it: for-of accounts
+   for only ~7% of the `matchAll` loop it appears in; the regex work is the rest.
 
 **What is NOT the problem**, each ruled out by measurement rather than argument:
 
-- *The regex engine.* It was previously called "41.8% of everything left, and it
-  is the MATCHER". Matching cost is flat in subject length (the memchr prefilter
-  works) and we are faster than V8 on a pure scan. The gap is per-call dispatch
-  and result-object construction.
-- *Property-name interning.* The obvious fix for cause 1 above — `Rc<str>` keys
-  behind an intern table — was built to completion and is **5-8% slower**: the
-  hash-and-probe costs more than the small `malloc` it replaces.
+- *Property-name interning.* Built to completion behind an `Rc<str>` intern
+  table and it is **5-8% slower** — the hash-and-probe costs more than the small
+  `malloc` it replaces. Independently confirmed later: of the 316ns above, the
+  three `String` keys are only 42ns of it.
 - *Inline property storage.* `SmallVec` inline slots make construction 1.4-1.9×
-  faster in isolation but regress the suite 2.82× → 3.05×, because
-  `HeapObj::Object(ObjMap)` stores the map inline and every heap slot grows.
-  Boxing `ObjMap` is the prerequisite.
+  faster in isolation but regressed the suite, because every `HeapObj` slot grew.
+  Slot size turned out to be a first-order lever in its own right — adding 64
+  bytes of pure padding to `HeapObj` cost 7.9% — so the fat variants are now
+  boxed (`Object(Box<ObjMap>)`, `Combinator(Box<…>)`), 112 → 80 bytes.
+- *The regex engine's scanning.* Matching cost is flat in subject length and we
+  beat V8 on a pure no-match scan. It is capture-and-build that is slow, not the
+  search.
 
-The next concrete step is `HeapObj::Object(Box<ObjMap>)`, then inline storage on
-top of it. `PERF_ROADMAP.md` carries the full plan with per-task file:line
-anchors, and — deliberately — the negative results too, since each cost a day to
-learn and none of them is visible from reading the code.
+The next concrete steps are the stable paged/slab object arena with hidden
+shapes, and an SSA optimizing tier. `PERF_ROADMAP.md` carries the full plan with
+per-task `file.rs:line` anchors and — deliberately — the negative results too,
+since each cost a day to learn and none is visible from reading the code.
 
 ## Coverage
 
@@ -127,12 +136,46 @@ Known gaps: static-semantics early errors (above), most of `Intl` beyond
 `en-US` `NumberFormat`, `Float16Array`, and `console` is a compile-time pattern
 match rather than a real global object (so `const log = console.log` throws).
 
+## How the JIT is organised
+
+Compilation is triggered by a loop back-edge (OSR) after 8 trips, or
+whole-function once a function is hot enough. A loop region is offered to four
+tiers in order, and takes the first that accepts it:
+
+| tier | value representation | accepts |
+|---|---|---|
+| SROA | scalars promoted out of memory | the narrowest shapes |
+| INT | raw `i64` in the low half of an xmm home | provably integer loops |
+| REGALLOC | `f64` in xmm homes | numeric loops with fractions |
+| MEM | boxed `Value`s, per-site inline caches | almost anything else |
+
+The INT tier is the one that beats V8, so most performance work is really about
+widening what it will accept. It reaches integer arithmetic and bitwise ops,
+`Math.imul`, pinned `Int32Array` elements, flat-ASCII `str.charCodeAt`/`.length`,
+and dense all-integer `Array` reads plus `.length`. A "pin" snapshots a
+receiver's identity, base pointer and length in the prologue; every access
+re-checks identity and bounds, so a wrong or stale pin degrades to the generic
+helper rather than to a wrong answer.
+
+Correctness rests on two invariants worth knowing before touching it. Every
+add/sub is range-checked against ±2^53 and bails to the interpreter if it leaves
+the range where f64 is exact. And an `i64` home cannot represent `-0`, so every
+path that could introduce one — `Neg` of zero, an entry load of `-0.0`, which
+`ucomisd` reports equal to `+0.0` — must bail instead.
+
+Everything the tier cannot represent becomes a *side exit*: the region flushes
+every home back to the register file and resumes the interpreter at an exact ip.
+Deopts are counted per region; 64 of them evict the region and it recompiles a
+tier down. That counter is the most useful debugging signal in the engine — a
+change that makes something slower while still printing the right answer usually
+shows up there first.
+
 ## Layout
 
 ```
 crates/zipp-vm/src/
-  compile/     AST -> register bytecode (13 modules)
-  codegen/     native x86-64 JIT, dynasm (16 modules)
+  compile/     AST -> register bytecode (14 modules)
+  codegen/     native x86-64 JIT, dynasm (15 modules)
   vm/          the runtime: dispatch, natives, props, construct, temporal, …
   heap.rs      object model, ObjMap, GC
   value.rs     NaN-boxed Value
@@ -167,6 +210,23 @@ Any change touching the JIT must produce identical output both ways —
 only *appears* correct is the common failure mode here: several bugs found in
 this engine returned right answers and were caught by a deopt counter or a
 missing speedup, not by a test.
+
+Two habits earned the hard way, both worth keeping:
+
+- **Never put an `std::env::var` probe on a hot path**, not even to instrument an
+  ablation. Doing so inflated every variant of one measurement by ~90ns and
+  produced a confidently wrong conclusion — twice. Read it once into a
+  `OnceLock`.
+- **Guard on a value, not a tag.** An intrinsic gated on `is_int()` looked
+  correct and made its benchmark faster while quietly causing 150 deopts and two
+  region evictions, because an integral value can be double-tagged.
+
+test262 is the real gate for anything touching property semantics; the unit
+suite will not catch it. Two examples from this repo: a fast path for ordinary
+property writes assumed `%Object.prototype%` carries no accessor for an ordinary
+key (a program can install one), and missed that class accessors live in
+`ClassData` rather than the prototype's `ObjMap`. Both returned right answers on
+every hand-written test.
 
 ## License
 
