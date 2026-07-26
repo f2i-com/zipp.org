@@ -26,6 +26,7 @@
 
 pub mod ast;
 pub mod lexer;
+pub mod oxc_bridge;
 pub mod token;
 
 #[cfg(test)]

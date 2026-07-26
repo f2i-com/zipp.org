@@ -210,6 +210,13 @@ pub enum Expr {
     Class(Box<Class>),
     Yield { arg: Option<Box<Expr>>, delegate: bool },
     Await(Box<Expr>),
+    /// `#brand in obj` — a private brand check.
+    ///
+    /// Not a `Member`: there is no object being keyed, the private name is the
+    /// LEFT operand of `in`. Giving it its own variant rather than bending
+    /// `MemberProp::Private` keeps `in`'s two operand shapes from being
+    /// confusable, and the compiler already emits a distinct opcode for it.
+    PrivateIn { name: Name, object: Box<Expr> },
     /// `new.target`
     NewTarget,
     /// `import.meta`

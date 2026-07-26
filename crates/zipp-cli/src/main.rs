@@ -92,6 +92,58 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{}", zipp_vm::compile_to_text(&src, module)?);
             Ok(())
         }
+        Some("ast") => {
+            // Parse with oxc, lower to zipp's AST, print it. The bridge's
+            // debugging aid and the input side of the Stage 1 gate.
+            let mut path = None;
+            let mut module = false;
+            let mut sweep = false;
+            for a in it.by_ref() {
+                match a.as_str() {
+                    "--module" => module = true,
+                    "--sweep" => sweep = true,
+                    other => path = Some(other.to_string()),
+                }
+            }
+            let path = path.ok_or("usage: zipp ast <file-or-dir> [--module] [--sweep]")?;
+            if !sweep {
+                let src = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("cannot read '{path}': {e}"))?;
+                println!("{}", zipp_vm::lower_to_text(&src, module)?);
+                return Ok(());
+            }
+            // Sweep: lower everything and report what the AST cannot yet say.
+            let mut files = Vec::new();
+            collect_js(std::path::Path::new(&path), &mut files);
+            files.sort();
+            let (mut ok, mut unsupported, mut unparsed) = (0usize, 0usize, 0usize);
+            let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+            for f in &files {
+                let Ok(src) = std::fs::read_to_string(f) else { continue };
+                let m = f.extension().is_some_and(|e| e == "mjs");
+                match zipp_vm::lower_to_text(&src, m) {
+                    Ok(_) => ok += 1,
+                    Err(e) if e.starts_with("SyntaxError") => unparsed += 1,
+                    Err(e) => {
+                        unsupported += 1;
+                        // Group by reason, not by file: one gap usually explains many.
+                        let key = e.splitn(2, " at ").next().unwrap_or(&e).to_string();
+                        *reasons.entry(key).or_default() += 1;
+                    }
+                }
+            }
+            println!("{} files: {ok} lowered, {unsupported} unsupported, {unparsed} not valid JS", files.len());
+            if !reasons.is_empty() {
+                println!("
+unsupported by reason:");
+                let mut v: Vec<_> = reasons.into_iter().collect();
+                v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                for (r, n) in v.iter().take(25) {
+                    println!("  {n:5}  {r}");
+                }
+            }
+            Ok(())
+        }
         Some("bcdiff") => {
             // The differential gate. Compiles every file in the corpus TWICE
             // and compares the canonical Programs.
