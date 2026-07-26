@@ -1,7 +1,7 @@
 //! Free-variable analysis for closures.
 //!
 //! Two questions drive closure compilation, both answered by a pure walk of the
-//! oxc AST (no register/compiler state):
+//! AST (no register/compiler state):
 //!
 //! * **`free_vars(fn)`** — names a function references but does not bind itself,
 //!   propagated up through nested functions. A name free in an inner function
@@ -22,11 +22,14 @@
 
 use std::collections::HashSet;
 
-use oxc_ast::ast as ox;
+use crate::parse::ast::{
+    Arg, ArrayElem, Arrow, ArrowBody, Class, ClassMember, Expr, ForInit, ForTarget, Function,
+    MemberProp, ObjectMember, Params, Pattern, PropKey, Stmt, Target,
+};
 
 /// Names a function body references but does not bind (propagated through nested
 /// functions). `params` are the function's parameters.
-pub fn free_vars(params: &[String], body: &[ox::Statement]) -> HashSet<String> {
+pub fn free_vars(params: &[String], body: &[Stmt]) -> HashSet<String> {
     let mut refs = HashSet::new();
     let mut bound: HashSet<String> = params.iter().cloned().collect();
     collect_bound_in_body(body, &mut bound);
@@ -37,53 +40,69 @@ pub fn free_vars(params: &[String], body: &[ox::Statement]) -> HashSet<String> {
     refs
 }
 
+/// The same, for an ARROW body, which may be a bare expression.
+///
+/// oxc funnelled `x => x + 1` through a `FunctionBody` holding exactly one
+/// synthetic `ExpressionStatement`, so the callers said `&a.body.statements` and
+/// got the expression walked as a statement. `ArrowBody::Expr` says it directly
+/// and there is no statement list to hand over, hence the extra entry point.
+/// The expression arm is byte-identical to what the synthetic statement gave:
+/// an expression body declares nothing, so only `params` are bound.
+pub fn free_vars_arrow(params: &[String], body: &ArrowBody) -> HashSet<String> {
+    match body {
+        ArrowBody::Block(b) => free_vars(params, &b.stmts),
+        ArrowBody::Expr(e) => {
+            let mut refs = HashSet::new();
+            let bound: HashSet<String> = params.iter().cloned().collect();
+            expr_refs(e, &mut refs);
+            refs.retain(|n| !bound.contains(n));
+            refs
+        }
+    }
+}
+
 /// Whether any parameter DEFAULT expression references `name` (free) — used
 /// to detect a possible direct eval in the parameter scope.
-pub fn params_reference(name: &str, params: &ox::FormalParameters) -> bool {
+pub fn params_reference(name: &str, params: &Params) -> bool {
     let mut refs = HashSet::new();
+    // A parameter default is `Pattern::Assign` and the rest parameter is
+    // `Pattern::Rest`, both INSIDE `items` — oxc kept the initializer on
+    // `FormalParameter::initializer` and the rest in its own field, so the two
+    // side channels the old code had to read separately are now one list.
     for item in &params.items {
-        if let Some(init) = &item.initializer {
-            expr_refs(init, &mut refs);
-        }
-        pattern_init_refs(&item.pattern, &mut refs);
-    }
-    if let Some(r) = &params.rest {
-        pattern_init_refs(&r.rest.argument, &mut refs);
+        pattern_init_refs(item, &mut refs);
     }
     refs.contains(name)
 }
 
 /// Collect every name referenced by a DEFAULT-VALUE expression nested anywhere
 /// inside a binding pattern (array/object destructuring element defaults).
-fn pattern_init_refs(pat: &ox::BindingPattern, out: &mut HashSet<String>) {
-    use ox::BindingPattern as P;
+fn pattern_init_refs(pat: &Pattern, out: &mut HashSet<String>) {
     match pat {
-        P::BindingIdentifier(_) => {}
-        P::AssignmentPattern(ap) => {
-            expr_refs(&ap.right, out);
-            pattern_init_refs(&ap.left, out);
+        Pattern::Ident(_) => {}
+        Pattern::Assign { left, right } => {
+            expr_refs(right, out);
+            pattern_init_refs(left, out);
         }
-        P::ObjectPattern(op) => {
-            for prop in &op.properties {
+        Pattern::Rest(inner) => pattern_init_refs(inner, out),
+        Pattern::Object { props, rest } => {
+            for prop in props {
                 // A computed key `{[expr]: v}` evaluates in the param scope —
                 // an eval there introduces vars like an element default does.
-                if prop.computed {
-                    if let Some(ke) = prop.key.as_expression() {
-                        expr_refs(ke, out);
-                    }
+                if let PropKey::Computed(ke) = &prop.key {
+                    expr_refs(ke, out);
                 }
                 pattern_init_refs(&prop.value, out);
             }
-            if let Some(rest) = &op.rest {
-                pattern_init_refs(&rest.argument, out);
+            if let Some(rest) = rest {
+                pattern_init_refs(rest, out);
             }
         }
-        P::ArrayPattern(arr) => {
-            for el in arr.elements.iter().flatten() {
-                pattern_init_refs(el, out);
-            }
-            if let Some(rest) = &arr.rest {
-                pattern_init_refs(&rest.argument, out);
+        Pattern::Array(elems) => {
+            // A hole is `None`; the rest element, if any, is the last entry and
+            // is a `Pattern::Rest` handled by the arm above.
+            for el in elems.iter().flatten() {
+                pattern_init_refs(&el.pat, out);
             }
         }
     }
@@ -121,7 +140,7 @@ fn params_free(p: &ox::FormalParameters, bound: &[String], out: &mut HashSet<Str
 }
 
 /// The function's own bindings that some directly-nested function captures.
-pub fn captured_locals(params: &[String], body: &[ox::Statement]) -> HashSet<String> {
+pub fn captured_locals(params: &[String], body: &[Stmt]) -> HashSet<String> {
     let mut bound: HashSet<String> = params.iter().cloned().collect();
     collect_bound_in_body(body, &mut bound);
 
@@ -133,11 +152,24 @@ pub fn captured_locals(params: &[String], body: &[ox::Statement]) -> HashSet<Str
     bound.intersection(&nested_free).cloned().collect()
 }
 
+/// The same, for an ARROW body — see [`free_vars_arrow`] for why this exists.
+pub fn captured_locals_arrow(params: &[String], body: &ArrowBody) -> HashSet<String> {
+    match body {
+        ArrowBody::Block(b) => captured_locals(params, &b.stmts),
+        ArrowBody::Expr(e) => {
+            let bound: HashSet<String> = params.iter().cloned().collect();
+            let mut nested_free = HashSet::new();
+            collect_nested_free_expr(e, &mut nested_free);
+            bound.intersection(&nested_free).cloned().collect()
+        }
+    }
+}
+
 /// True when a nested ARROW (transitively, with no intervening ordinary function
 /// — ordinary functions bind their own `arguments`, see `fn_node_free`) references
 /// `arguments`. The nearest enclosing ordinary function must then materialize and
 /// box its `arguments` object so the arrow can capture it lexically as an upvalue.
-pub fn nested_uses_arguments(body: &[ox::Statement]) -> bool {
+pub fn nested_uses_arguments(body: &[Stmt]) -> bool {
     let mut nested_free = HashSet::new();
     for s in body {
         collect_nested_free(s, &mut nested_free);
@@ -147,89 +179,92 @@ pub fn nested_uses_arguments(body: &[ox::Statement]) -> bool {
 
 // ── bound-name collection (this scope only; does NOT descend into nested fns) ──
 
-fn collect_bound_in_body(body: &[ox::Statement], out: &mut HashSet<String>) {
+fn collect_bound_in_body(body: &[Stmt], out: &mut HashSet<String>) {
     for s in body {
         collect_bound_stmt(s, out);
     }
 }
 
-fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
-    use ox::Statement as S;
+fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
     match s {
-        S::VariableDeclaration(d) => {
-            for decl in &d.declarations {
+        Stmt::VarDecl(d) => {
+            for decl in &d.decls {
                 collect_pattern_names(&decl.id, out);
             }
         }
-        S::FunctionDeclaration(f) => {
-            if let Some(id) = &f.id {
-                out.insert(id.name.to_string());
+        Stmt::FnDecl(f) => {
+            if let Some(n) = &f.name {
+                out.insert(n.to_string());
             }
         }
         // A class declaration is a lexical binding like `let`/`const`: a nested
         // closure that captures it must see it boxed (so a forward-materialised
         // function can hold its cell).
-        S::ClassDeclaration(c) => {
-            if let Some(id) = &c.id {
-                out.insert(id.name.to_string());
+        Stmt::ClassDecl(c) => {
+            if let Some(n) = &c.name {
+                out.insert(n.to_string());
             }
         }
         // Recurse into nested *statements* (blocks, loops, if) but NOT into
         // nested function bodies — those introduce their own scope.
-        S::BlockStatement(b) => collect_bound_in_body(&b.body, out),
-        S::IfStatement(i) => {
-            collect_bound_stmt(&i.consequent, out);
-            if let Some(a) = &i.alternate {
+        Stmt::Block(b) => collect_bound_in_body(b, out),
+        Stmt::If { cons, alt, .. } => {
+            collect_bound_stmt(cons, out);
+            if let Some(a) = alt {
                 collect_bound_stmt(a, out);
             }
         }
-        S::WhileStatement(w) => collect_bound_stmt(&w.body, out),
-        S::DoWhileStatement(d) => collect_bound_stmt(&d.body, out),
-        S::ForStatement(f) => {
-            if let Some(ox::ForStatementInit::VariableDeclaration(d)) = &f.init {
-                for decl in &d.declarations {
+        Stmt::While { body, .. } => collect_bound_stmt(body, out),
+        Stmt::DoWhile { body, .. } => collect_bound_stmt(body, out),
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::Var(d)) = init {
+                for decl in &d.decls {
                     collect_pattern_names(&decl.id, out);
                 }
             }
-            collect_bound_stmt(&f.body, out);
+            collect_bound_stmt(body, out);
         }
         // for-of / for-in declare their loop variable too, so a closure that
         // captures it must see it boxed.
-        S::ForOfStatement(f) => {
-            if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
-                for decl in &d.declarations {
+        Stmt::ForOf { left, body, .. } => {
+            if let ForTarget::Var(d) = left {
+                for decl in &d.decls {
                     collect_pattern_names(&decl.id, out);
                 }
             }
-            collect_bound_stmt(&f.body, out);
+            collect_bound_stmt(body, out);
         }
-        S::ForInStatement(f) => {
-            if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
-                for decl in &d.declarations {
+        Stmt::ForIn { left, body, .. } => {
+            if let ForTarget::Var(d) = left {
+                for decl in &d.decls {
                     collect_pattern_names(&decl.id, out);
                 }
             }
-            collect_bound_stmt(&f.body, out);
+            collect_bound_stmt(body, out);
         }
         // Descend into try/switch/labeled bodies so a binding declared inside one
         // that a nested closure captures is detected (and boxed).
-        S::TryStatement(t) => {
-            collect_bound_in_body(&t.block.body, out);
-            if let Some(h) = &t.handler {
-                collect_bound_in_body(&h.body.body, out);
+        Stmt::Try { block, handler, finalizer } => {
+            collect_bound_in_body(block, out);
+            if let Some(h) = handler {
+                // NOTE: the catch PARAMETER is deliberately not collected here —
+                // it was not collected before the port either (oxc's
+                // `CatchClause::param` was skipped, only `handler.body` walked),
+                // and the gate is byte-identical bytecode.
+                collect_bound_in_body(&h.body, out);
             }
-            if let Some(f) = &t.finalizer {
-                collect_bound_in_body(&f.body, out);
+            if let Some(f) = finalizer {
+                collect_bound_in_body(f, out);
             }
         }
-        S::SwitchStatement(sw) => {
-            for case in &sw.cases {
-                collect_bound_in_body(&case.consequent, out);
+        Stmt::Switch { cases, .. } => {
+            for case in cases {
+                collect_bound_in_body(&case.body, out);
             }
         }
-        S::LabeledStatement(l) => collect_bound_stmt(&l.body, out),
+        Stmt::Labeled { body, .. } => collect_bound_stmt(body, out),
         // `var` declarations inside a `with` body hoist to the enclosing fn.
-        S::WithStatement(w) => collect_bound_stmt(&w.body, out),
+        Stmt::With { body, .. } => collect_bound_stmt(body, out),
         _ => {}
     }
 }
@@ -237,27 +272,26 @@ fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
 /// Insert every name a binding pattern introduces — recursing through object/
 /// array destructuring, defaults (`= d`), and rest elements — so a destructured
 /// local captured by a nested closure is detected and boxed.
-pub(crate) fn collect_pattern_names(pat: &ox::BindingPattern, out: &mut HashSet<String>) {
-    use ox::BindingPattern as P;
+pub(crate) fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
     match pat {
-        P::BindingIdentifier(id) => {
-            out.insert(id.name.to_string());
+        Pattern::Ident(n) => {
+            out.insert(n.to_string());
         }
-        P::AssignmentPattern(ap) => collect_pattern_names(&ap.left, out),
-        P::ObjectPattern(op) => {
-            for prop in &op.properties {
+        Pattern::Assign { left, .. } => collect_pattern_names(left, out),
+        Pattern::Rest(inner) => collect_pattern_names(inner, out),
+        Pattern::Object { props, rest } => {
+            for prop in props {
                 collect_pattern_names(&prop.value, out);
             }
-            if let Some(rest) = &op.rest {
-                collect_pattern_names(&rest.argument, out);
+            if let Some(rest) = rest {
+                collect_pattern_names(rest, out);
             }
         }
-        P::ArrayPattern(arr) => {
-            for el in arr.elements.iter().flatten() {
-                collect_pattern_names(el, out);
-            }
-            if let Some(rest) = &arr.rest {
-                collect_pattern_names(&rest.argument, out);
+        Pattern::Array(elems) => {
+            // Holes are `None`; the rest element lives in the list as a
+            // `Pattern::Rest`, so one pass covers both.
+            for el in elems.iter().flatten() {
+                collect_pattern_names(&el.pat, out);
             }
         }
     }
@@ -265,299 +299,317 @@ pub(crate) fn collect_pattern_names(pat: &ox::BindingPattern, out: &mut HashSet<
 
 // ── reference collection (descends into nested functions) ──
 
-fn stmt_refs(s: &ox::Statement, out: &mut HashSet<String>) {
-    use ox::Statement as S;
+fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
     match s {
-        S::ExpressionStatement(e) => expr_refs(&e.expression, out),
+        Stmt::Expr(e) => expr_refs(e, out),
         // The with OBJECT expression and every reference in the body count
         // (an outer local referenced only inside a with body must be captured).
-        S::WithStatement(w) => {
-            expr_refs(&w.object, out);
-            stmt_refs(&w.body, out);
+        Stmt::With { object, body } => {
+            expr_refs(object, out);
+            stmt_refs(body, out);
         }
-        S::VariableDeclaration(d) => {
-            for decl in &d.declarations {
+        Stmt::VarDecl(d) => {
+            for decl in &d.decls {
                 if let Some(init) = &decl.init {
                     expr_refs(init, out);
                 }
             }
         }
-        S::BlockStatement(b) => {
-            for st in &b.body {
+        Stmt::Block(b) => {
+            for st in b {
                 stmt_refs(st, out);
             }
         }
-        S::IfStatement(i) => {
-            expr_refs(&i.test, out);
-            stmt_refs(&i.consequent, out);
-            if let Some(a) = &i.alternate {
+        Stmt::If { test, cons, alt } => {
+            expr_refs(test, out);
+            stmt_refs(cons, out);
+            if let Some(a) = alt {
                 stmt_refs(a, out);
             }
         }
-        S::WhileStatement(w) => {
-            expr_refs(&w.test, out);
-            stmt_refs(&w.body, out);
+        Stmt::While { test, body } => {
+            expr_refs(test, out);
+            stmt_refs(body, out);
         }
-        S::DoWhileStatement(d) => {
-            stmt_refs(&d.body, out);
-            expr_refs(&d.test, out);
+        Stmt::DoWhile { body, test } => {
+            stmt_refs(body, out);
+            expr_refs(test, out);
         }
-        S::ForStatement(f) => {
-            if let Some(init) = &f.init {
+        Stmt::For { init, test, update, body } => {
+            if let Some(init) = init {
                 match init {
-                    ox::ForStatementInit::VariableDeclaration(d) => {
-                        for decl in &d.declarations {
+                    ForInit::Var(d) => {
+                        for decl in &d.decls {
                             if let Some(i) = &decl.init {
                                 expr_refs(i, out);
                             }
                         }
                     }
-                    other => {
-                        if let Some(e) = other.as_expression() {
-                            expr_refs(e, out);
-                        }
-                    }
+                    ForInit::Expr(e) => expr_refs(e, out),
                 }
             }
-            if let Some(t) = &f.test {
+            if let Some(t) = test {
                 expr_refs(t, out);
             }
-            if let Some(u) = &f.update {
+            if let Some(u) = update {
                 expr_refs(u, out);
             }
-            stmt_refs(&f.body, out);
+            stmt_refs(body, out);
         }
-        S::ReturnStatement(r) => {
-            if let Some(a) = &r.argument {
+        Stmt::Return(r) => {
+            if let Some(a) = r {
                 expr_refs(a, out);
             }
         }
-        S::FunctionDeclaration(f) => {
+        Stmt::FnDecl(f) => {
             // A nested function declaration contributes its OWN free vars
             // (minus what it binds), exactly like a function expression would.
-            fn_node_free(&f.params, f.body.as_deref(), out);
+            fn_node_free(f, out);
         }
-        S::ForOfStatement(f) => {
-            expr_refs(&f.right, out);
-            stmt_refs(&f.body, out);
+        Stmt::ForOf { right, body, .. } => {
+            expr_refs(right, out);
+            stmt_refs(body, out);
         }
-        S::ForInStatement(f) => {
-            expr_refs(&f.right, out);
-            stmt_refs(&f.body, out);
+        Stmt::ForIn { right, body, .. } => {
+            expr_refs(right, out);
+            stmt_refs(body, out);
         }
-        S::TryStatement(t) => {
-            for st in &t.block.body {
+        Stmt::Try { block, handler, finalizer } => {
+            for st in block {
                 stmt_refs(st, out);
             }
-            if let Some(h) = &t.handler {
-                for st in &h.body.body {
+            if let Some(h) = handler {
+                for st in &h.body {
                     stmt_refs(st, out);
                 }
             }
-            if let Some(f) = &t.finalizer {
-                for st in &f.body {
+            if let Some(f) = finalizer {
+                for st in f {
                     stmt_refs(st, out);
                 }
             }
         }
-        S::SwitchStatement(sw) => {
-            expr_refs(&sw.discriminant, out);
-            for case in &sw.cases {
+        Stmt::Switch { disc, cases } => {
+            expr_refs(disc, out);
+            for case in cases {
                 if let Some(t) = &case.test {
                     expr_refs(t, out);
                 }
-                for st in &case.consequent {
+                for st in &case.body {
                     stmt_refs(st, out);
                 }
             }
         }
-        S::ThrowStatement(t) => expr_refs(&t.argument, out),
-        S::LabeledStatement(l) => stmt_refs(&l.body, out),
-        S::ClassDeclaration(c) => class_free(c, out),
+        Stmt::Throw(t) => expr_refs(t, out),
+        Stmt::Labeled { body, .. } => stmt_refs(body, out),
+        Stmt::ClassDecl(c) => class_free(c, out),
+        // NOTE: `Stmt::Import`/`Stmt::Export` fall here and contribute nothing.
+        // That is unchanged by the port — oxc flattened the module declarations
+        // into `Statement` and they hit the same catch-all, so `export function
+        // f(){ … }` never contributed its free vars before either. Preserved
+        // deliberately: the gate is byte-identical bytecode.
         _ => {}
     }
 }
 
-fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
-    use ox::Expression as E;
+fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
     match e {
-        E::Identifier(id) => {
-            if id.name != "undefined" {
-                out.insert(id.name.to_string());
+        Expr::Ident(n) => {
+            if &**n != "undefined" {
+                out.insert(n.to_string());
             }
         }
-        E::ParenthesizedExpression(p) => expr_refs(&p.expression, out),
-        E::BinaryExpression(b) => {
-            expr_refs(&b.left, out);
-            expr_refs(&b.right, out);
+        Expr::Binary { left, right, .. } => {
+            expr_refs(left, out);
+            expr_refs(right, out);
         }
-        E::LogicalExpression(l) => {
-            expr_refs(&l.left, out);
-            expr_refs(&l.right, out);
+        Expr::Logical { left, right, .. } => {
+            expr_refs(left, out);
+            expr_refs(right, out);
         }
-        E::UnaryExpression(u) => expr_refs(&u.argument, out),
-        E::UpdateExpression(u) => {
-            match &u.argument {
-                ox::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
-                    out.insert(id.name.to_string());
-                }
-                // `o.x++` / `o.#x++` / `o[k]++`: the OBJECT (and key) are reads
-                // an enclosing arrow/function must capture.
-                ox::SimpleAssignmentTarget::StaticMemberExpression(m) => {
-                    expr_refs(&m.object, out)
-                }
-                ox::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
-                    expr_refs(&m.object, out);
-                    expr_refs(&m.expression, out);
-                }
-                ox::SimpleAssignmentTarget::PrivateFieldExpression(p) => {
-                    expr_refs(&p.object, out)
-                }
-                _ => {}
-            }
+        Expr::Unary { arg, .. } => expr_refs(arg, out),
+        Expr::Update { target, .. } => target_refs(target, out),
+        Expr::Assign { target, value, .. } => {
+            target_refs(target, out);
+            expr_refs(value, out);
         }
-        E::AssignmentExpression(a) => {
-            match &a.left {
-                ox::AssignmentTarget::AssignmentTargetIdentifier(id) => {
-                    out.insert(id.name.to_string());
-                }
-                ox::AssignmentTarget::StaticMemberExpression(m) => expr_refs(&m.object, out),
-                ox::AssignmentTarget::ComputedMemberExpression(m) => {
-                    expr_refs(&m.object, out);
-                    expr_refs(&m.expression, out);
-                }
-                // `o.#x = v`: the object is a read to capture.
-                ox::AssignmentTarget::PrivateFieldExpression(p) => {
-                    expr_refs(&p.object, out)
-                }
-                _ => {}
-            }
-            expr_refs(&a.right, out);
+        Expr::Cond { test, cons, alt } => {
+            expr_refs(test, out);
+            expr_refs(cons, out);
+            expr_refs(alt, out);
         }
-        E::ConditionalExpression(c) => {
-            expr_refs(&c.test, out);
-            expr_refs(&c.consequent, out);
-            expr_refs(&c.alternate, out);
-        }
-        E::CallExpression(c) => {
+        Expr::Call(c) => {
             expr_refs(&c.callee, out);
-            for arg in &c.arguments {
-                if let Some(e) = arg_expr(arg) {
-                    expr_refs(e, out);
+            for arg in &c.args {
+                // The SPREAD operand counts too (`f(...xs)`): skipping it would
+                // drop a variable referenced ONLY inside a spread, so it would
+                // not be captured.
+                match arg {
+                    Arg::Expr(e) | Arg::Spread(e) => expr_refs(e, out),
                 }
             }
         }
-        E::NewExpression(n) => {
-            expr_refs(&n.callee, out);
-            for arg in &n.arguments {
-                if let Some(e) = arg_expr(arg) {
-                    expr_refs(e, out);
+        Expr::New { callee, args } => {
+            expr_refs(callee, out);
+            for arg in args {
+                match arg {
+                    Arg::Expr(e) | Arg::Spread(e) => expr_refs(e, out),
                 }
             }
         }
-        E::AwaitExpression(a) => expr_refs(&a.argument, out),
-        E::YieldExpression(y) => {
-            if let Some(a) = &y.argument {
+        Expr::Await(a) => expr_refs(a, out),
+        Expr::Yield { arg, .. } => {
+            if let Some(a) = arg {
                 expr_refs(a, out);
             }
         }
-        E::SequenceExpression(s) => {
-            for e in &s.expressions {
+        Expr::Seq(exprs) => {
+            for e in exprs {
                 expr_refs(e, out);
             }
         }
-        E::TemplateLiteral(t) => {
-            for e in &t.expressions {
+        Expr::Template(t) => {
+            for e in &t.exprs {
                 expr_refs(e, out);
             }
         }
-        E::TaggedTemplateExpression(t) => {
-            expr_refs(&t.tag, out);
-            for e in &t.quasi.expressions {
+        Expr::TaggedTemplate { tag, quasi } => {
+            expr_refs(tag, out);
+            for e in &quasi.exprs {
                 expr_refs(e, out);
             }
         }
-        E::StaticMemberExpression(m) => expr_refs(&m.object, out),
-        E::PrivateFieldExpression(p) => expr_refs(&p.object, out),
-        E::ComputedMemberExpression(m) => {
+        // `a.b`, `a.#b` and `a[b]` are one node now; only the computed form has a
+        // key expression to walk.
+        Expr::Member(m) => {
             expr_refs(&m.object, out);
-            expr_refs(&m.expression, out);
+            if let MemberProp::Computed(k) = &m.prop {
+                expr_refs(k, out);
+            }
         }
-        E::ArrayExpression(a) => {
-            for el in &a.elements {
-                if let Some(e) = array_el_expr(el) {
-                    expr_refs(e, out);
+        Expr::Array(els) => {
+            // A hole is `None` and references nothing. The spread operand is
+            // walked for the same reason as a spread argument.
+            for el in els.iter().flatten() {
+                match el {
+                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => expr_refs(e, out),
                 }
             }
         }
-        E::ObjectExpression(o) => {
-            for prop in &o.properties {
-                match prop {
-                    ox::ObjectPropertyKind::ObjectProperty(p) => {
+        Expr::Object(members) => {
+            for member in members {
+                match member {
+                    ObjectMember::Prop { key, value, .. } => {
                         // A computed key `{[expr]: v}` references variables too —
                         // they must be captured, not just the value's.
-                        if p.computed {
-                            if let Some(ke) = p.key.as_expression() {
-                                expr_refs(ke, out);
-                            }
-                        }
-                        expr_refs(&p.value, out);
+                        prop_key_refs(key, out);
+                        expr_refs(value, out);
+                        // NOTE: the CoverInitializedName (`{a = 1}`) initializer is
+                        // not walked. It is unreachable in a program that compiles:
+                        // as an expression `({a = 1})` is a SyntaxError, and as a
+                        // destructuring target the initializer moves to
+                        // `TargetProp::default`, which this walk does not reach
+                        // either (see `target_refs`). oxc kept it outside the tree
+                        // entirely, so this matches pre-port behaviour exactly.
                     }
-                    ox::ObjectPropertyKind::SpreadProperty(s) => expr_refs(&s.argument, out),
+                    // oxc spelled a method/getter/setter as an ordinary property
+                    // whose value was a `FunctionExpression`, so these reached
+                    // `fn_node_free` through the value arm above. They are named
+                    // shapes now, and must still contribute their free vars.
+                    ObjectMember::Method { key, func }
+                    | ObjectMember::Get { key, func }
+                    | ObjectMember::Set { key, func } => {
+                        prop_key_refs(key, out);
+                        fn_node_free(func, out);
+                    }
+                    ObjectMember::Spread(e) => expr_refs(e, out),
                 }
             }
         }
-        E::FunctionExpression(f) => fn_node_free(&f.params, f.body.as_deref(), out),
-        E::ArrowFunctionExpression(a) => arrow_free(a, out),
-        E::ClassExpression(c) => class_free(c, out),
+        Expr::Function(f) => fn_node_free(f, out),
+        Expr::Arrow(a) => arrow_free(a, out),
+        Expr::Class(c) => class_free(c, out),
+        // NOTE: `Expr::Chain` (`a?.b`), `Expr::PrivateIn` (`#x in o`) and
+        // `Expr::ImportCall` fall into this catch-all and contribute nothing.
+        // Each had an oxc node (`ChainExpression`, `PrivateInExpression`,
+        // `ImportExpression`) with no arm here, so this is exactly the
+        // pre-port behaviour — under-inclusion is conservative-safe (resolution
+        // falls back to a global lookup), and widening it would change which
+        // locals get boxed, i.e. the emitted bytecode.
         _ => {}
+    }
+}
+
+/// The reads performed by an ASSIGNMENT TARGET — the names/objects an enclosing
+/// arrow or function must capture in order to write through it.
+///
+/// One function for both `=` and `++`: oxc split these across `AssignmentTarget`
+/// and `SimpleAssignmentTarget` with identical arms, and the destructuring forms
+/// only ever reached the assignment side.
+fn target_refs(t: &Target, out: &mut HashSet<String>) {
+    match t {
+        // Not filtered against "undefined", unlike a read: `undefined = 1` names
+        // a binding here. Pre-port behaviour, preserved.
+        Target::Ident { name, .. } => {
+            out.insert(name.to_string());
+        }
+        // `o.x = v` / `o.#x = v` / `o[k] = v`: the OBJECT (and key) are reads an
+        // enclosing arrow/function must capture.
+        Target::Member(m) => {
+            expr_refs(&m.object, out);
+            if let MemberProp::Computed(k) = &m.prop {
+                expr_refs(k, out);
+            }
+        }
+        // Annex B `f() = 1` / `f()++`. The call IS evaluated before the
+        // ReferenceError is thrown, so its callee and arguments are genuine
+        // reads. NOTE: unreachable before the hand-written parser lands — the
+        // engine rewrites the source for this construct today
+        // (`annexb_call_target_rewrite`) and oxc cannot build the node — so this
+        // arm cannot move any bytecode the differential gate compares.
+        Target::Call(c) => {
+            expr_refs(&c.callee, out);
+            for arg in &c.args {
+                match arg {
+                    Arg::Expr(e) | Arg::Spread(e) => expr_refs(e, out),
+                }
+            }
+        }
+        // NOTE: a DESTRUCTURING target (`[a] = x`, `({k: o.b} = x)`) contributes
+        // nothing. oxc's `AssignmentTarget` pattern variants fell into a `_ => {}`
+        // here, so neither the bound names nor the member objects inside one were
+        // ever collected. Preserved rather than fixed: adding them would change
+        // which locals are boxed and therefore the emitted bytecode.
+        Target::Array(_) | Target::Object { .. } => {}
+    }
+}
+
+/// A computed property key evaluates expressions in the surrounding scope; a
+/// literal / private key names nothing.
+fn prop_key_refs(k: &PropKey, out: &mut HashSet<String>) {
+    if let PropKey::Computed(e) = k {
+        expr_refs(e, out);
     }
 }
 
 /// Add a nested function's free variables to `out`. The nested function's own
 /// bindings are subtracted, so only names it captures from further out remain.
-fn fn_node_free(
-    params: &ox::FormalParameters,
-    body: Option<&ox::FunctionBody>,
-    out: &mut HashSet<String>,
-) {
-    let mut param_names = param_names(params);
+fn fn_node_free(f: &Function, out: &mut HashSet<String>) {
+    let mut param_names = param_names(&f.params);
     // An ordinary function BINDS its own `arguments` (and `this`), so a reference
     // to `arguments` inside it is NOT free — it must not leak out as a capture of
     // the enclosing scope. (Arrows, handled by `arrow_free`, do not bind it.)
     param_names.push("arguments".to_string());
-    let stmts: &[ox::Statement] = match body {
-        Some(b) => &b.statements,
-        None => &[],
-    };
-    let inner = free_vars(&param_names, stmts);
+    let inner = free_vars(&param_names, &f.body.stmts);
     out.extend(inner);
     params_free(params, &param_names, out);
 }
 
-fn arrow_free(a: &ox::ArrowFunctionExpression, out: &mut HashSet<String>) {
+fn arrow_free(a: &Arrow, out: &mut HashSet<String>) {
     let param_names = param_names(&a.params);
-    let inner = free_vars(&param_names, &a.body.statements);
+    let inner = free_vars_arrow(&param_names, &a.body);
     out.extend(inner);
     params_free(&a.params, &param_names, out);
-}
-
-/// The operand expression of a call/new argument, including the spread case
-/// (`f(...xs)`): `as_expression()` returns None for a SpreadElement, which would
-/// drop a variable referenced ONLY inside a spread (so it wouldn't be captured).
-fn arg_expr<'a>(a: &'a ox::Argument<'a>) -> Option<&'a ox::Expression<'a>> {
-    match a {
-        ox::Argument::SpreadElement(s) => Some(&s.argument),
-        _ => a.as_expression(),
-    }
-}
-
-/// The operand expression of an array element, including the spread (`[...xs]`).
-fn array_el_expr<'a>(e: &'a ox::ArrayExpressionElement<'a>) -> Option<&'a ox::Expression<'a>> {
-    match e {
-        ox::ArrayExpressionElement::SpreadElement(s) => Some(&s.argument),
-        _ => e.as_expression(),
-    }
 }
 
 /// Names a class body references from OUTSIDE a method's own scope: each
@@ -568,252 +620,254 @@ fn array_el_expr<'a>(e: &'a ox::ArrayExpressionElement<'a>) -> Option<&'a ox::Ex
 /// `captured_locals` (boxing) and `free_vars` (transitive capture). Over-
 /// inclusion is harmless: it at most boxes an enclosing local used only
 /// directly, which is transparent.
-fn class_free(class: &ox::Class, out: &mut HashSet<String>) {
-    if let Some(sc) = &class.super_class {
+fn class_free(class: &Class, out: &mut HashSet<String>) {
+    if let Some(sc) = &class.superclass {
         expr_refs(sc, out);
     }
-    for el in &class.body.body {
+    for el in &class.body {
         match el {
-            ox::ClassElement::MethodDefinition(m) => {
-                fn_node_free(&m.value.params, m.value.body.as_deref(), out);
-                if m.computed {
-                    if let Some(k) = m.key.as_expression() {
-                        expr_refs(k, out);
-                    }
-                }
+            ClassMember::Method(m) => {
+                fn_node_free(&m.func, out);
+                prop_key_refs(&m.key, out);
             }
-            ox::ClassElement::PropertyDefinition(p) => {
+            ClassMember::Field(p) => {
                 if let Some(v) = &p.value {
                     expr_refs(v, out);
                 }
-                if p.computed {
-                    if let Some(k) = p.key.as_expression() {
-                        expr_refs(k, out);
-                    }
-                }
+                prop_key_refs(&p.key, out);
             }
-            ox::ClassElement::StaticBlock(b) => {
-                out.extend(free_vars(&[], &b.body));
+            ClassMember::StaticBlock(b) => {
+                out.extend(free_vars(&[], b));
             }
-            _ => {}
         }
     }
 }
 
 /// Union of free vars of functions nested DIRECTLY in `s` (one level down).
-fn collect_nested_free(s: &ox::Statement, out: &mut HashSet<String>) {
-    use ox::Statement as S;
+fn collect_nested_free(s: &Stmt, out: &mut HashSet<String>) {
     match s {
-        S::ExpressionStatement(e) => collect_nested_free_expr(&e.expression, out),
-        S::VariableDeclaration(d) => {
-            for decl in &d.declarations {
+        Stmt::Expr(e) => collect_nested_free_expr(e, out),
+        Stmt::VarDecl(d) => {
+            for decl in &d.decls {
                 if let Some(init) = &decl.init {
                     collect_nested_free_expr(init, out);
                 }
             }
         }
-        S::BlockStatement(b) => {
-            for st in &b.body {
+        Stmt::Block(b) => {
+            for st in b {
                 collect_nested_free(st, out);
             }
         }
-        S::IfStatement(i) => {
-            collect_nested_free_expr(&i.test, out);
-            collect_nested_free(&i.consequent, out);
-            if let Some(a) = &i.alternate {
+        Stmt::If { test, cons, alt } => {
+            collect_nested_free_expr(test, out);
+            collect_nested_free(cons, out);
+            if let Some(a) = alt {
                 collect_nested_free(a, out);
             }
         }
-        S::WhileStatement(w) => {
-            collect_nested_free_expr(&w.test, out);
-            collect_nested_free(&w.body, out);
+        Stmt::While { test, body } => {
+            collect_nested_free_expr(test, out);
+            collect_nested_free(body, out);
         }
-        S::WithStatement(w) => {
-            collect_nested_free_expr(&w.object, out);
-            collect_nested_free(&w.body, out);
+        Stmt::With { object, body } => {
+            collect_nested_free_expr(object, out);
+            collect_nested_free(body, out);
         }
-        S::DoWhileStatement(d) => {
-            collect_nested_free(&d.body, out);
-            collect_nested_free_expr(&d.test, out);
+        Stmt::DoWhile { body, test } => {
+            collect_nested_free(body, out);
+            collect_nested_free_expr(test, out);
         }
-        S::ForStatement(f) => {
+        Stmt::For { init, test, update, body } => {
             // A closure in the INIT (`for (let i = 0, f = () => i; …)`)
             // captures head bindings too — scan declarator initializers.
-            if let Some(init) = &f.init {
+            if let Some(init) = init {
                 match init {
-                    ox::ForStatementInit::VariableDeclaration(d) => {
-                        for decl in &d.declarations {
+                    ForInit::Var(d) => {
+                        for decl in &d.decls {
                             if let Some(i) = &decl.init {
                                 collect_nested_free_expr(i, out);
                             }
                         }
                     }
-                    other => {
-                        if let Some(e) = other.as_expression() {
-                            collect_nested_free_expr(e, out);
-                        }
-                    }
+                    ForInit::Expr(e) => collect_nested_free_expr(e, out),
                 }
             }
-            if let Some(t) = &f.test {
+            if let Some(t) = test {
                 collect_nested_free_expr(t, out);
             }
-            if let Some(u) = &f.update {
+            if let Some(u) = update {
                 collect_nested_free_expr(u, out);
             }
-            collect_nested_free(&f.body, out);
+            collect_nested_free(body, out);
         }
-        S::ForOfStatement(f) => {
-            collect_nested_free_expr(&f.right, out);
-            collect_nested_free(&f.body, out);
+        Stmt::ForOf { right, body, .. } => {
+            collect_nested_free_expr(right, out);
+            collect_nested_free(body, out);
         }
-        S::ForInStatement(f) => {
-            collect_nested_free_expr(&f.right, out);
-            collect_nested_free(&f.body, out);
+        Stmt::ForIn { right, body, .. } => {
+            collect_nested_free_expr(right, out);
+            collect_nested_free(body, out);
         }
-        S::ReturnStatement(r) => {
-            if let Some(a) = &r.argument {
+        Stmt::Return(r) => {
+            if let Some(a) = r {
                 collect_nested_free_expr(a, out);
             }
         }
-        S::FunctionDeclaration(f) => fn_node_free(&f.params, f.body.as_deref(), out),
-        S::TryStatement(t) => {
-            for st in &t.block.body {
+        Stmt::FnDecl(f) => fn_node_free(f, out),
+        Stmt::Try { block, handler, finalizer } => {
+            for st in block {
                 collect_nested_free(st, out);
             }
-            if let Some(h) = &t.handler {
-                for st in &h.body.body {
+            if let Some(h) = handler {
+                for st in &h.body {
                     collect_nested_free(st, out);
                 }
             }
-            if let Some(f) = &t.finalizer {
-                for st in &f.body {
+            if let Some(f) = finalizer {
+                for st in f {
                     collect_nested_free(st, out);
                 }
             }
         }
-        S::SwitchStatement(sw) => {
-            collect_nested_free_expr(&sw.discriminant, out);
-            for case in &sw.cases {
+        Stmt::Switch { disc, cases } => {
+            collect_nested_free_expr(disc, out);
+            for case in cases {
                 if let Some(t) = &case.test {
                     collect_nested_free_expr(t, out);
                 }
-                for st in &case.consequent {
+                for st in &case.body {
                     collect_nested_free(st, out);
                 }
             }
         }
-        S::ThrowStatement(t) => collect_nested_free_expr(&t.argument, out),
-        S::LabeledStatement(l) => collect_nested_free(&l.body, out),
-        S::ClassDeclaration(c) => class_free(c, out),
+        Stmt::Throw(t) => collect_nested_free_expr(t, out),
+        Stmt::Labeled { body, .. } => collect_nested_free(body, out),
+        Stmt::ClassDecl(c) => class_free(c, out),
         _ => {}
     }
 }
 
-fn collect_nested_free_expr(e: &ox::Expression, out: &mut HashSet<String>) {
-    use ox::Expression as E;
+fn collect_nested_free_expr(e: &Expr, out: &mut HashSet<String>) {
     match e {
-        E::FunctionExpression(f) => fn_node_free(&f.params, f.body.as_deref(), out),
-        E::ArrowFunctionExpression(a) => arrow_free(a, out),
-        E::ClassExpression(c) => class_free(c, out),
-        E::ParenthesizedExpression(p) => collect_nested_free_expr(&p.expression, out),
-        E::BinaryExpression(b) => {
-            collect_nested_free_expr(&b.left, out);
-            collect_nested_free_expr(&b.right, out);
+        Expr::Function(f) => fn_node_free(f, out),
+        Expr::Arrow(a) => arrow_free(a, out),
+        Expr::Class(c) => class_free(c, out),
+        Expr::Binary { left, right, .. } => {
+            collect_nested_free_expr(left, out);
+            collect_nested_free_expr(right, out);
         }
-        E::LogicalExpression(l) => {
-            collect_nested_free_expr(&l.left, out);
-            collect_nested_free_expr(&l.right, out);
+        Expr::Logical { left, right, .. } => {
+            collect_nested_free_expr(left, out);
+            collect_nested_free_expr(right, out);
         }
-        E::UnaryExpression(u) => collect_nested_free_expr(&u.argument, out),
-        E::AssignmentExpression(a) => collect_nested_free_expr(&a.right, out),
-        E::ConditionalExpression(c) => {
-            collect_nested_free_expr(&c.test, out);
-            collect_nested_free_expr(&c.consequent, out);
-            collect_nested_free_expr(&c.alternate, out);
+        Expr::Unary { arg, .. } => collect_nested_free_expr(arg, out),
+        // Only the VALUE side: a target cannot hold a function literal that is
+        // not already inside one of its own key expressions, which this walk did
+        // not visit before the port either.
+        Expr::Assign { value, .. } => collect_nested_free_expr(value, out),
+        Expr::Cond { test, cons, alt } => {
+            collect_nested_free_expr(test, out);
+            collect_nested_free_expr(cons, out);
+            collect_nested_free_expr(alt, out);
         }
-        E::CallExpression(c) => {
+        Expr::Call(c) => {
             collect_nested_free_expr(&c.callee, out);
-            for arg in &c.arguments {
-                if let Some(e) = arg.as_expression() {
+            for arg in &c.args {
+                // NOTE: a SPREAD argument is skipped, unlike in `expr_refs` where
+                // it is walked. That asymmetry predates the port (this walk used
+                // oxc's `Argument::as_expression`, which returns `None` for a
+                // spread, while `expr_refs` used a helper that unwrapped it), and
+                // widening it here would box additional locals.
+                if let Arg::Expr(e) = arg {
                     collect_nested_free_expr(e, out);
                 }
             }
         }
-        E::NewExpression(n) => {
-            collect_nested_free_expr(&n.callee, out);
-            for arg in &n.arguments {
-                if let Some(e) = arg.as_expression() {
+        Expr::New { callee, args } => {
+            collect_nested_free_expr(callee, out);
+            for arg in args {
+                if let Arg::Expr(e) = arg {
                     collect_nested_free_expr(e, out);
                 }
             }
         }
-        E::AwaitExpression(a) => collect_nested_free_expr(&a.argument, out),
-        E::YieldExpression(y) => {
-            if let Some(a) = &y.argument {
+        Expr::Await(a) => collect_nested_free_expr(a, out),
+        Expr::Yield { arg, .. } => {
+            if let Some(a) = arg {
                 collect_nested_free_expr(a, out);
             }
         }
-        E::SequenceExpression(s) => {
-            for e in &s.expressions {
+        Expr::Seq(exprs) => {
+            for e in exprs {
                 collect_nested_free_expr(e, out);
             }
         }
-        E::TemplateLiteral(t) => {
-            for e in &t.expressions {
+        Expr::Template(t) => {
+            for e in &t.exprs {
                 collect_nested_free_expr(e, out);
             }
         }
-        E::TaggedTemplateExpression(t) => {
-            collect_nested_free_expr(&t.tag, out);
-            for e in &t.quasi.expressions {
+        Expr::TaggedTemplate { tag, quasi } => {
+            collect_nested_free_expr(tag, out);
+            for e in &quasi.exprs {
                 collect_nested_free_expr(e, out);
             }
         }
-        E::StaticMemberExpression(m) => collect_nested_free_expr(&m.object, out),
-        E::PrivateFieldExpression(p) => collect_nested_free_expr(&p.object, out),
-        E::ComputedMemberExpression(m) => {
+        Expr::Member(m) => {
             collect_nested_free_expr(&m.object, out);
-            collect_nested_free_expr(&m.expression, out);
+            if let MemberProp::Computed(k) = &m.prop {
+                collect_nested_free_expr(k, out);
+            }
         }
-        E::ArrayExpression(a) => {
-            for el in &a.elements {
-                if let Some(e) = el.as_expression() {
+        Expr::Array(els) => {
+            for el in els.iter().flatten() {
+                // Spread skipped, as for a call argument — same pre-port
+                // asymmetry, same reason.
+                if let ArrayElem::Expr(e) = el {
                     collect_nested_free_expr(e, out);
                 }
             }
         }
-        E::ObjectExpression(o) => {
-            for prop in &o.properties {
-                match prop {
-                    ox::ObjectPropertyKind::ObjectProperty(p) => {
-                        if p.computed {
-                            if let Some(ke) = p.key.as_expression() {
-                                collect_nested_free_expr(ke, out);
-                            }
+        Expr::Object(members) => {
+            for member in members {
+                match member {
+                    ObjectMember::Prop { key, value, .. } => {
+                        if let PropKey::Computed(ke) = key {
+                            collect_nested_free_expr(ke, out);
                         }
-                        collect_nested_free_expr(&p.value, out);
+                        collect_nested_free_expr(value, out);
                     }
-                    ox::ObjectPropertyKind::SpreadProperty(s) => {
-                        collect_nested_free_expr(&s.argument, out)
+                    // Reached through the property VALUE before the port, when a
+                    // method was an `ObjectProperty` holding a `FunctionExpression`.
+                    ObjectMember::Method { key, func }
+                    | ObjectMember::Get { key, func }
+                    | ObjectMember::Set { key, func } => {
+                        if let PropKey::Computed(ke) = key {
+                            collect_nested_free_expr(ke, out);
+                        }
+                        fn_node_free(func, out);
                     }
+                    ObjectMember::Spread(e) => collect_nested_free_expr(e, out),
                 }
             }
         }
+        // NOTE: as in `expr_refs`, `Expr::Chain` / `Expr::PrivateIn` /
+        // `Expr::ImportCall` (and `Expr::Update`) land here and contribute
+        // nothing — unchanged from the oxc walk, which had no arm for them.
         _ => {}
     }
 }
 
-fn param_names(p: &ox::FormalParameters) -> Vec<String> {
+fn param_names(p: &Params) -> Vec<String> {
     // Every name a parameter list binds — plain identifiers, destructuring-pattern
     // leaves, and the rest parameter — so a nested function's own params shadow
-    // outer bindings (they must NOT be reported as free / captured).
+    // outer bindings (they must NOT be reported as free / captured). Defaults are
+    // `Pattern::Assign` and the rest parameter is `Pattern::Rest`, both inside
+    // `items`, so one pass covers what used to need three.
     let mut set = HashSet::new();
     for item in &p.items {
-        collect_pattern_names(&item.pattern, &mut set);
-    }
-    if let Some(r) = &p.rest {
-        collect_pattern_names(&r.rest.argument, &mut set);
+        collect_pattern_names(item, &mut set);
     }
     set.into_iter().collect()
 }

@@ -83,7 +83,7 @@ fn agent_worker(
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, &src, SourceType::unambiguous()).parse();
     let program = if parsed.errors.is_empty() {
-        crate::compile::compile_program(&parsed.program, &src).ok()
+        crate::compile::compile_program_oxc(&parsed.program, &src).ok()
     } else {
         None
     };

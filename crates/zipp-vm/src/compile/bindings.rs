@@ -4,6 +4,44 @@
 // each other. No logic changed.
 #![allow(unused_imports)]
 use super::*;
+// The AST this module consumes. Imported explicitly rather than relying on how
+// the parent spells its own import. NOTE: `ast::Program` and
+// `crate::bytecode::Program` are both in scope through globs, so `Program` is
+// deliberately never named in this file.
+use crate::parse::ast::*;
+
+/// The expression of a non-spread argument — the replacement for oxc's
+/// `Argument::as_expression()`.
+fn arg_expr(a: &Arg) -> Option<&Expr> {
+    match a {
+        Arg::Expr(e) => Some(e),
+        Arg::Spread(_) => None,
+    }
+}
+
+/// A parameter item split into its pattern and its `= default`. oxc kept those
+/// in two fields (`FormalParameter::{pattern, initializer}`); this AST folds the
+/// default into `Pattern::Assign`, so it is peeled back off here — everything
+/// downstream (`declare_pattern`, `extract_pattern`, the TDZ name list) wants
+/// the bare pattern, exactly as it did before.
+fn param_parts(p: &Pattern) -> (&Pattern, Option<&Expr>) {
+    match p {
+        Pattern::Assign { left, right } => (left, Some(right)),
+        other => (other, None),
+    }
+}
+
+/// Split `Params.items` into the positional parameters and the rest pattern.
+/// oxc parked the rest in its own field; this AST appends it as a trailing
+/// `Pattern::Rest` (the grammar puts it last and nothing may follow it). The
+/// loop in `bind_params_inner` indexes argument registers BY POSITION, so the
+/// rest has to come back off the end or every index would shift.
+fn split_rest(items: &[Pattern]) -> (&[Pattern], Option<&Pattern>) {
+    match items.last() {
+        Some(Pattern::Rest(inner)) => (&items[..items.len() - 1], Some(&**inner)),
+        _ => (items, None),
+    }
+}
 
 impl<'a> FnCompiler<'a> {
     /// Emit a read of `binding` into `dst`; returns the register holding the
@@ -152,19 +190,21 @@ impl<'a> FnCompiler<'a> {
     /// direct eval gets the `DirectEval { tail }` form (frame reuse fires
     /// only when `eval` is REBOUND at runtime), and a user-shadowed `eval`
     /// is an ordinary call.
-    pub(crate) fn tail_callable(&mut self, c: &ox::CallExpression) -> bool {
-        if c.optional || c.arguments.iter().any(|a| a.as_expression().is_none()) {
+    pub(crate) fn tail_callable(&mut self, c: &CallExpr) -> bool {
+        if c.optional || c.args.iter().any(|a| matches!(a, Arg::Spread(_))) {
             return false;
         }
-        fn callee_ok(e: &ox::Expression) -> bool {
+        fn callee_ok(e: &Expr) -> bool {
             match e {
                 // An identifier — including `eval` (direct eval gets the
                 // DirectEval{tail} form; a shadowed/with-resolved `eval` is an
                 // ordinary call) and with-shadowable names (lowered through
                 // the with chain with a TailCallWithThis prefix).
-                ox::Expression::Identifier(_) => true,
-                ox::Expression::CallExpression(inner) => !inner.optional,
-                ox::Expression::ParenthesizedExpression(p) => callee_ok(&p.expression),
+                Expr::Ident(_) => true,
+                Expr::Call(inner) => !inner.optional,
+                // (The parenthesized arm is gone with the node: `(f)()` and
+                // `(f())()` now arrive as the identifier / call themselves,
+                // which is what peeling produced anyway.)
                 _ => false,
             }
         }
@@ -177,38 +217,42 @@ impl<'a> FnCompiler<'a> {
     /// a (plain-tag) tagged template. Pure predicate — mirrors exactly what
     /// `emit_tail_return` lowers, so the return statement either emits the
     /// whole tail-aware form or falls back to the ordinary path untouched.
-    pub(crate) fn expr_has_tail_call(&mut self, e: &ox::Expression) -> bool {
-        use ox::Expression as E;
+    pub(crate) fn expr_has_tail_call(&mut self, e: &Expr) -> bool {
         match e {
-            E::ParenthesizedExpression(p) => self.expr_has_tail_call(&p.expression),
-            E::ConditionalExpression(c) => {
-                self.expr_has_tail_call(&c.consequent) || self.expr_has_tail_call(&c.alternate)
+            Expr::Cond { cons, alt, .. } => {
+                self.expr_has_tail_call(cons) || self.expr_has_tail_call(alt)
             }
-            E::LogicalExpression(l) => self.expr_has_tail_call(&l.right),
-            E::SequenceExpression(s) => match s.expressions.last() {
+            Expr::Logical { right, .. } => self.expr_has_tail_call(right),
+            Expr::Seq(exprs) => match exprs.last() {
                 Some(last) => self.expr_has_tail_call(last),
                 None => false,
             },
-            E::CallExpression(c) => self.tail_callable(c),
-            E::TaggedTemplateExpression(tt) => self.tagged_tail_callable(tt),
+            Expr::Call(c) => self.tail_callable(c),
+            Expr::TaggedTemplate { tag, .. } => self.tagged_tail_callable(tag),
             _ => false,
         }
     }
 
     /// A tagged template is tail-callable when its tag is a plain callee
-    /// (identifier / call / parenthesized of those — no member tag, whose
-    /// call binds `this` to the object; `String.raw` keeps its fast path).
-    pub(crate) fn tagged_tail_callable(&mut self, tt: &ox::TaggedTemplateExpression) -> bool {
-        match &tt.tag {
-            ox::Expression::Identifier(id) => {
-                self.with_objs_for(id.name.as_str()).is_empty()
-                    && !self.inherited_with_shadows.contains_key(id.name.as_str())
+    /// (identifier / call — no member tag, whose call binds `this` to the
+    /// object; `String.raw` keeps its fast path).
+    // NOTE: signature. `Expr::TaggedTemplate { tag, quasi }` inlines the node, so
+    // this takes the TAG expression.
+    //
+    // NOTE: behaviour, forced by the AST. The old oxc arm returned `true` for a
+    // PARENTHESIZED identifier tag WITHOUT the with-shadow test that a bare
+    // identifier tag gets, so `` with (o) { (f)`x` } `` used to be treated as
+    // tail-callable and `` f`x` `` was not. Parens are no longer a node, so both
+    // now take the identifier arm — i.e. the with-shadowed case falls back to the
+    // ordinary (non-tail) lowering. There is no bit left to reproduce the old
+    // split; this is the only reachable difference in this function.
+    pub(crate) fn tagged_tail_callable(&mut self, tag: &Expr) -> bool {
+        match tag {
+            Expr::Ident(id) => {
+                self.with_objs_for(id).is_empty()
+                    && !self.inherited_with_shadows.contains_key(&**id)
             }
-            ox::Expression::CallExpression(inner) => !inner.optional,
-            ox::Expression::ParenthesizedExpression(p) => matches!(
-                &p.expression,
-                ox::Expression::Identifier(_) | ox::Expression::CallExpression(_)
-            ),
+            Expr::Call(inner) => !inner.optional,
             _ => false,
         }
     }
@@ -218,43 +262,40 @@ impl<'a> FnCompiler<'a> {
     /// `TailCall` frame-reuse prefix emitted in front of each tail-position
     /// call. Only entered from a `tail_call_position()` context (strict, no
     /// handlers / iterator closes / using scopes / generator / async).
-    pub(crate) fn emit_tail_return(&mut self, e: &ox::Expression) -> R<()> {
-        use ox::Expression as E;
+    pub(crate) fn emit_tail_return(&mut self, e: &Expr) -> R<()> {
         match e {
-            E::ParenthesizedExpression(p) => self.emit_tail_return(&p.expression),
-            E::ConditionalExpression(c) => {
+            Expr::Cond { test, cons, alt } => {
                 let save = self.next_reg;
-                let cond = self.expr(&c.test)?;
+                let cond = self.expr(test)?;
                 let jf = self.here();
                 self.emit(Instr::JumpIfFalse { cond, target: 0 });
                 self.next_reg = save;
-                self.emit_tail_return(&c.consequent)?; // every path returns
-                let alt = self.here();
-                self.patch_jump(jf, alt);
-                self.emit_tail_return(&c.alternate)
+                self.emit_tail_return(cons)?; // every path returns
+                let alt_at = self.here();
+                self.patch_jump(jf, alt_at);
+                self.emit_tail_return(alt)
             }
-            E::LogicalExpression(l) => {
-                use ox::LogicalOperator as Op;
+            Expr::Logical { op, left, right } => {
                 let save = self.next_reg;
                 let v = self.alloc_reg();
-                let lv = self.expr_into(&l.left, v)?;
+                let lv = self.expr_into(left, v)?;
                 if lv != v {
                     self.emit(Instr::Move { dst: v, src: lv });
                 }
                 // Short-circuit → return the LEFT value; else the right
                 // operand is in tail position.
-                let jshort = match l.operator {
-                    Op::And => {
+                let jshort = match op {
+                    LogicalOp::And => {
                         let j = self.here();
                         self.emit(Instr::JumpIfFalse { cond: v, target: 0 });
                         j
                     }
-                    Op::Or => {
+                    LogicalOp::Or => {
                         let j = self.here();
                         self.emit(Instr::JumpIfTrue { cond: v, target: 0 });
                         j
                     }
-                    Op::Coalesce => {
+                    LogicalOp::Coalesce => {
                         let tsave = self.next_reg;
                         let undef = self.alloc_reg();
                         let isnull = self.alloc_reg();
@@ -264,7 +305,7 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 });
                         self.next_reg = tsave;
                         // nullish: the right operand is the tail position
-                        self.emit_tail_return(&l.right)?;
+                        self.emit_tail_return(right)?;
                         let keep = self.here();
                         self.patch_jump(j, keep);
                         self.emit(Instr::Return { src: v });
@@ -272,33 +313,32 @@ impl<'a> FnCompiler<'a> {
                         return Ok(());
                     }
                 };
-                self.emit_tail_return(&l.right)?;
+                self.emit_tail_return(right)?;
                 let short = self.here();
                 self.patch_jump(jshort, short);
                 self.emit(Instr::Return { src: v });
                 self.next_reg = save;
                 Ok(())
             }
-            E::SequenceExpression(s) if !s.expressions.is_empty() => {
-                let n = s.expressions.len();
-                for ex in &s.expressions[..n - 1] {
+            Expr::Seq(exprs) if !exprs.is_empty() => {
+                let n = exprs.len();
+                for ex in &exprs[..n - 1] {
                     let save = self.next_reg;
                     self.expr(ex)?;
                     self.next_reg = save;
                 }
-                self.emit_tail_return(&s.expressions[n - 1])
+                self.emit_tail_return(&exprs[n - 1])
             }
-            E::CallExpression(c) if self.tail_callable(c) => {
+            Expr::Call(c) if self.tail_callable(c) => {
                 // A with-shadowable identifier callee: the with-chain resolves
                 // the callee + `this` (= the with-object), then the frame is
                 // reused via TailCallWithThis (tco-non-eval-with).
-                if let E::Identifier(id) = &c.callee {
-                    let with_objs = self.with_obj_regs(id.name.as_str());
+                if let Expr::Ident(id) = &c.callee {
+                    let with_objs = self.with_obj_regs(id);
                     if !with_objs.is_empty() {
                         let save = self.next_reg;
-                        let (callee_reg, this_reg) =
-                            self.emit_with_callee_chain(id.name.as_str(), &with_objs);
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                        let (callee_reg, this_reg) = self.emit_with_callee_chain(id, &with_objs);
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                         self.emit(Instr::TailCallWithThis {
                             callee: callee_reg,
                             this_v: this_reg,
@@ -322,14 +362,14 @@ impl<'a> FnCompiler<'a> {
                 // op itself frame-reuses only when `eval` is REBOUND at
                 // runtime (an ordinary call); the genuine-eval path is not a
                 // tail call per spec.
-                if let E::Identifier(id) = &c.callee {
-                    if id.name == "eval"
+                if let Expr::Ident(id) = &c.callee {
+                    if &**id == "eval"
                         && matches!(self.resolve("eval"), Binding::Global(_))
                         && self.with_objs_for("eval").is_empty()
                     {
                         let save = self.next_reg;
                         let dst = self.alloc_reg();
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                         let arg = if argc == 0 {
                             let r = self.temp();
                             self.emit(Instr::LoadUndefined { dst: r });
@@ -349,8 +389,7 @@ impl<'a> FnCompiler<'a> {
                 if cv != ct {
                     self.emit(Instr::Move { dst: ct, src: cv });
                 }
-                let exprs: Vec<&ox::Expression> =
-                    c.arguments.iter().filter_map(|a| a.as_expression()).collect();
+                let exprs: Vec<&Expr> = c.args.iter().filter_map(arg_expr).collect();
                 let arg_base = self.eval_contiguous(&exprs)?;
                 let argc = exprs.len() as u16;
                 self.emit(Instr::TailCall { callee: ct, arg_base, argc });
@@ -360,10 +399,15 @@ impl<'a> FnCompiler<'a> {
                 self.next_reg = save;
                 Ok(())
             }
-            E::TaggedTemplateExpression(tt) if self.tagged_tail_callable(tt) => {
+            // NOTE: signature. `tagged_template_tail` took an
+            // `ox::TaggedTemplateExpression`; with the node inlined into
+            // `Expr::TaggedTemplate { tag, quasi }` it takes the two payloads —
+            // `fn tagged_template_tail(&mut self, tag: &Expr, quasi: &TemplateLit,
+            // dst: Reg) -> R<Reg>` (owned by `compile/exprs.rs`).
+            Expr::TaggedTemplate { tag, quasi } if self.tagged_tail_callable(tag) => {
                 let save = self.next_reg;
                 let dst = self.alloc_reg();
-                self.tagged_template_tail(tt, dst)?;
+                self.tagged_template_tail(tag, quasi, dst)?;
                 self.emit(Instr::Return { src: dst });
                 self.next_reg = save;
                 Ok(())
@@ -443,7 +487,7 @@ impl<'a> FnCompiler<'a> {
     /// parameter — `function f([x, y] = [1, 2], z = x + y)` must see x, y bound
     /// when it evaluates `z`. (A two-pass "all defaults, then all destructuring"
     /// order would read those names before the pattern extracted them.)
-    pub(crate) fn bind_params(&mut self, params: &ox::FormalParameters) -> R<()> {
+    pub(crate) fn bind_params(&mut self, params: &Params) -> R<()> {
         // Parameter defaults compile inside this call — a direct eval there is
         // in the PARAM scope (see FnCompiler::in_param_init).
         self.in_param_init = true;
@@ -452,18 +496,22 @@ impl<'a> FnCompiler<'a> {
         r
     }
 
-    pub(crate) fn bind_params_inner(&mut self, params: &ox::FormalParameters) -> R<()> {
+    pub(crate) fn bind_params_inner(&mut self, params: &Params) -> R<()> {
+        // `Params.simple` is precomputed by the front end and is not recomputed
+        // here; this function only needs the positional/rest split.
+        let (items, rest) = split_rest(&params.items);
         // Ordered identifier-parameter names, for Temporal-Dead-Zone tracking of a
         // default initializer that references the parameter itself or a later one.
-        let param_names: Vec<Option<String>> = params
-            .items
+        // A `= default` is a `Pattern::Assign` wrapper, so it is peeled before the
+        // identifier test — `function f(x = 1, y = x)` still lists `x`.
+        let param_names: Vec<Option<String>> = items
             .iter()
-            .map(|item| match &item.pattern {
-                ox::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+            .map(|item| match param_parts(item).0 {
+                Pattern::Ident(id) => Some(id.to_string()),
                 _ => None,
             })
             .collect();
-        for (i, item) in params.items.iter().enumerate() {
+        for (i, item) in items.iter().enumerate() {
             // While compiling param i's default, param i and every LATER identifier
             // parameter are in the TDZ (a self/forward reference throws); earlier
             // parameters are already bound, so backward references resolve normally.
@@ -471,23 +519,24 @@ impl<'a> FnCompiler<'a> {
             for n in param_names.iter().skip(i).flatten() {
                 self.param_tdz.insert(n.clone());
             }
-            match &item.pattern {
+            let (pat, default) = param_parts(item);
+            match pat {
                 // `x = default`: if (x === undefined) x = default.
-                ox::BindingPattern::BindingIdentifier(id) => {
-                    if let Some(default) = &item.initializer {
-                        let name = id.name.to_string();
+                Pattern::Ident(id) => {
+                    if let Some(default) = default {
+                        let name = id.to_string();
                         self.emit_ident_param_default(&name, default)?;
                     }
                 }
                 // A destructuring pattern: apply its parameter-level default to the
                 // incoming argument register (when undefined) BEFORE extracting.
-                ox::BindingPattern::ObjectPattern(_) | ox::BindingPattern::ArrayPattern(_) => {
-                    if let Some(default) = &item.initializer {
+                Pattern::Object { .. } | Pattern::Array(_) => {
+                    if let Some(default) = default {
                         self.apply_default_in_place((i + 1) as Reg, default)?;
                     }
-                    self.declare_pattern(&item.pattern)?;
+                    self.declare_pattern(pat)?;
                     let save = self.next_reg;
-                    self.extract_pattern(&item.pattern, (i + 1) as Reg)?;
+                    self.extract_pattern(pat, (i + 1) as Reg)?;
                     self.next_reg = save;
                 }
                 _ => {}
@@ -496,12 +545,12 @@ impl<'a> FnCompiler<'a> {
         // A destructuring rest parameter (`function f(...[a,b])`): the overflow args
         // were gathered into the rest array (rest_reg, the synthetic `<rest>` slot);
         // destructure that array into the pattern's leaves, like a normal pattern param.
-        if let Some(r) = &params.rest {
-            if !matches!(&r.rest.argument, ox::BindingPattern::BindingIdentifier(_)) {
+        if let Some(rest) = rest {
+            if !matches!(rest, Pattern::Ident(_)) {
                 if let Some(rr) = self.rest_reg {
-                    self.declare_pattern(&r.rest.argument)?;
+                    self.declare_pattern(rest)?;
                     let save = self.next_reg;
-                    self.extract_pattern(&r.rest.argument, rr)?;
+                    self.extract_pattern(rest, rr)?;
                     self.next_reg = save;
                 }
             }
@@ -513,7 +562,7 @@ impl<'a> FnCompiler<'a> {
     /// Emit `if (x === undefined) x = default` for one identifier parameter. Param
     /// regs are already bound (captured ones boxed), so reads/writes go through
     /// resolve + load_binding/store_binding (plain locals and cells uniformly).
-    pub(crate) fn emit_ident_param_default(&mut self, name: &str, default: &ox::Expression) -> R<()> {
+    pub(crate) fn emit_ident_param_default(&mut self, name: &str, default: &Expr) -> R<()> {
         let b = self.resolve(name);
         let save = self.next_reg;
         let prtmp = self.alloc_reg();

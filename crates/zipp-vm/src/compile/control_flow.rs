@@ -5,6 +5,32 @@
 #![allow(unused_imports)]
 use super::*;
 
+// NOTE: `ast::` is `crate::parse::ast`, brought in through `use super::*` from
+// `compile/mod.rs` (which replaces its `use oxc_ast::ast as ox;` with
+// `use crate::parse::ast;`). Nothing in this file references `ox` any more.
+//
+// NOTE (signatures): the statement nodes this file used to take —
+// `ox::IfStatement`, `WhileStatement`, `DoWhileStatement`, `ForStatement`,
+// `ForOfStatement`, `ForInStatement`, `SwitchStatement`, `TryStatement` — have
+// no struct in the zipp AST; their payload lives in the `ast::Stmt` variant. So
+// each entry point now takes the VARIANT'S FIELDS, in declaration order, and
+// `decls.rs`'s `stmt` destructures at the call site:
+//   S::If { test, cons, alt }            -> if_stmt(test, cons, alt.as_deref())
+//   S::While { test, body }              -> while_stmt(test, body)
+//   S::DoWhile { body, test }            -> do_while_statement(body, test)
+//   S::For { init, test, update, body }  -> for_stmt(init.as_ref(), test.as_ref(),
+//                                                    update.as_ref(), body)
+//   S::ForIn { left, right, body }       -> for_in_statement(left, right, body)
+//   S::ForOf { left, right, body, is_await }
+//                                        -> for_of_statement(left, right, body, *is_await)
+//   S::Switch { disc, cases }            -> switch_stmt(disc, cases)
+//   S::Try { block, handler, finalizer } -> try_statement(block, handler.as_ref(),
+//                                                         finalizer.as_deref())
+//
+// NOTE (Target::Call): this file never matches on `ast::Target` variants — a
+// for-in/for-of assignment head is handed straight to `assign_target`, which
+// owns the Annex B `f() = 1` arm. Nothing to add here.
+
 impl<'a> FnCompiler<'a> {
     /// Compile an `if`/`else` BRANCH. Annex B B.3.3: a bare FunctionDeclaration
     /// used directly as a branch (not inside a `{ }` block) is block-scoped to
@@ -13,10 +39,10 @@ impl<'a> FnCompiler<'a> {
     /// of overwriting an enclosing parameter / lexical of the same name. The
     /// Annex B function-scoped `var` assignment (b33_names / s0reg in func_decl)
     /// still runs for the non-conflicting case.
-    pub(crate) fn branch_stmt(&mut self, s: &ox::Statement) -> R<()> {
-        if let ox::Statement::FunctionDeclaration(f) = s {
-            if let Some(id) = &f.id {
-                let nm = id.name.as_str();
+    pub(crate) fn branch_stmt(&mut self, s: &ast::Stmt) -> R<()> {
+        if let ast::Stmt::FnDecl(f) = s {
+            if let Some(id) = &f.name {
+                let nm = &**id;
                 self.push_scope();
                 // Block-local when the name must stay block-scoped: strict mode, an
                 // enclosing-block lexical conflict, a protected param/lexical/class
@@ -37,16 +63,21 @@ impl<'a> FnCompiler<'a> {
         self.stmt(s)
     }
 
-    pub(crate) fn if_stmt(&mut self, i: &ox::IfStatement) -> R<()> {
+    pub(crate) fn if_stmt(
+        &mut self,
+        test: &ast::Expr,
+        cons: &ast::Stmt,
+        alt: Option<&ast::Stmt>,
+    ) -> R<()> {
         // The statement's completion V starts as undefined (a not-taken / empty
         // branch yields undefined, not the prior statement's value). No-op outside
         // eval mode.
         self.reset_loop_completion();
-        let cond = self.expr(&i.test)?;
+        let cond = self.expr(test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 }); // patched
-        self.branch_stmt(&i.consequent)?;
-        if let Some(alt) = &i.alternate {
+        self.branch_stmt(cons)?;
+        if let Some(alt) = alt {
             let jmp = self.here();
             self.emit(Instr::Jump { target: 0 }); // patched
             let else_start = self.here();
@@ -72,13 +103,13 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    pub(crate) fn while_stmt(&mut self, w: &ox::WhileStatement) -> R<()> {
+    pub(crate) fn while_stmt(&mut self, test: &ast::Expr, body: &ast::Stmt) -> R<()> {
         let top = self.here();
-        let cond = self.expr(&w.test)?;
+        let cond = self.expr(test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 });
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
-        self.stmt(&w.body)?;
+        self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         for c in ctx.continue_jumps {
             self.patch_jump(c, top); // continue → re-test
@@ -107,11 +138,11 @@ impl<'a> FnCompiler<'a> {
     /// The registers of a declaration's simple-identifier bindings that are
     /// cell-boxed (captured by a nested closure) — the ones needing per-iteration
     /// freshening in a loop head.
-    pub(crate) fn captured_decl_regs(&self, d: &ox::VariableDeclaration) -> Vec<Reg> {
+    pub(crate) fn captured_decl_regs(&self, d: &ast::VarDecl) -> Vec<Reg> {
         let mut regs = Vec::new();
-        for decl in &d.declarations {
-            if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
-                if let Some(reg) = self.local_reg(id.name.as_str()) {
+        for decl in &d.decls {
+            if let ast::Pattern::Ident(id) = &decl.id {
+                if let Some(reg) = self.local_reg(id) {
                     if self.cell_regs.contains(&reg) {
                         regs.push(reg);
                     }
@@ -133,16 +164,22 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    pub(crate) fn for_stmt(&mut self, f: &ox::ForStatement) -> R<()> {
+    pub(crate) fn for_stmt(
+        &mut self,
+        init: Option<&ast::ForInit>,
+        test: Option<&ast::Expr>,
+        update: Option<&ast::Expr>,
+        body: &ast::Stmt,
+    ) -> R<()> {
         self.push_scope();
         // `for (using x = r; …) body` / `for (await using …)`: the resource is
         // LOOP-scoped (disposed ONCE when the for-statement completes, normal or
         // abrupt), unlike for-of which disposes per-iteration. Open a scope + a
         // finally wrapping the whole loop; the `using` init registers x into it.
-        let using_async: Option<bool> = match &f.init {
-            Some(ox::ForStatementInit::VariableDeclaration(d)) => match d.kind {
-                ox::VariableDeclarationKind::Using => Some(false),
-                ox::VariableDeclarationKind::AwaitUsing => Some(true),
+        let using_async: Option<bool> = match init {
+            Some(ast::ForInit::Var(d)) => match d.kind {
+                ast::VarKind::Using => Some(false),
+                ast::VarKind::AwaitUsing => Some(true),
                 _ => None,
             },
             _ => None,
@@ -160,9 +197,9 @@ impl<'a> FnCompiler<'a> {
             None
         };
         // init
-        if let Some(init) = &f.init {
+        if let Some(init) = init {
             match init {
-                ox::ForStatementInit::VariableDeclaration(d) => {
+                ast::ForInit::Var(d) => {
                     // While compiling the `using` init, route its RegisterDisposable
                     // to the loop scope (restored after, so a using-block in the body
                     // uses its own scope).
@@ -172,10 +209,11 @@ impl<'a> FnCompiler<'a> {
                         self.using_scope_reg = p;
                     }
                 }
-                other => {
-                    let e = other
-                        .as_expression()
-                        .ok_or("unsupported for-init")?;
+                // NOTE: `ForInit` has exactly two variants, so the old
+                // `as_expression().ok_or("unsupported for-init")?` guard is gone —
+                // there is no third shape left to reject. Unreachable before, so no
+                // bytecode changes.
+                ast::ForInit::Expr(e) => {
                     self.expr(e)?;
                 }
             }
@@ -186,12 +224,8 @@ impl<'a> FnCompiler<'a> {
         // is actually boxed (captured) — otherwise the plain-register fast path
         // (and the hot-loop JIT) is preserved. `var` is function-scoped → no
         // freshening.
-        let fresh_regs: Vec<Reg> = match &f.init {
-            Some(ox::ForStatementInit::VariableDeclaration(d))
-                if d.kind != ox::VariableDeclarationKind::Var =>
-            {
-                self.captured_decl_regs(d)
-            }
+        let fresh_regs: Vec<Reg> = match init {
+            Some(ast::ForInit::Var(d)) if d.kind != ast::VarKind::Var => self.captured_decl_regs(d),
             _ => Vec::new(),
         };
         // CreatePerIterationEnvironment runs once BEFORE the first test (13.7.4.8
@@ -200,7 +234,7 @@ impl<'a> FnCompiler<'a> {
         // mutate.
         self.emit_freshen_cells(&fresh_regs);
         let top = self.here();
-        let jf = match &f.test {
+        let jf = match test {
             Some(t) => {
                 let cond = self.expr(t)?;
                 let j = self.here();
@@ -210,7 +244,7 @@ impl<'a> FnCompiler<'a> {
             None => None,
         };
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
-        self.stmt(&f.body)?;
+        self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
         for c in ctx.continue_jumps {
@@ -220,7 +254,7 @@ impl<'a> FnCompiler<'a> {
         // body's closures (which captured the OLD cell) keep this iteration's
         // value and the update mutates the new binding.
         self.emit_freshen_cells(&fresh_regs);
-        if let Some(update) = &f.update {
+        if let Some(update) = update {
             self.expr(update)?;
         }
         self.emit(Instr::Jump { target: top });
@@ -269,15 +303,24 @@ impl<'a> FnCompiler<'a> {
     /// chaining through any outer finally. `break`/`continue` exit via `JumpFinally`
     /// (emitted by `emit_loop_jump` when the target's handler depth is below the
     /// current one).
-    pub(crate) fn try_statement(&mut self, t: &ox::TryStatement) -> R<()> {
-        match &t.finalizer {
-            Some(finalizer) => self.try_with_finally(t, finalizer),
-            None => self.try_catch_only(t),
+    pub(crate) fn try_statement(
+        &mut self,
+        block: &[ast::Stmt],
+        handler: Option<&ast::CatchClause>,
+        finalizer: Option<&[ast::Stmt]>,
+    ) -> R<()> {
+        match finalizer {
+            Some(finalizer) => self.try_with_finally(block, handler, finalizer),
+            None => self.try_catch_only(block, handler),
         }
     }
 
     /// `try { … } catch (e) { … }` (no finalizer).
-    pub(crate) fn try_catch_only(&mut self, t: &ox::TryStatement) -> R<()> {
+    pub(crate) fn try_catch_only(
+        &mut self,
+        block: &[ast::Stmt],
+        handler: Option<&ast::CatchClause>,
+    ) -> R<()> {
         // The statement's completion V starts at undefined (an empty try/catch
         // yields undefined, not the prior statement's value).
         self.reset_loop_completion();
@@ -289,14 +332,14 @@ impl<'a> FnCompiler<'a> {
         // exiting it must pop the stale handler — see `emit_loop_jump`).
         self.handler_depth += 1;
         self.push_scope();
-        self.predeclare_lexical_tdz(&t.block.body);
-        self.compile_stmt_list(&t.block.body, false)?;
+        self.predeclare_lexical_tdz(block);
+        self.compile_stmt_list(block, false)?;
         self.pop_scope();
         // After the try body the catch handler is no longer active (the catch body
         // runs with it already popped by the unwind).
         self.handler_depth -= 1;
 
-        let handler = t.handler.as_ref().ok_or("try requires catch or finally")?;
+        let handler = handler.ok_or("try requires catch or finally")?;
         // Normal completion of the try: pop the handler, skip the catch.
         self.emit(Instr::PopHandler);
         let skip = self.here();
@@ -321,7 +364,7 @@ impl<'a> FnCompiler<'a> {
     /// Shared by plain blocks, switch case-blocks, and try/catch/finally bodies
     /// (a switch's CaseBlock calls it once per clause — the in-scope dedup makes
     /// the clauses share one block-level binding).
-    pub(crate) fn predeclare_lexical_tdz(&mut self, stmts: &[ox::Statement]) {
+    pub(crate) fn predeclare_lexical_tdz(&mut self, stmts: &[ast::Stmt]) {
         for st in stmts {
             let mut pre = |fc: &mut Self, name: &str| {
                 if fc.captured.contains(name)
@@ -335,16 +378,16 @@ impl<'a> FnCompiler<'a> {
                 }
             };
             match st {
-                ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
-                    for decl in &d.declarations {
-                        if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
-                            pre(self, id.name.as_str());
+                ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    for decl in &d.decls {
+                        if let ast::Pattern::Ident(id) = &decl.id {
+                            pre(self, id);
                         }
                     }
                 }
-                ox::Statement::ClassDeclaration(c) => {
-                    if let Some(id) = &c.id {
-                        pre(self, id.name.as_str());
+                ast::Stmt::ClassDecl(c) => {
+                    if let Some(id) = &c.name {
+                        pre(self, id);
                     }
                 }
                 _ => {}
@@ -355,24 +398,20 @@ impl<'a> FnCompiler<'a> {
     /// True iff `body` declares a top-level `using`/`await using` resource. Only
     /// such blocks/bodies get the disposal scaffolding — every other block keeps
     /// its byte-for-byte-identical fast path (the zero-regression gate).
-    pub(crate) fn block_has_using(body: &[ox::Statement]) -> bool {
+    pub(crate) fn block_has_using(body: &[ast::Stmt]) -> bool {
         body.iter().any(|st| {
             matches!(st,
-                ox::Statement::VariableDeclaration(d)
-                    if matches!(d.kind,
-                        ox::VariableDeclarationKind::Using
-                        | ox::VariableDeclarationKind::AwaitUsing))
+                ast::Stmt::VarDecl(d)
+                    if matches!(d.kind, ast::VarKind::Using | ast::VarKind::AwaitUsing))
         })
     }
 
     /// True iff `body` declares a top-level `await using` — such a scope disposes
     /// ASYNCHRONOUSLY (each dispose result is awaited), so its finally epilogue is
     /// the awaited disposal loop rather than the single sync `DisposeScope` op.
-    pub(crate) fn block_has_await_using(body: &[ox::Statement]) -> bool {
+    pub(crate) fn block_has_await_using(body: &[ast::Stmt]) -> bool {
         body.iter().any(|st| {
-            matches!(st,
-                ox::Statement::VariableDeclaration(d)
-                    if d.kind == ox::VariableDeclarationKind::AwaitUsing)
+            matches!(st, ast::Stmt::VarDecl(d) if d.kind == ast::VarKind::AwaitUsing)
         })
     }
 
@@ -425,7 +464,7 @@ impl<'a> FnCompiler<'a> {
     /// `scope_reg` and becomes `using_scope_reg` for the body, so each `using`'s
     /// `RegisterDisposable` pushes onto it. (Sync `using` only this iteration;
     /// `await using` still binds like `let` but is not yet disposed.)
-    pub(crate) fn compile_using_block(&mut self, body: &[ox::Statement], skip_fn_decls: bool) -> R<()> {
+    pub(crate) fn compile_using_block(&mut self, body: &[ast::Stmt], skip_fn_decls: bool) -> R<()> {
         // NB: unlike `try_with_finally`, do NOT reset the completion register — a
         // `using` block's own completion is empty (UpdateEmpty), so it must
         // PRESERVE the prior eval completion (`4; {using x=null;}` ⇒ 4). The
@@ -444,7 +483,7 @@ impl<'a> FnCompiler<'a> {
             // Function-body callers materialise top-level function declarations at
             // entry and skip them here (mirrors the non-using body loop).
             if skip_fn_decls {
-                if let ox::Statement::FunctionDeclaration(_) = st {
+                if let ast::Stmt::FnDecl(_) = st {
                     continue;
                 }
             }
@@ -480,13 +519,13 @@ impl<'a> FnCompiler<'a> {
     /// plain loop). Used by the statement-list contexts that are NOT the
     /// `BlockStatement` arm — try/catch/finally bodies — so `using` inside them is
     /// disposed at the end of that block, like any other block.
-    pub(crate) fn compile_stmt_list(&mut self, body: &[ox::Statement], skip_fn_decls: bool) -> R<()> {
+    pub(crate) fn compile_stmt_list(&mut self, body: &[ast::Stmt], skip_fn_decls: bool) -> R<()> {
         if Self::block_has_using(body) {
             self.compile_using_block(body, skip_fn_decls)
         } else {
             for s in body {
                 if skip_fn_decls {
-                    if let ox::Statement::FunctionDeclaration(_) = s {
+                    if let ast::Stmt::FnDecl(_) = s {
                         continue;
                     }
                 }
@@ -500,8 +539,9 @@ impl<'a> FnCompiler<'a> {
     /// exit path via a `PushFinally` handler + `EndFinally` epilogue.
     pub(crate) fn try_with_finally(
         &mut self,
-        t: &ox::TryStatement,
-        finalizer: &ox::BlockStatement,
+        block: &[ast::Stmt],
+        handler: Option<&ast::CatchClause>,
+        finalizer: &[ast::Stmt],
     ) -> R<()> {
         // The statement's completion V starts at undefined (an empty try/finally
         // yields undefined). The try/catch body value is then preserved through a
@@ -521,7 +561,7 @@ impl<'a> FnCompiler<'a> {
         // `emit_loop_jump`).
         self.handler_depth += 1;
 
-        let has_catch = t.handler.is_some();
+        let has_catch = handler.is_some();
         let catch_push = if has_catch {
             let at = self.here();
             self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
@@ -533,8 +573,8 @@ impl<'a> FnCompiler<'a> {
 
         // Try body.
         self.push_scope();
-        self.predeclare_lexical_tdz(&t.block.body);
-        self.compile_stmt_list(&t.block.body, false)?;
+        self.predeclare_lexical_tdz(block);
+        self.compile_stmt_list(block, false)?;
         self.pop_scope();
 
         // Normal-completion jumps (from the try body and, if present, the catch
@@ -550,7 +590,7 @@ impl<'a> FnCompiler<'a> {
 
         // Catch body (entered by the unwind, which already popped the Catch
         // handler; the Finally handler is still active for throws inside it).
-        if let (Some(catch_push), Some(handler)) = (catch_push, &t.handler) {
+        if let (Some(catch_push), Some(handler)) = (catch_push, handler) {
             self.compile_catch_body(handler, catch_push)?;
             self.emit_leave_finally_normal(kind_reg);
             normal_jumps.push(self.here());
@@ -586,8 +626,8 @@ impl<'a> FnCompiler<'a> {
             r
         });
         self.push_scope();
-        self.predeclare_lexical_tdz(&finalizer.body);
-        for s in &finalizer.body {
+        self.predeclare_lexical_tdz(finalizer);
+        for s in finalizer {
             self.stmt(s)?;
         }
         self.pop_scope();
@@ -611,7 +651,7 @@ impl<'a> FnCompiler<'a> {
 
     /// Compile a `catch (e) { … }` body and patch its `PushHandler` (at `push_at`)
     /// to land here with the thrown value in the catch register.
-    pub(crate) fn compile_catch_body(&mut self, handler: &ox::CatchClause, push_at: u32) -> R<()> {
+    pub(crate) fn compile_catch_body(&mut self, handler: &ast::CatchClause, push_at: u32) -> R<()> {
         // The VM deposits the thrown value into the catch register directly, so
         // reserve it WITHOUT auto-boxing; box it after if a nested closure
         // captures the binding (the value is present by then).
@@ -621,16 +661,16 @@ impl<'a> FnCompiler<'a> {
         // the binding; for `catch ([a,b])` / `catch ({e})` it's a scratch slot we
         // destructure into the pattern's bindings.
         let (e_reg, e_name, pattern) = match &handler.param {
-            Some(p) => match &p.pattern {
-                ox::BindingPattern::BindingIdentifier(id) => {
+            Some(p) => match p {
+                ast::Pattern::Ident(id) => {
                     // Strict mode: `catch (eval)` / `catch (arguments)` is an early SyntaxError.
-                    strict_name_err(self.cx.in_strict, id.name.as_str())?;
-                    let r = self.declare_local_no_box(id.name.as_str());
+                    strict_name_err(self.cx.in_strict, id)?;
+                    let r = self.declare_local_no_box(id);
                     // Mark the catch-PARAMETER binding: Annex B B.3.5 lets a
                     // same-named `var` / block function coexist with it (NOT an
                     // early error), so the B.3.3 promotion check must ignore it.
                     self.catch_param_regs.insert(r);
-                    (r, Some(id.name.to_string()), None)
+                    (r, Some(id.to_string()), None)
                 }
                 pat => (self.declare_local_no_box("<catch.val>"), None, Some(pat)),
             },
@@ -658,22 +698,22 @@ impl<'a> FnCompiler<'a> {
         // The catch BLOCK's captured lexicals get block-entry TDZ cells — after
         // the parameter above, so a closure in a destructuring default captures
         // the OUTER binding while closures in the block capture the block's.
-        self.predeclare_lexical_tdz(&handler.body.body);
-        self.compile_stmt_list(&handler.body.body, false)?;
+        self.predeclare_lexical_tdz(&handler.body);
+        self.compile_stmt_list(&handler.body, false)?;
         self.pop_scope();
         Ok(())
     }
 
-    pub(crate) fn do_while_statement(&mut self, d: &ox::DoWhileStatement) -> R<()> {
+    pub(crate) fn do_while_statement(&mut self, body: &ast::Stmt, test: &ast::Expr) -> R<()> {
         let top = self.here();
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
-        self.stmt(&d.body)?;
+        self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
         for c in ctx.continue_jumps {
             self.patch_jump(c, cont); // continue → re-evaluate the condition
         }
-        let cond = self.expr(&d.test)?;
+        let cond = self.expr(test)?;
         // Loop back to top while the condition is truthy.
         self.emit(Instr::JumpIfTrue { cond, target: top });
         let end = self.here();
@@ -687,7 +727,7 @@ impl<'a> FnCompiler<'a> {
     /// `disc === testᵢ` comparison jumps in order (and remember `default`), then
     /// emit the case bodies consecutively so fall-through is natural; `break`
     /// (collected in a non-loop frame) jumps to the end.
-    pub(crate) fn switch_stmt(&mut self, s: &ox::SwitchStatement) -> R<()> {
+    pub(crate) fn switch_stmt(&mut self, disc: &ast::Expr, cases: &[ast::SwitchCase]) -> R<()> {
         // CaseBlockEvaluation starts the completion V at undefined (a no-match /
         // all-empty switch yields undefined, not the prior statement's value).
         self.reset_loop_completion();
@@ -695,7 +735,7 @@ impl<'a> FnCompiler<'a> {
         // CaseBlock's block scope opens (NewDeclarativeEnvironment happens after
         // GetValue(exprRef)), so a closure in the discriminant captures outer
         // bindings, not the case-block's.
-        let disc = self.expr(&s.discriminant)?;
+        let disc = self.expr(disc)?;
         self.push_scope();
         // A switch CaseBlock is one block scope. Pre-declare its lexically-scoped
         // declarations as block-local so they don't leak past the switch:
@@ -703,21 +743,21 @@ impl<'a> FnCompiler<'a> {
         //    lexical (no Annex B), so block-local in both strict and sloppy;
         //  - an ordinary function declaration is block-local only in strict (sloppy
         //    keeps the Annex B hoist to the function/global scope).
-        for c in &s.cases {
-            for st in &c.consequent {
+        for c in cases {
+            for st in &c.body {
                 match st {
-                    ox::Statement::FunctionDeclaration(f) => {
-                        if let Some(id) = &f.id {
+                    ast::Stmt::FnDecl(f) => {
+                        if let Some(id) = &f.name {
                             // Block-local in strict / generator / async (always
                             // lexical), on a lexical conflict, or for a protected
                             // param/lexical/class or a B.3.3 var name — so Annex B
                             // param/lexical skip-leak applies in case bodies too. A
                             // same-named existing function is directly updated, not
                             // shadowed.
-                            let nm = id.name.as_str();
+                            let nm = &**id;
                             if self.cx.in_strict
-                                || f.generator
-                                || f.r#async
+                                || f.is_generator
+                                || f.is_async
                                 || self.block_fn_conflicts(nm)
                                 || self.protect_names.contains(nm)
                                 || self.b33_names.contains(nm)
@@ -726,9 +766,9 @@ impl<'a> FnCompiler<'a> {
                             }
                         }
                     }
-                    ox::Statement::ClassDeclaration(cd) => {
-                        if let Some(id) = &cd.id {
-                            self.declare_local(id.name.as_str());
+                    ast::Stmt::ClassDecl(cd) => {
+                        if let Some(id) = &cd.name {
+                            self.declare_local(id);
                         }
                     }
                     _ => {}
@@ -738,15 +778,15 @@ impl<'a> FnCompiler<'a> {
         // BlockDeclarationInstantiation's TDZ half: captured `let`/`const` in any
         // clause get block-entry TDZ cells, so a closure in a case selector or an
         // earlier clause captures the CaseBlock's binding, not an outer one.
-        for c in &s.cases {
-            self.predeclare_lexical_tdz(&c.consequent);
+        for c in cases {
+            self.predeclare_lexical_tdz(&c.body);
         }
 
         // Pass 1: comparison jumps (strict `===`, like JS). `default` is recorded
         // and dispatched after the others fail.
         let mut case_jumps: Vec<(usize, u32)> = Vec::new();
         let mut default_index: Option<usize> = None;
-        for (i, c) in s.cases.iter().enumerate() {
+        for (i, c) in cases.iter().enumerate() {
             match &c.test {
                 Some(t) => {
                     let save = self.next_reg;
@@ -767,10 +807,10 @@ impl<'a> FnCompiler<'a> {
 
         // Pass 2: case bodies, in source order (fall-through is natural).
         self.loop_ctx.push(LoopCtx::switch_frame(self.pending_label.take(), self.handler_depth));
-        let mut body_start: Vec<u32> = Vec::with_capacity(s.cases.len());
-        for c in &s.cases {
+        let mut body_start: Vec<u32> = Vec::with_capacity(cases.len());
+        for c in cases {
             body_start.push(self.here());
-            for st in &c.consequent {
+            for st in &c.body {
                 self.stmt(st)?;
             }
         }
@@ -793,8 +833,14 @@ impl<'a> FnCompiler<'a> {
     /// array/string: `let i=0; while (i < len(iter)) { x = iter[i]; body; i++ }`.
     /// (Generic iterables/iterators are not in the subset; arrays and strings
     /// cover the corpus and common code.)
-    pub(crate) fn for_of_statement(&mut self, f: &ox::ForOfStatement) -> R<()> {
-        if f.r#await && !self.in_async {
+    pub(crate) fn for_of_statement(
+        &mut self,
+        left: &ast::ForTarget,
+        right: &ast::Expr,
+        body: &ast::Stmt,
+        is_await: bool,
+    ) -> R<()> {
+        if is_await && !self.in_async {
             return Err("`for await` is only valid in an async function".into());
         }
         self.push_scope();
@@ -803,13 +849,15 @@ impl<'a> FnCompiler<'a> {
         // element; a plain `for (let x of …)` binds it to one variable. A head
         // that's NOT a declaration (`for (x of …)`, `for ([a,b] of …)`,
         // `for (obj.k of …)`) ASSIGNS each element to an existing target.
-        let decl_pat = match &f.left {
-            ox::ForStatementLeft::VariableDeclaration(d) => Some(&d.declarations[0].id),
+        let decl_pat = match left {
+            ast::ForTarget::Var(d) => Some(&d.decls[0].id),
             _ => None,
         };
-        let pattern =
-            decl_pat.filter(|p| !matches!(p, ox::BindingPattern::BindingIdentifier(_)));
-        let assign_tgt = f.left.as_assignment_target();
+        let pattern = decl_pat.filter(|p| !matches!(p, ast::Pattern::Ident(_)));
+        let assign_tgt = match left {
+            ast::ForTarget::Target(t) => Some(t),
+            _ => None,
+        };
 
         // Evaluate the iterable into a stable scratch local; `idx` is the cursor
         // IterNext advances for array/string/Map/Set (ignored for a generator,
@@ -818,11 +866,11 @@ impl<'a> FnCompiler<'a> {
         // The iterable expression is evaluated with the loop's `let`/`const` binding(s)
         // already in scope but in their TDZ — so `for (let x of [x]) {}` throws a
         // ReferenceError (the inner `x` shadows, uninitialized), per
-        // ForIn/OfHeadEvaluation. Mark the names as TDZ for the duration of `f.right`.
-        let tdz_added: Vec<String> = match &f.left {
-            ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical() => {
+        // ForIn/OfHeadEvaluation. Mark the names as TDZ for the duration of `right`.
+        let tdz_added: Vec<String> = match left {
+            ast::ForTarget::Var(d) if d.kind.is_lexical() => {
                 let mut names = std::collections::HashSet::new();
-                capture::collect_pattern_names(&d.declarations[0].id, &mut names);
+                capture::collect_pattern_names(&d.decls[0].id, &mut names);
                 names
                     .into_iter()
                     .filter(|n| self.param_tdz.insert(n.clone()))
@@ -831,7 +879,7 @@ impl<'a> FnCompiler<'a> {
             _ => Vec::new(),
         };
         // A RUNTIME TDZ scope over the head expression too: a CLOSURE created
-        // in `f.right` captures an uninitialized cell for each head name and
+        // in `right` captures an uninitialized cell for each head name and
         // throws ReferenceError when it later reads it (the head env binding
         // is never initialized), instead of capturing the outer binding.
         let head_tdz_scope = !tdz_added.is_empty();
@@ -844,7 +892,7 @@ impl<'a> FnCompiler<'a> {
                 self.cell_regs.insert(r);
             }
         }
-        let v = self.expr_into(&f.right, iter_reg)?;
+        let v = self.expr_into(right, iter_reg)?;
         if head_tdz_scope {
             self.pop_scope();
         }
@@ -857,7 +905,7 @@ impl<'a> FnCompiler<'a> {
         // Resolve the iterator. `for await` uses the ASYNC iterator (@@asyncIterator
         // → @@iterator fallback); plain `for of` uses @@iterator. Built-ins/async
         // generators pass through and are driven by IterNext / ForAwaitNext.
-        let sync_reg = if f.r#await {
+        let sync_reg = if is_await {
             // The sync flag must survive the whole loop (read each iteration
             // for the AsyncFromSyncIteratorContinuation value-await below).
             let s = self.declare_local("<forof.sync>");
@@ -872,7 +920,7 @@ impl<'a> FnCompiler<'a> {
         // — iterator-next-reference). Sync loops only; user-object iterators
         // only (built-ins keep the registerless cursor fast path, with no
         // observable prologue get).
-        let next_reg = if f.r#await {
+        let next_reg = if is_await {
             None
         } else {
             let n = self.declare_local("<forof.next>");
@@ -885,7 +933,7 @@ impl<'a> FnCompiler<'a> {
         // throws, the iterator must be closed before the error propagates. The
         // thrown value lands in `exc_reg`; a catch block after the loop closes the
         // iterator and re-throws. (for-await iterates asynchronously — left as-is.)
-        let exc_reg = if f.r#await {
+        let exc_reg = if is_await {
             None
         } else {
             Some(self.declare_local("<forof.exc>"))
@@ -893,8 +941,7 @@ impl<'a> FnCompiler<'a> {
 
         // The loop binding: a destructuring pattern's leaves, an assignment to an
         // existing target, or a single (possibly cell-boxed) declared variable.
-        let head_lexical = matches!(&f.left,
-            ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical());
+        let head_lexical = matches!(left, ast::ForTarget::Var(d) if d.kind.is_lexical());
         // A `var` head whose binding is NOT a plain current-function register
         // (catch-param cell / global slot / upvalue): per-iteration writes go
         // through `store_binding` — the loop creates NO binding of its own
@@ -912,11 +959,8 @@ impl<'a> FnCompiler<'a> {
             }
             (None, Some(_)) => (0, false), // assignment target: nothing to declare
             (None, None) => {
-                let var_name = for_left_name(&f.left)?;
-                if matches!(&f.left,
-                    ox::ForStatementLeft::VariableDeclaration(d)
-                        if d.kind == ox::VariableDeclarationKind::Var)
-                {
+                let var_name = for_left_name(left)?;
+                if matches!(left, ast::ForTarget::Var(d) if d.kind == ast::VarKind::Var) {
                     // `for (var x of …)`: resolve the EXISTING binding instead
                     // of declaring a loop-local; a first-mention var creates
                     // its FUNCTION-scoped binding.
@@ -931,12 +975,10 @@ impl<'a> FnCompiler<'a> {
                     let r = self.declare_local(&var_name);
                     // A `const`/`using`/`await using` loop variable is immutable
                     // WITHIN an iteration: a body assignment throws TypeError.
-                    if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                    if let ast::ForTarget::Var(d) = left {
                         if matches!(
                             d.kind,
-                            ox::VariableDeclarationKind::Const
-                                | ox::VariableDeclarationKind::Using
-                                | ox::VariableDeclarationKind::AwaitUsing
+                            ast::VarKind::Const | ast::VarKind::Using | ast::VarKind::AwaitUsing
                         ) {
                             self.const_regs.insert(r);
                         }
@@ -951,10 +993,10 @@ impl<'a> FnCompiler<'a> {
         // per-iteration disposal scope). Allocate the scope/completion registers
         // once (stable across iterations); OpenUsingScope writes a fresh scope id
         // each turn. Only a simple-identifier head is a using declaration.
-        let using_async: Option<bool> = match &f.left {
-            ox::ForStatementLeft::VariableDeclaration(d) => match d.kind {
-                ox::VariableDeclarationKind::Using => Some(false),
-                ox::VariableDeclarationKind::AwaitUsing => Some(true),
+        let using_async: Option<bool> = match left {
+            ast::ForTarget::Var(d) => match d.kind {
+                ast::VarKind::Using => Some(false),
+                ast::VarKind::AwaitUsing => Some(true),
                 _ => None,
             },
             _ => None,
@@ -982,7 +1024,7 @@ impl<'a> FnCompiler<'a> {
         } else {
             var_reg
         };
-        let jdone = if f.r#await {
+        let jdone = if is_await {
             // `r = await <next step>; done = r.done; value = r.value`. ForAwaitNext
             // yields a Promise (async iterator) or a {value,done} (sync) — awaiting
             // suspends on the former and passes the latter straight through.
@@ -1112,7 +1154,7 @@ impl<'a> FnCompiler<'a> {
             None
         };
 
-        self.stmt(&f.body)?;
+        self.stmt(body)?;
 
         // Close the per-iteration `using` finally (its DisposeScope/await-loop runs
         // on the normal path here, and on abrupt exits via the finally handler).
@@ -1181,39 +1223,44 @@ impl<'a> FnCompiler<'a> {
 
     /// `for (const k in obj) body` — iterate the object's own enumerable string
     /// keys (or an array's index strings), via the ObjectKeys op + an index loop.
-    pub(crate) fn for_in_statement(&mut self, f: &ox::ForInStatement) -> R<()> {
+    pub(crate) fn for_in_statement(
+        &mut self,
+        left: &ast::ForTarget,
+        right: &ast::Expr,
+        body: &ast::Stmt,
+    ) -> R<()> {
         self.push_scope();
         // Mirror for-of: `for (let k in …)` declares, `for (let [a,b] in …)`
         // destructures, `for (k in …)` / `for (obj.k in …)` assigns to a target.
-        let decl_pat = match &f.left {
-            ox::ForStatementLeft::VariableDeclaration(d) => Some(&d.declarations[0].id),
+        let decl_pat = match left {
+            ast::ForTarget::Var(d) => Some(&d.decls[0].id),
             _ => None,
         };
-        let pattern =
-            decl_pat.filter(|p| !matches!(p, ox::BindingPattern::BindingIdentifier(_)));
-        let assign_tgt = f.left.as_assignment_target();
+        let pattern = decl_pat.filter(|p| !matches!(p, ast::Pattern::Ident(_)));
+        let assign_tgt = match left {
+            ast::ForTarget::Target(t) => Some(t),
+            _ => None,
+        };
 
         // Annex B B.3.6: `for (var a = init in obj)` evaluates the initializer
         // ONCE and assigns it to the (function-scoped / shadowing) binding
         // BEFORE the object expression runs.
-        if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
-            if d.kind == ox::VariableDeclarationKind::Var {
-                if let (Some(init), ox::BindingPattern::BindingIdentifier(id)) =
-                    (&d.declarations[0].init, &d.declarations[0].id)
-                {
+        if let ast::ForTarget::Var(d) = left {
+            if d.kind == ast::VarKind::Var {
+                if let (Some(init), ast::Pattern::Ident(id)) = (&d.decls[0].init, &d.decls[0].id) {
                     // ResolveBinding FIRST (head_var_binding may permanently
                     // allocate the function-scoped register — it must stay
                     // below the temp watermark we reclaim to), then evaluate
                     // the initializer, then PutValue.
-                    let b = self.head_var_binding(id.name.as_str());
+                    let b = self.head_var_binding(id);
                     let save = self.next_reg;
                     let tmp = self.temp();
-                    let v = self.compile_named_init(tmp, init, id.name.as_str())?;
-                    let with_objs = self.with_obj_regs(id.name.as_str());
+                    let v = self.compile_named_init(tmp, init, id)?;
+                    let with_objs = self.with_obj_regs(id);
                     if with_objs.is_empty() {
                         self.store_binding(&b, v);
                     } else {
-                        self.store_with(id.name.as_str(), &with_objs, v);
+                        self.store_with(id, &with_objs, v);
                     }
                     self.next_reg = save;
                 }
@@ -1223,10 +1270,10 @@ impl<'a> FnCompiler<'a> {
         let obj_reg = self.declare_local("<forin.obj>");
         // The right-hand expression sees the loop's `let`/`const` binding(s) in their
         // TDZ (`for (let x in x) {}` throws a ReferenceError), per ForIn/OfHeadEvaluation.
-        let tdz_added: Vec<String> = match &f.left {
-            ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical() => {
+        let tdz_added: Vec<String> = match left {
+            ast::ForTarget::Var(d) if d.kind.is_lexical() => {
                 let mut names = std::collections::HashSet::new();
-                capture::collect_pattern_names(&d.declarations[0].id, &mut names);
+                capture::collect_pattern_names(&d.decls[0].id, &mut names);
                 names
                     .into_iter()
                     .filter(|n| self.param_tdz.insert(n.clone()))
@@ -1235,7 +1282,7 @@ impl<'a> FnCompiler<'a> {
             _ => Vec::new(),
         };
         // A RUNTIME TDZ scope over the head expression too: a CLOSURE created
-        // in `f.right` captures an uninitialized cell for each head name and
+        // in `right` captures an uninitialized cell for each head name and
         // throws ReferenceError when it later reads it (the head env binding
         // is never initialized), instead of capturing the outer binding.
         let head_tdz_scope = !tdz_added.is_empty();
@@ -1248,7 +1295,7 @@ impl<'a> FnCompiler<'a> {
                 self.cell_regs.insert(r);
             }
         }
-        let v = self.expr_into(&f.right, obj_reg)?;
+        let v = self.expr_into(right, obj_reg)?;
         if head_tdz_scope {
             self.pop_scope();
         }
@@ -1265,8 +1312,7 @@ impl<'a> FnCompiler<'a> {
         let idx_reg = self.declare_local("<forin.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
-        let head_lexical = matches!(&f.left,
-            ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical());
+        let head_lexical = matches!(left, ast::ForTarget::Var(d) if d.kind.is_lexical());
         // A `var` head whose binding is NOT a plain current-function register —
         // a shadowing catch parameter cell, a global slot, an upvalue: the
         // per-iteration write goes through `store_binding` (the loop creates NO
@@ -1282,11 +1328,8 @@ impl<'a> FnCompiler<'a> {
             }
             (None, Some(_)) => (0, false),
             (None, None) => {
-                let var_name = for_left_name(&f.left)?;
-                if matches!(&f.left,
-                    ox::ForStatementLeft::VariableDeclaration(d)
-                        if d.kind == ox::VariableDeclarationKind::Var)
-                {
+                let var_name = for_left_name(left)?;
+                if matches!(left, ast::ForTarget::Var(d) if d.kind == ast::VarKind::Var) {
                     // `for (var x in …)`: resolve the EXISTING binding (the
                     // hoisted function-scope var, a shadowing catch param, or
                     // the global slot) instead of declaring a loop-local; a
@@ -1302,12 +1345,10 @@ impl<'a> FnCompiler<'a> {
                     let r = self.declare_local(&var_name);
                     // A `const` loop variable is immutable WITHIN an iteration:
                     // a body assignment throws TypeError (mirrors for-of).
-                    if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                    if let ast::ForTarget::Var(d) = left {
                         if matches!(
                             d.kind,
-                            ox::VariableDeclarationKind::Const
-                                | ox::VariableDeclarationKind::Using
-                                | ox::VariableDeclarationKind::AwaitUsing
+                            ast::VarKind::Const | ast::VarKind::Using | ast::VarKind::AwaitUsing
                         ) {
                             self.const_regs.insert(r);
                         }
@@ -1377,7 +1418,7 @@ impl<'a> FnCompiler<'a> {
         self.next_reg = save;
 
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
-        self.stmt(&f.body)?;
+        self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
         self.patch_jump(live_jf, cont); // dead (deleted) key → skip to increment

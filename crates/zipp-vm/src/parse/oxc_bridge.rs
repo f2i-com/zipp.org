@@ -407,16 +407,27 @@ fn lower_object(o: &ox::ObjectExpression) -> R<Vec<ObjectMember>> {
             }
             ox::ObjectPropertyKind::ObjectProperty(p) => {
                 let key = lower_prop_key(&p.key, p.computed)?;
+                // SPAN. A method's [[SourceText]] is the whole
+                // MethodDefinition — `next () { … }`, `[Symbol.iterator] () { … }`,
+                // `get x () { … }` — but oxc's inner FunctionExpression span
+                // starts at the `(`, so using it would make
+                // `Function.prototype.toString` drop the key. The enclosing
+                // ObjectProperty span is the right text.
+                let method_span = sp(p.span);
+                let with_span = |f: Function| Function { span: method_span, ..f };
                 out.push(match p.kind {
-                    ox::PropertyKind::Get => {
-                        ObjectMember::Get { key, func: Box::new(lower_accessor_fn(&p.value)?) }
-                    }
-                    ox::PropertyKind::Set => {
-                        ObjectMember::Set { key, func: Box::new(lower_accessor_fn(&p.value)?) }
-                    }
-                    ox::PropertyKind::Init if p.method => {
-                        ObjectMember::Method { key, func: Box::new(lower_accessor_fn(&p.value)?) }
-                    }
+                    ox::PropertyKind::Get => ObjectMember::Get {
+                        key,
+                        func: Box::new(with_span(lower_accessor_fn(&p.value)?)),
+                    },
+                    ox::PropertyKind::Set => ObjectMember::Set {
+                        key,
+                        func: Box::new(with_span(lower_accessor_fn(&p.value)?)),
+                    },
+                    ox::PropertyKind::Init if p.method => ObjectMember::Method {
+                        key,
+                        func: Box::new(with_span(lower_accessor_fn(&p.value)?)),
+                    },
                     ox::PropertyKind::Init => ObjectMember::Prop {
                         key,
                         value: lower_expr(&p.value)?,

@@ -4,6 +4,10 @@
 // each other. No logic changed.
 #![allow(unused_imports)]
 use super::*;
+// Named explicitly so this file does not depend on how the parent module
+// re-exports the AST (`use super::*` would supply it too; an explicit import
+// shadows the glob rather than clashing with it).
+use crate::parse::ast;
 
 /// Compile a parsed program into bytecode.
 /// Is constant Value `v` a (pending) string literal? String constants are encoded
@@ -245,17 +249,20 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
 
 /// The `type` import attribute of an import/export-from declaration's
 /// `with { ... }` clause, if present.
-pub(crate) fn with_clause_type(wc: &Option<oxc_allocator::Box<ox::WithClause>>) -> Option<String> {
-    let wc = wc.as_ref()?;
-    for e in &wc.with_entries {
-        let key = match &e.key {
-            ox::ImportAttributeKey::Identifier(id) => id.name.as_str(),
-            ox::ImportAttributeKey::StringLiteral(s) => s.value.as_str(),
-        };
-        if key == "type" {
-            return Some(e.value.value.to_string());
+///
+/// NOTE: `ast::ImportDecl`/`ExportDecl` hold the attributes as a plain list, so
+/// this takes the list rather than an optional clause node — there is no
+/// `WithClause` wrapper to unwrap, and an absent clause is an empty slice. The
+/// `with` vs (legacy) `assert` keyword is not recorded by `ImportAttribute`,
+/// which changes nothing: this function ignored it before too.
+///
+/// A key or value holding a lone surrogate can never equal `"type"` and is never
+/// a module type, so the lossy view is exact for both comparisons here.
+pub(crate) fn with_clause_type(attrs: &[ast::ImportAttribute]) -> Option<String> {
+    for a in attrs {
+        if a.key.to_lossy_string() == "type" {
+            return Some(a.value.to_lossy_string());
         }
     }
     None
 }
-

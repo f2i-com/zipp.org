@@ -5,6 +5,37 @@
 #![allow(unused_imports)]
 use super::*;
 
+use crate::parse::ast::{
+    self, AssignOp, CallExpr, Expr, MemberProp, PropKey, Target, TargetElem, TargetProp,
+};
+
+// NOTE: signatures this file assumes of functions owned by other groups. Each
+// follows mechanically from the type mapping; if one lands differently, these
+// are the only call sites to adjust.
+//
+//   fn concat_key_literal_prefix(key: &Expr) -> Option<(&str, &Expr)>
+//       — `&str` rather than `&StrVal` because it is only ever fed to
+//         `string_name`, and the helper already excludes a lone-surrogate
+//         literal (now `StrVal::Utf16`), so the surviving case IS `&str`.
+//   fn class_key_name(key: &PropKey) -> R<String>
+//   fn compound_assign_instr(op: AssignOp, dst: Reg, a: Reg, b: Reg) -> Option<Instr>
+//   FnCompiler::extract_member(&mut self, obj: Reg, key: &PropKey, dst: Reg) -> R<()>
+//       — the `computed: bool` parameter is gone: `PropKey::Computed` is a
+//         variant now, so the flag can no longer disagree with the key.
+//   FnCompiler::expr(&mut self, e: &Expr) -> R<Reg>
+//   FnCompiler::expr_into(&mut self, e: &Expr, dst: Reg) -> R<Reg>
+//   FnCompiler::compile_named_init(&mut self, dst: Reg, init: &Expr, name: &str) -> R<Reg>
+//   FnCompiler::apply_default_in_place_named(&mut self, reg: Reg, default: &Expr,
+//                                            name: Option<&str>) -> R<()>
+//   FnCompiler::call(&mut self, c: &CallExpr, dst: Reg) -> R<Reg>
+//
+// `string_name` / `add_string_const` keep `&str`: a property key is a Rust
+// `String` engine-wide (`ObjMap.keys`), so nothing here wants a `StrVal`.
+//
+// NOTE: `assign` is now called as `self.assign(*op, target, value, dst)` from
+// the `Expr::Assign { op, target, value }` arm of `expr_into` — the struct node
+// is gone and its three fields arrive separately.
+
 /// Does compiling this expression into a destination register WRITE that
 /// register before it has finished READING its operands?
 ///
@@ -32,31 +63,26 @@ use super::*;
 /// property. This is deliberately a whitelist of what is SAFE-by-omission — a
 /// new in-place-building form must be added here, and `assign_reads_target` in
 /// the tests covers each shape.
-fn builds_into_dst_incrementally(e: &ox::Expression) -> bool {
-    use ox::Expression as E;
+fn builds_into_dst_incrementally(e: &Expr) -> bool {
     match e {
-        E::ObjectExpression(_) => true,
+        Expr::Object(_) => true,
         // A template with no interpolations is a plain constant string.
-        E::TemplateLiteral(t) => !t.expressions.is_empty(),
-        E::ConditionalExpression(c) => {
-            builds_into_dst_incrementally(&c.consequent)
-                || builds_into_dst_incrementally(&c.alternate)
+        Expr::Template(t) => !t.exprs.is_empty(),
+        Expr::Cond { cons, alt, .. } => {
+            builds_into_dst_incrementally(cons) || builds_into_dst_incrementally(alt)
         }
-        E::LogicalExpression(l) => {
-            builds_into_dst_incrementally(&l.left) || builds_into_dst_incrementally(&l.right)
+        Expr::Logical { left, right, .. } => {
+            builds_into_dst_incrementally(left) || builds_into_dst_incrementally(right)
         }
-        E::SequenceExpression(s) => {
-            s.expressions.last().is_some_and(builds_into_dst_incrementally)
-        }
-        E::ParenthesizedExpression(p) => builds_into_dst_incrementally(&p.expression),
-        E::AssignmentExpression(a) => {
-            use ox::AssignmentTarget as T;
-            matches!(
-                a.left,
-                T::StaticMemberExpression(_)
-                    | T::ComputedMemberExpression(_)
-                    | T::PrivateFieldExpression(_)
-            ) || builds_into_dst_incrementally(&a.right)
+        Expr::Seq(exprs) => exprs.last().is_some_and(builds_into_dst_incrementally),
+        // NOTE: the former `ParenthesizedExpression` arm is gone — the AST has
+        // no such node. Parenthesisation is observable only on an assignment
+        // TARGET (`Target::Ident { covered }`), never on the value side, so
+        // nothing is lost: a parenthesised object literal reaches the `Object`
+        // arm directly instead of through a peel.
+        Expr::Assign { target, value, .. } => {
+            // All three member shapes (`a.b`, `a[b]`, `a.#b`) are one node now.
+            matches!(target, Target::Member(_)) || builds_into_dst_incrementally(value)
         }
         _ => false,
     }
@@ -66,113 +92,125 @@ impl<'a> FnCompiler<'a> {
     /// Assign `src` to a destructuring-assignment target (existing binding or
     /// member, or a nested array/object pattern). Counterpart to `extract_pattern`
     /// for `=` targets that aren't declarations.
-    pub(crate) fn assign_target(&mut self, target: &ox::AssignmentTarget, src: Reg) -> R<()> {
-        use ox::AssignmentTarget as T;
+    pub(crate) fn assign_target(&mut self, target: &Target, src: Reg) -> R<()> {
         match target {
-            T::AssignmentTargetIdentifier(id) => {
-                let b = self.resolve(&id.name);
+            Target::Ident { name, .. } => {
+                let b = self.resolve(name);
                 self.store_binding(&b, src);
                 Ok(())
             }
-            T::StaticMemberExpression(m) => {
-                let save = self.next_reg;
-                let obj = self.expr(&m.object)?;
-                let name = self.string_name(m.property.name.as_str());
-                self.emit(Instr::SetProp { obj, name, val: src });
-                self.next_reg = save;
-                Ok(())
-            }
-            T::ComputedMemberExpression(m) => {
-                let save = self.next_reg;
-                let obj = self.expr(&m.object)?;
-                // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat
-                // (no throwaway concat-key allocation; see GetIndexConcat).
-                if let Some((name, rhs)) = concat_key_literal_prefix(&m.expression) {
-                    let nidx = self.string_name(name);
-                    let key = self.expr(rhs)?;
-                    self.emit(Instr::SetIndexConcat { obj, name: nidx, key, val: src });
+            Target::Member(m) => match &m.prop {
+                MemberProp::Ident(prop) => {
+                    let save = self.next_reg;
+                    let obj = self.expr(&m.object)?;
+                    let name = self.string_name(prop);
+                    self.emit(Instr::SetProp { obj, name, val: src });
                     self.next_reg = save;
-                    return Ok(());
+                    Ok(())
                 }
-                let key = self.expr(&m.expression)?;
-                self.emit(Instr::SetIndex { obj, key, val: src });
-                self.next_reg = save;
-                Ok(())
+                MemberProp::Computed(key_expr) => {
+                    let save = self.next_reg;
+                    let obj = self.expr(&m.object)?;
+                    // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat
+                    // (no throwaway concat-key allocation; see GetIndexConcat).
+                    if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
+                        let nidx = self.string_name(name);
+                        let key = self.expr(rhs)?;
+                        self.emit(Instr::SetIndexConcat { obj, name: nidx, key, val: src });
+                        self.next_reg = save;
+                        return Ok(());
+                    }
+                    let key = self.expr(key_expr)?;
+                    self.emit(Instr::SetIndex { obj, key, val: src });
+                    self.next_reg = save;
+                    Ok(())
+                }
+                MemberProp::Private(field) => {
+                    // `[this.#x] = arr` / `({a: this.#x} = o)`: a private field as a
+                    // destructuring target — brand-checked PrivateSet (the target
+                    // reference is taken before the value per the destructuring driver).
+                    self.check_private_declared(field)?;
+                    let save = self.next_reg;
+                    let obj = self.expr(&m.object)?;
+                    let name = self.string_name(&private_key(field));
+                    self.emit(Instr::SetPrivate { obj, name, val: src });
+                    self.next_reg = save;
+                    Ok(())
+                }
+            },
+            Target::Array(elems) => self.assign_array_target(elems, src),
+            Target::Object { props, rest } => {
+                self.assign_object_target(props, rest.as_deref(), src)
             }
-            T::PrivateFieldExpression(m) => {
-                // `[this.#x] = arr` / `({a: this.#x} = o)`: a private field as a
-                // destructuring target — brand-checked PrivateSet (the target
-                // reference is taken before the value per the destructuring driver).
-                self.check_private_declared(&m.field.name)?;
-                let save = self.next_reg;
-                let obj = self.expr(&m.object)?;
-                let name = self.string_name(&private_key(&m.field.name));
-                self.emit(Instr::SetPrivate { obj, name, val: src });
-                self.next_reg = save;
-                Ok(())
-            }
-            T::ArrayAssignmentTarget(arr) => self.assign_array_target(arr, src),
-            T::ObjectAssignmentTarget(o) => self.assign_object_target(o, src),
-            _ => Err("unsupported destructuring-assignment target in the zipp-vm subset".into()),
+            Target::Call(c) => self.assign_call_target(c),
         }
+    }
+
+    /// Annex B "Runtime Errors for Function Call Assignment Targets": in SLOPPY
+    /// code `AssignmentTargetType(CallExpression)` is *simple*, so `f() = 1`
+    /// parses, the call is EVALUATED, and a ReferenceError is thrown at runtime —
+    /// before the RHS, before any old-value read, and before any ToNumeric
+    /// coercion. The parser refuses to build this in strict code, so there is
+    /// nothing to re-check here.
+    ///
+    /// NOTE: this replaces `crate::annexb_call_target_rewrite`'s source rewrite
+    /// (`f(…)` → `((f(…)), __zipp_annexb_ref_error__())[0]`) with the same
+    /// observable behaviour emitted directly. It is UNREACHABLE through
+    /// `parse::oxc_bridge` — oxc cannot represent a call as an assignment target —
+    /// so it cannot move the byte-identical-bytecode gate; it goes live only with
+    /// the hand-written parser. Error kind 4 is ReferenceError
+    /// (`vm::native::ERROR_NAMES`).
+    pub(crate) fn assign_call_target(&mut self, c: &CallExpr) -> R<()> {
+        let save = self.next_reg;
+        let r = self.alloc_reg();
+        self.call(c, r)?;
+        let e = self.alloc_reg();
+        self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+        self.emit(Instr::Throw { src: e });
+        self.next_reg = save;
+        Ok(())
     }
 
     /// A destructuring MEMBER target's reference, evaluated BEFORE the source
     /// property read (KeyedDestructuringAssignmentEvaluation: the
     /// DestructuringAssignmentTarget reference comes first, then GetV).
-    pub(crate) fn pre_member_ref(
-        &mut self,
-        m: &ox::AssignmentTargetMaybeDefault,
-    ) -> R<Option<(Reg, PreKey)>> {
-        use ox::AssignmentTargetMaybeDefault as M;
-        // Unwrap a `target = default` to its inner target.
-        let inner: &ox::AssignmentTarget = match m {
-            M::AssignmentTargetWithDefault(d) => &d.binding,
-            // The flattened member variants reuse the same node types — handle
-            // them via a reconstructed reference below.
-            M::StaticMemberExpression(sm) => {
-                let r = self.pin_expr(&sm.object)?;
-                let name = self.string_name(sm.property.name.as_str());
-                return Ok(Some((r, PreKey::Static(name))));
-            }
-            M::ComputedMemberExpression(cm) => {
-                let r = self.pin_expr(&cm.object)?;
-                let k = self.pin_expr(&cm.expression)?;
-                return Ok(Some((r, PreKey::Computed(k))));
-            }
-            M::PrivateFieldExpression(pm) => {
-                self.check_private_declared(&pm.field.name)?;
-                let r = self.pin_expr(&pm.object)?;
-                let name = self.string_name(&private_key(&pm.field.name));
-                return Ok(Some((r, PreKey::Private(name))));
-            }
-            _ => return Ok(None),
-        };
-        use ox::AssignmentTarget as T;
-        match inner {
-            T::StaticMemberExpression(sm) => {
-                let r = self.pin_expr(&sm.object)?;
-                let name = self.string_name(sm.property.name.as_str());
-                Ok(Some((r, PreKey::Static(name))))
-            }
-            T::ComputedMemberExpression(cm) => {
-                let r = self.pin_expr(&cm.object)?;
-                let k = self.pin_expr(&cm.expression)?;
-                Ok(Some((r, PreKey::Computed(k))))
-            }
-            T::PrivateFieldExpression(pm) => {
-                self.check_private_declared(&pm.field.name)?;
-                let r = self.pin_expr(&pm.object)?;
-                let name = self.string_name(&private_key(&pm.field.name));
-                Ok(Some((r, PreKey::Private(name))))
-            }
+    ///
+    /// Takes the bare target: a `= default` is a SIBLING field on
+    /// `TargetElem`/`TargetProp` now, not a wrapper node, so there is nothing to
+    /// unwrap and the former "flattened member variants" duplicate arms collapse
+    /// into one.
+    pub(crate) fn pre_member_ref(&mut self, t: &Target) -> R<Option<(Reg, PreKey)>> {
+        match t {
+            Target::Member(m) => match &m.prop {
+                MemberProp::Ident(prop) => {
+                    let r = self.pin_expr(&m.object)?;
+                    let name = self.string_name(prop);
+                    Ok(Some((r, PreKey::Static(name))))
+                }
+                MemberProp::Computed(key_expr) => {
+                    let r = self.pin_expr(&m.object)?;
+                    let k = self.pin_expr(key_expr)?;
+                    Ok(Some((r, PreKey::Computed(k))))
+                }
+                MemberProp::Private(field) => {
+                    self.check_private_declared(field)?;
+                    let r = self.pin_expr(&m.object)?;
+                    let name = self.string_name(&private_key(field));
+                    Ok(Some((r, PreKey::Private(name))))
+                }
+            },
+            // NOTE: `Target::Call` falls here, so an Annex B call target in a
+            // destructuring position is evaluated (and throws) at STORE time via
+            // `assign_target`, not up front. That matches today's rewrite, whose
+            // `((f()), ref_error())[0]` base is itself a member reference the
+            // compiler cannot pre-resolve either.
             _ => Ok(None),
         }
     }
 
     /// Evaluate `e` into a PINNED register (survives later evaluation; the
     /// caller's next_reg reset reclaims it).
-    pub(crate) fn pin_expr(&mut self, e: &ox::Expression) -> R<Reg> {
+    pub(crate) fn pin_expr(&mut self, e: &Expr) -> R<Reg> {
         let r = self.alloc_reg();
         let v = self.expr_into(e, r)?;
         if v != r {
@@ -182,16 +220,16 @@ impl<'a> FnCompiler<'a> {
     }
 
     /// Store through a reference produced by `pre_member_ref`, applying any
-    /// `= default` of `m` first (no NamedEvaluation — the target is a member).
+    /// `= default` first (no NamedEvaluation — the target is a member).
     pub(crate) fn store_pre_ref(
         &mut self,
-        m: &ox::AssignmentTargetMaybeDefault,
+        default: Option<&Expr>,
         obj: Reg,
         key: &PreKey,
         val: Reg,
     ) -> R<()> {
-        if let ox::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) = m {
-            self.apply_default_in_place_named(val, &d.init, None)?;
+        if let Some(init) = default {
+            self.apply_default_in_place_named(val, init, None)?;
         }
         match *key {
             PreKey::Static(name) => self.emit(Instr::SetProp { obj, name, val }),
@@ -204,57 +242,68 @@ impl<'a> FnCompiler<'a> {
     /// One element of a destructuring assignment, applying its `= default` first.
     pub(crate) fn assign_maybe_default(
         &mut self,
-        m: &ox::AssignmentTargetMaybeDefault,
+        target: &Target,
+        default: Option<&Expr>,
         val: Reg,
     ) -> R<()> {
-        use ox::AssignmentTargetMaybeDefault as M;
-        match m {
-            M::AssignmentTargetWithDefault(d) => {
-                // `[a = function(){}] = arr` ⇒ the default function takes name "a".
-                let name = match &d.binding {
-                    ox::AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
-                    _ => None,
-                };
-                self.apply_default_in_place_named(val, &d.init, name.as_deref())?;
-                self.assign_target(&d.binding, val)
-            }
-            M::AssignmentTargetIdentifier(id) => {
-                let b = self.resolve(&id.name);
+        if let Some(init) = default {
+            // `[a = function(){}] = arr` ⇒ the default function takes name "a".
+            let name = match target {
+                Target::Ident { name, .. } => Some(name.to_string()),
+                _ => None,
+            };
+            self.apply_default_in_place_named(val, init, name.as_deref())?;
+            return self.assign_target(target, val);
+        }
+        // NOTE: the no-default member arms are deliberately NOT `assign_target`.
+        // That path fuses `obj[<string literal> + e] = v` into SetIndexConcat;
+        // this one never has, and the gate is byte-identical bytecode.
+        match target {
+            Target::Ident { name, .. } => {
+                let b = self.resolve(name);
                 self.store_binding(&b, val);
                 Ok(())
             }
-            M::StaticMemberExpression(m) => {
-                let save = self.next_reg;
-                let obj = self.expr(&m.object)?;
-                let name = self.string_name(m.property.name.as_str());
-                self.emit(Instr::SetProp { obj, name, val });
-                self.next_reg = save;
-                Ok(())
+            Target::Member(m) => match &m.prop {
+                MemberProp::Ident(prop) => {
+                    let save = self.next_reg;
+                    let obj = self.expr(&m.object)?;
+                    let name = self.string_name(prop);
+                    self.emit(Instr::SetProp { obj, name, val });
+                    self.next_reg = save;
+                    Ok(())
+                }
+                MemberProp::Computed(key_expr) => {
+                    let save = self.next_reg;
+                    let obj = self.expr(&m.object)?;
+                    let key = self.expr(key_expr)?;
+                    self.emit(Instr::SetIndex { obj, key, val });
+                    self.next_reg = save;
+                    Ok(())
+                }
+                MemberProp::Private(field) => {
+                    self.check_private_declared(field)?;
+                    let save = self.next_reg;
+                    let obj = self.expr(&m.object)?;
+                    let name = self.string_name(&private_key(field));
+                    self.emit(Instr::SetPrivate { obj, name, val });
+                    self.next_reg = save;
+                    Ok(())
+                }
+            },
+            Target::Array(elems) => self.assign_array_target(elems, val),
+            Target::Object { props, rest } => {
+                self.assign_object_target(props, rest.as_deref(), val)
             }
-            M::ComputedMemberExpression(m) => {
-                let save = self.next_reg;
-                let obj = self.expr(&m.object)?;
-                let key = self.expr(&m.expression)?;
-                self.emit(Instr::SetIndex { obj, key, val });
-                self.next_reg = save;
-                Ok(())
-            }
-            M::PrivateFieldExpression(m) => {
-                self.check_private_declared(&m.field.name)?;
-                let save = self.next_reg;
-                let obj = self.expr(&m.object)?;
-                let name = self.string_name(&private_key(&m.field.name));
-                self.emit(Instr::SetPrivate { obj, name, val });
-                self.next_reg = save;
-                Ok(())
-            }
-            M::ArrayAssignmentTarget(arr) => self.assign_array_target(arr, val),
-            M::ObjectAssignmentTarget(o) => self.assign_object_target(o, val),
-            _ => Err("unsupported destructuring-assignment element in the zipp-vm subset".into()),
+            Target::Call(c) => self.assign_call_target(c),
         }
     }
 
-    pub(crate) fn assign_array_target(&mut self, arr: &ox::ArrayAssignmentTarget, src_in: Reg) -> R<()> {
+    pub(crate) fn assign_array_target(
+        &mut self,
+        els: &[Option<TargetElem>],
+        src_in: Reg,
+    ) -> R<()> {
         // Array assignment destructuring: the SPEC's stepwise iterator driver.
         // Per element: evaluate a member target's REFERENCE first, then
         // IteratorStep (no step once exhausted), then the default, then store
@@ -262,6 +311,17 @@ impl<'a> FnCompiler<'a> {
         // non-exhausted iterator QUIETLY (the original throw wins); a normal
         // completion closes STRICTLY (a throwing/non-object return() result
         // propagates).
+        //
+        // `...rest` is the LAST entry of `els` with `rest: true` (the grammar
+        // allows nothing after it), where oxc used to park it in a sibling
+        // field. Split it back out so the element pass and the rest pass stay
+        // the two loops they were.
+        let rest: Option<&TargetElem> = match els.last() {
+            Some(Some(t)) if t.rest => Some(t),
+            _ => None,
+        };
+        let elements: &[Option<TargetElem>] =
+            if rest.is_some() { &els[..els.len() - 1] } else { els };
         let save_top = self.next_reg;
         let iter_reg = self.alloc_reg();
         self.emit(Instr::CheckIterable { src: src_in });
@@ -279,10 +339,10 @@ impl<'a> FnCompiler<'a> {
         let push_at = self.here();
         self.emit(Instr::PushFinally { target: 0, kind_reg, val_reg });
         self.handler_depth += 1;
-        for el in &arr.elements {
+        for el in elements {
             let save = self.next_reg;
             let pre = match el {
-                Some(maybe) => self.pre_member_ref(maybe)?,
+                Some(te) => self.pre_member_ref(&te.target)?,
                 None => None,
             };
             let val = self.alloc_reg();
@@ -308,15 +368,17 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::LoadUndefined { dst: val });
             let got = self.here();
             self.patch_jump(jgot, got);
-            if let Some(maybe) = el {
+            if let Some(te) = el {
                 match pre {
-                    Some((obj, key)) => self.store_pre_ref(maybe, obj, &key, val)?,
-                    None => self.assign_maybe_default(maybe, val)?,
+                    Some((obj, key)) => {
+                        self.store_pre_ref(te.default.as_ref(), obj, &key, val)?
+                    }
+                    None => self.assign_maybe_default(&te.target, te.default.as_ref(), val)?,
                 }
             }
             self.next_reg = save;
         }
-        if let Some(rest) = &arr.rest {
+        if let Some(rest) = rest {
             let save = self.next_reg;
             let pre = self.pre_rest_ref(&rest.target)?;
             let out = self.alloc_reg();
@@ -391,140 +453,115 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
-    /// `pre_member_ref` for a REST target (a plain AssignmentTarget).
-    pub(crate) fn pre_rest_ref(&mut self, t: &ox::AssignmentTarget) -> R<Option<(Reg, PreKey)>> {
-        use ox::AssignmentTarget as T;
-        match t {
-            T::StaticMemberExpression(sm) => {
-                let r = self.pin_expr(&sm.object)?;
-                let name = self.string_name(sm.property.name.as_str());
-                Ok(Some((r, PreKey::Static(name))))
-            }
-            T::ComputedMemberExpression(cm) => {
-                let r = self.pin_expr(&cm.object)?;
-                let k = self.pin_expr(&cm.expression)?;
-                Ok(Some((r, PreKey::Computed(k))))
-            }
-            T::PrivateFieldExpression(pm) => {
-                self.check_private_declared(&pm.field.name)?;
-                let r = self.pin_expr(&pm.object)?;
-                let name = self.string_name(&private_key(&pm.field.name));
-                Ok(Some((r, PreKey::Private(name))))
-            }
-            _ => Ok(None),
-        }
+    /// `pre_member_ref` for a REST target.
+    ///
+    /// NOTE: identical to `pre_member_ref` now — the two differed only because
+    /// oxc gave a rest target the bare `AssignmentTarget` type while an element
+    /// arrived wrapped in `AssignmentTargetMaybeDefault`. Both are a `Target`
+    /// here, so the name is kept (it says which caller it serves) but the body
+    /// delegates.
+    pub(crate) fn pre_rest_ref(&mut self, t: &Target) -> R<Option<(Reg, PreKey)>> {
+        self.pre_member_ref(t)
     }
 
-    pub(crate) fn assign_object_target(&mut self, o: &ox::ObjectAssignmentTarget, src: Reg) -> R<()> {
+    pub(crate) fn assign_object_target(
+        &mut self,
+        props: &[TargetProp],
+        rest: Option<&Target>,
+        src: Reg,
+    ) -> R<()> {
         // RequireObjectCoercible(src) for an empty pattern (`({} = x)` /
         // `({...rest} = x)`) — no member access would otherwise guard null/undefined.
-        if o.properties.is_empty() {
+        if props.is_empty() {
             self.emit(Instr::CheckCoercible { src });
         }
         // Computed sibling key + `...rest`: evaluate each sibling key once into a
         // contiguous block (reused for extraction and the ObjectRestDyn exclusion).
-        let has_computed = o.rest.is_some()
-            && o.properties.iter().any(|p| {
-                matches!(p, ox::AssignmentTargetProperty::AssignmentTargetPropertyProperty(pp) if pp.computed)
-            });
+        // A shorthand property can never be computed, so keying off the PropKey
+        // variant is exactly the old `p.computed` test.
+        let has_computed =
+            rest.is_some() && props.iter().any(|p| matches!(p.key, PropKey::Computed(_)));
         if has_computed {
-            use ox::AssignmentTargetProperty as ATP;
             let block_save = self.next_reg;
             let keys_base = self.next_reg;
-            let n = o.properties.len() as u16;
-            for _ in 0..o.properties.len() {
+            let n = props.len() as u16;
+            for _ in 0..props.len() {
                 self.alloc_reg();
             }
-            for (i, prop) in o.properties.iter().enumerate() {
+            for (i, prop) in props.iter().enumerate() {
                 let kreg = keys_base + i as Reg;
-                match prop {
-                    ATP::AssignmentTargetPropertyProperty(p) if p.computed => {
-                        let e = p.name.as_expression().ok_or("unsupported computed destructuring key")?;
+                match &prop.key {
+                    PropKey::Computed(e) => {
                         let v = self.expr_into(e, kreg)?;
                         if v != kreg {
                             self.emit(Instr::Move { dst: kreg, src: v });
                         }
                     }
-                    ATP::AssignmentTargetPropertyProperty(p) => {
-                        let name = class_key_name(&p.name)?;
+                    // Shorthand `{x}` and `{k: t}` land here together: a
+                    // shorthand's key is `PropKey::Ident`, and `class_key_name`
+                    // of that is the identifier itself — the same string the
+                    // shorthand arm used to take from its binding.
+                    key => {
+                        let name = class_key_name(key)?;
                         let idx = self.add_string_const(&name);
-                        self.emit(Instr::LoadConst { dst: kreg, idx });
-                    }
-                    ATP::AssignmentTargetPropertyIdentifier(p) => {
-                        let idx = self.add_string_const(&p.binding.name);
                         self.emit(Instr::LoadConst { dst: kreg, idx });
                     }
                 }
             }
-            for (i, prop) in o.properties.iter().enumerate() {
+            for (i, prop) in props.iter().enumerate() {
                 let save = self.next_reg;
                 let kreg = keys_base + i as Reg;
                 let val = self.alloc_reg();
                 self.emit(Instr::GetIndex { dst: val, obj: src, key: kreg });
-                match prop {
-                    ATP::AssignmentTargetPropertyIdentifier(p) => {
-                        if let Some(init) = &p.init {
-                            self.apply_default_in_place_named(val, init, Some(&p.binding.name))?;
+                match (&prop.target, prop.shorthand) {
+                    (Target::Ident { name, .. }, true) => {
+                        if let Some(init) = &prop.default {
+                            self.apply_default_in_place_named(val, init, Some(&**name))?;
                         }
-                        let b = self.resolve(&p.binding.name);
+                        let b = self.resolve(name);
                         self.store_binding(&b, val);
                     }
-                    ATP::AssignmentTargetPropertyProperty(p) => {
-                        self.assign_maybe_default(&p.binding, val)?;
+                    _ => {
+                        self.assign_maybe_default(&prop.target, prop.default.as_ref(), val)?;
                     }
                 }
                 self.next_reg = save;
             }
-            let rest = o.rest.as_ref().unwrap();
+            // `has_computed` is only set when there IS a rest target; no unwrap.
+            let rest_target = rest.ok_or("object-rest destructuring lost its rest target")?;
             let save = self.next_reg;
             let val = self.alloc_reg();
             self.emit(Instr::ObjectRestDyn { dst: val, src, keys_base, n });
-            self.assign_target(&rest.target, val)?;
+            self.assign_target(rest_target, val)?;
             self.next_reg = save;
             self.next_reg = block_save;
             return Ok(());
         }
-        for prop in &o.properties {
+        for prop in props {
             let save = self.next_reg;
-            match prop {
-                ox::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+            match (&prop.target, prop.shorthand) {
+                (Target::Ident { name, .. }, true) => {
                     // `({x} = o)` / `({x = d} = o)` — target is the identifier itself.
                     let val = self.alloc_reg();
-                    let name = self.string_name(&p.binding.name);
-                    self.emit(Instr::GetProp { dst: val, obj: src, name });
-                    if let Some(init) = &p.init {
+                    let nidx = self.string_name(name);
+                    self.emit(Instr::GetProp { dst: val, obj: src, name: nidx });
+                    if let Some(init) = &prop.default {
                         // `({x = function(){}} = o)` ⇒ default takes the name "x".
-                        self.apply_default_in_place_named(val, init, Some(&p.binding.name))?;
+                        self.apply_default_in_place_named(val, init, Some(&**name))?;
                     }
-                    let b = self.resolve(&p.binding.name);
+                    let b = self.resolve(name);
                     self.store_binding(&b, val);
                 }
-                ox::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                _ => {
                     // `({key: target} = o)`. For a MEMBER target the spec
                     // order is: PropertyName (incl. ToPropertyKey) -> target
                     // REFERENCE (object + uncoerced key exprs) -> GetV ->
                     // default -> PutValue (target-key coercion at store).
-                    let is_member_target = matches!(
-                        &p.binding,
-                        ox::AssignmentTargetMaybeDefault::StaticMemberExpression(_)
-                            | ox::AssignmentTargetMaybeDefault::ComputedMemberExpression(_)
-                            | ox::AssignmentTargetMaybeDefault::PrivateFieldExpression(_)
-                    ) || matches!(
-                        &p.binding,
-                        ox::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d)
-                            if matches!(
-                                &d.binding,
-                                ox::AssignmentTarget::StaticMemberExpression(_)
-                                    | ox::AssignmentTarget::ComputedMemberExpression(_)
-                                    | ox::AssignmentTarget::PrivateFieldExpression(_)
-                            )
-                    );
+                    // The `= default` is a sibling field now, so the two old
+                    // shapes (bare member, member-with-default) are one test.
+                    let is_member_target = matches!(&prop.target, Target::Member(_));
                     if is_member_target {
-                        let skey: Option<Reg> = if p.computed {
-                            let e = p
-                                .name
-                                .as_expression()
-                                .ok_or("unsupported computed destructuring key")?;
+                        let skey: Option<Reg> = if let PropKey::Computed(e) = &prop.key {
                             let raw = self.pin_expr(e)?;
                             let k = self.alloc_reg();
                             self.emit(Instr::ToPropKey { dst: k, obj: src, src: raw });
@@ -532,22 +569,22 @@ impl<'a> FnCompiler<'a> {
                         } else {
                             None
                         };
-                        let pre = self.pre_member_ref(&p.binding)?;
+                        let pre = self.pre_member_ref(&prop.target)?;
                         let val = self.alloc_reg();
                         match skey {
                             Some(k) => self.emit(Instr::GetIndex { dst: val, obj: src, key: k }),
                             None => {
-                                let name = class_key_name(&p.name)?;
+                                let name = class_key_name(&prop.key)?;
                                 let nidx = self.string_name(&name);
                                 self.emit(Instr::GetProp { dst: val, obj: src, name: nidx });
                             }
                         }
                         let (obj, key) = pre.expect("member target shape checked above");
-                        self.store_pre_ref(&p.binding, obj, &key, val)?;
+                        self.store_pre_ref(prop.default.as_ref(), obj, &key, val)?;
                     } else {
                         let val = self.alloc_reg();
-                        self.extract_member(src, &p.name, p.computed, val)?;
-                        self.assign_maybe_default(&p.binding, val)?;
+                        self.extract_member(src, &prop.key, val)?;
+                        self.assign_maybe_default(&prop.target, prop.default.as_ref(), val)?;
                     }
                 }
             }
@@ -555,19 +592,15 @@ impl<'a> FnCompiler<'a> {
         }
         // `({a, ...rest} = o)` — a new object of `src`'s own keys minus the
         // siblings, assigned to the rest target (mirrors the declaration form).
-        if let Some(rest) = &o.rest {
+        if let Some(rest_target) = rest {
             let exclude_start = self.string_constants.len() as u32;
             let mut exclude_count = 0u16;
-            for prop in &o.properties {
-                let key = match prop {
-                    ox::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
-                        p.binding.name.to_string()
-                    }
-                    ox::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                        class_key_name(&p.name).map_err(|_| {
-                            "object-rest with a computed sibling key is not in the subset"
-                        })?
-                    }
+            for prop in props {
+                let key = match (&prop.target, prop.shorthand) {
+                    (Target::Ident { name, .. }, true) => name.to_string(),
+                    _ => class_key_name(&prop.key).map_err(|_| {
+                        "object-rest with a computed sibling key is not in the subset"
+                    })?,
                 };
                 self.string_name(&key);
                 exclude_count += 1;
@@ -575,7 +608,7 @@ impl<'a> FnCompiler<'a> {
             let save = self.next_reg;
             let val = self.alloc_reg();
             self.emit(Instr::ObjectRest { dst: val, src, exclude_start, exclude_count });
-            self.assign_target(&rest.target, val)?;
+            self.assign_target(rest_target, val)?;
             self.next_reg = save;
         }
         Ok(())
@@ -584,15 +617,14 @@ impl<'a> FnCompiler<'a> {
     /// For a logical assignment (`||= &&= ??=`), emit the short-circuit test on
     /// `val` (which already holds the target's current value) and return the ip
     /// of the jump that, when taken, SKIPS the assignment (keeping `val`).
-    pub(crate) fn emit_logical_skip(&mut self, op: ox::AssignmentOperator, val: Reg) -> u32 {
-        use ox::AssignmentOperator as Op;
+    pub(crate) fn emit_logical_skip(&mut self, op: AssignOp, val: Reg) -> u32 {
         match op {
-            Op::LogicalOr => {
+            AssignOp::LogicalOr => {
                 let j = self.here();
                 self.emit(Instr::JumpIfTrue { cond: val, target: 0 }); // truthy → skip
                 j
             }
-            Op::LogicalAnd => {
+            AssignOp::LogicalAnd => {
                 let j = self.here();
                 self.emit(Instr::JumpIfFalse { cond: val, target: 0 }); // falsy → skip
                 j
@@ -611,231 +643,244 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    pub(crate) fn assign(&mut self, a: &ox::AssignmentExpression, dst: Reg) -> R<Reg> {
-        use ox::AssignmentOperator as Op;
-        let is_logical =
-            matches!(a.operator, Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish);
+    pub(crate) fn assign(
+        &mut self,
+        op: AssignOp,
+        target: &Target,
+        value: &Expr,
+        dst: Reg,
+    ) -> R<Reg> {
+        let is_logical = op.is_logical();
         // Member-target assignment: `obj.x = v` / `arr[i] = v`. Only plain
         // `=` is supported for members in this subset.
-        match &a.left {
-            // `super.x = v` / `super.x op= v` / `super.x ??= v`.
-            ox::AssignmentTarget::StaticMemberExpression(m)
-                if matches!(&m.object, ox::Expression::Super(_)) =>
-            {
-                let pid = self.super_class;
-                if pid.is_none() && !self.super_home_obj {
-                    return Err("`super.x = …` is only valid in a method".into());
+        match target {
+            Target::Member(m) => match &m.prop {
+                // `super.x = v` / `super.x op= v` / `super.x ??= v`.
+                MemberProp::Ident(prop) if matches!(&m.object, Expr::Super) => {
+                    let pid = self.super_class;
+                    if pid.is_none() && !self.super_home_obj {
+                        return Err("`super.x = …` is only valid in a method".into());
+                    }
+                    self.this_check();
+                    let name = self.string_name(prop);
+                    // A super GET/SET routes to the class op (home_class_id) or the
+                    // object-method op ([[HomeObject]]), depending on the lexical context.
+                    let emit_get = |s: &mut Self, d: Reg| match pid {
+                        Some(p) => s.emit(Instr::SuperGet { dst: d, home_class_id: p, name }),
+                        None => s.emit(Instr::SuperGetObj { dst: d, name }),
+                    };
+                    let emit_set = |s: &mut Self, v: Reg| match pid {
+                        Some(p) => s.emit(Instr::SuperSet { home_class_id: p, name, val: v }),
+                        None => s.emit(Instr::SuperSetObj { name, val: v }),
+                    };
+                    if is_logical {
+                        emit_get(self, dst);
+                        let j = self.emit_logical_skip(op, dst);
+                        let v = self.expr_into(value, dst)?;
+                        if v != dst {
+                            self.emit(Instr::Move { dst, src: v });
+                        }
+                        emit_set(self, dst);
+                        let end = self.here();
+                        self.patch_jump(j, end);
+                    } else if matches!(op, AssignOp::Assign) {
+                        let val = self.expr_into(value, dst)?;
+                        if val != dst {
+                            self.emit(Instr::Move { dst, src: val });
+                        }
+                        emit_set(self, dst);
+                    } else {
+                        let cur = self.temp();
+                        emit_get(self, cur);
+                        let rhs = self.expr(value)?;
+                        let instr = compound_assign_instr(op, dst, cur, rhs)
+                            .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                        self.emit(instr);
+                        emit_set(self, dst);
+                    }
+                    return Ok(dst);
                 }
-                self.this_check();
-                let name = self.string_name(m.property.name.as_str());
-                // A super GET/SET routes to the class op (home_class_id) or the
-                // object-method op ([[HomeObject]]), depending on the lexical context.
-                let emit_get = |s: &mut Self, d: Reg| match pid {
-                    Some(p) => s.emit(Instr::SuperGet { dst: d, home_class_id: p, name }),
-                    None => s.emit(Instr::SuperGetObj { dst: d, name }),
-                };
-                let emit_set = |s: &mut Self, v: Reg| match pid {
-                    Some(p) => s.emit(Instr::SuperSet { home_class_id: p, name, val: v }),
-                    None => s.emit(Instr::SuperSetObj { name, val: v }),
-                };
-                if is_logical {
-                    emit_get(self, dst);
-                    let j = self.emit_logical_skip(a.operator, dst);
-                    let v = self.expr_into(&a.right, dst)?;
-                    if v != dst {
-                        self.emit(Instr::Move { dst, src: v });
+                MemberProp::Ident(prop) => {
+                    let obj = self.expr(&m.object)?; // evaluate the receiver once
+                    let name = self.string_name(prop);
+                    if is_logical {
+                        // `obj.x ??= v` etc: read current; skip the store on short-circuit.
+                        self.emit(Instr::GetProp { dst, obj, name });
+                        let j = self.emit_logical_skip(op, dst);
+                        let v = self.expr_into(value, dst)?;
+                        if v != dst {
+                            self.emit(Instr::Move { dst, src: v });
+                        }
+                        self.emit(Instr::SetProp { obj, name, val: dst });
+                        let end = self.here();
+                        self.patch_jump(j, end);
+                    } else if matches!(op, AssignOp::Assign) {
+                        let val = self.expr_into(value, dst)?;
+                        if val != dst {
+                            self.emit(Instr::Move { dst, src: val });
+                        }
+                        self.emit(Instr::SetProp { obj, name, val: dst });
+                    } else {
+                        // Compound `obj.x op= v`: read obj.x, combine, write back.
+                        let cur = self.temp();
+                        self.emit(Instr::GetProp { dst: cur, obj, name });
+                        let rhs = self.expr(value)?;
+                        let instr = compound_assign_instr(op, dst, cur, rhs)
+                            .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                        self.emit(instr);
+                        self.emit(Instr::SetProp { obj, name, val: dst });
                     }
-                    emit_set(self, dst);
-                    let end = self.here();
-                    self.patch_jump(j, end);
-                } else if matches!(a.operator, Op::Assign) {
-                    let val = self.expr_into(&a.right, dst)?;
-                    if val != dst {
-                        self.emit(Instr::Move { dst, src: val });
-                    }
-                    emit_set(self, dst);
-                } else {
-                    let cur = self.temp();
-                    emit_get(self, cur);
-                    let rhs = self.expr(&a.right)?;
-                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
-                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
-                    self.emit(instr);
-                    emit_set(self, dst);
+                    return Ok(dst);
                 }
-                return Ok(dst);
-            }
-            ox::AssignmentTarget::StaticMemberExpression(m) => {
-                let obj = self.expr(&m.object)?; // evaluate the receiver once
-                let name = self.string_name(m.property.name.as_str());
-                if is_logical {
-                    // `obj.x ??= v` etc: read current; skip the store on short-circuit.
-                    self.emit(Instr::GetProp { dst, obj, name });
-                    let j = self.emit_logical_skip(a.operator, dst);
-                    let v = self.expr_into(&a.right, dst)?;
-                    if v != dst {
-                        self.emit(Instr::Move { dst, src: v });
+                // `obj.#x = v` / `obj.#x op= v` — same as a static member, keyed "#x".
+                MemberProp::Private(field) => {
+                    self.check_private_declared(field)?;
+                    let obj = self.expr(&m.object)?;
+                    let name = self.string_name(&private_key(field));
+                    if is_logical {
+                        self.emit(Instr::GetProp { dst, obj, name });
+                        let j = self.emit_logical_skip(op, dst);
+                        let v = self.expr_into(value, dst)?;
+                        if v != dst {
+                            self.emit(Instr::Move { dst, src: v });
+                        }
+                        self.emit(Instr::SetProp { obj, name, val: dst });
+                        let end = self.here();
+                        self.patch_jump(j, end);
+                    } else if matches!(op, AssignOp::Assign) {
+                        let val = self.expr_into(value, dst)?;
+                        if val != dst {
+                            self.emit(Instr::Move { dst, src: val });
+                        }
+                        self.emit(Instr::SetPrivate { obj, name, val: dst });
+                    } else {
+                        let cur = self.temp();
+                        self.emit(Instr::GetProp { dst: cur, obj, name });
+                        let rhs = self.expr(value)?;
+                        let instr = compound_assign_instr(op, dst, cur, rhs)
+                            .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                        self.emit(instr);
+                        self.emit(Instr::SetPrivate { obj, name, val: dst });
                     }
-                    self.emit(Instr::SetProp { obj, name, val: dst });
-                    let end = self.here();
-                    self.patch_jump(j, end);
-                } else if matches!(a.operator, Op::Assign) {
-                    let val = self.expr_into(&a.right, dst)?;
-                    if val != dst {
-                        self.emit(Instr::Move { dst, src: val });
-                    }
-                    self.emit(Instr::SetProp { obj, name, val: dst });
-                } else {
-                    // Compound `obj.x op= v`: read obj.x, combine, write back.
-                    let cur = self.temp();
-                    self.emit(Instr::GetProp { dst: cur, obj, name });
-                    let rhs = self.expr(&a.right)?;
-                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
-                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
-                    self.emit(instr);
-                    self.emit(Instr::SetProp { obj, name, val: dst });
+                    return Ok(dst);
                 }
-                return Ok(dst);
-            }
-            // `obj.#x = v` / `obj.#x op= v` — same as a static member, keyed "#x".
-            ox::AssignmentTarget::PrivateFieldExpression(p) => {
-                self.check_private_declared(&p.field.name)?;
-                let obj = self.expr(&p.object)?;
-                let name = self.string_name(&private_key(&p.field.name));
-                if is_logical {
-                    self.emit(Instr::GetProp { dst, obj, name });
-                    let j = self.emit_logical_skip(a.operator, dst);
-                    let v = self.expr_into(&a.right, dst)?;
-                    if v != dst {
-                        self.emit(Instr::Move { dst, src: v });
+                // `super[k] = v` / compound / logical.
+                MemberProp::Computed(key_expr) if matches!(&m.object, Expr::Super) => {
+                    let pid = self.super_class;
+                    if pid.is_none() && !self.super_home_obj {
+                        return Err("`super[k] = …` is only valid in a method".into());
                     }
-                    self.emit(Instr::SetProp { obj, name, val: dst });
-                    let end = self.here();
-                    self.patch_jump(j, end);
-                } else if matches!(a.operator, Op::Assign) {
-                    let val = self.expr_into(&a.right, dst)?;
-                    if val != dst {
-                        self.emit(Instr::Move { dst, src: val });
+                    self.this_check();
+                    let key = self.expr(key_expr)?;
+                    let key_reg = self.alloc_reg();
+                    if key != key_reg {
+                        self.emit(Instr::Move { dst: key_reg, src: key });
                     }
-                    self.emit(Instr::SetPrivate { obj, name, val: dst });
-                } else {
-                    let cur = self.temp();
-                    self.emit(Instr::GetProp { dst: cur, obj, name });
-                    let rhs = self.expr(&a.right)?;
-                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
-                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
-                    self.emit(instr);
-                    self.emit(Instr::SetPrivate { obj, name, val: dst });
+                    let emit_get = |s: &mut Self, d: Reg| match pid {
+                        Some(p) => s.emit(Instr::SuperGetComputed { dst: d, home_class_id: p, key: key_reg }),
+                        None => s.emit(Instr::SuperGetObjComputed { dst: d, key: key_reg }),
+                    };
+                    let emit_set = |s: &mut Self, v: Reg| match pid {
+                        Some(p) => s.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: v }),
+                        None => s.emit(Instr::SuperSetObjComputed { key: key_reg, val: v }),
+                    };
+                    if is_logical {
+                        emit_get(self, dst);
+                        let j = self.emit_logical_skip(op, dst);
+                        let v = self.expr_into(value, dst)?;
+                        if v != dst {
+                            self.emit(Instr::Move { dst, src: v });
+                        }
+                        emit_set(self, dst);
+                        let end = self.here();
+                        self.patch_jump(j, end);
+                    } else if matches!(op, AssignOp::Assign) {
+                        let val = self.expr_into(value, dst)?;
+                        if val != dst {
+                            self.emit(Instr::Move { dst, src: val });
+                        }
+                        emit_set(self, dst);
+                    } else {
+                        let cur = self.temp();
+                        emit_get(self, cur);
+                        let rhs = self.expr(value)?;
+                        let instr = compound_assign_instr(op, dst, cur, rhs)
+                            .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                        self.emit(instr);
+                        emit_set(self, dst);
+                    }
+                    return Ok(dst);
                 }
-                return Ok(dst);
-            }
-            // `super[k] = v` / compound / logical.
-            ox::AssignmentTarget::ComputedMemberExpression(m)
-                if matches!(&m.object, ox::Expression::Super(_)) =>
-            {
-                let pid = self.super_class;
-                if pid.is_none() && !self.super_home_obj {
-                    return Err("`super[k] = …` is only valid in a method".into());
-                }
-                self.this_check();
-                let key = self.expr(&m.expression)?;
-                let key_reg = self.alloc_reg();
-                if key != key_reg {
-                    self.emit(Instr::Move { dst: key_reg, src: key });
-                }
-                let emit_get = |s: &mut Self, d: Reg| match pid {
-                    Some(p) => s.emit(Instr::SuperGetComputed { dst: d, home_class_id: p, key: key_reg }),
-                    None => s.emit(Instr::SuperGetObjComputed { dst: d, key: key_reg }),
-                };
-                let emit_set = |s: &mut Self, v: Reg| match pid {
-                    Some(p) => s.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: v }),
-                    None => s.emit(Instr::SuperSetObjComputed { key: key_reg, val: v }),
-                };
-                if is_logical {
-                    emit_get(self, dst);
-                    let j = self.emit_logical_skip(a.operator, dst);
-                    let v = self.expr_into(&a.right, dst)?;
-                    if v != dst {
-                        self.emit(Instr::Move { dst, src: v });
+                MemberProp::Computed(key_expr) => {
+                    let obj = self.expr(&m.object)?; // evaluate receiver + key once
+                    let key = self.expr(key_expr)?;
+                    if is_logical {
+                        // A read-modify-write reuses the SAME property key for the load
+                        // and the store: coerce ToPropertyKey ONCE (its toString/valueOf
+                        // must not run twice).
+                        let keyk = self.temp();
+                        self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
+                        self.emit(Instr::GetIndex { dst, obj, key: keyk });
+                        let j = self.emit_logical_skip(op, dst);
+                        let v = self.expr_into(value, dst)?;
+                        if v != dst {
+                            self.emit(Instr::Move { dst, src: v });
+                        }
+                        self.emit(Instr::SetIndex { obj, key: keyk, val: dst });
+                        let end = self.here();
+                        self.patch_jump(j, end);
+                    } else if matches!(op, AssignOp::Assign) {
+                        // A plain store coerces the key once (the single SetIndex).
+                        let val = self.expr_into(value, dst)?;
+                        if val != dst {
+                            self.emit(Instr::Move { dst, src: val });
+                        }
+                        self.emit(Instr::SetIndex { obj, key, val: dst });
+                    } else {
+                        let keyk = self.temp();
+                        self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
+                        let cur = self.temp();
+                        self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
+                        let rhs = self.expr(value)?;
+                        let instr = compound_assign_instr(op, dst, cur, rhs)
+                            .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                        self.emit(instr);
+                        self.emit(Instr::SetIndex { obj, key: keyk, val: dst });
                     }
-                    emit_set(self, dst);
-                    let end = self.here();
-                    self.patch_jump(j, end);
-                } else if matches!(a.operator, Op::Assign) {
-                    let val = self.expr_into(&a.right, dst)?;
-                    if val != dst {
-                        self.emit(Instr::Move { dst, src: val });
-                    }
-                    emit_set(self, dst);
-                } else {
-                    let cur = self.temp();
-                    emit_get(self, cur);
-                    let rhs = self.expr(&a.right)?;
-                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
-                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
-                    self.emit(instr);
-                    emit_set(self, dst);
+                    return Ok(dst);
                 }
-                return Ok(dst);
-            }
-            ox::AssignmentTarget::ComputedMemberExpression(m) => {
-                let obj = self.expr(&m.object)?; // evaluate receiver + key once
-                let key = self.expr(&m.expression)?;
-                if is_logical {
-                    // A read-modify-write reuses the SAME property key for the load
-                    // and the store: coerce ToPropertyKey ONCE (its toString/valueOf
-                    // must not run twice).
-                    let keyk = self.temp();
-                    self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
-                    self.emit(Instr::GetIndex { dst, obj, key: keyk });
-                    let j = self.emit_logical_skip(a.operator, dst);
-                    let v = self.expr_into(&a.right, dst)?;
-                    if v != dst {
-                        self.emit(Instr::Move { dst, src: v });
-                    }
-                    self.emit(Instr::SetIndex { obj, key: keyk, val: dst });
-                    let end = self.here();
-                    self.patch_jump(j, end);
-                } else if matches!(a.operator, Op::Assign) {
-                    // A plain store coerces the key once (the single SetIndex).
-                    let val = self.expr_into(&a.right, dst)?;
-                    if val != dst {
-                        self.emit(Instr::Move { dst, src: val });
-                    }
-                    self.emit(Instr::SetIndex { obj, key, val: dst });
-                } else {
-                    let keyk = self.temp();
-                    self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
-                    let cur = self.temp();
-                    self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
-                    let rhs = self.expr(&a.right)?;
-                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
-                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
-                    self.emit(instr);
-                    self.emit(Instr::SetIndex { obj, key: keyk, val: dst });
-                }
-                return Ok(dst);
-            }
+            },
             // Destructuring assignment to existing targets: `[a,b]=arr`, `({x}=o)`.
-            ox::AssignmentTarget::ArrayAssignmentTarget(_)
-            | ox::AssignmentTarget::ObjectAssignmentTarget(_) => {
-                let src = self.expr_into(&a.right, dst)?;
+            Target::Array(_) | Target::Object { .. } => {
+                let src = self.expr_into(value, dst)?;
                 if src != dst {
                     self.emit(Instr::Move { dst, src });
                 }
-                self.assign_target(&a.left, dst)?;
+                self.assign_target(target, dst)?;
                 return Ok(dst);
             }
-            _ => {}
+            // Annex B `f() = v` / `f() op= v` / `f() ??= v`: the call is
+            // evaluated, then a ReferenceError is thrown — the RHS never runs.
+            Target::Call(c) => {
+                self.assign_call_target(c)?;
+                return Ok(dst);
+            }
+            Target::Ident { .. } => {}
         }
-        let (name, lhs_covered) = match &a.left {
-            ox::AssignmentTarget::AssignmentTargetIdentifier(id) => (
-                id.name.to_string(),
-                // oxc strips cover parens but keeps spans: a target starting
-                // AFTER the assignment expression was parenthesized — not an
-                // IdentifierRef, so NamedEvaluation does not apply.
-                id.span.start > a.span.start,
-            ),
+        let (name, lhs_covered) = match target {
+            // `covered` replaces the old span comparison (`id.span.start >
+            // a.span.start`): a PARENTHESIZED target is not an IdentifierRef, so
+            // NamedEvaluation does not apply and `(x) = function(){}` leaves the
+            // function anonymous.
+            //
+            // NOTE: `parse::oxc_bridge` always lowers `covered: false` (oxc's
+            // `SimpleAssignmentTarget::cover` peels the parens and drops the
+            // span), so through the bridge `(x) = function(){}` now DOES get
+            // NamedEvaluation where the span test suppressed it. That fidelity
+            // loss is the bridge's, not this module's — the real parser sets the
+            // flag — but it is the one construct in this file where bcdiff can
+            // legitimately disagree with the oxc compiler.
+            Target::Ident { name, covered } => (name.to_string(), *covered),
             _ => return Err("assignment to non-identifier not in zipp-vm v1".into()),
         };
         // Strict mode: assignment to `eval`/`arguments` is an early SyntaxError.
@@ -844,11 +889,11 @@ impl<'a> FnCompiler<'a> {
         // with-object (innermost first), else the static binding.
         let with_objs = self.with_obj_regs(&name);
         if !with_objs.is_empty() {
-            return self.assign_with(a, &name, &with_objs, dst);
+            return self.assign_with(op, value, &name, &with_objs, dst);
         }
         let binding = self.resolve(&name);
-        match a.operator {
-            Op::Assign => {
+        match op {
+            AssignOp::Assign => {
                 // `x = function(){}` / `x = class {}` names the anonymous value
                 // after the target (NamedEvaluation), like a declaration.
                 // A const local takes the store_binding path so the RHS is evaluated
@@ -866,15 +911,15 @@ impl<'a> FnCompiler<'a> {
                         // React's minified `createContext` is exactly this shape —
                         // `e = {_currentValue: e, …}` — so getting it wrong makes
                         // every context self-referential.
-                        let into = if builds_into_dst_incrementally(&a.right) {
+                        let into = if builds_into_dst_incrementally(value) {
                             self.temp()
                         } else {
                             r
                         };
                         let v = if lhs_covered {
-                            self.expr_into(&a.right, into)?
+                            self.expr_into(value, into)?
                         } else {
-                            self.compile_named_init(into, &a.right, &name)?
+                            self.compile_named_init(into, value, &name)?
                         };
                         if v != r {
                             self.emit(Instr::Move { dst: r, src: v });
@@ -891,9 +936,9 @@ impl<'a> FnCompiler<'a> {
                 let save_p = self.next_reg;
                 let snap = self.eval_snap_probe(&binding);
                 let v = if lhs_covered {
-                    self.expr_into(&a.right, dst)?
+                    self.expr_into(value, dst)?
                 } else {
-                    self.compile_named_init(dst, &a.right, &name)?
+                    self.compile_named_init(dst, value, &name)?
                 };
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
@@ -905,19 +950,19 @@ impl<'a> FnCompiler<'a> {
             // Logical assignment: `x ||= y` / `x &&= y` / `x ??= y` only assign
             // `y` when the short-circuit condition holds (truthy-skip for ||=,
             // falsy-skip for &&=, non-nullish-skip for ??=).
-            Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish => {
+            AssignOp::LogicalOr | AssignOp::LogicalAnd | AssignOp::LogicalCoalesce => {
                 let save_p = self.next_reg;
                 let snap = self.eval_snap_probe(&binding);
                 let cur = self.load_binding(&binding, dst);
                 if cur != dst {
                     self.emit(Instr::Move { dst, src: cur });
                 }
-                let j = self.emit_logical_skip(a.operator, dst);
+                let j = self.emit_logical_skip(op, dst);
                 // NamedEvaluation: `x ||= function(){}` / `&&=` / `??=` names the
                 // anonymous fn/arrow/class after the identifier LHS (IsIdentifierRef),
                 // matching plain `=`. `compile_named_init` no-ops to `expr_into` for a
                 // non-anonymous RHS, so a named/expression RHS is unaffected.
-                let v = self.compile_named_init(dst, &a.right, &name)?;
+                let v = self.compile_named_init(dst, value, &name)?;
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
@@ -933,7 +978,7 @@ impl<'a> FnCompiler<'a> {
                 if let Binding::Local(r) = binding {
                     if !self.const_regs.contains(&r) && !self.is_self_name_reg(r) {
                         // Plain mutable local: compute in place.
-                        let rhs = self.expr(&a.right)?;
+                        let rhs = self.expr(value)?;
                         let instr = compound_assign_instr(other, r, r, rhs)
                             .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                         self.emit(instr);
@@ -950,7 +995,7 @@ impl<'a> FnCompiler<'a> {
                 let save_p = self.next_reg;
                 let snap = self.eval_snap_probe(&binding);
                 let cur = self.load_binding(&binding, dst); // == dst
-                let rhs = self.expr(&a.right)?;
+                let rhs = self.expr(value)?;
                 let instr = compound_assign_instr(other, dst, cur, rhs)
                     .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                 self.emit(instr);
@@ -966,33 +1011,33 @@ impl<'a> FnCompiler<'a> {
     /// branch of `assign`, routing the read/write through `load_with`/`store_with`.
     pub(crate) fn assign_with(
         &mut self,
-        a: &ox::AssignmentExpression,
+        op: AssignOp,
+        value: &Expr,
         name: &str,
         objs: &[Reg],
         dst: Reg,
     ) -> R<Reg> {
-        use ox::AssignmentOperator as Op;
-        match a.operator {
-            Op::Assign => {
+        match op {
+            AssignOp::Assign => {
                 // The REFERENCE resolves before the RHS runs (which with-object,
                 // if any, holds the binding); PutValue writes through that
                 // snapshot even if the RHS deletes the with-object property.
                 let (found, tgt) = self.emit_with_probe(name, objs);
-                let v = self.compile_named_init(dst, &a.right, name)?;
+                let v = self.compile_named_init(dst, value, name)?;
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
                 self.emit_with_rmw_write(name, found, tgt, dst);
                 Ok(dst)
             }
-            Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish => {
+            AssignOp::LogicalOr | AssignOp::LogicalAnd | AssignOp::LogicalCoalesce => {
                 // Resolve the reference ONCE (which with-object, if any, holds the
                 // binding), then read and write through that same target — even if
                 // a getter run by the read mutates the object meanwhile.
                 let (found, tgt) = self.emit_with_probe(name, objs);
                 self.emit_with_rmw_read(name, found, tgt, dst);
-                let j = self.emit_logical_skip(a.operator, dst);
-                let v = self.compile_named_init(dst, &a.right, name)?;
+                let j = self.emit_logical_skip(op, dst);
+                let v = self.compile_named_init(dst, value, name)?;
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
@@ -1007,7 +1052,7 @@ impl<'a> FnCompiler<'a> {
                 // when the getter deletes/replaces the property in between.
                 let (found, tgt) = self.emit_with_probe(name, objs);
                 self.emit_with_rmw_read(name, found, tgt, dst); // current value → dst
-                let rhs = self.expr(&a.right)?;
+                let rhs = self.expr(value)?;
                 let instr = compound_assign_instr(other, dst, dst, rhs)
                     .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                 self.emit(instr);

@@ -4,53 +4,139 @@
 // each other. No logic changed.
 #![allow(unused_imports)]
 use super::*;
+// The AST and its string type, named explicitly so this file does not depend on
+// how the parent module happens to re-export them. `use super::*` would supply
+// them too; an explicit import SHADOWS a glob rather than clashing with it.
+use crate::parse::ast;
+use crate::parse::token::StrVal;
+
+// NOTE: parenthesization. `ast` has no ParenthesizedExpression, so every peel is
+// gone from this file (`expr_into`, `typeof (f)`, `delete (x)`). That is a
+// deliberate behaviour change in one direction only: a parenthesized operand now
+// reaches the pattern matches that recognise a *shape* — `new (Array)(1)`,
+// `x instanceof (Array)`, `(Math).PI`, `` (String.raw)`…` `` — where before the
+// wrapper node hid it and the generic path ran. Parenthesization is observable in
+// exactly two places (assignment-target simplicity, and NamedEvaluation via
+// `Target::Ident { covered }`), and neither is one of these, so the fold is
+// correct; it just was not reachable before.
+//
+// NOTE: helpers defined HERE and nowhere else in this file's group —
+// `arg_expr`, `static_key_text`, `lone_surrogate_markers`, `PropVal`, and the
+// `FnCompiler` methods `str_const`, `member`, `private_member`, `prop_value`,
+// `object_accessor`, `object_data_prop`. If another section lands an identical
+// helper, keep one copy.
+
+/// The expression of a plain (non-spread) argument. Mirrors oxc's
+/// `Argument::as_expression`, which returned `None` for a `...spread`, so every
+/// `args.first().and_then(|a| a.as_expression())` reads the same as before.
+pub(crate) fn arg_expr(a: &ast::Arg) -> Option<&ast::Expr> {
+    match a {
+        ast::Arg::Expr(e) => Some(e),
+        ast::Arg::Spread(_) => None,
+    }
+}
+
+/// The TEXT of a non-computed property key, or `None` when the key has no static
+/// spelling (a computed key, or a private name). Property keys are Rust `String`s
+/// engine-wide (`ObjMap.keys`), which cannot hold a lone surrogate — a key that
+/// does decodes LOSSILY here (two distinct lone-surrogate keys collide), the same
+/// documented stage-2 limit `string_literal_key` recorded.
+///
+/// NOTE: a BigInt property key (`({1n: 1})`, whose key is its exact decimal
+/// digits) used to be accepted here via `PropertyKey::BigIntLiteral`. `PropKey`
+/// cannot represent one — an f64 does not round-trip the digits — so such a
+/// literal is now rejected by the parser before it reaches the compiler.
+pub(crate) fn static_key_text(k: &ast::PropKey) -> Option<String> {
+    match k {
+        ast::PropKey::Ident(n) => Some(n.to_string()),
+        ast::PropKey::Str(s) => Some(s.to_lossy_string()),
+        ast::PropKey::Num(n) => Some(fmt_key_num(*n)),
+        ast::PropKey::Computed(_) | ast::PropKey::Private(_) => None,
+    }
+}
+
+/// UTF-16 code units → the lone-surrogate MARKER form (`\u{FFFD}XXXX` per lone
+/// unit, `\u{FFFD}fffd` for a literal U+FFFD) that `add_string_const_wtf8`
+/// expects and `resolve_const` decodes back to exact WTF-8 at intern time. The
+/// inverse of `crate::heap::decode_lone_surrogate_markers`, from code units
+/// rather than from WTF-8 bytes.
+pub(crate) fn lone_surrogate_markers(units: &[u16]) -> String {
+    let mut out = String::with_capacity(units.len() + 8);
+    for r in char::decode_utf16(units.iter().copied()) {
+        match r {
+            // A literal U+FFFD must be escaped too, or it could be read back as
+            // the start of a marker.
+            Ok('\u{FFFD}') => out.push_str("\u{FFFD}fffd"),
+            Ok(c) => out.push(c),
+            Err(e) => {
+                let u = e.unpaired_surrogate();
+                out.push('\u{FFFD}');
+                out.push_str(&format!("{u:04x}"));
+            }
+        }
+    }
+    out
+}
+
+/// How a property's value arrives: an ordinary expression (`k: v`, `[k]: v`), or
+/// a method/accessor's own `Function` node (`m(){}`, `get k(){}`). oxc modelled
+/// the second as a `FunctionExpression` in `value`; `ast` names it directly, so
+/// the two shapes are re-joined here rather than in every branch.
+#[derive(Clone, Copy)]
+pub(crate) enum PropVal<'a> {
+    Expr(&'a ast::Expr),
+    Func(&'a ast::Function),
+}
 
 impl<'a> FnCompiler<'a> {
     // ── expressions ──
     /// Compile `e`, returning the register holding its value.
-    pub(crate) fn expr(&mut self, e: &ox::Expression) -> R<Reg> {
+    pub(crate) fn expr(&mut self, e: &ast::Expr) -> R<Reg> {
         let dst = self.temp();
         self.expr_into(e, dst)
+    }
+
+    /// Intern a string LITERAL's value and return its CONSTANT-POOL index,
+    /// picking the slot its encoding needs: well-formed text goes to
+    /// `add_string_const`; a value holding a lone surrogate goes to the
+    /// WTF-8-decoding slot in the MARKER form, which `resolve_const` turns back
+    /// into the exact code units at intern time.
+    pub(crate) fn str_const(&mut self, s: &StrVal) -> u32 {
+        match s {
+            StrVal::Utf8(t) => self.add_string_const(t),
+            StrVal::Utf16(u) => self.add_string_const_wtf8(&lone_surrogate_markers(u)),
+        }
     }
 
     /// Compile `e` placing its value into `dst` (or another register it already
     /// occupies, which the caller may use directly). Returns the register that
     /// actually holds the result.
-    pub(crate) fn expr_into(&mut self, e: &ox::Expression, dst: Reg) -> R<Reg> {
-        use ox::Expression as E;
+    pub(crate) fn expr_into(&mut self, e: &ast::Expr, dst: Reg) -> R<Reg> {
+        use ast::Expr as E;
         match e {
-            E::NumericLiteral(n) => {
-                // Strict-mode early error: a legacy octal (`01`) or non-octal
-                // leading-zero (`08`) integer literal is a SyntaxError — oxc
-                // parses leniently and defers this check to semantics, so
-                // enforce it here (covers strict direct eval too).
-                if self.cx.in_strict {
-                    if let Some(raw) = &n.raw {
-                        let b = raw.as_bytes();
-                        if b.len() >= 2 && b[0] == b'0' && b[1].is_ascii_digit() {
-                            return Err(
-                                "SyntaxError: legacy octal literals are not allowed in strict mode"
-                                    .into(),
-                            );
-                        }
-                    }
-                }
-                self.load_number(dst, n.value);
+            // NOTE: the strict-mode legacy-octal early error (`01` / `08` is a
+            // SyntaxError in strict code) used to live here, because oxc parsed
+            // leniently and deferred the check to semantics via the literal's
+            // `raw` text. `Expr::Num` carries only the VALUE — the spelling is
+            // `token::NumLit.kind`, which the parser inspects while it still has
+            // it — so the check belongs to the parser now and is not
+            // reconstructible here. No bytecode changes: it only ever produced
+            // an error.
+            E::Num(n) => {
+                self.load_number(dst, *n);
                 Ok(dst)
             }
-            E::BigIntLiteral(b) => {
-                // oxc gives `value` as a base-10 string (the source base is already
+            E::BigInt(b) => {
+                // The digits are base-10 (the source base is already
                 // normalized). In-range literals load as inline i128 (the fast
                 // tier); beyond-i128 literals parse ONCE into the program's
                 // arbitrary-precision constant pool (the digits are decimal by
                 // construction, so only an out-of-range value reaches the pool —
                 // the canonical-form invariant holds).
-                match b.value.as_str().parse::<i128>() {
+                match b.parse::<i128>() {
                     Ok(v) => self.emit(Instr::LoadBigInt { dst, value: v }),
                     Err(_) => {
                         let big = b
-                            .value
-                            .as_str()
                             .parse::<num_bigint::BigInt>()
                             .map_err(|_| "invalid BigInt literal".to_string())?;
                         let idx = self.bigint_consts.len() as u32;
@@ -60,42 +146,22 @@ impl<'a> FnCompiler<'a> {
                 }
                 Ok(dst)
             }
-            E::RegExpLiteral(r) => {
+            E::Regex { pattern, flags } => {
                 // `/pat/flags` → NewRegExp (compiles via the `regress` engine at
-                // runtime). pattern.text is the source; flags as the JS flag string.
+                // runtime). `pattern` is the source (escapes stay escaped — the
+                // regex engine compiles the source); `flags` is the JS flag
+                // string, already in the spec's canonical order.
                 //
-                // EXACT-source recovery: when this program is an eval of a string
-                // holding lone surrogates (`exact_src` is Some), the parser saw the
-                // LOSSY view — a lone surrogate in the pattern reads U+FFFD. Both
-                // encodings are 3 bytes, so the pattern's byte range in the lossy
-                // source indexes the exact WTF-8 bytes identically: slice it and,
-                // if it differs from the lossy text, store the pattern constant in
-                // the oxc MARKER form (decoded to real WTF-8 at intern time), so
-                // the runtime compiles + stores the exact surrogate.
-                let text = r.regex.pattern.text.as_str();
-                let pat = 'pat: {
-                    if text.contains('\u{FFFD}') {
-                        if let Some(exact) = &self.cx.exact_src {
-                            // Pattern bytes start right after the opening `/`
-                            // (r.span covers the whole `/pat/flags` literal).
-                            let start = r.span.start as usize + 1;
-                            let end = start + text.len();
-                            // Guard: the range must reproduce the parser's pattern
-                            // text on the lossy source (validates the span math).
-                            if self.cx.source.as_bytes().get(start..end) == Some(text.as_bytes()) {
-                                if let Some(b) = exact.get(start..end) {
-                                    if b != text.as_bytes() {
-                                        let marked =
-                                            crate::heap::encode_lone_surrogate_markers(b);
-                                        break 'pat self.add_string_const_wtf8(&marked);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    self.add_string_const(text)
-                };
-                let flags_s = r.regex.flags.to_inline_string();
+                // EXACT-source recovery: a lone surrogate written literally in
+                // the pattern now lives in the `StrVal` itself, so it reaches the
+                // constant pool through the WTF-8-decoding slot (`str_const`).
+                // NOTE: this REPLACES the old `exact_src` span arithmetic —
+                // `Expr::Regex` carries no span (only `Function`/`Arrow`/`Class`
+                // do), and it needs none: the parser hands over the exact code
+                // units instead of the lossy U+FFFD view the compiler used to
+                // have to repair by slicing the source buffer.
+                let text = pattern.to_lossy_string();
+                let pat = self.str_const(pattern);
                 // EARLY ERROR: a RegularExpressionLiteral must parse under the
                 // `Pattern` goal at COMPILE time, not when it is evaluated. The
                 // difference is observable — `if (false) { /a{2,1}/ }` must be a
@@ -109,10 +175,12 @@ impl<'a> FnCompiler<'a> {
                 // Annex B / modern valid ones (lone `]`, `a{,2}`, `[a-\d]`,
                 // `(?=a)*`, `\c1`, `\08`, lookbehind, `\p{L}` under `u`,
                 // `[\q{abc}]` under `v`).
-                if let Err(e) = regress::Regex::with_flags(text, flags_s.as_str()) {
-                    return Err(format!("SyntaxError: invalid regular expression /{text}/{flags_s}: {e}"));
+                if let Err(err) = regress::Regex::with_flags(&text, &**flags) {
+                    return Err(format!(
+                        "SyntaxError: invalid regular expression /{text}/{flags}: {err}"
+                    ));
                 }
-                let flg = self.add_string_const(&flags_s);
+                let flg = self.add_string_const(flags);
                 let pt = self.temp();
                 self.emit(Instr::LoadConst { dst: pt, idx: pat });
                 let ft = self.temp();
@@ -121,45 +189,37 @@ impl<'a> FnCompiler<'a> {
                 self.next_reg -= 2;
                 Ok(dst)
             }
-            E::StringLiteral(s) => {
-                // `.lone_surrogates` literals carry the oxc marker encoding —
-                // route through the WTF-8-decoding constant slot.
-                let idx = if s.lone_surrogates {
-                    self.add_string_const_wtf8(s.value.as_str())
-                } else {
-                    self.add_string_const(s.value.as_str())
-                };
+            E::Str(s) => {
+                // A value holding a lone surrogate routes through the
+                // WTF-8-decoding constant slot (see `str_const`).
+                let idx = self.str_const(s);
                 self.emit(Instr::LoadConst { dst, idx });
                 Ok(dst)
             }
-            E::TemplateLiteral(t) => {
+            E::Template(t) => {
                 // Desugar `q0${e0}q1${e1}...qN` to string concatenation
                 // q0 + ToString(e0) + q1 + ToString(e1) + ... + qN. Each `${e}` is
                 // ToString'd (string hint) FIRST — NOT left to `+`, whose default
                 // hint tries `valueOf` before `toString` (wrong for e.g. a Temporal
                 // value, whose `valueOf` throws). After ToStr both operands are
                 // strings, so each `+` is a pure (rope) concat.
-                let q0e = &t.quasis[0];
-                let q0 = q0e.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
-                let idx = if q0e.lone_surrogates {
-                    self.add_string_const_wtf8(q0)
-                } else {
-                    self.add_string_const(q0)
+                let q0 = &t.quasis[0];
+                let idx = match q0.cooked.as_ref() {
+                    Some(s) => self.str_const(s),
+                    // No cooked value (an illegal escape) — untagged, so this is
+                    // a SyntaxError the parser raised; keep the "" the compiler
+                    // has always emitted rather than inventing a value.
+                    None => self.add_string_const(""),
                 };
                 self.emit(Instr::LoadConst { dst, idx });
-                for (i, e) in t.expressions.iter().enumerate() {
+                for (i, e) in t.exprs.iter().enumerate() {
                     let r = self.expr(e)?;
                     let rs = self.temp();
                     self.emit(Instr::ToStr { dst: rs, a: r });
                     self.emit(Instr::Add { dst, a: dst, b: rs });
                     if let Some(qe) = t.quasis.get(i + 1) {
-                        let q = qe.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
-                        if !q.is_empty() {
-                            let qidx = if qe.lone_surrogates {
-                                self.add_string_const_wtf8(q)
-                            } else {
-                                self.add_string_const(q)
-                            };
+                        if let Some(q) = qe.cooked.as_ref().filter(|s| !s.is_empty()) {
+                            let qidx = self.str_const(q);
                             let qr = self.temp();
                             self.emit(Instr::LoadConst { dst: qr, idx: qidx });
                             self.emit(Instr::Add { dst, a: dst, b: qr });
@@ -168,31 +228,29 @@ impl<'a> FnCompiler<'a> {
                 }
                 Ok(dst)
             }
-            E::TaggedTemplateExpression(tt) => self.tagged_template(tt, dst),
-            E::BooleanLiteral(b) => {
-                self.emit(Instr::LoadBool { dst, val: b.value });
+            E::TaggedTemplate { tag, quasi } => self.tagged_template(tag, quasi, dst),
+            E::Bool(b) => {
+                self.emit(Instr::LoadBool { dst, val: *b });
                 Ok(dst)
             }
-            E::NullLiteral(_) => {
+            E::Null => {
                 self.emit(Instr::LoadNull { dst });
                 Ok(dst)
             }
-            E::Identifier(id) => {
+            E::Ident(id) => {
+                let n: &str = id;
                 // A strict-mode reserved word may not appear as an identifier
                 // reference (property keys / member names are different AST nodes,
                 // so `obj.public` / `{public:1}` are unaffected).
-                if self.cx.in_strict && is_strict_reserved_word(id.name.as_str()) {
-                    return Err(format!(
-                        "SyntaxError: '{}' is a reserved word in strict mode",
-                        id.name
-                    ));
+                if self.cx.in_strict && is_strict_reserved_word(n) {
+                    return Err(format!("SyntaxError: '{n}' is a reserved word in strict mode"));
                 }
                 // Special global value identifiers that are not user bindings.
                 // Inside a `with`, an own property of a with-object SHADOWS the
                 // literal (e.g. `with({NaN:'x'}) NaN` === 'x'); the literal is the
                 // fallback when no with-object carries the name.
-                if matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
-                    let lit = |s: &mut Self| match id.name.as_str() {
+                if matches!(n, "undefined" | "NaN" | "Infinity") {
+                    let lit = |s: &mut Self| match n {
                         "undefined" => s.emit(Instr::LoadUndefined { dst }),
                         "NaN" => {
                             let idx = s.add_const(Value::num(f64::NAN));
@@ -203,12 +261,12 @@ impl<'a> FnCompiler<'a> {
                             s.emit(Instr::LoadConst { dst, idx });
                         }
                     };
-                    let with_objs = self.with_obj_regs(id.name.as_str());
+                    let with_objs = self.with_obj_regs(n);
                     if with_objs.is_empty() {
                         lit(self);
                         return Ok(dst);
                     }
-                    let nidx = self.string_name(id.name.as_str());
+                    let nidx = self.string_name(n);
                     let end_jumps = self.emit_with_get_chain(nidx, &with_objs, dst);
                     lit(self);
                     let end = self.here();
@@ -220,13 +278,13 @@ impl<'a> FnCompiler<'a> {
                 // A parameter referenced before its own left-to-right
                 // initialization — `(x = x)` (self) or `(x = y, y)` (forward) — is
                 // in the Temporal Dead Zone: reading it throws a ReferenceError.
-                if id.name == "arguments" && self.cx.in_field_init {
+                if n == "arguments" && self.cx.in_field_init {
                     return Err(
                         "SyntaxError: 'arguments' is not allowed in a class field initializer"
                             .into(),
                     );
                 }
-                if self.param_tdz.contains(id.name.as_str()) {
+                if self.param_tdz.contains(n) {
                     let e = self.alloc_reg();
                     self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
                     self.emit(Instr::Throw { src: e });
@@ -234,11 +292,11 @@ impl<'a> FnCompiler<'a> {
                 }
                 // Inside a `with`, a free identifier may resolve to a property of an
                 // active with-object (innermost first), else the static binding.
-                let with_objs = self.with_obj_regs(id.name.as_str());
+                let with_objs = self.with_obj_regs(n);
                 if !with_objs.is_empty() {
-                    return Ok(self.load_with(id.name.as_str(), &with_objs, dst));
+                    return Ok(self.load_with(n, &with_objs, dst));
                 }
-                match self.resolve(id.name.as_str()) {
+                match self.resolve(n) {
                     Binding::Local(r) => Ok(r), // already in a register
                     Binding::LocalCell(cell) => {
                         self.emit(Instr::CellGet { dst, cell });
@@ -272,50 +330,46 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
             }
-            E::ThisExpression(_) => {
+            E::This => {
                 // `this` lives in register 0 of the current function, unless a
                 // static field initializer has redirected it to the class value.
                 // In a derived ctor it is in TDZ until super() completes.
                 self.this_check();
                 Ok(self.this_override.unwrap_or(0))
             }
-            E::ParenthesizedExpression(p) => self.expr_into(&p.expression, dst),
-            E::BinaryExpression(b) => self.binary(b, dst),
-            E::LogicalExpression(l) => self.logical(l, dst),
-            E::UnaryExpression(u) => self.unary(u, dst),
-            E::UpdateExpression(u) => self.update(u, dst),
-            E::AssignmentExpression(a) => self.assign(a, dst),
-            E::ConditionalExpression(c) => self.conditional(c, dst),
-            E::YieldExpression(y) => self.yield_expr(y, dst),
-            E::AwaitExpression(a) => self.await_expr(a, dst),
-            E::CallExpression(c) => self.call(c, dst),
-            E::NewExpression(n) => {
+            E::Binary { op, left, right } => self.binary(*op, left, right, dst),
+            E::Logical { op, left, right } => self.logical(*op, left, right, dst),
+            E::Unary { op, arg } => self.unary(*op, arg, dst),
+            E::Update { op, prefix, target } => self.update(*op, *prefix, target, dst),
+            E::Assign { op, target, value } => self.assign(*op, target, value, dst),
+            E::Cond { test, cons, alt } => self.conditional(test, cons, alt, dst),
+            E::Yield { arg, delegate } => self.yield_expr(arg.as_deref(), *delegate, dst),
+            E::Await(a) => self.await_expr(a, dst),
+            E::Call(c) => self.call(c, dst),
+            E::New { callee, args } => {
                 // `new Error(msg)` / `new TypeError(msg)` / `new RangeError(msg)`
                 // → a plain object {name, message}. Other constructors aren't in
                 // the subset yet. The by-name lowerings below fire only for the
                 // PRISTINE global builtin — a user binding of the same name
                 // (`function TypeError() {}`) takes the generic value path.
-                let id_opt = match &n.callee {
-                    ox::Expression::Identifier(id)
-                        if self.builtin_unshadowed(id.name.as_str()) =>
-                    {
-                        Some(id)
-                    }
+                let id_opt = match &**callee {
+                    ast::Expr::Ident(id) if self.builtin_unshadowed(id) => Some(id),
                     _ => None,
                 };
                 if let Some(id) = id_opt {
-                    if let Some(kind) = error_ctor(&id.name) {
-                        return self.build_error(kind, &n.arguments, dst);
+                    let id: &str = id;
+                    if let Some(kind) = error_ctor(id) {
+                        return self.build_error(kind, args, dst);
                     }
                     // `new Array(…)` / `new Object()` builtins (no real global).
-                    if id.name == "Array" {
-                        let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
+                    if id == "Array" {
+                        let (arg_base, argc) = self.eval_args_contiguous(args)?;
                         self.emit(Instr::ArrayCtor { dst, arg_base, argc });
                         return Ok(dst);
                     }
-                    if id.name == "Object" {
+                    if id == "Object" {
                         // `new Object()` → a fresh object; `new Object(x)` → ToObject(x).
-                        if let Some(arg) = n.arguments.first().and_then(|a| a.as_expression()) {
+                        if let Some(arg) = args.first().and_then(arg_expr) {
                             let src = self.expr(arg)?;
                             self.emit(Instr::ToObject { dst, src });
                         } else {
@@ -327,10 +381,10 @@ impl<'a> FnCompiler<'a> {
                     // TypeError (NewPromise validates callability), not a
                     // compile error — `new Promise()` inside a never-taken
                     // branch must still compile.
-                    if id.name == "Promise" {
+                    if id == "Promise" {
                         let executor = {
                             let t = self.temp();
-                            match n.arguments.first().and_then(|a| a.as_expression()) {
+                            match args.first().and_then(arg_expr) {
                                 Some(e) => {
                                     let v = self.expr_into(e, t)?;
                                     if v != t {
@@ -346,13 +400,13 @@ impl<'a> FnCompiler<'a> {
                         return Ok(dst);
                     }
                     // `new RegExp(pattern?, flags?)` — pattern may be a string or a RegExp.
-                    if id.name == "RegExp" {
-                        return self.emit_regexp(&n.arguments, dst, true);
+                    if id == "RegExp" {
+                        return self.emit_regexp(args, dst, true);
                     }
                     // `new Map(iter?)` / `new Set(iter?)` / `new WeakMap(iter?)` /
                     // `new WeakSet(iter?)`.
-                    if matches!(id.name.as_str(), "Map" | "Set" | "WeakMap" | "WeakSet") {
-                        let src = match n.arguments.first().and_then(|a| a.as_expression()) {
+                    if matches!(id, "Map" | "Set" | "WeakMap" | "WeakSet") {
+                        let src = match args.first().and_then(arg_expr) {
                             Some(e) => {
                                 let t = self.temp();
                                 let v = self.expr_into(e, t)?;
@@ -363,7 +417,7 @@ impl<'a> FnCompiler<'a> {
                             }
                             None => None,
                         };
-                        self.emit(match id.name.as_str() {
+                        self.emit(match id {
                             "Set" => Instr::NewSet { dst, src },
                             "Map" => Instr::NewMap { dst, src },
                             "WeakSet" => Instr::NewWeakSet { dst, src },
@@ -375,13 +429,13 @@ impl<'a> FnCompiler<'a> {
                         return Ok(dst);
                     }
                     // `new String/Number/Boolean(arg?)` — a boxed primitive wrapper.
-                    if matches!(id.name.as_str(), "String" | "Number" | "Boolean") {
-                        let kind = match id.name.as_str() {
+                    if matches!(id, "String" | "Number" | "Boolean") {
+                        let kind = match id {
                             "String" => 0u8,
                             "Number" => 1,
                             _ => 2,
                         };
-                        let arg = match n.arguments.first().and_then(|a| a.as_expression()) {
+                        let arg = match args.first().and_then(arg_expr) {
                             Some(e) => {
                                 let t = self.temp();
                                 let v = self.expr_into(e, t)?;
@@ -400,9 +454,9 @@ impl<'a> FnCompiler<'a> {
                     }
                     // `new WeakRef(target)` — target required (the op validates it's
                     // an object).
-                    if id.name == "WeakRef" {
+                    if id == "WeakRef" {
                         let target = self.temp();
-                        match n.arguments.first().and_then(|a| a.as_expression()) {
+                        match args.first().and_then(arg_expr) {
                             Some(e) => {
                                 let v = self.expr_into(e, target)?;
                                 if v != target {
@@ -416,9 +470,9 @@ impl<'a> FnCompiler<'a> {
                         return Ok(dst);
                     }
                     // `new FinalizationRegistry(cleanupCallback)`.
-                    if id.name == "FinalizationRegistry" {
+                    if id == "FinalizationRegistry" {
                         let cleanup = self.temp();
-                        match n.arguments.first().and_then(|a| a.as_expression()) {
+                        match args.first().and_then(arg_expr) {
                             Some(e) => {
                                 let v = self.expr_into(e, cleanup)?;
                                 if v != cleanup {
@@ -432,8 +486,8 @@ impl<'a> FnCompiler<'a> {
                         return Ok(dst);
                     }
                     // `new Date(...)`.
-                    if id.name == "Date" {
-                        let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
+                    if id == "Date" {
+                        let (arg_base, argc) = self.eval_args_contiguous(args)?;
                         self.emit(Instr::DateNew { dst, arg_base, argc });
                         return Ok(dst);
                     }
@@ -445,67 +499,56 @@ impl<'a> FnCompiler<'a> {
                 // SNAPSHOTTED into a temp before the args run: an argument's
                 // side effect reassigning the callee variable must not change
                 // which value is constructed (EvaluateNew takes GetValue first).
-                let cv = self.expr(&n.callee)?;
+                let cv = self.expr(callee)?;
                 let save = self.next_reg;
-                let callee = self.temp();
-                if cv != callee {
-                    self.emit(Instr::Move { dst: callee, src: cv });
+                let callee_reg = self.temp();
+                if cv != callee_reg {
+                    self.emit(Instr::Move { dst: callee_reg, src: cv });
                 }
-                if n.arguments.iter().any(|a| a.as_expression().is_none()) {
-                    let args_arr = self.build_spread_args(&n.arguments)?;
-                    self.emit(Instr::NewSpread { dst, callee, args: args_arr });
+                if args.iter().any(|a| matches!(a, ast::Arg::Spread(_))) {
+                    let args_arr = self.build_spread_args(args)?;
+                    self.emit(Instr::NewSpread { dst, callee: callee_reg, args: args_arr });
                     self.next_reg = save; // reclaim the callee temp (+ arg scratch)
                     return Ok(dst);
                 }
-                let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
-                self.emit(Instr::New { dst, callee, arg_base, argc });
+                let (arg_base, argc) = self.eval_args_contiguous(args)?;
+                self.emit(Instr::New { dst, callee: callee_reg, arg_base, argc });
                 self.next_reg = save; // reclaim the callee temp + args
                 Ok(dst)
             }
-            E::FunctionExpression(f) => {
+            E::Function(f) => {
                 let (id, has_up) =
-                    self.compile_func_expr(f.id.as_ref().map(|i| i.name.to_string()), f)?;
+                    self.compile_func_expr(f.name.as_ref().map(|n| n.to_string()), f)?;
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
-            E::ArrowFunctionExpression(a) => {
+            E::Arrow(a) => {
                 let (id, _has_up) = self.compile_arrow(a, "")?;
                 self.emit_make_arrow(dst, id);
                 Ok(dst)
             }
-            E::ClassExpression(c) => self.class_expr(c, dst, None),
-            E::ArrayExpression(a) => self.array_literal(a, dst),
-            E::ObjectExpression(o) => self.object_literal(o, dst),
-            E::StaticMemberExpression(m) => self.static_member(m, dst),
-            E::ComputedMemberExpression(m) => self.computed_member(m, dst),
-            E::PrivateFieldExpression(p) => {
-                // `obj.#field` → read the reserved "#field" property.
-                self.check_private_declared(&p.field.name)?;
-                let obj = self.expr(&p.object)?;
-                if p.optional {
-                    self.emit_optional_check(obj);
-                }
-                let name = self.string_name(&private_key(&p.field.name));
-                self.emit(Instr::GetProp { dst, obj, name });
-                Ok(dst)
-            }
+            E::Class(c) => self.class_expr(c, dst, None),
+            E::Array(elems) => self.array_literal(elems, dst),
+            E::Object(props) => self.object_literal(props, dst),
+            // One node for all three member forms; `prop` says which.
+            E::Member(m) => self.member(m, dst),
             // `#field in obj` — private brand check (private fields are stored as
             // the reserved "#field" property, so this is a HasProp on that key).
-            E::PrivateInExpression(p) => {
-                self.check_private_declared(&p.left.name)?;
+            E::PrivateIn { name, object } => {
+                self.check_private_declared(name)?;
                 let kr = self.temp();
-                let idx = self.add_string_const(&private_key(&p.left.name));
+                let idx = self.add_string_const(&private_key(name));
                 self.emit(Instr::LoadConst { dst: kr, idx });
-                let obj = self.expr(&p.right)?;
+                let obj = self.expr(object)?;
                 // Ergonomic brand check: bypass the private-key reflection filter.
                 self.emit(Instr::HasProp { dst, key: kr, obj, brand: true });
                 Ok(dst)
             }
-            E::ChainExpression(ce) => self.chain_expr(ce, dst),
-            E::SequenceExpression(s) => {
+            E::Chain(inner) => self.chain_expr(inner, dst),
+            E::Seq(exprs) => {
                 // `(a, b, c)` — evaluate each for side effects; value is the last.
-                let n = s.expressions.len();
-                for (i, e) in s.expressions.iter().enumerate() {
+                let n = exprs.len();
+                for (i, e) in exprs.iter().enumerate() {
                     if i + 1 == n {
                         return self.expr_into(e, dst);
                     }
@@ -514,7 +557,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadUndefined { dst }); // empty sequence (unreachable)
                 Ok(dst)
             }
-            E::MetaProperty(mp) if mp.meta.name == "new" && mp.property.name == "target" => {
+            E::NewTarget => {
                 // `new.target` is an early SyntaxError outside a function/class body
                 // (e.g. at the top level of a script or an indirect eval), including
                 // inside an arrow that has no enclosing ordinary function.
@@ -527,50 +570,57 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadNewTarget { dst });
                 Ok(dst)
             }
-            E::ImportExpression(ie) => {
+            E::ImportCall { spec, options, phase } => {
                 // Dynamic `import(specifier [, options])` / `import.defer` /
                 // `import.source`. Evaluate the specifier (and options, if any);
                 // ImportCall does ToString, the options/phase checks, and the load.
-                let spec = self.expr(&ie.source)?;
-                let opts = match &ie.options {
+                let spec = self.expr(spec)?;
+                let opts = match options {
                     Some(o) => Some(self.expr(o)?),
                     None => None,
                 };
-                let phase = match ie.phase {
-                    Some(ox::ImportPhase::Source) => 2,
-                    Some(ox::ImportPhase::Defer) => 1,
-                    None => 0,
+                let phase = match phase {
+                    ast::ImportPhase::Source => 2,
+                    ast::ImportPhase::Defer => 1,
+                    ast::ImportPhase::Evaluation => 0,
                 };
                 self.emit(Instr::ImportCall { dst, spec, phase, opts });
                 Ok(dst)
             }
-            ox::Expression::MetaProperty(m) => {
+            E::ImportMeta => {
                 // `import.meta` — module code only (a SyntaxError in scripts);
-                // `new.target` is handled by the dedicated lowering elsewhere.
-                if m.meta.name == "import" && m.property.name == "meta" {
-                    // (Both module pipelines: compile_module entry and the
-                    // loader's compile_eval(is_module) — see the import
-                    // pre-pass gate.)
-                    let in_module =
-                        self.cx.module_mode || (self.cx.eval_mode && !self.cx.eval_locals);
-                    if !in_module {
-                        return Err("SyntaxError: import.meta is only valid in modules".into());
-                    }
-                    let dst = self.temp();
-                    self.emit(Instr::ImportMeta { dst });
-                    return Ok(dst);
+                // `new.target` is handled by the dedicated lowering above.
+                // (Both module pipelines: compile_module entry and the
+                // loader's compile_eval(is_module) — see the import
+                // pre-pass gate.)
+                let in_module = self.cx.module_mode || (self.cx.eval_mode && !self.cx.eval_locals);
+                if !in_module {
+                    return Err("SyntaxError: import.meta is only valid in modules".into());
                 }
-                Err("unsupported meta property".into())
+                let dst = self.temp();
+                self.emit(Instr::ImportMeta { dst });
+                Ok(dst)
             }
-            _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
+            // `super` is not a value; every position where it is legal is handled
+            // by the construct that owns it (member reads, `super(...)`).
+            E::Super => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
         }
     }
 
-    pub(crate) fn static_member(&mut self, m: &ox::StaticMemberExpression, dst: Reg) -> R<Reg> {
+    /// `obj.x` / `obj[k]` / `obj.#x` — one node in `ast`, three lowerings.
+    pub(crate) fn member(&mut self, m: &ast::Member, dst: Reg) -> R<Reg> {
+        match &m.prop {
+            ast::MemberProp::Ident(p) => self.static_member(m, p, dst),
+            ast::MemberProp::Computed(key) => self.computed_member(m, key, dst),
+            ast::MemberProp::Private(p) => self.private_member(m, p, dst),
+        }
+    }
+
+    pub(crate) fn static_member(&mut self, m: &ast::Member, prop: &str, dst: Reg) -> R<Reg> {
         // Math constants (Math.PI, Math.E, …) — Math has no real global object.
-        if let ox::Expression::Identifier(o) = &m.object {
-            if o.name == "Math" {
-                let c = match m.property.name.as_str() {
+        if let ast::Expr::Ident(o) = &m.object {
+            if &**o == "Math" {
+                let c = match prop {
                     "PI" => Some(std::f64::consts::PI),
                     "E" => Some(std::f64::consts::E),
                     "LN2" => Some(std::f64::consts::LN_2),
@@ -592,11 +642,11 @@ impl<'a> FnCompiler<'a> {
         }
         // `super.name` — read an inherited property through the lexical home: a class
         // method via its home class, an object method via its runtime [[HomeObject]].
-        if matches!(&m.object, ox::Expression::Super(_)) {
+        if matches!(&m.object, ast::Expr::Super) {
             // MakeSuperPropertyReference: GetThisBinding() throws FIRST in a
             // derived ctor pre-super.
             self.this_check();
-            let name = self.string_name(m.property.name.as_str());
+            let name = self.string_name(prop);
             if let Some(pid) = self.super_class {
                 self.emit(Instr::SuperGet { dst, home_class_id: pid, name });
             } else if self.super_home_obj {
@@ -610,21 +660,21 @@ impl<'a> FnCompiler<'a> {
         if m.optional {
             self.emit_optional_check(obj);
         }
-        let name = self.string_name(m.property.name.as_str());
+        let name = self.string_name(prop);
         self.emit(Instr::GetProp { dst, obj, name });
         Ok(dst)
     }
 
-    pub(crate) fn computed_member(&mut self, m: &ox::ComputedMemberExpression, dst: Reg) -> R<Reg> {
+    pub(crate) fn computed_member(&mut self, m: &ast::Member, key_expr: &ast::Expr, dst: Reg) -> R<Reg> {
         // `super[expr]` — computed inherited-property read.
-        if matches!(&m.object, ox::Expression::Super(_)) {
+        if matches!(&m.object, ast::Expr::Super) {
             // GetThisBinding() throws BEFORE the key expression is evaluated.
             self.this_check();
             if let Some(pid) = self.super_class {
-                let key = self.expr(&m.expression)?;
+                let key = self.expr(key_expr)?;
                 self.emit(Instr::SuperGetComputed { dst, home_class_id: pid, key });
             } else if self.super_home_obj {
-                let key = self.expr(&m.expression)?;
+                let key = self.expr(key_expr)?;
                 self.emit(Instr::SuperGetObjComputed { dst, key });
             } else {
                 return Err("`super[x]` is only valid in a method".into());
@@ -639,14 +689,26 @@ impl<'a> FnCompiler<'a> {
         // concat-key heap allocation; see the opcode doc). The literal has no
         // side effects, so not emitting its LoadConst is unobservable; `e` is
         // still evaluated after `obj`, matching the unfused order.
-        if let Some((name, rhs)) = concat_key_literal_prefix(&m.expression) {
+        if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
             let nidx = self.string_name(name);
             let key = self.expr(rhs)?;
             self.emit(Instr::GetIndexConcat { dst, obj, name: nidx, key });
             return Ok(dst);
         }
-        let key = self.expr(&m.expression)?;
+        let key = self.expr(key_expr)?;
         self.emit(Instr::GetIndex { dst, obj, key });
+        Ok(dst)
+    }
+
+    /// `obj.#field` → read the reserved "#field" property.
+    pub(crate) fn private_member(&mut self, m: &ast::Member, prop: &str, dst: Reg) -> R<Reg> {
+        self.check_private_declared(prop)?;
+        let obj = self.expr(&m.object)?;
+        if m.optional {
+            self.emit_optional_check(obj);
+        }
+        let name = self.string_name(&private_key(prop));
+        self.emit(Instr::GetProp { dst, obj, name });
         Ok(dst)
     }
 
@@ -686,31 +748,24 @@ impl<'a> FnCompiler<'a> {
     /// The chain ends at the parens: a nullish base lands the CALLEE at
     /// undefined (its own bail boundary), and the call then throws (or an
     /// outer `?.()` bails). Returns None for non-member chain elements
-    /// (call chains etc. — those stay value-calls).
-    pub(crate) fn chain_member_callee(&mut self, ce: &ox::ChainExpression) -> R<Option<(Reg, Reg)>> {
-        enum Kind<'a, 'x> {
-            Static(&'a ox::StaticMemberExpression<'x>),
-            Computed(&'a ox::ComputedMemberExpression<'x>),
+    /// (call chains etc. — those stay value-calls). `inner` is the chain's
+    /// wrapped expression (`Expr::Chain`'s payload).
+    pub(crate) fn chain_member_callee(&mut self, inner: &ast::Expr) -> R<Option<(Reg, Reg)>> {
+        enum Kind<'k> {
+            Static(&'k str),
+            Computed(&'k ast::Expr),
         }
-        let kind = match &ce.expression {
-            ox::ChainElement::StaticMemberExpression(m)
-                if !matches!(&m.object, ox::Expression::Super(_)) =>
-            {
-                Kind::Static(m)
-            }
-            ox::ChainElement::ComputedMemberExpression(m)
-                if !matches!(&m.object, ox::Expression::Super(_)) =>
-            {
-                Kind::Computed(m)
-            }
+        let (object, optional, kind) = match inner {
+            ast::Expr::Member(m) if !matches!(m.object, ast::Expr::Super) => match &m.prop {
+                ast::MemberProp::Ident(p) => (&m.object, m.optional, Kind::Static(p)),
+                ast::MemberProp::Computed(k) => (&m.object, m.optional, Kind::Computed(k)),
+                // A private member is neither of the two forms this handles.
+                ast::MemberProp::Private(_) => return Ok(None),
+            },
             _ => return Ok(None),
         };
         self.chain_bails.push(Vec::new());
         let res: R<(Reg, Reg)> = (|| {
-            let (object, optional) = match &kind {
-                Kind::Static(m) => (&m.object, m.optional),
-                Kind::Computed(m) => (&m.object, m.optional),
-            };
             let o = self.expr(object)?;
             let obj = self.alloc_reg();
             if o != obj {
@@ -721,12 +776,12 @@ impl<'a> FnCompiler<'a> {
             }
             let callee = self.alloc_reg();
             match &kind {
-                Kind::Static(m) => {
-                    let name = self.string_name(m.property.name.as_str());
+                Kind::Static(p) => {
+                    let name = self.string_name(p);
                     self.emit(Instr::GetProp { dst: callee, obj, name });
                 }
-                Kind::Computed(m) => {
-                    let key = self.expr(&m.expression)?;
+                Kind::Computed(k) => {
+                    let key = self.expr(k)?;
                     self.emit(Instr::GetIndex { dst: callee, obj, key });
                 }
             }
@@ -750,25 +805,16 @@ impl<'a> FnCompiler<'a> {
 
     /// Compile an optional chain `a?.b…`: open a short-circuit boundary, compile
     /// the chain element (its `?.` links record bail jumps), then route any
-    /// short-circuit to a single `undefined` result.
-    pub(crate) fn chain_expr(&mut self, ce: &ox::ChainExpression, dst: Reg) -> R<Reg> {
+    /// short-circuit to a single `undefined` result. `inner` is `Expr::Chain`'s
+    /// wrapped expression.
+    pub(crate) fn chain_expr(&mut self, inner: &ast::Expr, dst: Reg) -> R<Reg> {
         self.chain_bails.push(Vec::new());
-        let res = match &ce.expression {
-            ox::ChainElement::StaticMemberExpression(m) => self.static_member(m, dst),
-            ox::ChainElement::ComputedMemberExpression(m) => self.computed_member(m, dst),
-            ox::ChainElement::CallExpression(c) => self.call(c, dst),
-            // `o?.#field` (and nested `?.` links inside the object register
-            // their own bails): the GetProp private path handles brand checks.
-            ox::ChainElement::PrivateFieldExpression(p) => {
-                self.check_private_declared(&p.field.name)?;
-                let obj = self.expr(&p.object)?;
-                if p.optional {
-                    self.emit_optional_check(obj);
-                }
-                let name = self.string_name(&private_key(&p.field.name));
-                self.emit(Instr::GetProp { dst, obj, name });
-                Ok(dst)
-            }
+        let res = match inner {
+            // Static / computed / private links all live in one node now; the
+            // private path's GetProp handles brand checks, and nested `?.` links
+            // inside the object register their own bails.
+            ast::Expr::Member(m) => self.member(m, dst),
+            ast::Expr::Call(c) => self.call(c, dst),
             _ => Err("this optional-chain form is not in the zipp-vm subset yet".into()),
         };
         let bails = self.chain_bails.pop().unwrap();
@@ -794,50 +840,69 @@ impl<'a> FnCompiler<'a> {
     /// `` tag`q0${e0}q1…` `` — call `tag(strings, e0, e1, …)` where `strings` is
     /// the array of cooked literal parts carrying a `.raw` array of the un-escaped
     /// parts. `String.raw` is handled inline (no real global exists).
-    pub(crate) fn tagged_template(&mut self, tt: &ox::TaggedTemplateExpression, dst: Reg) -> R<Reg> {
-        self.tagged_template_impl(tt, dst, false)
+    pub(crate) fn tagged_template(
+        &mut self,
+        tag: &ast::Expr,
+        quasi: &ast::TemplateLit,
+        dst: Reg,
+    ) -> R<Reg> {
+        self.tagged_template_impl(tag, quasi, dst, false)
     }
 
     /// `return tag`…`` in a proper-tail-call position: same lowering with the
     /// `TailCall` frame-reuse prefix in front of the final plain `Call`.
-    pub(crate) fn tagged_template_tail(&mut self, tt: &ox::TaggedTemplateExpression, dst: Reg) -> R<Reg> {
-        self.tagged_template_impl(tt, dst, true)
+    pub(crate) fn tagged_template_tail(
+        &mut self,
+        tag: &ast::Expr,
+        quasi: &ast::TemplateLit,
+        dst: Reg,
+    ) -> R<Reg> {
+        self.tagged_template_impl(tag, quasi, dst, true)
     }
 
     pub(crate) fn tagged_template_impl(
         &mut self,
-        tt: &ox::TaggedTemplateExpression,
+        tag_expr: &ast::Expr,
+        quasi: &ast::TemplateLit,
         dst: Reg,
         tail: bool,
     ) -> R<Reg> {
-        let quasi = &tt.quasi;
         // `String.raw` template — concatenate the RAW parts with the values.
-        if let ox::Expression::StaticMemberExpression(m) = &tt.tag {
-            if let ox::Expression::Identifier(o) = &m.object {
-                if o.name == "String" && m.property.name == "raw" {
+        if let ast::Expr::Member(m) = tag_expr {
+            if let (ast::Expr::Ident(o), ast::MemberProp::Ident(p)) = (&m.object, &m.prop) {
+                if &**o == "String" && &**p == "raw" {
                     return self.string_raw(quasi, dst);
                 }
             }
         }
-        let n = quasi.expressions.len();
+        let n = quasi.exprs.len();
         // Evaluate the tag (and its `this` for a member tag) first, into stable
         // registers that survive the argument block.
         enum Tag {
             Plain(Reg),
             Method(Reg, u32),
         }
-        let tag = match &tt.tag {
-            ox::Expression::StaticMemberExpression(m) => {
-                let obj = self.expr(&m.object)?;
+        // Only a STATIC member tag binds a receiver here; a computed or private
+        // member tag goes down the plain-value path, as it always has.
+        let static_tag = match tag_expr {
+            ast::Expr::Member(m) => match &m.prop {
+                ast::MemberProp::Ident(p) => Some((&m.object, p)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let tag = match static_tag {
+            Some((object, prop)) => {
+                let obj = self.expr(object)?;
                 let obj_reg = self.alloc_reg();
                 if obj != obj_reg {
                     self.emit(Instr::Move { dst: obj_reg, src: obj });
                 }
-                let name = self.string_name(m.property.name.as_str());
+                let name = self.string_name(prop);
                 Tag::Method(obj_reg, name)
             }
-            other => {
-                let callee = self.expr(other)?;
+            None => {
+                let callee = self.expr(tag_expr)?;
                 let callee_reg = self.alloc_reg();
                 if callee != callee_reg {
                     self.emit(Instr::Move { dst: callee_reg, src: callee });
@@ -865,7 +930,7 @@ impl<'a> FnCompiler<'a> {
         }
         let block_top = self.next_reg;
         self.emit(Instr::Move { dst: arg_base, src: strings_reg });
-        for (i, e) in quasi.expressions.iter().enumerate() {
+        for (i, e) in quasi.exprs.iter().enumerate() {
             let slot = arg_base + 1 + i as Reg;
             let v = self.expr_into(e, slot)?;
             if v != slot {
@@ -892,26 +957,22 @@ impl<'a> FnCompiler<'a> {
 
     /// Build the tagged-template strings array `[q0,q1,…]` (cooked) into `dst`,
     /// with its `.raw` property set to the array of raw (un-escaped) parts.
-    pub(crate) fn build_template_strings(&mut self, quasi: &ox::TemplateLiteral, dst: Reg) -> R<()> {
+    pub(crate) fn build_template_strings(&mut self, quasi: &ast::TemplateLit, dst: Reg) -> R<()> {
         let nq = quasi.quasis.len() as u16;
         let save = self.next_reg;
         // Cooked array → dst. A quasi with an ILLEGAL escape sequence has no cooked
-        // value (oxc sets `cooked` to None) — in a TAGGED template that element is
+        // value (`cooked` is None) — in a TAGGED template that element is
         // `undefined` (only the tag sees it; an untagged template would be a syntax
         // error), so load undefined rather than masking it as "".
         let cooked_base = self.next_reg;
         for q in &quasi.quasis {
             let r = self.alloc_reg();
-            match q.value.cooked.as_ref() {
+            match q.cooked.as_ref() {
                 Some(s) => {
-                    // A `.lone_surrogates` quasi cooks to the oxc marker form —
-                    // decode to real WTF-8 at intern time. (Raw parts below are
-                    // source text — never markers.)
-                    let idx = if q.lone_surrogates {
-                        self.add_string_const_wtf8(s.as_str())
-                    } else {
-                        self.add_string_const(s.as_str())
-                    };
+                    // A cooked value holding a lone surrogate goes to the
+                    // WTF-8-decoding constant slot. (Raw parts below are source
+                    // text — never markers.)
+                    let idx = self.str_const(s);
                     self.emit(Instr::LoadConst { dst: r, idx });
                 }
                 None => self.emit(Instr::LoadUndefined { dst: r }),
@@ -924,7 +985,7 @@ impl<'a> FnCompiler<'a> {
         let raw_base = self.next_reg;
         for q in &quasi.quasis {
             let r = self.alloc_reg();
-            let idx = self.add_string_const(q.value.raw.as_str());
+            let idx = self.add_string_const(&q.raw);
             self.emit(Instr::LoadConst { dst: r, idx });
         }
         self.emit(Instr::NewArray { dst: raw_reg, arg_base: raw_base, argc: nq });
@@ -935,17 +996,15 @@ impl<'a> FnCompiler<'a> {
 
     /// `String.raw` template: concatenate the RAW literal parts with the
     /// stringified interpolation values (`String.raw\`a\\n${1}b\`` → `a\\n1b`).
-    pub(crate) fn string_raw(&mut self, quasi: &ox::TemplateLiteral, dst: Reg) -> R<Reg> {
-        let r0 = quasi.quasis[0].value.raw.as_str();
-        let idx = self.add_string_const(r0);
+    pub(crate) fn string_raw(&mut self, quasi: &ast::TemplateLit, dst: Reg) -> R<Reg> {
+        let idx = self.add_string_const(&quasi.quasis[0].raw);
         self.emit(Instr::LoadConst { dst, idx });
-        for (i, e) in quasi.expressions.iter().enumerate() {
+        for (i, e) in quasi.exprs.iter().enumerate() {
             let r = self.expr(e)?;
             self.emit(Instr::Add { dst, a: dst, b: r });
             if let Some(qe) = quasi.quasis.get(i + 1) {
-                let raw = qe.value.raw.as_str();
-                if !raw.is_empty() {
-                    let qidx = self.add_string_const(raw);
+                if !qe.raw.is_empty() {
+                    let qidx = self.add_string_const(&qe.raw);
                     let qr = self.temp();
                     self.emit(Instr::LoadConst { dst: qr, idx: qidx });
                     self.emit(Instr::Add { dst, a: dst, b: qr });
@@ -955,7 +1014,7 @@ impl<'a> FnCompiler<'a> {
         Ok(dst)
     }
 
-    pub(crate) fn array_literal(&mut self, a: &ox::ArrayExpression, dst: Reg) -> R<Reg> {
+    pub(crate) fn array_literal(&mut self, elems: &[Option<ast::ArrayElem>], dst: Reg) -> R<Reg> {
         // The fixed-block `NewArray` form needs one CONTIGUOUS register per
         // element and passes the count as a `u16` argc, so it is only usable
         // for literals that actually fit the frame. A big literal (machine-
@@ -969,30 +1028,29 @@ impl<'a> FnCompiler<'a> {
         // dense store, so it is semantically identical to `NewArray` — the
         // spread case below has always relied on that.
         const NEWARRAY_MAX_ELEMS: usize = 1024;
-        let n_elems = a.elements.len();
+        let n_elems = elems.len();
         let block_fits = self.next_reg as usize + n_elems <= Reg::MAX as usize;
         let incremental = n_elems > NEWARRAY_MAX_ELEMS
             || !block_fits
-            || a.elements.iter().any(|e| matches!(e, ox::ArrayExpressionElement::SpreadElement(_)));
+            || elems.iter().any(|e| matches!(e, Some(ast::ArrayElem::Spread(_))));
         // With a `...spread` element the final length is dynamic, so build the
         // array incrementally via ArrayAppend instead of the fixed-block NewArray.
         if incremental {
             self.emit(Instr::NewArray { dst, arg_base: self.next_reg, argc: 0 }); // []
-            for el in &a.elements {
+            for el in elems {
                 let save = self.next_reg;
                 match el {
-                    ox::ArrayExpressionElement::Elision(_) => {
-                        // An elided element is a HOLE, not a present `undefined`.
+                    // A hole is `None`, and is NOT a present `undefined`.
+                    None => {
                         let v = self.temp();
                         self.emit(Instr::LoadHole { dst: v });
                         self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: false });
                     }
-                    ox::ArrayExpressionElement::SpreadElement(s) => {
-                        let v = self.expr(&s.argument)?;
+                    Some(ast::ArrayElem::Spread(s)) => {
+                        let v = self.expr(s)?;
                         self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: true });
                     }
-                    other => {
-                        let e = other.as_expression().ok_or("unsupported array element")?;
+                    Some(ast::ArrayElem::Expr(e)) => {
                         let v = self.expr(e)?;
                         self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: false });
                     }
@@ -1007,20 +1065,19 @@ impl<'a> FnCompiler<'a> {
         // `n_elems <= NEWARRAY_MAX_ELEMS` here, so the cast cannot truncate.
         let count = n_elems as u16;
         let base = self.next_reg;
-        for _ in &a.elements {
+        for _ in elems {
             self.alloc_reg();
         }
         let block_top = self.next_reg;
-        for (i, el) in a.elements.iter().enumerate() {
+        for (i, el) in elems.iter().enumerate() {
             let slot = base + i as Reg;
             match el {
-                ox::ArrayExpressionElement::Elision(_) => {
-                    // An elided element is a HOLE, not a present `undefined`.
+                // A hole is `None`, and is NOT a present `undefined`.
+                None => {
                     self.emit(Instr::LoadHole { dst: slot });
                 }
-                ox::ArrayExpressionElement::SpreadElement(_) => unreachable!("handled above"),
-                other => {
-                    let e = other.as_expression().ok_or("unsupported array element")?;
+                Some(ast::ArrayElem::Spread(_)) => unreachable!("handled above"),
+                Some(ast::ArrayElem::Expr(e)) => {
                     let v = self.expr_into(e, slot)?;
                     if v != slot {
                         self.emit(Instr::Move { dst: slot, src: v });
@@ -1033,7 +1090,7 @@ impl<'a> FnCompiler<'a> {
         Ok(dst)
     }
 
-    pub(crate) fn object_literal(&mut self, o: &ox::ObjectExpression, dst: Reg) -> R<Reg> {
+    pub(crate) fn object_literal(&mut self, props: &[ast::ObjectMember], dst: Reg) -> R<Reg> {
         // Count the plain static data keys so the property vectors are sized
         // once, and decide which of them can skip `define`'s existence probe.
         // `appendable` goes false permanently at the first property that could
@@ -1043,20 +1100,14 @@ impl<'a> FnCompiler<'a> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut appendable = true;
         let mut static_keys = 0usize;
-        for prop in &o.properties {
+        for prop in props {
             match prop {
-                ox::ObjectPropertyKind::ObjectProperty(p)
-                    if !p.computed
-                        && !matches!(p.kind, ox::PropertyKind::Get | ox::PropertyKind::Set) =>
-                {
-                    let k = match &p.key {
-                        ox::PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
-                        ox::PropertyKey::StringLiteral(sl) => Some(string_literal_key(sl)),
-                        ox::PropertyKey::NumericLiteral(n) => Some(fmt_key_num(n.value)),
-                        _ => None,
-                    };
-                    match k {
-                        Some(k) if k != "__proto__" || p.method || p.shorthand => {
+                // A data property with a static key. `static_key_text` returns
+                // None for a computed (or private) key, which ends the run just
+                // as the old `!p.computed` guard did.
+                ast::ObjectMember::Prop { key, shorthand, .. } => {
+                    match static_key_text(key) {
+                        Some(k) if k != "__proto__" || *shorthand => {
                             if !seen.insert(k) {
                                 appendable = false; // duplicate key: the second one overwrites
                             } else {
@@ -1066,6 +1117,18 @@ impl<'a> FnCompiler<'a> {
                         _ => appendable = false,
                     }
                 }
+                // A concise method with a static key. `__proto__` is an ordinary
+                // own property in method form, so it does not end the run.
+                ast::ObjectMember::Method { key, .. } => match static_key_text(key) {
+                    Some(k) => {
+                        if !seen.insert(k) {
+                            appendable = false;
+                        } else {
+                            static_keys += 1;
+                        }
+                    }
+                    None => appendable = false,
+                },
                 _ => appendable = false,
             }
             if !appendable {
@@ -1077,153 +1140,218 @@ impl<'a> FnCompiler<'a> {
             dst,
             hint: static_keys.min(u16::MAX as usize) as u16,
         });
-        for prop in &o.properties {
+        for prop in props {
             let save = self.next_reg;
             match prop {
-                ox::ObjectPropertyKind::ObjectProperty(p) => {
-                    if matches!(p.kind, ox::PropertyKind::Get | ox::PropertyKind::Set) {
-                        // `{ get k(){…} }` / `{ set k(v){…} }` — an accessor property.
-                        // The key is loaded into a register (computed expr or the
-                        // static key string); a get+set pair on one key merges.
-                        let key = if p.computed {
-                            let ke =
-                                p.key.as_expression().ok_or("unsupported computed accessor key")?;
-                            self.expr(ke)?
-                        } else {
-                            let k = match &p.key {
-                                ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                                ox::PropertyKey::StringLiteral(s) => string_literal_key(s),
-                                ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
-                                ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
-                                _ => return Err("unsupported accessor key in the zipp-vm subset".into()),
-                            };
-                            let kr = self.alloc_reg();
-                            let idx = self.add_string_const(&k);
-                            self.emit(Instr::LoadConst { dst: kr, idx });
-                            kr
-                        };
-                        // An accessor is a method: it gets a [[HomeObject]], so `super`
-                        // inside it resolves via the object (set the transient flag the
-                        // function-body compiler consumes).
-                        self.cx.obj_method_super = true;
-                        let func = self.expr(&p.value)?;
-                        self.cx.obj_method_super = false;
-                        // `Function.prototype.toString` of an object accessor is the
-                        // whole `get k(){}` / `set k(v){}`; the value-Function span
-                        // omits the `get`/`set` and the key, so patch the just-
-                        // compiled proto (pushed last) with the ObjectProperty span.
-                        let fid = self.cx.functions.len() - 1;
-                        self.cx.functions[fid].source =
-                            self.cx.src_slice(p.span.start, p.span.end);
-                        self.cx.functions[fid].non_constructable = true; // accessor = method
-                        let is_setter = matches!(p.kind, ox::PropertyKind::Set);
-                        self.emit(Instr::DefineAccessor { obj: dst, key, func, is_setter });
-                        self.emit(Instr::SetHomeObject { method: func, home: dst });
-                        // SetFunctionName: a getter/setter is named "get k"/"set k"
-                        // (a Symbol key → "get [desc]"), at runtime so a computed key
-                        // is handled too.
-                        self.emit(Instr::SetFnNameFromKey {
-                            func,
-                            key,
-                            prefix: if is_setter { 2 } else { 1 },
-                        });
-                    } else if p.computed {
-                        // Computed key `{[expr]: v}` → CreateDataProperty with a
-                        // runtime key: ToPropertyKey runs BEFORE the value
-                        // evaluates (its coercion side effects order first), and
-                        // a computed "__proto__" defines an ORDINARY own
-                        // property (only the textual colon form sets the proto).
-                        let ke = p.key.as_expression().ok_or("unsupported computed object key")?;
-                        let raw = self.expr(ke)?;
-                        let key = self.alloc_reg();
-                        self.emit(Instr::ToPropKey { dst: key, obj: dst, src: raw });
-                        // A computed concise method gets a [[HomeObject]] (for super).
-                        if p.method {
-                            self.cx.obj_method_super = true;
-                        }
-                        let v = self.expr(&p.value)?;
-                        self.cx.obj_method_super = false;
-                        // A computed concise method `{ [expr](){} }` (incl. `*`/`async`):
-                        // its toString is the whole `[expr](){}` — the value-Function span
-                        // omits the computed key + modifiers, so patch it with the
-                        // ObjectProperty span (mirrors the static-key method branch below).
-                        if p.method {
-                            let fid = self.cx.functions.len() - 1;
-                            self.cx.functions[fid].source =
-                                self.cx.src_slice(p.span.start, p.span.end);
-                            self.cx.functions[fid].non_constructable = true;
-                        }
-                        // SetFunctionName: an anonymous function/arrow/class value
-                        // takes the (runtime) computed key as its name — a Symbol key
-                        // becomes "[description]".
-                        if is_anonymous_fn_def(&p.value) {
-                            self.emit(Instr::SetFnNameFromKey { func: v, key, prefix: 0 });
-                        }
-                        self.emit(Instr::InitDataPropDyn { obj: dst, key, val: v });
-                        if p.method {
-                            self.emit(Instr::SetHomeObject { method: v, home: dst });
-                        }
-                    } else {
-                        // Static identifier / string / number literal key.
-                        let key = match &p.key {
-                            ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                            ox::PropertyKey::StringLiteral(s) => string_literal_key(s),
-                            ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
-                                ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
-                            _ => return Err("unsupported object key in the zipp-vm subset".into()),
-                        };
-                        let name = self.string_name(&key);
-                        // `{ fn: function(){}, m(){}, C: class{} }` — an anonymous
-                        // value function/class takes the property key as its name,
-                        // EXCEPT `{ __proto__: fn }` (a proto-setter, not a data
-                        // property): its function value stays anonymous.
-                        let vtmp = self.alloc_reg();
-                        // A concise method gets a [[HomeObject]] (for `super`); a plain
-                        // `k: function(){}` data property does NOT.
-                        if p.method {
-                            self.cx.obj_method_super = true;
-                        }
-                        let v = if key == "__proto__" && !p.method && !p.shorthand {
-                            self.expr_into(&p.value, vtmp)?
-                        } else {
-                            self.compile_named_init(vtmp, &p.value, &key)?
-                        };
-                        self.cx.obj_method_super = false;
-                        // Shorthand method `{ m(){}, *g(){}, async a(){} }`: its
-                        // toString is the whole `m(){}` (the value-Function span omits
-                        // the name/modifiers). Patch the proto just compiled (last).
-                        // Regular `k: function(){}` keeps the value's own span.
-                        if p.method {
-                            let fid = self.cx.functions.len() - 1;
-                            self.cx.functions[fid].source =
-                                self.cx.src_slice(p.span.start, p.span.end);
-                            self.cx.functions[fid].non_constructable = true; // concise method
-                        }
-                        // `{ __proto__: v }` (colon form ONLY — shorthand
-                        // `{ __proto__ }` is an ordinary data property) sets the
-                        // prototype — a real [[Set]]/proto-setter; every other
-                        // key is CreateDataProperty, which must ignore an
-                        // inherited accessor / non-writable prop.
-                        if key == "__proto__" && !p.method && !p.shorthand {
-                            self.emit(Instr::SetProp { obj: dst, name, val: v });
-                        } else if all_appendable {
-                            self.emit(Instr::AppendDataProp { obj: dst, name, val: v });
-                        } else {
-                            self.emit(Instr::InitDataProp { obj: dst, name, val: v });
-                        }
-                        if p.method {
-                            self.emit(Instr::SetHomeObject { method: v, home: dst });
-                        }
-                    }
+                ast::ObjectMember::Get { key, func } => {
+                    self.object_accessor(dst, key, func, false)?
                 }
-                ox::ObjectPropertyKind::SpreadProperty(s) => {
-                    let src = self.expr(&s.argument)?;
+                ast::ObjectMember::Set { key, func } => {
+                    self.object_accessor(dst, key, func, true)?
+                }
+                // NOTE: `init` (CoverInitializedName — the `= 1` in `{a = 1}`) is
+                // ignored here on purpose. `({a = 1})` is a SyntaxError and
+                // `({a = 1} = {})` is a destructuring TARGET, so the initializer
+                // is either consumed by the target reinterpretation or raised as
+                // an error by the parser, which is the only place that knows
+                // which of the two this literal resolved as.
+                ast::ObjectMember::Prop { key, value, shorthand, .. } => self.object_data_prop(
+                    dst,
+                    key,
+                    PropVal::Expr(value),
+                    false,
+                    *shorthand,
+                    all_appendable,
+                )?,
+                ast::ObjectMember::Method { key, func } => self.object_data_prop(
+                    dst,
+                    key,
+                    PropVal::Func(func),
+                    true,
+                    false,
+                    all_appendable,
+                )?,
+                ast::ObjectMember::Spread(s) => {
+                    let src = self.expr(s)?;
                     self.emit(Instr::ObjectSpread { target: dst, src });
                 }
             }
             self.next_reg = save; // reclaim this property's scratch temps
         }
         Ok(dst)
+    }
+
+    /// A property's value into a fresh temp, exactly as `self.expr` would have
+    /// produced it when a method/accessor was still a `FunctionExpression` value.
+    pub(crate) fn prop_value(&mut self, val: PropVal<'_>) -> R<Reg> {
+        match val {
+            PropVal::Expr(e) => self.expr(e),
+            PropVal::Func(f) => {
+                let dst = self.temp();
+                let (id, has_up) =
+                    self.compile_func_expr(f.name.as_ref().map(|n| n.to_string()), f)?;
+                self.emit_make_callable(dst, id, has_up);
+                Ok(dst)
+            }
+        }
+    }
+
+    /// `{ get k(){…} }` / `{ set k(v){…} }` — an accessor property. The key is
+    /// loaded into a register (computed expr or the static key string); a get+set
+    /// pair on one key merges.
+    pub(crate) fn object_accessor(
+        &mut self,
+        obj: Reg,
+        key: &ast::PropKey,
+        func: &ast::Function,
+        is_setter: bool,
+    ) -> R<()> {
+        let key = match key {
+            ast::PropKey::Computed(ke) => self.expr(ke)?,
+            other => {
+                let k = static_key_text(other)
+                    .ok_or("unsupported accessor key in the zipp-vm subset")?;
+                let kr = self.alloc_reg();
+                let idx = self.add_string_const(&k);
+                self.emit(Instr::LoadConst { dst: kr, idx });
+                kr
+            }
+        };
+        // An accessor is a method: it gets a [[HomeObject]], so `super`
+        // inside it resolves via the object (set the transient flag the
+        // function-body compiler consumes).
+        self.cx.obj_method_super = true;
+        let func = self.prop_value(PropVal::Func(func))?;
+        self.cx.obj_method_super = false;
+        // NOTE: `Function.prototype.toString` of an object accessor is the whole
+        // `get k(){}` / `set k(v){}`. That used to be patched in here from the
+        // ObjectProperty's span, because oxc's value-`Function` span omits the
+        // `get`/`set` and the key. `ast::Function.span` IS the [[SourceText]]
+        // range by definition, so `compile_func_expr` already records the right
+        // text and there is nothing to patch — `ObjectMember` has no span, and
+        // inventing one is exactly what rule 5 forbids. (Under the oxc bridge
+        // this is a bridge-side fidelity gap, not a compiler one.)
+        let fid = self.cx.functions.len() - 1;
+        self.cx.functions[fid].non_constructable = true; // accessor = method
+        self.emit(Instr::DefineAccessor { obj, key, func, is_setter });
+        self.emit(Instr::SetHomeObject { method: func, home: obj });
+        // SetFunctionName: a getter/setter is named "get k"/"set k"
+        // (a Symbol key → "get [desc]"), at runtime so a computed key
+        // is handled too.
+        self.emit(Instr::SetFnNameFromKey {
+            func,
+            key,
+            prefix: if is_setter { 2 } else { 1 },
+        });
+        Ok(())
+    }
+
+    /// A data property or concise method: `{k: v}`, `{[k]: v}`, `{m(){}}`,
+    /// `{[k](){}}`.
+    pub(crate) fn object_data_prop(
+        &mut self,
+        obj: Reg,
+        key: &ast::PropKey,
+        val: PropVal<'_>,
+        is_method: bool,
+        shorthand: bool,
+        all_appendable: bool,
+    ) -> R<()> {
+        // IsAnonymousFunctionDefinition of the value: a method's function is
+        // anonymous unless it carries its own name (the property key is not one).
+        let anonymous = match val {
+            PropVal::Expr(e) => is_anonymous_fn_def(e),
+            PropVal::Func(f) => f.name.is_none(),
+        };
+        if let ast::PropKey::Computed(ke) = key {
+            // Computed key `{[expr]: v}` → CreateDataProperty with a
+            // runtime key: ToPropertyKey runs BEFORE the value
+            // evaluates (its coercion side effects order first), and
+            // a computed "__proto__" defines an ORDINARY own
+            // property (only the textual colon form sets the proto).
+            let raw = self.expr(ke)?;
+            let key = self.alloc_reg();
+            self.emit(Instr::ToPropKey { dst: key, obj, src: raw });
+            // A computed concise method gets a [[HomeObject]] (for super).
+            if is_method {
+                self.cx.obj_method_super = true;
+            }
+            let v = self.prop_value(val)?;
+            self.cx.obj_method_super = false;
+            // A computed concise method `{ [expr](){} }` (incl. `*`/`async`) is
+            // non-constructable. Its toString is the whole `[expr](){}`, which
+            // `Function.span` already covers — see the NOTE in `object_accessor`
+            // for why the old span patch is gone.
+            if is_method {
+                let fid = self.cx.functions.len() - 1;
+                self.cx.functions[fid].non_constructable = true;
+            }
+            // SetFunctionName: an anonymous function/arrow/class value
+            // takes the (runtime) computed key as its name — a Symbol key
+            // becomes "[description]".
+            if anonymous {
+                self.emit(Instr::SetFnNameFromKey { func: v, key, prefix: 0 });
+            }
+            self.emit(Instr::InitDataPropDyn { obj, key, val: v });
+            if is_method {
+                self.emit(Instr::SetHomeObject { method: v, home: obj });
+            }
+            return Ok(());
+        }
+        // Static identifier / string / number literal key.
+        let key = static_key_text(key).ok_or("unsupported object key in the zipp-vm subset")?;
+        let name = self.string_name(&key);
+        // `{ fn: function(){}, m(){}, C: class{} }` — an anonymous
+        // value function/class takes the property key as its name,
+        // EXCEPT `{ __proto__: fn }` (a proto-setter, not a data
+        // property): its function value stays anonymous.
+        let vtmp = self.alloc_reg();
+        // A concise method gets a [[HomeObject]] (for `super`); a plain
+        // `k: function(){}` data property does NOT.
+        if is_method {
+            self.cx.obj_method_super = true;
+        }
+        // `{ __proto__: v }` — the colon form ONLY (shorthand `{ __proto__ }` and
+        // the method form are ordinary data properties).
+        let is_proto = key == "__proto__" && !is_method && !shorthand;
+        let v = match val {
+            PropVal::Expr(e) if is_proto => self.expr_into(e, vtmp)?,
+            PropVal::Expr(e) => self.compile_named_init(vtmp, e, &key)?,
+            // NamedEvaluation for a concise method, which `compile_named_init`
+            // used to do via the anonymous-FunctionExpression arm.
+            PropVal::Func(f) => {
+                let n = match &f.name {
+                    Some(own) => own.to_string(),
+                    None => key.clone(),
+                };
+                let (id, has_up) = self.compile_func_expr(Some(n), f)?;
+                self.emit_make_callable(vtmp, id, has_up);
+                vtmp
+            }
+        };
+        self.cx.obj_method_super = false;
+        // A shorthand method `{ m(){}, *g(){}, async a(){} }` is non-constructable;
+        // its toString is the whole `m(){}`, which `Function.span` already covers
+        // (see the NOTE in `object_accessor`). A regular `k: function(){}` keeps
+        // the value's own span and is constructable.
+        if is_method {
+            let fid = self.cx.functions.len() - 1;
+            self.cx.functions[fid].non_constructable = true; // concise method
+        }
+        // `{ __proto__: v }` sets the prototype — a real [[Set]]/proto-setter;
+        // every other key is CreateDataProperty, which must ignore an
+        // inherited accessor / non-writable prop.
+        if is_proto {
+            self.emit(Instr::SetProp { obj, name, val: v });
+        } else if all_appendable {
+            self.emit(Instr::AppendDataProp { obj, name, val: v });
+        } else {
+            self.emit(Instr::InitDataProp { obj, name, val: v });
+        }
+        if is_method {
+            self.emit(Instr::SetHomeObject { method: v, home: obj });
+        }
+        Ok(())
     }
 
     pub(crate) fn load_number(&mut self, dst: Reg, n: f64) {
@@ -1235,29 +1363,35 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    pub(crate) fn binary(&mut self, b: &ox::BinaryExpression, dst: Reg) -> R<Reg> {
-        use ox::BinaryOperator as Op;
+    pub(crate) fn binary(
+        &mut self,
+        op: ast::BinaryOp,
+        left: &ast::Expr,
+        right: &ast::Expr,
+        dst: Reg,
+    ) -> R<Reg> {
+        use ast::BinaryOp as Op;
         // `x instanceof Ctor`: only built-in constructors are recognised (the
         // engine has no user prototype chain). Decided structurally in the VM.
-        if matches!(b.operator, Op::Instanceof) {
+        if matches!(op, Op::Instanceof) {
             // A built-in constructor name → structural InstanceOf; anything else
             // (a user class value) → runtime InstanceOfDyn against its class link.
-            if let ox::Expression::Identifier(id) = &b.right {
-                if let Some(ctor) = InstanceCtor::from_name(&id.name) {
-                    let val = self.expr(&b.left)?;
+            if let ast::Expr::Ident(id) = right {
+                if let Some(ctor) = InstanceCtor::from_name(id) {
+                    let val = self.expr(left)?;
                     self.emit(Instr::InstanceOf { dst, val, ctor });
                     return Ok(dst);
                 }
             }
-            let val = self.expr(&b.left)?;
-            let ctor = self.expr(&b.right)?;
+            let val = self.expr(left)?;
+            let ctor = self.expr(right)?;
             self.emit(Instr::InstanceOfDyn { dst, val, ctor });
             return Ok(dst);
         }
         // `key in obj`.
-        if matches!(b.operator, Op::In) {
-            let key = self.expr(&b.left)?;
-            let obj = self.expr(&b.right)?;
+        if matches!(op, Op::In) {
+            let key = self.expr(left)?;
+            let obj = self.expr(right)?;
             self.emit(Instr::HasProp { dst, key, obj, brand: false });
             return Ok(dst);
         }
@@ -1269,66 +1403,74 @@ impl<'a> FnCompiler<'a> {
         // numeric literal or another arithmetic expression we just produced a
         // number from. When unsure, fall through to the generic `Add`, which
         // handles string concatenation correctly.
-        if let ox::Expression::NumericLiteral(n) = &b.right {
-            let imm_ok = n.value.fract() == 0.0
-                && n.value >= i32::MIN as f64
-                && n.value <= i32::MAX as f64;
+        if let ast::Expr::Num(n) = right {
+            let imm_ok = n.fract() == 0.0 && *n >= i32::MIN as f64 && *n <= i32::MAX as f64;
             // `x - 0` must stay a real Sub: AddInt would compute `x + 0`, and
             // IEEE `-0.0 + 0.0` is `+0.0` while `-0.0 - 0.0` is `-0.0`.
             // (`x + 0` is the same operation either way, so it stays eligible.)
-            let eligible = (matches!(b.operator, Op::Subtraction) && n.value != 0.0)
-                || (matches!(b.operator, Op::Addition) && is_numeric_expr(&b.left));
+            let eligible = (matches!(op, Op::Sub) && *n != 0.0)
+                || (matches!(op, Op::Add) && is_numeric_expr(left));
             if imm_ok && eligible {
-                let a = self.expr(&b.left)?;
-                let mut imm = n.value as i32;
-                if matches!(b.operator, Op::Subtraction) {
+                let a = self.expr(left)?;
+                let mut imm = *n as i32;
+                if matches!(op, Op::Sub) {
                     imm = -imm;
                 }
                 self.emit(Instr::AddInt { dst, a, imm, upd: false });
                 return Ok(dst);
             }
         }
-        let a = self.expr(&b.left)?;
-        let r = self.expr(&b.right)?;
-        let instr = match b.operator {
-            Op::Addition => Instr::Add { dst, a, b: r },
-            Op::Subtraction => Instr::Sub { dst, a, b: r },
-            Op::Multiplication => Instr::Mul { dst, a, b: r },
-            Op::Division => Instr::Div { dst, a, b: r },
-            Op::Remainder => Instr::Mod { dst, a, b: r },
-            Op::LessThan => Instr::Lt { dst, a, b: r },
-            Op::LessEqualThan => Instr::Le { dst, a, b: r },
-            Op::GreaterThan => Instr::Gt { dst, a, b: r },
-            Op::GreaterEqualThan => Instr::Ge { dst, a, b: r },
-            Op::StrictEquality => Instr::Eq { dst, a, b: r },
-            Op::StrictInequality => Instr::Ne { dst, a, b: r },
-            Op::Equality => Instr::LooseEq { dst, a, b: r },
-            Op::Inequality => Instr::LooseNe { dst, a, b: r },
-            Op::BitwiseAnd => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::And },
-            Op::BitwiseOR => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Or },
-            Op::BitwiseXOR => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Xor },
-            Op::ShiftLeft => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Shl },
-            Op::ShiftRight => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Shr },
-            Op::ShiftRightZeroFill => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Ushr },
-            Op::Exponential => Instr::Pow { dst, a, b: r },
-            _ => return Err("unsupported binary operator (zipp-vm v1)".into()),
+        let a = self.expr(left)?;
+        let r = self.expr(right)?;
+        let instr = match op {
+            Op::Add => Instr::Add { dst, a, b: r },
+            Op::Sub => Instr::Sub { dst, a, b: r },
+            Op::Mul => Instr::Mul { dst, a, b: r },
+            Op::Div => Instr::Div { dst, a, b: r },
+            Op::Rem => Instr::Mod { dst, a, b: r },
+            Op::Lt => Instr::Lt { dst, a, b: r },
+            Op::LtEq => Instr::Le { dst, a, b: r },
+            Op::Gt => Instr::Gt { dst, a, b: r },
+            Op::GtEq => Instr::Ge { dst, a, b: r },
+            Op::StrictEq => Instr::Eq { dst, a, b: r },
+            Op::StrictNotEq => Instr::Ne { dst, a, b: r },
+            Op::Eq => Instr::LooseEq { dst, a, b: r },
+            Op::NotEq => Instr::LooseNe { dst, a, b: r },
+            Op::BitAnd => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::And },
+            Op::BitOr => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Or },
+            Op::BitXor => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Xor },
+            Op::Shl => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Shl },
+            Op::Shr => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Shr },
+            Op::UShr => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Ushr },
+            Op::Exp => Instr::Pow { dst, a, b: r },
+            // Both are handled above; kept explicit so a new operator breaks the
+            // build instead of falling into a catch-all.
+            Op::In | Op::Instanceof => {
+                return Err("unsupported binary operator (zipp-vm v1)".into())
+            }
         };
         self.emit(instr);
         Ok(dst)
     }
 
-    pub(crate) fn logical(&mut self, l: &ox::LogicalExpression, dst: Reg) -> R<Reg> {
-        use ox::LogicalOperator as Op;
+    pub(crate) fn logical(
+        &mut self,
+        op: ast::LogicalOp,
+        left: &ast::Expr,
+        right: &ast::Expr,
+        dst: Reg,
+    ) -> R<Reg> {
+        use ast::LogicalOp as Op;
         // `a && b`: eval a into dst; if falsy, short-circuit; else eval b.
-        let _a = self.expr_into(&l.left, dst)?;
+        let _a = self.expr_into(left, dst)?;
         if _a != dst {
             self.emit(Instr::Move { dst, src: _a });
         }
-        match l.operator {
+        match op {
             Op::And => {
                 let j = self.here();
                 self.emit(Instr::JumpIfFalse { cond: dst, target: 0 });
-                let b = self.expr_into(&l.right, dst)?;
+                let b = self.expr_into(right, dst)?;
                 if b != dst {
                     self.emit(Instr::Move { dst, src: b });
                 }
@@ -1338,7 +1480,7 @@ impl<'a> FnCompiler<'a> {
             Op::Or => {
                 let j = self.here();
                 self.emit(Instr::JumpIfTrue { cond: dst, target: 0 });
-                let b = self.expr_into(&l.right, dst)?;
+                let b = self.expr_into(right, dst)?;
                 if b != dst {
                     self.emit(Instr::Move { dst, src: b });
                 }
@@ -1354,7 +1496,7 @@ impl<'a> FnCompiler<'a> {
                 let j = self.here();
                 self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 }); // non-nullish → keep dst
                 self.next_reg = save; // the nullish-test temps are dead now
-                let b = self.expr_into(&l.right, dst)?;
+                let b = self.expr_into(right, dst)?;
                 if b != dst {
                     self.emit(Instr::Move { dst, src: b });
                 }
@@ -1365,38 +1507,36 @@ impl<'a> FnCompiler<'a> {
         Ok(dst)
     }
 
-    pub(crate) fn unary(&mut self, u: &ox::UnaryExpression, dst: Reg) -> R<Reg> {
-        use ox::UnaryOperator as Op;
-        match u.operator {
-            Op::UnaryNegation => {
-                let a = self.expr(&u.argument)?;
+    pub(crate) fn unary(&mut self, op: ast::UnaryOp, arg: &ast::Expr, dst: Reg) -> R<Reg> {
+        use ast::UnaryOp as Op;
+        match op {
+            Op::Minus => {
+                let a = self.expr(arg)?;
                 self.emit(Instr::Neg { dst, a });
                 Ok(dst)
             }
-            Op::UnaryPlus => {
-                let a = self.expr(&u.argument)?;
+            Op::Plus => {
+                let a = self.expr(arg)?;
                 self.emit(Instr::ToNum { dst, a });
                 Ok(dst)
             }
-            Op::LogicalNot => {
-                let a = self.expr(&u.argument)?;
+            Op::Not => {
+                let a = self.expr(arg)?;
                 self.emit(Instr::Not { dst, a });
                 Ok(dst)
             }
             Op::Typeof => {
                 // `typeof <unbound identifier>` must yield "undefined", NOT throw
-                // a ReferenceError — and this holds when the identifier is wrapped in
-                // parentheses (`typeof (f)`), so peel them first. A bare identifier
-                // that resolves to a global is read with the non-throwing variant so
-                // the never-declared sentinel degrades to undefined.
+                // a ReferenceError — and this holds when the identifier is wrapped
+                // in parentheses (`typeof (f)`), which is no longer a node, so the
+                // operand IS the identifier. A bare identifier that resolves to a
+                // global is read with the non-throwing variant so the
+                // never-declared sentinel degrades to undefined.
                 // (`undefined`/`NaN`/`Infinity` are literals, handled by `expr`.)
-                let mut arg = &u.argument;
-                while let ox::Expression::ParenthesizedExpression(p) = arg {
-                    arg = &p.expression;
-                }
-                if let ox::Expression::Identifier(id) = arg {
-                    if !matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
-                        if let Binding::Global(idx) = self.resolve(id.name.as_str()) {
+                if let ast::Expr::Ident(id) = arg {
+                    let n: &str = id;
+                    if !matches!(n, "undefined" | "NaN" | "Infinity") {
+                        if let Binding::Global(idx) = self.resolve(n) {
                             // A DECLARED top-level lexical still observes its
                             // TDZ through typeof (a ReferenceError) — only a
                             // name the compiler never saw declared degrades to
@@ -1419,77 +1559,88 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::TypeOf { dst, a });
                 Ok(dst)
             }
-            Op::BitwiseNot => {
-                let a = self.expr(&u.argument)?;
+            Op::BitNot => {
+                let a = self.expr(arg)?;
                 self.emit(Instr::BitNot { dst, a });
                 Ok(dst)
             }
             Op::Void => {
                 // Evaluate the operand for side effects; the value is `undefined`.
-                let _ = self.expr(&u.argument)?;
+                let _ = self.expr(arg)?;
                 self.emit(Instr::LoadUndefined { dst });
                 Ok(dst)
             }
-            Op::Delete => self.delete_expr(&u.argument, dst),
+            Op::Delete => self.delete_expr(arg, dst),
         }
     }
 
     /// `delete <ref>` — remove a property (`obj.x` / `obj[k]`) and yield the
     /// boolean result. A non-reference operand (or a bare identifier) evaluates
     /// for side effects and yields `true` (matching sloppy-mode `delete x`).
-    pub(crate) fn delete_expr(&mut self, arg: &ox::Expression, dst: Reg) -> R<Reg> {
+    pub(crate) fn delete_expr(&mut self, arg: &ast::Expr, dst: Reg) -> R<Reg> {
         match arg {
-            ox::Expression::StaticMemberExpression(m) => {
-                // `delete super.x` is a runtime ReferenceError (a super reference has
-                // no [[Delete]]). Not a SyntaxError, so it's thrown when evaluated.
-                if matches!(&m.object, ox::Expression::Super(_)) {
-                    let e = self.alloc_reg();
-                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
-                    self.emit(Instr::Throw { src: e });
-                    return Ok(dst);
+            ast::Expr::Member(m) => match &m.prop {
+                ast::MemberProp::Ident(prop) => {
+                    // `delete super.x` is a runtime ReferenceError (a super reference has
+                    // no [[Delete]]). Not a SyntaxError, so it's thrown when evaluated.
+                    if matches!(&m.object, ast::Expr::Super) {
+                        let e = self.alloc_reg();
+                        self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+                        self.emit(Instr::Throw { src: e });
+                        return Ok(dst);
+                    }
+                    let obj = self.expr(&m.object)?;
+                    let name = self.string_name(prop);
+                    let strict = self.cx.in_strict;
+                    self.emit(Instr::DeleteProp { dst, obj, name, strict });
+                    Ok(dst)
                 }
-                let obj = self.expr(&m.object)?;
-                let name = self.string_name(&m.property.name);
-                let strict = self.cx.in_strict;
-                self.emit(Instr::DeleteProp { dst, obj, name, strict });
-                Ok(dst)
-            }
-            ox::Expression::ComputedMemberExpression(m) => {
-                // `delete super[expr]`: SuperProperty evaluation does
-                // GetThisBinding BEFORE the key expression — in a derived ctor
-                // before super() that ReferenceError fires FIRST and `expr`
-                // never runs. Otherwise evaluate `expr` (side effects +
-                // ToPropertyKey), then throw a ReferenceError — a super
-                // reference has no delete.
-                if matches!(&m.object, ox::Expression::Super(_)) {
-                    self.this_check();
-                    let _ = self.expr(&m.expression)?;
-                    let e = self.alloc_reg();
-                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
-                    self.emit(Instr::Throw { src: e });
-                    return Ok(dst);
+                ast::MemberProp::Computed(ke) => {
+                    // `delete super[expr]`: SuperProperty evaluation does
+                    // GetThisBinding BEFORE the key expression — in a derived ctor
+                    // before super() that ReferenceError fires FIRST and `expr`
+                    // never runs. Otherwise evaluate `expr` (side effects +
+                    // ToPropertyKey), then throw a ReferenceError — a super
+                    // reference has no delete.
+                    if matches!(&m.object, ast::Expr::Super) {
+                        self.this_check();
+                        let _ = self.expr(ke)?;
+                        let e = self.alloc_reg();
+                        self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+                        self.emit(Instr::Throw { src: e });
+                        return Ok(dst);
+                    }
+                    let obj = self.expr(&m.object)?;
+                    let strict = self.cx.in_strict;
+                    // Fuse `delete obj[<plain string literal> + e]` → DeleteIndexConcat
+                    // (no throwaway concat-key allocation; see GetIndexConcat).
+                    if let Some((name, rhs)) = concat_key_literal_prefix(ke) {
+                        let nidx = self.string_name(name);
+                        let key = self.expr(rhs)?;
+                        self.emit(Instr::DeleteIndexConcat { dst, obj, name: nidx, key, strict });
+                        return Ok(dst);
+                    }
+                    let key = self.expr(ke)?;
+                    self.emit(Instr::DeleteIndex { dst, obj, key, strict });
+                    Ok(dst)
                 }
-                let obj = self.expr(&m.object)?;
-                let strict = self.cx.in_strict;
-                // Fuse `delete obj[<plain string literal> + e]` → DeleteIndexConcat
-                // (no throwaway concat-key allocation; see GetIndexConcat).
-                if let Some((name, rhs)) = concat_key_literal_prefix(&m.expression) {
-                    let nidx = self.string_name(name);
-                    let key = self.expr(rhs)?;
-                    self.emit(Instr::DeleteIndexConcat { dst, obj, name: nidx, key, strict });
-                    return Ok(dst);
+                // `delete obj.#x` is a SyntaxError the parser rejects; if one ever
+                // reaches here it takes the generic-operand path below (evaluate
+                // for side effects, yield `true`), exactly as it did when a
+                // private field was its own node this match did not name.
+                ast::MemberProp::Private(_) => {
+                    let _ = self.expr(arg)?;
+                    self.emit(Instr::LoadBool { dst, val: true });
+                    Ok(dst)
                 }
-                let key = self.expr(&m.expression)?;
-                self.emit(Instr::DeleteIndex { dst, obj, key, strict });
-                Ok(dst)
-            }
-            ox::Expression::ParenthesizedExpression(p) => self.delete_expr(&p.expression, dst),
+            },
             // `delete <identifier>`: in strict mode an early SyntaxError; in sloppy
             // mode deleting a resolvable binding (var/let/const/param/function or a
             // declared global) yields `false` (non-configurable), while an
             // unresolvable name is a no-op that yields `true` — and must NOT be
             // evaluated (evaluating an undeclared name would throw ReferenceError).
-            ox::Expression::Identifier(id) => {
+            ast::Expr::Ident(id) => {
+                let n: &str = id;
                 if self.cx.in_strict {
                     return Err(
                         "SyntaxError: Delete of an unqualified identifier in strict mode".into(),
@@ -1498,9 +1649,9 @@ impl<'a> FnCompiler<'a> {
                 // Inside a `with`, `delete name` removes the binding from the
                 // innermost with-object that has it (yielding its delete result),
                 // else falls through to the static-binding delete semantics below.
-                let with_objs = self.with_obj_regs(id.name.as_str());
+                let with_objs = self.with_obj_regs(n);
                 if !with_objs.is_empty() {
-                    return Ok(self.delete_with(id.name.as_str(), &with_objs, dst));
+                    return Ok(self.delete_with(n, &with_objs, dst));
                 }
                 // A binding is non-configurable — `delete` yields `false` — when it is
                 // a local (param/`var`/`let`/`const`/function) or a DECLARED global
@@ -1511,11 +1662,11 @@ impl<'a> FnCompiler<'a> {
                 // `NaN`/`Infinity`/`undefined` are the only non-configurable builtin
                 // global properties; they're not tracked as compiler globals, so
                 // check them by name (a local of that name still resolves below).
-                if matches!(id.name.as_str(), "NaN" | "Infinity" | "undefined") {
+                if matches!(n, "NaN" | "Infinity" | "undefined") {
                     self.emit(Instr::LoadBool { dst, val: false });
                     return Ok(dst);
                 }
-                match self.resolve_existing(&id.name) {
+                match self.resolve_existing(n) {
                     Some(Binding::Local(_))
                     | Some(Binding::LocalCell(_))
                     | Some(Binding::Upvalue(_))
@@ -1538,7 +1689,7 @@ impl<'a> FnCompiler<'a> {
                         // `delete x` whose `x` only exists in the outer
                         // program. A never-declared name's fresh slot is
                         // UNINITIALIZED, so DeleteGlobal is a true no-op.
-                        let slot = self.cx.global_slot(&id.name) as u32;
+                        let slot = self.cx.global_slot(n) as u32;
                         self.emit(Instr::DeleteGlobal { dst, slot });
                     }
                 }
@@ -1552,127 +1703,142 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    pub(crate) fn update(&mut self, u: &ox::UpdateExpression, dst: Reg) -> R<Reg> {
-        let delta = match u.operator {
-            ox::UpdateOperator::Increment => 1,
-            ox::UpdateOperator::Decrement => -1,
+    pub(crate) fn update(
+        &mut self,
+        op: ast::UpdateOp,
+        prefix: bool,
+        target: &ast::Target,
+        dst: Reg,
+    ) -> R<Reg> {
+        let delta = match op {
+            ast::UpdateOp::Inc => 1,
+            ast::UpdateOp::Dec => -1,
         };
         // `obj.x++` / `arr[i]--` etc — read the member, yield old (postfix) or
         // new (prefix), write the incremented value back to the same slot.
-        match &u.argument {
-            // `super.x++` / `--super.x` — read via the super-get sequence,
-            // coerce/step, write back via the super-set sequence.
-            ox::SimpleAssignmentTarget::StaticMemberExpression(m)
-                if matches!(&m.object, ox::Expression::Super(_)) =>
-            {
-                let pid = self.super_class;
-                if pid.is_none() && !self.super_home_obj {
-                    return Err("`super.x++` is only valid in a method".into());
+        if let ast::Target::Member(m) = target {
+            match (&m.object, &m.prop) {
+                // `super.x++` / `--super.x` — read via the super-get sequence,
+                // coerce/step, write back via the super-set sequence.
+                (ast::Expr::Super, ast::MemberProp::Ident(prop)) => {
+                    let pid = self.super_class;
+                    if pid.is_none() && !self.super_home_obj {
+                        return Err("`super.x++` is only valid in a method".into());
+                    }
+                    self.this_check();
+                    let name = self.string_name(prop);
+                    let cur = self.temp();
+                    match pid {
+                        Some(p) => self.emit(Instr::SuperGet { dst: cur, home_class_id: p, name }),
+                        None => self.emit(Instr::SuperGetObj { dst: cur, name }),
+                    }
+                    let oldnum = self.temp();
+                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    let nw = self.temp();
+                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
+                    match pid {
+                        Some(p) => self.emit(Instr::SuperSet { home_class_id: p, name, val: nw }),
+                        None => self.emit(Instr::SuperSetObj { name, val: nw }),
+                    }
+                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    return Ok(dst);
                 }
-                self.this_check();
-                let name = self.string_name(m.property.name.as_str());
-                let cur = self.temp();
-                match pid {
-                    Some(p) => self.emit(Instr::SuperGet { dst: cur, home_class_id: p, name }),
-                    None => self.emit(Instr::SuperGetObj { dst: cur, name }),
+                // `super[k]++` / `--super[k]` — SuperProperty evaluation checks the
+                // this-TDZ BEFORE evaluating the key Expression
+                // (prop-expr-uninitialized-this-putvalue-increment), and the
+                // computed super ops capture GetSuperBase before ToPropertyKey.
+                (ast::Expr::Super, ast::MemberProp::Computed(ke)) => {
+                    let pid = self.super_class;
+                    if pid.is_none() && !self.super_home_obj {
+                        return Err("`super[k]++` is only valid in a method".into());
+                    }
+                    self.this_check();
+                    let key = self.expr(ke)?;
+                    let key_reg = self.alloc_reg();
+                    if key != key_reg {
+                        self.emit(Instr::Move { dst: key_reg, src: key });
+                    }
+                    let cur = self.temp();
+                    match pid {
+                        Some(p) => self.emit(Instr::SuperGetComputed { dst: cur, home_class_id: p, key: key_reg }),
+                        None => self.emit(Instr::SuperGetObjComputed { dst: cur, key: key_reg }),
+                    }
+                    let oldnum = self.temp();
+                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    let nw = self.temp();
+                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
+                    match pid {
+                        Some(p) => self.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: nw }),
+                        None => self.emit(Instr::SuperSetObjComputed { key: key_reg, val: nw }),
+                    }
+                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    return Ok(dst);
                 }
-                let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
-                let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                match pid {
-                    Some(p) => self.emit(Instr::SuperSet { home_class_id: p, name, val: nw }),
-                    None => self.emit(Instr::SuperSetObj { name, val: nw }),
+                (_, ast::MemberProp::Ident(prop)) => {
+                    let obj = self.expr(&m.object)?;
+                    let name = self.string_name(prop);
+                    let cur = self.temp();
+                    self.emit(Instr::GetProp { dst: cur, obj, name });
+                    // ToNumeric(old) ONCE (AddInt imm:0), derive the new value from it,
+                    // and yield the COERCED old (postfix) — `x++` returns a number, not
+                    // the raw operand. Single coercion = one valueOf for an object operand.
+                    let oldnum = self.temp();
+                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    let nw = self.temp();
+                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
+                    self.emit(Instr::SetProp { obj, name, val: nw });
+                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    return Ok(dst);
                 }
-                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
-                return Ok(dst);
+                (_, ast::MemberProp::Computed(ke)) => {
+                    let obj = self.expr(&m.object)?;
+                    let key = self.expr(ke)?;
+                    // `o[k]++` reads then writes `o[k]` — coerce the key ToPropertyKey
+                    // ONCE and reuse it (its toString/valueOf must not run twice).
+                    let keyk = self.temp();
+                    self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
+                    let cur = self.temp();
+                    self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
+                    let oldnum = self.temp();
+                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    let nw = self.temp();
+                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
+                    self.emit(Instr::SetIndex { obj, key: keyk, val: nw });
+                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    return Ok(dst);
+                }
+                // `obj.#x++` — like a static member, keyed "#x".
+                (_, ast::MemberProp::Private(prop)) => {
+                    self.check_private_declared(prop)?;
+                    let obj = self.expr(&m.object)?;
+                    let name = self.string_name(&private_key(prop));
+                    let cur = self.temp();
+                    self.emit(Instr::GetProp { dst: cur, obj, name });
+                    let oldnum = self.temp();
+                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    let nw = self.temp();
+                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
+                    self.emit(Instr::SetProp { obj, name, val: nw });
+                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    return Ok(dst);
+                }
             }
-            // `super[k]++` / `--super[k]` — SuperProperty evaluation checks the
-            // this-TDZ BEFORE evaluating the key Expression
-            // (prop-expr-uninitialized-this-putvalue-increment), and the
-            // computed super ops capture GetSuperBase before ToPropertyKey.
-            ox::SimpleAssignmentTarget::ComputedMemberExpression(m)
-                if matches!(&m.object, ox::Expression::Super(_)) =>
-            {
-                let pid = self.super_class;
-                if pid.is_none() && !self.super_home_obj {
-                    return Err("`super[k]++` is only valid in a method".into());
-                }
-                self.this_check();
-                let key = self.expr(&m.expression)?;
-                let key_reg = self.alloc_reg();
-                if key != key_reg {
-                    self.emit(Instr::Move { dst: key_reg, src: key });
-                }
-                let cur = self.temp();
-                match pid {
-                    Some(p) => self.emit(Instr::SuperGetComputed { dst: cur, home_class_id: p, key: key_reg }),
-                    None => self.emit(Instr::SuperGetObjComputed { dst: cur, key: key_reg }),
-                }
-                let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
-                let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                match pid {
-                    Some(p) => self.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: nw }),
-                    None => self.emit(Instr::SuperSetObjComputed { key: key_reg, val: nw }),
-                }
-                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
-                return Ok(dst);
-            }
-            ox::SimpleAssignmentTarget::StaticMemberExpression(m) => {
-                let obj = self.expr(&m.object)?;
-                let name = self.string_name(m.property.name.as_str());
-                let cur = self.temp();
-                self.emit(Instr::GetProp { dst: cur, obj, name });
-                // ToNumeric(old) ONCE (AddInt imm:0), derive the new value from it,
-                // and yield the COERCED old (postfix) — `x++` returns a number, not
-                // the raw operand. Single coercion = one valueOf for an object operand.
-                let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
-                let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                self.emit(Instr::SetProp { obj, name, val: nw });
-                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
-                return Ok(dst);
-            }
-            ox::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
-                let obj = self.expr(&m.object)?;
-                let key = self.expr(&m.expression)?;
-                // `o[k]++` reads then writes `o[k]` — coerce the key ToPropertyKey
-                // ONCE and reuse it (its toString/valueOf must not run twice).
-                let keyk = self.temp();
-                self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
-                let cur = self.temp();
-                self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
-                let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
-                let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                self.emit(Instr::SetIndex { obj, key: keyk, val: nw });
-                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
-                return Ok(dst);
-            }
-            // `obj.#x++` — like a static member, keyed "#x".
-            ox::SimpleAssignmentTarget::PrivateFieldExpression(p) => {
-                self.check_private_declared(&p.field.name)?;
-                let obj = self.expr(&p.object)?;
-                let name = self.string_name(&private_key(&p.field.name));
-                let cur = self.temp();
-                self.emit(Instr::GetProp { dst: cur, obj, name });
-                let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
-                let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                self.emit(Instr::SetProp { obj, name, val: nw });
-                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
-                return Ok(dst);
-            }
-            _ => {}
         }
         // `x++` / `++x` / `x--` / `--x` on a simple identifier.
-        let name = match &u.argument {
-            ox::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
+        let name = match target {
+            ast::Target::Ident { name, .. } => name.to_string(),
+            // Annex B: `f()++` is a SIMPLE assignment target in sloppy code, so
+            // it parses and throws a ReferenceError when EVALUATED — after the
+            // call has run. NOTE: unreachable through the oxc bridge (oxc cannot
+            // build a call target at all), so this changes no existing bytecode.
+            ast::Target::Call(c) => {
+                let t = self.temp();
+                let _ = self.call(c, t)?;
+                let e = self.alloc_reg();
+                self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+                self.emit(Instr::Throw { src: e });
+                return Ok(dst);
+            }
             _ => return Err("update on this target not in zipp-vm v1".into()),
         };
         // Strict mode: `eval++` / `--arguments` is an early SyntaxError.
@@ -1685,7 +1851,7 @@ impl<'a> FnCompiler<'a> {
             // getter runs once), then read and write through that target.
             let (found, tgt) = self.emit_with_probe(&name, &with_objs);
             self.emit_with_rmw_read(&name, found, tgt, dst);
-            if u.prefix {
+            if prefix {
                 self.emit(Instr::AddInt { dst, a: dst, imm: delta, upd: true });
                 self.emit_with_rmw_write(&name, found, tgt, dst);
                 return Ok(dst); // dst holds the new value
@@ -1703,7 +1869,7 @@ impl<'a> FnCompiler<'a> {
         if let Binding::Local(r) = binding {
             if !self.const_regs.contains(&r) {
                 // Plain mutable register local: mutate in place.
-                if u.prefix {
+                if prefix {
                     self.emit(Instr::AddInt { dst: r, a: r, imm: delta, upd: true });
                     if r != dst {
                         self.emit(Instr::Move { dst, src: r });
@@ -1719,7 +1885,7 @@ impl<'a> FnCompiler<'a> {
         // Cell / upvalue / global / const-local: read into `dst`, compute, store
         // back (store_binding throws for a const after the read + increment).
         let cur = self.load_binding(&binding, dst); // == dst
-        if u.prefix {
+        if prefix {
             self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta, upd: true });
             self.store_binding(&binding, cur);
             Ok(dst) // dst holds the new value

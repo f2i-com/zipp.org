@@ -138,7 +138,7 @@ fn compile_program_source(src: &str) -> Result<Program, String> {
         }
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
-    crate::compile::compile_program(&ret.program, src)
+    crate::compile::compile_program_oxc(&ret.program, src)
 }
 
 impl ScriptState {
