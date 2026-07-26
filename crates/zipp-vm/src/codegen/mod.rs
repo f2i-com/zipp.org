@@ -232,6 +232,17 @@ pub struct LeafInlinePlan {
     pub reg_window: u16,
     /// Callee register-window size (validated to fit the reserved capacity).
     pub callee_reg_count: u16,
+    /// The Value bits to write into the callee window's `this` (reg 0).
+    ///
+    /// The inline site is a plain `Call`, so `thisArg` is undefined — and
+    /// `OrdinaryCallBindThis` then does one of two things depending on the
+    /// CALLEE: a strict function keeps `undefined`, a sloppy one substitutes its
+    /// realm's global object. Baking the answer here is what lets an ordinary
+    /// sloppy `function f(a,b){ return a+b; }` inline at all. Hard-coding
+    /// `undefined` meant declining every non-strict callee, which measured 26.7ns
+    /// per call against 3.6ns for the equivalent method — the single commonest
+    /// call shape in the language taking the slowest path.
+    pub this_bits: u64,
     /// Callee formal parameter count (args 0..min(argc,param_count) are copied
     /// into scratch regs `reg_window+1 ..` ; reg `reg_window+0` is `this`).
     pub param_count: u16,

@@ -292,22 +292,34 @@ impl<'p> Vm<'p> {
                     upvals.insert(i, Value::heap(self.closure_upvalue(cidx, i)).bits());
                 }
             }
-            // The inline emitter forces `this = undefined` for the callee window.
-            // That is ONLY correct for a STRICT, NON-ARROW leaf (its `this` is
-            // genuinely undefined when called as `f(args)`). An arrow captures
-            // `this` lexically (stored in the Closure, NOT undefined); a sloppy
-            // function substitutes the global object (OrdinaryCallBindThis). Both
-            // would observe the wrong `this` if inlined — decline them.
-            if callee.lexical_this || !callee.is_strict {
+            // What `this` is in the callee window. The site is a plain `Call`,
+            // so `thisArg` is undefined and `OrdinaryCallBindThis` decides:
+            // undefined for a STRICT callee, the realm's global object for a
+            // SLOPPY one. Both are compile-time constants, so both inline.
+            //
+            // An ARROW is the one shape that cannot: its `this` is captured
+            // lexically and lives in the Closure, so it is neither of those two
+            // values and there is nothing to bake.
+            if callee.lexical_this {
                 if log {
                     eprintln!(
-                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
-                         (lexical_this={} strict={})",
-                        callee.lexical_this, callee.is_strict
+                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (arrow — \
+                         lexical this)"
                     );
                 }
                 continue;
             }
+            let this_bits = if callee.is_strict {
+                Value::UNDEFINED.bits()
+            } else if self.global_this != 0 {
+                Value::heap(self.global_this).bits()
+            } else {
+                // No realm global yet (setup); nothing sound to bake.
+                if log {
+                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (no realm global)");
+                }
+                continue;
+            };
             // The carved scratch window must hold the callee's whole register
             // file; the headroom (vs MAX_FRAMES recursion) is checked at the
             // region entry by `jit_regs_fits`.
@@ -382,6 +394,7 @@ impl<'p> Vm<'p> {
                 LeafInlinePlan {
                     callee_bits,
                     callee_ver,
+                    this_bits,
                     reg_window,
                     callee_reg_count: callee.reg_count + extra_regs,
                     param_count: callee.param_count,

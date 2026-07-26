@@ -1316,6 +1316,49 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B35 — Sloppy leaf calls were declined for a `this` that is a constant: 7.7x
+
+`plain function f(a,b){ return a+b; }` called in a hot loop cost **26.7ns**
+against the equivalent object method's **3.6ns** — the commonest call shape in
+the language taking the slowest path, and 8x slower than the shape everyone
+assumes is more expensive. `ZIPP_JITLOG=1` names it in one line:
+
+```
+[leaf] fn0@16 callee fn1 DECLINE (lexical_this=false strict=false)
+```
+
+The leaf-inline emitter hard-coded `this = undefined` into the callee window,
+which is only right for a strict callee, so the planner declined every SLOPPY
+one. But the site is a plain `Call`, so `thisArg` is undefined and
+`OrdinaryCallBindThis` has exactly two answers — `undefined` for a strict
+callee, the realm's global object for a sloppy one — and BOTH are compile-time
+constants. The plan now carries `this_bits` and the emitter writes it. Only an
+ARROW still declines: its `this` is captured lexically and is neither constant.
+
+| shape | before | after | node |
+|---|---|---|---|
+| `f(i,1)` plain function | 26.65ns | **3.45ns** | 0.55 |
+| `clo(1)` closure | 32.75ns | **5.05ns** | 0.65 |
+| `obj.m(i,1)` | 3.65ns | 3.50ns | 0.55 |
+
+Verified against node: sloppy `this === globalThis`, strict `this === undefined`,
+arrow `this` lexical, and a body that READS `this` — all identical, under
+`ZIPP_GC_STRESS=1` too. test262 938 failures, no regressions.
+
+**Suite effect: +0.1%, i.e. nothing — and the reason is worth writing down.
+All ten benches in `bench/real/` open with `"use strict"`.** Their callees were
+already strict, so they were already inlining; there was no decline to remove.
+The fix is worth 7.7x to sloppy code, which is most of the real world and every
+CommonJS bundle that never opted in, and 0% to this suite.
+
+Two things follow. First, the suite systematically under-samples sloppy-mode
+behaviour — worth fixing by adding a non-strict bench rather than by editing the
+existing ten (which would break every historical ratio). Second, and more
+usefully: with the sloppy decline gone, the remaining leaf-inline misses are
+`NOT-MONO (no single Callee IC way)` and `DECLINE (not leaf-eligible)`, which
+markdown-render hits 22 and 20 times respectively. Those are the next questions,
+and they are about eligibility, not about `this`.
+
 ### B34 — `hasOwnProperty(i)` spelled the index; `"02"` was an array index
 
 `Object.prototype.hasOwnProperty` ran `to_property_key` (which allocates a

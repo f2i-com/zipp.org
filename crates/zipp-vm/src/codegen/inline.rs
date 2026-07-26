@@ -149,7 +149,7 @@ pub(crate) fn emit_inline_leaf_call(
         // beyond `param_count`/`argc` are ignored by a leaf body (no
         // `arguments`); params beyond `argc` stay undefined (the slot is zeroed
         // here so a stale scratch value can't leak in).
-        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; mov rax, QWORD plan.this_bits as i64
         ; mov [rbx + dreg(w)], rax
     );
     let n = argc.min(plan.param_count);
