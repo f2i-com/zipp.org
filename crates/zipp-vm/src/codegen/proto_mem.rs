@@ -16,12 +16,14 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         return false;
     }
     if proto.is_generator || proto.is_async {
+        if std::env::var_os("ZIPP_JITLOG").is_some() { eprintln!("[tierC-reject] generator/async"); }
         return false;
     }
     // A rest parameter's array / the `arguments` object are built by the
     // interpreter's call setup, not by emitted code — the native entry would skip
     // them. Stay interpreted.
     if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
+        if std::env::var_os("ZIPP_JITLOG").is_some() { eprintln!("[tierC-reject] rest/arguments"); }
         return false;
     }
     for instr in &proto.code {
@@ -56,13 +58,24 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             | Instr::JumpIfNotLt { .. }
             | Instr::JumpIfNotLe { .. }
             | Instr::Return { .. }
-            | Instr::ReturnUndefined => {}
+            | Instr::ReturnUndefined
+            // Bitwise / `!` — self-contained register ops with the same
+            // ToInt32-or-bail contract the region path uses. Their absence here
+            // was the single most common Tier C rejection across the benches
+            // (10 functions over three of them, tied with UpvalGet), and it is
+            // silent: the whole function is blacklisted and INTERPRETED for the
+            // rest of the run, so one `h ^= h << 13` costs the entire body.
+            | Instr::Bitwise { .. }
+            | Instr::Not { .. } => {}
             // General plain call `f(args…)` — `this = undefined`.
             Instr::Call { .. } => {}
             // v1 method calls: ONLY the 1-arg `charCodeAt` (dedicated helper).
             Instr::CallMethod { name, argc, .. } => {
                 let key = proto.string_constants.get(name as usize).map(|s| s.as_str());
                 if !(argc == 1 && key == Some("charCodeAt")) {
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!("[tierC-reject] CallMethod {key:?} argc={argc}");
+                    }
                     return false;
                 }
             }
@@ -73,9 +86,19 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                 Some(c) if c.is_number() => {}
                 Some(&c) if single_char_const_bits(proto, c).is_some() => {}
                 _ if const_strs.contains_key(&idx) => {}
-                _ => return false,
+                _ => {
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!("[tierC-reject] LoadConst (non-numeric, non-interned string)");
+                    }
+                    return false;
+                }
             },
-            _ => return false,
+            ref other => {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[tierC-reject] op {other:?}");
+                }
+                return false;
+            }
         }
     }
     true
@@ -275,6 +298,89 @@ pub(crate) fn compile_proto_mem(
                 store_xmm(&mut ops, dst);
                 dynasm!(ops ; => done_ai);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::Bitwise { dst, a, b, op } => {
+                // ToInt32 both operands (Int payloads or exactly-integral
+                // i32-range doubles — see `load_toint32`; everything else
+                // bails), then the 32-bit op. x86 32-bit shifts mask the count
+                // to 5 bits — exactly JS's `& 31`. Results always fit i32
+                // (boxed Int) except `>>>`, whose u32 result may exceed
+                // i32::MAX and is then boxed as an (exact) double.
+                use crate::bytecode::BitwiseOp as B;
+                load_toint32(&mut ops, a, bail);
+                dynasm!(ops ; mov r8d, eax);             // stash a
+                load_toint32(&mut ops, b, bail);
+                dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
+                match op {
+                    B::And => {
+                        dynasm!(ops ; and eax, ecx);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Or => {
+                        dynasm!(ops ; or eax, ecx);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Xor => {
+                        dynasm!(ops ; xor eax, ecx);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Shl => {
+                        dynasm!(ops ; shl eax, cl);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Shr => {
+                        dynasm!(ops ; sar eax, cl);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Ushr => {
+                        let as_dbl = ops.new_dynamic_label();
+                        let done_u = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; shr eax, cl
+                            ; test eax, eax
+                            ; js => as_dbl                // u32 > i32::MAX → double
+                        );
+                        box_eax(&mut ops, dst);
+                        dynasm!(ops
+                            ; jmp => done_u
+                            ; => as_dbl
+                            ; mov eax, eax                // zero-extend u32 into rax
+                            ; cvtsi2sd xmm0, rax          // exact (< 2^32)
+                            ; movq rax, xmm0
+                            ; mov [rbx + dreg(dst)], rax
+                            ; => done_u
+                        );
+                    }
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::Not { dst, a } => {
+                // `!x`: a Bool flips its payload bit in place (the tag survives
+                // the xor); anything else asks the read-only `jit_truthy`
+                // helper (handles Int/double/heap incl. empty strings and
+                // [[IsHTMLDDA]]) and flips its 0/1.
+                let slow = ops.new_dynamic_label();
+                let done_n = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(a)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, (INT_TAG_HI + 1) as i32   // Bool tag 0x7FFA
+                    ; jne => slow
+                    ; xor rax, 1                          // flip the payload bit
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => done_n
+                    ; => slow
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, rax                        // value bits
+                    ; mov rax, QWORD heap.truthy as i64
+                    ; call rax
+                    ; xor rax, 1                          // !truthy
+                    ; mov r8, QWORD BOOL_TAG as i64
+                    ; or rax, r8
+                    ; mov [rbx + dreg(dst)], rax
+                    ; => done_n
+                );
             }
             Instr::Sub { dst, a, b } => {
                 dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Sub, int_hint)

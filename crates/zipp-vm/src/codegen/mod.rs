@@ -850,6 +850,10 @@ impl Jit {
         // path before blacklisting. Gated behind ZIPP_FNJIT_MEM (default-ON;
         // opt out with ZIPP_NO_FNJIT_MEM).
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if std::env::var_os("ZIPP_JITLOG").is_some() && !mem_can_compile(proto, const_strs) {
+            eprintln!("[jit] fn{func_id} mem_can_compile=false ({} ops)", proto.code.len());
+        }
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if fnjit_mem_enabled() && mem_can_compile(proto, const_strs) {
             // One inline-cache site per GetProp/SetProp in the whole function
             // (0 for the call/arith-only functions of v1). reserve_ic_sites never
@@ -874,6 +878,9 @@ impl Jit {
                 self.set_fn_state(func_id, FN_COMPILED);
                 return;
             }
+        }
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!("[jit] fn{func_id} BLACKLISTED (neither Tier A nor Tier C compiled)");
         }
         self.blacklist.insert(func_id);
         self.set_fn_state(func_id, FN_DEAD);
