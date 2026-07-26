@@ -86,6 +86,36 @@ fn assign_op(p: Punct) -> Option<AssignOp> {
 impl<'s> Parser<'s> {
     // ---- entry points ------------------------------------------------------
 
+    /// [`Self::parse_assign`], finalized: the expression cannot become a
+    /// destructuring pattern in any enclosing context, so a pending
+    /// CoverInitializedName error (`{a = 1}` outside a target position) is
+    /// raised HERE. Every full-expression position — statement expressions,
+    /// conditions, arguments, computed keys, initializers — goes through one of
+    /// these two wrappers; the plain variants are only for positions an
+    /// enclosing conversion can still reinterpret.
+    pub(crate) fn parse_assign_full(&mut self) -> PResult<Expr> {
+        let outer = self.cover.pattern_only.take();
+        let e = self.parse_assign()?;
+        if let Some(err) = self.cover.pattern_only.take() {
+            self.cover.pattern_only = outer;
+            return Err(err);
+        }
+        self.cover.pattern_only = outer;
+        Ok(e)
+    }
+
+    /// [`Self::parse_expr`], finalized — see [`Self::parse_assign_full`].
+    pub(crate) fn parse_expr_full(&mut self) -> PResult<Expr> {
+        let outer = self.cover.pattern_only.take();
+        let e = self.parse_expr()?;
+        if let Some(err) = self.cover.pattern_only.take() {
+            self.cover.pattern_only = outer;
+            return Err(err);
+        }
+        self.cover.pattern_only = outer;
+        Ok(e)
+    }
+
     /// `Expression` — the comma operator.
     pub(crate) fn parse_expr(&mut self) -> PResult<Expr> {
         let first = self.parse_assign()?;
@@ -116,25 +146,26 @@ impl<'s> Parser<'s> {
         }
 
         let start = self.cur().span.start;
-        // Stash the enclosing region's expression-only error so an inner one
+        // Stash the enclosing region's pattern-only error so an inner one
         // cannot be mistaken for it, and vice versa.
-        let outer_expr_only = self.cover.expr_only.take();
+        let outer_po = self.cover.pattern_only.take();
         let lhs = self.parse_conditional()?;
 
         let Some(op) = self.cur().kind.as_punct().and_then(assign_op) else {
-            // No `=` follows, so this was an expression after all — which is
-            // the moment a CoverInitializedName (`({a = 1})`) becomes a
-            // SyntaxError. Nothing else ever discharges it.
-            if let Some(err) = self.cover.expr_only.take() {
-                self.cover.expr_only = outer_expr_only;
-                return Err(err);
-            }
-            self.cover.expr_only = outer_expr_only;
+            // No `=` follows here — but the expression may STILL become a
+            // pattern in an enclosing context (`({style = ''}) => …` reaches
+            // this point for the object while the paren cover is undecided), so
+            // the recorded error PROPAGATES rather than raising. It is raised
+            // at expression finalization (`parse_assign_full`) or by the paren
+            // cover's expression resolution — the points where no conversion
+            // remains possible. Earliest error wins, and the outer one was
+            // recorded first.
+            self.cover.pattern_only = outer_po.or(self.cover.pattern_only.take());
             return Ok(lhs);
         };
-        // It IS an assignment, so the target reading wins and the recorded
-        // expression-only error was never an error.
-        self.cover.expr_only = outer_expr_only;
+        // It IS an assignment, so the target reading wins for the LHS and its
+        // recorded pattern-only error was never an error.
+        self.cover.pattern_only = outer_po;
         self.bump_before_operand()?;
         // Only `=` may target a destructuring pattern; `+=` and friends require
         // a simple target, which `expr_to_target` enforces by rejecting the
@@ -181,14 +212,26 @@ impl<'s> Parser<'s> {
         }
         let save = self.save();
         let start = self.cur().span.start;
-        let (name, _) = self.binding_ident()?;
+        // Read WITHOUT the strict-mode eval/arguments check: until the `=>` is
+        // seen this identifier may be an ordinary REFERENCE, and
+        // `arguments.length` in strict code is perfectly legal. Erroring here
+        // rejected real programs.
+        let tok = self.bump_after_operand()?;
+        let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
         // The `=>` of an arrow may not be preceded by a LineTerminator.
         if !self.at(Punct::Arrow) || self.cur().newline_before {
             self.restore(save);
             return Ok(None);
         }
+        // NOW it is a binding, so the check applies.
+        if self.ctx.strict && (name == "eval" || name == "arguments") {
+            return Err(SyntaxError::new(
+                format!("SyntaxError: '{name}' cannot be a parameter name in strict mode"),
+                start,
+            ));
+        }
         self.bump_before_operand()?; // `=>`
-        let params = Params { items: vec![Pattern::Ident(name)], simple: true };
+        let params = Params { items: vec![Pattern::Ident(name.into_boxed_str())], simple: true };
         Ok(Some(self.finish_arrow(params, false, start)?))
     }
 
@@ -208,12 +251,21 @@ impl<'s> Parser<'s> {
             let f = self.parse_function_rest(true, start)?;
             return Ok(Some(Expr::Function(Box::new(f))));
         }
-        // `async x => …`
+        // `async x => …` — same permissive read as `try_ident_arrow`: the name
+        // is only a binding once the `=>` is confirmed.
         if self.is_binding_ident() {
-            let (name, _) = self.binding_ident()?;
+            let tok = self.bump_after_operand()?;
+            let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
             if self.at(Punct::Arrow) && !self.cur().newline_before {
+                if self.ctx.strict && (name == "eval" || name == "arguments") {
+                    return Err(SyntaxError::new(
+                        format!("SyntaxError: '{name}' cannot be a parameter name in strict mode"),
+                        start,
+                    ));
+                }
                 self.bump_before_operand()?;
-                let params = Params { items: vec![Pattern::Ident(name)], simple: true };
+                let params =
+                    Params { items: vec![Pattern::Ident(name.into_boxed_str())], simple: true };
                 return Ok(Some(self.finish_arrow(params, true, start)?));
             }
             self.restore(save);
@@ -251,55 +303,66 @@ impl<'s> Parser<'s> {
         Ok(Expr::Cond { test: Box::new(test), cons: Box::new(cons), alt: Box::new(alt) })
     }
 
-    /// Logical and nullish operators, which sit above the binary ones and may
-    /// not be mixed without parentheses.
+    /// ShortCircuitExpression: either a `??` chain or a `||`/`&&` chain — the
+    /// grammar makes them ALTERNATIVES, so mixing them at one level without
+    /// parentheses is a SyntaxError.
+    ///
+    /// The flag returned by the chain parsers says "a bare `||`/`&&` was
+    /// consumed AT THIS LEVEL". Parenthesized logicals don't set it — the paren
+    /// contents are parsed levels deeper — which is exactly the distinction the
+    /// rule needs: `(a || b) ?? c` is legal, `a || b ?? c` is not. Testing the
+    /// NEXT token (the previous implementation) got the parenthesized case
+    /// wrong, because by then the parens were invisible.
     fn parse_nullish(&mut self, _min: u8) -> PResult<Expr> {
-        let mut left = self.parse_logical_or()?;
-        if self.at(Punct::QuestionQuestion) {
-            while self.at(Punct::QuestionQuestion) {
-                self.bump_before_operand()?;
-                let right = self.parse_logical_or()?;
-                left = Expr::Logical {
-                    op: LogicalOp::Coalesce,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                };
-            }
-            // `a ?? b || c` is a SyntaxError — mixing requires parentheses.
-            if self.at(Punct::PipePipe) || self.at(Punct::AmpAmp) {
-                return Err(self.err_here(
-                    "SyntaxError: '??' cannot be mixed with '||' or '&&' without parentheses",
-                ));
-            }
+        let (mut left, saw_logical) = self.parse_or_chain()?;
+        if !self.at(Punct::QuestionQuestion) {
+            return Ok(left);
         }
-        Ok(left)
-    }
-
-    fn parse_logical_or(&mut self) -> PResult<Expr> {
-        let mut left = self.parse_logical_and()?;
-        while self.at(Punct::PipePipe) {
-            self.bump_before_operand()?;
-            let right = self.parse_logical_and()?;
-            left =
-                Expr::Logical { op: LogicalOp::Or, left: Box::new(left), right: Box::new(right) };
-        }
-        if self.at(Punct::QuestionQuestion) {
+        if saw_logical {
             return Err(self.err_here(
                 "SyntaxError: '??' cannot be mixed with '||' or '&&' without parentheses",
             ));
         }
+        while self.at(Punct::QuestionQuestion) {
+            self.bump_before_operand()?;
+            let (right, saw) = self.parse_or_chain()?;
+            if saw {
+                return Err(self.err_here(
+                    "SyntaxError: '??' cannot be mixed with '||' or '&&' without parentheses",
+                ));
+            }
+            left = Expr::Logical {
+                op: LogicalOp::Coalesce,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
         Ok(left)
     }
 
-    fn parse_logical_and(&mut self) -> PResult<Expr> {
+    fn parse_or_chain(&mut self) -> PResult<(Expr, bool)> {
+        let (mut left, mut saw) = self.parse_and_chain()?;
+        while self.at(Punct::PipePipe) {
+            saw = true;
+            self.bump_before_operand()?;
+            let (right, _) = self.parse_and_chain()?;
+            left =
+                Expr::Logical { op: LogicalOp::Or, left: Box::new(left), right: Box::new(right) };
+        }
+        Ok((left, saw))
+    }
+
+    fn parse_and_chain(&mut self) -> PResult<(Expr, bool)> {
         let mut left = self.parse_binary(4)?;
+        let mut saw = false;
         while self.at(Punct::AmpAmp) {
+            saw = true;
             self.bump_before_operand()?;
             let right = self.parse_binary(4)?;
             left =
                 Expr::Logical { op: LogicalOp::And, left: Box::new(left), right: Box::new(right) };
         }
-        Ok(left)
+        Ok((left, saw))
     }
 
     /// Precedence climbing. `min` is the lowest binding power this call accepts.
@@ -453,7 +516,7 @@ impl<'s> Parser<'s> {
                     e = Expr::Call(Box::new(CallExpr { callee: e, args, optional: true }));
                 } else if self.at(Punct::LBracket) {
                     self.bump_before_operand()?;
-                    let idx = self.parse_expr()?;
+                    let idx = self.parse_expr_full()?;
                     self.expect(Punct::RBracket, false)?;
                     e = Expr::Member(Box::new(Member {
                         object: e,
@@ -466,7 +529,7 @@ impl<'s> Parser<'s> {
                 }
             } else if self.at(Punct::LBracket) {
                 self.bump_before_operand()?;
-                let idx = self.parse_expr()?;
+                let idx = self.parse_expr_full()?;
                 self.expect(Punct::RBracket, false)?;
                 e = Expr::Member(Box::new(Member {
                     object: e,
@@ -561,9 +624,9 @@ impl<'s> Parser<'s> {
         while !self.at(Punct::RParen) {
             if self.at(Punct::DotDotDot) {
                 self.bump_before_operand()?;
-                out.push(Arg::Spread(self.parse_assign()?));
+                out.push(Arg::Spread(self.parse_assign_full()?));
             } else {
-                out.push(Arg::Expr(self.parse_assign()?));
+                out.push(Arg::Expr(self.parse_assign_full()?));
             }
             if !self.eat(Punct::Comma, true)? {
                 break;
@@ -576,6 +639,11 @@ impl<'s> Parser<'s> {
     // ---- primary -----------------------------------------------------------
 
     fn parse_primary(&mut self) -> PResult<Expr> {
+        // Clear the flag on entry so it describes only the primary about to be
+        // parsed. Without this it leaks forward: `(a + b); x = 1` would mark
+        // `x` as parenthesized because nothing consumed the flag in between.
+        // The `(` branch re-sets it after its contents are parsed.
+        self.parenthesized = false;
         let start = self.cur().span.start;
         match self.cur().kind.clone() {
             TokenKind::Num(n) => {
@@ -744,7 +812,7 @@ impl<'s> Parser<'s> {
         let mut done = tail;
         self.bump_after_operand()?;
         while !done {
-            exprs.push(self.parse_expr()?);
+            exprs.push(self.parse_expr_full()?);
             // The `}` that closes a substitution is not a punctuator here — the
             // lexer must resume template scanning AT it.
             if !self.at(Punct::RBrace) {
@@ -776,15 +844,13 @@ impl<'s> Parser<'s> {
             if self.at(Punct::DotDotDot) {
                 let pos = self.cur().span.start;
                 self.bump_before_operand()?;
+                let _ = pos;
+                // In a LITERAL a spread may sit anywhere (`[...a, b]` is
+                // ordinary). The rest-must-be-last rule applies only to the
+                // PATTERN reading, and `expr_to_target`/`expr_to_pattern`
+                // enforce it during conversion — recording it here as a cover
+                // error rejected valid literals.
                 items.push(Some(ArrayElem::Spread(self.parse_assign()?)));
-                // A rest element must be last and may not be followed by a
-                // comma — but only when this turns out to be a target.
-                if self.at(Punct::Comma) {
-                    self.cover_pattern_only(SyntaxError::new(
-                        "SyntaxError: rest element must be last",
-                        pos,
-                    ));
-                }
             } else {
                 items.push(Some(ArrayElem::Expr(self.parse_assign()?)));
             }
@@ -824,7 +890,10 @@ impl<'s> Parser<'s> {
         // `__proto__: v` properties, not shorthand, methods or computed keys,
         // and not when the literal is a destructuring target.
         if proto_count > 1 {
-            self.cover_expr_only(SyntaxError::new(
+            // An error only for an actual LITERAL — duplicate `__proto__` in a
+            // destructuring target is legal — so it too fires on the
+            // expression reading.
+            self.cover_pattern_only(SyntaxError::new(
                 "SyntaxError: duplicate __proto__ property in object literal",
                 proto_pos,
             ));
@@ -902,8 +971,10 @@ impl<'s> Parser<'s> {
         if self.at(Punct::Eq) {
             self.bump_before_operand()?;
             init = Some(self.parse_assign()?);
-            // Legal ONLY if this literal turns out to be a destructuring target.
-            self.cover_expr_only(SyntaxError::new(
+            // Legal ONLY if this literal turns out to be a destructuring
+            // target, so it fires when the region resolves to an EXPRESSION —
+            // in arrow params (`({a = 1}) => …`) it is a default and fine.
+            self.cover_pattern_only(SyntaxError::new(
                 "SyntaxError: invalid shorthand property initializer",
                 start,
             ));

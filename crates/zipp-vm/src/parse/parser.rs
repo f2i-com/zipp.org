@@ -349,6 +349,9 @@ pub struct Parser<'s> {
     /// than a wrapper node: parenthesization is observable in exactly two
     /// places, and both consume it immediately.
     pub(crate) parenthesized: bool,
+    /// The grammar goal. `import`/`export` are declarations only in a module;
+    /// in a script they are ordinary identifiers.
+    pub(crate) goal: Goal,
 }
 
 impl<'s> Parser<'s> {
@@ -366,6 +369,7 @@ impl<'s> Parser<'s> {
             super_call: opts.allow_super_call,
             ..Ctx::default()
         };
+        let goal = opts.goal;
         Ok(Parser {
             lx,
             src,
@@ -377,6 +381,7 @@ impl<'s> Parser<'s> {
             opts,
             labels: Vec::new(),
             parenthesized: false,
+            goal,
         })
     }
 
@@ -478,6 +483,10 @@ impl<'s> Parser<'s> {
     pub(crate) fn resume_template(&mut self) -> PResult<Token> {
         self.lx.seek(self.tok.span.start);
         let t = self.lx.read_template_continue()?;
+        // This bypasses `bump`, so it must maintain `prev_end` itself — an
+        // arrow or function whose body ENDS in a template gets its span's end
+        // from here, and a stale value truncated it by the tail chunk's length.
+        self.prev_end = t.span.end;
         self.tok = self.lx.next_token(false)?;
         Ok(t)
     }

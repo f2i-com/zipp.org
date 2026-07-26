@@ -100,7 +100,7 @@ impl<'s> Parser<'s> {
             }
             let pat = self.parse_binding_pattern()?;
             items.push(if self.eat(Punct::Eq, true)? {
-                Pattern::Assign { left: Box::new(pat), right: Box::new(self.parse_assign()?) }
+                Pattern::Assign { left: Box::new(pat), right: Box::new(self.parse_assign_full()?) }
             } else {
                 pat
             });
@@ -168,7 +168,7 @@ impl<'s> Parser<'s> {
             } else {
                 let p = self.parse_binding_pattern()?;
                 if self.eat(Punct::Eq, true)? {
-                    Pattern::Assign { left: Box::new(p), right: Box::new(self.parse_assign()?) }
+                    Pattern::Assign { left: Box::new(p), right: Box::new(self.parse_assign_full()?) }
                 } else {
                     p
                 }
@@ -198,21 +198,22 @@ impl<'s> Parser<'s> {
                 break;
             }
             let key = self.parse_prop_key()?;
-            let value = if self.eat(Punct::Colon, true)? {
-                self.parse_binding_pattern()?
+            // Shorthand is "no colon", not "the key is an identifier" —
+            // `{a: b}` has an identifier key and is NOT shorthand.
+            let (value, shorthand) = if self.eat(Punct::Colon, true)? {
+                (self.parse_binding_pattern()?, false)
             } else {
                 // Shorthand `{a}` / `{a = 1}`.
                 let PropKey::Ident(n) = &key else {
                     return Err(self.err_here("SyntaxError: expected ':' in binding pattern"));
                 };
-                Pattern::Ident(n.clone())
+                (Pattern::Ident(n.clone()), true)
             };
             let value = if self.eat(Punct::Eq, true)? {
-                Pattern::Assign { left: Box::new(value), right: Box::new(self.parse_assign()?) }
+                Pattern::Assign { left: Box::new(value), right: Box::new(self.parse_assign_full()?) }
             } else {
                 value
             };
-            let shorthand = matches!(&key, PropKey::Ident(_));
             props.push(PatternProp { key, value, shorthand });
             if !self.eat(Punct::Comma, true)? {
                 break;
@@ -366,7 +367,7 @@ impl<'s> Parser<'s> {
             self.ctx.in_field_init = true;
             self.ctx.return_ = false;
             self.ctx.super_prop = true;
-            let v = self.parse_assign()?;
+            let v = self.parse_assign_full()?;
             self.ctx = saved;
             Some(v)
         } else {

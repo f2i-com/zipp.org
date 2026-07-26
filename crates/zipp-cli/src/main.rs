@@ -98,10 +98,12 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut path = None;
             let mut module = false;
             let mut sweep = false;
+            let mut use_parser = false;
             for a in it.by_ref() {
                 match a.as_str() {
                     "--module" => module = true,
                     "--sweep" => sweep = true,
+                    "--parser" => use_parser = true,
                     other => path = Some(other.to_string()),
                 }
             }
@@ -109,7 +111,12 @@ fn run(args: &[String]) -> Result<(), String> {
             if !sweep {
                 let src = std::fs::read_to_string(&path)
                     .map_err(|e| format!("cannot read '{path}': {e}"))?;
-                println!("{}", zipp_vm::lower_to_text(&src, module)?);
+                let text = if use_parser {
+                    zipp_vm::parse_to_text(&src, module)?
+                } else {
+                    zipp_vm::lower_to_text(&src, module)?
+                };
+                println!("{text}");
                 return Ok(());
             }
             // Sweep: lower everything and report what the AST cannot yet say.
@@ -205,6 +212,77 @@ unsupported by reason:");
             } else {
                 Err(format!("{differ} mismatches"))
             }
+        }
+        Some("parsediff") => {
+            // The parser's gate: our parser vs the oxc bridge, over a corpus.
+            // The bridge's output is already known to compile byte-identically,
+            // so any disagreement here is the parser's, with one suspect.
+            let paths: Vec<String> = it.cloned().collect();
+            if paths.is_empty() {
+                return Err("usage: zipp parsediff <file-or-dir>...".into());
+            }
+            let mut files = Vec::new();
+            for p in &paths {
+                collect_js(std::path::Path::new(p), &mut files);
+            }
+            files.sort();
+            let (mut same, mut differ, mut ours_err, mut both_err) = (0usize, 0usize, 0usize, 0usize);
+            let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+            for f in &files {
+                let Ok(src) = std::fs::read_to_string(f) else { continue };
+                let m = f.extension().is_some_and(|e| e == "mjs");
+                let mut theirs = zipp_vm::lower_to_text(&src, m);
+                let mut ours = zipp_vm::parse_to_text(&src, m);
+                // A `.js` file that is really an ES MODULE: oxc parses module
+                // syntax under any goal, so the bridge accepts it as a script
+                // while our parser (correctly) rejects `import`/`export` there.
+                // Retry BOTH sides under the module goal and compare those.
+                if !m && ours.is_err() && theirs.is_ok() {
+                    let mt = zipp_vm::lower_to_text(&src, true);
+                    let mo = zipp_vm::parse_to_text(&src, true);
+                    if mo.is_ok() {
+                        theirs = mt;
+                        ours = mo;
+                    }
+                }
+                match (&theirs, &ours) {
+                    (Ok(a), Ok(b)) if a == b => same += 1,
+                    (Ok(_), Ok(_)) => {
+                        differ += 1;
+                        if differ <= 10 {
+                            println!("DIFFER  {}", f.display());
+                        }
+                    }
+                    // oxc rejected it too: agreement about invalid input.
+                    (Err(_), Err(_)) => both_err += 1,
+                    (Ok(_), Err(e)) => {
+                        ours_err += 1;
+                        let key: String = e.split(" (at ").next().unwrap_or(e).chars().take(90).collect();
+                        *reasons.entry(key).or_default() += 1;
+                    }
+                    (Err(_), Ok(_)) => {
+                        differ += 1;
+                        if differ <= 10 {
+                            println!("WE-ACCEPT-THEY-REJECT  {}", f.display());
+                        }
+                    }
+                }
+            }
+            println!(
+                "
+{} files: {same} identical, {differ} differing AST, {ours_err} we reject, {both_err} both reject",
+                files.len()
+            );
+            if !reasons.is_empty() {
+                println!("
+our parse failures by reason:");
+                let mut v: Vec<_> = reasons.into_iter().collect();
+                v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                for (r, n) in v.iter().take(20) {
+                    println!("  {n:5}  {r}");
+                }
+            }
+            Ok(())
         }
         Some("--help") | Some("-h") | None => {
             println!("zipp — a clean-sheet JavaScript engine\n");

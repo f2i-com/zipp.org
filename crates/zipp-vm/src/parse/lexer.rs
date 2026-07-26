@@ -54,6 +54,11 @@ impl<'s> Lexer<'s> {
         if lx.src.starts_with(&[0xEF, 0xBB, 0xBF]) {
             lx.pos = 3;
         }
+        // A hashbang (`#!...`) is a comment, but ONLY as the very first bytes —
+        // anywhere else `#` starts a private name.
+        if lx.src[lx.pos..].starts_with(b"#!") {
+            lx.skip_to_line_end();
+        }
         lx
     }
 

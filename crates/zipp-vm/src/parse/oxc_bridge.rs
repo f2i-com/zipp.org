@@ -24,6 +24,24 @@ use super::token::{Span, StrVal};
 
 type R<T> = Result<T, String>;
 
+// Whether the code currently being lowered is strict. The parser threads this
+// through `Ctx`; these free functions have no context parameter and adding one
+// means touching every signature in a file that exists to be deleted — so a
+// thread-local carries it instead. Scaffolding-grade on purpose: the bridge dies
+// when the parser is wired in, and the real parser does this properly.
+thread_local! {
+    static STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with the strictness cell set to `on`, restoring the previous value —
+/// including on the error path, or one failed lowering would poison the rest.
+fn with_strict<T>(on: bool, f: impl FnOnce() -> R<T>) -> R<T> {
+    let prev = STRICT.with(|c| c.replace(on));
+    let out = f();
+    STRICT.with(|c| c.set(prev));
+    out
+}
+
 /// oxc span -> ours.
 fn sp(s: oxc_span::Span) -> Span {
     Span::new(s.start, s.end)
@@ -941,7 +959,8 @@ pub fn lower_program(p: &ox::Program, goal: Goal) -> R<Program> {
     // forces strictness, but that fact lives with the caller, not the source, so
     // it is ORed in by whoever has it rather than guessed at here.
     let strict = goal == Goal::Module || directives.iter().any(|d| &*d.raw == "use strict");
-    Ok(Program { goal, strict, directives, body: lower_stmts(&p.body)? })
+    let body = with_strict(strict, || lower_stmts(&p.body))?;
+    Ok(Program { goal, strict, directives, body })
 }
 
 fn lower_stmts(v: &[ox::Statement]) -> R<Vec<Stmt>> {
@@ -1219,12 +1238,15 @@ fn lower_function_at(f: &ox::Function, span: Span, strict: bool) -> R<Function> 
 }
 
 fn lower_fn_body(b: &ox::FunctionBody, strict: bool) -> R<FnBody> {
+    // `strict` is what the construct forces (a class member); the cell carries
+    // what is inherited (an enclosing strict program or function); the prologue
+    // is the body's own. oxc's `has_use_strict_directive` compares the RAW
+    // directive text, so `"use strict"` correctly does not count.
+    let s = strict || STRICT.with(|c| c.get()) || b.has_use_strict_directive();
     Ok(FnBody {
         directives: lower_directives(&b.directives),
-        stmts: lower_stmts(&b.statements)?,
-        // oxc's `has_use_strict_directive` compares the RAW directive text, so
-        // `"use strict"` correctly does not count.
-        strict: strict || b.has_use_strict_directive(),
+        stmts: with_strict(s, || lower_stmts(&b.statements))?,
+        strict: s,
     })
 }
 
@@ -1266,16 +1288,21 @@ fn lower_class(c: &ox::Class) -> R<Class> {
     {
         return Err("unsupported: TypeScript class modifiers".to_string());
     }
-    let mut body = Vec::with_capacity(c.body.body.len());
-    for el in &c.body.body {
-        body.push(lower_class_element(el)?);
-    }
-    Ok(Class {
-        name: c.id.as_ref().map(|id| name(id.name.as_str())),
-        superclass: match &c.super_class {
+    // A class is strict code in its entirety — heritage expression included.
+    let (body, superclass) = with_strict(true, || {
+        let mut body = Vec::with_capacity(c.body.body.len());
+        for el in &c.body.body {
+            body.push(lower_class_element(el)?);
+        }
+        let superclass = match &c.super_class {
             Some(e) => Some(Box::new(lower_expr(e)?)),
             None => None,
-        },
+        };
+        Ok((body, superclass))
+    })?;
+    Ok(Class {
+        name: c.id.as_ref().map(|id| name(id.name.as_str())),
+        superclass,
         body,
         span: sp(c.span),
     })

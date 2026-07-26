@@ -2,7 +2,7 @@
 
 use super::ast::*;
 use super::parser::{BindKind, PResult, ParseOptions, Parser, ScopeKind, SyntaxError};
-use super::token::{Keyword, Punct, TokenKind};
+use super::token::{Keyword, Punct, StrVal, TokenKind};
 
 /// Parse a complete program.
 pub fn parse(src: &str, opts: ParseOptions) -> PResult<Program> {
@@ -27,10 +27,244 @@ impl<'s> Parser<'s> {
         Ok(Program { goal, strict: self.ctx.strict, directives, body })
     }
 
+    /// `import` / `export`, legal only at a module's top level.
+    ///
+    /// `import` is also an EXPRESSION (`import(spec)`, `import.meta`), so the
+    /// declaration form is only taken when the next token cannot continue one.
+    fn parse_module_decl(&mut self) -> PResult<Option<Stmt>> {
+        if self.goal != Goal::Module {
+            return Ok(None);
+        }
+        if self.at_kw(Keyword::Import) {
+            let save = self.save();
+            let pos = self.cur().span.start;
+            self.bump_after_operand()?;
+            // `import(` and `import.` are expressions, not declarations.
+            if self.at(Punct::LParen) || self.at(Punct::Dot) {
+                self.restore(save);
+                return Ok(None);
+            }
+            return Ok(Some(Stmt::Import(Box::new(self.parse_import_rest(pos)?))));
+        }
+        if self.at_kw(Keyword::Export) {
+            let pos = self.cur().span.start;
+            self.bump_after_operand()?;
+            return Ok(Some(Stmt::Export(Box::new(self.parse_export_rest(pos)?))));
+        }
+        Ok(None)
+    }
+
+    fn parse_import_rest(&mut self, pos: u32) -> PResult<ImportDecl> {
+        // `import "m"` — side effect only.
+        if let TokenKind::Str(s) = self.cur().kind.clone() {
+            self.bump_after_operand()?;
+            let attributes = self.parse_import_attributes()?;
+            self.semicolon()?;
+            return Ok(ImportDecl {
+                specifiers: Vec::new(),
+                source: s,
+                attributes,
+                phase: ImportPhase::Evaluation,
+            });
+        }
+        let mut specifiers = Vec::new();
+        // `import d from`, `import d, {…} from`, `import d, * as ns from`
+        if self.is_binding_ident() {
+            let (n, p) = self.binding_ident()?;
+            self.declare(&n.clone(), BindKind::Import, p)?;
+            specifiers.push(ImportSpecifier::Default(n));
+            if self.eat(Punct::Comma, false)? {
+                self.parse_import_bindings(&mut specifiers)?;
+            }
+        } else {
+            self.parse_import_bindings(&mut specifiers)?;
+        }
+        if !self.eat_kw(Keyword::From, false)? {
+            return Err(SyntaxError::new("SyntaxError: expected 'from'", pos));
+        }
+        let TokenKind::Str(source) = self.cur().kind.clone() else {
+            return Err(self.err_here("SyntaxError: expected a module specifier string"));
+        };
+        self.bump_after_operand()?;
+        let attributes = self.parse_import_attributes()?;
+        self.semicolon()?;
+        Ok(ImportDecl { specifiers, source, attributes, phase: ImportPhase::Evaluation })
+    }
+
+    /// `* as ns` or `{ a, b as c }`.
+    fn parse_import_bindings(&mut self, out: &mut Vec<ImportSpecifier>) -> PResult<()> {
+        if self.eat(Punct::Star, false)? {
+            if !self.eat_kw(Keyword::As, false)? {
+                return Err(self.err_here("SyntaxError: expected 'as' after '*'"));
+            }
+            let (n, p) = self.binding_ident()?;
+            self.declare(&n.clone(), BindKind::Import, p)?;
+            out.push(ImportSpecifier::Namespace(n));
+            return Ok(());
+        }
+        self.expect(Punct::LBrace, false)?;
+        while !self.at(Punct::RBrace) {
+            let imported = self.parse_module_export_name()?;
+            let (local, lpos) = if self.eat_kw(Keyword::As, false)? {
+                self.binding_ident()?
+            } else {
+                // Without `as`, the imported name must itself be a valid
+                // binding, so a string name or a reserved word is an error.
+                let ModuleExportName::Ident(n) = &imported else {
+                    return Err(self.err_here("SyntaxError: a string module name requires 'as'"));
+                };
+                (n.clone(), self.cur().span.start)
+            };
+            self.declare(&local.clone(), BindKind::Import, lpos)?;
+            out.push(ImportSpecifier::Named { imported, local });
+            if !self.eat(Punct::Comma, false)? {
+                break;
+            }
+        }
+        self.expect(Punct::RBrace, false)?;
+        Ok(())
+    }
+
+    /// `with { type: "json" }`. The legacy `assert` spelling is accepted the
+    /// same way; the keyword itself is not recorded because nothing consumes it.
+    fn parse_import_attributes(&mut self) -> PResult<Vec<ImportAttribute>> {
+        let is_with = self.at_kw(Keyword::With);
+        let is_assert =
+            matches!(&self.cur().kind, TokenKind::Ident { name, .. } if name == "assert");
+        if !is_with && !is_assert {
+            return Ok(Vec::new());
+        }
+        // A LineTerminator before `assert` means ASI, not an attribute clause.
+        if is_assert && self.cur().newline_before {
+            return Ok(Vec::new());
+        }
+        self.bump_after_operand()?;
+        self.expect(Punct::LBrace, false)?;
+        let mut out = Vec::new();
+        while !self.at(Punct::RBrace) {
+            let key = match self.cur().kind.clone() {
+                TokenKind::Str(s) => {
+                    self.bump_after_operand()?;
+                    s
+                }
+                TokenKind::Ident { .. } => StrVal::Utf8(self.ident_name()?.to_string()),
+                _ => return Err(self.err_here("SyntaxError: expected an attribute key")),
+            };
+            self.expect(Punct::Colon, false)?;
+            let TokenKind::Str(value) = self.cur().kind.clone() else {
+                return Err(
+                    self.err_here("SyntaxError: an import attribute value must be a string")
+                );
+            };
+            self.bump_after_operand()?;
+            out.push(ImportAttribute { key, value });
+            if !self.eat(Punct::Comma, false)? {
+                break;
+            }
+        }
+        self.expect(Punct::RBrace, false)?;
+        Ok(out)
+    }
+
+    fn parse_module_export_name(&mut self) -> PResult<ModuleExportName> {
+        if let TokenKind::Str(s) = self.cur().kind.clone() {
+            self.bump_after_operand()?;
+            return Ok(ModuleExportName::Str(s));
+        }
+        // Reserved words are legal here: `export { default as d }`.
+        Ok(ModuleExportName::Ident(self.ident_name()?))
+    }
+
+    fn parse_export_rest(&mut self, pos: u32) -> PResult<ExportDecl> {
+        // `export * from "m"` / `export * as ns from "m"`
+        if self.eat(Punct::Star, false)? {
+            let alias = if self.eat_kw(Keyword::As, false)? {
+                Some(self.parse_module_export_name()?)
+            } else {
+                None
+            };
+            if !self.eat_kw(Keyword::From, false)? {
+                return Err(SyntaxError::new("SyntaxError: expected 'from'", pos));
+            }
+            let TokenKind::Str(source) = self.cur().kind.clone() else {
+                return Err(self.err_here("SyntaxError: expected a module specifier string"));
+            };
+            self.bump_after_operand()?;
+            let attributes = self.parse_import_attributes()?;
+            self.semicolon()?;
+            return Ok(ExportDecl::All { alias, source, attributes });
+        }
+        // `export default …`
+        if self.at_kw(Keyword::Default) {
+            let start = self.cur().span.start;
+            self.bump_before_operand()?;
+            if self.at_kw(Keyword::Function) {
+                self.bump_after_operand()?;
+                let f = self.parse_function_rest(false, start)?;
+                return Ok(ExportDecl::Default(ExportDefault::Function(Box::new(f))));
+            }
+            if self.at_kw(Keyword::Async) {
+                let save = self.save();
+                self.bump_after_operand()?;
+                if self.at_kw(Keyword::Function) && !self.cur().newline_before {
+                    self.bump_after_operand()?;
+                    let f = self.parse_function_rest(true, start)?;
+                    return Ok(ExportDecl::Default(ExportDefault::Function(Box::new(f))));
+                }
+                self.restore(save);
+            }
+            if self.at_kw(Keyword::Class) {
+                self.bump_after_operand()?;
+                let c = self.parse_class_rest(start)?;
+                return Ok(ExportDecl::Default(ExportDefault::Class(Box::new(c))));
+            }
+            let e = self.parse_assign_full()?;
+            self.semicolon()?;
+            return Ok(ExportDecl::Default(ExportDefault::Expr(e)));
+        }
+        // `export { a, b as c }` / `export { … } from "m"`
+        if self.at(Punct::LBrace) {
+            self.bump_after_operand()?;
+            let mut specifiers = Vec::new();
+            while !self.at(Punct::RBrace) {
+                let local = self.parse_module_export_name()?;
+                let exported = if self.eat_kw(Keyword::As, false)? {
+                    self.parse_module_export_name()?
+                } else {
+                    local.clone()
+                };
+                specifiers.push(ExportSpecifier { local, exported });
+                if !self.eat(Punct::Comma, false)? {
+                    break;
+                }
+            }
+            self.expect(Punct::RBrace, false)?;
+            let source = if self.eat_kw(Keyword::From, false)? {
+                let TokenKind::Str(s) = self.cur().kind.clone() else {
+                    return Err(self.err_here("SyntaxError: expected a module specifier string"));
+                };
+                self.bump_after_operand()?;
+                Some(s)
+            } else {
+                None
+            };
+            let attributes = self.parse_import_attributes()?;
+            self.semicolon()?;
+            return Ok(ExportDecl::Named { specifiers, source, attributes });
+        }
+        // `export var/let/const/function/class …` — the declaration binds
+        // exactly as it would without the `export`.
+        let decl = self.parse_stmt_list_item()?;
+        Ok(ExportDecl::Decl(Box::new(decl)))
+    }
+
     /// A StatementListItem: a Statement, or a declaration. Declarations are
     /// legal here and NOT in the Statement-only positions (an `if` body, a loop
     /// body), which is why the two entry points are distinct.
     pub(crate) fn parse_stmt_list_item(&mut self) -> PResult<Stmt> {
+        if let Some(m) = self.parse_module_decl()? {
+            return Ok(m);
+        }
         if self.at_kw(Keyword::Function) {
             let start = self.cur().span.start;
             self.bump_after_operand()?;
@@ -107,7 +341,7 @@ impl<'s> Parser<'s> {
             let pos = self.cur().span.start;
             let id = self.parse_binding_pattern()?;
             self.declare_pattern(&id, kind, pos)?;
-            let init = if self.eat(Punct::Eq, true)? { Some(self.parse_assign()?) } else { None };
+            let init = if self.eat(Punct::Eq, true)? { Some(self.parse_assign_full()?) } else { None };
             // `const` without an initializer is an early error — except in a
             // for-in/of head, which parses through a different path.
             if init.is_none() && kind == VarKind::Const {
@@ -201,7 +435,7 @@ impl<'s> Parser<'s> {
                     {
                         None
                     } else {
-                        Some(self.parse_expr()?)
+                        Some(self.parse_expr_full()?)
                     };
                     self.semicolon()?;
                     Ok(Stmt::Return(arg))
@@ -212,7 +446,7 @@ impl<'s> Parser<'s> {
                         return Err(self
                             .err_here("SyntaxError: no line break allowed after 'throw'"));
                     }
-                    let e = self.parse_expr()?;
+                    let e = self.parse_expr_full()?;
                     self.semicolon()?;
                     Ok(Stmt::Throw(e))
                 }
@@ -260,7 +494,7 @@ impl<'s> Parser<'s> {
                     }
                     self.bump_before_operand()?;
                     self.expect(Punct::LParen, true)?;
-                    let object = self.parse_expr()?;
+                    let object = self.parse_expr_full()?;
                     self.expect(Punct::RParen, true)?;
                     let body = self.parse_stmt()?;
                     Ok(Stmt::With { object, body: Box::new(body) })
@@ -280,10 +514,15 @@ impl<'s> Parser<'s> {
     /// An expression statement, or a labelled statement.
     fn parse_expr_or_labeled(&mut self) -> PResult<Stmt> {
         let start = self.cur().span.start;
-        // `foo:` — an identifier followed by a colon.
+        // `foo:` — an identifier followed by a colon. Read PERMISSIVELY: a
+        // label is not a binding, so `eval: …` is legal even in strict mode,
+        // and a statement that merely STARTS with `arguments` (say
+        // `arguments.length;`) must not be rejected while probing for one.
         if self.is_binding_ident() {
             let save = self.save();
-            let (name, _) = self.binding_ident()?;
+            let tok = self.bump_after_operand()?;
+            let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+            let name = name.into_boxed_str();
             if self.at(Punct::Colon) {
                 self.bump_before_operand()?;
                 if self.labels.iter().any(|l| **l == *name) {
@@ -299,7 +538,7 @@ impl<'s> Parser<'s> {
             }
             self.restore(save);
         }
-        let e = self.parse_expr()?;
+        let e = self.parse_expr_full()?;
         self.semicolon()?;
         Ok(Stmt::Expr(e))
     }
@@ -307,7 +546,7 @@ impl<'s> Parser<'s> {
     fn parse_if(&mut self) -> PResult<Stmt> {
         self.bump_before_operand()?;
         self.expect(Punct::LParen, true)?;
-        let test = self.parse_expr()?;
+        let test = self.parse_expr_full()?;
         self.expect(Punct::RParen, true)?;
         let cons = Box::new(self.parse_stmt()?);
         let alt = if self.eat_kw(Keyword::Else, true)? {
@@ -321,7 +560,7 @@ impl<'s> Parser<'s> {
     fn parse_while(&mut self) -> PResult<Stmt> {
         self.bump_before_operand()?;
         self.expect(Punct::LParen, true)?;
-        let test = self.parse_expr()?;
+        let test = self.parse_expr_full()?;
         self.expect(Punct::RParen, true)?;
         let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
         Ok(Stmt::While { test, body })
@@ -334,7 +573,7 @@ impl<'s> Parser<'s> {
             return Err(self.err_here("SyntaxError: expected 'while'"));
         }
         self.expect(Punct::LParen, true)?;
-        let test = self.parse_expr()?;
+        let test = self.parse_expr_full()?;
         self.expect(Punct::RParen, false)?;
         // `do … while (…)` takes an optional semicolon, always.
         let _ = self.eat(Punct::Semi, true)?;
@@ -373,7 +612,7 @@ impl<'s> Parser<'s> {
                 let of = self.at_kw(Keyword::Of);
                 self.bump_before_operand()?;
                 self.ctx.in_ = saved_in;
-                let right = if of { self.parse_assign()? } else { self.parse_expr()? };
+                let right = if of { self.parse_assign_full()? } else { self.parse_expr_full()? };
                 self.expect(Punct::RParen, true)?;
                 let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
                 let left = ForTarget::Var(VarDecl {
@@ -418,7 +657,7 @@ impl<'s> Parser<'s> {
                 self.bump_before_operand()?;
                 self.ctx.in_ = saved_in;
                 let target = self.expr_to_target(e, true, pos)?;
-                let right = if of { self.parse_assign()? } else { self.parse_expr()? };
+                let right = if of { self.parse_assign_full()? } else { self.parse_expr_full()? };
                 self.expect(Punct::RParen, true)?;
                 let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
                 let left = ForTarget::Target(target);
@@ -439,9 +678,9 @@ impl<'s> Parser<'s> {
 
     /// The `;;` form, with the first `;` already consumed.
     fn parse_for_classic(&mut self, init: Option<ForInit>) -> PResult<Stmt> {
-        let test = if self.at(Punct::Semi) { None } else { Some(self.parse_expr()?) };
+        let test = if self.at(Punct::Semi) { None } else { Some(self.parse_expr_full()?) };
         self.expect(Punct::Semi, true)?;
-        let update = if self.at(Punct::RParen) { None } else { Some(self.parse_expr()?) };
+        let update = if self.at(Punct::RParen) { None } else { Some(self.parse_expr_full()?) };
         self.expect(Punct::RParen, true)?;
         let body = Box::new(self.in_loop(|p| p.parse_stmt())?);
         Ok(Stmt::For { init, test, update, body })
@@ -450,7 +689,7 @@ impl<'s> Parser<'s> {
     fn parse_switch(&mut self) -> PResult<Stmt> {
         self.bump_before_operand()?;
         self.expect(Punct::LParen, true)?;
-        let disc = self.parse_expr()?;
+        let disc = self.parse_expr_full()?;
         self.expect(Punct::RParen, true)?;
         self.expect(Punct::LBrace, true)?;
         // The whole CaseBlock is ONE scope, not one per clause — so
@@ -462,7 +701,7 @@ impl<'s> Parser<'s> {
         let mut seen_default = false;
         while !self.at(Punct::RBrace) && !self.at_eof() {
             let test = if self.eat_kw(Keyword::Case, true)? {
-                Some(self.parse_expr()?)
+                Some(self.parse_expr_full()?)
             } else if self.at_kw(Keyword::Default) {
                 let pos = self.cur().span.start;
                 self.bump_before_operand()?;

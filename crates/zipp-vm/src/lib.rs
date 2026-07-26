@@ -97,7 +97,14 @@ pub fn parse_to_text(src: &str, module: bool) -> Result<String, String> {
     let opts = if module {
         parse::parser::ParseOptions::module()
     } else {
-        parse::parser::ParseOptions::script()
+        // The engine's scripts are CommonJS-shaped (`SourceType::cjs()` today):
+        // node wraps a file in a function, so top-level `return` is legal and
+        // real packages use it. `ParseOptions::script()` stays spec-strict for
+        // callers that want the pure Script goal.
+        parse::parser::ParseOptions {
+            allow_return: true,
+            ..parse::parser::ParseOptions::script()
+        }
     };
     match parse::stmt::parse(src, opts) {
         Ok(p) => Ok(format!("{p:#?}")),

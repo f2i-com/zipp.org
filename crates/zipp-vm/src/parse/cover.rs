@@ -150,16 +150,23 @@ impl<'s> Parser<'s> {
         start: u32,
     ) -> PResult<Expr> {
         let saved = self.ctx;
-        // An arrow has no `this`, no `arguments`, and no `yield` of its own — it
-        // inherits them. But `await` follows its OWN async-ness.
+        let saved_labels = std::mem::take(&mut self.labels);
+        // An arrow inherits `this`, `arguments`, `new.target` and the enclosing
+        // `yield`-ness — but `await` follows its OWN async-ness, `return` is
+        // legal in its block body, and `break`/`continue`/labels do NOT reach
+        // out of it (`x => { break; }` inside a loop is still an error).
         self.ctx.await_ = is_async;
         self.ctx.in_ = true;
+        self.ctx.return_ = true;
+        self.ctx.in_loop = false;
+        self.ctx.in_switch = false;
         let body = if self.at(Punct::LBrace) {
             ArrowBody::Block(self.parse_fn_body()?)
         } else {
-            ArrowBody::Expr(Box::new(self.parse_assign()?))
+            ArrowBody::Expr(Box::new(self.parse_assign_full()?))
         };
         self.ctx = saved;
+        self.labels = saved_labels;
         let span = Span::new(start, self.prev_end());
         Ok(Expr::Arrow(Box::new(Arrow { params, body, is_async, span })))
     }
