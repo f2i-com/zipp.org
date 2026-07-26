@@ -577,6 +577,54 @@ mod tests {
     }
 
     #[test]
+    fn a_read_modify_write_cannot_strip_an_object_s_methods() {
+        // Exactly what a UI host does to a bridge object: read it, spread it,
+        // add a key, write it back. The methods it could not see come back as
+        // Null, and must not land as Null.
+        let mut st = compile_script(
+            "var bridge = { greet: function (n) { return 'hi ' + n; }, count: 1 };",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        let slot = slot_of(&st, "bridge");
+
+        let read = st.get_slot(slot);
+        assert_eq!(
+            read,
+            HostValue::Object(vec![
+                ("greet".into(), HostValue::Opaque),
+                ("count".into(), HostValue::Number(1.0)),
+            ])
+        );
+
+        // Write back the shape the host would produce from that read.
+        assert!(st.set_slot(
+            slot,
+            &HostValue::Object(vec![
+                ("greet".into(), HostValue::Null),
+                ("count".into(), HostValue::Number(2.0)),
+                ("added".into(), HostValue::String("x".into())),
+            ]),
+        ));
+        assert_eq!(
+            st.eval_in_context("bridge.greet('bob') + '/' + bridge.count + '/' + bridge.added"),
+            Ok(JsValue::String("hi bob/2/x".into())),
+            "the method survived the round trip"
+        );
+
+        // A key the host omits entirely is preserved when opaque, dropped when
+        // it is data the host chose not to send back.
+        assert!(st.set_slot(slot, &HostValue::Object(vec![("count".into(), HostValue::Number(3.0))])));
+        assert_eq!(st.eval_in_context("bridge.greet('x')"), Ok(JsValue::String("hi x".into())));
+        assert_eq!(st.eval_in_context("typeof bridge.added"), Ok(JsValue::String("undefined".into())));
+
+        // But an explicit value always wins — this protects what the host could
+        // not express, never what it deliberately set.
+        assert!(st.set_slot(slot, &HostValue::Object(vec![("greet".into(), HostValue::Number(9.0))])));
+        assert_eq!(st.eval_in_context("bridge.greet"), Ok(JsValue::Number(9.0)));
+    }
+
+    #[test]
     fn cycles_and_holes_do_not_hang_the_walk() {
         let mut st = compile_script(
             "var cyc = { name: 'root' }; cyc.self = cyc; var sparse = [1, , 3];",

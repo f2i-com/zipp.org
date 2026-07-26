@@ -25,6 +25,11 @@ use zipp_vm::embed::{compile_script, HostValue, ScriptState, SymbolScope};
 
 const PREAMBLE: &str = include_str!("preamble.js");
 
+/// Preamble bindings the host may address by slot even though it did not
+/// declare them. `window` in particular is a two-way channel: hosts stash keys
+/// on it and read them back, so it needs a stable index.
+const EXPOSED_PREAMBLE: &[&str] = &["window", "navigator", "host"];
+
 /// Route Rust panics to `console.error` with a message instead of a bare
 /// `unreachable` trap — without this a panic in wasm is undiagnosable.
 #[wasm_bindgen]
@@ -143,7 +148,11 @@ impl Engine {
         self.slots.clear();
         let out = js_sys::Object::new();
         for s in st.symbols() {
-            if preamble_names.contains(&s.name) {
+            // Preamble names are engine plumbing, with one exception: the host
+            // needs a slot for the bridge objects it also writes to (it syncs
+            // `window.__foo` keys both ways), so those stay visible. Hosts are
+            // expected to exclude them from what they treat as script state.
+            if preamble_names.contains(&s.name) && !EXPOSED_PREAMBLE.contains(&s.name.as_str()) {
                 continue;
             }
             let entry = js_sys::Object::new();

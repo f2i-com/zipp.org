@@ -140,7 +140,7 @@ impl<'p> Vm<'p> {
             return false;
         }
         let _g = self.gc_lock_guard();
-        let v = self.host_in(hv, 0);
+        let v = self.host_in_over(cur, hv, 0);
         self.globals[index as usize] = v;
         true
     }
@@ -284,6 +284,62 @@ impl<'p> Vm<'p> {
                 HostValue::Object(out)
             }
         }
+    }
+
+    /// [`HostValue`] → `Value`, written OVER an existing value.
+    ///
+    /// The slot-level rule — a write may not replace something opaque with the
+    /// placeholder it reads back as — has to hold one level deeper too, because
+    /// a host that reads an object, spreads it, and writes it back sends every
+    /// method it could not see back as `Null`. Without this, a single
+    /// read-modify-write of an object carrying host functions silently strips
+    /// them, and the failure only shows up the next time the script calls one.
+    ///
+    /// So: an incoming `Null`/`Undefined` for a key whose CURRENT value is
+    /// opaque keeps the current value, and keys the host omitted entirely are
+    /// preserved when they are opaque. An explicit non-null write always wins —
+    /// this protects what the host could not express, never what it chose.
+    fn host_in_over(&mut self, old: Value, hv: &HostValue, depth: usize) -> Value {
+        let HostValue::Object(pairs) = hv else {
+            return self.host_in(hv, depth);
+        };
+        if depth >= MAX_DEPTH || !old.is_heap() {
+            return self.host_in(hv, depth);
+        }
+        // Snapshot the old object's own data properties, then drop the borrow.
+        let old_props: Vec<(String, Value)> = match self.heap.get(old.heap_index()) {
+            HeapObj::Object(m) => (0..m.keys.len())
+                .filter(|&i| !m.attrs[i].accessor)
+                .map(|i| (m.keys[i].clone(), m.vals[i]))
+                .collect(),
+            _ => return self.host_in(hv, depth),
+        };
+        let find_old = |k: &str| old_props.iter().find(|(ok, _)| ok == k).map(|(_, v)| *v);
+
+        let mut m = ObjMap::with_capacity(pairs.len().max(old_props.len()));
+        for (k, val) in pairs {
+            let prev = find_old(k);
+            let v = match (val, prev) {
+                // The host is not overwriting here — it is echoing back a value
+                // it was never able to see. Keep what is really there.
+                (HostValue::Null | HostValue::Undefined | HostValue::Opaque, Some(p))
+                    if self.host_is_opaque(p) =>
+                {
+                    p
+                }
+                (_, Some(p)) => self.host_in_over(p, val, depth + 1),
+                (_, None) => self.host_in(val, depth + 1),
+            };
+            m.set(k, v);
+        }
+        // Keys the host dropped entirely: preserve the opaque ones for the same
+        // reason. Data the host omitted is treated as deliberately removed.
+        for (k, p) in &old_props {
+            if !pairs.iter().any(|(pk, _)| pk == k) && self.host_is_opaque(*p) {
+                m.set(k, *p);
+            }
+        }
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
     }
 
     /// [`HostValue`] → `Value`. Builds bottom-up; the caller holds a GC lock for
