@@ -1046,6 +1046,49 @@ mode. The next attempt should start by instrumenting WHICH receiver register and
 which use makes `used_elsewhere` true, rather than fixing gates one at a time —
 three were opened in sequence here and a fourth remained.
 
+### B23 — Bitwise on the f64 (regalloc) path: correct, exercised, and SLOWER
+
+`x[i] = (((i * K) >>> 0) % M) / M` — a Float64Array fill, about as ordinary as
+numeric code gets — had no tier at all: the INT path refuses the division
+(fractional) and the regalloc path refused the shift (`admit_bitwise=false`), so
+it ran on the boxed memory path at 128ms against node's 26ms.
+
+Admitting it is easy and was done: ToInt32 each f64 home via a `cvttsd2si`
+round-trip (rejecting NaN, the infinities, fractions and out-of-i32 values, all
+of which JS defines by a modular reduction the interpreter performs), the 32-bit
+op, then convert back. `-0` needs no special case here, unlike an i64 home:
+ToInt32(-0) is +0, and the round-trip compares equal because IEEE says
+-0.0 == +0.0, so the +0.0 written back IS the defined answer. Verified
+byte-identical to node and the interpreter over both zeroes, both i32 bounds,
+2^32-1, ±Inf, NaN, fractions and 1e21.
+
+It is genuinely exercised — the regalloc tier wins two regions in
+`typedarray-math` that previously fell to memory. And it is a REGRESSION:
+paired medians of 11, `async-promise-chain +5.5%`, mean **+1.3%**.
+
+**Why, and this is the part that generalises.** The cost of a bitwise op depends
+entirely on how the tier represents its operands:
+
+  * INT tier (i64 homes): the low 32 bits ARE ToInt32 already. One instruction,
+    no conversion, no guard. This is why admitting Bitwise to Tier C won.
+  * MEM path (boxed Values): `load_toint32` takes an Int-TAGGED value's i32
+    payload directly — a tag check and a move.
+  * f64 homes: every operand needs `cvttsd2si` + `cvtsi2sd` + `ucomisd` to
+    convert AND prove the conversion exact. Two round-trips per binary op, and
+    the result needs a third conversion going back.
+
+So for integer-valued data the BOXED representation is cheaper than the f64-home
+representation, because a tagged Int carries its payload and an f64 home has to
+compute it. Bitwise belongs on the INT tier or the memory path, never the f64
+path — and the region that "upgraded" from memory to regalloc got slower for
+exactly that reason.
+
+Third consecutive revert in tier-admission work (B20 MathOp/UpvalGet, B22
+DataView, this). The pattern is now explicit enough to state as a rule:
+**admitting an op to a tier is only a win when that tier's value representation
+makes the op cheaper than the tier it is displacing.** Blacklist counts and
+decline logs identify candidates; they do not predict the sign of the change.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
