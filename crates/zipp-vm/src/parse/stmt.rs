@@ -533,32 +533,21 @@ impl<'s> Parser<'s> {
                     let body = self.parse_stmt()?;
                     Ok(Stmt::With { object, body: Box::new(body) })
                 }
-<<<<<<< Updated upstream
                 // `var` is a VariableStatement, which IS a Statement, so it is
                 // legal as the unbraced body of `if`/`else`/`while`/`for`/`do`.
-                // Only `let`/`const`/`class`/`function` are Declarations and
-                // barred here.
+                // Only `let`/`const`/`class` are Declarations and barred here.
                 //
                 // Falling through to the expression parser instead rejected
                 // `if (x) var y = 1;` as "unexpected reserved word". Minifiers
                 // emit that shape constantly — dropping the braces is one of
                 // their standard size wins — so this took out every real-world
                 // bundle, React's included.
-=======
-                // A VariableStatement IS a Statement — `if (c) var x = 1;` is
-                // legal, and transpiled code produces it constantly. Only the
-                // LEXICAL declarations are restricted to StatementListItem.
->>>>>>> Stashed changes
                 Keyword::Var => {
                     self.bump_after_operand()?;
                     let d = self.parse_var_decl(VarKind::Var)?;
                     self.semicolon()?;
                     Ok(Stmt::VarDecl(d))
                 }
-<<<<<<< Updated upstream
-                // A declaration is NOT a Statement, so it is an error here even
-                // though it is fine as a StatementListItem.
-=======
                 // Annex B B.3.4: a function DECLARATION as a bare statement
                 // body (`if (x) function f() {}`, `l: function f() {}`) is
                 // web-compat sloppy-mode legality. Strict code keeps the error.
@@ -570,7 +559,8 @@ impl<'s> Parser<'s> {
                     }
                     Ok(Stmt::FnDecl(Box::new(f)))
                 }
->>>>>>> Stashed changes
+                // A declaration is NOT a Statement, so it is an error here even
+                // though it is fine as a StatementListItem.
                 Keyword::Function | Keyword::Class => Err(SyntaxError::new(
                     "SyntaxError: declaration not allowed in this position",
                     start,
