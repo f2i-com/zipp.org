@@ -1316,6 +1316,46 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B47 — B33-F landed: Map/Set iterator results elided too
+
+| loop | before | after | node |
+|---|---|---|---|
+| `for (v of set)` (positional fast path) | 24.3 | 24.0 | 2.3 |
+| `for (e of map)` (positional fast path) | 51.7 | 51.7 | 5.0 |
+| `map.keys()` | 155.7 | **38.0** | 3.3 |
+| `map.values()` | 166.3 | **39.7** | 3.0 |
+| `map.entries()` | 175.3 | **62.0** | 5.0 |
+
+ns/step. **4.1x, 4.2x, 2.8x** — the same magnitude as B45, and predicted by it:
+this is the identical shape (an iterator OBJECT stepped by the pristine
+`ITER_NEXT`, where the step itself is a trivial collection walk so the result
+object dominates). The rows that already had a positional fast path do not move,
+which is the control.
+
+`collection_iter_step` is the Map/Set + snapshot tail lifted out of `ITER_NEXT`
+and shared with the `IterNext` opcode. It answers `None` for a TypedArray-backed
+iterator, whose per-step out-of-bounds check can THROW and therefore keeps its
+own path.
+
+Verified against node across twelve shapes: deleting during iteration (tombstones
+skipped, not shifted), appending during iteration (seen), exhaustion LATCHING so
+a later add is not iterated, a patched `%MapIteratorPrototype%.next` (honoured,
+then restored), Set holes, `entries` shape, TypedArray iterators, destructuring,
+spread, and the result object when the USER holds it. Both tiers, under
+`ZIPP_GC_STRESS`.
+
+**Suite: `map-set-heavy` -0.3%, i.e. nothing** — it uses `for (const [k, v] of
+map)`, which takes the POSITIONAL fast path that already existed and never built
+an iterator object. The benchmark exercises the one Map/Set iteration form this
+does not touch. Worth stating plainly, because "the Map/Set bench did not move"
+is otherwise easy to read as "Map/Set iteration did not improve".
+
+**The B45/B46/B47 sequence is the useful record.** The same optimisation was
+worth 3.8x (array iterators), 2% (generators) and 4.1x (Map/Set). B33 priced all
+three from the object's cost alone and got two right and one wrong. What decides
+it is what SURROUNDS the object: a trivial step leaves the object dominant, a
+step that suspends and resumes a frame does not.
+
 ### B46 — B33-B is REFUTED as written: the generator result object is not the cost
 
 B33 priced `for (v of gen())` at 174ns/step against node's 8.3 and attributed it

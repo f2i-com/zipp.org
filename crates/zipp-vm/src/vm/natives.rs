@@ -895,6 +895,89 @@ impl<'p> Vm<'p> {
         Ok(result)
     }
 
+
+    /// One step of a live Map/Set iterator, or of a snapshot iterator, WITHOUT
+    /// materialising the `{value, done}` result object.
+    ///
+    /// `None` only for a TypedArray-backed iterator, whose per-step
+    /// out-of-bounds check can THROW and therefore keeps its own path.
+    ///
+    /// Same elision argument as `array_iter_step`, and the same measured shape:
+    /// `map.keys()` cost 155.7ns/step against node's 3.3 while `for (e of map)`
+    /// — which already had a positional fast path — cost 51.7. The gap is the
+    /// object.
+    ///
+    /// Semantics preserved exactly: tombstoned (deleted) slots are skipped,
+    /// entries appended after the iterator was created ARE seen, and exhaustion
+    /// LATCHES via `usize::MAX` so a later add is not iterated.
+    pub(crate) fn collection_iter_step(&mut self, it_idx: u32) -> Option<(Value, bool)> {
+        let (live, mut index) = match self.heap.get(it_idx) {
+            HeapObj::Iterator { live, index, .. } => (*live, *index),
+            _ => return None,
+        };
+        if let Some((coll, _)) = live {
+            if matches!(self.heap.get(coll), HeapObj::TypedArray { .. }) {
+                return None;
+            }
+        }
+        let out = if let Some((coll, kind)) = live {
+            let mut result = (Value::UNDEFINED, true);
+            if index != usize::MAX {
+                loop {
+                    // Copy out the (key, value) at `index` (or stop), releasing
+                    // the heap borrow before any allocation below.
+                    let pair: Option<(Value, Value)> = match self.heap.get(coll) {
+                        HeapObj::Set(items) => {
+                            if index >= items.len() {
+                                break;
+                            }
+                            let v = items[index];
+                            (!v.is_hole()).then_some((v, v))
+                        }
+                        HeapObj::Map { keys, vals } => {
+                            if index >= keys.len() {
+                                break;
+                            }
+                            let k = keys[index];
+                            (!k.is_hole()).then_some((k, vals[index]))
+                        }
+                        _ => break, // collection gone
+                    };
+                    index += 1;
+                    if let Some((k, v)) = pair {
+                        let yielded = match kind {
+                            0 => k,
+                            1 => v,
+                            _ => Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))),
+                        };
+                        result = (yielded, false);
+                        break;
+                    }
+                }
+            }
+            // Persist the cursor; on exhaustion latch permanent-done.
+            let store = if result.1 { usize::MAX } else { index };
+            if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                *i = store;
+            }
+            result
+        } else {
+            match self.heap.get_mut(it_idx) {
+                HeapObj::Iterator { items, index: i, .. } => {
+                    if *i < items.len() {
+                        let v = items[*i];
+                        *i += 1;
+                        (v, false)
+                    } else {
+                        (Value::UNDEFINED, true)
+                    }
+                }
+                _ => return None,
+            }
+        };
+        Some(out)
+    }
+
     pub(crate) fn call_native(&mut self, id: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         use native::*;
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -3460,64 +3543,14 @@ impl<'p> Vm<'p> {
                     m.set("done", Value::bool(done));
                     return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))));
                 }
-                let (val, done) = if let Some((coll, kind)) = live {
-                    // Live Map/Set iterator: step the backing collection, skipping
-                    // tombstoned (deleted) slots; appends made after creation are seen.
-                    // Once the cursor reaches the end the iterator is PERMANENTLY done
-                    // (a later add is NOT iterated), marked by index == usize::MAX.
-                    let mut result = (Value::UNDEFINED, true);
-                    if index != usize::MAX {
-                        loop {
-                            // Copy out the (key, value) at `index` (or stop), releasing
-                            // the heap borrow before any allocation below.
-                            let pair: Option<(Value, Value)> = match self.heap.get(coll) {
-                                HeapObj::Set(items) => {
-                                    if index >= items.len() {
-                                        break;
-                                    }
-                                    let v = items[index];
-                                    (!v.is_hole()).then_some((v, v))
-                                }
-                                HeapObj::Map { keys, vals } => {
-                                    if index >= keys.len() {
-                                        break;
-                                    }
-                                    let k = keys[index];
-                                    (!k.is_hole()).then_some((k, vals[index]))
-                                }
-                                _ => break, // collection gone
-                            };
-                            index += 1;
-                            if let Some((k, v)) = pair {
-                                let yielded = match kind {
-                                    0 => k,
-                                    1 => v,
-                                    _ => Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))),
-                                };
-                                result = (yielded, false);
-                                break;
-                            }
-                        }
-                    }
-                    // Persist the cursor; on exhaustion latch permanent-done.
-                    let store = if result.1 { usize::MAX } else { index };
-                    if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
-                        *i = store;
-                    }
-                    result
-                } else {
-                    match self.heap.get_mut(it_idx) {
-                        HeapObj::Iterator { items, index: i, .. } => {
-                            if *i < items.len() {
-                                let v = items[*i];
-                                *i += 1;
-                                (v, false)
-                            } else {
-                                (Value::UNDEFINED, true)
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
+                // Live Map/Set, or a snapshot iterator. Shared with the
+                // `IterNext` opcode, which takes the pair and never builds the
+                // result object — see `collection_iter_step`.
+                let (val, done) = match self.collection_iter_step(it_idx) {
+                    Some(p) => p,
+                    // Unreachable from here: the TypedArray-backed case is
+                    // handled above and is the only thing that answers `None`.
+                    None => (Value::UNDEFINED, true),
                 };
                 let mut m = ObjMap::new();
                 m.set("value", val);

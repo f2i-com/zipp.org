@@ -5679,6 +5679,19 @@ impl<'p> Vm<'p> {
                                         ip += 1;
                                         continue;
                                     }
+                                    // Map/Set (`map.keys()`, `set.values()`,
+                                    // `map.entries()`) and snapshot iterators.
+                                    // `None` leaves the TypedArray-backed case,
+                                    // whose per-step bounds check can throw, on
+                                    // the general path below.
+                                    if let Some((val, done)) =
+                                        self.collection_iter_step(it.heap_index())
+                                    {
+                                        self.set(base, value_dst, val);
+                                        self.set(base, done_dst, Value::bool(done));
+                                        ip += 1;
+                                        continue;
+                                    }
                                 }
                                 let res = self.call_value(next, it, &[])?;
                                 // IteratorNext step 3: a non-Object result is a TypeError.
