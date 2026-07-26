@@ -75,6 +75,38 @@ pub fn params_reference(name: &str, params: &Params) -> bool {
     refs.contains(name)
 }
 
+/// Nested functions living inside a binding pattern's DEFAULT expressions.
+///
+/// Mirrors `pattern_init_refs`, but feeds `collect_nested_free_expr` so a
+/// function written as a default (`const {f = () => x} = o`) has its own free
+/// names accounted for.
+fn collect_nested_free_pattern(pat: &Pattern, out: &mut HashSet<String>) {
+    match pat {
+        Pattern::Ident(_) => {}
+        Pattern::Assign { left, right } => {
+            collect_nested_free_expr(right, out);
+            collect_nested_free_pattern(left, out);
+        }
+        Pattern::Rest(inner) => collect_nested_free_pattern(inner, out),
+        Pattern::Object { props, rest } => {
+            for prop in props {
+                if let PropKey::Computed(ke) = &prop.key {
+                    collect_nested_free_expr(ke, out);
+                }
+                collect_nested_free_pattern(&prop.value, out);
+            }
+            if let Some(rest) = rest {
+                collect_nested_free_pattern(rest, out);
+            }
+        }
+        Pattern::Array(elems) => {
+            for el in elems.iter().flatten() {
+                collect_nested_free_pattern(&el.pat, out);
+            }
+        }
+    }
+}
+
 /// Collect every name referenced by a DEFAULT-VALUE expression nested anywhere
 /// inside a binding pattern (array/object destructuring element defaults).
 fn pattern_init_refs(pat: &Pattern, out: &mut HashSet<String>) {
@@ -314,6 +346,11 @@ fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
                 if let Some(init) = &decl.init {
                     expr_refs(init, out);
                 }
+                // Destructuring DEFAULTS read names too: `const {bgColor:m=Cb}=o`
+                // references `Cb`. Walking only the initializer missed them, so a
+                // name used solely as a pattern default was never captured and
+                // threw "not defined" — the same gap parameter defaults had.
+                pattern_init_refs(&decl.id, out);
             }
         }
         Stmt::Block(b) => {
@@ -411,6 +448,17 @@ fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
         // deliberately: the gate is byte-identical bytecode.
         _ => {}
     }
+}
+
+/// Does `e` reference `name` anywhere?
+///
+/// Used to decide whether an assignment's right-hand side may observe the
+/// target register, which matters when a form writes the destination partway
+/// through evaluating itself.
+pub(crate) fn references_name(e: &Expr, name: &str) -> bool {
+    let mut set = HashSet::new();
+    expr_refs(e, &mut set);
+    set.contains(name)
 }
 
 fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
@@ -658,6 +706,9 @@ fn collect_nested_free(s: &Stmt, out: &mut HashSet<String>) {
                 if let Some(init) = &decl.init {
                     collect_nested_free_expr(init, out);
                 }
+                // A default can itself contain a function
+                // (`const {f = () => x} = o`), whose free names must be seen.
+                collect_nested_free_pattern(&decl.id, out);
             }
         }
         Stmt::Block(b) => {

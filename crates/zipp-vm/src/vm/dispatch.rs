@@ -378,7 +378,17 @@ impl<'p> Vm<'p> {
                                     HeapObj::Object(m) if m.pos(&name).is_some()
                                 );
                             if !has_own {
-                                return Err(Thrown(format!("ReferenceError: {name} is not defined")));
+                                // Name the enclosing function, as the
+                                // not-a-function and property-read errors do:
+                                // Error.stack is empty, so a bare identifier is
+                                // not enough to find the reference in minified
+                                // code. Built only on the throw path.
+                                let f = self.func(func_id as usize);
+                                let fname: &str =
+                                    if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                                return Err(Thrown(format!(
+                                    "ReferenceError: {name} is not defined (in {fname})"
+                                )));
                             }
                             let gobj = Value::heap(self.global_this);
                             let val = self.get_prop(gobj, &name)?;

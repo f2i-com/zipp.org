@@ -63,26 +63,41 @@ use crate::parse::ast::{
 /// property. This is deliberately a whitelist of what is SAFE-by-omission — a
 /// new in-place-building form must be added here, and `assign_reads_target` in
 /// the tests covers each shape.
-fn builds_into_dst_incrementally(e: &Expr) -> bool {
+fn builds_into_dst_incrementally(e: &Expr, target: &str) -> bool {
     match e {
         Expr::Object(_) => true,
         // A template with no interpolations is a plain constant string.
         Expr::Template(t) => !t.exprs.is_empty(),
         Expr::Cond { cons, alt, .. } => {
-            builds_into_dst_incrementally(cons) || builds_into_dst_incrementally(alt)
+            builds_into_dst_incrementally(cons, target)
+                || builds_into_dst_incrementally(alt, target)
         }
         Expr::Logical { left, right, .. } => {
-            builds_into_dst_incrementally(left) || builds_into_dst_incrementally(right)
+            // A logical stores the LEFT value in the destination and only then
+            // evaluates the right, so a right operand that reads the target sees
+            // the left value instead of the target's old one.
+            //
+            // `s = m.get(s) || s` — look it up, else keep what you had — is one
+            // of the most common idioms there is, and in place it always yielded
+            // the miss: `m.get(s)` wrote undefined over `s`, then `|| s` read
+            // that undefined back. React resolves every attribute alias this
+            // way, so each `aria-*` prop reached the DOM with an undefined NAME.
+            crate::capture::references_name(right, target)
+                || builds_into_dst_incrementally(left, target)
+                || builds_into_dst_incrementally(right, target)
         }
-        Expr::Seq(exprs) => exprs.last().is_some_and(builds_into_dst_incrementally),
+        Expr::Seq(exprs) => exprs
+            .last()
+            .is_some_and(|e| builds_into_dst_incrementally(e, target)),
         // NOTE: the former `ParenthesizedExpression` arm is gone — the AST has
         // no such node. Parenthesisation is observable only on an assignment
         // TARGET (`Target::Ident { covered }`), never on the value side, so
         // nothing is lost: a parenthesised object literal reaches the `Object`
         // arm directly instead of through a peel.
-        Expr::Assign { target, value, .. } => {
+        Expr::Assign { target: tgt, value, .. } => {
             // All three member shapes (`a.b`, `a[b]`, `a.#b`) are one node now.
-            matches!(target, Target::Member(_)) || builds_into_dst_incrementally(value)
+            matches!(tgt, Target::Member(_))
+                || builds_into_dst_incrementally(value, target)
         }
         _ => false,
     }
@@ -911,7 +926,7 @@ impl<'a> FnCompiler<'a> {
                         // React's minified `createContext` is exactly this shape —
                         // `e = {_currentValue: e, …}` — so getting it wrong makes
                         // every context self-referential.
-                        let into = if builds_into_dst_incrementally(value) {
+                        let into = if builds_into_dst_incrementally(value, &name) {
                             self.temp()
                         } else {
                             r
