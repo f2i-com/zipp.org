@@ -121,20 +121,21 @@ fn pattern_init_refs(pat: &Pattern, out: &mut HashSet<String>) {
 ///
 /// The parameter names themselves are treated as bound: a default referring to
 /// an earlier parameter is not a capture of anything outer.
-fn params_free(p: &ox::FormalParameters, bound: &[String], out: &mut HashSet<String>) {
+fn params_free(p: &Params, bound: &[String], out: &mut HashSet<String>) {
+    // `pattern_init_refs` already walks a Pattern for every expression that
+    // evaluates in the parameter scope — defaults (`Pattern::Assign.right`) at
+    // any depth, and computed keys in object patterns. In this AST a defaulted
+    // parameter IS a `Pattern::Assign` inside `items`, so what used to need a
+    // separate `initializer` field is one pass.
     let mut refs = HashSet::new();
     for item in &p.items {
-        if let Some(init) = &item.initializer {
-            expr_refs(init, &mut refs);
-        }
-        pattern_init_refs(&item.pattern, &mut refs);
+        pattern_init_refs(item, &mut refs);
     }
-    if let Some(r) = &p.rest {
-        pattern_init_refs(&r.rest.argument, &mut refs);
-    }
-    for name in refs {
-        if !bound.iter().any(|b| *b == name) {
-            out.insert(name);
+    // The parameter names themselves are bound: a default referring to an
+    // earlier parameter captures nothing outer.
+    for r in refs {
+        if !bound.iter().any(|b| *b == r) {
+            out.insert(r);
         }
     }
 }
@@ -602,7 +603,7 @@ fn fn_node_free(f: &Function, out: &mut HashSet<String>) {
     param_names.push("arguments".to_string());
     let inner = free_vars(&param_names, &f.body.stmts);
     out.extend(inner);
-    params_free(params, &param_names, out);
+    params_free(&f.params, &param_names, out);
 }
 
 fn arrow_free(a: &Arrow, out: &mut HashSet<String>) {
