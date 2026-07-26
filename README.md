@@ -37,15 +37,18 @@ finished result — they are the current state.
 | ECMA-262 + staging, both modes | 96,029 | 93,835 (97.72%) |
 | intl402 (opt-in, `--include-intl402`) | 3,341 | 563 (16.9%) |
 
-The 2,194 remaining failures are 1,265 distinct files (most run in both sloppy
-and strict mode). **845 of those are static-semantics early errors the engine
-does not raise at all** — `let x; let x;`, `let x; var x;`, duplicate class
-constructors and duplicate labels all currently run instead of being a
-`SyntaxError`. The cause is that `zipp-vm` pulls `oxc_parser` but not
-`oxc_semantic`, which is one of the reasons the engine is growing its own front
-end (`src/parse/`): a parser that raises early errors as it goes closes the
-single largest category left. The dominant intl402 cause is separate —
-`Intl.DateTimeFormat` cannot be constructed at all (`vm/intl.rs:436`).
+The engine parses with its own hand-written front end (`src/parse/`: lexer,
+AST, recursive-descent parser with the spec's cover-grammar technique — no
+backtracking, no oxc). That parser raises early errors as it goes — duplicate
+lexical declarations, `let`/`var` conflicts across block boundaries, duplicate
+class constructors and labels, CoverInitializedName, strict-mode restrictions —
+which were the single largest failure category (845 of the 2,194 baseline
+failures at the time of the swap; the number above predates re-baselining with
+the parser's early errors, so expect it to move). Annex B call assignment
+targets (`f() = 1` in sloppy code) parse natively as `Target::Call` and throw a
+`ReferenceError` at runtime, replacing a rewrite-and-reparse workaround. The
+dominant intl402 cause is separate — `Intl.DateTimeFormat` cannot be
+constructed at all (`vm/intl.rs:436`).
 
 `tools/test262-expected-failures.txt` is the checked-in baseline, so a
 regression is a diff rather than a remembered number.

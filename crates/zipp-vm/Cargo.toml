@@ -6,11 +6,6 @@ license.workspace = true
 description = "ZIPP dynamic JavaScript engine v2 — explicit-frame register VM with a NaN-boxed value model, designed from the ground up so a JIT can keep unboxed values in registers across call boundaries (the property V8 wins on)."
 
 [dependencies]
-oxc_allocator = "0.126.0"
-oxc_ast = "0.126.0"
-oxc_parser = "0.126.0"
-oxc_span = "0.126.0"
-oxc_syntax = "0.126.0"
 rustc-hash = { workspace = true }
 # The regex engine. A DIRECT path dependency on our fork rather than a
 # crates.io version rewritten by `[patch.crates-io]`: zipp-vm calls

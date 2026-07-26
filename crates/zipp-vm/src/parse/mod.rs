@@ -26,7 +26,6 @@
 
 pub mod ast;
 pub mod lexer;
-pub mod oxc_bridge;
 pub mod cover;
 pub mod stmt;
 pub mod expr;

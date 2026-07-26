@@ -34,9 +34,6 @@ mod parse;
 pub mod value;
 mod vm;
 
-use oxc_allocator::Allocator;
-use oxc_parser::Parser;
-use oxc_span::SourceType;
 
 pub use value::Value;
 
@@ -111,23 +108,6 @@ pub fn parse_to_text(src: &str, module: bool) -> Result<String, String> {
         Ok(p) => Ok(format!("{p:#?}")),
         Err(e) => Err(format!("{} (at {})", e.msg, e.pos)),
     }
-}
-
-/// Parse with oxc, lower to zipp's own AST, and return a canonical text form.
-///
-/// The bridge's own gate: an `Err` here is a construct the new AST cannot yet
-/// represent, and finding those against a real corpus is the point of having a
-/// bridge at all.
-pub fn lower_to_text(src: &str, module: bool) -> Result<String, String> {
-    let allocator = Allocator::default();
-    let source_type = if module { SourceType::mjs() } else { SourceType::cjs() };
-    let ret = Parser::new(&allocator, src, source_type).parse();
-    if !ret.errors.is_empty() {
-        return Err(format!("SyntaxError: {}", ret.errors[0]));
-    }
-    let goal = if module { parse::ast::Goal::Module } else { parse::ast::Goal::Script };
-    let lowered = parse::oxc_bridge::lower_program(&ret.program, goal)?;
-    Ok(format!("{lowered:#?}"))
 }
 
 /// Parse + compile, no VM. Shares `run_with_base`'s Annex B parse-retry so the

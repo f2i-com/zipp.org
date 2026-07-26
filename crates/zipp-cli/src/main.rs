@@ -93,17 +93,16 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("ast") => {
-            // Parse with oxc, lower to zipp's AST, print it. The bridge's
-            // debugging aid and the input side of the Stage 1 gate.
+            // Parse with zipp's parser and print the AST.
             let mut path = None;
             let mut module = false;
             let mut sweep = false;
-            let mut use_parser = false;
             for a in it.by_ref() {
                 match a.as_str() {
                     "--module" => module = true,
                     "--sweep" => sweep = true,
-                    "--parser" => use_parser = true,
+                    // The front end is no longer selectable — there is one.
+                    "--parser" => {}
                     other => path = Some(other.to_string()),
                 }
             }
@@ -111,38 +110,32 @@ fn run(args: &[String]) -> Result<(), String> {
             if !sweep {
                 let src = std::fs::read_to_string(&path)
                     .map_err(|e| format!("cannot read '{path}': {e}"))?;
-                let text = if use_parser {
-                    zipp_vm::parse_to_text(&src, module)?
-                } else {
-                    zipp_vm::lower_to_text(&src, module)?
-                };
-                println!("{text}");
+                println!("{}", zipp_vm::parse_to_text(&src, module)?);
                 return Ok(());
             }
-            // Sweep: lower everything and report what the AST cannot yet say.
+            // Sweep: parse everything and report failures grouped by reason.
             let mut files = Vec::new();
             collect_js(std::path::Path::new(&path), &mut files);
             files.sort();
-            let (mut ok, mut unsupported, mut unparsed) = (0usize, 0usize, 0usize);
+            let (mut ok, mut failed) = (0usize, 0usize);
             let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
             for f in &files {
                 let Ok(src) = std::fs::read_to_string(f) else { continue };
                 let m = f.extension().is_some_and(|e| e == "mjs");
-                match zipp_vm::lower_to_text(&src, m) {
+                let r = zipp_vm::parse_to_text(&src, m)
+                    .or_else(|_| zipp_vm::parse_to_text(&src, true));
+                match r {
                     Ok(_) => ok += 1,
-                    Err(e) if e.starts_with("SyntaxError") => unparsed += 1,
                     Err(e) => {
-                        unsupported += 1;
-                        // Group by reason, not by file: one gap usually explains many.
-                        let key = e.splitn(2, " at ").next().unwrap_or(&e).to_string();
+                        failed += 1;
+                        let key: String =
+                            e.split(" (at ").next().unwrap_or(&e).chars().take(90).collect();
                         *reasons.entry(key).or_default() += 1;
                     }
                 }
             }
-            println!("{} files: {ok} lowered, {unsupported} unsupported, {unparsed} not valid JS", files.len());
+            println!("{} files: {ok} parsed, {failed} failed", files.len());
             if !reasons.is_empty() {
-                println!("
-unsupported by reason:");
                 let mut v: Vec<_> = reasons.into_iter().collect();
                 v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
                 for (r, n) in v.iter().take(25) {
@@ -213,77 +206,6 @@ unsupported by reason:");
                 Err(format!("{differ} mismatches"))
             }
         }
-        Some("parsediff") => {
-            // The parser's gate: our parser vs the oxc bridge, over a corpus.
-            // The bridge's output is already known to compile byte-identically,
-            // so any disagreement here is the parser's, with one suspect.
-            let paths: Vec<String> = it.cloned().collect();
-            if paths.is_empty() {
-                return Err("usage: zipp parsediff <file-or-dir>...".into());
-            }
-            let mut files = Vec::new();
-            for p in &paths {
-                collect_js(std::path::Path::new(p), &mut files);
-            }
-            files.sort();
-            let (mut same, mut differ, mut ours_err, mut both_err) = (0usize, 0usize, 0usize, 0usize);
-            let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
-            for f in &files {
-                let Ok(src) = std::fs::read_to_string(f) else { continue };
-                let m = f.extension().is_some_and(|e| e == "mjs");
-                let mut theirs = zipp_vm::lower_to_text(&src, m);
-                let mut ours = zipp_vm::parse_to_text(&src, m);
-                // A `.js` file that is really an ES MODULE: oxc parses module
-                // syntax under any goal, so the bridge accepts it as a script
-                // while our parser (correctly) rejects `import`/`export` there.
-                // Retry BOTH sides under the module goal and compare those.
-                if !m && ours.is_err() && theirs.is_ok() {
-                    let mt = zipp_vm::lower_to_text(&src, true);
-                    let mo = zipp_vm::parse_to_text(&src, true);
-                    if mo.is_ok() {
-                        theirs = mt;
-                        ours = mo;
-                    }
-                }
-                match (&theirs, &ours) {
-                    (Ok(a), Ok(b)) if a == b => same += 1,
-                    (Ok(_), Ok(_)) => {
-                        differ += 1;
-                        if differ <= 10 {
-                            println!("DIFFER  {}", f.display());
-                        }
-                    }
-                    // oxc rejected it too: agreement about invalid input.
-                    (Err(_), Err(_)) => both_err += 1,
-                    (Ok(_), Err(e)) => {
-                        ours_err += 1;
-                        let key: String = e.split(" (at ").next().unwrap_or(e).chars().take(90).collect();
-                        *reasons.entry(key).or_default() += 1;
-                    }
-                    (Err(_), Ok(_)) => {
-                        differ += 1;
-                        if differ <= 10 {
-                            println!("WE-ACCEPT-THEY-REJECT  {}", f.display());
-                        }
-                    }
-                }
-            }
-            println!(
-                "
-{} files: {same} identical, {differ} differing AST, {ours_err} we reject, {both_err} both reject",
-                files.len()
-            );
-            if !reasons.is_empty() {
-                println!("
-our parse failures by reason:");
-                let mut v: Vec<_> = reasons.into_iter().collect();
-                v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-                for (r, n) in v.iter().take(20) {
-                    println!("  {n:5}  {r}");
-                }
-            }
-            Ok(())
-        }
         Some("--help") | Some("-h") | None => {
             println!("zipp — a clean-sheet JavaScript engine\n");
             println!("usage:");
@@ -291,6 +213,7 @@ our parse failures by reason:");
             println!("  zipp mjs <file.mjs>             run a file as an ES module");
             println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
             println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");
+            println!("  zipp ast <file-or-dir>          parse and print the AST (--sweep for a corpus)");
             println!("\nenvironment:");
             println!("  ZIPP_NOJIT=1                    interpreter only (no native codegen)");
             println!("  ZIPP_GC_STRESS=1                collect on every allocation");
