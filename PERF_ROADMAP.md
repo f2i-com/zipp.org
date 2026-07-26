@@ -1270,6 +1270,31 @@ its refutation deliberately.
 Before quoting any microbenchmark in this file, check with `ZIPP_JITLOG=1`
 whether its loop actually compiled.
 
+### B28 — Mark bits as a BITMAP: slower (+0.8%)
+
+Sweep is the dominant GC phase (B25), and roughly a third of it is simply
+walking the `marks` array. That array is `Vec<bool>` — one BYTE per slot — and
+mark, sweep and the 36 side-table prunes each stream all of it, so on a 1.2M-slot
+heap it is a 1.2MB array (larger than L2) re-zeroed every collection. As bits it
+would be 147KB and stay resident.
+
+Built it (`MarkBits` over `Vec<u64>`, `get`/`set` by shift and mask), verified
+correct under `ZIPP_GC_STRESS` and against node. Result: **+0.8% mean** over 9
+paired reps — map-set-heavy +2.1%, regex-log-scan +1.8%, sparse-array +3.1%.
+Reverted.
+
+The shift/mask per access costs more than the byte load it replaces, and the
+prune closures (`retain(|&k, _| marks[k])`) pay it per map entry, which is where
+the regressing benches spend their prune time. The array being smaller than L2
+did not matter because it is streamed SEQUENTIALLY — the hardware prefetcher
+already handled the byte version, so the win was hypothetical while the extra ALU
+work per access was not.
+
+Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
+Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
+timing the GC, logging tier declines. Every probe that started from reading the
+code and reasoning about what ought to be expensive has been wrong.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
