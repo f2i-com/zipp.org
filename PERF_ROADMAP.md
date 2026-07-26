@@ -1316,7 +1316,7 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
-### B41 — The MEM tier is not naively slow. The missing piece is a property IC.
+### B41 — The MEM tier is already well optimised. There is no single missing mechanism.
 
 Checked the emitter rather than assuming. `codegen/region_mem.rs` already emits
 INLINE machine code — no helper call — for a pinned dense Array read: identity
@@ -1324,28 +1324,26 @@ guard against the snapshot, unsigned bounds check, `mov rax, [rdx + rcx*8]`,
 HOLE compare, store. Same shape for a pinned TypedArray. 32 call sites in 1,826
 lines, so the tier is mostly inline already.
 
-What has NO inline path is **a plain OBJECT property access with a non-constant
-key**, which falls to the generic helper. That is the op in B39's 21ns
-measurement that is not already fast, and it is the op every object-shaped
-benchmark is made of.
+Nor is `GetProp` a helper call. `Instr::GetProp` in the same file carries an
+**8-way inline cache that is CALL-FREE on a hit** — receiver identity plus live
+receiver version, plus the live version of each guarded proto hop, then a direct
+read of the holder's `vals_ptr[slot]`. It even inlines a trivial class getter.
+Constant-key object property reads are already about as good as an
+identity-keyed cache gets.
 
-The infrastructure for the fix already exists and is used for something else:
-`MethodInlineShape` (`vm/engine/jit_plans.rs`) bakes `(recv_bits, recv_ver,
-vals_ptr, method_slot)` for a monomorphic CallMethod site and the emitter loads
-through it. Extending exactly that to a property READ — bake the slot, guard
-identity + version, `mov` from `vals_ptr` — is the concrete next step, not a
-rewrite.
+**So the inventory of what IS already inlined in compiled code is:** constant-key
+property reads (8-way IC), pinned dense-Array elements, pinned TypedArray
+elements, monomorphic method calls, and — since this session — sloppy leaf calls.
+The one shape left on the generic helper is a property access with a
+NON-CONSTANT key (`o[expr]`), which is the dictionary-churn form that
+`polymorphic-objects` is built from and which is rare in ordinary code.
 
-**Scope it honestly before building it.** It needs a monomorphic receiver, so it
-helps `rd.js`-shaped code (one object read in a loop) and probably
-`class-prototype-hot` (5 receivers, inside `IC_WAYS`), and it does NOT help
-`json-large` (walks thousands of distinct objects) or `markdown-render` (creates
-no objects). Per B40 that makes it another sub-uniform item unless it is paired
-with shapes — a shape-keyed guard instead of an identity-keyed one is what makes
-it work for the megamorphic sites, and that is the hidden-classes project again.
-
-So the honest ordering is: shapes FIRST (so the guard can be shape-keyed), then
-this. Doing this alone repeats the pattern B40 warns about.
+That materially shrinks what B39 implied. The compiled tier is not missing a
+mechanism; it is missing the last few percent on several axes at once, exactly
+as B40's arithmetic says. The honest ordering for anyone taking this further is
+still shapes FIRST — a shape-keyed guard is what lifts the existing 8-way IC off
+the `IC_WAYS = 8` identity cliff and makes it work for megamorphic sites — and
+only then a dynamic-key variant of it.
 
 ### B40 — What "under 2x geomean" actually costs, computed from the current ratios
 
