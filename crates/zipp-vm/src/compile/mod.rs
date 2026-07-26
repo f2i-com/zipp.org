@@ -492,6 +492,22 @@ struct FnCompiler<'a> {
     /// `CellSetChecked` (a write during the TDZ is a ReferenceError).
     /// Cleaned per-register in `pop_scope`.
     block_tdz_cells: HashSet<Reg>,
+    /// Registers of ARROW-BODY-level lexical cells pre-created in TDZ at entry
+    /// (so a hoisted nested function can capture them) whose textual
+    /// declaration has not been compiled yet. Gates ONLY the choice of
+    /// `CellSetChecked` over `CellSet` in `store_binding`, so that an
+    /// ASSIGNMENT reaching one during its TDZ is the ReferenceError it should
+    /// be — `(() => { b = 0; let b; })()`.
+    ///
+    /// Deliberately NOT `block_tdz_cells`: that set has a second job (deciding
+    /// whether a textual declaration REUSES the pre-created register), and
+    /// entry cells must not participate in that.
+    ///
+    /// A register LEAVES this set at its declaration — including the
+    /// destructuring path — because `store_binding` also emits the
+    /// declaration's OWN initializing store, and a checked store there would
+    /// throw on the very cell it is initializing.
+    entry_tdz_cells: HashSet<Reg>,
     /// Registers holding CATCH PARAMETERS (simple-identifier `catch (e)`
     /// bindings). Annex B B.3.5 allows a same-named `var` / promoted block
     /// function alongside one (no early error), so the B.3.3-applicability

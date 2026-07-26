@@ -609,14 +609,34 @@ pub(crate) fn plan_region_cold(
             alias: FxHashMap::default(),
             cmp: None,
         };
+        // Live-ins get the interval the ENTRY GUARD ACTUALLY ENFORCES, which is
+        // `IV_FULL` = [-2^53, 2^53] — not `IV_I32`.
+        //
+        // These were seeded IV_I32 back when `emit_int_entry_load` admitted only
+        // Int-TAGGED values, whose payload is an i32 by construction. That load
+        // now also admits a double holding an exact integer up to ±2^53 (so a
+        // loop whose accumulator crosses 2^31 can re-enter the tier at all), and
+        // the two contracts silently diverged: the analysis went on believing
+        // every live-in was ≤ 2^31 and elided guards on that basis.
+        //
+        // It is reachable. `for (…) { out = x * 1024; x = x - 0; }` entered with
+        // x = 2^53 seeds x as i32, concludes the product is at most 2^41, elides
+        // the 2^53 guard AND strength-reduces the multiply to `psllq 10` — and
+        // 2^53 << 10 is the i64 sign bit, i.e. -2^63 instead of +2^63.
+        //
+        // Eliding is harmless while the i64 arithmetic stays exact (above 2^53
+        // an i64 is MORE precise than the f64 JS would produce, and exit boxing
+        // rounds it to the same answer); the divergence begins where i64 itself
+        // overflows. IV_FULL is what the guard promises, so it is what the
+        // analysis is told.
         for (&r, &def_first) in &first_seen {
             if !def_first && ty.get(&r) == Some(&VTy::Num) {
-                entry.regs.insert(r, IV_I32); // live-in reg: entry-guarded Int
+                entry.regs.insert(r, IV_FULL);
             }
         }
         for (&g, &read_first) in &glob_first_read {
             if read_first {
-                entry.globs.insert(g, IV_I32); // live-in global: entry-guarded Int
+                entry.globs.insert(g, IV_FULL);
             }
         }
         for &r in &hoisted {

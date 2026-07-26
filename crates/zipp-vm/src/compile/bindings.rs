@@ -92,7 +92,7 @@ impl<'a> FnCompiler<'a> {
                 // A block-entry pre-created lexical cell whose declaration has
                 // not yet been compiled: the assignment may run during its TDZ,
                 // so the checked store rejects an UNINITIALIZED cell.
-                if self.block_tdz_cells.contains(cell) {
+                if self.block_tdz_cells.contains(cell) || self.entry_tdz_cells.contains(cell) {
                     self.emit(Instr::CellSetChecked { cell: *cell, src });
                 } else {
                     self.emit(Instr::CellSet { cell: *cell, src });

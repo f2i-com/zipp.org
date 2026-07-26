@@ -1214,6 +1214,11 @@ impl Compiler {
                         fc.emit(Instr::MakeCellTdz { reg: r });
                         fc.cell_regs.insert(r);
                         fc.entry_lexicals.insert(name.clone());
+                        // The cell now EXISTS, so an assignment before the
+                        // textual declaration resolves to it and would emit a
+                        // plain `CellSet`, writing straight through the TDZ.
+                        // A read always threw, which is why this looked fine.
+                        fc.entry_tdz_cells.insert(r);
                     }
                 }
             }

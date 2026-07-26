@@ -713,11 +713,14 @@ impl<'a> FnCompiler<'a> {
             // rather than shadowed, so the closure and this declaration share one
             // cell; otherwise a fresh binding is allocated.
             let reg = if self.scopes.len() == 1 && self.entry_lexicals.contains(name) {
-                self.scopes[0]
+                let r = self
+                    .scopes[0]
                     .iter()
                     .find(|(n, _)| n == name)
                     .map(|(_, r)| *r)
-                    .unwrap_or_else(|| self.declare_local(name))
+                    .unwrap_or_else(|| self.declare_local(name));
+                self.entry_tdz_cells.remove(&r); // TDZ ends here
+                r
             } else if let Some(r) = self
                 .scopes
                 .last()
@@ -866,6 +869,15 @@ impl<'a> FnCompiler<'a> {
                     // Pre-created as a cell at entry (a captured forward-referenced
                     // lexical); reuse it so extraction and the capturing closure
                     // share one cell rather than shadowing with a fresh binding.
+                    //
+                    // Its TDZ ends here: the extraction that follows writes
+                    // through `store_binding`, and a checked store would throw on
+                    // the very cell it is initializing (`const {z} = {z:9}`).
+                    if let Some(r) =
+                        self.scopes[0].iter().find(|(n, _)| n == id.name.as_str()).map(|(_, r)| *r)
+                    {
+                        self.entry_tdz_cells.remove(&r);
+                    }
                 } else {
                     self.declare_local(&id.name);
                 }

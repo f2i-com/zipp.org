@@ -5,6 +5,10 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Upper bound on a learned `ctor_field_hint` (see `Vm::ctor_field_hint`).
+/// Keeps one outlier instance from teaching a huge reservation permanently.
+const CTOR_FIELD_HINT_MAX: u16 = 32;
+
 impl<'p> Vm<'p> {
     /// `new cv(args)` with newTarget defaulting to the constructor itself (the
     /// common case for `new` / a plain `Reflect.construct(cv, args)`).
@@ -743,6 +747,15 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(m) => m.keys.len().min(u16::MAX as usize) as u16,
                     _ => 0,
                 };
+                // CAPPED. A high-water mark is unbounded by construction: one
+                // unusual instance that happens to take 65,535 properties would
+                // teach the mark permanently, and every later instance of that
+                // constructor would then reserve ~3 MiB across the three vectors
+                // — for the whole process lifetime, which is especially bad in a
+                // persistent embedded VM (`embed::ScriptState`). Pre-sizing only
+                // ever saves regrowth, and regrowth past a few dozen properties
+                // is amortised anyway, so the cap costs nothing measurable.
+                let n = n.min(CTOR_FIELD_HINT_MAX);
                 if n > 0 {
                     if self.ctor_field_hint.len() <= f as usize {
                         self.ctor_field_hint.resize(f as usize + 1, 0);

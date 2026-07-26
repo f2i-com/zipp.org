@@ -493,6 +493,150 @@ mod tests {
         assert_jit_matches("let s=0; for(let i=0;i<1000;i++){ s-=i; } console.log(s)", &["-499500"]);
     }
 
+    #[test]
+    fn heap_obj_slot_stays_small() {
+        // Every heap slot is one `HeapObj`, so the enum's size multiplies across
+        // the whole heap. Measured: +64 bytes of pure padding cost 7.9% on the
+        // bench suite, which is why `Object` and `Combinator` are boxed. A new
+        // fat variant would silently undo that, so pin it.
+        assert!(
+            std::mem::size_of::<crate::heap::HeapObj>() <= 80,
+            "HeapObj grew to {} bytes (cap 80) — box the new variant's payload",
+            std::mem::size_of::<crate::heap::HeapObj>()
+        );
+    }
+
+    #[test]
+    fn ctor_field_hint_is_capped() {
+        // One enormous instance must not teach a permanent reservation; the
+        // small instances that follow must still be correct.
+        assert_jit_matches(
+            "function C(n){ for(var i=0;i<n;i++) this['k'+i]=i; }              var big=new C(3000); var small=[];              for(var j=0;j<200;j++) small.push(Object.keys(new C(2)).length);              console.log(Object.keys(big).length + ',' + small[0] + ',' + small[199])",
+            &["3000,2,2"],
+        );
+    }
+
+    #[test]
+    fn arrow_body_lexical_assign_before_decl_is_tdz() {
+        // Pre-creating an arrow body's lexical cells (so a hoisted nested
+        // function can capture them) made an ASSIGNMENT before the textual
+        // declaration resolve to that cell and emit a plain `CellSet`, writing
+        // straight through the TDZ. A READ always threw, which is why it looked
+        // fine. `block_tdz_cells` is what selects the checked store; the
+        // declaration clears it again.
+        // Regression: staging/sm/expressions/optional-chain-tdz.js [strict].
+        //
+        // NOTE the same shape in a `function` body or a bare block still fails
+        // to throw in SLOPPY mode — a separate, PRE-EXISTING gap (those only
+        // pre-create a cell when the name is captured, so an uncaptured
+        // forward-assigned lexical resolves to an implicit global store
+        // instead). That is why the `[sloppy]` half of the test262 case above
+        // is a long-standing expected failure. Not covered here so this test
+        // stays a regression guard for the arrow fix rather than a to-do.
+        assert_jit_matches(
+            "var out=[];              function t(n,f){ try{ f(); out.push(n+':none'); }catch(e){ out.push(n+':'+e.constructor.name); } }              t('assign', () => { b = 0; let b; });              t('read',   () => { var z = b; let b; });              t('optchain', () => { const N=null; N?.[b]; b = 0; let b; });              console.log(out.join('|'))",
+            &["assign:ReferenceError|read:ReferenceError|optchain:ReferenceError"],
+        );
+    }
+
+    #[test]
+    fn arrow_body_lexical_assign_after_decl_is_allowed() {
+        // The other side: once the declaration has run, assignment is normal.
+        assert_jit_matches(
+            "console.log((() => { let b = 1; b = 2; b += 3; return b; })())",
+            &["5"],
+        );
+    }
+
+    // ── INT live-in interval contract ─────────────────────────────────────────
+    // `emit_int_entry_load` admits an Int-tagged value OR a double holding an
+    // exact integer in [-2^53, 2^53], so `plan_region` must seed the interval
+    // analysis with IV_FULL for live-ins. It used to seed IV_I32 (correct only
+    // while the load was Int-tag-only), and the analysis then elided 2^53
+    // overflow guards — and strength-reduced multiplies to `psllq` — on values
+    // that were never i32. `x * 1024` entered with x = 2^53 shifted into the
+    // i64 sign bit: -2^63 instead of +2^63.
+    //
+    // Each of these runs a loop-CARRIED live-in (read before written in the
+    // region, so it is a genuine entry-guarded live-in) whose true value is far
+    // outside i32, through an operation whose i64 result overflows.
+
+    #[test]
+    fn int_live_in_mul_pow2_at_2p53() {
+        // 2^53 * 1024 == 2^63, which does not fit i64: the guard must survive.
+        assert_jit_matches(
+            "var x=9007199254740992,o=0; for(var i=0;i<300;i++){ o=x*1024; x=x-0; } console.log(o)",
+            &["9223372036854776000"],
+        );
+    }
+
+    #[test]
+    fn int_live_in_mul_pow2_negative_at_2p53() {
+        assert_jit_matches(
+            "var x=-9007199254740992,o=0; for(var i=0;i<300;i++){ o=x*1024; x=x-0; } console.log(o)",
+            &["-9223372036854776000"],
+        );
+    }
+
+    #[test]
+    fn int_live_in_mul_2048_at_2p53() {
+        // 2^53 * 2048 == 2^64 — a full i64 wrap to 0 if the guard is elided.
+        assert_jit_matches(
+            "var x=9007199254740992,o=0; for(var i=0;i<300;i++){ o=x*2048; x=x-0; } console.log(o)",
+            &["18446744073709552000"],
+        );
+    }
+
+    #[test]
+    fn int_live_in_non_pow2_mul_at_2p53() {
+        // Not a power of two, so no psllq — exercises the plain guard path.
+        assert_jit_matches(
+            "var x=9007199254740992,o=0; for(var i=0;i<300;i++){ o=x*3; x=x-0; } console.log(o)",
+            &["27021597764222976"],
+        );
+    }
+
+    #[test]
+    fn int_live_in_add_at_2p53() {
+        assert_jit_matches(
+            "var x=9007199254740992,o=0; for(var i=0;i<300;i++){ o=x+x; x=x-0; } console.log(o)",
+            &["18014398509481984"],
+        );
+    }
+
+    #[test]
+    fn int_live_in_roundtrip_identity_at_2p53() {
+        // (x + 1) - 1 at 2^53: JS rounds x+1 back to 2^53, so the answer is 2^53
+        // and NOT 2^53 - 1. An i64 home computes the unrounded value, which is
+        // why the guard has to fire here.
+        assert_jit_matches(
+            "var x=9007199254740992,o=0; for(var i=0;i<300;i++){ o=(x+1)-1; x=x-0; } console.log(o)",
+            &["9007199254740991"],
+        );
+    }
+
+    #[test]
+    fn int_live_in_accumulator_crosses_i32() {
+        // The shape the widened entry load exists FOR: a nested loop whose
+        // accumulator leaves i32, so the inner region must re-enter with a
+        // double live-in rather than deopt to eviction.
+        assert_jit_matches(
+            "var a=[]; for(var i=0;i<2000;i++)a.push(i*1000);              var s=0; for(var k=0;k<40;k++){ for(var i=0;i<a.length;i++) s+=a[i]; } console.log(s)",
+            &["79960000000"],
+        );
+    }
+
+    #[test]
+    fn int_live_in_negative_zero_survives_entry() {
+        // -0 cannot live in an i64 home (ucomisd reports -0.0 == +0.0, so the
+        // entry round-trip would accept it and box back +0). A zero-iteration
+        // inner loop must leave the accumulator as -0.
+        assert_jit_matches(
+            "var n=0,s=-0; for(var k=0;k<300;k++){ for(var i=0;i<n;i++) s+=1; } console.log(1/s)",
+            &["-Infinity"],
+        );
+    }
+
     // ── early-exit flush soundness ────────────────────────────────────────────
     // A trip count of exactly OSR_THRESHOLD (8) compiles the region on the final
     // back-edge, so it is ENTERED and then exits with zero body iterations. Every

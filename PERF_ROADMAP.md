@@ -38,30 +38,34 @@ The failures are extremely concentrated — this is a short list, not a long tai
 `tools/test262-expected-failures.txt` is the checked-in baseline; a regression
 is a `diff`, not a remembered number.
 
-### Performance — geomean 2.80× slower than node (was 3.31×)
+### Performance — geomean 2.72× slower than node (was 3.31×)
 
-`bench/real/*.js`, best-of-7, output byte-identical to node.
+`bench/real/*.js`, best-of-5, output compared against node.
 
 | bench | node | zipp | ratio |
 |---|---|---|---|
-| map-set-heavy | 607ms | 977ms | 1.61× |
-| async-promise-chain | 333ms | 794ms | 2.38× |
-| json-large | 232ms | 556ms | 2.40× |
-| polymorphic-objects | 299ms | 807ms | 2.70× |
-| parse-large-js | 237ms | 692ms | 2.92× |
-| class-prototype-hot | 260ms | 777ms | 2.99× |
-| markdown-render | 236ms | 942ms | 3.99× |
-| typedarray-math | 170ms | 696ms | 4.09× |
-| sparse-array | 52ms | 286ms | 5.50× |
-| regex-log-scan | 411ms | 3354ms | 8.16× |
+| map-set-heavy | 625ms | 783ms | 1.25× |
+| json-large | 265ms | 631ms | 2.38× |
+| parse-large-js | 255ms | 617ms | 2.42× |
+| polymorphic-objects | 294ms | 715ms | 2.43× |
+| async-promise-chain | 297ms | 731ms | 2.46× |
+| markdown-render | 240ms | 676ms | 2.82× |
+| class-prototype-hot | 253ms | 753ms | 2.98× |
+| sparse-array | 43ms | 156ms | 3.63× |
+| typedarray-math | 174ms | 688ms | 3.95× |
+| regex-log-scan | 408ms | 1745ms | 4.28× |
 
 **Run-to-run variance is ±10–17%** — node's own `map-set` time has ranged
 609–966ms and `markdown` 231–416ms across runs on the same machine. A
 single-row move under ~10% is noise; re-run before attributing it to a change.
-Track the geomean, which has moved 4.77× → 4.20× → **3.31×** (the last step
-being the mimalloc global allocator plus the string-receiver borrow).
+Track the geomean, which has moved 4.77× → 4.20× → 3.31× → 2.82× → **2.72×**.
 
-Startup is ~1.9× faster than node (30ms vs 58ms).
+⚠️ **These three tables drift.** README, this file and `bench/results_real.txt`
+are maintained by hand from separate runs and have disagreed by up to 0.1×.
+Treat `bench/results_real.txt` as authoritative; the fix is to generate both
+tables from structured output (see §1b).
+
+Startup is ~2× faster than node (26ms vs 53ms).
 
 ### What the engine already wins
 
@@ -103,7 +107,7 @@ Every engine change must pass, in full:
 2. **test262, BOTH tiers:** `tools/run_test262.py --dump-fails f.txt`, then
    `diff <(sort f.txt) <(sort tools/test262-expected-failures.txt)` — zero new
    entries. Repeat with `ZIPP_NOJIT=1`.
-3. **Unit tests:** `cargo test --release` = **249 passing, 0 failed**. Check the
+3. **Unit tests:** `cargo test --release` = **287 passing, 0 failed**. Check the
    SUMMED pass count; the suite count is invariant to deleting tests.
 4. **Bench correctness:** `bash bench/run_real.sh` → `ALL_CORRECT=1`, default
    **and** `ZIPP_NOJIT=1`.

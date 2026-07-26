@@ -53,6 +53,7 @@ impl<'a> FnCompiler<'a> {
             is_script: false,
             completion_reg: None,
             block_tdz_cells: HashSet::new(),
+            entry_tdz_cells: HashSet::new(),
             catch_param_regs: HashSet::new(),
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
