@@ -32,7 +32,16 @@ dynasmrt = "2.0"
 
 [profile.release]
 opt-level = 3
-lto = false
+# MEASURED 2026-07-26: fat LTO + a single codegen unit is worth ~2% geomean
+# across the real suite (2.80x -> 2.77x), for ~45s more build time. Cross-crate
+# inlining matters here because the hot path spans zipp-vm, the regress fork and
+# mimalloc.
+#
+# NOT set: `target-cpu=native`, which measures faster still but produces a binary
+# that will not run on an older machine — wrong default for a shipped engine.
+# Benchmark it locally with RUSTFLAGS if you want the number.
+lto = "fat"
+codegen-units = 1
 # Panics are internal bugs, never normal control flow (JS errors propagate as
 # `Result`/`Thrown`). Aborting lets the JIT's per-self-call `catch_unwind` at the
 # native↔Rust boundary compile to ~nothing (no landing pads on the hot recursive
