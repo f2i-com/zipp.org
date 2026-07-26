@@ -229,6 +229,24 @@ impl ScriptState {
         )
     }
 
+    /// Run queued microtasks (promise reactions, `queueMicrotask`) to
+    /// completion.
+    ///
+    /// `run_init` drains these when the program finishes, but `call_global` and
+    /// `eval_in_context` do NOT: they return as soon as the called function
+    /// returns, leaving anything it scheduled sitting in the queue.
+    ///
+    /// That matters for any host that re-enters a live script. A UI framework
+    /// typically applies state updates on a microtask, so a click handler that
+    /// calls `setState` has only QUEUED the re-render by the time it returns —
+    /// without draining, the update never happens and the interaction silently
+    /// does nothing.
+    pub fn run_microtasks(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.drain_microtasks();
+        }
+    }
+
     /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
     /// buffer. Un-drained output accumulates for the VM's lifetime, so a
     /// long-lived embedder should drain (or discard) periodically.
@@ -687,6 +705,21 @@ mod tests {
         st.call_slot(slot_of(&st, "go"), &[]).expect("calls");
         // Without the drain the continuation would still be queued here.
         assert_eq!(st.get_slot(slot_of(&st, "done")), HostValue::Bool(true));
+    }
+
+    /// A host that re-enters a script must be able to flush what that re-entry
+    /// scheduled. UI frameworks apply state updates on a microtask, so without
+    /// this a click handler's `setState` never takes effect.
+    #[test]
+    fn microtasks_scheduled_by_a_reentry_can_be_drained() {
+        let mut st = compile_script("var log = []; function go() { Promise.resolve().then(function(){ log.push('ran') }) }")
+            .expect("compiles");
+        st.run_init().expect("runs");
+        st.call_global("go", &[]).expect("calls");
+        // The reaction is queued, not run: call_global returns as soon as `go` does.
+        assert_eq!(st.eval_in_context("log.length"), Ok(JsValue::Number(0.0)));
+        st.run_microtasks();
+        assert_eq!(st.eval_in_context("log.length"), Ok(JsValue::Number(1.0)));
     }
 
     #[test]
