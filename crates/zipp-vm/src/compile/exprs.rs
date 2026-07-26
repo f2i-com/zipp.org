@@ -303,7 +303,7 @@ impl<'a> FnCompiler<'a> {
                             let src = self.expr(arg)?;
                             self.emit(Instr::ToObject { dst, src });
                         } else {
-                            self.emit(Instr::NewObject { dst });
+                            self.emit(Instr::NewObject { dst, hint: 0 });
                         }
                         return Ok(dst);
                     }
@@ -1018,7 +1018,49 @@ impl<'a> FnCompiler<'a> {
     }
 
     pub(crate) fn object_literal(&mut self, o: &ox::ObjectExpression, dst: Reg) -> R<Reg> {
-        self.emit(Instr::NewObject { dst });
+        // Count the plain static data keys so the property vectors are sized
+        // once, and decide which of them can skip `define`'s existence probe.
+        // `appendable` goes false permanently at the first property that could
+        // make a later key collide or reorder — a spread, a computed key, an
+        // accessor, a `__proto__:` colon form, or a repeated static key. After
+        // that everything falls back to `InitDataProp`, which is what runs today.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut appendable = true;
+        let mut static_keys = 0usize;
+        for prop in &o.properties {
+            match prop {
+                ox::ObjectPropertyKind::ObjectProperty(p)
+                    if !p.computed
+                        && !matches!(p.kind, ox::PropertyKind::Get | ox::PropertyKind::Set) =>
+                {
+                    let k = match &p.key {
+                        ox::PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+                        ox::PropertyKey::StringLiteral(sl) => Some(string_literal_key(sl)),
+                        ox::PropertyKey::NumericLiteral(n) => Some(fmt_key_num(n.value)),
+                        _ => None,
+                    };
+                    match k {
+                        Some(k) if k != "__proto__" || p.method || p.shorthand => {
+                            if !seen.insert(k) {
+                                appendable = false; // duplicate key: the second one overwrites
+                            } else {
+                                static_keys += 1;
+                            }
+                        }
+                        _ => appendable = false,
+                    }
+                }
+                _ => appendable = false,
+            }
+            if !appendable {
+                break;
+            }
+        }
+        let all_appendable = appendable;
+        self.emit(Instr::NewObject {
+            dst,
+            hint: static_keys.min(u16::MAX as usize) as u16,
+        });
         for prop in &o.properties {
             let save = self.next_reg;
             match prop {
@@ -1148,6 +1190,8 @@ impl<'a> FnCompiler<'a> {
                         // inherited accessor / non-writable prop.
                         if key == "__proto__" && !p.method && !p.shorthand {
                             self.emit(Instr::SetProp { obj: dst, name, val: v });
+                        } else if all_appendable {
+                            self.emit(Instr::AppendDataProp { obj: dst, name, val: v });
                         } else {
                             self.emit(Instr::InitDataProp { obj: dst, name, val: v });
                         }

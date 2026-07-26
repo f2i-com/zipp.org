@@ -510,7 +510,11 @@ pub enum Instr {
     /// `dst = [reg[arg_base], …, reg[arg_base+argc-1]]` — array literal.
     NewArray { dst: Reg, arg_base: Reg, argc: u16 },
     /// `dst = {}` — empty object (populated by following SetProp/SetIndex).
-    NewObject { dst: Reg },
+    /// `{}` — a fresh ordinary object. `hint` is the number of static data
+    /// properties the literal will append, so the property vectors can be sized
+    /// once instead of regrowing (0 when unknown). Purely an allocation hint; it
+    /// changes nothing observable.
+    NewObject { dst: Reg, hint: u16 },
     /// `dst = ToObject(src)` — `Object(x)` / `new Object(x)`: primitives box
     /// (string/number/boolean/symbol/bigint wrappers), null/undefined → a fresh
     /// object, and an existing object is returned unchanged.
@@ -634,6 +638,14 @@ pub enum Instr {
     /// fresh object — CreateDataProperty, NOT [[Set]]: used for object-literal data
     /// properties, which must ignore any inherited accessor / non-writable property.
     InitDataProp { obj: Reg, name: u32, val: Reg },
+    /// `InitDataProp` for a key the COMPILER has proven is new: the Nth distinct
+    /// static key of a literal with no spread, computed key, accessor or
+    /// `__proto__:` before it. Appends without the existence probe that
+    /// `ObjMap::define` performs, which is what made building a literal O(n^2)
+    /// in its key count. No version bump is needed (nor done by `InitDataProp`):
+    /// the object was created by the immediately preceding `NewObject`, so no
+    /// inline cache can hold a slot for it yet.
+    AppendDataProp { obj: Reg, name: u32, val: Reg },
     /// CreateDataProperty with a COMPUTED key (already ToPropertyKey'd via
     /// `ToPropKey`) on an object literal: an ordinary own data property even
     /// for "__proto__" — only the textual `__proto__:` colon form sets the

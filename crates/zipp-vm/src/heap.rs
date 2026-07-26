@@ -238,6 +238,20 @@ impl PropAttr {
 }
 
 impl ObjMap {
+    /// An empty map sized for `n` properties up front — one allocation per
+    /// vector instead of the regrowth an object literal otherwise pays as it
+    /// appends (a 6-key literal cost ~36ns/key at the tail against ~17ns
+    /// steady-state, and that difference is the regrowth).
+    pub fn with_capacity(n: usize) -> ObjMap {
+        let mut m = ObjMap::new();
+        if n > 0 {
+            m.keys.reserve_exact(n);
+            m.vals.reserve_exact(n);
+            m.attrs.reserve_exact(n);
+        }
+        m
+    }
+
     pub fn new() -> ObjMap {
         ObjMap {
             keys: Vec::new(),

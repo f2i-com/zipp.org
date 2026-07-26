@@ -3220,8 +3220,10 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::NewObject { dst } => {
-                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
+                    Instr::NewObject { dst, hint } => {
+                        let v = Value::heap(
+                            self.heap.alloc(HeapObj::Object(Box::new(ObjMap::with_capacity(hint as usize)))),
+                        );
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -3938,6 +3940,24 @@ impl<'p> Vm<'p> {
                             let oi = o.heap_index();
                             if let HeapObj::Object(m) = self.heap.get_mut(oi) {
                                 m.define(key, v, crate::heap::PropAttr::data());
+                            } else {
+                                let k = key.to_string();
+                                self.set_prop(o, &k, v, false)?;
+                            }
+                        }
+                        ip += 1;
+                    }
+                    // The compiler proved this key is new (see `AppendDataProp`):
+                    // append without `define`'s existence probe.
+                    Instr::AppendDataProp { obj, name, val } => {
+                        let o = self.get(base, obj);
+                        let v = self.get(base, val);
+                        let key: &'p str =
+                            &self.func(func_id as usize).string_constants[name as usize];
+                        if o.is_heap() {
+                            let oi = o.heap_index();
+                            if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                                m.push_data(key.to_string(), v);
                             } else {
                                 let k = key.to_string();
                                 self.set_prop(o, &k, v, false)?;

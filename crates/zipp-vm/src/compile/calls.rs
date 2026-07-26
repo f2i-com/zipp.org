@@ -850,7 +850,7 @@ impl<'a> FnCompiler<'a> {
                     let src = self.expr(arg)?;
                     self.emit(Instr::ToObject { dst, src });
                 } else {
-                    self.emit(Instr::NewObject { dst });
+                    self.emit(Instr::NewObject { dst, hint: 0 });
                 }
                 return Ok(dst);
             }
