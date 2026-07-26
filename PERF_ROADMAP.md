@@ -1316,6 +1316,54 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B39 — The unifying number: the MEM tier costs ~3.5ns per boxed op, and
+everything object-shaped lands there
+
+Six probes this session each produced a per-operation figure — 21.7ns for a
+property read, 33.2ns for `{}`, 26.7ns for a plain call, 64ns/key for `for-in`,
+55ns for a dictionary read. They are all the same number wearing different
+clothes. `ZIPP_JITLOG` on the property-read loop:
+
+```
+[jit] INT decline [43,60]: region_is_int=false
+[decline-reason] GetIndex/SetIndex (element not a pinned TypedArray)
+[jit] DOUBLE/MEM region fn0 [43,60] compiled      -> 21.0ns/iter, ~6 ops
+```
+
+**~3.5ns per boxed op.** The read is not 21ns; the ITERATION is, and the read is
+one of six ops all paying the MEM tier's rate. The INT tier does the same
+arithmetic at ~1ns/op (B38's control), and node's optimised code is under
+0.3ns/op.
+
+The admission rule is the whole story: `GetIndex`/`SetIndex` reach the unboxed
+tiers only for a PINNED TypedArray, so ANY loop touching a plain object or a
+plain Array falls to MEM. That is every object-shaped benchmark in the suite, and
+it is why:
+
+* making the key scan cheaper (atoms) moves ~1 op of 6;
+* removing an allocation moves ~1 op of 6 (B29: +0.1%);
+* eliding a result object moves ~1 op of 6;
+* and a 7.7x win on call dispatch (B35) moved 0.1%.
+
+Each is a real improvement to one op among many that all cost the same 3.5ns.
+**No accumulation of them reaches 2x**, which needs every bench ~22% faster.
+
+**The one project.** An optimizing tier with SSA form gives, from the same
+infrastructure: unboxed representations for plain-object element/property access
+(so these loops leave MEM), escape analysis (B37 — node's `{}` is 0.5ns because
+it does not allocate), inline bump allocation from a nursery (B38 — so an
+allocating loop is not blacklisted and its other ops keep their tier), and real
+register allocation instead of memory homes. Everything in B29-B39 is a symptom
+of its absence, and every entry in this file that was built, measured and
+reverted (B23, B24, B28, B29, and the GC probe in B37) failed for the same
+reason: it optimised one op inside a loop where all the ops cost the same.
+
+Scheduling note: this supersedes "compact object storage" and "result-object
+allocation" as headline items. Both are worth doing — B36-corrected puts
+dynamic-key access at 4.6-6.8x and names `key_of`'s owned `String` inside it,
+and B33 prices the five result-object sites — but they are ~1-2% each, and this
+file should stop implying otherwise.
+
 ### B38 — One allocation in a loop body costs the OTHER ops 3x. B24 measured
 the wrong thing.
 
