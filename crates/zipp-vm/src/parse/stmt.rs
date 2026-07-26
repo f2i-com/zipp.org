@@ -196,26 +196,32 @@ impl<'s> Parser<'s> {
         }
         // `export default …`
         if self.at_kw(Keyword::Default) {
-            let start = self.cur().span.start;
             self.bump_before_operand()?;
+            // The [[SourceText]] of the exported declaration starts at ITS
+            // first token (`function`, `async`, `class`) — `export default`
+            // belongs to the export statement, not to the function whose
+            // `toString` must reproduce the source.
             if self.at_kw(Keyword::Function) {
+                let fstart = self.cur().span.start;
                 self.bump_after_operand()?;
-                let f = self.parse_function_rest(false, start)?;
+                let f = self.parse_function_rest(false, fstart)?;
                 return Ok(ExportDecl::Default(ExportDefault::Function(Box::new(f))));
             }
             if self.at_kw(Keyword::Async) {
                 let save = self.save();
+                let fstart = self.cur().span.start;
                 self.bump_after_operand()?;
                 if self.at_kw(Keyword::Function) && !self.cur().newline_before {
                     self.bump_after_operand()?;
-                    let f = self.parse_function_rest(true, start)?;
+                    let f = self.parse_function_rest(true, fstart)?;
                     return Ok(ExportDecl::Default(ExportDefault::Function(Box::new(f))));
                 }
                 self.restore(save);
             }
             if self.at_kw(Keyword::Class) {
+                let cstart = self.cur().span.start;
                 self.bump_after_operand()?;
-                let c = self.parse_class_rest(start)?;
+                let c = self.parse_class_rest(cstart)?;
                 return Ok(ExportDecl::Default(ExportDefault::Class(Box::new(c))));
             }
             let e = self.parse_assign_full()?;
