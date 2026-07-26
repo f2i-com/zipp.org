@@ -759,7 +759,7 @@ impl<'p> Vm<'p> {
         let recv_ver = self.heap.version_of(ridx);
         Some((
             crate::codegen::MethodInlineShape {
-                method_slot: None,
+                method_slot,
                 recv_bits: recv.bits(),
                 recv_ver,
                 vals_ptr,
