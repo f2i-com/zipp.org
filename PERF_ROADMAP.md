@@ -906,6 +906,67 @@ That is shapes: no per-object `keys` vector, no per-object `attrs` vector, no
 `String` per property. Shapes reduce steady-state memory and construction cost at
 the same time, which is exactly the pair every attempt so far has traded against.
 
+### B20 — Tier C admissions: Bitwise/Not WON, MathOp/UpvalGet did NOT
+
+Tier C (whole-function) rejections were entirely silent: a function containing
+one unsupported op was blacklisted and INTERPRETED for the rest of the process,
+however hot it got, and nothing said so. `[jit] fnN BLACKLISTED` plus
+`[tierC-reject] op <Instr>` under `ZIPP_JITLOG` turned "calls are slow" into a
+ranked list. That instrumentation is worth more than either patch below.
+
+The list, over four benches: Bitwise 10, UpvalGet 10, TailCall 8, substring 4,
+MathOp 4→10, NewArray 2, SetProp 2.
+
+**Bitwise + Not: kept.** The emitters already existed in the region path and
+Tier C already shared its addressing, bail labels and helpers — an allowlist gap
+that outlived its emitter. Microbenchmark: a call to a non-inlinable function
+went 81.5 → 37.0 ns/op. Suite, paired medians of 7: **-0.9% mean**, concentrated
+where it should be (json-large -4.0%, markdown -2.4%, parse-large-js -2.1%,
+map-set-heavy -1.3%); everything else inside noise.
+
+**MathOp + UpvalGet: reverted.** Both ported the same way, both reduced the
+blacklist count (parse-large-js 4→3, regex-log-scan 2→1), and both made the
+suite SLOWER: +0.6% for MathOp alone, +0.9% for the pair, with async-promise-chain
+and map-set-heavy consistently worse in every variant.
+
+The reason is the shape of the emitted code, not the admission: in Tier C both
+ops emit a win64 helper CALL per occurrence. The interpreter reads an upvalue
+with a direct cell access. So for a function whose body is mostly upvalue reads
+or `Math.*`, the "compiled" version is a sequence of C calls and is genuinely
+slower than interpreting it — and admitting it also costs the compile.
+
+**The generalisable lesson: fewer blacklisted functions is not the objective
+function.** Tier C only pays when the ops it admits emit real inline code. An op
+that lowers to a helper call should be admitted only when it is incidental to a
+body that is otherwise inline-able — which the current all-or-nothing allowlist
+cannot express. Making that per-op judgement (or giving Tier C a cost model)
+is the prerequisite for the rest of the list.
+
+### B21 — The benchmark harness was the blocker (tools/bench.py)
+
+`bench/run_real.sh` cannot resolve the size of change this work now produces.
+Measured: back-to-back runs of the SAME binary drift 3-10%, and best-of-N
+reports the luckiest sample. A best-of-3 comparison credited the Bitwise change
+with **-2.0%**; paired medians of 7 put it at **-0.9%**. The first number was
+reported before this was understood — it was wrong, not merely imprecise.
+
+Worse, its correctness claim was false: it pipes both outputs through
+`tr -d '-ÿ'`, deleting every non-ASCII byte before comparing, so
+"byte-identical to node" was never checked for any bench emitting non-ASCII. It
+also discards stderr and ignores exit status, so a crashed engine scores as a
+fast one.
+
+`tools/bench.py` replaces it for anything that matters: engines run PAIRED
+(one repetition covers every engine on the same bench, so drift lands on all of
+them), medians with p10/p90 so spread is visible, raw samples to JSON,
+per-engine startup subtracted so the numbers stay comparable with this series,
+and output compared as EXACT BYTES with a non-zero exit treated as a failure.
+
+    python tools/bench.py --reps 7 --json bench/results.json
+    python tools/bench.py --ab old.exe new.exe      # the A/B optimisation loop
+
+First authoritative reading: **geomean 2.60x**, ALL_CORRECT=1 on exact bytes.
+
 ### B17 — Object CONSTRUCTION is the biggest single gap (143x), and it is one fix
 
 Property READS are fine. Construction is not:
