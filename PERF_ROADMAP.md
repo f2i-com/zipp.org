@@ -1165,10 +1165,31 @@ not only reclaiming memory — so "collect less" has an optimum, and it is near.
 Cost: peak slots, regex-log-scan 496k -> 804k (~40MB -> 64MB). The
 `objs.len() / 2` floor is unchanged, so an already-grown heap keeps its schedule.
 
-**The remaining GC cost needs a generational nursery, not more tuning.** 17% of
-regex-log-scan is still GC at this setting, and the reason is structural: every
-collection traces the whole live set to reclaim a young garbage set. That is
-B6, and this measurement is the case for it.
+**The remaining GC cost needs a generational nursery, not more tuning** — and
+the phase split says which part and why. Timing mark / sweep / prune separately:
+
+    bench              mark   sweep   prune
+    json-large           43      28       0
+    markdown-render      37      69       0
+    regex-log-scan       45     104      56
+    async-promise-chain   6      49       0
+
+**Sweep dominates, not mark.** Sweep walks `floor..n` — every slot, live or dead
+— and its real cost is `free_slot` dropping each dead `HeapObj`, which for an
+object frees a `Box<ObjMap>` plus three `Vec`s. So it is proportional to the
+HEAP, and its constant is the allocator's free() cost. That is exactly what a
+copying nursery removes: young garbage is never freed individually, the
+semispace is reset.
+
+`prune` (the 36 side-table `retain`s) is only visible on regex-log-scan, and
+guarding each with `is_empty()` was tried and changed NOTHING (56ms -> 56ms) —
+the cost is a genuinely large `arr_props`, which holds an entry per live
+`exec` result. It goes away by not putting match results in a side table (see
+B8b), not by skipping empty maps.
+
+So the GC ordering for future work is: nursery first (sweep + mark), match-result
+representation second (prune), and no further threshold tuning — 3 is the
+measured optimum.
 
 ### B26 — Where the object-construction gap ISN'T: escape analysis, not allocation
 
