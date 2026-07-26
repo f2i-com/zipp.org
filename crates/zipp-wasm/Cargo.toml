@@ -1,0 +1,17 @@
+[package]
+name = "zipp-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebAssembly embedding of the zipp JavaScript engine: a persistent VM a browser host can keep alive across re-entries."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The engine, interpreter-only: the JIT tier is x86-64 native codegen and has
+# no meaning on wasm (see zipp-vm's `jit` feature).
+zipp-vm = { path = "../zipp-vm", default-features = false }
+wasm-bindgen = "0.2.126"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"

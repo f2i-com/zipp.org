@@ -14,6 +14,7 @@ resolver = "2"
 members = [
     "crates/zipp-vm",      # the JavaScript engine: register VM + native x86-64 OSR JIT
     "crates/zipp-cli",     # `zipp js file.js` / `zipp mjs file.mjs`
+    "crates/zipp-wasm",    # wasm-bindgen embedding: a persistent VM for browser hosts
     "crates/regress-fork", # our fork of regress 0.11.1 — the regex engine (see its FORK.md)
 ]
 

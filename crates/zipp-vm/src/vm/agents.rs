@@ -286,10 +286,10 @@ fn next_waiter_id() -> u64 {
 /// `timeout_ms` (clamped >= 0, possibly +inf) as an `Instant` deadline; None
 /// = wait forever. Finite values are capped (~1 year) so
 /// `Duration::from_secs_f64` cannot overflow on absurd-but-finite timeouts.
-pub(crate) fn finite_deadline(timeout_ms: f64) -> Option<std::time::Instant> {
+pub(crate) fn finite_deadline(timeout_ms: f64) -> Option<crate::vm::clock::Instant> {
     if timeout_ms.is_finite() {
         let secs = (timeout_ms / 1000.0).min(86_400.0 * 365.0);
-        Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(secs))
+        Some(crate::vm::clock::Instant::now() + std::time::Duration::from_secs_f64(secs))
     } else {
         None
     }
@@ -334,7 +334,7 @@ pub(crate) fn sync_wait(
         match deadline {
             None => st = cell.cv.wait(st).unwrap(),
             Some(d) => {
-                let now = std::time::Instant::now();
+                let now = crate::vm::clock::Instant::now();
                 if now >= d {
                     break;
                 }

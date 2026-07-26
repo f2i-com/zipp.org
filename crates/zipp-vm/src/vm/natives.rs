@@ -2014,7 +2014,7 @@ impl<'p> Vm<'p> {
                     .to_number_coerce(args.get(1).copied().unwrap_or(Value::UNDEFINED))?
                     .max(0.0);
                 if self.is_callable(cb) {
-                    let due = std::time::Instant::now()
+                    let due = crate::vm::clock::Instant::now()
                         + std::time::Duration::from_secs_f64(ms / 1000.0);
                     self.timer_queue.push((due, cb));
                 }
@@ -4167,12 +4167,7 @@ impl<'p> Vm<'p> {
                 Value::heap(self.heap.alloc_js(js))
             }
             // Date static methods as values.
-            DATE_NOW => Value::num(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0),
-            ),
+            DATE_NOW => Value::num(crate::vm::clock::now_epoch_ms()),
             DATE_PARSE => Value::num(parse_date(&self.display(a0))),
             DATE_UTC => Value::num(self.date_utc_ms(args)?),
             STR_RAW => {

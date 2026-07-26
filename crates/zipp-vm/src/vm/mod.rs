@@ -300,7 +300,7 @@ pub struct Vm<'p> {
     pub(crate) host: Option<Box<dyn FnMut(&str, &[String]) -> Result<String, String>>>,
     /// VM start instant — the zero point for `performance.now()` (which reports
     /// fractional milliseconds elapsed since the program began).
-    start: std::time::Instant,
+    start: clock::Instant,
     /// The JS value currently being thrown, set when a `Throw` (or an internal
     /// error) begins unwinding and cleared when a `catch` handler receives it.
     /// Carrying the real `Value` (not just a message) lets `catch (e)` bind the
@@ -795,12 +795,12 @@ pub struct Vm<'p> {
     /// entries "ok"; a due deadline resolves "timed-out" in the event loop —
     /// unless its registry entry is already gone (a notify won the race).
     /// Buffer + promise indices are GC ROOTS; the id needs no rooting.
-    async_waiters: Vec<(u32, usize, u32, Option<std::time::Instant>, u64)>,
+    async_waiters: Vec<(u32, usize, u32, Option<clock::Instant>, u64)>,
     /// `$262.agent.setTimeout` macrotasks: (due, callback). Callback Values
     /// are GC ROOTS.
-    timer_queue: Vec<(std::time::Instant, Value)>,
+    timer_queue: Vec<(clock::Instant, Value)>,
     /// VM construction time — the `$262.agent.monotonicNow()` epoch.
-    vm_start: std::time::Instant,
+    vm_start: clock::Instant,
     /// Cross-agent state for the `$262.agent` worker subsystem (report FIFO +
     /// one handle per started agent). `None` until the first `agent.start` —
     /// a run that never starts an agent pays nothing; each worker Vm holds a
@@ -1138,6 +1138,8 @@ pub struct Thrown(pub String);
 
 
 // submodules (split from the former monolithic vm.rs)
+pub(crate) mod clock;
+pub(crate) mod host_api;
 mod engine;
 mod dispatch;
 mod async_runtime;

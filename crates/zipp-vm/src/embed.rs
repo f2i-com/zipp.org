@@ -32,6 +32,8 @@ use crate::bytecode::Program;
 use crate::value::Value;
 use crate::vm::Vm;
 
+pub use crate::vm::host_api::{HostValue, Symbol, SymbolScope};
+
 /// The embedder's side of `__zippHostCall(kind, ...args)`. Arguments arrive
 /// already stringified and the reply is a string, so anything structured
 /// crosses as JSON — both sides have a JSON implementation and neither needs to
@@ -238,6 +240,50 @@ impl ScriptState {
     pub fn take_errput(&mut self) -> Vec<String> {
         self.vm.as_mut().map(|vm| std::mem::take(&mut vm.errput)).unwrap_or_default()
     }
+
+    // ---- Rich-value API (see `crate::vm::host_api`) -----------------------
+    //
+    // The methods above address the script by NAME and marshal shallowly, which
+    // is the right shape for a host that runs a script and reads a result. A
+    // host that keeps live state in sync with the script wants the opposite:
+    // stable addressing and structured values. These do that.
+
+    /// The program's top-level bindings, each with a stable slot index. Call
+    /// after [`Self::run_init`] so function declarations have been hoisted.
+    pub fn symbols(&self) -> Vec<Symbol> {
+        self.vm.as_ref().map(|vm| vm.host_symbols()).unwrap_or_default()
+    }
+
+    /// Read the global in `index` as a structured value.
+    pub fn get_slot(&mut self, index: u32) -> HostValue {
+        self.vm.as_mut().map(|vm| vm.host_get_slot(index)).unwrap_or(HostValue::Undefined)
+    }
+
+    /// Write the global in `index`. `false` means the write was declined
+    /// because the slot holds something that cannot be represented as data (a
+    /// function, a class, a `Map`, …) — see [`HostValue::Opaque`].
+    pub fn set_slot(&mut self, index: u32, value: &HostValue) -> bool {
+        self.vm.as_mut().map(|vm| vm.host_set_slot(index, value)).unwrap_or(false)
+    }
+
+    /// Call the function in global slot `index` and drain the microtask queue.
+    ///
+    /// Prefer this to [`Self::call_global`] on any hot path: `call_global`
+    /// resolves its callee by compiling the name as a fresh program, and those
+    /// compilations are interned for the VM's lifetime.
+    pub fn call_slot(&mut self, index: u32, args: &[HostValue]) -> Result<HostValue, String> {
+        match self.vm.as_mut() {
+            Some(vm) => vm.host_call_slot(index, args),
+            None => Err("zipp: VM has been torn down".into()),
+        }
+    }
+
+    /// Run pending microtasks without calling anything.
+    pub fn pump(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.host_pump();
+        }
+    }
 }
 
 impl Drop for ScriptState {
@@ -431,6 +477,168 @@ mod tests {
         assert!(st.call_global("nope; evil()", &[]).is_err(), "non-identifier is rejected");
         assert!(!st.has_global_function("nope"));
         assert!(st.has_global_function("isNaN"));
+    }
+
+    /// Resolve a symbol by name, for tests that care about a binding rather
+    /// than a slot number.
+    fn slot_of(st: &ScriptState, name: &str) -> u32 {
+        st.symbols().into_iter().find(|s| s.name == name).unwrap_or_else(|| panic!("no {name}")).index
+    }
+
+    #[test]
+    fn symbols_report_declarations_not_free_identifiers() {
+        let mut st = compile_script(
+            "var a = 1; let b = 2; const c = 3; function f() { return Math.max(1, 2); } class K {}",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        let syms = st.symbols();
+        let by = |n: &str| syms.iter().find(|s| s.name == n).map(|s| s.scope);
+        assert_eq!(by("a"), Some(SymbolScope::Variable));
+        assert_eq!(by("b"), Some(SymbolScope::Variable));
+        assert_eq!(by("c"), Some(SymbolScope::Variable));
+        assert_eq!(by("f"), Some(SymbolScope::Function));
+        assert_eq!(by("K"), Some(SymbolScope::Function), "a class is callable state");
+        // `Math` is mentioned by the program, so it has a global slot — but it
+        // is not a declaration and a host syncing it would be syncing the
+        // standard library.
+        assert_eq!(by("Math"), None, "free identifiers are not symbols");
+        let mut idx: Vec<u32> = syms.iter().map(|s| s.index).collect();
+        let n = idx.len();
+        idx.dedup();
+        assert_eq!(idx.len(), n, "slots are unique");
+    }
+
+    #[test]
+    fn structured_state_round_trips() {
+        let mut st = compile_script(
+            "var state = { items: [{ id: 1, tags: ['a', 'b'] }], open: true, note: null };",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        let slot = slot_of(&st, "state");
+
+        let got = st.get_slot(slot);
+        let expected = HostValue::Object(vec![
+            (
+                "items".into(),
+                HostValue::Array(vec![HostValue::Object(vec![
+                    ("id".into(), HostValue::Number(1.0)),
+                    (
+                        "tags".into(),
+                        HostValue::Array(vec![
+                            HostValue::String("a".into()),
+                            HostValue::String("b".into()),
+                        ]),
+                    ),
+                ])]),
+            ),
+            ("open".into(), HostValue::Bool(true)),
+            ("note".into(), HostValue::Null),
+        ]);
+        assert_eq!(got, expected);
+
+        // Write a modified tree back and let the SCRIPT observe it — the real
+        // test of `set_slot`, since it proves the rebuilt objects are ordinary
+        // engine values and not a parallel representation.
+        assert!(st.set_slot(
+            slot,
+            &HostValue::Object(vec![(
+                "items".into(),
+                HostValue::Array(vec![
+                    HostValue::Object(vec![("id".into(), HostValue::Number(7.0))]),
+                    HostValue::Object(vec![("id".into(), HostValue::Number(8.0))]),
+                ]),
+            )]),
+        ));
+        assert_eq!(
+            st.eval_in_context("state.items.length + ':' + state.items[1].id"),
+            Ok(JsValue::String("2:8".into()))
+        );
+    }
+
+    #[test]
+    fn opaque_values_never_cross_and_are_never_clobbered() {
+        let mut st = compile_script(
+            "function keep() { return 42; } var m = new Map([['k', 1]]); var d = new Date(0);",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+
+        for name in ["keep", "m", "d"] {
+            assert_eq!(st.get_slot(slot_of(&st, name)), HostValue::Opaque, "{name} is opaque");
+        }
+        // A host that read the whole global set and wrote it back must not
+        // destroy the function it read as `Opaque`.
+        let keep = slot_of(&st, "keep");
+        assert!(!st.set_slot(keep, &HostValue::Number(1.0)), "write to a function slot is declined");
+        assert!(!st.set_slot(keep, &HostValue::Opaque));
+        assert_eq!(st.eval_in_context("keep()"), Ok(JsValue::Number(42.0)));
+    }
+
+    #[test]
+    fn cycles_and_holes_do_not_hang_the_walk() {
+        let mut st = compile_script(
+            "var cyc = { name: 'root' }; cyc.self = cyc; var sparse = [1, , 3];",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        // The back-edge becomes Null rather than recursing forever.
+        assert_eq!(
+            st.get_slot(slot_of(&st, "cyc")),
+            HostValue::Object(vec![
+                ("name".into(), HostValue::String("root".into())),
+                ("self".into(), HostValue::Null),
+            ])
+        );
+        assert_eq!(
+            st.get_slot(slot_of(&st, "sparse")),
+            HostValue::Array(vec![
+                HostValue::Number(1.0),
+                HostValue::Undefined,
+                HostValue::Number(3.0),
+            ])
+        );
+    }
+
+    #[test]
+    fn call_slot_passes_structures_and_sees_mutations() {
+        let mut st = compile_script(
+            "var log = []; function add(item, n) { for (var i = 0; i < n; i++) log.push(item.id); \
+             return { count: log.length, last: item.id }; }",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        let add = slot_of(&st, "add");
+        let arg = HostValue::Object(vec![("id".into(), HostValue::String("x".into()))]);
+        let got = st.call_slot(add, &[arg, HostValue::Number(2.0)]).expect("calls");
+        assert_eq!(
+            got,
+            HostValue::Object(vec![
+                ("count".into(), HostValue::Number(2.0)),
+                ("last".into(), HostValue::String("x".into())),
+            ])
+        );
+        // The in-place mutation of a global the call performed is visible.
+        assert_eq!(
+            st.get_slot(slot_of(&st, "log")),
+            HostValue::Array(vec![HostValue::String("x".into()), HostValue::String("x".into())])
+        );
+        // A throw is an Err, and the VM stays usable afterwards.
+        assert!(st.call_slot(add, &[HostValue::Null, HostValue::Number(1.0)]).is_err());
+        assert_eq!(st.eval_in_context("1 + 1"), Ok(JsValue::Number(2.0)));
+    }
+
+    #[test]
+    fn call_slot_drains_microtasks_before_returning() {
+        let mut st = compile_script(
+            "var done = false; function go() { Promise.resolve().then(function () { done = true; }); }",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        st.call_slot(slot_of(&st, "go"), &[]).expect("calls");
+        // Without the drain the continuation would still be queued here.
+        assert_eq!(st.get_slot(slot_of(&st, "done")), HostValue::Bool(true));
     }
 
     #[test]

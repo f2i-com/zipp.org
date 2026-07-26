@@ -589,10 +589,7 @@ impl<'p> Vm<'p> {
                     Instr::Now { dst, epoch } => {
                         let ms = if epoch {
                             // Date.now(): integer ms since the Unix epoch.
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as f64)
-                                .unwrap_or(0.0)
+                            crate::vm::clock::now_epoch_ms()
                         } else {
                             // performance.now(): fractional ms since VM start.
                             self.start.elapsed().as_secs_f64() * 1000.0

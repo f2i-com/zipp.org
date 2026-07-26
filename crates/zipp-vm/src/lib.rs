@@ -36,6 +36,19 @@ use oxc_span::SourceType;
 
 pub use value::Value;
 
+/// Install the host's clocks — required on wasm32, ignored everywhere else.
+///
+/// wasm32 has no clock of its own: `std`'s `Instant::now`/`SystemTime::now`
+/// there are stubs that PANIC, and `Vm::new` reads one, so on that target an
+/// embedder must call this before constructing a VM or the engine traps before
+/// running a line of JS. On every other target `std::time` is already the best
+/// available source and this is a no-op, so a host may call it unconditionally.
+///
+/// `epoch_ms` is milliseconds since the Unix epoch (`Date.now`); `mono_ms` is a
+/// monotonically non-decreasing millisecond count with an arbitrary zero
+/// (`performance.now`). See `vm::clock` for what the engine does without them.
+pub use vm::clock::install as install_clock;
+
 /// Result of running a program: console output plus an optional uncaught-throw
 /// message (output produced before the throw is preserved, like a real engine
 /// flushing stdout before reporting the error).

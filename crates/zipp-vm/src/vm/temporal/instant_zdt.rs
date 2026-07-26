@@ -8,10 +8,7 @@ use super::*;
 impl<'p> Vm<'p> {
     /// Current wall-clock time as nanoseconds since the Unix epoch.
     pub(crate) fn now_epoch_ns() -> i128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i128)
-            .unwrap_or(0)
+        crate::vm::clock::now_epoch_ns()
     }
 
     pub(crate) fn make_instant(&mut self, ns: i128) -> Result<Value, Thrown> {

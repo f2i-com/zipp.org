@@ -783,10 +783,7 @@ impl<'p> Vm<'p> {
     /// 1 Date = copy; 1 string = parsed; ≥2 = UTC components (month0-based).
     pub(crate) fn date_new_ms(&mut self, args: &[Value]) -> Result<f64, Thrown> {
         match args.len() {
-            0 => Ok(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as f64)
-                .unwrap_or(0.0)),
+            0 => Ok(crate::vm::clock::now_epoch_ms()),
             1 => {
                 let a = args[0];
                 // `new Date(aDate)` copies its time value directly.

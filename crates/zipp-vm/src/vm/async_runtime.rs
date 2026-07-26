@@ -2377,7 +2377,7 @@ impl<'p> Vm<'p> {
             // microtask drain and the deadline bookkeeping below.
             self.drain_mailbox();
             self.drain_microtasks();
-            let now = std::time::Instant::now();
+            let now = crate::vm::clock::Instant::now();
             let next_timer = self.timer_queue.iter().map(|(d, _)| *d).min();
             let next_wait = self
                 .async_waiters
@@ -2411,7 +2411,7 @@ impl<'p> Vm<'p> {
                     drop(self.mailbox.cv.wait_timeout(wakes, due - now).unwrap().0);
                 }
             }
-            let now = std::time::Instant::now();
+            let now = crate::vm::clock::Instant::now();
             // Fire due timers (FIFO among due ones by due-time order).
             //
             // Firing ORDER and removal ORDER are different orders and must not
