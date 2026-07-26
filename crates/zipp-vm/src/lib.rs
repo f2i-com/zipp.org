@@ -27,6 +27,9 @@ mod compile;
 /// re-entries rather than running it once (see the module docs).
 pub mod embed;
 mod heap;
+/// Hand-written front end (lexer/AST/parser) being built to replace
+/// `oxc_parser` — see the module docs for why. Not yet wired in.
+mod parse;
 pub mod value;
 mod vm;
 
