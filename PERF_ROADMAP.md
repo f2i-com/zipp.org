@@ -1429,11 +1429,30 @@ per-operation, 30,000 objects of 60 dynamic-string keys:
 | **read** | **55.0ns** | **56.1** | **1.00x** |
 | for-in | 183.3ns/key | 17.8 | 10.3x |
 
-**Reading a property out of a 60-key dictionary object is at PARITY with V8.**
-That is the whole case against Option A (atoms) for this suite: `pos()` is not
-where the time is, so making the key scan 10x cheaper buys nothing here. It
-remains a real win for megamorphic sites and for construction — but not a
-geomean lever, and B29 already showed the enumeration half measuring +0.1%.
+**CORRECTION — that "parity" row is an artifact; do not cite it.** Both engines
+were paying for the `"p" + k` concat that produces the key, and node's
+concat-key path is unusually slow (35.0ns against zipp's 24.3ns — zipp WINS
+that shape). Re-measured with the keys precomputed into an array, so only the
+property operation varies:
+
+| op, key already a string | zipp | node | ratio |
+|---|---|---|---|
+| read from a 60-key object | 21.7ns | 4.7ns | 4.6x |
+| write to a 60-key object | 32.0ns | 4.7ns | 6.8x |
+| `"prop_" + n` concat alone | 43.3ns | 2.0ns | 21x |
+
+So property access by dynamic key IS ~5-7x off, and Option A is NOT ruled out
+the way the first pass claimed. What the corrected numbers point at inside that
+5-7x is `key_of` (`vm/values.rs`), which returns an OWNED `String` — a full copy
+of the key text on every computed-key read and write. It cannot simply return
+`Cow<'_, str>`, because the borrow would still be live when the caller needs
+`&mut self` for the lookup; the shape that works is a Vm-owned scratch `String`
+taken with `mem::take` and put back, so the capacity is reused and the steady
+state is zero allocations. Estimated at ~9ns of the ~20ns access, i.e. ~8% of
+polymorphic-objects and ~1-2% of the suite — worth doing, not a geomean lever.
+
+B29's +0.1% on the enumeration half still stands, and so does B37/B38 on
+construction.
 
 Also checked and NOT true, so nobody re-derives them: for-in is not superlinear
 in key count (flat 64ns/key at 4 keys down to 31.5ns at 128 — the small-object
