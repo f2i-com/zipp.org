@@ -1179,6 +1179,44 @@ impl Compiler {
                     }
                 }
             }
+            // Pre-create cells for body-level lexical (`let`/`const`/`class`)
+            // bindings, exactly as a function body does — an arrow body is a
+            // scope like any other, and a nested function declaration hoisted
+            // above the declaration must be able to capture its cell.
+            //
+            // Without this the forward reference finds no binding and compiles
+            // to a GLOBAL load, so it fails at runtime with "x is not defined"
+            // (not the TDZ error, which is what a real forward-read reports).
+            // Webpack wraps whole bundles in `(() => { "use strict"; … })()`, so
+            // every `function f(){ …G… } … const G = …` pair in a bundle hit
+            // this — it is why react-router could not resolve its own helpers.
+            {
+                let mut lex = std::collections::HashSet::new();
+                for s in &a.body.statements {
+                    match s {
+                        ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                            for decl in &d.declarations {
+                                capture::collect_pattern_names(&decl.id, &mut lex);
+                            }
+                        }
+                        ox::Statement::ClassDeclaration(c) => {
+                            if let Some(id) = &c.id {
+                                lex.insert(id.name.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for name in &lex {
+                    if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                        let r = fc.alloc_reg();
+                        fc.scopes[0].push((name.clone(), r));
+                        fc.emit(Instr::MakeCellTdz { reg: r });
+                        fc.cell_regs.insert(r);
+                        fc.entry_lexicals.insert(name.clone());
+                    }
+                }
+            }
             for s in &a.body.statements {
                 fc.stmt(s)?;
             }

@@ -385,6 +385,56 @@ mod tests {
         );
     }
 
+    /// An arrow body is a scope like any other: a `function` declaration hoisted
+    /// above a `let`/`const` in the same body must still capture that binding.
+    ///
+    /// Only function BODIES pre-created cells for their body-level lexicals, so
+    /// in an arrow the forward reference found no binding, compiled to a global
+    /// load, and failed at runtime with "x is not defined" (note: NOT the TDZ
+    /// error, which is what a genuine too-early read reports). Webpack wraps
+    /// bundles in `(() => { "use strict"; … })()`, so this hit essentially every
+    /// modern minified bundle.
+    #[test]
+    fn arrow_body_lexicals_are_capturable() {
+        // The shape webpack emits.
+        assert_eq!(
+            run_ok(
+                "console.log((() => { \"use strict\"; \
+                 function use() { return G('x') } const G = e => '?' + e; return use() })())"
+            ),
+            vec!["?x"]
+        );
+        // let, and a chain of declarators referring to each other.
+        assert_eq!(
+            run_ok(
+                "console.log((() => { function use() { return K(['a','b']) } \
+                 let q = e => e, K = e => q(e.join('/')); return use() })())"
+            ),
+            vec!["a/b"]
+        );
+        // A class declaration is a lexical binding too.
+        assert_eq!(
+            run_ok(
+                "console.log((() => { function make() { return new C().v } \
+                 class C { constructor() { this.v = 7 } } return make() })())"
+            ),
+            vec!["7"]
+        );
+        // The equivalent function-expression body always worked — keep it working.
+        assert_eq!(
+            run_ok(
+                "console.log((function () { \
+                 function use() { return G('x') } const G = e => '?' + e; return use() })())"
+            ),
+            vec!["?x"]
+        );
+        // A genuine too-early read still reports TDZ, not "not defined".
+        let out = run("(() => { function early() { return L } early(); const L = 1 })()")
+            .expect("compiles");
+        let err = out.error.expect("throws");
+        assert!(err.contains("before initialization"), "got {err:?}");
+    }
+
     #[test]
     fn let_and_reassign() {
         assert_eq!(run_ok("let x = 5; x = x + 1; console.log(x)"), vec!["6"]);
