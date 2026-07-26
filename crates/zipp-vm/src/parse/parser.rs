@@ -304,6 +304,22 @@ impl ScopeStack {
     /// Block, a CaseBlock or a catch body it is block-scoped — so it must not be
     /// walked out to the nearest var boundary and checked against bindings it
     /// can never actually collide with.
+    /// The parse position is a ModuleItemList's own top level — the only place
+    /// an `import` or `export` DECLARATION may appear. A function body, an
+    /// arrow body or a plain Block all push a scope, so depth alone settles it.
+    pub(crate) fn at_module_top_level(&self) -> bool {
+        self.scopes.len() == 1 && self.scopes[0].kind == ScopeKind::Module
+    }
+
+    /// Is `name` bound anywhere at the module's top level (lexically or by a
+    /// `var`)? An `export { x }` must resolve to such a binding.
+    pub(crate) fn module_binds(&self, name: &str) -> bool {
+        self.scopes.iter().any(|s| {
+            s.lex.iter().any(|(n, _, _)| &**n == name)
+                || s.var.iter().any(|(n, _)| &**n == name)
+        })
+    }
+
     pub(crate) fn fn_decl_is_var_scoped(&self) -> bool {
         matches!(
             self.scopes.last().map(|s| s.kind),
@@ -343,17 +359,18 @@ impl ScopeStack {
                 break;
             }
         }
-        // Record at the nearest var boundary so a later lexical there conflicts.
-        for scope in self.scopes.iter_mut().rev() {
-            if scope.var_boundary {
-                if !scope.var.iter().any(|(n, _)| &**n == name) {
-                    scope.var.push((name.into(), pos));
-                }
-                return Ok(());
-            }
-        }
+        // Record in the CURRENT scope, not at the boundary. `pop` walks the name
+        // outward one scope at a time (re-running the check above at each), so it
+        // still reaches the boundary — but on the way it stays visible to the
+        // block it was written in, which is what `{ var f; let f }` needs: the
+        // spec's Block early error compares LexicallyDeclaredNames against the
+        // VarDeclaredNames of the SAME StatementList, and jumping straight to the
+        // boundary erased exactly that association. `var f; { let f }` stays
+        // legal because there the `var` is recorded in the outer scope.
         if let Some(scope) = self.scopes.last_mut() {
-            scope.var.push((name.into(), pos));
+            if !scope.var.iter().any(|(n, _)| &**n == name) {
+                scope.var.push((name.into(), pos));
+            }
         }
         Ok(())
     }
@@ -427,6 +444,13 @@ pub struct Parser<'s> {
     /// `ListItem` by every `parse_stmt_list_item`, so a braced body restores it
     /// automatically and only the unbraced single-statement forms have to set it.
     pub(crate) stmt_pos: StmtPos,
+    /// Every name this module exports, for the duplicate-`ExportedNames` rule.
+    pub(crate) exported_names: Vec<Box<str>>,
+    /// Local names an `export { … }` (with no `from`) referred to, and where.
+    /// A module must declare every one of them, but the declaration may come
+    /// LATER in the file, so the check waits until the module's top level is
+    /// complete.
+    pub(crate) pending_export_locals: Vec<(Box<str>, u32)>,
 }
 
 impl<'s> Parser<'s> {
@@ -459,6 +483,8 @@ impl<'s> Parser<'s> {
             parenthesized: false,
             goal,
             stmt_pos: StmtPos::ListItem,
+            exported_names: Vec::new(),
+            pending_export_locals: Vec::new(),
         })
     }
 

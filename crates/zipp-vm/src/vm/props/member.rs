@@ -5,6 +5,23 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// The RegExp flag character a per-flag accessor name reports, if the name is
+/// one of the eight. Lets a `re.global`-style read be answered from the flag
+/// string in place, with no allocation and no prototype walk.
+fn regexp_flag_char(key: &str) -> Option<char> {
+    Some(match key {
+        "hasIndices" => 'd',
+        "global" => 'g',
+        "ignoreCase" => 'i',
+        "multiline" => 'm',
+        "dotAll" => 's',
+        "unicode" => 'u',
+        "unicodeSets" => 'v',
+        "sticky" => 'y',
+        _ => return None,
+    })
+}
+
 impl<'p> Vm<'p> {
     /// Like `proto_member`, but ACCESSOR-AWARE: when the property found on the
     /// chain is a getter (e.g. a user `Object.defineProperty(TA.prototype,
@@ -680,8 +697,7 @@ impl<'p> Vm<'p> {
         // A RegExp's accessor-like own properties (source/flags/lastIndex + the
         // flag booleans) and its match-result Array's `.index`/`.input`/`.groups`.
         // Cloned out of the heap borrow before any allocation.
-        if let HeapObj::RegExp { source, flags, last_index, .. } = self.heap.get(obj.heap_index()) {
-            let (s, f, li) = (source.clone(), flags.clone(), *last_index);
+        if matches!(self.heap.get(obj.heap_index()), HeapObj::RegExp { .. }) {
             // A custom own property (`re.exec = fn`, `re.x = …`, or an
             // Object.defineProperty'd `flags`/`source`/flag-boolean) in the side
             // table shadows the prototype AND the synthesized intrinsic accessor —
@@ -770,12 +786,39 @@ impl<'p> Vm<'p> {
                 }
                 return Ok(self.alloc_str(out));
             }
+            // Answer everything that needs no OWNED text while the heap borrow is
+            // still open: `lastIndex`, the eight flag booleans, and -- the case
+            // that actually matters -- every other key, which is a prototype walk
+            // (`re.test`, `re.exec`, `re.constructor`). Cloning `source` and
+            // `flags` up front made every property read on a RegExp cost two heap
+            // allocations sized by the PATTERN TEXT: measured 31ns for a 1-char
+            // pattern against 120ns for a 20,000-char one, on a read that returns
+            // an integer. `re.flags` read nine such properties, so it cost 227ns
+            // against node's 3ns.
+            if let HeapObj::RegExp { flags, last_index, .. } = self.heap.get(obj.heap_index()) {
+                if key == "lastIndex" {
+                    return Ok(*last_index);
+                }
+                if let Some(c) = regexp_flag_char(key) {
+                    return Ok(Value::bool(flags.contains(c)));
+                }
+            }
             let eff = self
                 .proto_of
                 .get(&obj.heap_index())
                 .and_then(|p| p.is_heap().then(|| p.heap_index()))
                 .unwrap_or(self.regexp_proto);
-            return self.regexp_get_prop(obj.heap_index(), &s, &f, li, key, eff);
+            // `source` is the one intrinsic left that has to own its text.
+            // (`flags` never reaches here -- the spec-mandated per-flag-getter
+            // synthesis above always returns.)
+            if key == "source" {
+                let src = match self.heap.get(obj.heap_index()) {
+                    HeapObj::RegExp { source, .. } => source.clone(),
+                    _ => String::new(),
+                };
+                return Ok(self.regexp_source_value(obj.heap_index(), &src));
+            }
+            return Ok(self.proto_member(eff, key));
         }
         // An Array's named (non-index) own properties (arr.foo, and a match
         // result's index/input/groups) live in arr_props and shadow the prototype.

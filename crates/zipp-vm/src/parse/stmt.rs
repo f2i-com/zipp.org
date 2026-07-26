@@ -40,6 +40,14 @@ impl<'s> Parser<'s> {
         while !self.at_eof() {
             body.push(self.parse_stmt_list_item()?);
         }
+        for (name, pos) in std::mem::take(&mut self.pending_export_locals) {
+            if !self.scopes.module_binds(&name) {
+                return Err(SyntaxError::new(
+                    format!("SyntaxError: export '{name}' is not defined in the module"),
+                    pos,
+                ));
+            }
+        }
         self.scopes.pop()?;
         Ok(Program { goal, strict: self.ctx.strict, directives, body })
     }
@@ -50,6 +58,14 @@ impl<'s> Parser<'s> {
     /// declaration form is only taken when the next token cannot continue one.
     fn parse_module_decl(&mut self) -> PResult<Option<Stmt>> {
         if self.goal != Goal::Module {
+            return Ok(None);
+        }
+        // `import`/`export` DECLARATIONS are ModuleItems, not StatementListItems,
+        // so they are legal only at the module's own top level — `function f() {
+        // export default null; }` is a SyntaxError. Declining here sends the
+        // token to the expression parser, which rejects the reserved word (and
+        // still accepts `import(…)` / `import.meta`, which ARE expressions).
+        if !self.scopes.at_module_top_level() {
             return Ok(None);
         }
         if self.at_kw(Keyword::Import) {
@@ -107,6 +123,24 @@ impl<'s> Parser<'s> {
         let attributes = self.parse_import_attributes()?;
         self.semicolon()?;
         Ok(ImportDecl { specifiers, source, attributes, phase })
+    }
+
+    /// Record one ExportedName, rejecting a duplicate. §16.2.3.1: a module's
+    /// ExportedNames must be unique — `export {x}; export {x};` is an error even
+    /// though both name the same binding.
+    fn record_export_name(&mut self, name: &ModuleExportName, pos: u32) -> PResult<()> {
+        let text: Box<str> = match name {
+            ModuleExportName::Ident(n) => n.clone(),
+            ModuleExportName::Str(s) => s.to_lossy_string().into_boxed_str(),
+        };
+        if self.exported_names.iter().any(|n| *n == text) {
+            return Err(SyntaxError::new(
+                format!("SyntaxError: duplicate export name '{text}'"),
+                pos,
+            ));
+        }
+        self.exported_names.push(text);
+        Ok(())
     }
 
     /// The current token is the UNESCAPED contextual keyword `want`.
@@ -243,7 +277,9 @@ impl<'s> Parser<'s> {
         // `export * from "m"` / `export * as ns from "m"`
         if self.eat(Punct::Star, false)? {
             let alias = if self.eat_kw(Keyword::As, false)? {
-                Some(self.parse_module_export_name()?)
+                let a = self.parse_module_export_name()?;
+                self.record_export_name(&a, pos)?;
+                Some(a)
             } else {
                 None
             };
@@ -261,6 +297,7 @@ impl<'s> Parser<'s> {
         // `export default …`
         if self.at_kw(Keyword::Default) {
             self.bump_before_operand()?;
+            self.record_export_name(&ModuleExportName::Ident("default".into()), pos)?;
             // The [[SourceText]] of the exported declaration starts at ITS
             // first token (`function`, `async`, `class`) — `export default`
             // belongs to the export statement, not to the function whose
@@ -303,6 +340,7 @@ impl<'s> Parser<'s> {
                 } else {
                     local.clone()
                 };
+                self.record_export_name(&exported, pos)?;
                 specifiers.push(ExportSpecifier { local, exported });
                 if !self.eat(Punct::Comma, false)? {
                     break;
@@ -320,6 +358,19 @@ impl<'s> Parser<'s> {
             };
             let attributes = self.parse_import_attributes()?;
             self.semicolon()?;
+            // Without a `from`, each LOCAL name must resolve to a binding in
+            // this module -- `export { unresolvable };` is an early error, not a
+            // link-time one. The binding may still be declared further down the
+            // file, so the names are queued and judged when the module ends.
+            // WITH a `from` the local half is the FOREIGN module's export name
+            // and binds nothing here, so it is exempt.
+            if source.is_none() {
+                for sp in &specifiers {
+                    if let ModuleExportName::Ident(n) = &sp.local {
+                        self.pending_export_locals.push((n.clone(), pos));
+                    }
+                }
+            }
             return Ok(ExportDecl::Named { specifiers, source, attributes });
         }
         // `export var/let/const/function/class …` — the declaration binds
