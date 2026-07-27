@@ -2367,10 +2367,29 @@ impl<'p> Vm<'p> {
             return Ok(items.clone());
         }
         let kiter = self.call_value(keys_fn, obj, &[])?;
-        Ok(self
-            .iterate_to_vec(kiter)?
-            .into_iter()
-            .map(|v| if v.is_number() && v.as_f64() == 0.0 { Value::int(0) } else { v })
-            .collect())
+        // GetSetRecord treats the `keys()` result as an ALREADY-OBTAINED Iterator
+        // Record: `Get(keysIter, "next")` once, then repeated Call. Draining it
+        // with the general iterable helper additionally read
+        // `keysIter[Symbol.iterator]` and called it, which is observable on a
+        // Proxy-wrapped set-like and is not in the algorithm.
+        let next = self.get_prop(kiter, "next")?;
+        if !self.is_callable(next) {
+            return Err(Thrown("TypeError: set-like keys() iterator has no next method".into()));
+        }
+        let mut out = Vec::new();
+        loop {
+            let res = self.call_value(next, kiter, &[])?;
+            if !self.is_object_value(res) {
+                return Err(Thrown("TypeError: iterator result is not an object".into()));
+            }
+            let done = self.get_prop(res, "done")?;
+            if self.truthy(done) {
+                break;
+            }
+            let v = self.get_prop(res, "value")?;
+            // -0 normalises to +0 for SameValueZero membership.
+            out.push(if v.is_number() && v.as_f64() == 0.0 { Value::int(0) } else { v });
+        }
+        Ok(out)
     }
 }

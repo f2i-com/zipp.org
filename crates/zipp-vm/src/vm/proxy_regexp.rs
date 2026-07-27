@@ -287,8 +287,19 @@ impl<'p> Vm<'p> {
         while i < chars.len() {
             let c = chars[i];
             if c == '\\' && i + 1 < chars.len() {
+                // An escape pair passes through UNCHANGED — except that the
+                // escaped character may itself be a raw LineTerminator, and
+                // EscapeRegExpPattern's whole job is that `eval("/" + source +
+                // "/")` re-parses. Emitting `\` + a literal LF produced an
+                // unterminated regular expression.
                 out.push('\\');
-                out.push(chars[i + 1]);
+                match chars[i + 1] {
+                    '\n' => out.push_str("n"),
+                    '\r' => out.push_str("r"),
+                    '\u{2028}' => out.push_str("u2028"),
+                    '\u{2029}' => out.push_str("u2029"),
+                    other => out.push(other),
+                }
                 i += 2;
                 continue;
             }
