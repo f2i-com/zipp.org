@@ -322,6 +322,91 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // HIDDEN %TypedArray% intrinsic. `Int8Array.prototype`'s OWN properties
+        // are only `constructor` and `BYTES_PER_ELEMENT` — every method lives on
+        // %TypedArray%.prototype, and `from`/`of`/`@@species` live on
+        // %TypedArray% itself. Neither is a named global, so the loop above never
+        // gave them a realm image, and the chain mirroring then pointed each
+        // per-kind prototype at the realm's `Object.prototype`, severing the
+        // inheritance that would have supplied them. A child realm's
+        // `Int8Array.prototype.at` was `undefined`.
+        //
+        // Built AFTER the mirroring block on purpose: that block walks
+        // `realms[r]` and would re-target these to `Object.prototype`.
+        {
+            let realm_obj_proto = self.realms[r as usize].get(&self.obj_proto).copied();
+            let realm_fn_proto = self.realms[r as usize].get(&self.fn_proto).copied();
+            let ta_proto_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+            let mut cmap = ObjMap::new();
+            cmap.is_ctor = true;
+            cmap.define("prototype", Value::heap(ta_proto_idx), proto_attr);
+            let ta_ctor_idx = self.heap.alloc(HeapObj::Object(Box::new(cmap)));
+            if let HeapObj::Object(pm) = self.heap.get_mut(ta_proto_idx) {
+                pm.define("constructor", Value::heap(ta_ctor_idx), ne);
+            }
+            // Same own-property copy the named pairs get.
+            for (src, dst, skip_ctor) in
+                [(self.ta_base_proto, ta_proto_idx, true), (self.ta_base_ctor, ta_ctor_idx, false)]
+            {
+                if src == 0 {
+                    continue;
+                }
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(src) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals.iter())
+                        .zip(mm.attrs.iter())
+                        .filter(|((k, _), _)| {
+                            let k = k.as_str();
+                            if skip_ctor {
+                                k != "constructor"
+                            } else {
+                                k != "prototype" && k != "name" && k != "length"
+                            }
+                        })
+                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(m) = self.heap.get_mut(dst) {
+                        m.define(&k, copy, a);
+                    }
+                }
+            }
+            self.obj_realm.insert(ta_ctor_idx, r);
+            self.obj_realm.insert(ta_proto_idx, r);
+            if self.ta_base_proto != 0 {
+                self.realms[r as usize].insert(self.ta_base_proto, ta_proto_idx);
+            }
+            if self.ta_base_ctor != 0 {
+                self.realms[r as usize].insert(self.ta_base_ctor, ta_ctor_idx);
+                self.realm_ctor_main.insert(ta_ctor_idx, self.ta_base_ctor);
+            }
+            if let Some(t) = realm_obj_proto {
+                self.proto_of.insert(ta_proto_idx, Value::heap(t));
+            }
+            if let Some(t) = realm_fn_proto {
+                self.proto_of.insert(ta_ctor_idx, Value::heap(t));
+            }
+            // Re-link every per-kind pair onto it: prototype -> %TypedArray%
+            // .prototype (methods) and constructor -> %TypedArray% (`from`/`of`).
+            for (k, kind) in native::TA_KINDS.iter().enumerate() {
+                if let Some(&rp) = self.realms[r as usize].get(&self.ta_protos[k]) {
+                    self.proto_of.insert(rp, Value::heap(ta_proto_idx));
+                }
+                if let Some(cv) = g.get(kind.0) {
+                    if cv.is_heap() {
+                        self.proto_of.insert(cv.heap_index(), Value::heap(ta_ctor_idx));
+                    }
+                }
+            }
+        }
         // HIDDEN dynamic-function intrinsics: per-realm %GeneratorFunction% /
         // %AsyncFunction% / %AsyncGeneratorFunction% facades, their `.prototype`
         // images, and (for the generator kinds) the %GeneratorPrototype% /
