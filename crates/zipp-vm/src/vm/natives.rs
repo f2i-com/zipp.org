@@ -1463,17 +1463,45 @@ impl<'p> Vm<'p> {
                 self.regexp_exec(this.heap_index(), a0)?
             }
             REGEXP_TEST => {
-                if !matches!(
-                    this.is_heap().then(|| self.heap.get(this.heap_index())),
-                    Some(HeapObj::RegExp { .. })
-                ) {
+                // 22.2.6.16: the receiver need only be an OBJECT. The
+                // [[RegExpMatcher]] brand check belongs to RegExpBuiltinExec,
+                // which RegExpExec reaches only when `exec` is not callable — so
+                // requiring a real RegExp up front made
+                // `RegExp.prototype.test.call({ exec() {…} }, "")` throw, and
+                // made a patched `re.exec` invisible to `re.test`.
+                if !self.is_object_value(this) {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.test called on a non-object".into(),
+                    ));
+                }
+                let is_re = this.is_heap()
+                    && matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. });
+                // Fast path: a pristine RegExp whose `exec` is still the
+                // intrinsic. The Get and the call are then unobservable, so go
+                // straight to the builtin and skip the match-array build too.
+                if is_re && self.regexp_exec_fast_ok(this.heap_index()) {
+                    let r = self.regexp_exec_impl(this.heap_index(), a0, false)?;
+                    return Ok(Value::bool(r != Value::NULL));
+                }
+                // ToString(S) precedes RegExpExec, so a custom `exec` receives
+                // the coerced string rather than the raw argument.
+                let s = self.to_str_value(a0)?;
+                let exec = self.get_prop(this, "exec")?;
+                if self.is_callable(exec) {
+                    let res = self.call_value(exec, this, &[s])?;
+                    if res != Value::NULL && !self.is_object_value(res) {
+                        return Err(Thrown(
+                            "TypeError: RegExp exec method returned something other than an Object or null".into(),
+                        ));
+                    }
+                    return Ok(Value::bool(res != Value::NULL));
+                }
+                if !is_re {
                     return Err(Thrown(
                         "TypeError: RegExp.prototype.test called on a non-RegExp".into(),
                     ));
                 }
-                // Same protocol as exec (lastIndex Get + stateful Sets), but the
-                // unobservable match-array materialization is skipped.
-                let r = self.regexp_exec_impl(this.heap_index(), a0, false)?;
+                let r = self.regexp_exec_impl(this.heap_index(), s, false)?;
                 Value::bool(r != Value::NULL)
             }
             REGEXP_COMPILE => {
