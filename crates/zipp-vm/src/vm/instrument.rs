@@ -9,16 +9,31 @@
 //! feature and compiles to nothing in a default build. This engine's inner
 //! dispatch loop does not get a branch it cannot use.
 //!
-//! # The JIT is off while instrumented, and that is not negotiable
+//! # Metering keeps the JIT; tracing cannot
 //!
-//! `try_run_jit` runs a whole function activation natively and `try_run_osr`
-//! runs a whole loop region natively; both return only a resume-ip. Millions of
-//! instructions can therefore execute with zero iterations of the interpreter
-//! loop this module hooks. A budget would silently stop bounding anything inside
-//! a hot loop, and a trace would attest to an execution that never happened —
-//! the worst failure mode available, because the program still returns the right
-//! answer. [`super::Vm::set_instrumentation`] switches the JIT off for the VM's
-//! lifetime, and it is the only way to switch instrumentation on.
+//! `try_run_jit` runs a whole function activation natively and `try_run_osr` a
+//! whole loop region; both return only a resume-ip, so millions of instructions
+//! can execute with zero iterations of the loop this module hooks.
+//!
+//! For the BUDGET and the ABORT FLAG that is solved rather than avoided:
+//! compiled code charges [`super::Vm::jit_steps`] itself, once per basic block,
+//! by that block's exact instruction count (`codegen::meter`). The charge is the
+//! same number in the same unit the interpreter would have counted — a test
+//! pins the two to be equal — so `max_steps` means one thing regardless of how
+//! hot the code got. Native code runs on a bounded loan of the budget, which is
+//! what makes it hand control back often enough for the abort flag to be
+//! polled.
+//!
+//! For the TRACE there is no such fix, and the JIT genuinely does go off
+//! ([`super::Vm::enter_trace_mode`]). A trace has to be a row-per-instruction
+//! record; native code produces no rows, so a JIT'd hot loop would simply be
+//! missing from it while the program still returned the right answer — and a
+//! proof over that trace would attest to an execution that never happened.
+//!
+//! Two paths execute user work with neither an interpreter loop nor a VM
+//! pointer to charge against: the fused array kernels and the off-frame method
+//! inliner. The inliner knows its body length and charges it in Rust; the
+//! kernels are declined outright in a metered VM (`Vm::jit_fused_ok`).
 //!
 //! # The trace contract
 //!
@@ -59,6 +74,7 @@
 //! moves a row onto a different polynomial constraint. Add at the end.
 
 use crate::bytecode::Instr;
+use crate::codegen::meter::NATIVE_CHUNK;
 use crate::value::Value;
 
 /// The trace opcode set — one per AIR selector column. A wire contract with the
@@ -163,8 +179,11 @@ const ABORT_CHECK_MASK: u64 = 0xFFF;
 
 /// Per-VM instrumentation state. Allocated only when a host asks for it.
 pub(crate) struct Recorder {
-    /// Instructions the script may still execute. `u64::MAX` means unlimited.
-    pub(crate) budget: u64,
+    /// Instructions the script may still execute, NOT counting any chunk
+    /// currently lent to native code (see `Vm::meter_lend`). Signed because the
+    /// native tier charges a whole basic block at a time and can overshoot zero
+    /// by up to one block; `i64::MAX` means unlimited.
+    pub(crate) remaining: i64,
     /// Set by another thread to stop a running script.
     pub(crate) abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     steps: Vec<TraceStep>,
@@ -184,7 +203,7 @@ pub(crate) struct Recorder {
 impl Recorder {
     pub(crate) fn new() -> Self {
         Self {
-            budget: u64::MAX,
+            remaining: i64::MAX,
             abort: None,
             steps: Vec::new(),
             tracing: false,
@@ -273,6 +292,84 @@ fn blank(row: &mut TraceStep) {
 pub(crate) type Tick = Result<(), &'static str>;
 
 impl super::Vm<'_> {
+    /// Lend the native tier a slice of the step budget, returning what it took.
+    ///
+    /// Compiled code charges `Vm::jit_steps` directly (two instructions per
+    /// basic block — see `codegen::meter`), so the budget has to be *in* that
+    /// field for native code to see it. Lending a bounded chunk rather than the
+    /// whole budget is what makes a native run finite: it hands control back at
+    /// most `NATIVE_CHUNK` steps later, which is the abort flag's worst-case
+    /// response time inside an otherwise unbounded loop.
+    ///
+    /// The caller MUST pair this with [`Self::meter_return`], and must save and
+    /// restore `jit_steps` around the pair — native code re-enters Rust through
+    /// its call helpers, and that Rust can enter native again.
+    #[must_use]
+    pub(crate) fn meter_lend(&mut self) -> i64 {
+        let Some(rec) = self.instr_rec.as_mut() else { return 0 };
+        // Once per native entry is the right cadence for the abort poll: the
+        // interpreter's own every-4096-instructions check barely advances while
+        // a hot loop is running natively.
+        if let Some(flag) = rec.abort.as_ref() {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                self.jit_steps = 0;
+                return 0;
+            }
+        }
+        let lend = rec.remaining.min(NATIVE_CHUNK).max(0);
+        rec.remaining -= lend;
+        self.jit_steps = lend;
+        lend
+    }
+
+    /// Reconcile after a native run: give back what it did not spend.
+    ///
+    /// A negative `jit_steps` is the overshoot of the block that tripped the
+    /// check; it is absorbed rather than refunded, so the budget is never
+    /// credited for work that happened.
+    pub(crate) fn meter_return(&mut self) {
+        let unspent = self.jit_steps.max(0);
+        if let Some(rec) = self.instr_rec.as_mut() {
+            if rec.remaining != i64::MAX {
+                rec.remaining += unspent;
+            }
+        }
+    }
+
+    /// Charge `n` steps for work that ran neither in the dispatch loop nor in
+    /// compiled code — the off-frame method inliner evaluates a callee body in
+    /// Rust, outside `run_loop` entirely, so nothing else would see it.
+    ///
+    /// Charge only AFTER the work is known to have completed: a path that
+    /// declines half way falls back to a real call, which the interpreter
+    /// charges itself, and charging both would be double-counting.
+    pub(crate) fn charge_steps(&mut self, n: i64) {
+        if let Some(rec) = self.instr_rec.as_mut() {
+            if rec.remaining != i64::MAX {
+                rec.remaining -= n;
+            }
+        }
+    }
+
+    /// Whether the last native run stopped because it ran out of lent steps
+    /// rather than because a type guard failed. A metering exit says nothing
+    /// about the region's quality, so it must not count toward eviction.
+    pub(crate) fn meter_exhausted(&self) -> bool {
+        self.instr_rec.is_some() && self.jit_steps <= 0
+    }
+
+    /// The displacement of [`Self::jit_steps`] from the VM pointer, for the
+    /// compilers to bake into `[rdi + off]`. `None` leaves the compiled code
+    /// byte-identical to an unmetered build.
+    pub(crate) fn meter_offset(&self) -> Option<i32> {
+        self.instr_rec.as_ref()?;
+        let base = self as *const Self as usize;
+        let field = &self.jit_steps as *const i64 as usize;
+        Some((field - base) as i32)
+    }
+}
+
+impl super::Vm<'_> {
     /// The dispatch loop's hook, run once per instruction *before* it executes:
     /// completes the previous row, charges one step against the budget, polls
     /// the abort flag, and opens a row for `instr`.
@@ -286,11 +383,11 @@ impl super::Vm<'_> {
             None => return Ok(()),
         };
         rec.ticks = rec.ticks.wrapping_add(1);
-        if rec.budget != u64::MAX {
-            if rec.budget == 0 {
+        if rec.remaining != i64::MAX {
+            if rec.remaining <= 0 {
                 return Err(BUDGET_MSG);
             }
-            rec.budget -= 1;
+            rec.remaining -= 1;
         }
         if rec.ticks & ABORT_CHECK_MASK == 0 {
             if let Some(flag) = rec.abort.as_ref() {

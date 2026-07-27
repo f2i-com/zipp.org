@@ -260,6 +260,7 @@ pub(crate) fn compile_proto(
     self_func_id: u32,
     self_call_helper: usize,
     self_val_bits: u64,
+    meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     let self_slot = proto.name_global;
     if !can_compile(proto, self_slot) {
@@ -283,6 +284,12 @@ pub(crate) fn compile_proto(
     // trampoline on the clean hot path. The recursion runs on the native stack,
     // bounded by an inline depth guard (see `emit_self_call`).
     let self_entry = ops.new_dynamic_label();
+    // Step metering (a metered VM only). A whole-function body can contain a
+    // loop — `can_compile` whitelists every branch with no direction
+    // restriction — so without this a JIT'd function is an unbounded native
+    // path. Charges land out of line, next to the epilogue.
+    let blocks = crate::codegen::meter::block_map(meter, &proto.code, 0, n - 1);
+    let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
 
     // ── prologue ── save callee-saved regs, stash the 3 inputs, reserve shadow.
     // 3 pushes (24B) + sub 48 = 72B; +8 (return addr) = 80 ⇒ 16-aligned. The 48
@@ -307,6 +314,13 @@ pub(crate) fn compile_proto(
         // — guarantees a guard jumps to THIS op's bail, never a neighbour's
         // (which would resume the interpreter at the wrong ip: a silent bug).
         let bail = ops.new_dynamic_label();
+        if let Some((m, bl)) = blocks.as_ref() {
+            if let Some(&len) = bl.get(&ip) {
+                let stub = ops.new_dynamic_label();
+                crate::codegen::meter::emit_charge(&mut ops, m, len, stub);
+                meter_stubs.push((stub, ip));
+            }
+        }
         match *instr {
             Instr::LoadInt { dst, val } => {
                 let boxed = INT_TAG | (val as u32 as u64);
@@ -462,6 +476,18 @@ pub(crate) fn compile_proto(
         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
         ; jmp => epilogue
     );
+
+    // ── metering exits ── out of line so the hot path is just `sub` + a
+    // not-taken `jle`. Resuming at this ip is exactly an ordinary guard bail:
+    // the interpreter re-runs the block, charging it as it goes.
+    for (stub, ip) in meter_stubs {
+        dynasm!(ops
+            ; => stub
+            ; mov DWORD [rsi], ip as i32
+            ; xor rax, rax
+            ; jmp => epilogue
+        );
+    }
 
     // ── epilogue ── undo the prologue and return (rax already holds the result
     // or 0-for-bail; [rsi] already holds NO_BAIL or the bail ip).

@@ -239,7 +239,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn native_cb_entry(&mut self, cb: Value) -> Option<(*const u8, usize, usize)> {
         // Mirror the interpreter's JIT-entry guard: respect ZIPP_NOJIT and never
         // enter native code from a deopted self-call continuation (livelock).
-        if !self.jit_enabled || self.jit_recurse_depth != 0 || !cb.is_heap() {
+        if !self.jit_fused_ok() || self.jit_recurse_depth != 0 || !cb.is_heap() {
             return None;
         }
         let (fid, ups) = self.heap.as_callable(cb.heap_index())?;

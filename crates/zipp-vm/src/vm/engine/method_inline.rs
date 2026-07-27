@@ -54,7 +54,15 @@ impl<'p> Vm<'p> {
         // Pass 1: validate the body shape without executing anything.
         let body_len = self.method_body_inlinable(fid)?;
         // Pass 2: execute over a local register window.
-        self.run_method_inline(fid, recv, caller_base, arg_base, argc, body_len, 0)
+        let out = self.run_method_inline(fid, recv, caller_base, arg_base, argc, body_len, 0);
+        // These ops ran here, not in `run_loop`, so the dispatch hook never saw
+        // them — charge them by hand. Only on success: a decline falls back to a
+        // real frame call, which the interpreter charges itself.
+        #[cfg(feature = "instrument")]
+        if out.is_some() {
+            self.charge_steps(body_len as i64);
+        }
+        out
     }
 
     /// Pass 1 of method inlining: is `fid`'s body a straight-line prefix of ops

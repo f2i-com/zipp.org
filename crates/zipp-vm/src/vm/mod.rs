@@ -294,6 +294,17 @@ pub struct Vm<'p> {
     /// pointer in the hot struct rather than the recorder's whole footprint.
     #[cfg(feature = "instrument")]
     pub(crate) instr_rec: Option<Box<instrument::Recorder>>,
+    /// Steps lent to the native tier, charged directly by compiled code as
+    /// `sub QWORD [rdi + off], <block length>` — `rdi` is the VM pointer every
+    /// region and whole-function body already holds, so this needs no spare
+    /// register and no frame slot. Reconciled against the real budget by
+    /// `meter_lend`/`meter_return`; 0 and unread in an unmetered VM.
+    ///
+    /// A plain field rather than part of the boxed `Recorder` so its offset from
+    /// the VM pointer is fixed for compiled code, and so the hot path is one
+    /// memory operand rather than a pointer chase.
+    #[cfg(feature = "instrument")]
+    pub(crate) jit_steps: i64,
     /// Lines produced by `Print` (console.log/info/debug → stdout), in order.
     pub output: Vec<String>,
     /// Lines produced by `console.error`/`console.warn` (→ stderr in node).

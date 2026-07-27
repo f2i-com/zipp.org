@@ -85,6 +85,8 @@ impl<'p> Vm<'p> {
             frames: Vec::new(),
             #[cfg(feature = "instrument")]
             instr_rec: None,
+            #[cfg(feature = "instrument")]
+            jit_steps: 0,
             output: Vec::new(),
             errput: Vec::new(),
             host: None,
@@ -323,6 +325,32 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether the fused array kernels and the off-frame method inliner may
+    /// run.
+    ///
+    /// Both execute user code natively or in Rust with no interpreter loop and
+    /// no VM pointer to charge against — the fused kernels take neither
+    /// (`codegen::kernels`), and `try_method_inline` evaluates a callee body
+    /// off-frame entirely outside `run_loop`. The compiled-code metering does
+    /// not reach either of them, so a metered VM declines them rather than
+    /// leaving a native path a script can spend unbounded work in. Both are
+    /// throughput optimisations; correctness never depended on them.
+    #[inline]
+    pub(crate) fn jit_fused_ok(&self) -> bool {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            #[cfg(feature = "instrument")]
+            if self.jit.metered() {
+                return false;
+            }
+            self.jit_enabled
+        }
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        {
+            false
+        }
+    }
+
     /// Force the JIT on/off (overrides the `ZIPP_NOJIT` default). Used by the
     /// test suite to run a program both ways and assert the outputs match.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -333,20 +361,43 @@ impl<'p> Vm<'p> {
 
     /// Attach a step budget / abort flag / trace recorder to this VM.
     ///
-    /// **This switches the JIT off for the VM's lifetime**, and there is no way
-    /// to instrument a VM without doing so. `try_run_jit` executes a whole
-    /// function activation natively and `try_run_osr` a whole loop region;
-    /// neither iterates the interpreter loop the instrumentation hooks, so with
-    /// the JIT on a budget would stop bounding a hot loop and a trace would omit
-    /// it entirely — while the program still returned the right answer. A
-    /// silently incomplete trace is worse than no trace at all, so the two
-    /// cannot be enabled together.
+    /// The JIT stays ON. Compiled code charges the budget itself — once per
+    /// basic block, by that block's exact instruction count, against
+    /// `Vm::jit_steps` (see `codegen::meter`) — so a native loop is bounded by
+    /// the same counter the interpreter uses. Code compiled BEFORE this call
+    /// carries no charge, so `Jit::set_meter` throws it away.
+    ///
+    /// Tracing is the exception, and `enter_trace_mode` below is where the JIT
+    /// actually goes off: a trace has to be a complete instruction-by-instruction
+    /// record, and native code produces no rows at all.
     #[cfg(feature = "instrument")]
     pub(crate) fn set_instrumentation(&mut self, rec: super::super::instrument::Recorder) {
+        self.instr_rec = Some(Box::new(rec));
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            // Safe to read now that `instr_rec` is set: the offset is relative to
+            // the VM pointer, which every compiled body is handed afresh on each
+            // native entry, so it survives this `Vm` being moved.
+            if let Some(off) = self.meter_offset() {
+                self.jit.set_meter(crate::codegen::meter::Meter { steps_off: off });
+            }
+        }
+    }
+
+    /// Switch the JIT off for this VM's lifetime, because a trace is being
+    /// recorded.
+    ///
+    /// `try_run_jit` runs a whole function activation natively and `try_run_osr`
+    /// a whole loop region; neither iterates the interpreter loop the trace hook
+    /// lives in. A JIT'd hot loop would therefore leave NO rows behind while the
+    /// program still returned the right answer — a proof over that trace would
+    /// attest to an execution that never happened. Metering can be made to work
+    /// natively (it is a counter); a trace cannot.
+    #[cfg(feature = "instrument")]
+    pub(crate) fn enter_trace_mode(&mut self) {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             self.jit_enabled = false;
         }
-        self.instr_rec = Some(Box::new(rec));
     }
 }

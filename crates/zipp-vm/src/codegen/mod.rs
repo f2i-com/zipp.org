@@ -779,6 +779,10 @@ pub struct Jit {
     reduce_kernels: FxHashMap<u32, Option<JitFn>>,
     /// Compiled fused `filter` kernels, keyed by predicate `func_id` (as above).
     filter_kernels: FxHashMap<u32, Option<JitFn>>,
+    /// Where compiled code charges the step budget, when this VM is metered.
+    /// Set once by `Vm::set_instrumentation`; `None` means every emitter is
+    /// byte-for-byte what an uninstrumented build produces.
+    meter: Option<meter::Meter>,
     /// Evicted regions parked here instead of being dropped. A region can be
     /// evicted REENTRANTLY (its `jit_call_*_ic` helper runs user code, which can
     /// loop back into the SAME region and deopt it past the limit) while an
@@ -792,6 +796,35 @@ pub struct Jit {
 impl Jit {
     pub fn new() -> Jit {
         Jit::default()
+    }
+
+    /// Point compiled code at a step counter, and throw away everything already
+    /// compiled without it.
+    ///
+    /// The discard is the whole point: code emitted before the VM was metered
+    /// contains no charge, so leaving it installed would leave a permanently
+    /// unmetered native path — the exact hole this machinery exists to close.
+    /// Buffers are PARKED rather than dropped, because a native frame may be
+    /// live on the stack (see `retired`).
+    pub fn set_meter(&mut self, m: meter::Meter) {
+        self.meter = Some(m);
+        self.retired.extend(self.regions.drain().map(|(_, r)| r));
+        self.compiled.clear();
+        self.counts.clear();
+        self.region_counts.clear();
+        self.fn_state.clear();
+        self.self_cache = None;
+        self.map_kernels.clear();
+        self.reduce_kernels.clear();
+        self.filter_kernels.clear();
+    }
+
+    /// Whether this VM meters native code. The fused array kernels and the
+    /// off-frame method inliner run user work with no VM pointer and no
+    /// interpreter loop, so a metered VM declines them rather than leaving an
+    /// uncharged native path open.
+    pub fn metered(&self) -> bool {
+        self.meter.is_some()
     }
 
     /// Look up compiled native code for `func_id`, if any.
@@ -860,7 +893,8 @@ impl Jit {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
         }
-        match compile_proto(proto, func_id, self_call_helper, self_val_bits) {
+        let meter = self.meter;
+        match compile_proto(proto, func_id, self_call_helper, self_val_bits, meter) {
             Some(f) => {
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
@@ -889,7 +923,7 @@ impl Jit {
             let ic_base_idx = self.reserve_ic_sites(n_sites);
             let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
             if let Some(f) =
-                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs, leaf_plan)
+                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs, leaf_plan, meter)
             {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!(
@@ -1017,6 +1051,7 @@ impl Jit {
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
             return;
         }
+        let meter = self.meter;
 
         // ── object scalar-replacement (SROA) ── if the region's heap ops all
         // target one non-escaping global object, rewrite them to scratch
@@ -1032,7 +1067,7 @@ impl Jit {
                         .map(|(i, &name)| (name, field_pool_base + i as u32))
                         .collect();
                     let rewritten = rewrite_for_field_promotion(proto, start, end, &fp, field_pool_base);
-                    let compiled = compile_region_numeric(&rewritten, start, end, globals_base_helper);
+                    let compiled = compile_region_numeric(&rewritten, start, end, globals_base_helper, meter);
                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                         eprintln!(
                             "[jit] SROA region fn{func_id} [{start},{end}] fields={} -> {}",
@@ -1063,7 +1098,7 @@ impl Jit {
         // double/memory path.
         if !self.region_int_blacklist.contains(&key) {
             if let Some(code) =
-                compile_region_int(proto, start, end, globals_base_helper, ta_plan, heap_helpers.ta_snapshot)
+                compile_region_int(proto, start, end, globals_base_helper, ta_plan, heap_helpers.ta_snapshot, meter)
             {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
@@ -1081,7 +1116,7 @@ impl Jit {
             .count();
         let ic_base_idx = self.reserve_ic_sites(n_sites);
         let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
-        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan) {
+        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, meter) {
             Some(code) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] DOUBLE/MEM region fn{func_id} [{start},{end}] compiled");
@@ -1230,6 +1265,7 @@ impl Region {
 
 // submodules (split out of the former monolithic codegen.rs)
 mod fn_int;
+pub(crate) mod meter;
 mod self_call;
 mod kernels;
 mod region_admit;

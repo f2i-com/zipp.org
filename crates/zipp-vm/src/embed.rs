@@ -314,11 +314,14 @@ impl ScriptState {
     /// [`Self::run_init`] / [`Self::eval_in_context`] / [`Self::call_slot`] —
     /// which the script cannot `catch` its way past.
     ///
-    /// **Switches the JIT off for this VM.** Native code runs whole functions
-    /// and whole loop regions without touching the interpreter loop the budget
-    /// lives in, so a JIT'd hot loop would ignore the limit completely. Call
-    /// this before [`Self::run_init`]; calling it again replaces the limits and
-    /// resets the step count.
+    /// The JIT stays on. Compiled code charges the budget itself, once per
+    /// basic block, by that block's exact instruction count — the same number
+    /// the interpreter would have counted, so the limit means one thing whether
+    /// or not the code got hot enough to compile.
+    ///
+    /// Call this before [`Self::run_init`]. Calling it again replaces the limits
+    /// and discards everything compiled so far, since code emitted for a
+    /// different budget carries the wrong charge.
     ///
     /// `abort` is polled every few thousand instructions rather than every one:
     /// an atomic load per instruction is a real cost for a flag that is almost
@@ -335,7 +338,8 @@ impl ScriptState {
     ) {
         if let Some(vm) = self.vm.as_mut() {
             let mut rec = crate::vm::instrument::Recorder::new();
-            rec.budget = max_steps;
+            // Saturating, so `u64::MAX` keeps meaning "unlimited".
+            rec.remaining = max_steps.min(i64::MAX as u64) as i64;
             rec.abort = abort;
             vm.set_instrumentation(rec);
         }
@@ -343,14 +347,27 @@ impl ScriptState {
 
     /// Start recording an execution trace, stopping at `max_steps` rows.
     ///
-    /// Requires [`Self::set_limits`] first — that is what attaches the recorder
-    /// and switches the JIT off; without it this is a no-op. Recording costs
-    /// roughly 64 bytes and a few register reads per instruction, so switch it
-    /// on immediately before the code you want to prove and take it back with
-    /// [`Self::finish_trace`] straight after.
+    /// Requires [`Self::set_limits`] first (that is what attaches the recorder);
+    /// without it this is a no-op.
+    ///
+    /// **This switches the JIT off for the VM's lifetime.** Unlike the budget,
+    /// which compiled code can charge itself, a trace has to be a complete
+    /// row-per-instruction record — native code produces no rows, so a JIT'd hot
+    /// loop would be missing from the trace entirely while the program still
+    /// returned the right answer.
+    ///
+    /// Recording costs roughly 64 bytes and a few register reads per
+    /// instruction, so switch it on immediately before the code you want to
+    /// prove and take it back with [`Self::finish_trace`] straight after.
     #[cfg(feature = "instrument")]
     pub fn start_trace(&mut self, max_steps: usize) {
-        if let Some(rec) = self.vm.as_mut().and_then(|vm| vm.instr_rec.as_mut()) {
+        let Some(vm) = self.vm.as_mut() else { return };
+        if vm.instr_rec.is_none() {
+            return;
+        }
+        // A trace must be a complete record, and native code produces no rows.
+        vm.enter_trace_mode();
+        if let Some(rec) = vm.instr_rec.as_mut() {
             rec.start_trace(max_steps);
         }
     }
@@ -379,12 +396,17 @@ impl ScriptState {
 
     /// Instructions still available under [`Self::set_limits`]; `u64::MAX` when
     /// unlimited or uninstrumented.
+    ///
+    /// Includes any chunk currently on loan to the native tier, so the figure is
+    /// the same whether or not the JIT happened to be running.
     #[cfg(feature = "instrument")]
     pub fn steps_remaining(&self) -> u64 {
-        self.vm
-            .as_ref()
-            .and_then(|vm| vm.instr_rec.as_ref())
-            .map_or(u64::MAX, |r| r.budget)
+        let Some(vm) = self.vm.as_ref() else { return u64::MAX };
+        let Some(rec) = vm.instr_rec.as_ref() else { return u64::MAX };
+        if rec.remaining == i64::MAX {
+            return u64::MAX;
+        }
+        (rec.remaining + vm.jit_steps.max(0)).max(0) as u64
     }
 }
 

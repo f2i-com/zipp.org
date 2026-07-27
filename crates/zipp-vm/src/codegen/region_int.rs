@@ -146,8 +146,18 @@ pub(crate) fn compile_region_int(
     globals_base_helper: usize,
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
+    meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
-    compile_region_int_maybe_cold(proto, start, end, globals_base_helper, ta_plan, ta_snapshot, false)
+    compile_region_int_maybe_cold(
+        proto,
+        start,
+        end,
+        globals_base_helper,
+        ta_plan,
+        ta_snapshot,
+        false,
+        meter,
+    )
 }
 
 /// `cold_exit`: compile ops the INT emitter has no arm for as SIDE EXITS rather
@@ -164,6 +174,7 @@ pub(crate) fn compile_region_int_maybe_cold(
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
     cold_exit: bool,
+    meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     let unadmitted = int_unadmitted_ips(proto, start, end, ta_plan)?;
     let cold: FxHashSet<usize> = if unadmitted.is_empty() {
@@ -241,6 +252,10 @@ pub(crate) fn compile_region_int_maybe_cold(
     let mut exit_stubs: FxHashMap<u32, dynasmrt::DynamicLabel> = FxHashMap::default();
     let flush_exit = ops.new_dynamic_label();
     let entry_bail = ops.new_dynamic_label();
+    // Step metering (a metered VM only). One charge per basic block, of that
+    // block's exact instruction count, against `[rdi + off]` — `rdi` is the VM
+    // pointer this body already holds, so no register and no frame slot.
+    let blocks = crate::codegen::meter::block_map(meter, &proto.code, s, e);
     let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
 
     // ── prologue ── mirrors the double path (save callee-saved, fetch globals base,
@@ -343,6 +358,11 @@ pub(crate) fn compile_region_int_maybe_cold(
         if plan.jump_targets.contains(&ip) {
             lc = None; // control may arrive here with different home contents
         }
+        // Charge this basic block before running it. A block is straight-line,
+        // so entering it means executing all of it — the same count the
+        // interpreter would have made, in the same unit.
+        let charged =
+            crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         // B9: an ip in a cold block never runs natively — flush every home and
         // hand this exact ip back to the interpreter, which runs the block (and
         // the rest of the iteration) itself.
@@ -365,7 +385,13 @@ pub(crate) fn compile_region_int_maybe_cold(
                 continue;
             }
         }
-        let prev_flag = flag_cmp.take();
+        // The charge's `sub` clobbers flags, so a compare from an earlier ip can
+        // no longer drive this ip's branch. In practice fusion never reaches a
+        // block head anyway (a branch consumes `flag_cmp` without restoring it,
+        // and every block head follows a branch or is a jump target), but the
+        // fusion predicate is subtle enough that stating the dependency beats
+        // relying on it.
+        let prev_flag = flag_cmp.take().filter(|_| !charged);
         match proto.code[ip] {
             Instr::LoadInt { .. } | Instr::LoadConst { .. } => {
                 emit_int_const(&mut ops, &plan, &proto.code[ip], proto);

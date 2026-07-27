@@ -51,7 +51,7 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Map)
             && kernel_ok
-            && self.jit_enabled
+            && self.jit_fused_ok()
             && self.jit_recurse_depth == 0
             && cb.is_heap()
             && snapshot.len() <= i32::MAX as usize
@@ -112,7 +112,7 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Filter)
             && kernel_ok
-            && self.jit_enabled
+            && self.jit_fused_ok()
             && self.jit_recurse_depth == 0
             && cb.is_heap()
             && snapshot.len() <= i32::MAX as usize
@@ -2063,7 +2063,7 @@ impl<'p> Vm<'p> {
                 // and the accumulated value (via the in/out acc pointer); the
                 // per-element tail below finishes `[start, len)` correctly.
                 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                if self.jit_enabled
+                if self.jit_fused_ok()
                     && self.jit_recurse_depth == 0
                     && cb.is_heap()
                     && start < snapshot.len()

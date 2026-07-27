@@ -6054,7 +6054,20 @@ impl<'p> Vm<'p> {
         // regs Vec around the recursion (see its safety note).
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        // Lend the native tier a bounded slice of the step budget, which its
+        // compiled body charges directly. Saved and restored around the run
+        // because native code re-enters Rust through its call helpers, and that
+        // Rust can enter native again.
+        #[cfg(feature = "instrument")]
+        let outer_steps = self.jit_steps;
+        #[cfg(feature = "instrument")]
+        let _ = self.meter_lend();
         let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
+        #[cfg(feature = "instrument")]
+        {
+            self.meter_return();
+            self.jit_steps = outer_steps;
+        }
         Some((Value::from_bits(bits), bail))
     }
 
@@ -6152,6 +6165,10 @@ impl<'p> Vm<'p> {
         // SAFETY: `entry` points into the region's mmap'd ExecutableBuffer
         // (stable even if `jit.regions` rehashes; eviction parks, never drops,
         // a possibly-running region); regs/globals never reallocate (pinned).
+        #[cfg(feature = "instrument")]
+        let outer_steps = self.jit_steps;
+        #[cfg(feature = "instrument")]
+        let _ = self.meter_lend();
         let resume = unsafe {
             let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
                 std::mem::transmute(entry);
@@ -6159,6 +6176,19 @@ impl<'p> Vm<'p> {
             let _ = f(regs_ptr, &mut resume as *mut u32, vm_ptr);
             resume
         };
+        // Running out of lent steps is a normal, periodic exit, not a signal
+        // about this region's quality — the interpreter tops the budget up and
+        // the next back-edge comes straight back here. Counting it as a deopt
+        // would evict every hot loop after 64 chunks.
+        #[cfg(feature = "instrument")]
+        let meter_exit = self.meter_exhausted();
+        #[cfg(feature = "instrument")]
+        {
+            self.meter_return();
+            self.jit_steps = outer_steps;
+        }
+        #[cfg(not(feature = "instrument"))]
+        let meter_exit = false;
 
         // â”€â”€ post-run sync â”€â”€ flush the pool globals back to the object's fields,
         // so the interpreter (which resumes on the ORIGINAL bytecode, reading the
@@ -6177,7 +6207,7 @@ impl<'p> Vm<'p> {
         // A call helper may have flagged this exit as exempt (depth-cap deopt /
         // a throw the call legitimately produced) — legal recursion and caught
         // exceptions must not evict a hot region.
-        let exempt = std::mem::take(&mut self.osr_deopt_exempt);
+        let exempt = std::mem::take(&mut self.osr_deopt_exempt) || meter_exit;
         if !exempt {
             self.jit.note_region_resume(func_id, entry_ip, resume);
         }

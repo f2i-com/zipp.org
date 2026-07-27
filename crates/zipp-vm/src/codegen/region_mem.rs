@@ -21,6 +21,7 @@ pub(crate) fn compile_region_mem(
     ta_plan: &TaPinPlan,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
+    meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end, Some(const_strs)) {
         return None;
@@ -92,6 +93,8 @@ pub(crate) fn compile_region_mem(
     // compute deopts at entry (`g` isn't a string/array).
     let entry_len_bail = ops.new_dynamic_label();
     let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
+    // Step metering (a metered VM only) — see codegen::meter.
+    let blocks = crate::codegen::meter::block_map(meter, &proto.code, s, e);
 
     // ── prologue ── save callee-saved, stash inputs, fetch globals base, jump to
     // the loop header (OSR entry).
@@ -183,6 +186,7 @@ pub(crate) fn compile_region_mem(
         }
         let ipl = lbl(ip as u32, &in_region);
         dynasm!(ops ; => ipl);
+        crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         let bail = ops.new_dynamic_label();
         match proto.code[ip] {
             Instr::LoadInt { dst, val } => {

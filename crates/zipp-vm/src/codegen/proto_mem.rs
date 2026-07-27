@@ -119,6 +119,7 @@ pub(crate) fn compile_proto_mem(
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+    meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -216,8 +217,19 @@ pub(crate) fn compile_proto_mem(
     // GetProp arm). Reserved contiguously by `Jit::compile` via reserve_ic_sites.
     let mut ic_site = heap.ic_base_idx;
     let int_hint = true; // v1 admits no double-constant feeds.
+    // Step metering (a metered VM only) — a Tier C body can loop just as a Tier
+    // A one can, so it needs the same charge. See codegen::meter.
+    let blocks = crate::codegen::meter::block_map(meter, &proto.code, 0, n - 1);
+    let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
     for ip in 0..n {
         dynasm!(ops ; => labels[ip]);
+        if let Some((m, bl)) = blocks.as_ref() {
+            if let Some(&len) = bl.get(&ip) {
+                let stub = ops.new_dynamic_label();
+                crate::codegen::meter::emit_charge(&mut ops, m, len, stub);
+                meter_stubs.push((stub, ip));
+            }
+        }
         // Each op gets its OWN dedicated bail label (records THIS ip); a guard
         // miss resumes the interpreter exactly here, side-effect-free.
         let bail = ops.new_dynamic_label();
@@ -777,6 +789,17 @@ pub(crate) fn compile_proto_mem(
         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
         ; jmp => epilogue
     );
+
+    // ── metering exits ── out of line, so the hot path is `sub` plus a
+    // not-taken `jle`. Resuming at this ip is an ordinary bail.
+    for (stub, ip) in meter_stubs {
+        dynasm!(ops
+            ; => stub
+            ; mov DWORD [rsi], ip as i32
+            ; xor rax, rax
+            ; jmp => epilogue
+        );
+    }
 
     // ── epilogue ── restore and return; rax = result (or garbage on bail), [rsi]
     // = NO_BAIL or the resume ip. Mirrors `compile_region_mem`'s 6-pop epilogue.

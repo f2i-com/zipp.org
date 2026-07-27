@@ -17,6 +17,7 @@ pub(crate) fn compile_region_regalloc(
     globals_base_helper: usize,
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
+    meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end, None) {
         return None;
@@ -32,6 +33,8 @@ pub(crate) fn compile_region_regalloc(
     let flush_exit = ops.new_dynamic_label(); // flush homes, then restore + ret
     let entry_bail = ops.new_dynamic_label(); // entry guard failed: restore + ret, NO flush
     let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
+    // Step metering (a metered VM only) — see codegen::meter.
+    let blocks = crate::codegen::meter::block_map(meter, &proto.code, s, e);
 
     // ── prologue ── save callee-saved gprs, fetch globals base, save the
     // nonvolatile xmm6..15 (we may use them as homes), load live-in homes, jump
@@ -129,6 +132,8 @@ pub(crate) fn compile_region_regalloc(
     let mut lc: LastCopy = None;
     for ip in s..=e {
         dynasm!(ops ; => lbl(ip as u32, &in_region));
+        let charged =
+            crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         if plan.jump_targets.contains(&ip) {
             lc = None; // control may arrive here with different home contents
         }
@@ -146,7 +151,9 @@ pub(crate) fn compile_region_regalloc(
                 continue;
             }
         }
-        let prev_flag = flag_cmp.take();
+        // A metering charge clobbers flags, so a compare from an earlier ip can
+        // no longer drive this ip's branch. See the note in region_int.
+        let prev_flag = flag_cmp.take().filter(|_| !charged);
         match proto.code[ip] {
             Instr::LoadInt { .. } | Instr::LoadConst { .. } => {
                 emit_load_const(&mut ops, &plan, &proto.code[ip], proto);

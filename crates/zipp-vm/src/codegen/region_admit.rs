@@ -669,14 +669,15 @@ pub(crate) fn compile_region(
     ta_plan: &TaPinPlan,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
+    meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     // The register/SROA paths decline any region containing a Call/CallMethod, so
     // leaf inlining and method inlining (which apply only to those sites) are
     // reachable only via the memory path below.
-    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot) {
+    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot, meter) {
         return Some(f);
     }
-    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan)
+    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan, meter)
 }
 
 /// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
@@ -684,13 +685,19 @@ pub(crate) fn compile_region(
 /// path — the rewrite removed all heap ops, so if the register paths decline
 /// (e.g. register pressure even with reuse), SROA is abandoned and the caller
 /// falls back to the inline-cache mem path on the ORIGINAL bytecode.
-pub(crate) fn compile_region_numeric(proto: &FuncProto, start: u32, end: u32, gh: usize) -> Option<(JitFn, bool)> {
+pub(crate) fn compile_region_numeric(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    gh: usize,
+    meter: Option<crate::codegen::meter::Meter>,
+) -> Option<(JitFn, bool)> {
     // SROA-rewritten code has no index ops, so an empty TA plan (no snapshot) is correct.
-    if let Some(f) = compile_region_int(proto, start, end, gh, &TaPinPlan::default(), 0) {
+    if let Some(f) = compile_region_int(proto, start, end, gh, &TaPinPlan::default(), 0, meter) {
         return Some((f, true));
     }
     // SROA-rewritten code has no index ops, so an empty TA plan is correct here.
-    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default(), 0).map(|f| (f, false))
+    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default(), 0, meter).map(|f| (f, false))
 }
 
 /// Clone `proto` and rewrite the region's heap ops to scratch field-globals so

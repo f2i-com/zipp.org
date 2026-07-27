@@ -244,6 +244,129 @@ fn hitting_the_row_cap_yields_no_trace_at_all() {
     assert_eq!(v.as_str(), Some("4999950000"));
 }
 
+/// The step count must be the SAME NUMBER whether or not the JIT ran, or
+/// `max_steps` would mean two different things depending on how hot the code
+/// got — and a script near its limit would succeed or fail unpredictably.
+///
+/// Compiled code charges one basic block at a time, by that block's exact
+/// instruction count. A basic block is straight-line, so entering it means
+/// executing all of it: the charge is what the interpreter would have counted.
+/// `start_trace` is the lever used here to force interpreter-only execution,
+/// since a trace has to be a complete record and native code produces no rows.
+#[test]
+fn the_jit_charges_exactly_what_the_interpreter_would() {
+    const BIG: u64 = 1_000_000_000;
+
+    fn steps_and_result(script: &str, interpreter_only: bool) -> (u64, String) {
+        let mut st = embed::compile_script(BOOT).expect("compiles");
+        st.set_limits(BIG, None);
+        if interpreter_only {
+            st.start_trace(usize::MAX);
+        }
+        st.run_init().expect("runs");
+        let before = st.steps_remaining();
+        let _ = st.eval_in_context(&format!(
+            "globalThis.__r = (0,eval)({});",
+            js_string(script)
+        ));
+        let used = before - st.steps_remaining();
+        let out = st
+            .eval_in_context("String(globalThis.__r)")
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        (used, out)
+    }
+
+    for script in [
+        // A counted loop far past OSR_THRESHOLD — the integer region tier.
+        "let s=0; for(let i=0;i<200000;i++) s+=i; s",
+        // A branchy body, so the block partition has to be right and not just
+        // "the whole loop span".
+        "let s=0; for(let i=0;i<200000;i++){ if(i%3===0) s+=i; else s-=1; } s",
+        // Self-recursion — the whole-function tier and its native self-calls.
+        "function fib(n){return n<2?n:fib(n-1)+fib(n-2)} fib(22)",
+        // Arrays: pinned dense-element access in a hot loop.
+        "const a=[]; for(let i=0;i<50000;i++)a.push(i*3);          let t=0; for(let i=0;i<a.length;i++)t+=a[i]; t",
+        // Property access, which routes through the inline-cache memory tier.
+        "let o={n:0}; for(let i=0;i<100000;i++){ o.n = o.n + 1; } o.n",
+        // String building — the helper-call path.
+        "let s=''; for(let i=0;i<2000;i++) s+='x'; s.length",
+    ] {
+        let (jit, jit_out) = steps_and_result(script, false);
+        let (interp, interp_out) = steps_and_result(script, true);
+        assert_eq!(jit_out, interp_out, "different RESULT for {script:?}");
+        assert_eq!(jit, interp, "different step count for {script:?}");
+        assert!(jit > 1000, "{script:?} charged only {jit} steps — is it running at all?");
+    }
+}
+
+/// The point of the whole exercise: a loop hot enough to be compiled must still
+/// stop at its budget. Before native metering it would run to completion,
+/// ignore the limit entirely, and return the right answer — the failure mode
+/// that is hardest to notice.
+#[test]
+fn a_jit_hot_loop_still_hits_its_budget() {
+    let mut st = instrumented(500_000, None);
+    let started = std::time::Instant::now();
+    let err = st
+        .eval_in_context("(0,eval)('let s=0; for(let i=0;i<1000000000;i++) s+=i; s')")
+        .expect_err("a billion-iteration loop must not complete");
+    assert!(err.contains("instruction budget"), "got {err:?}");
+    assert_eq!(st.steps_remaining(), 0);
+    // A billion iterations would take seconds even compiled; stopping at half a
+    // million steps must be immediate.
+    assert!(started.elapsed().as_millis() < 500, "took {:?}", started.elapsed());
+}
+
+/// The abort flag has to reach compiled code too. It is polled in Rust once per
+/// native entry, and the lent chunk is what forces those entries to keep
+/// happening inside an otherwise unbounded loop.
+#[test]
+fn the_abort_flag_stops_a_jit_hot_loop() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let setter = flag.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        setter.store(true, Ordering::Relaxed);
+    });
+    let mut st = instrumented(u64::MAX, Some(flag));
+    let started = std::time::Instant::now();
+    let err = st
+        .eval_in_context("(0,eval)('let s=0; for(let i=0;i<100000000000;i++) s+=i; s')")
+        .expect_err("must be aborted");
+    assert!(err.contains("aborted by the host"), "got {err:?}");
+    assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    t.join().unwrap();
+}
+
+/// Metering a VM must not change what its programs compute. This is the same
+/// contract the crate's JIT-on/JIT-off differential tests enforce, extended to
+/// the third configuration that now exists: JIT on, and charging.
+#[test]
+fn metering_does_not_change_results() {
+    for (script, want) in [
+        ("let s=0; for(let i=0;i<100000;i++) s+=i; s", "4999950000"),
+        ("function fib(n){return n<2?n:fib(n-1)+fib(n-2)} fib(24)", "46368"),
+        ("const a=[]; for(let i=0;i<10000;i++)a.push(i%7); a.filter(x=>x===3).length", "1429"),
+        ("let o={a:0,b:0}; for(let i=0;i<50000;i++){o.a+=1;o.b+=o.a;} o.b", "1250025000"),
+        ("let s=0; for(let i=0;i<50000;i++){ s = (s + i*3) | 0; } s", "-545042296"),
+    ] {
+        let mut metered = instrumented(u64::MAX, None);
+        let got = metered
+            .eval_in_context(&format!("String((0,eval)({}))", js_string(script)))
+            .unwrap_or_else(|e| panic!("metered run of {script:?} failed: {e}"));
+        assert_eq!(got.as_str(), Some(want), "metered result for {script:?}");
+
+        let mut plain = embed::compile_script(BOOT).expect("compiles");
+        plain.run_init().expect("runs");
+        let base = plain
+            .eval_in_context(&format!("String((0,eval)({}))", js_string(script)))
+            .expect("plain run");
+        assert_eq!(got, base, "metered vs unmetered differ for {script:?}");
+    }
+}
+
 /// Uninstrumented VMs must behave exactly as before — no budget, no recorder,
 /// and (the part worth pinning) the JIT still on.
 #[test]
