@@ -288,6 +288,12 @@ pub struct Vm<'p> {
     /// the window `[base, base + reg_count)`.
     regs: Vec<Value>,
     frames: Vec<Frame>,
+    /// Step budget / abort flag / execution trace, when an embedder has asked
+    /// for them. `None` — the only state a default build can be in — means the
+    /// dispatch hook returns immediately. Boxed so the `Option` costs one
+    /// pointer in the hot struct rather than the recorder's whole footprint.
+    #[cfg(feature = "instrument")]
+    pub(crate) instr_rec: Option<Box<instrument::Recorder>>,
     /// Lines produced by `Print` (console.log/info/debug → stdout), in order.
     pub output: Vec<String>,
     /// Lines produced by `console.error`/`console.warn` (→ stderr in node).
@@ -1166,6 +1172,11 @@ pub struct Thrown(pub String);
 // submodules (split from the former monolithic vm.rs)
 pub(crate) mod clock;
 pub(crate) mod host_api;
+/// Step budget, cooperative abort, and the optional execution trace. Off by
+/// default: the hook it adds to the inner dispatch loop is not something a
+/// `zipp js file.js` run should pay for.
+#[cfg(feature = "instrument")]
+pub mod instrument;
 mod engine;
 mod dispatch;
 mod async_runtime;

@@ -254,6 +254,19 @@ impl<'p> Vm<'p> {
             // a new frame or a return pops this one.
             loop {
                 let instr = &code[ip];
+                // Step budget / abort poll / execution trace. Compiled out
+                // entirely without the `instrument` feature, and a null check
+                // when it is present but unused — this is the hot loop.
+                // `ip` (the local) is the pc, never `frames[..].ip`, which is
+                // only synced at frame transitions and is stale in here.
+                #[cfg(feature = "instrument")]
+                if self.instr_rec.is_some() {
+                    if let Err(msg) = self.instrument_step(base, ip, instr) {
+                        let top = self.frames.len() - 1;
+                        self.frames[top].ip = ip;
+                        return Err(Thrown(msg.to_string()));
+                    }
+                }
                 match *instr {
                     Instr::LoadConst { dst, idx } => {
                         let v = self.func(func_id as usize).constants[idx as usize];

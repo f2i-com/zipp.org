@@ -33,6 +33,10 @@ use crate::value::Value;
 use crate::vm::Vm;
 
 pub use crate::vm::host_api::{HostValue, Symbol, SymbolScope};
+/// The execution-trace row and its opcode contract. See
+/// [`ScriptState::start_trace`].
+#[cfg(feature = "instrument")]
+pub use crate::vm::instrument::{op, TraceStep};
 
 /// The embedder's side of `__zippHostCall(kind, ...args)`. Arguments arrive
 /// already stringified and the reply is a string, so anything structured
@@ -296,6 +300,91 @@ impl ScriptState {
         if let Some(vm) = self.vm.as_mut() {
             vm.host_pump();
         }
+    }
+
+    // ---- Untrusted-code controls (`instrument` feature) -------------------
+    //
+    // A host running code it did not write needs to bound it and, for some
+    // hosts, to record what it did. See `crate::vm::instrument`.
+
+    /// Bound this VM: at most `max_steps` bytecode instructions, and stop early
+    /// when `abort` becomes true.
+    ///
+    /// Exceeding either surfaces as an uncaught `RangeError` — an `Err` from
+    /// [`Self::run_init`] / [`Self::eval_in_context`] / [`Self::call_slot`] —
+    /// which the script cannot `catch` its way past.
+    ///
+    /// **Switches the JIT off for this VM.** Native code runs whole functions
+    /// and whole loop regions without touching the interpreter loop the budget
+    /// lives in, so a JIT'd hot loop would ignore the limit completely. Call
+    /// this before [`Self::run_init`]; calling it again replaces the limits and
+    /// resets the step count.
+    ///
+    /// `abort` is polled every few thousand instructions rather than every one:
+    /// an atomic load per instruction is a real cost for a flag that is almost
+    /// never set.
+    ///
+    /// Note what this does NOT bound: a single native builtin. A pathological
+    /// `JSON.parse` or a catastrophic regex is ONE instruction, so wall-clock
+    /// safety still needs the abort flag driven by a timer on another thread.
+    #[cfg(feature = "instrument")]
+    pub fn set_limits(
+        &mut self,
+        max_steps: u64,
+        abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        if let Some(vm) = self.vm.as_mut() {
+            let mut rec = crate::vm::instrument::Recorder::new();
+            rec.budget = max_steps;
+            rec.abort = abort;
+            vm.set_instrumentation(rec);
+        }
+    }
+
+    /// Start recording an execution trace, stopping at `max_steps` rows.
+    ///
+    /// Requires [`Self::set_limits`] first — that is what attaches the recorder
+    /// and switches the JIT off; without it this is a no-op. Recording costs
+    /// roughly 64 bytes and a few register reads per instruction, so switch it
+    /// on immediately before the code you want to prove and take it back with
+    /// [`Self::finish_trace`] straight after.
+    #[cfg(feature = "instrument")]
+    pub fn start_trace(&mut self, max_steps: usize) {
+        if let Some(rec) = self.vm.as_mut().and_then(|vm| vm.instr_rec.as_mut()) {
+            rec.start_trace(max_steps);
+        }
+    }
+
+    /// Stop recording and take the trace, appending a terminal halt row that
+    /// carries `result`.
+    ///
+    /// `None` means the trace is not usable for proving — it hit the row cap, or
+    /// is too short — and the caller should fall back to whatever unproven
+    /// receipt it offers. It is never a PARTIAL trace: a truncated recording is
+    /// discarded rather than returned, because a trace missing its tail attests
+    /// to an execution that did not happen.
+    #[cfg(feature = "instrument")]
+    pub fn finish_trace(&mut self, result: u64) -> Option<Vec<TraceStep>> {
+        self.vm.as_mut().and_then(|vm| vm.instr_rec.as_mut())?.finish(result)
+    }
+
+    /// Whether the last recording stopped early at the row cap.
+    #[cfg(feature = "instrument")]
+    pub fn trace_truncated(&self) -> bool {
+        self.vm
+            .as_ref()
+            .and_then(|vm| vm.instr_rec.as_ref())
+            .is_some_and(|r| r.truncated())
+    }
+
+    /// Instructions still available under [`Self::set_limits`]; `u64::MAX` when
+    /// unlimited or uninstrumented.
+    #[cfg(feature = "instrument")]
+    pub fn steps_remaining(&self) -> u64 {
+        self.vm
+            .as_ref()
+            .and_then(|vm| vm.instr_rec.as_ref())
+            .map_or(u64::MAX, |r| r.budget)
     }
 }
 

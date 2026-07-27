@@ -83,6 +83,8 @@ impl<'p> Vm<'p> {
             globals,
             regs: Vec::new(),
             frames: Vec::new(),
+            #[cfg(feature = "instrument")]
+            instr_rec: None,
             output: Vec::new(),
             errput: Vec::new(),
             host: None,
@@ -329,4 +331,22 @@ impl<'p> Vm<'p> {
         self.jit_enabled = on;
     }
 
+    /// Attach a step budget / abort flag / trace recorder to this VM.
+    ///
+    /// **This switches the JIT off for the VM's lifetime**, and there is no way
+    /// to instrument a VM without doing so. `try_run_jit` executes a whole
+    /// function activation natively and `try_run_osr` a whole loop region;
+    /// neither iterates the interpreter loop the instrumentation hooks, so with
+    /// the JIT on a budget would stop bounding a hot loop and a trace would omit
+    /// it entirely — while the program still returned the right answer. A
+    /// silently incomplete trace is worse than no trace at all, so the two
+    /// cannot be enabled together.
+    #[cfg(feature = "instrument")]
+    pub(crate) fn set_instrumentation(&mut self, rec: super::super::instrument::Recorder) {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.jit_enabled = false;
+        }
+        self.instr_rec = Some(Box::new(rec));
+    }
 }
