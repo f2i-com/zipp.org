@@ -828,7 +828,9 @@ impl<'p> Vm<'p> {
             // completion (the &self has_property swallows both).
             if self.has_property_dyn(this, fk)? {
                 let v = self.get_index(this, fk)?;
-                self.set_index(this, Value::num(to as f64), v, false)?;
+                // Set(O, to, v, THROW) — same reason as `fill`: copyWithin on a
+                // frozen array must raise, not silently drop the write.
+                self.set_index(this, Value::num(to as f64), v, true)?;
             } else {
                 let deleted = self.delete_property(this, &to.to_string())?;
                 if !self.truthy(deleted) {
@@ -870,7 +872,10 @@ impl<'p> Vm<'p> {
         };
         let end = rel(e0);
         while k < end {
-            self.set_index(this, Value::num(k as f64), value, false)?;
+            // Set(O, Pk, value, THROW) — the `true` matters: a non-writable
+            // element or a non-extensible receiver must raise a TypeError, not
+            // be dropped. `fill` on a frozen array silently succeeded.
+            self.set_index(this, Value::num(k as f64), value, true)?;
             k += 1;
         }
         Ok(Some(this))
@@ -1539,6 +1544,26 @@ impl<'p> Vm<'p> {
         // splice() with no args still set `length`). (A SEALED-but-not-frozen array
         // keeps `length` writable, so it is not gated here; its add/delete failures
         // are a separate concern.)
+        // `fill` and `copyWithin` write elements with Set(O, k, v, THROW). The
+        // dense arms below store into `items[i]` directly, which cannot fail —
+        // so a frozen array was silently overwritten and a sealed or
+        // non-extensible one silently ignored. Route those receivers to the
+        // generic array-like helpers, which go through the observable
+        // Get/Set/HasProperty path and throw where the spec says to. The dense
+        // arms stay for the overwhelmingly common unconstrained array.
+        if matches!(name, "fill" | "copyWithin")
+            && self
+                .arr_props
+                .get(&idx)
+                .map_or(false, |m| m.is_frozen() || m.is_sealed() || !m.extensible)
+        {
+            let this = Value::heap(idx);
+            return if name == "fill" {
+                self.array_like_fill(this, args)
+            } else {
+                self.array_like_copy_within(this, args)
+            };
+        }
         if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice")
             && (self.arr_props.get(&idx).map_or(false, |m| m.is_frozen())
                 || self.array_length_nonwritable.contains(&idx))
