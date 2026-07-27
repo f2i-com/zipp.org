@@ -31,7 +31,10 @@ var window = {
 var navigator = {
   clipboard: {
     writeText: function (t) { __zippHostCall("nav.clipboardWrite", String(t)); },
-    readText: function () { return __zippHostCall("nav.clipboardRead"); },
+    // Parsed, like every other reply: the host JSON-encodes what it returns, so
+    // reading it raw hands the script the two-character string `""` for an empty
+    // clipboard — which is truthy, and guards on it take the wrong branch.
+    readText: function () { return JSON.parse(__zippHostCall("nav.clipboardRead")); },
   },
 };
 
