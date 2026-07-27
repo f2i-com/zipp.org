@@ -83,9 +83,41 @@ impl<'p> Vm<'p> {
                                         HeapObj::Native(n) if *n == id)
                     })
                 };
-                intrinsic("exec", native::REGEXP_EXEC)
-                    && intrinsic("@@replace", native::REGEXP_SYM_REPLACE)
+                if !(intrinsic("exec", native::REGEXP_EXEC)
+                    && intrinsic("@@replace", native::REGEXP_SYM_REPLACE))
+                {
+                    return false;
+                }
             }
+            _ => return false,
+        }
+        // The fast path starts matching at 0 and does not write `lastIndex`
+        // back, which is only unobservable for a NON-sticky pattern whose
+        // `lastIndex` is already 0. `@@replace` reads `lastIndex` for a sticky
+        // regex and, when global, sets it to 0 before matching and leaves it
+        // there — `"aaaa".replace(/a/g, "b")` must end with `lastIndex === 0`,
+        // and a sticky `re` with `lastIndex === 5` must resume at 5.
+        let (flags, last_index) = match self.heap.get(re) {
+            HeapObj::RegExp { flags, last_index, .. } => (flags.clone(), *last_index),
+            _ => return false,
+        };
+        if flags.contains('y') {
+            return false;
+        }
+        if !(last_index.is_number() && last_index.as_f64() == 0.0) {
+            return false;
+        }
+        // `@@replace` also reads `global` and `unicode` off the INSTANCE, so a
+        // patched accessor on the prototype is observable.
+        match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => ["global", "unicode", "flags", "source"].iter().all(|k| {
+                m.pos(k).is_none_or(|i| {
+                    let a = m.attrs[i];
+                    a.accessor
+                        && m.vals[i].is_heap()
+                        && matches!(self.heap.get(m.vals[i].heap_index()), HeapObj::Native(_))
+                })
+            }),
             _ => false,
         }
     }
