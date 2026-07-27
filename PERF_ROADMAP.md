@@ -1316,8 +1316,8 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
-### B49 — B36's MARGINAL term: 40% of it IS allocation, and interning it still
-does not pay
+### B49 — B36's MARGINAL term: 40% of it IS allocation, and interning it does
+not pay — CLOSED after three attempts
 
 Splitting the 36.2ns/key that remains after B48, on a 32-key object:
 
@@ -1357,14 +1357,31 @@ that ~1,500 interned strings become permanent GC ROOTS traced on every
 collection, and `json-large` collects often. Not chased further: a microbench win
 that costs the benchmark suite 1% is not shippable at face value.
 
-**What the next attempt should do differently:** make the interned strings NOT
-permanent roots — a weak side table swept with the heap, or entries reclaimed
-when the string is otherwise unreachable — and re-measure. The 12.2ns is real and
-still on the table; the rooting is what has to go.
+**Then built the weak version too, and it is REFUTED as well.** Entries pruned
+in the same pass that drops the other side tables — no traced roots, and sound
+because the prune runs after `free_slot` and before any subsequent `alloc`, so an
+entry cannot survive into the moment its slot is recycled. That did recover part
+of the cost (`json-large` +1.0% -> +0.6%), confirming rooting was a real term.
+But the SUITE is **+0.9% mean, 7 of 10 benches slower**, and the microbench win
+holds throughout (`Object.keys` 27.6 -> 23.7ns/key).
 
-Recorded twice now, which is the point: the same idea, refuted for two DIFFERENT
-reasons, at two different times. The first refutation was measurement error of a
-kind (wrong workload); the second is a real cost that has a known fix.
+**So the item is closed, not parked.** Three attempts — permanent-root interning
+(B29), capped interning, weak interning — refuted for three separately measured
+reasons. What remains is the honest explanation: the benches barely enumerate, so
+the interner's per-key hash probe and per-GC prune are paid everywhere while the
+12.2ns it saves is collected almost nowhere. The 12.2ns is real; it is simply not
+reachable by caching, because the cache costs more than it saves at this hit
+rate.
+
+Anyone reopening this should attack the **~20ns cost of creating a heap object**
+(B37) rather than try to avoid creating one. That is the term under
+`alloc_str`, it is the same term under `{}` and `Promise.resolve`, and unlike
+interning it pays everywhere at once.
+
+Recorded three times on purpose. The first refutation was the wrong workload, the
+second was GC rooting, the third is the cache's own overhead — and only the first
+was an error. That is what an item looks like when it is genuinely finished
+rather than merely abandoned.
 
 ### B48 — B36's for-in fixed cost: it was the prototype walk, not the allocations
 
