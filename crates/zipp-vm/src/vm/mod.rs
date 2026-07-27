@@ -1090,6 +1090,15 @@ pub struct Vm<'p> {
     iterator_ctor: u32,
     /// The test262 `$262` host object (0 until set up).
     dollar262: u32,
+    /// Whether to install `$262` at all.
+    ///
+    /// It is a TEST HARNESS object — `agent.start()` spawns detached OS threads
+    /// running their own VMs, `createRealm` builds a fresh global, `evalScript`
+    /// and `detachArrayBuffer` reach past ordinary JS — and a host running code
+    /// it did not write wants none of it. `zipp js` and the test262 runner keep
+    /// it; `embed::compile_script` turns it off, because that API exists
+    /// precisely for untrusted code.
+    pub(crate) host_262: bool,
     /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
     /// iterators (and the default array `@@iterator`). 0 until set up.
     array_iter_proto: u32,

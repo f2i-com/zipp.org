@@ -2477,10 +2477,15 @@ impl<'p> Vm<'p> {
             ("print", print_fn),
             ("eval", eval_fn),
             ("globalThis", global_this),
-            ("$262", self.dollar262),
             (native::ANNEXB_REF_ERROR_NAME, annexb_ref_error_fn),
             (native::HOST_CALL_NAME, host_call_fn),
         ];
+        // The test262 harness object, only when the host asked for it. Omitted
+        // rather than zeroed: the loop below installs whatever index it is
+        // handed, so a sentinel would bind `$262` to heap slot 0.
+        if self.host_262 {
+            all.push(("$262", self.dollar262));
+        }
         // The 11 TypedArray constructors (Int8Array … BigUint64Array).
         for (k, t) in native::TA_KINDS.iter().enumerate() {
             all.push((t.0, self.ta_ctors[k]));

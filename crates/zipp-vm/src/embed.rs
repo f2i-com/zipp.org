@@ -124,7 +124,14 @@ pub fn compile_script(src: &str) -> Result<ScriptState, String> {
     // SAFETY: `leaked` is a live, uniquely-owned allocation; reborrowing it as
     // shared for the VM is fine because `program` is only dereferenced again in
     // `Drop`, after the VM (the sole holder of the shared borrow) is gone.
-    let vm = Vm::new(unsafe { &*program });
+    let mut vm = Vm::new(unsafe { &*program });
+    // No test262 host object for embedded code. `$262.agent.start()` spawns a
+    // detached OS thread running its own VM — outside any budget, abort flag,
+    // trace or timeout the embedder set — and `createRealm`/`evalScript`/
+    // `detachArrayBuffer` are equally not things a page script or a sandboxed
+    // job should reach. This API is the untrusted-code path; it does not get
+    // the harness. `zipp js` and the test262 runner still do.
+    vm.host_262 = false;
     Ok(ScriptState { vm: Some(vm), program })
 }
 

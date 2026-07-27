@@ -367,6 +367,31 @@ fn metering_does_not_change_results() {
     }
 }
 
+/// An embedded VM must not be handed the test262 harness.
+///
+/// `$262.agent.start()` spawns a detached OS thread running its own VM: outside
+/// the budget, outside the abort flag, absent from the trace, and still running
+/// after the host's timeout fires. `createRealm`, `evalScript` and
+/// `detachArrayBuffer` are the same kind of thing. None of it belongs in an API
+/// whose entire purpose is running code somebody else wrote.
+#[test]
+fn the_test262_host_object_is_not_exposed_to_embedded_code() {
+    let mut st = embed::compile_script(BOOT).expect("compiles");
+    st.run_init().expect("runs");
+    assert_eq!(
+        st.eval_in_context("typeof $262").unwrap().as_str(),
+        Some("undefined"),
+        "$262 must not exist in an embedded VM"
+    );
+    // Reaching it through the global object must fail too.
+    assert_eq!(
+        st.eval_in_context("typeof globalThis.$262").unwrap().as_str(),
+        Some("undefined")
+    );
+    // And the thread-spawning corner specifically.
+    assert!(st.eval_in_context("$262.agent.start('')").is_err());
+}
+
 /// Uninstrumented VMs must behave exactly as before — no budget, no recorder,
 /// and (the part worth pinning) the JIT still on.
 #[test]

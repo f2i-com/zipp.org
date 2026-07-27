@@ -293,6 +293,7 @@ impl<'p> Vm<'p> {
             throw_type_error: Value::UNDEFINED,
             iterator_ctor: 0,
             dollar262: 0,
+            host_262: true,
             array_iter_proto: 0,
             map_iter_proto: 0,
             set_iter_proto: 0,
