@@ -926,9 +926,15 @@ impl<'p> Vm<'p> {
                 // constructor zeros.
                 let avail = self.ta_effective_len(idx).unwrap_or(0);
                 let copy = count.min(avail.saturating_sub(start));
-                for i in 0..copy {
-                    let v = self.ta_element_get(idx, start + i);
-                    self.ta_element_set(dest.heap_index(), i, v)?;
+                // Same element type: a BYTE copy, per spec — and observably so,
+                // since a float NaN payload does not survive a round trip
+                // through an f64 `Value`. Falls back per-element when the raw
+                // copy does not apply (different kinds, shared storage, …).
+                if !self.ta_raw_copy(idx, start, dest.heap_index(), copy) {
+                    for i in 0..copy {
+                        let v = self.ta_element_get(idx, start + i);
+                        self.ta_element_set(dest.heap_index(), i, v)?;
+                    }
                 }
                 Ok(Some(dest))
             }

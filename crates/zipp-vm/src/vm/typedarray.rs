@@ -309,6 +309,60 @@ impl<'p> Vm<'p> {
 
     /// Read element `i` of a TypedArray as a Value (number, or BigInt for the
     /// 64-bit BigInt kinds). Out-of-bounds → undefined.
+    /// Copy `count` elements from `src[src_start..]` into `dst[0..]` as RAW
+    /// BYTES. Returns false when that is not possible — different element
+    /// kinds, a detached or non-plain buffer, an out-of-range range — and the
+    /// caller falls back to the per-element path.
+    ///
+    /// %TypedArray%.prototype.slice with a same-type destination is specified as
+    /// a byte copy, and the difference is OBSERVABLE for the float kinds:
+    /// routing an element through an f64 `Value` canonicalises a NaN payload, so
+    /// a Float32Array holding 0x7F800001 came back as 0x7FC00000.
+    pub(crate) fn ta_raw_copy(
+        &mut self,
+        src: u32,
+        src_start: usize,
+        dst: u32,
+        count: usize,
+    ) -> bool {
+        if count == 0 {
+            return true;
+        }
+        let (sbuf, skind, soff) = match self.heap.get(src) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+            _ => return false,
+        };
+        let (dbuf, dkind, doff) = match self.heap.get(dst) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+            _ => return false,
+        };
+        if skind != dkind || sbuf == dbuf {
+            return false; // different types, or overlapping storage
+        }
+        let size = native::TA_KINDS[skind as usize].1;
+        let n = count * size;
+        let bytes: Vec<u8> = match self.heap.get(sbuf) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                let a = soff + src_start * size;
+                if a + n > data.len() {
+                    return false;
+                }
+                data[a..a + n].to_vec()
+            }
+            _ => return false,
+        };
+        match self.heap.get_mut(dbuf) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                if doff + n > data.len() {
+                    return false;
+                }
+                data[doff..doff + n].copy_from_slice(&bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn ta_element_get(&mut self, ta_idx: u32, i: usize) -> Value {
         let (kind, bytes) = {
             let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
