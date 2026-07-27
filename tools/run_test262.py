@@ -89,6 +89,21 @@ def parse_frontmatter(src):
     fl = re.search(r"^flags:\s*\[(.*?)\]", block, re.M)
     if fl:
         meta["flags"] = [x.strip() for x in fl.group(1).split(",") if x.strip()]
+    else:
+        # YAML multi-line list form, which `includes` below already handled and
+        # this did not:
+        #
+        #     flags:
+        #       - noStrict
+        #
+        # Missing it ran every such test in BOTH modes, so a `noStrict` test —
+        # `staging/sm` uses this spelling throughout — was additionally run under
+        # "use strict" and failed on `with`, `delete x`, `arguments`/`eval` as
+        # bindings, and the other sloppy-only constructs it exists to test. Those
+        # were counted as engine failures.
+        fl2 = re.search(r"^flags:\s*\n((?:\s*-\s*\S+\n)+)", block, re.M)
+        if fl2:
+            meta["flags"] = re.findall(r"-\s*(\S+)", fl2.group(1))
     inc = re.search(r"^includes:\s*\[(.*?)\]", block, re.M)
     if inc:
         meta["includes"] = [x.strip() for x in inc.group(1).split(",") if x.strip()]

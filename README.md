@@ -30,18 +30,18 @@ wasm32 are built and tested.
 Both figures are measured on this repo, not estimated. Neither is finished —
 they are the current state.
 
-**Conformance — 99.0% of test262**, 95,091 of 96,029 required executions
+**Conformance — 99.2% of test262**, 95,077 of 95,848 required executions
 (ECMA-262 + `staging`, run in both sloppy and strict mode as `INTERPRETING.md`
 requires). Both tiers produce a **byte-identical** failure set, which is the
 cheapest evidence that a JIT change has not quietly diverged:
 
 | slice | executions | pass |
 |---|---|---|
-| ECMA-262 + staging, both modes | 96,029 | 95,091 (99.0%) |
+| ECMA-262 + staging, both modes | 95,848 | 95,077 (99.2%) |
 | intl402 (opt-in, `--include-intl402`) | 3,341 | 563 (16.9%) |
 
 That is up from 96.97% under `oxc_parser`, and the increase is the whole reason
-the engine grew its own front end. 938 executions still fail, across 552
+the engine grew its own front end. 771 executions still fail, across 500
 distinct files. The parse-phase negatives that used to dominate are now a
 minority: **80 files**, down from 607, after the static-semantics work described
 below. The largest remaining single item is deliberate — 20 executions want
