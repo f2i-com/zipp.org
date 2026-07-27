@@ -536,7 +536,7 @@ fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
                 expr_refs(k, out);
             }
         }
-        Expr::Array(els) => {
+        Expr::Array(els, _) => {
             // A hole is `None` and references nothing. The spread operand is
             // walked for the same reason as a spread argument.
             for el in els.iter().flatten() {
@@ -545,7 +545,7 @@ fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
-        Expr::Object(members) => {
+        Expr::Object(members, _) => {
             for member in members {
                 match member {
                     ObjectMember::Prop { key, value, .. } => {
@@ -877,7 +877,7 @@ fn collect_nested_free_expr(e: &Expr, out: &mut HashSet<String>) {
                 collect_nested_free_expr(k, out);
             }
         }
-        Expr::Array(els) => {
+        Expr::Array(els, _) => {
             for el in els.iter().flatten() {
                 // Spread skipped, as for a call argument — same pre-port
                 // asymmetry, same reason.
@@ -886,7 +886,7 @@ fn collect_nested_free_expr(e: &Expr, out: &mut HashSet<String>) {
                 }
             }
         }
-        Expr::Object(members) => {
+        Expr::Object(members, _) => {
             for member in members {
                 match member {
                     ObjectMember::Prop { key, value, .. } => {

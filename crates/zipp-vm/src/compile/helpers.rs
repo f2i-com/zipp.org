@@ -378,6 +378,34 @@ pub(crate) fn expr_has_yield_or_await(e: &Expr, want_yield: bool, want_await: bo
     }
 }
 
+/// 15.5.1 / 15.8.1: a generator's or async function's FormalParameters are
+/// parsed with [~Yield]/[~Await], so a `yield`/`await` anywhere in them — a
+/// default value or a computed key — is an early SyntaxError. Both body
+/// compilers (`compile_function_body` and `compile_class_fn`) must run this;
+/// class methods used to skip it, which let `class { *g(x = yield) {} }`
+/// through while the object-literal form was rejected.
+pub(crate) fn check_params_yield_await(
+    params_ast: Option<&crate::parse::ast::Params>,
+    is_generator: bool,
+    is_async: bool,
+) -> Result<(), String> {
+    if !(is_generator || is_async) {
+        return Ok(());
+    }
+    if let Some(pa) = params_ast {
+        if pa
+            .items
+            .iter()
+            .any(|item| pattern_has_yield_or_await(item, is_generator, is_async))
+        {
+            return Err(
+                "SyntaxError: yield/await expression not permitted in formal parameters".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The [Yield]/[Await] early-error scan over a binding pattern's nested
 /// DEFAULT-VALUE expressions and computed keys (the FormalParameter space).
 pub(crate) fn pattern_has_yield_or_await(pat: &Pattern, want_yield: bool, want_await: bool) -> bool {

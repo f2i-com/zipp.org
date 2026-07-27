@@ -237,8 +237,12 @@ impl<'s> Lexer<'s> {
                         self.skip_to_line_end();
                         continue;
                     }
+                    // B.1.1: SingleLineHTMLCloseComment is only recognised where
+                    // a LineTerminator precedes it — and the START of the source
+                    // counts, since the production is reachable from the first
+                    // InputElement. At pos 0 nothing has been "seen" yet.
                     b'-' if self.html_comments
-                        && self.saw_newline
+                        && (self.saw_newline || self.pos == 0)
                         && self.peek_at(1) == b'-'
                         && self.peek_at(2) == b'>' =>
                     {

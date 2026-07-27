@@ -65,7 +65,7 @@ use crate::parse::ast::{
 /// the tests covers each shape.
 fn builds_into_dst_incrementally(e: &Expr, target: &str) -> bool {
     match e {
-        Expr::Object(_) => true,
+        Expr::Object(..) => true,
         // A template with no interpolations is a plain constant string.
         Expr::Template(t) => !t.exprs.is_empty(),
         Expr::Cond { cons, alt, .. } => {

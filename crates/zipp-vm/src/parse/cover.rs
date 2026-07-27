@@ -221,7 +221,13 @@ impl<'s> Parser<'s> {
                 }
                 Target::Call(c)
             }
-            Expr::Array(items) if allow_pattern => {
+            Expr::Array(items, rest_comma) if allow_pattern => {
+                if rest_comma {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: rest element may not be followed by a comma",
+                        pos,
+                    ));
+                }
                 let mut out = Vec::with_capacity(items.len());
                 let n = items.len();
                 for (i, item) in items.into_iter().enumerate() {
@@ -248,7 +254,13 @@ impl<'s> Parser<'s> {
                 }
                 Target::Array(out)
             }
-            Expr::Object(members) if allow_pattern => {
+            Expr::Object(members, rest_comma) if allow_pattern => {
+                if rest_comma {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: rest property may not be followed by a comma",
+                        pos,
+                    ));
+                }
                 let mut props = Vec::new();
                 let mut rest = None;
                 let n = members.len();
@@ -314,7 +326,12 @@ impl<'s> Parser<'s> {
                 left: Box::new(self.target_to_pattern(target)?),
                 right: value,
             },
-            Expr::Array(items) => {
+            Expr::Array(items, rest_comma) => {
+                if rest_comma {
+                    return Err(
+                        self.err_here("SyntaxError: rest element may not be followed by a comma")
+                    );
+                }
                 let n = items.len();
                 let mut out = Vec::with_capacity(n);
                 for (i, item) in items.into_iter().enumerate() {
@@ -325,6 +342,16 @@ impl<'s> Parser<'s> {
                                 return Err(
                                     self.err_here("SyntaxError: rest element must be last")
                                 );
+                            }
+                            // `[...x = []]`: AssignmentRestElement is `...`
+                            // DestructuringAssignmentTarget with no Initializer.
+                            // The non-cover paths (`function f([...x = []])`,
+                            // `var [...x = []]`) already reject it; only this one
+                            // used to let `expr_to_pattern` fold the `=` into a
+                            // Pattern::Assign and accept it.
+                            if matches!(inner, Expr::Assign { op: AssignOp::Assign, .. }) {
+                                return Err(self
+                                    .err_here("SyntaxError: rest element may not have a default"));
                             }
                             Some(PatternElem {
                                 pat: Pattern::Rest(Box::new(self.expr_to_pattern(inner)?)),
@@ -337,7 +364,11 @@ impl<'s> Parser<'s> {
                 }
                 Pattern::Array(out)
             }
-            Expr::Object(members) => {
+            Expr::Object(members, rest_comma) => {
+                if rest_comma {
+                    return Err(self
+                        .err_here("SyntaxError: rest property may not be followed by a comma"));
+                }
                 let mut props = Vec::new();
                 let mut rest = None;
                 let n = members.len();
@@ -348,6 +379,11 @@ impl<'s> Parser<'s> {
                                 return Err(
                                     self.err_here("SyntaxError: rest element must be last")
                                 );
+                            }
+                            // AssignmentRestProperty takes no Initializer either.
+                            if matches!(inner, Expr::Assign { op: AssignOp::Assign, .. }) {
+                                return Err(self
+                                    .err_here("SyntaxError: rest element may not have a default"));
                             }
                             rest = Some(Box::new(self.expr_to_pattern(inner)?));
                         }

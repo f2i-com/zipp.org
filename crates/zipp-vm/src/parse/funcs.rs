@@ -112,6 +112,26 @@ impl<'s> Parser<'s> {
         Ok(())
     }
 
+    /// 15.4.1: a getter's parameter list is empty (`get PropertyName ( )`) and a
+    /// setter's is `PropertySetParameterList : FormalParameter` — exactly one,
+    /// and a FormalParameter is a BindingElement, so it may carry a default but
+    /// may NOT be a rest. Both are early errors, checked here for class members
+    /// and object literals alike.
+    pub(crate) fn check_accessor_arity(&self, is_get: bool, params: &Params) -> PResult<()> {
+        if is_get {
+            if !params.items.is_empty() {
+                return Err(self.err_here("SyntaxError: getter must not have any formal parameters"));
+            }
+        } else if params.items.len() != 1 {
+            return Err(
+                self.err_here("SyntaxError: setter must have exactly one formal parameter")
+            );
+        } else if matches!(params.items[0], Pattern::Rest(_)) {
+            return Err(self.err_here("SyntaxError: setter parameter may not be a rest parameter"));
+        }
+        Ok(())
+    }
+
     /// A method's parameters and body. `start` is the offset of the whole
     /// MethodDefinition, which is what `toString` must reproduce.
     pub(crate) fn parse_method_rest(
@@ -554,6 +574,7 @@ impl<'s> Parser<'s> {
                 if self.at_class_key_start() {
                     let key = self.parse_prop_key()?;
                     let func = self.parse_method_rest(false, false, start)?;
+                    self.check_accessor_arity(kind == MethodKind::Get, &func.params)?;
                     return Ok(ClassMember::Method(ClassMethod {
                         key,
                         kind,

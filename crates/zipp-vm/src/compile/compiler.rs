@@ -253,20 +253,7 @@ impl Compiler {
         // NOTE: that relies on `pattern_has_yield_or_await` recursing through BOTH
         // of those variants — they are the two the old parameter shape kept outside
         // the pattern, so they are exactly what its port must not drop.
-        if is_generator || is_async {
-            if let Some(pa) = params_ast {
-                let bad = pa
-                    .items
-                    .iter()
-                    .any(|item| pattern_has_yield_or_await(item, is_generator, is_async));
-                if bad {
-                    return Err(
-                        "SyntaxError: yield/await expression not permitted in formal parameters"
-                            .into(),
-                    );
-                }
-            }
-        }
+        check_params_yield_await(params_ast, is_generator, is_async)?;
         // `new.target` is allowed inside an ordinary function, not at script/eval
         // top level; nested arrows inherit this. Restored at the end. A DIRECT eval
         // from inside a function/method/field initializer forces it on for the eval
@@ -937,6 +924,7 @@ impl Compiler {
         is_generator: bool,
         is_async: bool,
     ) -> R<FuncProto> {
+        check_params_yield_await(params_ast, is_generator, is_async)?;
         // A nested closure in the method body may capture the method's own
         // params/locals — they must be boxed. (Class methods don't close over an
         // enclosing function in this subset, so the enclosing chain stays empty.)

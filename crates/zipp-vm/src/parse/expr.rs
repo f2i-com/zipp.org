@@ -189,6 +189,18 @@ impl<'s> Parser<'s> {
         // a simple target, which `expr_to_target` enforces by rejecting the
         // array/object forms for them.
         let target = self.expr_to_target(lhs, op == AssignOp::Assign, start)?;
+        // The Annex-B allowance that lets a CallExpression be an assignment
+        // target in sloppy code (`f() = 1` ⇒ runtime ReferenceError) predates
+        // logical assignment, and 13.15.1 grants it no carve-out: `f() &&= 1`
+        // is an early SyntaxError in both modes. `=` and `+=` keep the legacy.
+        if matches!(target, Target::Call(_))
+            && matches!(
+                op,
+                AssignOp::LogicalAnd | AssignOp::LogicalOr | AssignOp::LogicalCoalesce
+            )
+        {
+            return Err(SyntaxError::new("SyntaxError: invalid assignment target", start));
+        }
         let value = self.parse_assign()?;
         Ok(Expr::Assign { op, target, value: Box::new(value) })
     }
@@ -991,6 +1003,7 @@ impl<'s> Parser<'s> {
         let saved_in = self.ctx.in_;
         self.ctx.in_ = true;
         let mut items: Vec<Option<ArrayElem>> = Vec::new();
+        let mut rest_comma = false;
         loop {
             if self.at(Punct::RBracket) {
                 break;
@@ -1017,10 +1030,16 @@ impl<'s> Parser<'s> {
             if !self.eat(Punct::Comma, true)? {
                 break;
             }
+            // `[...x,]` — a comma directly after the final spread, with the
+            // bracket next. Recorded, not rejected: only the pattern reading
+            // forbids it.
+            if self.at(Punct::RBracket) && matches!(items.last(), Some(Some(ArrayElem::Spread(_)))) {
+                rest_comma = true;
+            }
         }
         self.ctx.in_ = saved_in;
         self.expect(Punct::RBracket, false)?;
-        Ok(Expr::Array(items))
+        Ok(Expr::Array(items, rest_comma))
     }
 
     fn parse_object_literal(&mut self) -> PResult<Expr> {
@@ -1029,6 +1048,7 @@ impl<'s> Parser<'s> {
         let saved_in = self.ctx.in_;
         self.ctx.in_ = true;
         let mut members = Vec::new();
+        let mut rest_comma = false;
         let mut proto_count = 0usize;
         let mut proto_pos = 0u32;
         while !self.at(Punct::RBrace) {
@@ -1048,6 +1068,10 @@ impl<'s> Parser<'s> {
             if !self.eat(Punct::Comma, true)? {
                 break;
             }
+            // `{...x,}` — see the Array case; legal only as a literal.
+            if self.at(Punct::RBrace) && matches!(members.last(), Some(ObjectMember::Spread(_))) {
+                rest_comma = true;
+            }
         }
         self.ctx.in_ = saved_in;
         self.expect(Punct::RBrace, false)?;
@@ -1063,7 +1087,7 @@ impl<'s> Parser<'s> {
                 proto_pos,
             ));
         }
-        Ok(Expr::Object(members))
+        Ok(Expr::Object(members, rest_comma))
     }
 
     /// Returns the member, whether it is a plain `__proto__: v`, and its position.
@@ -1078,6 +1102,7 @@ impl<'s> Parser<'s> {
                 if self.at_property_name_start() {
                     let key = self.parse_prop_key()?;
                     let func = self.parse_method_rest(false, false, start)?;
+                    self.check_accessor_arity(is_get, &func.params)?;
                     let m = if is_get {
                         ObjectMember::Get { key, func: Box::new(func) }
                     } else {

@@ -146,7 +146,12 @@ def classify(meta, code, out, err):
         # The body ran, so whatever the exit code says, the required early error
         # was NOT raised. This check must precede the type match: a test whose
         # body throws its own TypeError would otherwise "match" want=TypeError.
-        if DONOTEVALUATE in blob or TEST262ERROR in blob:
+        # ...except when Test262Error IS the wanted type: those tests (e.g. the
+        # line-terminator and html-comment ones) assert a construct works by
+        # ending in `throw new Test262Error()`, so the body running is the pass
+        # condition. $DONOTEVALUATE throws a bare string, never a Test262Error,
+        # so that half of the proof stays active for them.
+        if DONOTEVALUATE in blob or (want != TEST262ERROR and TEST262ERROR in blob):
             return ("FAIL", f"early-error-not-raised want={want}")
         if want and (want in err or want.lower() in err.lower()):
             return ("PASS", None)
@@ -260,7 +265,11 @@ def run_one(args, get_harness, job):
             # Module tests run the ORIGINAL file (self-imports resolve to the
             # same module record); scripts run the assembled tmp.
             entry = path if is_module else tmp
-            cmd = [args.zipp, subcmd, entry]
+            # test262 tests the Script goal as specified: top-level `return` is
+            # an early SyntaxError and `import`/`export` are Module-only. The
+            # engine's default is node's CommonJS shape (both legal), so ask for
+            # the pure goal. Module tests already use it by construction.
+            cmd = [args.zipp, subcmd] + ([] if is_module else ["--script-goal"]) + [entry]
             if harness_src is not None:
                 hfd, hf = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=".js", dir=os.path.dirname(path))
                 os.write(hfd, harness_src.encode("utf-8"))

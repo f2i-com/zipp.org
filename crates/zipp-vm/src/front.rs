@@ -25,8 +25,29 @@ fn err_str(e: crate::parse::parser::SyntaxError) -> String {
     format!("SyntaxError: {}", e.msg.strip_prefix("SyntaxError: ").unwrap_or(&e.msg))
 }
 
+/// Conformance mode: parse a top-level script under the PURE Script goal.
+///
+/// Off by default, because the two accommodations it disables are load-bearing
+/// for real code: node wraps a `.js` file in a CommonJS function (so top-level
+/// `return` is legal and packages ship it), and `zipp js` on an ESM-shaped
+/// `.js` file falls back to the Module goal rather than failing. test262 tests
+/// the grammar as specified — `ScriptBody : StatementList[~Return]`, and
+/// `import`/`export` reachable only from the Module goal — so the runner turns
+/// this on. Process-wide rather than a parameter so that `$262.evalScript` and
+/// agent sources inherit it without threading a flag through every call site.
+static PURE_SCRIPT_GOAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_pure_script_goal(on: bool) {
+    PURE_SCRIPT_GOAL.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn pure_script_goal() -> bool {
+    PURE_SCRIPT_GOAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn parse_script(src: &str) -> Result<Program, String> {
-    parse(src, ParseOptions { allow_return: true, ..ParseOptions::script() }).map_err(err_str)
+    let allow_return = !pure_script_goal();
+    parse(src, ParseOptions { allow_return, ..ParseOptions::script() }).map_err(err_str)
 }
 
 pub(crate) fn parse_module(src: &str) -> Result<Program, String> {
@@ -36,6 +57,10 @@ pub(crate) fn parse_module(src: &str) -> Result<Program, String> {
 pub(crate) fn parse_auto(src: &str) -> Result<Program, String> {
     match parse_script(src) {
         Ok(p) => Ok(p),
+        // Under the pure Script goal there is no second guess: a script that
+        // fails to parse is a SyntaxError, not a module. This is what makes
+        // `export default null;` at top level the early error the spec wants.
+        Err(script_err) if pure_script_goal() => Err(script_err),
         Err(script_err) => match parse_module(src) {
             Ok(p) => Ok(p),
             // The script error, not the module one: a file that is neither is

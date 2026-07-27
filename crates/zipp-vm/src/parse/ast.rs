@@ -188,8 +188,16 @@ pub enum Expr {
     Str(StrVal),
     Regex { pattern: StrVal, flags: Box<str> },
     /// A hole in `[1, , 3]` is `None`; a spread element is `Spread`.
-    Array(Vec<Option<ArrayElem>>),
-    Object(Vec<ObjectMember>),
+    ///
+    /// The `bool` is "a comma followed the final spread element" — `[...x,]`.
+    /// It is legal in a LITERAL and an early error in a PATTERN
+    /// (`ArrayAssignmentPattern` puts no comma after AssignmentRestElement), and
+    /// the comma leaves no other trace: `[...x,]` and `[...x]` yield identical
+    /// `items`, so the conversion in `cover.rs` cannot otherwise see it.
+    Array(Vec<Option<ArrayElem>>, bool),
+    /// The `bool` is "a comma followed the final rest property" — `{...x,}`.
+    /// Legal in a literal, an early error in a pattern; see [`Expr::Array`].
+    Object(Vec<ObjectMember>, bool),
     Template(Box<TemplateLit>),
     TaggedTemplate { tag: Box<Expr>, quasi: Box<TemplateLit> },
     Unary { op: UnaryOp, arg: Box<Expr> },
@@ -673,9 +681,9 @@ mod tests {
             Some(ArrayElem::Expr(Expr::Num(1.0))),
             None,
             Some(ArrayElem::Spread(Expr::Ident("r".into()))),
-        ]);
+        ], false);
         match a {
-            Expr::Array(items) => {
+            Expr::Array(items, _) => {
                 assert!(matches!(items[0], Some(ArrayElem::Expr(_))));
                 assert!(items[1].is_none(), "a hole is not `undefined`");
                 assert!(matches!(items[2], Some(ArrayElem::Spread(_))));

@@ -551,8 +551,8 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             E::Class(c) => self.class_expr(c, dst, None),
-            E::Array(elems) => self.array_literal(elems, dst),
-            E::Object(props) => self.object_literal(props, dst),
+            E::Array(elems, _) => self.array_literal(elems, dst),
+            E::Object(props, _) => self.object_literal(props, dst),
             // One node for all three member forms; `prop` says which.
             E::Member(m) => self.member(m, dst),
             // `#field in obj` — private brand check (private fields are stored as

@@ -57,7 +57,22 @@ fn run(args: &[String]) -> Result<(), String> {
             // native stack) with a native x86-64 OSR JIT. console.log streams to
             // stdout during eval, like `node file.js`. (`js` and `js-vm` are
             // aliases for the same engine.)
-            let path = it.next().ok_or("usage: zipp js <file.js>")?;
+            // `--script-goal` parses under the PURE Script goal: top-level
+            // `return` is a SyntaxError and `import`/`export` are not accepted
+            // (no Module-goal fallback). Off by default because node's CJS
+            // wrapper makes both legal in real `.js` files; test262 wants the
+            // grammar as specified, so its runner passes this.
+            let mut path = None;
+            for a in it.by_ref() {
+                match a.as_str() {
+                    "--script-goal" => zipp_vm::set_pure_script_goal(true),
+                    other => {
+                        path = Some(other.to_string());
+                        break;
+                    }
+                }
+            }
+            let path = &path.ok_or("usage: zipp js [--script-goal] <file.js>")?;
             let src =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
             // The script's directory resolves relative `import(specifier)` loads.
