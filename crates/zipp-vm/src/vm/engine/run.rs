@@ -693,7 +693,10 @@ impl<'p> Vm<'p> {
         force_strict: bool,
         force_new_target_ok: bool,
         this_override: Option<Value>,
-        inherit_super: Option<(u32, bool)>,
+        // The caller's class context, when the call site is inside a class
+        // element: (home class id, static element, derived-class constructor,
+        // the class's inner NAME binding is unshadowed here).
+        inherit_super: Option<(u32, bool, bool, bool)>,
         ban_arguments: bool,
         direct: bool,
         caller_new_target: Value,
@@ -784,7 +787,15 @@ impl<'p> Vm<'p> {
             code,
             force_strict,
             force_new_target_ok,
-            inherit_super.map(|(_, s)| s),
+            // The caller class's inner NAME comes from its ClassDef, so a class
+            // EXPRESSION's name (which has no outer binding at all) is visible
+            // to the eval'd code too.
+            inherit_super.map(|(cid, stat, derived, name_ok)| crate::compile::EvalClassCtx {
+                static_ctx: stat,
+                derived_ctor: derived,
+                name: Some(self.class_def(cid as usize).name.clone())
+                    .filter(|n| name_ok && !n.is_empty()),
+            }),
             ban_arguments,
             visible,
             false,
@@ -806,7 +817,7 @@ impl<'p> Vm<'p> {
             eval_prog,
             this_override,
             false,
-            inherit_super.map(|(h, _)| h),
+            inherit_super.map(|(h, _, _, _)| h),
             caller_chain,
             caller_new_target,
             caller_home_obj,

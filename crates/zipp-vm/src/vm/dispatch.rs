@@ -1410,6 +1410,8 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::ClassAddMember { class, key, func, kind } => {
+                        let write_back = kind & crate::bytecode::KEY_WRITEBACK != 0;
+                        let kind = kind & !crate::bytecode::KEY_WRITEBACK;
                         let cv = self.get(base, class);
                         // ToPropertyKey the computed key the SAME way get_index/set_index
                         // do (ToPrimitive string-hint, Symbols kept, real ToString for a
@@ -1418,6 +1420,13 @@ impl<'p> Vm<'p> {
                         // stored under a key the access could never recompute.
                         let kraw = self.get(base, key);
                         let k = self.coerce_index_key(kraw)?;
+                        // An auto-accessor's setter instruction follows on the same
+                        // key register: hand it the already-coerced key so the
+                        // element's ToPropertyKey runs exactly once. The compiler
+                        // guarantees the register is a temp when it sets this.
+                        if write_back {
+                            self.set(base, key, k);
+                        }
                         let kstr = self.key_of(k);
                         // A STATIC element (method/getter/setter) whose computed key is
                         // "prototype" is a TypeError at class definition (a literal
@@ -1472,6 +1481,25 @@ impl<'p> Vm<'p> {
                                 let dup = list.iter().position(|(n, _)| *n == kstr);
                                 let parked = list.iter().position(|(n, _)| *n == ph);
                                 match (dup, parked) {
+                                    // Defined twice in one class body: the
+                                    // property keeps the FIRST definition's
+                                    // position and the LAST definition's value.
+                                    // Which came first is the entry ORDER — the
+                                    // placeholder sits at the computed member's
+                                    // source position — and this arm is the case
+                                    // where the computed one is EARLIER, so the
+                                    // already-installed named member is the
+                                    // later definition and its value wins.
+                                    // Overwriting unconditionally instead made a
+                                    // computed member beat a later same-named one
+                                    // (`class C { [k](){return 1} m(){return 2} }`
+                                    // answered 1), which is also what let an
+                                    // `accessor [k]` clobber a `get k` below it.
+                                    (Some(d), Some(p)) if p < d => {
+                                        let v = list[d].1;
+                                        list[p] = (kstr, v);
+                                        list.remove(d);
+                                    }
                                     (Some(d), p) => {
                                         list[d].1 = fv;
                                         if let Some(p) = p {
@@ -4054,14 +4082,36 @@ impl<'p> Vm<'p> {
                             // and the binding persists (only eval VARs delete).
                             || self.eval_lexical_globals.contains(&slot)
                             || self.eval_const_globals.contains(&slot);
-                        if nonconfig {
-                            self.set(base, dst, Value::bool(false));
-                        } else {
+                        // A binding may exist as an own property of the global
+                        // OBJECT without any compile-time declaration behind it
+                        // (`Object.defineProperty(globalThis, …)`, an implicit
+                        // `x = 1`, an eval `var`). The object environment record
+                        // delegates to [[Delete]], so the property's own
+                        // attributes decide: a non-configurable one refuses
+                        // (`delete nonconfigurable` is false, not true), and a
+                        // configurable one must actually be REMOVED — clearing
+                        // only the slot left the property behind, still visible
+                        // to `in` and getOwnPropertyDescriptor.
+                        let mut ok = !nonconfig;
+                        if ok && self.global_this != 0 {
+                            if let Some(name) = self.global_slot_name(slot) {
+                                let g = self.global_this;
+                                let has_own = matches!(
+                                    self.heap.get(g),
+                                    HeapObj::Object(m) if m.pos(&name).is_some()
+                                );
+                                if has_own {
+                                    ok = self.delete_property(Value::heap(g), &name)?
+                                        == Value::bool(true);
+                                }
+                            }
+                        }
+                        if ok {
                             if let Some(g) = self.globals.get_mut(slot as usize) {
                                 *g = Value::UNINITIALIZED;
                             }
-                            self.set(base, dst, Value::bool(true));
                         }
+                        self.set(base, dst, Value::bool(ok));
                         ip += 1;
                     }
                     Instr::DeleteProp { dst, obj, name, strict } => {
@@ -4144,7 +4194,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::heap(idx));
                         ip += 1;
                     }
-                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site, tail } => {
+                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, derived_ctor, class_name_ok, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site, tail } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
@@ -4190,8 +4240,8 @@ impl<'p> Vm<'p> {
                             // the static-field-initializer's `this_reg`) and the
                             // caller's strictness.
                             let caller_this = self.get(base, this_reg);
-                            let inherit =
-                                (home_class != u32::MAX).then_some((home_class, super_static));
+                            let inherit = (home_class != u32::MAX)
+                                .then_some((home_class, super_static, derived_ctor, class_name_ok));
                             // The caller activation's new.target and (for an
                             // object-literal method) its [[HomeObject]]. Read it
                             // through frame_new_target so an eval in an ARROW body
@@ -5579,6 +5629,19 @@ impl<'p> Vm<'p> {
                         // ignored so the original abrupt completion is preserved.
                         let it = self.get(base, iter);
                         let _ = self.iterator_close(it);
+                        ip += 1;
+                    }
+                    Instr::IterCloseFinally { iter, kind_reg } => {
+                        // The for-of close handler; see the opcode's doc comment for
+                        // why each completion kind closes (or does not).
+                        let it = self.get(base, iter);
+                        match self.regs[base + kind_reg as usize].as_int() & 3 {
+                            1 => self.iterator_close(it)?,
+                            2 => {
+                                let _ = self.iterator_close(it);
+                            }
+                            _ => {}
+                        }
                         ip += 1;
                     }
                     Instr::IterPrime { dst, iter } => {

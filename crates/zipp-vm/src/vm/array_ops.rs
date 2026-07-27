@@ -1338,7 +1338,7 @@ impl<'p> Vm<'p> {
                         let v = self.get_index(Value::heap(idx), Value::num((len - 1 - k) as f64))?;
                         out.push(v);
                     }
-                    return Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))));
+                    return Ok(Some(self.alloc_array_current_realm(out)));
                 }
                 // at: length is read ONCE, THEN the index argument is coerced (its
                 // valueOf may mutate the receiver, e.g. shrink a resizable buffer),
@@ -1434,7 +1434,15 @@ impl<'p> Vm<'p> {
                         } else if name == "toLocaleString" {
                             let f = self.get_prop(v, "toLocaleString")?;
                             let s = if self.is_callable(f) {
-                                let r = self.call_value(f, v, &[])?;
+                                // ECMA-402 sup-array.prototype.toLocaleString:
+                                // Invoke(element, "toLocaleString", «locales,
+                                // options») — the arguments are FORWARDED, so a
+                                // number element honours the same format options.
+                                let fwd = [
+                                    args.first().copied().unwrap_or(Value::UNDEFINED),
+                                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                                ];
+                                let r = self.call_value(f, v, &fwd)?;
                                 self.display(r)
                             } else {
                                 self.display(v)
@@ -1497,7 +1505,7 @@ impl<'p> Vm<'p> {
                         out.push(self.get_index(Value::heap(idx), Value::num(r as f64))?);
                         r += 1;
                     }
-                    return Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))));
+                    return Ok(Some(self.alloc_array_current_realm(out)));
                 }
                 // with/toSorted build a result of the source length via
                 // ArrayCreate(len), which throws RangeError for len > 2^32-1 — BEFORE
@@ -2433,7 +2441,7 @@ impl<'p> Vm<'p> {
                     });
                     snapshot = keyed.into_iter().map(|(_, v)| v).collect();
                 }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(snapshot)))))
+                Ok(Some(self.alloc_array_current_realm(snapshot)))
             }
             "toReversed" => {
                 // Read in SPEC order: out[k] = Get(O, len-k-1). A snapshot-then-reverse
@@ -2450,7 +2458,7 @@ impl<'p> Vm<'p> {
                     let from = len - k - 1;
                     out.push(self.array_iter_get(this, from)?.unwrap_or(Value::UNDEFINED));
                 }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                Ok(Some(self.alloc_array_current_realm(out)))
             }
             "splice" => {
                 // splice(start, deleteCount?, ...items): mutate in place, return
@@ -2515,13 +2523,19 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.make_live_iterator(idx, 2, self.array_iter_proto)))
             }
             "toLocaleString" => {
-                // Join each element's own toLocaleString() with ","; nullish → "".
+                // Join each element's own toLocaleString(locales, options) with
+                // ","; nullish → "". The two arguments are forwarded per ECMA-402
+                // sup-array.prototype.toLocaleString.
                 let snapshot = if self.arr_props.contains_key(&idx) || self.array_has_holes(idx)
                 {
                     self.array_snapshot_get(idx)?
                 } else {
                     self.array_snapshot(idx)
                 };
+                let fwd = [
+                    args.first().copied().unwrap_or(Value::UNDEFINED),
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                ];
                 let mut parts: Vec<String> = Vec::with_capacity(snapshot.len());
                 for v in snapshot {
                     if v.is_nullish() {
@@ -2529,7 +2543,7 @@ impl<'p> Vm<'p> {
                     } else {
                         let f = self.get_prop(v, "toLocaleString")?;
                         let s = if self.is_callable(f) {
-                            let r = self.call_value(f, v, &[])?;
+                            let r = self.call_value(f, v, &fwd)?;
                             self.display(r)
                         } else {
                             self.display(v)
@@ -2566,7 +2580,7 @@ impl<'p> Vm<'p> {
                         out.push(self.array_iter_get(this, k)?.unwrap_or(Value::UNDEFINED));
                     }
                 }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                Ok(Some(self.alloc_array_current_realm(out)))
             }
             "toSpliced" => {
                 // Like splice() but returns the modified COPY; receiver unchanged.
@@ -2586,7 +2600,7 @@ impl<'p> Vm<'p> {
                 };
                 let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
                 out.splice(start..start + del, insert);
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                Ok(Some(self.alloc_array_current_realm(out)))
             }
             "copyWithin" => {
                 // A prototype index / accessor side table makes the per-index

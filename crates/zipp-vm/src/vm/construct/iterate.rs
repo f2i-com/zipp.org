@@ -1264,9 +1264,13 @@ impl<'p> Vm<'p> {
         // The %Array% intrinsic (or a non-constructor receiver) builds a plain
         // dense Array; any OTHER constructor receiver is constructed and
         // receives its elements via CreateDataPropertyOrThrow.
+        // "%Array%" means THIS built-in's realm's — `other.Array.from.call(Array,…)`
+        // must really `Construct` the main-realm Array, because the dense shortcut
+        // creates the array in the RUNNING built-in's realm (`from_realms.js`).
+        let arr_proto_here = self.native_home(self.arr_proto);
         let is_array_global = this_ctor.is_heap()
             && matches!(self.heap.get(this_ctor.heap_index()), HeapObj::Object(m)
-                if m.get("prototype").is_some_and(|p| p.is_heap() && p.heap_index() == self.arr_proto));
+                if m.get("prototype").is_some_and(|p| p.is_heap() && p.heap_index() == arr_proto_here));
         let custom_ctor = !is_array_global && self.is_constructor(this_ctor);
         if self.is_callable(using_iter) {
             // Iterator path, in spec order: A = Construct(C) — NO arguments —
@@ -1328,7 +1332,10 @@ impl<'p> Vm<'p> {
                     self.set_prop(a, "length", Value::num(k as f64), true)?;
                     Ok(a)
                 }
-                None => Ok(Value::heap(self.heap.alloc(HeapObj::Array(out)))),
+                // No constructor receiver → ArrayCreate(0) in the realm of the
+                // `from` built-in running now: `var f = other.Array.from; f([1])`
+                // yields an array whose prototype is the OTHER realm's.
+                None => Ok(self.alloc_array_current_realm(out)),
             };
         }
         // Natively-iterable kinds whose prototype carries no VISIBLE @@iterator
@@ -1362,7 +1369,7 @@ impl<'p> Vm<'p> {
                 self.set_prop(a, "length", Value::num(len as f64), true)?;
                 return Ok(a);
             }
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))));
+            return Ok(self.alloc_array_current_realm(elems));
         }
         // Array-like path: arrayLike = ToObject(items); len = ToLength(Get(O,
         // 'length')); elements are read live and DEFINED on the result
@@ -1401,7 +1408,7 @@ impl<'p> Vm<'p> {
             };
             out.push(mapped);
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+        Ok(self.alloc_array_current_realm(out))
     }
 
 }

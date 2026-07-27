@@ -292,10 +292,16 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
         Stmt::Try { block, handler, finalizer } => {
             collect_bound_in_body(block, out);
             if let Some(h) = handler {
-                // NOTE: the catch PARAMETER is deliberately not collected here —
-                // it was not collected before the port either (oxc's
-                // `CatchClause::param` was skipped, only `handler.body` walked),
-                // and the gate is byte-identical bytecode.
+                // The catch PARAMETER is a binding of this scope like any other:
+                // omitting it kept the name out of `captured`, so
+                // `compile_catch_body`'s `if self.captured.contains(n)` never
+                // fired and the register was never boxed — a closure over it
+                // then had no cell to capture and threw "e is not defined"
+                // (`try{throw 5}catch(e){ f = () => e }`). It only appeared to
+                // work when a same-named OUTER binding put the name in the set.
+                if let Some(p) = &h.param {
+                    collect_pattern_names(p, out);
+                }
                 collect_bound_in_body(&h.body, out);
             }
             if let Some(f) = finalizer {

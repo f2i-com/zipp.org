@@ -31,7 +31,7 @@ use crate::parse::ast::{self, *};
 use crate::parse::token::{Span, StrVal};
 
 use crate::bytecode::{
-    BitwiseOp, ClassDef, FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource,
+    BitwiseOp, ClassDef, FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource, KEY_WRITEBACK,
 };
 use crate::capture;
 use crate::value::Value;
@@ -94,8 +94,8 @@ struct Compiler {
     eval_mode: bool,
     /// Set for a DIRECT eval from a class-member context: the eval's top-level
     /// script (and its arrows) inherits the caller's home class for `super`
-    /// (compiled against the u32::MAX sentinel) — Some(super_static).
-    eval_inherit_super: Option<bool>,
+    /// (compiled against the u32::MAX sentinel).
+    eval_inherit_super: Option<EvalClassCtx>,
     /// True while compiling a class FIELD INITIALIZER expression (or an eval
     /// program invoked from one): `arguments` is an early SyntaxError there.
     /// Arrows inherit (Compiler-level state); function/method bodies reset it.
@@ -364,6 +364,16 @@ struct FnCompiler<'a> {
     wtf8_consts: Vec<u32>,
     /// Lexical scope chain: each entry is (name, register).
     scopes: Vec<Vec<(String, Reg)>>,
+    /// Parallel to `scopes` (same length, same indices): the lexically-declared
+    /// names of each BLOCK-like scope, recorded at block ENTRY.
+    ///
+    /// `block_fn_conflicts` used to read `scopes`, which only holds bindings
+    /// already declared — so a `let` written AFTER a nested block did not block
+    /// that block's Annex B B.3.3 promotion (`{ { function x(){} } let x; }`
+    /// promoted, and the later declaration clobbered an earlier legitimate one).
+    /// B.3.3.1's "would not produce any Early Errors" test spans the whole
+    /// enclosing block, not the part textually above the declaration.
+    scope_lex_names: Vec<HashSet<String>>,
     /// Next free register / high-water mark.
     next_reg: Reg,
     max_reg: Reg,
@@ -590,9 +600,15 @@ struct LoopCtx {
     /// `floor` a `break`/`continue` targeting it must unwind the handler stack to.
     handler_depth: usize,
     /// For a `for-of` / `for-await-of` frame: the register holding the live
-    /// iterator, so an abrupt `return` out of the body runs IteratorClose on it
-    /// (a normal `break` already closes via its own block). `None` for other loops.
+    /// iterator, so an abrupt `break`/`continue` LEAVING this loop from inside a
+    /// nested one runs IteratorClose on it (a `break` targeting this loop closes
+    /// via its own block). `None` for other loops.
     iter_close: Option<Reg>,
+    /// Set when this for-of's body runs under the `IterCloseFinally` handler, which
+    /// already closes on a `return` completion — `return` must then NOT also emit an
+    /// inline `IterClose` for this frame or the iterator closes twice. False for
+    /// `for await`, whose inline close is still the only one.
+    close_via_finally: bool,
 }
 
 /// A pre-evaluated destructuring member-target key (see `pre_member_ref`).
@@ -621,6 +637,7 @@ impl LoopCtx {
             label,
             handler_depth,
             iter_close: None,
+            close_via_finally: false,
         }
     }
     fn switch_frame(label: Option<String>, handler_depth: usize) -> LoopCtx {
@@ -632,6 +649,7 @@ impl LoopCtx {
             label,
             handler_depth,
             iter_close: None,
+            close_via_finally: false,
         }
     }
     /// The frame a LABELLED non-loop/non-switch statement pushes so `break
@@ -645,10 +663,31 @@ impl LoopCtx {
             label: Some(label),
             handler_depth,
             iter_close: None,
+            close_via_finally: false,
         }
     }
 }
 
+
+/// The CLASS context a direct eval inherits from its caller (PerformEval: the
+/// eval's lexical environment is the caller's, so the caller's `super` binding,
+/// its derived-constructor `super()` right, and its class inner-name binding are
+/// all in scope for the eval'd code).
+///
+/// This used to be a bare `Option<bool>` carrying only `super_static`, which
+/// dropped the other two: `eval("super()")` in a derived constructor was a
+/// SyntaxError, and `eval("C")` in a class element missed the inner name (it
+/// hit the outer binding — still in TDZ for a static field initializer).
+#[derive(Clone, Debug, Default)]
+pub struct EvalClassCtx {
+    /// The caller is a STATIC class element, so `super.x` starts at the class's
+    /// own [[Prototype]] rather than at `prototype`.
+    pub static_ctx: bool,
+    /// The caller is a DERIVED-class constructor, so `super(...)` is legal.
+    pub derived_ctor: bool,
+    /// The caller class's inner NAME binding, if the class has a name.
+    pub name: Option<String>,
+}
 
 enum Binding {
     /// Plain register-resident local (the fast path; no capture).

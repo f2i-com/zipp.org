@@ -723,6 +723,25 @@ impl<'p> Vm<'p> {
         main_proto
     }
 
+    /// ArrayCreate for a built-in's result. 10.4.2.2 makes the new array's
+    /// [[Prototype]] the CURRENT Realm Record's %Array.prototype%, and for a
+    /// built-in the current realm is its own [[Realm]] — so
+    /// `otherRealm.Array.prototype.toSorted.call(mainArray)` must return an
+    /// array whose prototype is the OTHER realm's, not the caller's. Identity
+    /// (one Option check) for a main-realm built-in, which is every call until
+    /// `$262.createRealm()` hands a realm-copied method to another realm.
+    pub(crate) fn alloc_array_current_realm(&mut self, items: Vec<Value>) -> Value {
+        let idx = self.heap.alloc(HeapObj::Array(items));
+        if let Some(r) = self.native_callee_realm {
+            let home = self.native_home(self.arr_proto);
+            if home != self.arr_proto {
+                self.proto_of.insert(idx, Value::heap(home));
+                self.obj_realm.insert(idx, r);
+            }
+        }
+        Value::heap(idx)
+    }
+
     /// The CURRENT realm's image of a main intrinsic prototype: primitive member
     /// access inside a createRealm child resolves through the CHILD's prototype
     /// (`other.Number.prototype.x` is visible to `(1).x` inside the child).
@@ -855,7 +874,11 @@ impl<'p> Vm<'p> {
         // main `$262.evalScript` program path it returns the COMPLETION VALUE,
         // which realm tests rely on (`other.evalScript('(function(){…})')`).
         let _ = kind;
-        let evaled = self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, true, None, Vec::new(), None, None, exact.as_deref());
+        // PerformEval for an INDIRECT eval runs in the eval function's own realm,
+        // so its ThisBinding is the CHILD's global object — `other.eval("this")`
+        // (and `eval = other.eval; eval("this")`) must not answer the caller's.
+        let this_realm_global = Some(Value::heap(gidx));
+        let evaled = self.do_eval(&code, false, false, this_realm_global, None, false, false, Value::UNDEFINED, None, true, None, Vec::new(), None, None, exact.as_deref());
         self.active_realm = prev_realm;
         let v = evaled?;
         // The completion value (typically a function/class the caller will use)
@@ -5049,10 +5072,13 @@ impl<'p> Vm<'p> {
             INTL_SUPPORTED_VALUES_OF => {
                 let key = self.to_js_string(a0)?;
                 let vals: &[&str] = match key.as_str() {
-                    "calendar" => &["gregory", "iso8601"],
+                    // Shared with the DateTimeFormat/NumberFormat option
+                    // resolution so the two agree: a value listed here is
+                    // exactly one that resolvedOptions will echo back.
+                    "calendar" => crate::vm::intl::AVAILABLE_CALENDARS,
                     "collation" => &["default"],
                     "currency" => &["USD", "EUR", "GBP", "JPY"],
-                    "numberingSystem" => &["latn"],
+                    "numberingSystem" => crate::vm::intl::AVAILABLE_NUMBERING_SYSTEMS,
                     "timeZone" => &["UTC"],
                     "unit" => &["meter", "second", "byte"],
                     _ => {
@@ -5066,6 +5092,13 @@ impl<'p> Vm<'p> {
             }
             INTL_SUPPORTED_LOCALES_OF => {
                 let list = self.canonicalize_locale_list(a0)?;
+                // SupportedLocales: GetOptionsObject on the 2nd argument, then
+                // GetOption(options, "localeMatcher", …) — both observable, and
+                // both skipped before (an invalid matcher silently succeeded).
+                if a1 != Value::UNDEFINED && !self.is_object_value(a1) {
+                    return Err(Thrown("TypeError: Options must be an object or undefined".into()));
+                }
+                self.opt_string(a1, "localeMatcher", "best fit", &["lookup", "best fit"])?;
                 let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
                 Value::heap(self.heap.alloc(HeapObj::Array(items)))
             }
@@ -5086,20 +5119,39 @@ impl<'p> Vm<'p> {
             }
             INTL_NF_FORMAT_TO_PARTS => {
                 let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "formatToParts")?;
-                let formatted = self.intl_number_format(resolved, a0)?;
-                let mut part = ObjMap::new();
-                let ty = self.alloc_str("integer".to_string());
-                part.set("type", ty);
-                part.set("value", formatted);
-                let p = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(part))));
-                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+                let n = self.to_number(a0)?;
+                let parts = self.nf_parts(resolved, n)?;
+                let parts: Vec<(String, String, &str)> =
+                    parts.into_iter().map(|(t, v)| (t, v, "")).collect();
+                self.intl_parts_array(&parts)
+            }
+            INTL_NF_FORMAT_RANGE | INTL_NF_FORMAT_RANGE_TO_PARTS => {
+                let name = if id == INTL_NF_FORMAT_RANGE { "formatRange" } else { "formatRangeToParts" };
+                let resolved = self.intl_this(this, INTL_NUMBERFORMAT, name)?;
+                // FormatNumericRange step 3: an undefined endpoint is a TypeError
+                // BEFORE either is coerced; a NaN endpoint is a RangeError after.
+                if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
+                    return Err(Thrown(format!("TypeError: {name} requires two values")));
+                }
+                let x = self.to_number(a0)?;
+                let y = self.to_number(a1)?;
+                if x.is_nan() || y.is_nan() {
+                    return Err(Thrown(format!("RangeError: {name} values must not be NaN")));
+                }
+                let parts = self.nf_range_parts(resolved, x, y)?;
+                if id == INTL_NF_FORMAT_RANGE {
+                    let s: String = parts.iter().map(|(_, v, _)| v.as_str()).collect();
+                    self.alloc_str(s)
+                } else {
+                    self.intl_parts_array(&parts)
+                }
             }
             INTL_DTF_FORMAT => {
                 let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "format")?;
                 let ms = if a0 == Value::UNDEFINED {
                     (Self::now_epoch_ns() / 1_000_000) as f64
                 } else {
-                    self.to_number(a0)?
+                    self.dtf_time_value(a0)?
                 };
                 let s = self.dtf_format(resolved, ms);
                 self.alloc_str(s)
@@ -5109,16 +5161,38 @@ impl<'p> Vm<'p> {
                 let ms = if a0 == Value::UNDEFINED {
                     (Self::now_epoch_ns() / 1_000_000) as f64
                 } else {
-                    self.to_number(a0)?
+                    self.dtf_time_value(a0)?
                 };
-                let s = self.dtf_format(resolved, ms);
-                let mut part = ObjMap::new();
-                let ty = self.alloc_str("literal".to_string());
-                part.set("type", ty);
-                let sv = self.alloc_str(s);
-                part.set("value", sv);
-                let p = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(part))));
-                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+                let parts: Vec<(String, String, &str)> = self
+                    .dtf_parts(resolved, ms)
+                    .into_iter()
+                    .map(|(t, v)| (t.to_string(), v, ""))
+                    .collect();
+                self.intl_parts_array(&parts)
+            }
+            INTL_DTF_FORMAT_RANGE | INTL_DTF_FORMAT_RANGE_TO_PARTS => {
+                let name =
+                    if id == INTL_DTF_FORMAT_RANGE { "formatRange" } else { "formatRangeToParts" };
+                let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, name)?;
+                if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
+                    return Err(Thrown(format!("TypeError: {name} requires two dates")));
+                }
+                // The endpoints must be the same kind of value: a Date/number
+                // range or a range of the SAME Temporal type, never a mix.
+                if self.dt_arg_kind(a0) != self.dt_arg_kind(a1) {
+                    return Err(Thrown(format!(
+                        "TypeError: {name} endpoints must be of the same type"
+                    )));
+                }
+                let x = self.dtf_time_value(a0)?;
+                let y = self.dtf_time_value(a1)?;
+                let parts = self.dtf_range_parts(resolved, x, y);
+                if id == INTL_DTF_FORMAT_RANGE {
+                    let s: String = parts.iter().map(|(_, v, _)| v.as_str()).collect();
+                    self.alloc_str(s)
+                } else {
+                    self.intl_parts_array(&parts)
+                }
             }
             INTL_COLLATOR_COMPARE => {
                 let _ = self.intl_this(this, INTL_COLLATOR, "compare")?;
@@ -5216,6 +5290,50 @@ impl<'p> Vm<'p> {
                 let dur = self.to_duration(a0)?;
                 let s = format_duration_en(&dur);
                 self.alloc_str(s)
+            }
+            INTL_DURATION_FORMAT_TO_PARTS => {
+                let _ = self.intl_this(this, INTL_DURATIONFORMAT, "formatToParts")?;
+                let dur = self.to_duration(a0)?;
+                // PartitionDurationFormatPattern: each non-zero unit contributes an
+                // `integer` + `literal` + `unit` run, joined by ", " literals. Every
+                // part inside a run also carries the SINGULAR unit name it belongs
+                // to (the `unit` field), which the range/parts tests read.
+                let mut parts: Vec<(String, String, &str)> = vec![];
+                for (i, field) in native::DURATION_FIELDS.iter().enumerate() {
+                    if dur[i] == 0 {
+                        continue;
+                    }
+                    if !parts.is_empty() {
+                        parts.push(("literal".into(), ", ".into(), ""));
+                    }
+                    let unit = field.strip_suffix('s').unwrap_or(field);
+                    parts.push(("integer".into(), dur[i].to_string(), unit));
+                    parts.push(("literal".into(), " ".into(), unit));
+                    parts.push(("unit".into(), duration_unit_label(i).into(), unit));
+                }
+                if parts.is_empty() {
+                    parts.push(("integer".into(), "0".into(), "second"));
+                    parts.push(("literal".into(), " ".into(), "second"));
+                    parts.push(("unit".into(), "sec".into(), "second"));
+                }
+                // The third tuple slot is the `unit` field here, not `source`.
+                let arr = self.intl_parts_array(
+                    &parts.iter().map(|(t, v, _)| (t.clone(), v.clone(), "")).collect::<Vec<_>>(),
+                );
+                let items = match self.heap.get(arr.heap_index()) {
+                    HeapObj::Array(v) => v.clone(),
+                    _ => vec![],
+                };
+                for (o, (_, _, unit)) in items.iter().zip(parts.iter()) {
+                    if unit.is_empty() {
+                        continue;
+                    }
+                    let uv = self.alloc_str(unit.to_string());
+                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                        m.set("unit", uv);
+                    }
+                }
+                arr
             }
             _ if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16)
                 .contains(&id) =>

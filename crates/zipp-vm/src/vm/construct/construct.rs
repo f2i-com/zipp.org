@@ -502,7 +502,14 @@ impl<'p> Vm<'p> {
             if let Some(kind) = self.intl_ctors.iter().position(|&c| c == ci) {
                 let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                return self.make_intl(kind as u8, locales, options);
+                let r = self.make_intl(kind as u8, locales, options)?;
+                // OrdinaryCreateFromConstructor(newTarget, "%Intl.<svc>.prototype%"):
+                // a subclass / Reflect.construct newTarget supplies the instance's
+                // [[Prototype]] (`class M extends Intl.Collator {}` must produce an
+                // M, not a bare Collator).
+                let default_proto = self.intl_protos[kind];
+                let over = self.newtarget_proto_override(new_target, cv, default_proto)?;
+                return Ok(self.set_ctor_proto(r, over));
             }
         }
         // Constructing through a Proxy: `construct` trap (or construct the target).

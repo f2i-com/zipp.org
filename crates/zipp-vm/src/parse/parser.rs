@@ -465,6 +465,11 @@ pub struct Parser<'s> {
     /// LATER in the file, so the check waits until the module's top level is
     /// complete.
     pub(crate) pending_export_locals: Vec<(Box<str>, u32)>,
+    /// Counter for the private backing slot an auto-accessor (`accessor x`)
+    /// desugars to. Unique across the whole parse, so a base class and a
+    /// derived class that both declare `accessor x` get DISTINCT slots on the
+    /// same instance (private names are keyed by string).
+    pub(crate) accessor_seq: u32,
 }
 
 impl<'s> Parser<'s> {
@@ -511,6 +516,7 @@ impl<'s> Parser<'s> {
             stmt_pos: StmtPos::ListItem,
             exported_names: Vec::new(),
             pending_export_locals: Vec::new(),
+            accessor_seq: 0,
         })
     }
 

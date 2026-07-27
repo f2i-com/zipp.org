@@ -73,7 +73,12 @@ impl<'a> FnCompiler<'a> {
                 let mut entry_fns: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 for st in body {
-                    if let S::FnDecl(f) = st {
+                    // A LABELLED function declaration (`{ L: function f(){} }`) is
+                    // still a FunctionDeclaration of this block: BlockDeclaration-
+                    // Instantiation instantiates it at block entry like any other,
+                    // and unwrapping the label chain is the only way it gets a
+                    // block binding at all.
+                    if let Some(f) = labelled_fn_decl(st) {
                         if let Some(id) = &f.name {
                             // Inside a function body, block functions are always
                             // block-local. At script level they normally hoist to
@@ -83,11 +88,15 @@ impl<'a> FnCompiler<'a> {
                             // (Annex B is not honored in strict mode, so the function
                             // stays block-local and does not leak past the block).
                             let nm: &str = id;
-                            // Block-local for strict / enclosing-block lexical
+                            // Block-local for strict / a generator or async
+                            // declaration (never eligible for Annex B, so purely
+                            // lexical in sloppy mode too) / enclosing-block lexical
                             // conflict / a protected param-lexical-class name / a
                             // B.3.3 var name. A name matching an existing function is
                             // NOT shadowed — it is directly updated (B.3.3).
                             if self.cx.in_strict
+                                || f.is_generator
+                                || f.is_async
                                 || self.block_fn_conflicts(nm)
                                 || self.protect_names.contains(nm)
                                 || self.b33_names.contains(nm)
@@ -109,7 +118,7 @@ impl<'a> FnCompiler<'a> {
                     // var-binding sync stays at the declaration's textual
                     // position (B.3.3.3 fires at evaluation, not entry).
                     for st in body {
-                        if let S::FnDecl(f) = st {
+                        if let Some(f) = labelled_fn_decl(st) {
                             if let Some(id) = &f.name {
                                 if entry_fns.contains(&**id) {
                                     self.func_decl_inner(f, false)?;
@@ -118,7 +127,7 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                     for st in body {
-                        if let S::FnDecl(f) = st {
+                        if let Some(f) = labelled_fn_decl(st) {
                             if let Some(id) = &f.name {
                                 if entry_fns.contains(&**id) {
                                     self.emit_b33_sync(id);
@@ -283,8 +292,17 @@ impl<'a> FnCompiler<'a> {
                     }
                     None => None,
                 };
-                let iters: Vec<Reg> =
-                    self.loop_ctx.iter().rev().filter_map(|c| c.iter_close).collect();
+                // A sync for-of closes on a return completion from its own
+                // `IterCloseFinally` handler — which runs AFTER the body's `try`
+                // handlers, where the spec puts it. Emitting here as well would
+                // close twice, so only for-await frames (no such handler) do.
+                let iters: Vec<Reg> = self
+                    .loop_ctx
+                    .iter()
+                    .rev()
+                    .filter(|c| !c.close_via_finally)
+                    .filter_map(|c| c.iter_close)
+                    .collect();
                 for it in iters {
                     self.emit(Instr::IterClose { iter: it });
                 }

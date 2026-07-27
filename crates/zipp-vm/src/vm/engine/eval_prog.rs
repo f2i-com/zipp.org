@@ -155,8 +155,20 @@ impl<'p> Vm<'p> {
                     // Class-id operands: the class itself, the class inner-name
                     // read (`C` inside `class C`), and every `super` reference
                     // (which names its home class).
-                    Instr::MakeClass { class_id, .. }
-                    | Instr::LoadClassValue { class_id, .. } => *class_id += base_class,
+                    Instr::MakeClass { class_id, .. } => *class_id += base_class,
+                    // A class-inner-name read carries the same SENTINEL as the
+                    // `super` ops when it names the EVAL CALLER's class
+                    // (`class C { m(){ return eval("C") } }`): that class lives
+                    // in the caller's table, not this program's.
+                    Instr::LoadClassValue { class_id, .. } => {
+                        if *class_id == u32::MAX {
+                            if let Some(h) = caller_home {
+                                *class_id = h;
+                            }
+                        } else {
+                            *class_id += base_class;
+                        }
+                    }
                     Instr::SuperCtor { home_class_id, .. }
                     | Instr::SuperCtorSpread { home_class_id, .. }
                     | Instr::SuperMethod { home_class_id, .. }
@@ -423,6 +435,10 @@ impl<'p> Vm<'p> {
             let global_id = (self.main_func_count + local) as u32;
             if let Some(slot) = self.eval_funcs[local].name_global {
                 let v = Value::heap(self.heap.alloc(HeapObj::Func(global_id)));
+                // Hoisted here rather than by MakeFunc, so this is the only place a
+                // `other.eval("function f(){}")` declaration can pick up the CHILD's
+                // realm tag — without it `other.f()` binds the MAIN global as `this`.
+                self.realm_tag_new(v.heap_index());
                 if (slot as usize) >= self.globals.len() {
                     continue;
                 }

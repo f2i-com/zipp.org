@@ -368,6 +368,11 @@ impl<'a> FnCompiler<'a> {
     /// (a switch's CaseBlock calls it once per clause — the in-scope dedup makes
     /// the clauses share one block-level binding).
     pub(crate) fn predeclare_lexical_tdz(&mut self, stmts: &[ast::Stmt]) {
+        // Every block-like scope funnels through here right after `push_scope`,
+        // so this is also where the scope's lexical NAMES are recorded for the
+        // Annex B B.3.3 blocker test — which must see a `let` written below a
+        // nested block, not just the bindings compiled so far.
+        self.note_block_lexicals(stmts);
         for st in stmts {
             let mut pre = |fc: &mut Self, name: &str| {
                 if fc.captured.contains(name)
@@ -701,7 +706,11 @@ impl<'a> FnCompiler<'a> {
             r?;
         }
         if let Some(n) = &e_name {
-            if self.captured.contains(n) {
+            // Same boxing rule as `declare_local`, just deferred until the value
+            // is present: a nested closure captures it, or the function may
+            // direct-eval (the eval site map is built from `cell_regs`, so an
+            // unboxed catch param was invisible to `eval("e")` inside the catch).
+            if self.captured.contains(n) || self.box_all_locals || self.script_eval_lexicals {
                 self.emit(Instr::MakeCell { reg: e_reg });
                 self.cell_regs.insert(e_reg);
             }
@@ -940,14 +949,20 @@ impl<'a> FnCompiler<'a> {
         };
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
-        // Close-on-throw (sync for-of only): if the element binding or the body
-        // throws, the iterator must be closed before the error propagates. The
-        // thrown value lands in `exc_reg`; a catch block after the loop closes the
-        // iterator and re-throws. (for-await iterates asynchronously — left as-is.)
-        let exc_reg = if is_await {
-            None
+        // Close-on-abrupt-exit (sync for-of only): the body runs under a `finally`
+        // whose block is `IterCloseFinally` — the ONE place every abrupt exit meets
+        // the iterator, so the close runs after the body's own catch/finally
+        // handlers (7.4.11 is part of the for-of statement, not of its body) and a
+        // `gen.return()` resumed at a `yield` in the body reaches it too. The
+        // completion record lands in (`kind_reg`, `val_reg`).
+        // (for-await iterates asynchronously — left on the inline-close path.)
+        let (kind_reg, exc_reg) = if is_await {
+            (None, None)
         } else {
-            Some(self.declare_local("<forof.exc>"))
+            (
+                Some(self.declare_local("<forof.kind>")),
+                Some(self.declare_local("<forof.cval>")),
+            )
         };
 
         // The loop binding: a destructuring pattern's leaves, an assignment to an
@@ -1080,18 +1095,22 @@ impl<'a> FnCompiler<'a> {
             j
         };
         // Enter the loop body's break/continue scope, then install the per-iteration
-        // close-on-throw handler. The scope's `handler_depth` floor is recorded
-        // BEFORE the push so a `break`/`continue` (handler_depth > floor) unwinds
-        // through it (popping the handler) on its way to the break/continue target.
+        // close handler. The scope's `handler_depth` floor is recorded BEFORE the
+        // push so a `break`/`continue` (handler_depth > floor) unwinds through it
+        // (popping the handler) on its way to the break/continue target.
         // The handler is OUTSIDE the IterNext/done-check above, so a throwing
         // `next()` (or normal exhaustion) does NOT close the iterator (per spec).
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
-        // Record the iterator so a `return` out of the body closes it (the
-        // close-on-throw handler and the break-close block cover the other exits).
+        // Record the iterator so a `break`/`continue` LEAVING this loop from inside a
+        // nested one closes it, and (for-await only, which has no close handler) so
+        // does a `return`.
         self.loop_ctx.last_mut().unwrap().iter_close = Some(iter_reg);
-        let close_push = if let Some(er) = exc_reg {
+        let close_push = if let (Some(kr), Some(er)) = (kind_reg, exc_reg) {
+            // The close handler subsumes the `return` case, so `return` must NOT
+            // also emit an inline IterClose for this frame — that would close twice.
+            self.loop_ctx.last_mut().unwrap().close_via_finally = true;
             let at = self.here();
-            self.emit(Instr::PushHandler { catch_target: 0, catch_reg: er });
+            self.emit(Instr::PushFinally { target: 0, kind_reg: kr, val_reg: er });
             self.handler_depth += 1;
             Some(at)
         } else {
@@ -1197,9 +1216,10 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::EndFinally { kind_reg: kreg, val_reg: vreg });
         }
 
-        // Normal iteration completion: pop the close-on-throw handler before looping.
+        // Normal iteration completion: pop the close handler before looping (the
+        // block is never entered on this path, so no completion record is needed).
         if close_push.is_some() {
-            self.emit(Instr::PopHandler);
+            self.emit(Instr::PopFinally);
             self.handler_depth -= 1;
         }
         let ctx = self.loop_ctx.pop().unwrap();
@@ -1207,17 +1227,18 @@ impl<'a> FnCompiler<'a> {
             self.patch_jump(c, top); // continue → re-run IterNext (advance + test)
         }
         self.emit(Instr::Jump { target: top });
-        // Close-on-throw catch block: reached only when a throw unwinds out of the
-        // element binding or body (the handler is already popped by the unwind).
-        // Close the iterator quietly (error context — the original error wins) and
-        // re-throw it. `return` out of the body discards the catch handler (it is
-        // not a finally), so it does not close here — a remaining gap.
-        if let (Some(at), Some(er)) = (close_push, exc_reg) {
-            let catch_target = self.here();
-            self.emit(Instr::IterCloseQuiet { iter: iter_reg });
-            self.emit(Instr::Throw { src: er });
-            if let Instr::PushHandler { catch_target: ct, .. } = &mut self.code[at as usize] {
-                *ct = catch_target;
+        // The close handler's block: reached only by an abrupt exit out of the
+        // element binding or body — a throw (unwind_to_handler), a `return`
+        // (route_through_finally, including the one a `gen.return()` at a `yield`
+        // in the body synthesises), or a `break`/`continue` that leaves this
+        // handler (route_jump_through_finally). `IterCloseFinally` decides which
+        // of those actually closes; `EndFinally` then resumes the completion.
+        if let (Some(at), Some(kr), Some(er)) = (close_push, kind_reg, exc_reg) {
+            let fin_start = self.here();
+            self.emit(Instr::IterCloseFinally { iter: iter_reg, kind_reg: kr });
+            self.emit(Instr::EndFinally { kind_reg: kr, val_reg: er });
+            if let Instr::PushFinally { target, .. } = &mut self.code[at as usize] {
+                *target = fin_start;
             }
         }
         // A `break` out of the loop closes the (not-yet-exhausted) iterator via a

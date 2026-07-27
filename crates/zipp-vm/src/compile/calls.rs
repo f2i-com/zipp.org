@@ -1325,6 +1325,14 @@ impl<'a> FnCompiler<'a> {
             this_reg,
             home_class: self.super_class.unwrap_or(u32::MAX),
             super_static: self.super_static,
+            // `super()` in a direct eval needs the CONSTRUCTOR of a derived
+            // class (`in_derived_ctor`, which arrows inherit) — `derived_class`
+            // is also true in that class's methods, where the eval rules "as
+            // outside a constructor" apply. A field INITIALIZER runs inside the
+            // ctor's compiler but is likewise "outside a constructor" for these
+            // early errors (derived-cls-direct-eval-err-contains-supercall).
+            derived_ctor: self.in_derived_ctor && !self.cx.in_field_init,
+            class_name_ok: self.class_inner_name_visible(),
             ban_arguments: self.cx.in_field_init,
             strict_caller: self.cx.in_strict,
             super_home_obj: self.super_home_obj,

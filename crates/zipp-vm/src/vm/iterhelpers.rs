@@ -1018,7 +1018,7 @@ impl<'p> Vm<'p> {
                 while let Some(v) = self.ih_step(this, next)? {
                     out.push(v);
                 }
-                Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+                Ok(self.alloc_array_current_realm(out))
             }
             ITER_FOREACH => {
                 let next = self.iter_direct_next(this)?;

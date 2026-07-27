@@ -593,7 +593,12 @@ impl<'p> Vm<'p> {
                     }
                     let f = self.get_prop(el, "toLocaleString")?;
                     let s = if self.is_callable(f) {
-                        let r = self.call_value(f, el, &[])?;
+                        // ECMA-402 forwards (locales, options) to each element.
+                        let fwd = [
+                            args.first().copied().unwrap_or(Value::UNDEFINED),
+                            args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                        ];
+                        let r = self.call_value(f, el, &fwd)?;
                         self.to_js_string(r)?
                     } else {
                         self.to_js_string(el)?

@@ -622,6 +622,22 @@ impl<'s> Parser<'s> {
             return Ok(ClassMember::StaticBlock(stmts));
         }
 
+        // `FieldDefinition : accessor [no LineTerminator here] ClassElementName
+        // Initializer_opt` — an AUTO-ACCESSOR. `accessor` is contextual and may
+        // be the member's own name, so it is the modifier only when a
+        // ClassElementName follows it ON THE SAME LINE: `accessor = 1`,
+        // `accessor;`, `accessor(){}` and `accessor \n $;` are all a member
+        // NAMED `accessor` (the last by ASI, which is what
+        // `field-definition-accessor-no-line-terminator` asserts).
+        if self.at_kw(Keyword::Accessor) {
+            let save = self.save();
+            self.bump_after_operand()?;
+            if !self.cur().newline_before && self.at_class_key_start() {
+                return self.parse_auto_accessor(is_static, start);
+            }
+            self.restore(save);
+        }
+
         // Accessors and modifiers, each of which may instead be a plain name.
         for (kw, kind) in [(Keyword::Get, MethodKind::Get), (Keyword::Set, MethodKind::Set)] {
             if self.at_kw(kw) {
@@ -696,7 +712,78 @@ impl<'s> Parser<'s> {
             None
         };
         self.semicolon()?;
-        Ok(ClassMember::Field(ClassField { key, value, is_static }))
+        Ok(ClassMember::Field(ClassField { key, value, is_static, accessor: None }))
+    }
+
+    /// `accessor ClassElementName Initializer_opt`, with the `accessor` keyword
+    /// already consumed. Produces ONE member: a private backing field plus the
+    /// get/set pair that reads and writes it.
+    fn parse_auto_accessor(&mut self, is_static: bool, start: u32) -> PResult<ClassMember> {
+        let key = self.parse_prop_key()?;
+        let value = if self.eat(Punct::Eq, true)? {
+            let saved = self.ctx;
+            self.ctx.in_field_init = true;
+            self.ctx.return_ = false;
+            self.ctx.super_prop = true;
+            self.ctx.new_target = true;
+            let v = self.parse_assign_full()?;
+            self.ctx = saved;
+            Some(v)
+        } else {
+            None
+        };
+        self.semicolon()?;
+        let span = Span::new(start, self.prev_end());
+        // `@` is not an identifier character, so no source can spell this name
+        // and no user private can collide with it. The counter runs across the
+        // whole parse, not per class, so `class B extends A` — where both
+        // declare `accessor x` — gets two slots on the instance rather than one
+        // shared one.
+        self.accessor_seq += 1;
+        let storage: Name = format!("#accessor@{}", self.accessor_seq).into_boxed_str();
+        let slot = |p: &Name| -> Expr {
+            Expr::Member(Box::new(Member {
+                object: Expr::This,
+                prop: MemberProp::Private(p.clone()),
+                optional: false,
+            }))
+        };
+        let body = |stmts: Vec<Stmt>| FnBody { directives: Vec::new(), stmts, strict: true };
+        let getter = Function {
+            name: None,
+            params: Params { items: Vec::new(), simple: true },
+            body: body(vec![Stmt::Return(Some(slot(&storage)))]),
+            is_async: false,
+            is_generator: false,
+            span,
+        };
+        let setter_param: Name = "value".into();
+        let setter = Function {
+            name: None,
+            params: Params { items: vec![Pattern::Ident(setter_param.clone())], simple: true },
+            body: body(vec![Stmt::Expr(Expr::Assign {
+                op: AssignOp::Assign,
+                target: Target::Member(Box::new(Member {
+                    object: Expr::This,
+                    prop: MemberProp::Private(storage.clone()),
+                    optional: false,
+                })),
+                value: Box::new(Expr::Ident(setter_param)),
+            })]),
+            is_async: false,
+            is_generator: false,
+            span,
+        };
+        Ok(ClassMember::Field(ClassField {
+            key,
+            value,
+            is_static,
+            accessor: Some(Box::new(AutoAccessor {
+                storage,
+                getter: Box::new(getter),
+                setter: Box::new(setter),
+            })),
+        }))
     }
 
     fn at_class_key_start(&self) -> bool {

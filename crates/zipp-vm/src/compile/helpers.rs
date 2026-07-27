@@ -202,6 +202,22 @@ pub(crate) fn add_block_lexicals(s: &Stmt, out: &mut std::collections::HashSet<S
     }
 }
 
+/// The FunctionDeclaration a statement declares, seeing through any chain of
+/// labels (`L: M: function f(){}`). A LabelledStatement's LabelledItem may be a
+/// FunctionDeclaration in sloppy code, and its (Top-level)VarScopedDeclarations
+/// are those of the item — so the declaration hoists and is instantiated exactly
+/// like an unlabelled one. Matching only `Stmt::FnDecl` left the labelled form
+/// with no binding at all: `func_decl` resolved the name to a fresh global slot,
+/// took neither local arm, and emitted nothing (`L: function f(){}; f()` → "f is
+/// not a function").
+pub(crate) fn labelled_fn_decl(s: &Stmt) -> Option<&crate::parse::ast::Function> {
+    match s {
+        Stmt::FnDecl(f) => Some(f),
+        Stmt::Labeled { body, .. } => labelled_fn_decl(body),
+        _ => None,
+    }
+}
+
 /// Annex B B.3.3: collect names of `function` declarations inside BLOCKS (not at
 /// the top level of the function body) that are eligible for a function-scoped
 /// `var` binding. `blockers` is the set of lexical names in scope (params,
@@ -326,6 +342,12 @@ pub(crate) fn collect_b33_block_fns(
             }
         }
         S::Labeled { body, .. } => collect_b33_block_fns(body, nested, blockers, out),
+        // A `with` body is an ordinary Statement — normally a Block, whose
+        // function declarations are B.3.3-eligible like any other block's.
+        // Skipping it left `with (o) { function f(){} }` with no function-scoped
+        // binding at all (the declaration became an eagerly-materialized global
+        // function instead of a var seeded to undefined at instantiation).
+        S::With { body, .. } => collect_b33_block_fns(body, true, blockers, out),
         _ => {}
     }
 }

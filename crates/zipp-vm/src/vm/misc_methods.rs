@@ -153,8 +153,20 @@ impl<'p> Vm<'p> {
                 }
             }
             "valueOf" => Ok(Some(nv)),
-            // No Intl: toLocaleString() behaves like the default base-10 toString().
-            "toLocaleString" => Ok(Some(self.alloc_str(self.display(nv)))),
+            // ECMA-402 Number.prototype.toLocaleString: Construct an
+            // Intl.NumberFormat from (locales, options) and FormatNumeric through
+            // it — so grouping, style and the digit options apply here too, and a
+            // bad option throws exactly as the constructor would.
+            "toLocaleString" => {
+                let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let nf = self.make_intl(native::INTL_NUMBERFORMAT, locales, options)?;
+                let resolved = match self.heap.get(nf.heap_index()) {
+                    HeapObj::Intl { resolved, .. } => *resolved,
+                    _ => return Ok(Some(self.alloc_str(self.display(nv)))),
+                };
+                Ok(Some(self.intl_number_format(resolved, nv)?))
+            }
             "toExponential" => {
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let digits = if arg == Value::UNDEFINED {

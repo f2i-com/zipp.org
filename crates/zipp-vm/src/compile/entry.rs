@@ -93,7 +93,7 @@ pub fn compile_eval(
     source: &str,
     force_strict: bool,
     force_new_target_ok: bool,
-    inherit_super: Option<bool>,
+    inherit_super: Option<EvalClassCtx>,
     ban_arguments: bool,
     visible_privates: std::collections::HashSet<String>,
     is_module: bool,
@@ -305,6 +305,15 @@ pub fn compile_eval(
     // class: `super.x` in the eval'd top level (and its arrows) compiles
     // against the u32::MAX SENTINEL, which prepare_eval_program remaps to the
     // caller's runtime class id. Plain nested functions still reset it.
+    // The caller class's inner NAME rides the same sentinel, so `eval("C")`
+    // inside a class element yields the class value rather than resolving to
+    // (and, in a static field initializer, tripping the TDZ of) the outer
+    // binding.
+    // (`name` is already None when something at the call site shadows it — see
+    // `class_inner_name_visible`.)
+    if let Some(n) = inherit_super.as_ref().and_then(|cx| cx.name.clone()) {
+        c.class_names.push((n, u32::MAX));
+    }
     c.eval_inherit_super = inherit_super;
     c.in_field_init = ban_arguments;
     c.eval_visible_privates = visible_privates;

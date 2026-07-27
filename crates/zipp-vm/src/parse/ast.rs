@@ -499,6 +499,29 @@ pub struct ClassField {
     pub key: PropKey,
     pub value: Option<Expr>,
     pub is_static: bool,
+    /// `accessor x = v` — an AUTO-ACCESSOR (proposal-decorators). Present only
+    /// for that form. The field itself becomes the private backing slot named
+    /// [`AutoAccessor::storage`]; `key` names the get/set pair installed
+    /// alongside it. Kept as one member (rather than three) so the ClassBody
+    /// early errors see a single element under `key` — `accessor #x` declares
+    /// `#x` exactly once — and so a COMPUTED key is evaluated exactly once.
+    pub accessor: Option<Box<AutoAccessor>>,
+}
+
+/// The get/set pair an auto-accessor desugars to. Both bodies are synthesized
+/// by the parser (`return this.#slot` / `this.#slot = value`) rather than
+/// modelled with a dedicated opcode: the engine's private-element semantics
+/// already give an auto-accessor everything it must have — hidden per-instance
+/// storage, a brand check that makes `Derived.staticAccessor` a TypeError, and
+/// shadowing between a base and a derived class's same-named slot.
+#[derive(Debug, Clone)]
+pub struct AutoAccessor {
+    /// The private backing slot, e.g. `#accessor@3`. Unspellable in source
+    /// (`@` is not an identifier character), so it can never collide with a
+    /// user private name.
+    pub storage: Name,
+    pub getter: Box<Function>,
+    pub setter: Box<Function>,
 }
 
 // ============================================================================

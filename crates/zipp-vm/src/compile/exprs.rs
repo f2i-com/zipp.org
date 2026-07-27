@@ -1712,6 +1712,15 @@ impl<'a> FnCompiler<'a> {
                         // tell) and removes a configurable binding.
                         self.emit(Instr::DeleteGlobal { dst, slot });
                     }
+                    // A binding of an ENCLOSING function is a declarative
+                    // record binding, so `delete` is false — but
+                    // `resolve_existing` reports it as unresolved (it does not
+                    // thread upvalues), which sent it to the global fallback
+                    // below and answered `true`. Costs one non-threading scan
+                    // of the enclosing chain, only on this arm.
+                    None if self.bound_in_enclosing(n) => {
+                        self.emit(Instr::LoadBool { dst, val: false });
+                    }
                     None => {
                         // Unreferenced-so-far name: allocate its global slot
                         // (like an identifier reference would) so the runtime

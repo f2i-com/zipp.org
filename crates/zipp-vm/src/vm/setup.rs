@@ -1860,6 +1860,8 @@ impl<'p> Vm<'p> {
                     // `format` is an accessor (added below), not a data method.
                     vec![
                         ("formatToParts", INTL_NF_FORMAT_TO_PARTS),
+                        ("formatRange", INTL_NF_FORMAT_RANGE),
+                        ("formatRangeToParts", INTL_NF_FORMAT_RANGE_TO_PARTS),
                         ("resolvedOptions", INTL_RESOLVED_OPTIONS),
                     ],
                     true,
@@ -1870,6 +1872,8 @@ impl<'p> Vm<'p> {
                     0.0,
                     vec![
                         ("formatToParts", INTL_DTF_FORMAT_TO_PARTS),
+                        ("formatRange", INTL_DTF_FORMAT_RANGE),
+                        ("formatRangeToParts", INTL_DTF_FORMAT_RANGE_TO_PARTS),
                         ("resolvedOptions", INTL_RESOLVED_OPTIONS),
                     ],
                     true,
@@ -1951,6 +1955,7 @@ impl<'p> Vm<'p> {
                     0.0,
                     vec![
                         ("format", INTL_DURATION_FORMAT),
+                        ("formatToParts", INTL_DURATION_FORMAT_TO_PARTS),
                         ("resolvedOptions", INTL_RESOLVED_OPTIONS),
                     ],
                     true,

@@ -21,6 +21,22 @@ fn computed_key(k: &ast::PropKey) -> Option<&ast::Expr> {
     }
 }
 
+/// Install a statically-named class member. A DUPLICATE name in the same list
+/// (`get b(){}` + `get ['b'](){}` — both statically nameable, or a user getter
+/// and an `accessor` of the same name) REPLACES the earlier definition (last
+/// wins) while keeping its original position in property order.
+fn put_member<'x>(
+    list: &mut Vec<(String, &'x ast::Function)>,
+    name: String,
+    f: &'x ast::Function,
+) {
+    if let Some(slot) = list.iter_mut().find(|(n, _)| *n == name) {
+        slot.1 = f;
+    } else {
+        list.push((name, f));
+    }
+}
+
 /// The statement list of an arrow body, for the `&[Stmt]`-shaped analyses
 /// (`hoisted_var_names`, `capture::captured_locals`, `stash_child_with_shadows`).
 ///
@@ -397,10 +413,42 @@ impl<'a> FnCompiler<'a> {
         // member keys install the members; computed FIELD keys evaluate ONCE
         // (an instance key parks on the class for the ctor's FieldInit; a
         // static key parks in a register that phase 2 consumes).
-        for (key, func, kind) in &computed {
+        for (key, func, kind, pair) in &computed {
             let save = self.next_reg;
-            let kr = self.expr(key)?;
-            self.emit(Instr::ClassAddMember { class: cls, key: kr, func: *func, kind: *kind });
+            let Some(sfid) = pair else {
+                let kr = self.expr(key)?;
+                self.emit(Instr::ClassAddMember {
+                    class: cls,
+                    key: kr,
+                    func: *func,
+                    kind: *kind,
+                });
+                self.next_reg = save;
+                continue;
+            };
+            // An auto-accessor installs TWO members from ONE ClassElementName,
+            // so `accessor [k] = v` must evaluate `k` once AND ToPropertyKey it
+            // once — a key whose `toString` counts calls sees exactly one. The
+            // key goes into a fresh temp (`expr` may hand back a live local's
+            // register) so the KEY_WRITEBACK bit can leave the coerced key
+            // there for the setter's instruction to reuse.
+            let kt = self.temp();
+            let v = self.expr_into(key, kt)?;
+            if v != kt {
+                self.emit(Instr::Move { dst: kt, src: v });
+            }
+            self.emit(Instr::ClassAddMember {
+                class: cls,
+                key: kt,
+                func: *func,
+                kind: *kind | KEY_WRITEBACK,
+            });
+            self.emit(Instr::ClassAddMember {
+                class: cls,
+                key: kt,
+                func: *sfid,
+                kind: if *kind == 4 { 5 } else { 2 },
+            });
             self.next_reg = save;
         }
         let mut parked: Vec<Option<Reg>> = Vec::with_capacity(computed_fields.len());
@@ -547,7 +595,7 @@ impl<'a> FnCompiler<'a> {
     ) -> R<(
         u32,
         Vec<(String, Option<&'b ast::Expr>)>,
-        Vec<(&'b ast::Expr, u32, u8)>,
+        Vec<(&'b ast::Expr, u32, u8, Option<u32>)>,
         Vec<(&'b ast::Expr, Option<&'b ast::Expr>, bool)>,
         Vec<u32>,
         Vec<(u8, usize)>,
@@ -639,18 +687,17 @@ impl<'a> FnCompiler<'a> {
         // Members with a runtime-computed key (`[expr]() {}`) — the key is
         // evaluated and the member installed at class-creation time (see
         // class_decl). kind: 0=method 1=getter 2=setter 3=static method.
-        let mut computed: Vec<(&'b ast::Expr, &'b ast::Function, u8)> = Vec::new();
+        // The 4th slot is an AUTO-ACCESSOR's setter, riding along on its
+        // getter's entry: `accessor [k] = v` must evaluate `k` exactly ONCE and
+        // install two members from it, which two independent entries could not
+        // do.
+        let mut computed: Vec<(&'b ast::Expr, &'b ast::Function, u8, Option<&'b ast::Function>)> =
+            Vec::new();
         // NOTE: `ClassMember` has exactly three variants (Method / Field /
         // StaticBlock), so the old trailing `_ => Err("unsupported class member
         // in the zipp-vm subset")` arm is gone — it would now be an unreachable
-        // pattern. Two constructs that used to reach the compiler no longer can:
-        // `accessor x = init` (which this file lowered to an ordinary field with
-        // the same key/initializer timing) and decorated members. Neither has a
-        // `ClassMember` variant, so they are rejected before compilation instead
-        // of here. If the hand-written parser adds an accessor variant, the
-        // SUBSET lowering it needs is the one that used to live in this match:
-        // an ordinary field, with the synthesized private backing slot and the
-        // prototype get/set pair NOT modeled.
+        // pattern. Decorated members still cannot reach here: they have no AST
+        // representation and are rejected by the parser.
         for el in &class.body {
             match el {
                 ast::ClassMember::Method(m) => {
@@ -671,21 +718,6 @@ impl<'a> FnCompiler<'a> {
                         ast::MethodKind::Method if m.is_static => 3u8,
                         ast::MethodKind::Method => 0u8,
                     };
-                    // A DUPLICATE member name in the same list (`get b(){}` +
-                    // `get ['b'](){}` — both statically nameable) REPLACES the
-                    // earlier definition (last wins) while keeping its original
-                    // position in property order.
-                    fn put_member<'x>(
-                        list: &mut Vec<(String, &'x ast::Function)>,
-                        name: String,
-                        f: &'x ast::Function,
-                    ) {
-                        if let Some(slot) = list.iter_mut().find(|(n, _)| *n == name) {
-                            slot.1 = f;
-                        } else {
-                            list.push((name, f));
-                        }
-                    }
                     match class_key_name(&m.key) {
                         Ok(name) => match (m.is_static, m.kind) {
                             (true, ast::MethodKind::Method) => put_member(&mut statics, name, &*m.func),
@@ -701,22 +733,72 @@ impl<'a> FnCompiler<'a> {
                         // runtime-keyed member; anything else is the error.
                         Err(e) => {
                             let Some(key) = computed_key(&m.key) else { return Err(e) };
-                            // An INSTANCE member with a runtime-computed key keeps
-                            // its SOURCE position in the prototype's property order:
-                            // park a placeholder entry here; `ClassAddMember` renames
-                            // it in place once the key value is known (the ordinal is
-                            // rewritten to the member's func id below, which the
-                            // dispatch arm can recompute).
-                            if matches!(kind, 0 | 1 | 2) {
+                            // A member with a runtime-computed key keeps its
+                            // SOURCE position in the owner's property order:
+                            // park a placeholder entry here; `ClassAddMember`
+                            // renames it in place once the key value is known
+                            // (the ordinal is rewritten to the member's func id
+                            // below, which the dispatch arm can recompute). The
+                            // placeholder is also what tells the VM which of a
+                            // duplicate pair came first. Kind 3 (static method)
+                            // is excluded: it lands in the class's ObjMap, which
+                            // already keeps insertion order.
+                            if matches!(kind, 0 | 1 | 2 | 4 | 5) {
                                 let ph = format!("\u{1}cm{}", computed.len());
                                 let list = match kind {
                                     1 => &mut getters,
                                     2 => &mut setters,
+                                    4 => &mut static_getters,
+                                    5 => &mut static_setters,
                                     _ => &mut methods,
                                 };
                                 list.push((ph, &*m.func));
                             }
-                            computed.push((key, &*m.func, kind));
+                            computed.push((key, &*m.func, kind, None));
+                        }
+                    }
+                }
+                // `accessor x = v` — the auto-accessor of proposal-decorators.
+                // One element, three pieces: a private backing FIELD (same
+                // initializer, same timing as an ordinary field) plus the
+                // get/set pair that reads and writes it, installed under the
+                // declared key. Nothing here is new machinery — the pair is
+                // ordinary class accessors and the slot an ordinary private
+                // field, which is what gives `Derived.staticAccessor` its
+                // TypeError and keeps a base/derived same-named pair distinct.
+                ast::ClassMember::Field(p) if p.accessor.is_some() => {
+                    let acc = p.accessor.as_ref().unwrap();
+                    let slot = private_key(&acc.storage);
+                    if p.is_static {
+                        static_fields.push((slot, p.value.as_ref()));
+                        static_order.push((0, static_fields.len() - 1));
+                    } else {
+                        fields.push((slot, p.value.as_ref()));
+                    }
+                    match class_key_name(&p.key) {
+                        Ok(name) => {
+                            let (gl, sl) = if p.is_static {
+                                (&mut static_getters, &mut static_setters)
+                            } else {
+                                (&mut getters, &mut setters)
+                            };
+                            put_member(gl, name.clone(), &*acc.getter);
+                            put_member(sl, name, &*acc.setter);
+                        }
+                        Err(e) => {
+                            let Some(key) = computed_key(&p.key) else { return Err(e) };
+                            // Both sides keep their source position via a parked
+                            // placeholder, exactly as a computed accessor does.
+                            let i = computed.len();
+                            let (gl, sl) = if p.is_static {
+                                (&mut static_getters, &mut static_setters)
+                            } else {
+                                (&mut getters, &mut setters)
+                            };
+                            gl.push((format!("\u{1}cm{i}"), &*acc.getter));
+                            sl.push((format!("\u{1}cs{i}"), &*acc.setter));
+                            let kind = if p.is_static { 4u8 } else { 1u8 };
+                            computed.push((key, &*acc.getter, kind, Some(&*acc.setter)));
                         }
                     }
                 }
@@ -909,6 +991,10 @@ impl<'a> FnCompiler<'a> {
         // Static accessor protos (this = the class value on `C.name` read/write).
         let mut static_getter_defs: Vec<(String, u32)> = Vec::new();
         for (gname, func) in &static_getters {
+            if gname.starts_with('\u{1}') {
+                static_getter_defs.push((gname.clone(), u32::MAX));
+                continue;
+            }
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
                 &format!("get {gname}"),
@@ -931,6 +1017,10 @@ impl<'a> FnCompiler<'a> {
         }
         let mut static_setter_defs: Vec<(String, u32)> = Vec::new();
         for (sname, func) in &static_setters {
+            if sname.starts_with('\u{1}') {
+                static_setter_defs.push((sname.clone(), u32::MAX));
+                continue;
+            }
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
                 &format!("set {sname}"),
@@ -1023,46 +1113,65 @@ impl<'a> FnCompiler<'a> {
         // Computed-key method protos. They carry no static name, so they're
         // installed at runtime by class_decl (which evaluates each key) via
         // ClassAddMember; here we just compile each proto and pair it with its key.
-        let mut computed_defs: Vec<(&'b ast::Expr, u32, u8)> = Vec::new();
-        for (key, func, kind) in &computed {
-            let (params, rest, body) = function_parts(func)?;
-            let mut proto = self.cx.compile_class_fn(
-                &format!("{cname}.[computed]"),
-                &params,
-                rest.as_deref(),
-                Some(&func.params),
-                &[],
-                &[],
-                body,
-                super_class_id,
-                matches!(*kind, 3 | 4 | 5), // static computed members get the parent-class super base
-                func.is_generator,
-                func.is_async,
-            )?;
-            proto.source = method_source(
-                self.cx.src_slice(func.span.start, func.span.end),
-                matches!(*kind, 3 | 4 | 5),
-            );
-            let fid = self.cx.functions.len() as u32;
-            self.cx.functions.push(proto);
-            computed_defs.push((key, fid, *kind));
+        let mut computed_defs: Vec<(&'b ast::Expr, u32, u8, Option<u32>)> = Vec::new();
+        for (key, func, kind, pair) in &computed {
+            let is_static = matches!(*kind, 3 | 4 | 5);
+            let mut compile_one = |f: &ast::Function| -> R<u32> {
+                let (params, rest, body) = function_parts(f)?;
+                let mut proto = self.cx.compile_class_fn(
+                    &format!("{cname}.[computed]"),
+                    &params,
+                    rest.as_deref(),
+                    Some(&f.params),
+                    &[],
+                    &[],
+                    body,
+                    super_class_id,
+                    is_static, // static computed members get the parent-class super base
+                    f.is_generator,
+                    f.is_async,
+                )?;
+                proto.source =
+                    method_source(self.cx.src_slice(f.span.start, f.span.end), is_static);
+                let fid = self.cx.functions.len() as u32;
+                self.cx.functions.push(proto);
+                Ok(fid)
+            };
+            let fid = compile_one(func)?;
+            let pair_fid = match pair {
+                Some(s) => Some(compile_one(s)?),
+                None => None,
+            };
+            computed_defs.push((key, fid, *kind, pair_fid));
         }
         // Rewrite each instance placeholder's ordinal to its member's FUNC ID
         // ("\u{1}cm{ordinal}" → "\u{1}cm{fid}"), so the `ClassAddMember`
         // dispatch arm — which knows only the func id — can find and rename
         // the parked entry in place (preserving the member's source position).
-        for (i, (_, fid, kind)) in computed_defs.iter().enumerate() {
-            if !matches!(*kind, 0 | 1 | 2) {
+        // An auto-accessor pair parks two entries, distinguished at compile time
+        // by the "cs" marker; both end up as the "cm{fid}" the VM looks for.
+        for (i, (_, fid, kind, pair_fid)) in computed_defs.iter().enumerate() {
+            if !matches!(*kind, 0 | 1 | 2 | 4 | 5) {
                 continue;
             }
             let old = format!("\u{1}cm{i}");
             let list = match *kind {
                 1 => &mut getter_defs,
                 2 => &mut setter_defs,
+                4 => &mut static_getter_defs,
+                5 => &mut static_setter_defs,
                 _ => &mut method_defs,
             };
             if let Some(slot) = list.iter_mut().find(|(n, _)| *n == old) {
                 slot.0 = format!("\u{1}cm{fid}");
+            }
+            if let Some(sf) = pair_fid {
+                let old = format!("\u{1}cs{i}");
+                let list =
+                    if *kind == 4 { &mut static_setter_defs } else { &mut setter_defs };
+                if let Some(slot) = list.iter_mut().find(|(n, _)| *n == old) {
+                    slot.0 = format!("\u{1}cm{sf}");
+                }
             }
         }
         // `static { … }` blocks: each body compiles to a zero-arg thunk (like a

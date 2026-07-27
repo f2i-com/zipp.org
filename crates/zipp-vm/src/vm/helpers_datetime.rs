@@ -595,78 +595,300 @@ pub(crate) fn canonicalize_locale(tag: &str) -> Option<String> {
     Some(out.join("-"))
 }
 
-/// Format a number for Intl.NumberFormat with grouping + min/max fraction digits.
-/// (en-US conventions: "," grouping, "." decimal; percent multiplies by 100.)
-pub(crate) fn format_number_intl(
-    n: f64,
-    style: &str,
-    min_frac: i64,
-    max_frac: i64,
-    min_int: i64,
-    grouping: bool,
-) -> String {
-    if n.is_nan() {
-        return "NaN".to_string();
+/// The resolved NumberFormat slots that drive FormatNumeric. Passed as a struct
+/// because ECMA-402's rounding depends on all of them together (a significant-
+/// digit target, a fraction-digit target, or both under morePrecision).
+pub(crate) struct NumFmtParams<'a> {
+    pub style: &'a str,
+    pub min_int: i64,
+    pub min_frac: Option<i64>,
+    pub max_frac: Option<i64>,
+    pub min_sig: Option<i64>,
+    pub max_sig: Option<i64>,
+    pub rounding_priority: &'a str,
+    pub rounding_mode: &'a str,
+    pub rounding_increment: i64,
+    pub trailing_zero_display: &'a str,
+    pub sign_display: &'a str,
+    pub grouping: bool,
+}
+
+/// The decimal digits a non-negative finite f64 rounds from, as (integer,
+/// fraction). This is the SHORTEST round-tripping representation (Rust's
+/// `Display`), not the exact binary expansion: ECMA-402's "Intl mathematical
+/// value" is the decimal the double denotes, so `1.15` must round to `1.2`
+/// under halfExpand even though the stored binary value is 1.14999999999999991.
+fn exact_decimal(x: f64) -> (String, String) {
+    let s = format!("{x}");
+    match s.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (s, String::new()),
     }
-    let neg = n.is_sign_negative() && n != 0.0;
+}
+
+/// Fold a signed rounding mode into a magnitude decision: `ceil`/`floor` and
+/// their half- forms depend on the sign, the rest do not.
+fn fold_rounding_mode(mode: &str, neg: bool) -> &'static str {
+    match mode {
+        "ceil" => if neg { "trunc" } else { "expand" },
+        "floor" => if neg { "expand" } else { "trunc" },
+        "halfCeil" => if neg { "halfTrunc" } else { "halfExpand" },
+        "halfFloor" => if neg { "halfExpand" } else { "halfTrunc" },
+        "expand" => "expand",
+        "trunc" => "trunc",
+        "halfTrunc" => "halfTrunc",
+        "halfEven" => "halfEven",
+        _ => "halfExpand",
+    }
+}
+
+/// Should the kept prefix be incremented? `cmp` compares the dropped remainder
+/// against exactly one half of the rounding unit.
+fn round_up(mode: &str, nonzero: bool, cmp: std::cmp::Ordering, last_odd: bool) -> bool {
+    use std::cmp::Ordering::*;
+    if !nonzero {
+        return false;
+    }
+    match mode {
+        "expand" => true,
+        "trunc" => false,
+        "halfTrunc" => cmp == Greater,
+        "halfEven" => cmp == Greater || (cmp == Equal && last_odd),
+        _ => cmp != Less, // halfExpand
+    }
+}
+
+/// Add one to a decimal digit string, growing it on carry-out ("999" → "1000").
+fn bump(digits: &mut Vec<u8>) {
+    for d in digits.iter_mut().rev() {
+        if *d < 9 {
+            *d += 1;
+            return;
+        }
+        *d = 0;
+    }
+    digits.insert(0, 1);
+}
+
+/// Round the non-negative decimal `int_s`.`frac_s` at fraction position `k`
+/// (negative k rounds the integer part to tens/hundreds/…), returning the digit
+/// string scaled to exactly `k` fraction places when k ≥ 0.
+fn round_decimal_at(int_s: &str, frac_s: &str, k: i64, mode: &str) -> (String, String) {
+    let all: Vec<u8> = int_s.bytes().chain(frac_s.bytes()).map(|b| b - b'0').collect();
+    let point = int_s.len() as i64;
+    let keep = (point + k).max(0) as usize;
+    let mut kept: Vec<u8> = all.iter().copied().take(keep).collect();
+    while kept.len() < keep {
+        kept.push(0);
+    }
+    let rest = if keep < all.len() { &all[keep..] } else { &[][..] };
+    let nonzero = rest.iter().any(|d| *d != 0);
+    let cmp = match rest.first() {
+        None => std::cmp::Ordering::Less,
+        Some(&d) if d > 5 => std::cmp::Ordering::Greater,
+        Some(&d) if d < 5 => std::cmp::Ordering::Less,
+        _ => {
+            if rest[1..].iter().any(|d| *d != 0) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }
+    };
+    let last_odd = kept.last().is_some_and(|d| d % 2 == 1);
+    if round_up(mode, nonzero, cmp, last_odd) {
+        if kept.is_empty() {
+            kept.push(1);
+        } else {
+            bump(&mut kept);
+        }
+    }
+    // Re-split at the point. `bump` may have prepended a digit, and a negative k
+    // means the dropped integer places come back as zeros.
+    let mut s: String = kept.iter().map(|d| (d + b'0') as char).collect();
+    let grown = kept.len() as i64 - keep as i64;
+    if k < 0 {
+        for _ in 0..(-k) {
+            s.push('0');
+        }
+        return (if s.is_empty() { "0".into() } else { s }, String::new());
+    }
+    let ip = (point + grown).max(0) as usize;
+    while s.len() < ip {
+        s.insert(0, '0');
+    }
+    let (i, f) = s.split_at(ip.min(s.len()));
+    (if i.is_empty() { "0".to_string() } else { i.to_string() }, f.to_string())
+}
+
+/// The decimal exponent of the most significant digit (1 for "1.5", 0 for
+/// "0.5", -1 for "0.05"); 1 for an all-zero value so a zero keeps one digit.
+fn decimal_exponent(int_s: &str, frac_s: &str) -> i64 {
+    if int_s.bytes().any(|b| b != b'0') {
+        return int_s.trim_start_matches('0').len() as i64;
+    }
+    match frac_s.bytes().position(|b| b != b'0') {
+        Some(i) => -(i as i64),
+        None => 1,
+    }
+}
+
+/// Round to a multiple of `inc` at fraction position `k`. The scaled value is
+/// held in i128, which covers every roundingIncrement the spec allows against a
+/// realistic magnitude; anything wider falls back to plain rounding.
+fn round_to_increment(int_s: &str, frac_s: &str, k: i64, inc: i64, mode: &str) -> Option<(String, String)> {
+    let k = k.max(0) as usize;
+    let mut scaled = String::from(int_s);
+    let f: String = frac_s.chars().chain(std::iter::repeat('0')).take(k).collect();
+    scaled.push_str(&f);
+    let q: i128 = scaled.trim_start_matches('0').parse().unwrap_or(0);
+    let rest = &frac_s[k.min(frac_s.len())..];
+    let rest_nonzero = rest.bytes().any(|b| b != b'0');
+    let inc = inc as i128;
+    let lo = (q / inc) * inc;
+    // Distance from the lower multiple, in units of 1/2 the increment, using the
+    // dropped tail only to break an exact tie.
+    let off = q - lo;
+    let cmp = (off * 2).cmp(&inc);
+    let cmp = if cmp == std::cmp::Ordering::Equal && rest_nonzero {
+        std::cmp::Ordering::Greater
+    } else {
+        cmp
+    };
+    let nonzero = off != 0 || rest_nonzero;
+    let last_odd = (lo / inc) % 2 == 1;
+    let v = if round_up(mode, nonzero, cmp, last_odd) { lo + inc } else { lo };
+    let mut s = v.to_string();
+    while s.len() <= k {
+        s.insert(0, '0');
+    }
+    let (i, fr) = s.split_at(s.len() - k);
+    Some((i.to_string(), fr.to_string()))
+}
+
+/// Format a number for Intl.NumberFormat: ECMA-402 rounding (fraction digits,
+/// significant digits, rounding mode + increment, trailing-zero display) and
+/// sign display, then en-US decoration ("," grouping, "." decimal; percent
+/// multiplies by 100).
+pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
+    // The sign comes from the INPUT, so -0.0001 rounded to "0" still prints
+    // "-0" under signDisplay "auto"; only exceptZero/negative consult the
+    // ROUNDED magnitude (below).
+    let neg = n.is_sign_negative() && !n.is_nan();
+    let decorate = |body: String, neg: bool, zero: bool, nan: bool| -> String {
+        let sign = match p.sign_display {
+            "never" => "",
+            "always" => {
+                if neg { "-" } else { "+" }
+            }
+            "exceptZero" => {
+                if zero || nan {
+                    ""
+                } else if neg {
+                    "-"
+                } else {
+                    "+"
+                }
+            }
+            "negative" => {
+                if neg && !zero && !nan { "-" } else { "" }
+            }
+            _ => {
+                if neg { "-" } else { "" }
+            }
+        };
+        format!("{sign}{body}")
+    };
+    if n.is_nan() {
+        return decorate("NaN".to_string(), false, false, true);
+    }
     let mut x = n.abs();
-    if style == "percent" {
+    if p.style == "percent" {
         x *= 100.0;
     }
     if x.is_infinite() {
-        let mut s = "∞".to_string();
-        if style == "percent" {
-            s.push('%');
-        }
-        if neg {
-            s.insert(0, '-');
-        }
-        return s;
+        let body = if p.style == "percent" { "∞%".to_string() } else { "∞".to_string() };
+        return decorate(body, neg, false, false);
     }
-    let factor = 10f64.powi(max_frac.clamp(0, 100) as i32);
-    let rounded = (x * factor).round() / factor;
-    let s = format!("{:.*}", max_frac.clamp(0, 100) as usize, rounded);
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i.to_string(), f.to_string()),
-        None => (s.clone(), String::new()),
+    let mode = fold_rounding_mode(p.rounding_mode, neg);
+    let (int_s, frac_s) = exact_decimal(x);
+    // The fraction-digit and significant-digit targets are separate roundings;
+    // "morePrecision"/"lessPrecision" run both and pick between them, "auto"
+    // only ever has one configured.
+    let by_frac = p.max_frac.map(|k| {
+        if p.rounding_increment != 1 {
+            round_to_increment(&int_s, &frac_s, k, p.rounding_increment, mode)
+                .unwrap_or_else(|| round_decimal_at(&int_s, &frac_s, k, mode))
+        } else {
+            round_decimal_at(&int_s, &frac_s, k, mode)
+        }
+    });
+    let by_sig = p.max_sig.map(|sd| {
+        let k = sd - decimal_exponent(&int_s, &frac_s);
+        round_decimal_at(&int_s, &frac_s, k, mode)
+    });
+    // Digit-count of a candidate, used to pick the more/less precise one.
+    let precision = |v: &(String, String)| -> usize { v.1.trim_end_matches('0').len() };
+    let (mut ip, mut fp) = match (by_frac, by_sig) {
+        (Some(f), Some(s)) => {
+            if p.rounding_priority == "lessPrecision" {
+                if precision(&f) <= precision(&s) { f } else { s }
+            } else {
+                if precision(&f) >= precision(&s) { f } else { s }
+            }
+        }
+        (Some(f), None) => f,
+        (None, Some(s)) => s,
+        (None, None) => round_decimal_at(&int_s, &frac_s, 3, mode),
     };
-    let mut frac = frac_part;
-    while frac.len() as i64 > min_frac && frac.ends_with('0') {
-        frac.pop();
+    // Pad/strip the fraction to the configured minimum. Under significant-digit
+    // rounding the minimum comes from minimumSignificantDigits instead.
+    let min_frac = match (p.min_frac, p.min_sig) {
+        (Some(m), _) => m,
+        (None, Some(sd)) => (sd - decimal_exponent(&ip, &fp)).max(0),
+        (None, None) => 0,
+    };
+    while (fp.len() as i64) < min_frac {
+        fp.push('0');
     }
-    let mut int_digits = int_part;
-    while (int_digits.len() as i64) < min_int {
-        int_digits.insert(0, '0');
+    while fp.len() as i64 > min_frac && fp.ends_with('0') {
+        fp.pop();
     }
-    let grouped = if grouping && int_digits.len() > 3 {
-        let n = int_digits.len();
-        let first = match n % 3 {
+    // trailingZeroDisplay "stripIfInteger": drop the whole fraction when it is
+    // all zeros, overriding the minimum.
+    if p.trailing_zero_display == "stripIfInteger" && fp.bytes().all(|b| b == b'0') {
+        fp.clear();
+    }
+    while (ip.len() as i64) < p.min_int {
+        ip.insert(0, '0');
+    }
+    let is_zero = ip.bytes().all(|b| b == b'0') && fp.bytes().all(|b| b == b'0');
+    let grouped = if p.grouping && ip.len() > 3 {
+        let len = ip.len();
+        let first = match len % 3 {
             0 => 3,
             r => r,
         };
-        let mut out = String::from(&int_digits[..first]);
+        let mut out = String::from(&ip[..first]);
         let mut i = first;
-        while i < n {
+        while i < len {
             out.push(',');
-            out.push_str(&int_digits[i..i + 3]);
+            out.push_str(&ip[i..i + 3]);
             i += 3;
         }
         out
     } else {
-        int_digits
+        ip
     };
     let mut res = grouped;
-    if !frac.is_empty() {
+    if !fp.is_empty() {
         res.push('.');
-        res.push_str(&frac);
+        res.push_str(&fp);
     }
-    if style == "percent" {
+    if p.style == "percent" {
         res.push('%');
     }
-    if neg {
-        res.insert(0, '-');
-    }
-    res
+    decorate(res, neg, is_zero, false)
 }
 
 /// A short currency symbol for the common codes (en-US "symbol" display); unknown
@@ -712,20 +934,24 @@ pub(crate) fn format_relative_time_en(value: f64, unit: &str) -> String {
 
 /// Minimal en duration formatting: non-zero fields joined as "N unit, …".
 pub(crate) fn format_duration_en(d: &[i64; 10]) -> String {
-    const NAMES: [&str; 10] = [
-        "yr", "mth", "wk", "day", "hr", "min", "sec", "ms", "μs", "ns",
-    ];
     let parts: Vec<String> = d
         .iter()
         .enumerate()
         .filter(|(_, &v)| v != 0)
-        .map(|(i, &v)| format!("{v} {}", NAMES[i]))
+        .map(|(i, &v)| format!("{v} {}", duration_unit_label(i)))
         .collect();
     if parts.is_empty() {
         "0 sec".to_string()
     } else {
         parts.join(", ")
     }
+}
+
+/// The en "short"-style label of a Duration field, by DURATION_FIELDS index —
+/// shared by `format` and `formatToParts` so the two never drift apart.
+pub(crate) fn duration_unit_label(i: usize) -> &'static str {
+    const NAMES: [&str; 10] = ["yr", "mth", "wk", "day", "hr", "min", "sec", "ms", "μs", "ns"];
+    NAMES[i.min(9)]
 }
 
 /// Normalize a Temporal unit option: strip a trailing plural "s"; "auto"→`auto_to`.

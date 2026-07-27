@@ -29,6 +29,7 @@ impl<'a> FnCompiler<'a> {
             bigint_consts: Vec::new(),
             wtf8_consts: Vec::new(),
             scopes: vec![Vec::new()],
+            scope_lex_names: vec![HashSet::new()],
             next_reg: 0,
             max_reg: 0,
             reg_overflow: false,
@@ -227,8 +228,24 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn push_scope(&mut self) {
         self.scopes.push(Vec::new());
+        self.scope_lex_names.push(HashSet::new());
     }
+
+    /// Record the lexically-declared names of the block scope just opened, for
+    /// the position-sensitive Annex B B.3.3 blocker test (`block_fn_conflicts`).
+    /// Call right after `push_scope`, before compiling the block's contents.
+    pub(crate) fn note_block_lexicals(&mut self, stmts: &[ast::Stmt]) {
+        let mut names = HashSet::new();
+        for st in stmts {
+            super::helpers::add_block_lexicals(st, &mut names);
+        }
+        if let Some(top) = self.scope_lex_names.last_mut() {
+            top.extend(names);
+        }
+    }
+
     pub(crate) fn pop_scope(&mut self) {
+        self.scope_lex_names.pop();
         let scope = self.scopes.pop().unwrap();
         // Free the registers the scope's locals used (block-local reuse) —
         // and drop their per-register markings, or a later local reallocated
@@ -361,6 +378,48 @@ impl<'a> FnCompiler<'a> {
         Binding::Global(slot as u32)
     }
 
+    /// True when a plain reference to the enclosing class's own name would
+    /// resolve to its inner CLASS-NAME binding here — i.e. nothing nearer
+    /// shadows it. Mirrors the prefix of `resolve` (heritage class, then this
+    /// function's scopes, then the function-expression self-name) without its
+    /// upvalue-threading / global-minting side effects.
+    ///
+    /// A direct eval inherits the caller's lexical environment, so this is also
+    /// the answer for the eval'd code — but only the caller can compute it: an
+    /// INLINE static field initializer compiles in the enclosing function's
+    /// scope stack, where the dead `class C` local of that function sits right
+    /// next to the class binding and only `heritage_class` separates them.
+    pub(crate) fn class_inner_name_visible(&self) -> bool {
+        let Some(cid) = self.super_class else { return false };
+        let Some(name) = self
+            .cx
+            .class_names
+            .iter()
+            .rev()
+            .find(|(_, id)| *id == cid)
+            .map(|(n, _)| n.as_str())
+        else {
+            return false;
+        };
+        if self.heritage_class.as_ref().is_some_and(|(n, _)| n == name) {
+            return true;
+        }
+        !self.scopes.iter().any(|s| s.iter().any(|(n, _)| n == name))
+            && !self.self_name.as_ref().is_some_and(|(n, _)| n == name)
+    }
+
+    /// True when `name` is bound by a function ENCLOSING this one — a boxed
+    /// local of an outer frame, or something that frame itself captured. Read
+    /// straight off the enclosing snapshots, so unlike `resolve_upvalue` it
+    /// threads nothing and changes no bytecode. Used by `delete <identifier>`,
+    /// where a resolvable binding must answer `false`.
+    pub(crate) fn bound_in_enclosing(&self, name: &str) -> bool {
+        self.enclosing.iter().any(|enc| {
+            enc.cell_locals.iter().any(|(n, _)| n == name)
+                || enc.upvalues.borrow().iter().any(|(n, _)| n == name)
+        })
+    }
+
     /// Like `resolve`, but NON-creating: returns `None` for a name that has no
     /// existing binding (rather than minting a fresh global slot). Used by
     /// `delete <identifier>` to tell a resolvable binding (→ `false`) from an
@@ -422,6 +481,16 @@ impl<'a> FnCompiler<'a> {
         self.scopes[1..n - 1]
             .iter()
             .any(|s| s.iter().any(|(nm, _)| nm == name))
+            || self.enclosing_block_lexical(name)
+    }
+
+    /// `name` is lexically declared by an ENCLOSING block, wherever in that
+    /// block it is written. `scopes` only lists bindings already compiled, so a
+    /// `let` below a nested block is invisible to the walks above — see
+    /// `scope_lex_names`.
+    fn enclosing_block_lexical(&self, name: &str) -> bool {
+        let n = self.scope_lex_names.len();
+        n >= 2 && self.scope_lex_names[1..n - 1].iter().any(|s| s.contains(name))
     }
 
     /// Like `block_fn_conflicts` but for the B.3.3 VAR-SYNC applicability
@@ -443,7 +512,7 @@ impl<'a> FnCompiler<'a> {
         }
         self.scopes[1..n - 1].iter().any(|s| {
             s.iter().any(|(nm, r)| nm == name && !self.catch_param_regs.contains(r))
-        })
+        }) || self.enclosing_block_lexical(name)
     }
 
     pub(crate) fn add_const(&mut self, v: Value) -> u32 {

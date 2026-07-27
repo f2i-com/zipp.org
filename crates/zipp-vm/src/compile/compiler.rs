@@ -332,9 +332,13 @@ impl Compiler {
         // the caller's home class as the u32::MAX sentinel (arrows inherit it;
         // plain nested functions reset super_class as usual).
         if is_script {
-            if let Some(stat) = fc.cx.eval_inherit_super {
+            if let Some(ctx) = fc.cx.eval_inherit_super.clone() {
                 fc.super_class = Some(u32::MAX);
-                fc.super_static = stat;
+                fc.super_static = ctx.static_ctx;
+                // PerformEval keeps the caller's [[ThisBindingStatus]], so a
+                // direct eval in a DERIVED constructor may call `super()` —
+                // rejected outright while this flag defaulted to false.
+                fc.derived_class = ctx.derived_ctor;
             }
         }
         // An object-literal concise method / accessor compiles with object-method
@@ -432,8 +436,12 @@ impl Compiler {
         // materialises the function object at startup via `name_global`).
         // Nested names become locals, populated by a `MakeFunc` at the point
         // `func_decl` reaches them.
+        // A LABELLED declaration (`L: function f(){}`) is a TopLevelVarScoped-
+        // Declaration of the body too, so the label chain is unwrapped here as
+        // well — otherwise the name had no binding and `func_decl` emitted
+        // nothing at all.
         for s in body {
-            if let ast::Stmt::FnDecl(f) = s {
+            if let Some(f) = labelled_fn_decl(s) {
                 if let Some(id) = &f.name {
                     if is_script && fc.cx.script_binds_globals {
                         fc.cx.global_slot(id);
@@ -483,12 +491,12 @@ impl Compiler {
                             protect.insert(id.to_string());
                         }
                     }
-                    ast::Stmt::FnDecl(f) => {
-                        if let Some(id) = &f.name {
+                    // (Labelled top-level declarations too — see the hoist above.)
+                    _ => {
+                        if let Some(id) = labelled_fn_decl(s).and_then(|f| f.name.as_ref()) {
                             blockers.insert(id.to_string());
                         }
                     }
-                    _ => {}
                 }
             }
             fc.protect_names = protect;
@@ -501,7 +509,7 @@ impl Compiler {
                 let mut script_blockers = blockers.clone();
                 let mut fn_names = std::collections::HashSet::new();
                 for s in body {
-                    if let ast::Stmt::FnDecl(f) = s {
+                    if let Some(f) = labelled_fn_decl(s) {
                         if let Some(id) = &f.name {
                             script_blockers.remove(&**id);
                             fn_names.insert(id.to_string());
@@ -906,7 +914,13 @@ impl Compiler {
             is_async,
             non_constructable: false, // a plain function/expression IS constructable
             lexical_this: false,
-            super_static: false, // a plain function is not a static class element
+            // A plain function is not a static class element, so this stays
+            // false for every ordinary body — but a direct-eval ROOT inherits
+            // the caller's static-ness above, and the super ops read it from
+            // the PROTO, not from their operands. Hard-coding false here made
+            // `eval("super.m()")` inside a static method walk the instance
+            // chain (`super.m is not a function`).
+            super_static: fc.super_static,
             is_strict,
             // IsSimpleParameterList is decided by the parser and carried on
             // `Params`, so it is read, not recomputed.

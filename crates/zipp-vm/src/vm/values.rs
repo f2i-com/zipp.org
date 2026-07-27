@@ -1003,7 +1003,22 @@ impl<'p> Vm<'p> {
         }
         let idx = val.heap_index();
         match ctor {
-            C::Array => matches!(self.heap.get(idx), HeapObj::Array(_)),
+            C::Array => {
+                if !matches!(self.heap.get(idx), HeapObj::Array(_)) {
+                    false
+                } else if self.arr_proto == 0 || !self.proto_of.contains_key(&idx) {
+                    // No re-linked [[Prototype]] → the structural answer is the
+                    // chain answer, and this is every array on the hot path.
+                    true
+                } else {
+                    // A re-linked array (`class X extends Array` instance, an
+                    // ArrayCreate performed by ANOTHER realm's built-in) is only
+                    // `instanceof Array` when THIS realm's %Array.prototype% is
+                    // still in its chain: `other.Array.prototype.toSorted.call(a)`
+                    // must answer false here and true for `other.Array`.
+                    self.is_prototype_of(Value::heap(self.arr_proto), val)
+                }
+            }
             // Spec instanceof: is %Function.prototype% in `val`'s prototype chain?
             // Catches plain functions/closures AND bound functions, natives, and
             // the builtin constructor objects (Array/Object/Map/…) — all of which
@@ -1657,8 +1672,18 @@ impl<'p> Vm<'p> {
         if let Some(b) = exact_bytes {
             self.regexp_exact_source.insert(idx, b);
         }
+        // RegExpAlloc is OrdinaryCreateFromConstructor(%RegExp%, "%RegExp.prototype%"),
+        // and %RegExp% is the CURRENT Realm Record's — so a literal evaluated by
+        // createRealm-child code (`other.eval("/foo/")`) inherits the CHILD's
+        // %RegExp.prototype%. Without it `re.constructor === RegExp` in the main
+        // realm and `RegExp(re)` hands the foreign object straight back (ctor step
+        // 2.b). The native-side image comes first (a realm-COPIED @@split/@@matchAll
+        // building a species clone is the current realm even with no child frame).
         if self.regexp_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.regexp_proto));
+            let home = self.native_home(self.regexp_proto);
+            let proto =
+                if home != self.regexp_proto { home } else { self.active_realm_proto(self.regexp_proto) };
+            self.proto_of.insert(idx, Value::heap(proto));
         }
         Ok(Value::heap(idx))
     }

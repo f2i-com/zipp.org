@@ -15,6 +15,12 @@ use crate::value::Value;
 /// A register index within a function's frame.
 pub type Reg = u16;
 
+/// `ClassAddMember.kind` flag: leave the ToPropertyKey'd key back in the `key`
+/// register. An auto-accessor installs a get/set PAIR from one
+/// ClassElementName, so the second instruction must reuse the first's coerced
+/// key — re-coercing would run a `toString`/`@@toPrimitive` key a second time.
+pub const KEY_WRITEBACK: u8 = 0x80;
+
 /// One bytecode instruction. Kept as a fieldful enum (not packed bytes) for v1:
 /// the dispatch cost of a wide enum is negligible next to correctness clarity,
 /// and the JIT will consume this same structured form rather than re-decoding
@@ -276,6 +282,17 @@ pub enum Instr {
     /// throw/return out of a `for-of` body closes the iterator while preserving the
     /// original abrupt completion (the spec's `Completion(...)` discard of the close result).
     IterCloseQuiet { iter: Reg },
+    /// The body of a `for-of`'s close handler, keyed on the completion record the
+    /// finally machinery deposited in `kind_reg`: a THROW completion (2) closes
+    /// quietly (the original error wins), a RETURN completion (1) closes for real
+    /// so a throwing `return()` replaces the return value, and a normal (0) or
+    /// break/continue (3) completion closes NOTHING — the loop's own break block
+    /// already does that, and a `continue` must leave the iterator open. Running
+    /// the close from a `finally` rather than inline before `Return` is what puts
+    /// it AFTER the body's own handlers (7.4.11 runs it as the for-of statement's
+    /// completion, outside any `try` in the body) and what makes `gen.return()` at
+    /// a `yield` inside the loop close the loop's iterator at all.
+    IterCloseFinally { iter: Reg, kind_reg: Reg },
     /// Resolve `src`'s ASYNC iterator into `dst`: `src[@@asyncIterator]()` if
     /// present, else `src[@@iterator]()` (a sync iterable used by `for await`),
     /// else pass `src` through (async generators / built-ins iterate directly).
@@ -710,7 +727,14 @@ pub enum Instr {
     /// runtime identity check finds `eval` REBOUND (an ordinary call of that
     /// value, not a direct eval), the frame is reused like `TailCall`
     /// (tco-non-eval-global: `eval = f; return eval(n-1)` must be a PTC).
-    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool, site: u16, tail: bool },
+    /// `derived_ctor`: the call site is inside a DERIVED-class constructor, so
+    /// `super(...)` in the eval'd code is legal (PerformEval inherits the
+    /// caller's this-binding status along with its lexical environment).
+    /// `class_name_ok`: nothing at this site shadows `home_class`'s inner NAME
+    /// binding, so the eval'd code sees it too. Decided by the compiler because
+    /// only it knows the caller's scope chain — a method-body `let C` shadows
+    /// the class name, an enclosing function's `C` does not.
+    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, derived_ctor: bool, class_name_ok: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool, site: u16, tail: bool },
 
     /// CreateDataPropertyOrThrow for a class FIELD initializer: an own
     /// {writable, enumerable, configurable} data property on the receiver —
@@ -809,7 +833,8 @@ pub enum Instr {
     /// Install a method on a class value at runtime under a COMPUTED key
     /// (`class C { [expr]() {} }`). `class` holds the class value, `key` the
     /// evaluated key, `func` the method's function id, `kind` selects 0=method /
-    /// 1=getter / 2=setter / 3=static method.
+    /// 1=getter / 2=setter / 3=static method / 4=static getter / 5=static
+    /// setter, optionally OR'd with [`KEY_WRITEBACK`].
     ClassAddMember { class: Reg, key: Reg, func: u32, kind: u8 },
     /// `new Date(...)` → a Date. 0 args = now; 1 number = epoch ms; 1 string =
     /// parsed; ≥2 = (year, month0, day, h, m, s, ms) interpreted as UTC.

@@ -577,11 +577,27 @@ pub const LOCALE_ACCESSORS: &[&str] = &[
     "language", "script", "region", "baseName", "calendar", "caseFirst", "collation",
     "hourCycle", "numeric", "numberingSystem",
 ];
+/// The SetFunctionName ("get <prop>") form of each LOCALE_ACCESSORS entry — an
+/// accessor's own `name` is the prefixed string, and `static_name_length` must
+/// hand back a `&'static str`, so the pairs are spelled out rather than formatted.
+pub const LOCALE_ACCESSOR_GET_NAMES: &[&str] = &[
+    "get language", "get script", "get region", "get baseName", "get calendar",
+    "get caseFirst", "get collation", "get hourCycle", "get numeric",
+    "get numberingSystem",
+];
 /// `format`/`compare` bound-function getters (spec: these are accessors that
 /// return a function bound to the instance).
 pub const INTL_NF_FORMAT_GET: u16 = 592;
 pub const INTL_DTF_FORMAT_GET: u16 = 593;
 pub const INTL_COLLATOR_COMPARE_GET: u16 = 594;
+/// The range-formatting halves of NumberFormat/DateTimeFormat, and the parts
+/// forms that were missing entirely. Numbered above the allocated block (595..)
+/// so the existing Intl ids keep their values.
+pub const INTL_NF_FORMAT_RANGE: u16 = 918;
+pub const INTL_NF_FORMAT_RANGE_TO_PARTS: u16 = 919;
+pub const INTL_DTF_FORMAT_RANGE: u16 = 920;
+pub const INTL_DTF_FORMAT_RANGE_TO_PARTS: u16 = 921;
+pub const INTL_DURATION_FORMAT_TO_PARTS: u16 = 922;
 /// Intl service kinds (index into VM.intl_ctors / intl_protos).
 pub const INTL_NUMBERFORMAT: u8 = 0;
 pub const INTL_DATETIMEFORMAT: u8 = 1;
@@ -867,6 +883,10 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     if id == ARRAYBUFFER_TRANSFER_FIXED {
         return Some(("transferToFixedLength", 0));
     }
+    // Intl.Locale.prototype subtag getters — accessor functions named "get <prop>".
+    if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16).contains(&id) {
+        return Some((LOCALE_ACCESSOR_GET_NAMES[(id - INTL_LOCALE_GET_BASE) as usize], 0));
+    }
     // Temporal.<Type>.prototype method natives: name + length as own properties.
     for (base, methods) in [
         (TEMPORAL_M_BASE, TEMPORAL_DURATION_METHODS),
@@ -1128,6 +1148,40 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         INST_FROM_EPOCH_NS => ("fromEpochNanoseconds", 1),
         INST_FROM_EPOCH_SEC => ("fromEpochSeconds", 1),
         INST_FROM_EPOCH_US => ("fromEpochMicroseconds", 1),
+        // ECMA-402 service methods. Every one is a built-in function, so it needs
+        // the own `name`/`length` data properties `propertyHelper.verifyProperty`
+        // asserts — without these the whole intl402 `name.js`/`length.js` family
+        // fails with "name should be an own property".
+        INTL_GET_CANONICAL_LOCALES => ("getCanonicalLocales", 1),
+        INTL_SUPPORTED_VALUES_OF => ("supportedValuesOf", 1),
+        INTL_RESOLVED_OPTIONS => ("resolvedOptions", 0),
+        INTL_SUPPORTED_LOCALES_OF => ("supportedLocalesOf", 1),
+        // The `format`/`compare` TARGETS are never exposed directly: the accessor
+        // hands out a Bound wrapper whose name is "" (handled in
+        // callable_name_length), so these entries only cover a direct .call().
+        INTL_NF_FORMAT | INTL_DTF_FORMAT => ("", 1),
+        INTL_COLLATOR_COMPARE => ("", 2),
+        INTL_NF_FORMAT_TO_PARTS
+        | INTL_DTF_FORMAT_TO_PARTS
+        | INTL_LIST_FORMAT_TO_PARTS
+        | INTL_DURATION_FORMAT_TO_PARTS => ("formatToParts", 1),
+        INTL_NF_FORMAT_RANGE | INTL_DTF_FORMAT_RANGE => ("formatRange", 2),
+        INTL_NF_FORMAT_RANGE_TO_PARTS | INTL_DTF_FORMAT_RANGE_TO_PARTS => {
+            ("formatRangeToParts", 2)
+        }
+        INTL_PLURAL_SELECT => ("select", 1),
+        INTL_PLURAL_SELECT_RANGE => ("selectRange", 2),
+        INTL_LIST_FORMAT | INTL_DURATION_FORMAT => ("format", 1),
+        // RelativeTimeFormat takes (value, unit): length 2, not 1.
+        INTL_RTF_FORMAT => ("format", 2),
+        INTL_RTF_FORMAT_TO_PARTS => ("formatToParts", 2),
+        INTL_DISPLAYNAMES_OF => ("of", 1),
+        INTL_LOCALE_TOSTRING => ("toString", 0),
+        INTL_LOCALE_MAXIMIZE => ("maximize", 0),
+        INTL_LOCALE_MINIMIZE => ("minimize", 0),
+        INTL_SEGMENTER_SEGMENT => ("segment", 1),
+        INTL_NF_FORMAT_GET | INTL_DTF_FORMAT_GET => ("get format", 0),
+        INTL_COLLATOR_COMPARE_GET => ("get compare", 0),
         _ => return None,
     })
 }
