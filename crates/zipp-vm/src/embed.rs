@@ -302,6 +302,28 @@ impl ScriptState {
         }
     }
 
+    /// Cap the approximate resident heap a script may reach.
+    ///
+    /// Enforced against the same figure [`Self::heap_bytes`] reports, checked
+    /// on the schedule the abort flag uses — every few thousand instructions in
+    /// the interpreter, and once per entry into compiled code, which is the
+    /// only place native execution can be stopped from. A script therefore
+    /// overshoots the ceiling by a bounded amount before it is stopped; set the
+    /// limit with that headroom in mind rather than at the exact figure a host
+    /// cannot afford.
+    ///
+    /// Exceeding it raises a catchable `RangeError`, like the step budget. Call
+    /// after [`Self::set_limits`], which is what allocates the recorder this
+    /// lives in; without it this is a no-op. `usize::MAX` means unlimited.
+    #[cfg(feature = "instrument")]
+    pub fn set_heap_limit(&mut self, bytes: usize) {
+        if let Some(vm) = self.vm.as_mut() {
+            if let Some(rec) = vm.instr_rec.as_mut() {
+                rec.heap_limit = bytes;
+            }
+        }
+    }
+
     /// Approximate resident heap, in bytes.
     ///
     /// Slot count times the size of a heap object. Slots are never returned to

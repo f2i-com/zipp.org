@@ -126,6 +126,8 @@ pub struct TraceStep {
 /// cannot `catch` its way past its own budget.
 pub(crate) const BUDGET_MSG: &str = "RangeError: script exceeded its instruction budget";
 pub(crate) const ABORT_MSG: &str = "RangeError: script execution was aborted by the host";
+/// Raised when a script exceeds the heap ceiling its host set.
+pub(crate) const MEMORY_MSG: &str = "RangeError: script exceeded its memory budget";
 
 /// A row whose operands have been sampled but whose result has not: the
 /// destination register is not written until the instruction runs, so the row is
@@ -186,6 +188,13 @@ pub(crate) struct Recorder {
     pub(crate) remaining: i64,
     /// Set by another thread to stop a running script.
     pub(crate) abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Approximate heap ceiling in bytes; `usize::MAX` means unlimited.
+    ///
+    /// Checked on the same schedule as the abort flag, for the same reason:
+    /// a script that allocates without bound does so over many instructions,
+    /// so noticing a few thousand instructions late costs a bounded overshoot
+    /// and keeps the per-instruction path free of an extra memory read.
+    pub(crate) heap_limit: usize,
     steps: Vec<TraceStep>,
     /// Whether to record rows at all — metering works without tracing.
     tracing: bool,
@@ -205,6 +214,7 @@ impl Recorder {
         Self {
             remaining: i64::MAX,
             abort: None,
+            heap_limit: usize::MAX,
             steps: Vec::new(),
             tracing: false,
             max_steps: usize::MAX,
@@ -316,6 +326,30 @@ impl super::Vm<'_> {
                 return 0;
             }
         }
+        // The heap ceiling needs checking here for the same reason: compiled
+        // code never reaches `instrument_step`, so a native loop that allocates
+        // would run to the end of its lent chunk unexamined.
+        let ceiling = rec.heap_limit;
+        if ceiling != usize::MAX {
+            if self.heap_bytes() > ceiling {
+                // Lend nothing, so control returns to the interpreter, and
+                // arrange for its next instruction to land on a poll — the
+                // error itself is raised there, where there is a `Tick` to
+                // return it in. Without this nudge the script could run
+                // another 4095 instructions before anyone looked.
+                if let Some(rec) = self.instr_rec.as_mut() {
+                    rec.ticks = u64::MAX;
+                }
+                self.jit_steps = 0;
+                return 0;
+            }
+            // `heap_bytes` took `&self`, so the recorder has to be re-borrowed.
+            let Some(rec) = self.instr_rec.as_mut() else { return 0 };
+            let lend = rec.remaining.min(NATIVE_CHUNK).max(0);
+            rec.remaining -= lend;
+            self.jit_steps = lend;
+            return lend;
+        }
         let lend = rec.remaining.min(NATIVE_CHUNK).max(0);
         rec.remaining -= lend;
         self.jit_steps = lend;
@@ -389,14 +423,28 @@ impl super::Vm<'_> {
             }
             rec.remaining -= 1;
         }
+        // Heap ceiling rides the abort poll's schedule. Measuring it needs
+        // `&self.heap`, which cannot be borrowed while `rec` is, so the limit
+        // comes out here and the comparison happens once the borrow ends.
+        let mut ceiling = usize::MAX;
         if rec.ticks & ABORT_CHECK_MASK == 0 {
             if let Some(flag) = rec.abort.as_ref() {
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(ABORT_MSG);
                 }
             }
+            ceiling = rec.heap_limit;
         }
-        if !rec.tracing {
+        let tracing = rec.tracing;
+
+        if ceiling != usize::MAX && self.heap_bytes() > ceiling {
+            return Err(MEMORY_MSG);
+        }
+
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return Ok(());
+        };
+        if !tracing {
             return Ok(());
         }
         if rec.steps.len() >= rec.max_steps {

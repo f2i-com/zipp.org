@@ -406,3 +406,81 @@ fn an_uninstrumented_vm_is_unbounded() {
         embed::JsValue::Number(44_999_850_000.0)
     );
 }
+
+/// A runaway allocation is stopped, and the error says why.
+///
+/// The step budget alone does not bound memory: `a.push({})` in a loop is a
+/// handful of instructions per object, so a script can be well inside its
+/// instruction budget and still take the host's heap with it.
+#[test]
+fn a_script_that_allocates_without_bound_is_stopped() {
+    let mut st = embed::compile_script("var x = 0;").expect("compiles");
+    st.run_init().expect("runs");
+    st.set_limits(50_000_000, None);
+    let baseline = st.heap_bytes();
+    st.set_heap_limit(baseline + 400_000);
+
+    let err = st
+        .eval_in_context("(function(){var a=[];for(var i=0;i<1000000;i++)a.push({n:i});return a.length})()")
+        .expect_err("must not be allowed to finish");
+    assert!(err.contains("memory budget"), "unexpected error: {err}");
+
+    // Stopped for memory, not for running out of instructions.
+    assert!(
+        st.steps_remaining() > 0,
+        "the step budget should be untouched — this was a memory stop"
+    );
+}
+
+/// The ceiling is a ceiling, not a straitjacket: a script that stays under it
+/// runs to completion untouched.
+#[test]
+fn a_script_within_its_heap_budget_is_left_alone() {
+    let mut st = embed::compile_script("var x = 0;").expect("compiles");
+    st.run_init().expect("runs");
+    st.set_limits(50_000_000, None);
+    st.set_heap_limit(st.heap_bytes() + 4_000_000);
+
+    assert_eq!(
+        st.eval_in_context("(function(){var a=[];for(var i=0;i<2000;i++)a.push({n:i});return a.length})()")
+            .unwrap(),
+        embed::JsValue::Number(2000.0)
+    );
+}
+
+/// Overshoot is bounded. The check rides the abort poll rather than running per
+/// instruction, so a script passes the line before it is stopped — but by a
+/// margin proportional to the poll interval, not an unbounded one.
+#[test]
+fn the_overshoot_past_the_ceiling_is_bounded() {
+    let mut st = embed::compile_script("var x = 0;").expect("compiles");
+    st.run_init().expect("runs");
+    st.set_limits(50_000_000, None);
+    let ceiling = st.heap_bytes() + 200_000;
+    st.set_heap_limit(ceiling);
+
+    let _ = st.eval_in_context(
+        "(function(){var a=[];for(var i=0;i<1000000;i++)a.push({n:i});return a.length})()",
+    );
+
+    let overshoot = st.heap_bytes().saturating_sub(ceiling);
+    assert!(
+        overshoot < 4_000_000,
+        "overshot the ceiling by {overshoot} bytes, which is not a bounded margin"
+    );
+}
+
+/// No limit set means no limit, and in particular no cost: the default recorder
+/// leaves the ceiling at `usize::MAX`, which the hot path tests against once.
+#[test]
+fn no_heap_limit_means_no_heap_limit() {
+    let mut st = embed::compile_script("var x = 0;").expect("compiles");
+    st.run_init().expect("runs");
+    st.set_limits(50_000_000, None);
+
+    assert_eq!(
+        st.eval_in_context("(function(){var a=[];for(var i=0;i<50000;i++)a.push({n:i});return a.length})()")
+            .unwrap(),
+        embed::JsValue::Number(50000.0)
+    );
+}
