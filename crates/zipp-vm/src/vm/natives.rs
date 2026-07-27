@@ -556,7 +556,15 @@ impl<'p> Vm<'p> {
         self.realm_fns.insert(script_idx, (g_idx, 1));
         realm.define("evalScript", Value::heap(script_idx), PropAttr::data());
         realm.define("global", Value::heap(g_idx), data);
-        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(realm))))
+        let realm_val = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(realm))));
+        // INTERPRETING.md requires the child realm to carry `$262` on its OWN
+        // global, not merely for the parent to receive it as the return value —
+        // a test that does `$262.createRealm().global.$262.detachArrayBuffer(…)`
+        // is exercising the child's host hooks, and saw `undefined`.
+        if let HeapObj::Object(gm) = self.heap.get_mut(g_idx) {
+            gm.define("$262", realm_val, PropAttr::data());
+        }
+        realm_val
     }
 
     /// The GLOBAL object of createRealm child `r` (None for the main realm or a

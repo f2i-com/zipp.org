@@ -1802,10 +1802,18 @@ where
                         // Found a high surrogate. Try to parse a low surrogate next
                         // to see if we can rebuild the original `char`
 
+                        // Snapshot BEFORE consuming the escape, not after. The
+                        // restore below has to undo the WHOLE failed trail-
+                        // surrogate attempt; snapshotting after the two-character
+                        // escape prefix was eaten left the parser resuming
+                        // mid-escape. A braced trail restarted at `{DC38}+` and
+                        // reported "Invalid quantifier"; a non-surrogate trail
+                        // restarted at `3042*` and produced four literal digit
+                        // atoms instead of one character.
+                        orig_input = self.input.clone();
                         if !self.try_consume_str("\\u") {
                             return Some(u as u32);
                         }
-                        orig_input = self.input.clone();
 
                         // A poor man's try block to handle the backtracking
                         // in a single place instead of every time we want to return.
