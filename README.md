@@ -30,26 +30,48 @@ wasm32 are built and tested.
 Both figures are measured on this repo, not estimated. Neither is finished —
 they are the current state.
 
-**Conformance — 99.2% of test262**, 95,077 of 95,848 required executions
+**Conformance — 99.71% of test262**, 95,574 of 95,848 required executions
 (ECMA-262 + `staging`, run in both sloppy and strict mode as `INTERPRETING.md`
 requires). Both tiers produce a **byte-identical** failure set, which is the
 cheapest evidence that a JIT change has not quietly diverged:
 
 | slice | executions | pass |
 |---|---|---|
-| ECMA-262 + staging, both modes | 95,848 | 95,077 (99.2%) |
-| intl402 (opt-in, `--include-intl402`) | 3,341 | 563 (16.9%) |
+| ECMA-262 + staging, both modes | 95,848 | 95,574 (99.71%) |
+| intl402 (opt-in, `--include-intl402`) | 6,682 | 4,250 (63.6%) |
 
 That is up from 96.97% under `oxc_parser`, and the increase is the whole reason
-the engine grew its own front end. 771 executions still fail, across 500
-distinct files. The parse-phase negatives that used to dominate are now a
-minority: **80 files**, down from 607, after the static-semantics work described
-below. The largest remaining single item is deliberate — 20 executions want
-top-level `return` in a Script to be a SyntaxError, and `zipp js` allows it
-because node wraps a `.js` file in a function and real packages rely on it.
+the engine grew its own front end.
 
-The dominant intl402 cause is unrelated: `Intl.DateTimeFormat` cannot be
-constructed at all (`vm/intl.rs:436`).
+274 executions still fail. The two largest items are known and bounded:
+
+* **Decorators (~34).** Not implemented, and `@dec` is an honest SyntaxError
+  rather than a parser that accepts the syntax and silently ignores it. The
+  runtime is the blocker, not the grammar: a decorator context object needs
+  `addInitializer` and `access.{has,get,set}` as callable values carrying
+  state, and this engine has no generic native-closure — every stateful native
+  is its own `HeapObj` variant, with ~18 touch points where omitting one is a
+  wrong answer rather than a compile error. Auto-accessors (`accessor x = v`),
+  which share the cluster, *are* implemented.
+* **Annex B block functions named `arguments` (2).** Left failing on purpose.
+  B.3.2.4 step 1.a.ii's `parameterNames does not contain F` condition gates the
+  whole step and FunctionDeclarationInstantiation puts `"arguments"` in
+  parameterNames, so zipp is correct here and node is not. Matching node would
+  mean becoming non-conformant.
+
+`zipp js` parses the CommonJS-shaped script by default — top-level `return` is
+legal, and an ESM-shaped `.js` falls back to the Module goal — because node
+wraps a `.js` file in a function and real packages rely on both. Pass
+`--script-goal` for the pure Script goal, which is what the test262 runner uses.
+
+**intl402** is mostly a Temporal calendar suite in disguise: before non-ISO
+calendars existed, 79% of its failures were one defect — every calendar but
+`iso8601` was rejected. Nine arithmetic calendars now exist (gregory, buddhist,
+roc, japanese, coptic, ethiopic, ethioaa, islamic-civil, islamic-tbla), all
+closed-form, no CLDR data. `chinese`, `dangi` and `hebrew` still raise
+RangeError rather than approximating, and `islamic-umalqura` needs a ~1,500
+entry month-length table. Formatting output, collation order and plural
+categories need real locale data the engine does not carry.
 
 `tools/test262-expected-failures.txt` is the checked-in baseline, so a
 regression is a diff rather than a remembered number. Run both tiers — a JIT
