@@ -472,6 +472,8 @@ impl<'p> Vm<'p> {
                 self.fn_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
                     || self.callable_has_intrinsic(obj, key)
                     || (key == "prototype" && self.callable_has_prototype(obj))
+                    // A legacy sloppy function OWNS `caller`/`arguments`.
+                    || self.fn_has_legacy_caller_prop(obj.heap_index(), key)
             }
             // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*, …)
             // keep their named own props in the arr_props side table; a boxed String

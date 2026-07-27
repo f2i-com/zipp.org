@@ -515,6 +515,10 @@ impl<'p> Vm<'p> {
         }
         // The eval frame's new.target is the CALLER's (consumed at frame setup).
         self.pending_new_target = caller_new_target;
+        // Mark the frame about to be pushed as an EVAL frame — the legacy
+        // `f.caller` walk steps past it so an eval is transparent to the caller
+        // chain (function-caller-skips-eval-frames.js).
+        self.pending_eval_frame = true;
         let this = this_override.unwrap_or_else(|| {
             if self.global_this != 0 {
                 Value::heap(self.global_this)

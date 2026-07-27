@@ -695,7 +695,8 @@ impl<'a> FnCompiler<'a> {
             // globals): a destructured name must not leak past the catch nor
             // hoist a same-named block function to a global (B.3.5 skip).
             self.pattern_block_local = true;
-            let r = self.declare_pattern(pat).and_then(|_| self.extract_pattern(pat, e_reg));
+            let r =
+                self.declare_pattern(pat, false).and_then(|_| self.extract_pattern(pat, e_reg));
             self.pattern_block_local = false;
             r?;
         }
@@ -952,6 +953,10 @@ impl<'a> FnCompiler<'a> {
         // The loop binding: a destructuring pattern's leaves, an assignment to an
         // existing target, or a single (possibly cell-boxed) declared variable.
         let head_lexical = matches!(left, ast::ForTarget::Var(d) if d.kind.is_lexical());
+        let head_const = matches!(left, ast::ForTarget::Var(d) if matches!(
+            d.kind,
+            ast::VarKind::Const | ast::VarKind::Using | ast::VarKind::AwaitUsing
+        ));
         // A `var` head whose binding is NOT a plain current-function register
         // (catch-param cell / global slot / upvalue): per-iteration writes go
         // through `store_binding` — the loop creates NO binding of its own
@@ -960,9 +965,10 @@ impl<'a> FnCompiler<'a> {
         let (var_reg, var_is_cell) = match (pattern, assign_tgt) {
             (Some(p), _) => {
                 // A `let`/`const` head pattern binds HEAD-SCOPE locals (a
-                // script-level `var` pattern still binds globals).
+                // script-level `var` pattern still binds globals); a `var` head
+                // pattern binds nothing — it reuses the hoisted var bindings.
                 self.pattern_block_local = head_lexical;
-                let r = self.declare_pattern(p);
+                let r = self.declare_pattern(p, !head_lexical);
                 self.pattern_block_local = false;
                 r?;
                 (0, false)
@@ -1097,26 +1103,28 @@ impl<'a> FnCompiler<'a> {
             // new cell rather than nesting the old one), then the extraction
             // CellSets this iteration's values into it.
             if head_lexical {
-                let mut names = std::collections::HashSet::new();
-                capture::collect_pattern_names(p, &mut names);
-                // Sorted: this loop EMITS, so raw HashSet order would permute
-                // the instruction stream even though the registers already exist.
-                for n in &crate::compile::helpers::sorted_name_vec(&names) {
-                    let found = self
-                        .scopes
-                        .iter()
-                        .flatten()
-                        .find(|(nm, _)| nm == n)
-                        .map(|(_, r)| *r);
-                    if let Some(r) = found {
-                        if self.cell_regs.contains(&r) {
-                            self.emit(Instr::LoadUndefined { dst: r });
-                            self.emit(Instr::MakeCell { reg: r });
-                        }
+                for r in self.pattern_leaf_regs(p) {
+                    if self.cell_regs.contains(&r) {
+                        self.emit(Instr::LoadUndefined { dst: r });
+                        self.emit(Instr::MakeCell { reg: r });
                     }
                 }
             }
             self.extract_pattern(p, elem)?;
+            // A `const` head PATTERN's leaves are immutable within the iteration,
+            // exactly like the simple-identifier head above — but marked only
+            // AFTER the extraction, whose per-iteration stores go through
+            // `store_binding` and would otherwise throw on the initialization.
+            if head_const {
+                for r in self.pattern_leaf_regs(p) {
+                    self.const_regs.insert(r);
+                    // The fresh per-iteration cell is re-tagged each turn so a
+                    // closure created in the body can't write through it.
+                    if self.cell_regs.contains(&r) {
+                        self.emit(Instr::MarkCellConst { reg: r });
+                    }
+                }
+            }
         } else if let Some(tgt) = assign_tgt {
             self.assign_target(tgt, elem)?;
         } else if let Some(b) = &var_binding {
@@ -1129,6 +1137,9 @@ impl<'a> FnCompiler<'a> {
             // the body captures THIS element, not the last one (for-of let).
             self.emit(Instr::Move { dst: var_reg, src: elem });
             self.emit(Instr::MakeCell { reg: var_reg });
+            if head_const {
+                self.emit(Instr::MarkCellConst { reg: var_reg });
+            }
         }
         self.next_reg = save; // reclaim done + elem temps
 
@@ -1323,6 +1334,10 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
         let head_lexical = matches!(left, ast::ForTarget::Var(d) if d.kind.is_lexical());
+        let head_const = matches!(left, ast::ForTarget::Var(d) if matches!(
+            d.kind,
+            ast::VarKind::Const | ast::VarKind::Using | ast::VarKind::AwaitUsing
+        ));
         // A `var` head whose binding is NOT a plain current-function register —
         // a shadowing catch parameter cell, a global slot, an upvalue: the
         // per-iteration write goes through `store_binding` (the loop creates NO
@@ -1330,8 +1345,10 @@ impl<'a> FnCompiler<'a> {
         let mut var_binding: Option<Binding> = None;
         let (var_reg, var_is_cell) = match (pattern, assign_tgt) {
             (Some(p), _) => {
+                // As in for-of: a `var` head pattern reuses the hoisted var
+                // bindings rather than declaring loop-local shadows.
                 self.pattern_block_local = head_lexical;
-                let r = self.declare_pattern(p);
+                let r = self.declare_pattern(p, !head_lexical);
                 self.pattern_block_local = false;
                 r?;
                 (0, false)
@@ -1396,24 +1413,24 @@ impl<'a> FnCompiler<'a> {
         self.next_reg -= 1;
         if let Some(p) = pattern {
             if head_lexical {
-                let mut names = std::collections::HashSet::new();
-                capture::collect_pattern_names(p, &mut names);
-                for n in &names {
-                    let found = self
-                        .scopes
-                        .iter()
-                        .flatten()
-                        .find(|(nm, _)| nm == n)
-                        .map(|(_, r)| *r);
-                    if let Some(r) = found {
-                        if self.cell_regs.contains(&r) {
-                            self.emit(Instr::LoadUndefined { dst: r });
-                            self.emit(Instr::MakeCell { reg: r });
-                        }
+                for r in self.pattern_leaf_regs(p) {
+                    if self.cell_regs.contains(&r) {
+                        self.emit(Instr::LoadUndefined { dst: r });
+                        self.emit(Instr::MakeCell { reg: r });
                     }
                 }
             }
             self.extract_pattern(p, key_dst)?;
+            // Marked after the extraction, as in for-of: the per-iteration
+            // stores that initialize the leaves go through `store_binding`.
+            if head_const {
+                for r in self.pattern_leaf_regs(p) {
+                    self.const_regs.insert(r);
+                    if self.cell_regs.contains(&r) {
+                        self.emit(Instr::MarkCellConst { reg: r });
+                    }
+                }
+            }
         } else if let Some(tgt) = assign_tgt {
             self.assign_target(tgt, key_dst)?;
         } else if let Some(b) = &var_binding {
@@ -1424,6 +1441,9 @@ impl<'a> FnCompiler<'a> {
         } else if var_is_cell {
             // Per-iteration binding: a FRESH cell each iteration (for-in let).
             self.emit(Instr::MakeCell { reg: var_reg });
+            if head_const {
+                self.emit(Instr::MarkCellConst { reg: var_reg });
+            }
         }
         self.next_reg = save;
 

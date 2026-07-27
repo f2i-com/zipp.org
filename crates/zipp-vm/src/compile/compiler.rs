@@ -12,6 +12,17 @@ use crate::parse::ast;
 use crate::parse::token::StrVal;
 
 impl Compiler {
+    /// Whether `name` names a binding of the eval's VARIABLE ENVIRONMENT — the
+    /// calling function's own activation. Such a name is re-used by a top-level
+    /// `var`/`function` declaration (EvalDeclarationInstantiation: the binding
+    /// already exists, so the declaration is a no-op and the initializer assigns
+    /// through it). A binding visible only through an ENCLOSING function is
+    /// readable but is NOT the varEnv, so a declaration there shadows instead.
+    pub(crate) fn eval_caller_var(&self, name: &str) -> bool {
+        self.eval_caller_scope.iter().any(|n| n == name)
+            && !self.eval_outer_scope.iter().any(|n| n == name)
+    }
+
     pub(crate) fn new(source: String) -> Compiler {
         Compiler {
             functions: Vec::new(),
@@ -31,6 +42,7 @@ impl Compiler {
             script_binds_globals: true,
             eval_inherit_super_obj: false,
             eval_caller_scope: Vec::new(),
+            eval_outer_scope: Vec::new(),
             eval_dynamic_names: std::collections::HashSet::new(),
             eval_fn_context: false,
             dyn_global_zone: false,
@@ -154,9 +166,7 @@ impl Compiler {
                 // A name the CALLER binds is not a global var of the eval —
                 // the declaration is a no-op and assignments write the cell.
                 // A dynamic (EvalScope) name is never a global either.
-                if self.eval_caller_scope.iter().any(|n| *n == name)
-                    || self.eval_dynamic_names.contains(&name)
-                {
+                if self.eval_caller_var(&name) || self.eval_dynamic_names.contains(&name) {
                     continue;
                 }
                 let slot = self.global_slot(&name) as u32;
@@ -501,9 +511,7 @@ impl Compiler {
                     // A sloppy fn-context eval binds these in the CALLER's
                     // EvalScope (or updates a caller binding) instead — no
                     // realm global is created.
-                    if fc.cx.eval_dynamic_names.contains(name)
-                        || fc.cx.eval_caller_scope.iter().any(|n| n == name)
-                    {
+                    if fc.cx.eval_dynamic_names.contains(name) || fc.cx.eval_caller_var(name) {
                         continue;
                     }
                     if !fn_names.contains(name) {

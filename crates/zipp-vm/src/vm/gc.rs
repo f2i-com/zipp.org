@@ -442,6 +442,7 @@ impl Vm<'_> {
         self.arguments_objs.retain(|&k, _| marks[k as usize]);
         self.gen_args_obj.retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
         self.fn_name_cells.retain(|&k| marks[k as usize]);
+        self.const_cells.retain(|&k| marks[k as usize]);
         self.gen_callee.retain(|&k, _| marks[k as usize]);
         self.module_body_results.retain(|&k| marks[k as usize]);
         self.module_namespaces.retain(|&k, _| marks[k as usize]);

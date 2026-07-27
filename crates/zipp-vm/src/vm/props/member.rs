@@ -39,6 +39,14 @@ impl<'p> Vm<'p> {
         let mut guard = 0u32;
         while cur != 0 && guard < 64 {
             guard += 1;
+            // `own_member` only sees ordinary storage, so a PROXY spliced into the
+            // chain (`Object.setPrototypeOf(Number.prototype, p); (5).x`) would be
+            // walked straight past and its `get` trap never run. Hand the rest of
+            // the chain to the ordinary member path, which runs the trap with the
+            // original receiver.
+            if matches!(self.heap.get(cur), HeapObj::Proxy { .. }) {
+                return self.get_member(Value::heap(cur), key, receiver);
+            }
             if let Some((attr, raw)) = self.own_member(cur, key) {
                 return if attr.accessor {
                     if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, receiver, &[]) }
@@ -104,10 +112,133 @@ impl<'p> Vm<'p> {
             HeapObj::Bound { .. } => return true,
             HeapObj::Func(fid) => *fid,
             HeapObj::Closure { func, .. } => *func,
-            _ => return false,
+            // Built-ins (`Function.prototype.bind.caller`), realm-WrappedFunctions
+            // and the internal resolver closures are not legacy functions either:
+            // 16.2 Forbidden Extensions gives own caller/arguments ONLY to a
+            // sloppy ordinary function declaration/expression.
+            _ => return true,
         };
         let f = self.func(fid as usize);
         f.is_strict || f.is_generator || f.is_async || f.lexical_this || f.non_constructable
+    }
+
+    /// Whether `key` is a LEGACY own `caller`/`arguments` of this callable — the
+    /// pair a sloppy ORDINARY function keeps as non-writable, non-enumerable,
+    /// non-configurable own data properties. Everything `fn_restricted_caller`
+    /// rejects (strict/generator/async/arrow/method/bound), and everything that
+    /// is not an ordinary function object at all (native, class, wrapped), has
+    /// none — for those the pair is the inherited %ThrowTypeError% accessor.
+    pub(crate) fn fn_has_legacy_caller_prop(&self, idx: u32, key: &str) -> bool {
+        (key == "caller" || key == "arguments")
+            && matches!(self.heap.get(idx), HeapObj::Func(_) | HeapObj::Closure { .. })
+            && !self.fn_restricted_caller(idx)
+    }
+
+    /// The func-proto id a callable heap object runs, if it is an ordinary
+    /// function (not a native/bound/class).
+    fn callable_func_id(&self, idx: u32) -> Option<u32> {
+        match self.heap.get(idx) {
+            HeapObj::Func(f) => Some(*f),
+            HeapObj::Closure { func, .. } => Some(*func),
+            _ => None,
+        }
+    }
+
+    /// The function VALUE a frame is executing, or UNDEFINED when the frame
+    /// cannot name one (the top-level script; a JIT bail-out window, which
+    /// records only the func id).
+    fn frame_callee(&self, i: usize) -> Value {
+        let fr = &self.frames[i];
+        if fr.callee.is_heap() {
+            fr.callee
+        } else if fr.closure != NO_CLOSURE {
+            Value::heap(fr.closure)
+        } else {
+            Value::UNDEFINED
+        }
+    }
+
+    /// Index of the TOPMOST live activation of the callable at `fidx`, if any.
+    /// Identity first (`Frame::callee` is the very object the caller invoked, so
+    /// two clones of the same source function stay distinguishable — the whole
+    /// point of regress-577648-1.js); the func-proto id is only a fallback for
+    /// frames that carry no callee value.
+    fn topmost_activation(&self, fidx: u32) -> Option<usize> {
+        let target = Value::heap(fidx);
+        let fid = self.callable_func_id(fidx);
+        (0..self.frames.len()).rev().find(|&i| {
+            let fr = &self.frames[i];
+            if fr.callee.is_heap() || fr.closure != NO_CLOSURE {
+                self.frame_callee(i) == target
+            } else {
+                fid.is_some_and(|f| f == fr.func)
+            }
+        })
+    }
+
+    /// Legacy `f.caller` (Annex B "forbidden extensions" carves this out for a
+    /// sloppy ordinary function): the function that invoked `f`'s topmost live
+    /// activation, or `null`. NEVER undefined — no live activation, a strict
+    /// caller, and a caller the engine cannot name (top-level script code) all
+    /// report null, so the value is never mistaken for an ordinary miss.
+    pub(crate) fn legacy_fn_caller(&mut self, fidx: u32) -> Value {
+        let Some(i) = self.topmost_activation(fidx) else {
+            return Value::NULL;
+        };
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if self.frames[j].is_eval {
+                continue; // an eval is transparent to the caller chain
+            }
+            let callee = self.frame_callee(j);
+            if !callee.is_heap() {
+                return Value::NULL; // top-level script: no caller function
+            }
+            // A STRICT caller is censored — the legacy accessor must never leak
+            // a strict function's activation (censor-strict-caller.js).
+            let strict = match self.callable_func_id(callee.heap_index()) {
+                Some(f) => self.func(f as usize).is_strict,
+                None => true, // bound/native/class: not a legacy caller
+            };
+            return if strict { Value::NULL } else { callee };
+        }
+        Value::NULL
+    }
+
+    /// Legacy `f.arguments`: the arguments of `f`'s topmost live activation, or
+    /// `null` when it has none. Materialized ON DEMAND — a function that never
+    /// mentions `arguments` gets no object at call time, so the frame's recorded
+    /// argument window is replayed into a fresh unmapped one.
+    pub(crate) fn legacy_fn_arguments(&mut self, fidx: u32) -> Value {
+        let Some(i) = self.topmost_activation(fidx) else {
+            return Value::NULL;
+        };
+        let (arg_win, argc, base, func) = {
+            let fr = &self.frames[i];
+            (fr.arg_win as usize, fr.argc as usize, fr.base, fr.func)
+        };
+        // The body already built one (it references `arguments`): hand back that
+        // object, so the two views of the same activation agree.
+        if let Some(areg) = self.func(func as usize).arguments_reg {
+            return self.regs[base + areg as usize];
+        }
+        let pcount = self.func(func as usize).param_count as usize;
+        let args: Vec<Value> = if arg_win != u32::MAX as usize {
+            // A formal's CURRENT register wins over the staged copy for the
+            // indices a mapped arguments object would alias, so a parameter
+            // reassigned since entry is what `f.arguments[i]` reports.
+            (0..argc)
+                .map(|k| if k < pcount { self.regs[base + 1 + k] } else { self.regs[arg_win + k] })
+                .collect()
+        } else {
+            // Entered from native code (`call_value`), where the arguments were
+            // never staged in a register window — the bound formals are all that
+            // survives.
+            let pc = self.func(func as usize).param_count as usize;
+            (0..pc).map(|k| self.regs[base + 1 + k]).collect()
+        };
+        self.build_arguments_object(args, Value::heap(fidx), false, None)
     }
 
     pub(crate) fn callable_name_length(&self, obj: Value) -> Option<(String, f64)> {
@@ -588,7 +719,11 @@ impl<'p> Vm<'p> {
                 return match self.proxy_trap(handler, "get")? {
                     Some(trap) => {
                         let kv = self.key_to_value(key);
-                        let r = self.call_value(trap, handler, &[target, kv, obj])?;
+                        // 10.5.8 [[Get]](P, Receiver): the trap's third argument is
+                        // the RECEIVER, which is only the proxy itself for a direct
+                        // read — reading through a child (`Object.create(p).x`) or
+                        // `Reflect.get(p, k, other)` must hand the trap that object.
+                        let r = self.call_value(trap, handler, &[target, kv, receiver])?;
                         // Invariant: a non-configurable, non-writable target data
                         // property must be reported with its actual value; a
                         // non-configurable accessor with no getter must report
@@ -1362,7 +1497,11 @@ impl<'p> Vm<'p> {
                 }
                 if let Some((_, g)) = c.static_getters.iter().find(|(k, _)| k == key) {
                     let g = *g;
-                    return self.call_value(g, obj, &[]);
+                    // OrdinaryGet step 6: an accessor's getter runs with the
+                    // RECEIVER, not the object it was found on — `Sub.staticGetter`
+                    // must see `this === Sub`, and `Reflect.get(C, k, other)` must
+                    // see `other`.
+                    return self.call_value(g, receiver, &[]);
                 }
                 // A setter-only own static accessor (`static set name(_)`) is an own
                 // property: reading it returns undefined and does NOT fall through to
@@ -1371,28 +1510,18 @@ impl<'p> Vm<'p> {
                 if c.static_setters.iter().any(|(k, _)| k == key) {
                     return Ok(Value::UNDEFINED);
                 }
-                let mut cur = c.parent;
-                while let Some(pidx) = cur {
-                    match self.heap.get(pidx) {
-                        HeapObj::Class(pc) => {
-                            if let Some(v) = pc.statics.get(key) {
-                                return Ok(v);
-                            }
-                            if let Some((_, g)) = pc.static_getters.iter().find(|(k, _)| k == key) {
-                                let g = *g;
-                                return self.call_value(g, obj, &[]);
-                            }
-                            if pc.static_setters.iter().any(|(k, _)| k == key) {
-                                return Ok(Value::UNDEFINED);
-                            }
-                            cur = pc.parent;
-                        }
-                        // A non-Class parent (a built-in constructor or a plain
-                        // function) is the subclass constructor's [[Prototype]]:
-                        // delegate the static read up its prototype chain (so
-                        // `class X extends Temporal.Y {}` inherits `Y.from` etc.).
-                        _ => return self.get_member(Value::heap(pidx), key, obj),
-                    }
+                // The parent class IS this constructor's [[Prototype]], so an own
+                // miss is an ORDINARY prototype-chain step: delegate the whole
+                // parent lookup to `get_member` instead of re-scanning statics
+                // here. A statics-only scan could not see the parent's SYNTHESIZED
+                // `name`/`length` (so `delete C.name; C.name` reported "" from
+                // %Function.prototype% instead of the parent's name — className.js),
+                // and it invoked an inherited `static get` with the parent rather
+                // than the original receiver. The same call also covers a non-Class
+                // parent (a built-in constructor or plain function, so
+                // `class X extends Temporal.Y {}` inherits `Y.from`).
+                if let Some(pidx) = c.parent {
+                    return self.get_member(Value::heap(pidx), key, receiver);
                 }
                 // A class is a function: keys not found as a static fall back to
                 // Function.prototype (so `C.toString()` → the class source via
@@ -1507,17 +1636,21 @@ impl<'p> Vm<'p> {
                 }
                 // Poison-pill: `caller`/`arguments` on a restricted function are
                 // the %ThrowTypeError% accessors (AddRestrictedFunctionProperties).
-                // Only a LEGACY sloppy ordinary function reads `undefined` here
-                // (zipp exposes no legacy own caller/arguments) — handled explicitly
-                // so the inherited throwing accessor on Function.prototype is not
-                // leaked as a value by the proto-chain walk below.
+                // A LEGACY sloppy ordinary function instead owns them as live
+                // properties — handled here so the inherited throwing accessor on
+                // Function.prototype is neither run nor leaked by the walk below.
                 if key == "caller" || key == "arguments" {
                     if self.fn_restricted_caller(obj.heap_index()) {
                         return Err(Thrown(format!(
                             "TypeError: '{key}' may not be accessed on strict-mode or bound functions"
                         )));
                     }
-                    return Ok(Value::UNDEFINED);
+                    let i = obj.heap_index();
+                    return Ok(if key == "caller" {
+                        self.legacy_fn_caller(i)
+                    } else {
+                        self.legacy_fn_arguments(i)
+                    });
                 }
                 // Inherited methods: an explicit [[Prototype]] override (a
                 // Reflect.construct(Function, …, foreignNewTarget) function whose

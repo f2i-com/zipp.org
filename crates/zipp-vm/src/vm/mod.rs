@@ -114,6 +114,21 @@ struct Frame {
     /// its own heap index — the liveness proof (each activation allocates a
     /// fresh object, so a recycled frame slot can never spoof it).
     args_obj: u32,
+    /// Absolute index into `regs` of this call's ARGUMENT window — the caller's
+    /// staging registers — with `argc` the number of values there. `u32::MAX`
+    /// when the arguments were not staged in a register window (a native
+    /// `call_value`, a generator/async resume, a JIT bail-out). Only the legacy
+    /// `f.arguments` accessor reads them, and only while this frame is live: the
+    /// caller is suspended at its call instruction, so its staging registers
+    /// cannot change underneath us, and they sit BELOW this frame's base so a
+    /// pop can never truncate them away first.
+    arg_win: u32,
+    argc: u16,
+    /// True for the frame running an `eval` program's body. The legacy
+    /// `f.caller` walk steps PAST these: an eval is not a function activation,
+    /// so `function nest(){ return eval("innermost();"); }` must report `nest`
+    /// as `innermost`'s caller, not the eval script.
+    is_eval: bool,
 }
 
 /// [[ParameterMap]] bookkeeping for a MAPPED arguments object (sloppy callee
@@ -329,6 +344,11 @@ pub struct Vm<'p> {
     /// invoking the body; the frame-setup path consumes it into `Frame::new_target`
     /// and resets it to `undefined`, so ordinary calls observe `new.target` undefined.
     pending_new_target: Value,
+    /// One-shot "the NEXT frame entered runs an eval program" flag, set right
+    /// before `execute_eval_program` invokes the compiled eval script and
+    /// consumed into `Frame::is_eval` at frame setup (same one-shot idiom as
+    /// `pending_new_target`). Lets the legacy `f.caller` walk skip eval frames.
+    pending_eval_frame: bool,
     /// Set by a `Yield` op to hand a generator's yielded value (+ the yield's
     /// bytecode ip, for the resume point) back to `generator_method`, which
     /// `.take()`s it to distinguish a suspension from a normal return.
@@ -737,6 +757,12 @@ pub struct Vm<'p> {
     /// no-op in sloppy code and throw TypeError in strict code. Pruned on GC
     /// sweep (the cells themselves are ordinary traced heap objects).
     fn_name_cells: std::collections::HashSet<u32>,
+    /// Heap indices of `const`/`using` cells (MarkCellConst). A write through a
+    /// closure or a direct eval (UpvalSet/StoreUpvalDyn) is a TypeError in BOTH
+    /// modes — the compiler can only reject the declaring function's own
+    /// assignments, since `Binding::Upvalue` carries no const-ness. Pruned on GC
+    /// sweep like `fn_name_cells`.
+    const_cells: std::collections::HashSet<u32>,
     /// `$262.evalScript` flag: the NEXT eval-program instantiation uses SCRIPT
     /// GlobalDeclarationInstantiation semantics (non-configurable brandNew
     /// bindings, lexical-collision SyntaxErrors, realm-persistent lexicals)

@@ -84,6 +84,12 @@ impl<'p> Vm<'p> {
             if cur == 0 {
                 break;
             }
+            // A PROXY link in the chain carries a `get` trap that `own_member`
+            // (ordinary storage only) cannot see — delegate the rest of the walk
+            // to the ordinary member path so the trap runs with `receiver`.
+            if matches!(self.heap.get(cur), HeapObj::Proxy { .. }) {
+                return self.get_member(Value::heap(cur), key, receiver);
+            }
             if let Some((attr, raw)) = self.own_member(cur, key) {
                 if attr.accessor {
                     return if raw == Value::UNDEFINED {
@@ -834,6 +840,20 @@ impl<'p> Vm<'p> {
         } else {
             Value::UNDEFINED
         };
+        self.alloc_iter_helper(source, kind, arg, n, next)
+    }
+
+    /// `make_iter_helper` for a caller that has ALREADY performed GetIteratorDirect's
+    /// `Get(source, "next")` — Iterator.from must do that read before its %Iterator%
+    /// brand check, so the read cannot be deferred to helper creation.
+    fn alloc_iter_helper(
+        &mut self,
+        source: Value,
+        kind: u8,
+        arg: Value,
+        n: i64,
+        next: Value,
+    ) -> Result<Value, Thrown> {
         let idx = self.heap.alloc(HeapObj::IterHelper {
             source,
             kind,
@@ -948,12 +968,10 @@ impl<'p> Vm<'p> {
             Ok(v) => Ok(v),
             Err(e) => {
                 // IfAbruptCloseIterator returns the ORIGINAL completion: the callback's
-                // thrown value wins even if the source's return() also throws. Since the
-                // thrown VALUE lives in `pending_throw` (which the return() call would
-                // overwrite), save and restore it around the close.
-                let saved = self.pending_throw;
-                let _ = self.iterator_close(src);
-                self.pending_throw = saved;
+                // thrown value wins even if the source's return() also throws — which is
+                // exactly what `iterator_close_quiet` guarantees (it preserves the
+                // `pending_throw` VALUE the close would otherwise overwrite).
+                self.iterator_close_quiet(src);
                 Err(e)
             }
         }
@@ -1197,11 +1215,20 @@ impl<'p> Vm<'p> {
                 4 => {
                     // flatMap
                     if inner != Value::UNDEFINED {
-                        match self.iterator_step(inner)? {
-                            Some(v) => return Ok(self.iter_result(v, false)),
-                            None => {
+                        // IfAbruptCloseIterator(innerValue, iterated) (27.1.4.9 step
+                        // 6.b.viii.2): a throw from the INNER iterator — its next(), or
+                        // the `done`/`value` getters on the result it returns — must
+                        // close the OUTER iterator before propagating. Only the inner's
+                        // completion survives, so the close is the quiet form.
+                        match self.iterator_step(inner) {
+                            Ok(Some(v)) => return Ok(self.iter_result(v, false)),
+                            Ok(None) => {
                                 self.ih_set_inner(idx, Value::UNDEFINED);
                                 continue;
+                            }
+                            Err(e) => {
+                                self.iterator_close_quiet(source);
+                                return Err(e);
                             }
                         }
                     }
@@ -1214,7 +1241,17 @@ impl<'p> Vm<'p> {
                             let mapped =
                                 self.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])?;
                             self.ih_inc_idx(idx);
-                            let it = self.get_iterator_flattenable(mapped, true)?;
+                            // IfAbruptCloseIterator(innerIterator, iterated) (step
+                            // 6.b.vi): a mapper result that is not flattenable (a
+                            // primitive, or an @@iterator returning a non-object) also
+                            // closes the OUTER iterator.
+                            let it = match self.get_iterator_flattenable(mapped, true) {
+                                Ok(it) => it,
+                                Err(e) => {
+                                    self.iterator_close_quiet(source);
+                                    return Err(e);
+                                }
+                            };
                             self.ih_set_inner(idx, it);
                             continue;
                         }
@@ -1255,15 +1292,15 @@ impl<'p> Vm<'p> {
                     continue;
                 }
                 _ => {
-                    // 5 = passthrough wrapper (Iterator.from of a foreign iterator):
-                    // step via the cached next (GetIteratorDirect read it once).
-                    match self.ih_step(source, next)? {
-                        None => {
-                            self.ih_set_done(idx);
-                            return Ok(self.iter_result(Value::UNDEFINED, true));
-                        }
-                        Some(v) => return Ok(self.iter_result(v, false)),
-                    }
+                    // 5 = %WrapForValidIteratorPrototype%.next (Iterator.from of a
+                    // foreign iterator). Unlike every other kind this is NOT a
+                    // generator closure: the whole spec body is
+                    // `Return ? Call(record.[[NextMethod]], record.[[Iterator]])`.
+                    // The result object is forwarded VERBATIM — no IteratorComplete /
+                    // IteratorValue, so `done`/`value` getters are never fired here,
+                    // a non-object (even a primitive) passes straight through instead
+                    // of being rejected, and the wrapper keeps no [[Done]] state.
+                    return self.call_value(next, source, &[]);
                 }
             }
         }
@@ -1275,24 +1312,36 @@ impl<'p> Vm<'p> {
         // A string yields its code-point iterator; otherwise get the iterable's
         // iterator (or use it directly if it is one).
         let it = self.get_iterator_flattenable(o, false)?;
+        // GetIteratorFlattenable ENDS with GetIteratorDirect(iterator), so the
+        // observable `Get(iterator, "next")` is step 1 — it precedes the
+        // OrdinaryHasInstance brand check below. A Proxy source must therefore log
+        // `get: next` BEFORE `getPrototypeOf`, and an iterator that IS returned
+        // unwrapped still has its `next` getter fired exactly once.
+        let next = self.get_prop(it, "next")?;
         // If the iterator ALREADY inherits %Iterator.prototype% (OrdinaryHasInstance
         // (%Iterator%, it) — e.g. a generator or a built-in iterator), return it
         // unwrapped; only a foreign iterator gets the WrapForValidIterator wrapper.
         // Walk via object_get_prototype_of so a Generator's gen_proto link is followed
         // (generator instances resolve their [[Prototype]] specially, not via proto_of).
-        if it.is_heap() && self.iterator_proto_root != 0 {
+        // %Iterator% is the intrinsic of the REALM of the `Iterator.from` running now,
+        // so `otherGlobal.Iterator.from(mainRealmIterator)` must WRAP: the argument
+        // inherits the main realm's %Iterator.prototype%, not the child realm's image.
+        let iter_root = self.native_home(self.iterator_proto_root);
+        if it.is_heap() && iter_root != 0 {
             let mut cur = it;
             for _ in 0..64 {
                 let p = self.object_get_prototype_of(cur);
                 if !p.is_heap() {
                     break;
                 }
-                if p.heap_index() == self.iterator_proto_root {
+                if p.heap_index() == iter_root {
                     return Ok(it);
                 }
                 cur = p;
             }
         }
-        self.make_iter_helper(it, 5, Value::UNDEFINED, 0)
+        // The wrapper's [[Iterated]] record keeps the `next` read above — the spec
+        // never re-reads it, so a later mutation of `iterator.next` is not observed.
+        self.alloc_iter_helper(it, 5, Value::UNDEFINED, 0, next)
     }
 }

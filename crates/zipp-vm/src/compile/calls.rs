@@ -1239,13 +1239,50 @@ impl<'a> FnCompiler<'a> {
                     map.push((n, 0u8, r));
                 }
             }
-            if eval_root {
-                let ups: Vec<String> =
-                    self.upvalues.borrow().iter().map(|(n, _)| n.clone()).collect();
-                for (i, n) in ups.iter().enumerate() {
-                    if seen.insert(n.clone()) {
-                        map.push((n.clone(), 1u8, i as u16));
+            // ENCLOSING function scopes. `free_vars` cannot look inside the eval
+            // STRING, so nothing made this function capture the enclosing
+            // activation's bindings — and with no upvalue there is no cell to
+            // hand the eval program, which then resolved the name as a global
+            // (`function o(){ var a=1; return function(){ return eval("a"); }; }`
+            // threw ReferenceError). Force one upvalue per visible enclosing
+            // binding, innermost first, so the shadowing order the map wants is
+            // the order they are pushed in. Only reached in a body that
+            // references `eval`, so ordinary functions keep their exact
+            // capture set.
+            if !eval_root {
+                let outer: Vec<String> = self
+                    .enclosing
+                    .iter()
+                    .rev()
+                    .flat_map(|enc| {
+                        let mut ns: Vec<String> =
+                            enc.cell_locals.iter().rev().map(|(n, _)| n.clone()).collect();
+                        ns.extend(enc.upvalues.borrow().iter().map(|(n, _)| n.clone()));
+                        ns
+                    })
+                    .collect();
+                for n in outer {
+                    if seen.contains(&n) {
+                        continue;
                     }
+                    if self.resolve_upvalue(&n).is_some() {
+                        seen.insert(n);
+                    }
+                }
+            }
+            // Every upvalue this closure holds is a live caller binding the eval
+            // may name: the ones just forced, the ones the body genuinely
+            // captures, and — at an eval ROOT — its seeded caller scope, so
+            // nested evals keep reaching the original caller. Kind 1 at an eval
+            // root (those cells ARE the eval's variable environment); kind 2
+            // otherwise — an ENCLOSING function's binding is readable but a
+            // top-level `var` of that name shadows it instead of assigning it.
+            let ups: Vec<String> =
+                self.upvalues.borrow().iter().map(|(n, _)| n.clone()).collect();
+            let kind = if eval_root { 1u8 } else { 2u8 };
+            for (i, n) in ups.iter().enumerate() {
+                if !map.iter().any(|(m, _, _)| m == n) {
+                    map.push((n.clone(), kind, i as u16));
                 }
             }
             // In a parameter default, the eval's sloppy var/function

@@ -99,6 +99,10 @@ pub fn compile_eval(
     is_module: bool,
     inherit_super_obj: bool,
     caller_scope: Vec<String>,
+    // The subset of `caller_scope` that belongs to an ENCLOSING function of the
+    // caller rather than to the caller's own activation — readable, but not the
+    // eval's variable environment (see `Compiler::eval_caller_var`).
+    caller_outer_scope: Vec<String>,
     fn_var_env: bool,
     exact_src: Option<&[u8]>,
 ) -> R<Program> {
@@ -210,8 +214,13 @@ pub fn compile_eval(
     // hoist skips them and their accesses compile to the Dyn global ops.
     if fn_var_env && !(force_strict || has_use_strict(&prog.directives)) {
         c.eval_fn_context = true;
+        // A name bound only by an ENCLOSING function of the caller is NOT the
+        // eval's varEnv, so the declaration still goes into the EvalScope.
+        let caller_var = |n: &str| {
+            caller_scope.iter().any(|c| c == n) && !caller_outer_scope.iter().any(|c| c == n)
+        };
         for n in eval_var_and_fn_names(prog) {
-            if !caller_scope.iter().any(|c| *c == n) {
+            if !caller_var(&n) {
                 c.eval_dynamic_names.insert(n);
             }
         }
@@ -239,12 +248,13 @@ pub fn compile_eval(
             collect_b33_block_fns(s, false, &blockers, &mut b33);
         }
         for n in b33 {
-            if !caller_scope.iter().any(|c| *c == n) {
+            if !caller_var(&n) {
                 c.eval_dynamic_names.insert(n);
             }
         }
     }
     c.eval_caller_scope = caller_scope;
+    c.eval_outer_scope = caller_outer_scope;
     // DIRECT EVAL INSIDE `with`: the caller's eval-site map threads each active
     // with-object's hidden cell binding (" with-object-N") along with the
     // ordinary caller bindings, listed INNERMOST-FIRST. ResolveBinding for the

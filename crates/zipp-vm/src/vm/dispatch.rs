@@ -3109,6 +3109,13 @@ impl<'p> Vm<'p> {
                         self.set(base, reg, Value::heap(cell));
                         ip += 1;
                     }
+                    Instr::MarkCellConst { reg } => {
+                        // The cell is already live (MakeCell / MakeCellTdz) and
+                        // initialized; record it so a closure's write throws.
+                        let cell = self.get(base, reg).heap_index();
+                        self.const_cells.insert(cell);
+                        ip += 1;
+                    }
                     Instr::MakeCellTdz { reg } => {
                         // A captured lexical pre-created at entry: the cell starts in
                         // its TDZ (UNINITIALIZED) until the textual declaration runs.
@@ -3163,6 +3170,12 @@ impl<'p> Vm<'p> {
                     }
                     Instr::UpvalSet { idx, src } => {
                         let cell = self.closure_upvalue(cur_closure, idx);
+                        // Assignment to a captured `const` (PutValue on an
+                        // immutable binding) throws in sloppy code too, so this
+                        // precedes the strict-only fn-name check.
+                        if !self.const_cells.is_empty() && self.const_cells.contains(&cell) {
+                            return Err(Thrown("TypeError: Assignment to constant variable.".into()));
+                        }
                         // A named function expression's own-name binding is
                         // immutable: strict writer → TypeError, sloppy → no-op.
                         if !self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell) {
@@ -3215,6 +3228,10 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let cell = self.closure_upvalue(cur_closure, idx);
+                        // Captured `const` (see UpvalSet) — throws in both modes.
+                        if !self.const_cells.is_empty() && self.const_cells.contains(&cell) {
+                            return Err(Thrown("TypeError: Assignment to constant variable.".into()));
+                        }
                         // Immutable own-name binding (see UpvalSet).
                         if !self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell) {
                             let f = self.frames.last().unwrap().func;
@@ -4243,13 +4260,16 @@ impl<'p> Vm<'p> {
                                             .clone();
                                         let mut names = Vec::with_capacity(map.len());
                                         let mut cells = Vec::with_capacity(map.len());
+                                        let mut outer = Vec::new();
                                         for (n, kind, idx) in map {
                                             let cv = if kind == 0 {
                                                 self.get(base, idx)
                                             } else {
-                                                // kind 1: this frame's closure
+                                                // kind 1/2: this frame's closure
                                                 // upvalue cell (an eval root
-                                                // forwarding its caller scope).
+                                                // forwarding its caller scope,
+                                                // or — kind 2 — a binding of a
+                                                // function ENCLOSING the caller).
                                                 let cl = self
                                                     .frames
                                                     .last()
@@ -4270,11 +4290,14 @@ impl<'p> Vm<'p> {
                                                 }
                                             };
                                             if cv.is_heap() {
+                                                if kind == 2 {
+                                                    outer.push(n.clone());
+                                                }
                                                 names.push(n);
                                                 cells.push(cv);
                                             }
                                         }
-                                        Some((names, cells))
+                                        Some((names, cells, outer))
                                     } else {
                                         None
                                     }
@@ -5994,6 +6017,12 @@ impl<'p> Vm<'p> {
         fr.eval_scope = u32::MAX;
         fr.super_done = false;
         fr.args_obj = args_obj;
+        // `argv` was copied OUT before the window was truncated, so this
+        // activation has no caller argument window to replay — the legacy
+        // `f.arguments` accessor falls back to the bound formals.
+        fr.arg_win = u32::MAX;
+        fr.argc = 0;
+        fr.is_eval = false;
         Ok(true)
     }
 
@@ -6570,7 +6599,13 @@ impl<'p> Vm<'p> {
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
+        // Remember WHERE the arguments were staged (the caller's contiguous
+        // register window) so the legacy `f.arguments` accessor can report every
+        // actual argument even when the body never mentions `arguments` — a
+        // function with no formals and no `arguments` reference otherwise retains
+        // nothing about its call.
+        let arg_win = (caller_base + arg_base as usize) as u32;
+        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, arg_win, argc, is_eval: false, func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
         Ok(())
     }
 

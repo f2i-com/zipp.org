@@ -404,11 +404,13 @@ fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
             // (minus what it binds), exactly like a function expression would.
             fn_node_free(f, out);
         }
-        Stmt::ForOf { right, body, .. } => {
+        Stmt::ForOf { left, right, body, .. } => {
+            for_head_refs(left, out);
             expr_refs(right, out);
             stmt_refs(body, out);
         }
-        Stmt::ForIn { right, body, .. } => {
+        Stmt::ForIn { left, right, body } => {
+            for_head_refs(left, out);
             expr_refs(right, out);
             stmt_refs(body, out);
         }
@@ -629,12 +631,110 @@ fn target_refs(t: &Target, out: &mut HashSet<String>) {
                 }
             }
         }
-        // NOTE: a DESTRUCTURING target (`[a] = x`, `({k: o.b} = x)`) contributes
-        // nothing. oxc's `AssignmentTarget` pattern variants fell into a `_ => {}`
-        // here, so neither the bound names nor the member objects inside one were
-        // ever collected. Preserved rather than fixed: adding them would change
-        // which locals are boxed and therefore the emitted bytecode.
-        Target::Array(_) | Target::Object { .. } => {}
+        // A DESTRUCTURING target (`[a] = x`, `({k: o.b} = x)`) assigns every leaf
+        // it names and evaluates every member base, computed key and default
+        // inside it — all references of the enclosing scope, exactly as if each
+        // leaf had been written as its own `=`. Missing them meant a closure that
+        // only ever wrote an outer local through a pattern (`() => { [a,b] = v }`)
+        // did not capture it and silently wrote a global instead.
+        Target::Array(elems) => {
+            for el in elems.iter().flatten() {
+                target_refs(&el.target, out);
+                if let Some(d) = &el.default {
+                    expr_refs(d, out);
+                }
+            }
+        }
+        Target::Object { props, rest } => {
+            for p in props {
+                prop_key_refs(&p.key, out);
+                target_refs(&p.target, out);
+                if let Some(d) = &p.default {
+                    expr_refs(d, out);
+                }
+            }
+            if let Some(r) = rest {
+                target_refs(r, out);
+            }
+        }
+    }
+}
+
+/// Functions nested one level down inside an assignment TARGET — only a
+/// default, a member base or a computed key can hold one (`[a = () => x] = []`).
+fn target_nested_free(t: &Target, out: &mut HashSet<String>) {
+    match t {
+        Target::Ident { .. } => {}
+        Target::Member(m) => {
+            collect_nested_free_expr(&m.object, out);
+            if let MemberProp::Computed(k) = &m.prop {
+                collect_nested_free_expr(k, out);
+            }
+        }
+        Target::Call(c) => {
+            collect_nested_free_expr(&c.callee, out);
+            for arg in &c.args {
+                match arg {
+                    Arg::Expr(e) | Arg::Spread(e) => collect_nested_free_expr(e, out),
+                }
+            }
+        }
+        Target::Array(elems) => {
+            for el in elems.iter().flatten() {
+                target_nested_free(&el.target, out);
+                if let Some(d) = &el.default {
+                    collect_nested_free_expr(d, out);
+                }
+            }
+        }
+        Target::Object { props, rest } => {
+            for p in props {
+                if let PropKey::Computed(e) = &p.key {
+                    collect_nested_free_expr(e, out);
+                }
+                target_nested_free(&p.target, out);
+                if let Some(d) = &p.default {
+                    collect_nested_free_expr(d, out);
+                }
+            }
+            if let Some(r) = rest {
+                target_nested_free(r, out);
+            }
+        }
+    }
+}
+
+/// The references a `for (… in/of …)` HEAD makes. A declaration head BINDS its
+/// names (subtracted later) but still READS its defaults; a target head assigns
+/// EXISTING bindings once per iteration, which is a reference to each of them —
+/// the case `Stmt::ForOf`/`Stmt::ForIn` used to drop entirely.
+fn for_head_refs(left: &ForTarget, out: &mut HashSet<String>) {
+    match left {
+        ForTarget::Var(d) => {
+            for decl in &d.decls {
+                pattern_init_refs(&decl.id, out);
+                // Annex B `for (var x = init in obj)`.
+                if let Some(i) = &decl.init {
+                    expr_refs(i, out);
+                }
+            }
+        }
+        ForTarget::Target(t) => target_refs(t, out),
+    }
+}
+
+/// `for_head_refs` for the nested-function walk.
+fn for_head_nested_free(left: &ForTarget, out: &mut HashSet<String>) {
+    match left {
+        ForTarget::Var(d) => {
+            for decl in &d.decls {
+                collect_nested_free_pattern(&decl.id, out);
+                if let Some(i) = &decl.init {
+                    collect_nested_free_expr(i, out);
+                }
+            }
+        }
+        ForTarget::Target(t) => target_nested_free(t, out),
     }
 }
 
@@ -758,11 +858,13 @@ fn collect_nested_free(s: &Stmt, out: &mut HashSet<String>) {
             }
             collect_nested_free(body, out);
         }
-        Stmt::ForOf { right, body, .. } => {
+        Stmt::ForOf { left, right, body, .. } => {
+            for_head_nested_free(left, out);
             collect_nested_free_expr(right, out);
             collect_nested_free(body, out);
         }
-        Stmt::ForIn { right, body, .. } => {
+        Stmt::ForIn { left, right, body } => {
+            for_head_nested_free(left, out);
             collect_nested_free_expr(right, out);
             collect_nested_free(body, out);
         }
@@ -822,7 +924,11 @@ fn collect_nested_free_expr(e: &Expr, out: &mut HashSet<String>) {
         // Only the VALUE side: a target cannot hold a function literal that is
         // not already inside one of its own key expressions, which this walk did
         // not visit before the port either.
-        Expr::Assign { value, .. } => collect_nested_free_expr(value, out),
+        // The TARGET too: `[a = () => x] = []` nests a function in a default.
+        Expr::Assign { target, value, .. } => {
+            target_nested_free(target, out);
+            collect_nested_free_expr(value, out);
+        }
         Expr::Cond { test, cons, alt } => {
             collect_nested_free_expr(test, out);
             collect_nested_free_expr(cons, out);

@@ -34,7 +34,7 @@ impl<'p> Vm<'p> {
         // only the top frame so the reservation math is relative to a known base.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.reserve_jit_regs();
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
+        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false, func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
         // Everything allocated so far (interned strings, all built-ins, hoisted
         // top-level functions) is pinned: the GC never collects below this floor.
         self.set_gc_floor();
@@ -555,7 +555,13 @@ impl<'p> Vm<'p> {
 
         let stop_depth = self.frames.len();
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
+        // `execute_eval_program` reaches exactly this push (its script value is a
+        // fresh Func/Closure, so every earlier arm of `call_value` falls through),
+        // so this is where the one-shot eval-frame marker is consumed.
+        let is_eval = std::mem::take(&mut self.pending_eval_frame);
+        // The arguments arrived as a slice, not as a caller register window —
+        // `f.arguments` falls back to the frame's own `arguments` object / params.
+        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval, func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
         self.run_loop(stop_depth)
     }
 
@@ -695,7 +701,9 @@ impl<'p> Vm<'p> {
         var_env_global: bool,
         param_collisions: Option<Vec<String>>,
         lexical_collisions: Vec<String>,
-        caller_scope: Option<(Vec<String>, Vec<Value>)>,
+        // (ordered caller bindings, their cells, the subset that lives in a
+        // function ENCLOSING the caller — readable but not the eval's varEnv).
+        caller_scope: Option<(Vec<String>, Vec<Value>, Vec<String>)>,
         eval_scope_idx: Option<u32>,
         exact_src: Option<&[u8]>,
     ) -> Result<Value, Thrown> {
@@ -782,7 +790,11 @@ impl<'p> Vm<'p> {
             caller_home_obj.is_some(),
             caller_scope
                 .as_ref()
-                .map(|(n, _)| n.clone())
+                .map(|(n, _, _)| n.clone())
+                .unwrap_or_default(),
+            caller_scope
+                .as_ref()
+                .map(|(_, _, o)| o.clone())
                 .unwrap_or_default(),
             eval_scope_idx.is_some(),
             exact_src,
@@ -799,7 +811,7 @@ impl<'p> Vm<'p> {
             caller_new_target,
             caller_home_obj,
             var_env_global,
-            caller_scope.map(|(_, c)| c),
+            caller_scope.map(|(_, c, _)| c),
             eval_scope_idx,
         )
         .map(|(v, _)| v)

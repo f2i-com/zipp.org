@@ -153,13 +153,15 @@ impl<'a> FnCompiler<'a> {
                 self.for_in_statement(left, right, body)?
             }
             S::Break(label) => {
-                // `break label` targets the labeled loop/switch; bare `break` the
-                // innermost.
+                // `break label` targets any labelled statement; a BARE `break`
+                // only the innermost iteration statement / `switch` — a labelled
+                // `if`/`try`/block frame is skipped, since `break` with no label
+                // inside one is a SyntaxError, not a jump to its end.
                 let idx = match label {
                     Some(lbl) => {
                         self.loop_ctx.iter().rposition(|c| c.label.as_deref() == Some(&**lbl))
                     }
-                    None => self.loop_ctx.len().checked_sub(1),
+                    None => self.loop_ctx.iter().rposition(|c| c.bare_breakable),
                 };
                 let idx = match idx {
                     Some(i) => i,
@@ -202,28 +204,37 @@ impl<'a> FnCompiler<'a> {
                 self.emit_loop_jump(idx, false);
             }
             S::Labeled { label, body } => {
-                if let S::Block(stmts) = &**body {
-                    // `label: { … break label … }` — a break-only target around a
-                    // block (continue to a block label is invalid, and naturally
-                    // won't match: the frame is not a loop).
-                    self.loop_ctx
-                        .push(LoopCtx::switch_frame(Some(label.to_string()), self.handler_depth));
-                    self.push_scope();
-                    for s in stmts {
-                        self.stmt(s)?;
+                if stmt_takes_label(body) {
+                    // An iteration statement / `switch` takes the label itself —
+                    // it needs it for `continue label` too — and patches its own
+                    // break jumps at its exit.
+                    self.pending_label = Some(label.to_string());
+                    self.stmt(body)?;
+                    self.pending_label = None;
+                } else {
+                    // EVERY other labelled statement is still a `break label`
+                    // target: LabelledEvaluation (14.13.3) turns a break carrying
+                    // the label into a normal completion of the labelled
+                    // statement, whatever it is — `L: { … }`, `L: if (…) …`, and
+                    // (the case this replaced a compile error) `L: try { return
+                    // 42; } finally { break L; }`. The frame is NOT
+                    // bare-breakable, so an unlabelled `break` inside still fails.
+                    self.loop_ctx.push(LoopCtx::label_frame(label.to_string(), self.handler_depth));
+                    if let S::Block(stmts) = &**body {
+                        // A labelled block keeps its own lexical scope.
+                        self.push_scope();
+                        for s in stmts {
+                            self.stmt(s)?;
+                        }
+                        self.pop_scope();
+                    } else {
+                        self.stmt(body)?;
                     }
-                    self.pop_scope();
                     let ctx = self.loop_ctx.pop().unwrap();
                     let end = self.here();
                     for j in ctx.break_jumps {
                         self.patch_jump(j, end);
                     }
-                } else {
-                    // A loop/switch consumes the label for break/continue;
-                    // cleared afterwards if the body was something else.
-                    self.pending_label = Some(label.to_string());
-                    self.stmt(body)?;
-                    self.pending_label = None;
                 }
             }
             S::Switch { disc, cases } => self.switch_stmt(disc, cases)?,
@@ -540,7 +551,7 @@ impl<'a> FnCompiler<'a> {
                 // simple-identifier path below, so `{ let {a} = o; }` doesn't leak.
                 let block_local = d.kind.is_lexical() && self.scopes.len() > 1;
                 self.pattern_block_local = block_local;
-                self.declare_pattern(&decl.id)?;
+                self.declare_pattern(&decl.id, !d.kind.is_lexical())?;
                 let save = self.next_reg;
                 // TOP-LEVEL global-bound leaves: INITIALIZE each slot before
                 // extraction. The extraction stores are assignment-flavored —
@@ -585,6 +596,28 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::Move { dst: src, src: sv });
                 }
                 self.extract_pattern(&decl.id, src)?;
+                // `const {a} = o` / `const [a] = xs`: the leaves are immutable
+                // too. Recorded only NOW — the extraction above stores through
+                // `store_binding`, which would reject its own initialization —
+                // and, for a captured leaf, tagged at runtime so a closure's
+                // write throws (see the simple-identifier path below).
+                if is_const {
+                    if self.is_script && self.cx.script_binds_globals && !block_local {
+                        let mut leaves = std::collections::HashSet::new();
+                        capture::collect_pattern_names(&decl.id, &mut leaves);
+                        for n in sorted_name_vec(&leaves) {
+                            let slot = self.cx.global_slot(&n) as u32;
+                            self.cx.const_globals.insert(slot);
+                        }
+                    } else {
+                        for r in self.pattern_leaf_regs(&decl.id) {
+                            self.const_regs.insert(r);
+                            if self.cell_regs.contains(&r) {
+                                self.emit(Instr::MarkCellConst { reg: r });
+                            }
+                        }
+                    }
+                }
                 self.pattern_block_local = false;
                 self.next_reg = save; // reclaim the source + extraction temps
                 continue;
@@ -610,7 +643,7 @@ impl<'a> FnCompiler<'a> {
             if self.is_script
                 && !d.kind.is_lexical()
                 && self.scopes.len() == 1
-                && self.cx.eval_caller_scope.iter().any(|n| n == name)
+                && self.cx.eval_caller_var(name)
             {
                 if let Some(init) = &decl.init {
                     let tmp = self.temp();
@@ -826,6 +859,14 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::LoadUndefined { dst: reg });
                 }
             }
+            // A CAPTURED `const`: `const_regs` only stops this function's own
+            // assignments — a nested closure or a direct eval reaches the binding
+            // as an upvalue, which carries no const-ness at compile time. Tag the
+            // cell so those writes throw at runtime. After the initializing store,
+            // which is itself a plain CellSet.
+            if is_const && is_cell {
+                self.emit(Instr::MarkCellConst { reg });
+            }
             // A `using`/`await using x = init` registers its resource for disposal
             // at block exit (after the binding is stored). `using_scope_reg` is set
             // by the enclosing `compile_using_block`; it is always present for such a
@@ -886,7 +927,7 @@ impl<'a> FnCompiler<'a> {
         }
         // EVAL root with the name in the caller scope: assign through the
         // seeded caller upvalue (mirrors var_decl's eval-caller path).
-        if self.is_script && self.cx.eval_caller_scope.iter().any(|n| n == name) {
+        if self.is_script && self.cx.eval_caller_var(name) {
             if let Some(idx) = self.resolve_upvalue(name) {
                 return Binding::Upvalue(idx);
             }
@@ -906,12 +947,27 @@ impl<'a> FnCompiler<'a> {
     /// Phase 1 of a destructuring declaration: declare every leaf binding the
     /// pattern introduces, so they occupy stable (low) registers / global slots
     /// and any captured ones are boxed before extraction writes to them.
-    pub(crate) fn declare_pattern(&mut self, pat: &ast::Pattern) -> R<()> {
+    ///
+    /// `is_var` marks a `var` pattern (a `var` declaration or a `for (var … of/in
+    /// …)` head). A `var` leaf declares NO new binding: its VarDeclaredName was
+    /// bound when the function was entered (the hoisting pre-pass), so it must
+    /// reuse that binding — see the `P::Ident` arm.
+    pub(crate) fn declare_pattern(&mut self, pat: &ast::Pattern, is_var: bool) -> R<()> {
         use ast::Pattern as P;
         match pat {
             P::Ident(id) => {
                 if self.is_script && !self.pattern_block_local {
                     self.cx.global_slot(id);
+                } else if is_var {
+                    // A `var` leaf resolves to the EXISTING binding (the hoisted
+                    // function-scope var, a shadowing catch parameter, an eval
+                    // caller binding), exactly like a `for (var x of …)` head.
+                    // Minting a fresh register here shadowed the hoisted one
+                    // within this scope while `snapshot`/`capture_source` — which
+                    // scan scopes front-to-back — still handed the HOISTED cell to
+                    // any closure the initializer creates: the closure then read a
+                    // cell extraction never wrote (`var [x,y] = [1,()=>x]`).
+                    self.head_var_binding(id);
                 } else if self.scopes.len() == 1 && self.entry_lexicals.contains(&**id) {
                     // Pre-created as a cell at entry (a captured forward-referenced
                     // lexical); reuse it so extraction and the capturing closure
@@ -930,13 +986,13 @@ impl<'a> FnCompiler<'a> {
                 }
                 Ok(())
             }
-            P::Assign { left, .. } => self.declare_pattern(left),
+            P::Assign { left, .. } => self.declare_pattern(left, is_var),
             P::Object { props, rest } => {
                 for prop in props {
-                    self.declare_pattern(&prop.value)?;
+                    self.declare_pattern(&prop.value, is_var)?;
                 }
                 if let Some(rest) = rest {
-                    self.declare_pattern(rest)?;
+                    self.declare_pattern(rest, is_var)?;
                 }
                 Ok(())
             }
@@ -946,14 +1002,34 @@ impl<'a> FnCompiler<'a> {
             // binding LAST, exactly as before.
             P::Array(elems) => {
                 for el in elems.iter().flatten() {
-                    self.declare_pattern(&el.pat)?;
+                    self.declare_pattern(&el.pat, is_var)?;
                 }
                 Ok(())
             }
             // Reached for a rest element (array or parameter list). The binding
             // it introduces is the inner pattern's.
-            P::Rest(inner) => self.declare_pattern(inner),
+            P::Rest(inner) => self.declare_pattern(inner, is_var),
         }
+    }
+
+    /// The registers a just-declared pattern's leaves occupy, innermost binding
+    /// first — the same reverse walk `resolve` does, so a head leaf that shadows
+    /// an outer same-named local is found (`let a; for (const {a} of …)`).
+    pub(crate) fn pattern_leaf_regs(&self, pat: &ast::Pattern) -> Vec<Reg> {
+        let mut names = std::collections::HashSet::new();
+        capture::collect_pattern_names(pat, &mut names);
+        // Sorted: callers EMIT per register, so raw HashSet order would permute
+        // the instruction stream between compiles of the same source.
+        sorted_name_vec(&names)
+            .iter()
+            .filter_map(|n| {
+                self.scopes
+                    .iter()
+                    .rev()
+                    .find_map(|s| s.iter().rev().find(|(nm, _)| nm == n))
+                    .map(|(_, r)| *r)
+            })
+            .collect()
     }
 
     /// Phase 2: extract values from `src` (the initializer's value) into the

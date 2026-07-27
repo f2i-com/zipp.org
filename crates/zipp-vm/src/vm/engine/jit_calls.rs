@@ -97,7 +97,7 @@ impl<'p> Vm<'p> {
             // The native callee bailed mid-body: finish this activation on the
             // interpreter over the SAME window via a transient frame. The frame
             // base is `new_base` into self.regs (stable — reserved capacity).
-            self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
+            self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
                 func: func_id,
                 base: new_base,
                 ip: bail as usize,
@@ -216,7 +216,7 @@ impl<'p> Vm<'p> {
         // and the recursion can't re-enter native → no livelock; frames grow to
         // MAX_FRAMES → RangeError on runaway.
         self.jit_recurse_depth += 1;
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
+        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
             func: func_id,
             base: new_base,
             ip: 0,

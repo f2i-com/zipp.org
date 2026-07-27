@@ -28,6 +28,24 @@ pub(crate) fn compound_assign_instr(op: AssignOp, dst: Reg, a: Reg, b: Reg) -> O
     })
 }
 
+/// Whether a labelled statement's body CONSUMES the label — an iteration
+/// statement or a `switch`, which push their own break frame (and, for the
+/// loops, need the label for `continue label`). Everything else gets the
+/// generic `label_frame` wrapper so `break label` can still complete it.
+/// A nested `LabelledStatement` is deliberately NOT a consumer: `a: b: for(;;)`
+/// gives `a` its own frame and lets the loop take `b`.
+pub(crate) fn stmt_takes_label(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::While { .. }
+            | Stmt::DoWhile { .. }
+            | Stmt::For { .. }
+            | Stmt::ForOf { .. }
+            | Stmt::ForIn { .. }
+            | Stmt::Switch { .. }
+    )
+}
+
 /// The string of an `export`/`import` ModuleExportName (`foo`, `foo as bar`,
 /// `"a-b"`), for recording a module's (exported, local) export pairs.
 pub(crate) fn module_export_name(n: &ModuleExportName) -> String {

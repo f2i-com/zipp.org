@@ -333,6 +333,20 @@ impl<'p> Vm<'p> {
             }
             // A function's assigned own properties (`fn.x = y`).
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
+                // A legacy sloppy function's own `caller`/`arguments`: a LIVE
+                // value read from the stack, reported with the fixed attributes
+                // engines give them (nothing about them is writable or
+                // configurable), so hasOwnProperty/gOPD agree with the read.
+                if self.fn_has_legacy_caller_prop(idx, key)
+                    && self.fn_props.get(&idx).map_or(true, |m| m.pos(key).is_none())
+                {
+                    let v = if key == "caller" {
+                        self.legacy_fn_caller(idx)
+                    } else {
+                        self.legacy_fn_arguments(idx)
+                    };
+                    return self.make_data_descriptor(v, false, false, false);
+                }
                 self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
             }
             // A TypedArray's integer-indexed element: a data descriptor
@@ -591,6 +605,13 @@ impl<'p> Vm<'p> {
                     }
                     if has_name || fp_has("name") {
                         keys.push("name".to_string());
+                    }
+                    // A legacy sloppy function's own `arguments`/`caller` are
+                    // created with the function, right after `name` and before
+                    // `prototype` — the order engines report.
+                    if self.fn_has_legacy_caller_prop(idx, "arguments") && !fp_has("arguments") {
+                        keys.push("arguments".to_string());
+                        keys.push("caller".to_string());
                     }
                     if has_proto_early {
                         keys.push("prototype".to_string());

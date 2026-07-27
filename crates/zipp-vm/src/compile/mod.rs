@@ -134,6 +134,14 @@ struct Compiler {
     /// supplies as the eval closure's upvalue cells. Free names in the eval
     /// resolve to these as UpvalGet/UpvalSet before falling back to globals.
     eval_caller_scope: Vec<String>,
+    /// The subset of `eval_caller_scope` that lives in an ENCLOSING function of
+    /// the caller, not in the caller's own activation. Those bindings are
+    /// READABLE (they are ordinary upvalue cells) but they are not the eval's
+    /// variable environment, so a top-level `var`/`function` of the same name
+    /// creates a fresh binding that SHADOWS them rather than assigning through
+    /// — `function o(){ var a=1; (function(){ eval("var a=5") })(); return a }`
+    /// must still see 1.
+    eval_outer_scope: Vec<String>,
     /// FUNCTION-context sloppy eval: the eval's own var/function names that
     /// live in the caller's dynamic EvalScope (the Dyn global ops find them).
     eval_dynamic_names: std::collections::HashSet<String>,
@@ -580,6 +588,11 @@ struct LoopCtx {
     break_jumps: Vec<u32>,
     continue_jumps: Vec<u32>,
     is_loop: bool,
+    /// Whether a BARE `break` may target this frame. True for iteration
+    /// statements and `switch` (the only two the grammar lets an unlabelled
+    /// `break` leave), false for the frame a labelled non-loop statement pushes
+    /// — `L: if (x) { break; }` is a SyntaxError even though `break L` is fine.
+    bare_breakable: bool,
     /// The label attached to this loop/switch (`outer: for …`), for labeled
     /// `break outer` / `continue outer`.
     label: Option<String>,
@@ -614,6 +627,7 @@ impl LoopCtx {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             is_loop: true,
+            bare_breakable: true,
             label,
             handler_depth,
             iter_close: None,
@@ -624,7 +638,21 @@ impl LoopCtx {
             break_jumps: Vec::new(),
             continue_jumps: Vec::new(),
             is_loop: false,
+            bare_breakable: true,
             label,
+            handler_depth,
+            iter_close: None,
+        }
+    }
+    /// The frame a LABELLED non-loop/non-switch statement pushes so `break
+    /// label` can complete it (14.13.3). Reachable only by its own label.
+    fn label_frame(label: String, handler_depth: usize) -> LoopCtx {
+        LoopCtx {
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            is_loop: false,
+            bare_breakable: false,
+            label: Some(label),
             handler_depth,
             iter_close: None,
         }

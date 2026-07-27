@@ -77,9 +77,7 @@ impl<'a> FnCompiler<'a> {
             }
         }
         if self.is_script {
-            let caller_b33_upval = if self.cx.eval_fn_context
-                && self.cx.eval_caller_scope.iter().any(|c| c == name)
-            {
+            let caller_b33_upval = if self.cx.eval_fn_context && self.cx.eval_caller_var(name) {
                 self.resolve_upvalue(name)
             } else {
                 None
@@ -150,7 +148,7 @@ impl<'a> FnCompiler<'a> {
         {
             if let Some(ui) = name
                 .as_deref()
-                .filter(|n| self.cx.eval_caller_scope.iter().any(|c| c == n))
+                .filter(|n| self.cx.eval_caller_var(n))
                 .and_then(|n| self.resolve_upvalue(n))
             {
                 self.cx.functions.push(proto);
@@ -223,7 +221,7 @@ impl<'a> FnCompiler<'a> {
                     if self.is_script
                         && b33_applicable
                         && self.cx.eval_fn_context
-                        && self.cx.eval_caller_scope.iter().any(|c| c == n) =>
+                        && self.cx.eval_caller_var(n) =>
                 {
                     self.resolve_upvalue(n)
                 }

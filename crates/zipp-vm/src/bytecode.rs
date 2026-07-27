@@ -488,6 +488,14 @@ pub enum Instr {
     /// through it (UpvalSet / StoreUpvalDyn) is a silent no-op in sloppy code
     /// and a TypeError in strict code.
     MakeCellFnName { reg: Reg },
+    /// Tag the cell already in `reg` IMMUTABLE — a `const`/`using` binding that a
+    /// nested closure captures. Emitted after the declaration's initializing
+    /// store (a per-iteration loop binding re-tags its fresh cell each turn),
+    /// because the declaring function's own writes are rejected at compile time
+    /// and only writes THROUGH the closure (UpvalSet / StoreUpvalDyn) need the
+    /// runtime check. Unlike `MakeCellFnName`, the write always throws a
+    /// TypeError — sloppy code does not get a silent no-op for `const`.
+    MarkCellConst { reg: Reg },
     /// `dst = *<cell in reg>` — read a captured local's cell.
     CellGet { dst: Reg, cell: Reg },
     /// `*<cell in reg> = src` — write a captured local's cell.

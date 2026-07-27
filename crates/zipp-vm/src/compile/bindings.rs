@@ -534,7 +534,7 @@ impl<'a> FnCompiler<'a> {
                     if let Some(default) = default {
                         self.apply_default_in_place((i + 1) as Reg, default)?;
                     }
-                    self.declare_pattern(pat)?;
+                    self.declare_pattern(pat, false)?;
                     let save = self.next_reg;
                     self.extract_pattern(pat, (i + 1) as Reg)?;
                     self.next_reg = save;
@@ -548,7 +548,7 @@ impl<'a> FnCompiler<'a> {
         if let Some(rest) = rest {
             if !matches!(rest, Pattern::Ident(_)) {
                 if let Some(rr) = self.rest_reg {
-                    self.declare_pattern(rest)?;
+                    self.declare_pattern(rest, false)?;
                     let save = self.next_reg;
                     self.extract_pattern(rest, rr)?;
                     self.next_reg = save;

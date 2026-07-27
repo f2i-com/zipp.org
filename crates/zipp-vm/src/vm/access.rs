@@ -238,6 +238,13 @@ impl<'p> Vm<'p> {
         if key == "prototype" && self.callable_has_prototype(obj) {
             return Value::bool(false);
         }
+        // A legacy sloppy function's own `caller`/`arguments` are non-configurable
+        // too — `delete f.caller` fails and the live property stays.
+        if self.fn_has_legacy_caller_prop(idx, key)
+            && self.fn_props.get(&idx).map_or(true, |m| m.pos(key).is_none())
+        {
+            return Value::bool(false);
+        }
         // A callable's `name`/`length` are configurable: record the deletion so
         // the synthesized property stops appearing (own-property queries + reads).
         // An fn_props OVERRIDE (defineProperty'd or a setup-time SetFunctionName)
@@ -256,10 +263,28 @@ impl<'p> Vm<'p> {
             if ovr_attr == Some(false) {
                 return Value::bool(false);
             }
-            if ovr_attr.is_some() || self.callable_has_intrinsic(obj, key) {
+            // A class element named `name`/`length` (`static name(){}`,
+            // `static get name()`, `static set name(_)`, `static length = …`) is
+            // defined OVER the ClassDefinitionEvaluation SetFunctionName result, so
+            // the class owns exactly ONE such property. Deleting it must tombstone
+            // the synthesized intrinsic too, or the class's own name would resurface
+            // as a brand-new own property instead of exposing the parent's.
+            let class_own = matches!(self.heap.get(idx), HeapObj::Class(c)
+                if c.statics.pos(key).is_some()
+                    || c.static_getters.iter().any(|(k, _)| k == key)
+                    || c.static_setters.iter().any(|(k, _)| k == key));
+            if ovr_attr.is_some() || class_own || self.callable_has_intrinsic(obj, key) {
                 if ovr_attr.is_some() {
                     if let Some(m) = self.fn_props.get_mut(&idx) {
                         m.remove(key);
+                    }
+                    self.heap.bump_version(idx);
+                }
+                if class_own {
+                    if let HeapObj::Class(c) = self.heap.get_mut(idx) {
+                        c.statics.remove(key);
+                        c.static_getters.retain(|(k, _)| k != key);
+                        c.static_setters.retain(|(k, _)| k != key);
                     }
                     self.heap.bump_version(idx);
                 }
@@ -1187,10 +1212,16 @@ impl<'p> Vm<'p> {
             // `caller`/`arguments` on a restricted function (anything but a legacy
             // sloppy ordinary one) are the inherited %ThrowTypeError% accessors —
             // assigning either throws, mirroring the read poison (props.rs).
-            if (key == "caller" || key == "arguments") && self.fn_restricted_caller(idx) {
-                return Err(Thrown(format!(
-                    "TypeError: '{key}' may not be assigned on strict-mode or bound functions"
-                )));
+            if key == "caller" || key == "arguments" {
+                if self.fn_restricted_caller(idx) {
+                    return Err(Thrown(format!(
+                        "TypeError: '{key}' may not be assigned on strict-mode or bound functions"
+                    )));
+                }
+                // A LEGACY sloppy ordinary function owns them as NON-WRITABLE data
+                // properties: the assignment is a sloppy no-op / strict TypeError,
+                // never a new own property that would shadow the live value.
+                return self.reject_write(key, strict);
             }
             // Reassigning `fn.prototype = value` redirects what `new fn()` / the
             // `.prototype` getter see. ANY value is honoured (incl. a non-object —
