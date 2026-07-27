@@ -1316,6 +1316,56 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B49 — B36's MARGINAL term: 40% of it IS allocation, and interning it still
+does not pay
+
+Splitting the 36.2ns/key that remains after B48, on a 32-key object:
+
+| | zipp | node |
+|---|---|---|
+| `for (k in o)` | 36.2 | 12.8 |
+| `Object.keys(o)` + a plain loop over the result | 31.0 | 9.1 |
+| `Object.keys(o)` alone | **27.3** | 8.6 |
+| a plain loop over a 32-element array | 2.1 | 0.8 |
+
+**75% of the marginal cost is building the key array**, not the for-in protocol
+(5.2ns) and not iterating the result (3.7ns).
+
+And the allocation inside that is measurable, using the heap's own pre-interned
+single-ASCII-char strings as the control — `alloc_str` reuses those slots, so a
+one-char key allocates nothing:
+
+| `Object.keys` over 32 keys | ns/key |
+|---|---|
+| one-char keys (pre-interned, no allocation) | **18.8** |
+| multi-char keys (fresh `JsStr` + heap slot) | **31.0** |
+
+So the heap string is **12.2ns, ~40% of the marginal term** — which is B37's
+"creating any heap object costs ~20ns" showing up again.
+
+**B29 refuted interning at +0.1%. That refutation had EXPIRED**, and re-testing
+it was right: B29 measured on an 8-key object where B36's 151ns per-call fixed
+cost swamped the per-key term. B48 removed that fixed cost. Re-landed, the
+interner is worth **`Object.keys` 27.6 -> 22.4ns/key (-19%)** and **for-in
+37.0 -> 32.6**.
+
+**And it still does not pay on the suite, so it is reverted again.**
+`json-large` measured **+1.0%** across two independent runs. Ruled out: the
+failed probes past the cap (bypassing the table entirely once full — the
+self-tuning trick that fixed B43 — changed nothing). The remaining suspect is
+that ~1,500 interned strings become permanent GC ROOTS traced on every
+collection, and `json-large` collects often. Not chased further: a microbench win
+that costs the benchmark suite 1% is not shippable at face value.
+
+**What the next attempt should do differently:** make the interned strings NOT
+permanent roots — a weak side table swept with the heap, or entries reclaimed
+when the string is otherwise unreachable — and re-measure. The 12.2ns is real and
+still on the table; the rooting is what has to go.
+
+Recorded twice now, which is the point: the same idea, refuted for two DIFFERENT
+reasons, at two different times. The first refutation was measurement error of a
+kind (wrong workload); the second is a real cost that has a known fix.
+
 ### B48 — B36's for-in fixed cost: it was the prototype walk, not the allocations
 
 B36 fitted `for-in` at **A = 134ns fixed + 30.5ns/key** and guessed the fixed
