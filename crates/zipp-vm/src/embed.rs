@@ -302,6 +302,19 @@ impl ScriptState {
         }
     }
 
+    /// Approximate resident heap, in bytes.
+    ///
+    /// Slot count times the size of a heap object. Slots are never returned to
+    /// the allocator once claimed, so this is a HIGH-WATER figure — the peak the
+    /// script reached, not what it holds now — which is the more useful number
+    /// for a host reporting resource use, and the one a limit would be set
+    /// against. It counts the object table only: a string or array payload
+    /// lives in its own allocation and is not included, so treat this as an
+    /// indicator rather than an accounting of every byte.
+    pub fn heap_bytes(&self) -> usize {
+        self.vm.as_ref().map_or(0, |vm| vm.heap_bytes())
+    }
+
     /// Run pending microtasks without calling anything.
     pub fn pump(&mut self) {
         if let Some(vm) = self.vm.as_mut() {

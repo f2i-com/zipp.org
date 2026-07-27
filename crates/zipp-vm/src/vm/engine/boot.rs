@@ -352,6 +352,11 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Approximate resident heap in bytes — see `embed::ScriptState::heap_bytes`.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.heap.len() * std::mem::size_of::<crate::heap::HeapObj>()
+    }
+
     /// Force the JIT on/off (overrides the `ZIPP_NOJIT` default). Used by the
     /// test suite to run a program both ways and assert the outputs match.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
