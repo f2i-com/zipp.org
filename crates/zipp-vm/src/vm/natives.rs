@@ -2838,6 +2838,14 @@ impl<'p> Vm<'p> {
                 let target = a0;
                 let this_arg = a1;
                 let args_list = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                // 28.1.1: `IsCallable(target)` is step 1, BEFORE
+                // CreateListFromArrayLike. The order is observable — building the
+                // list reads `length` and the indices, so a throwing `length`
+                // getter on the argument object surfaced instead of the
+                // TypeError the non-callable target owes.
+                if !self.is_callable(target) {
+                    return Err(Thrown("TypeError: Reflect.apply target is not a function".into()));
+                }
                 // Reflect.apply requires an array-like argumentsList (CreateListFromArrayLike).
                 let arg_vec = self.create_list_from_array_like(args_list)?;
                 self.call_value(target, this_arg, &arg_vec)?
@@ -3418,7 +3426,13 @@ impl<'p> Vm<'p> {
             WM_GET_OR_INSERT => self.weakmap_method(this, "getOrInsert", args)?,
             WM_GET_OR_INSERT_COMPUTED => self.weakmap_method(this, "getOrInsertComputed", args)?,
             SET_SIZE_GET => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                Some(HeapObj::Set(items)) => Value::num(items.len() as f64),
+                // Deleted entries are TOMBSTONED in place (a hole) so live
+                // iterators keep their cursor, so the count is the non-hole
+                // count — which the property fast path in `props/member.rs`
+                // already did and this, the extracted-getter path, did not.
+                Some(HeapObj::Set(items)) => {
+                    Value::num(items.iter().filter(|v| !v.is_hole()).count() as f64)
+                }
                 _ => {
                     return Err(Thrown(
                         "TypeError: get Set.prototype.size called on incompatible receiver".into(),
@@ -3426,7 +3440,9 @@ impl<'p> Vm<'p> {
                 }
             },
             MAP_SIZE_GET => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                Some(HeapObj::Map { keys, .. }) => Value::num(keys.len() as f64),
+                Some(HeapObj::Map { keys, .. }) => {
+                    Value::num(keys.iter().filter(|k| !k.is_hole()).count() as f64)
+                }
                 _ => {
                     return Err(Thrown(
                         "TypeError: get Map.prototype.size called on incompatible receiver".into(),
