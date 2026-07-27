@@ -88,20 +88,6 @@ struct Compiler {
     /// The full program source, kept so each function can record its exact
     /// source slice (by span) for `Function.prototype.toString`.
     source: String,
-    /// EXACT WTF-8 bytes of the source, present only when an eval'd code
-    /// string held lone surrogates (`source` is then the LOSSY view — U+FFFD
-    /// per surrogate; both encodings are 3 bytes, so byte offsets/spans
-    /// in `source` index `exact_src` identically). Lets a regex literal
-    /// recover its exact pattern bytes. None for well-formed sources (the
-    /// overwhelmingly common case) — zero cost there.
-    ///
-    /// NOTE: the recovery in `exprs.rs` indexes this by the REGEX LITERAL's
-    /// span, and `Expr::Regex` carries none — only `Function`, `Arrow` and
-    /// `Class` do. Whoever ports that site needs either a span on the regex node
-    /// or the pattern to arrive as a `StrVal::Utf16`, which is the whole point
-    /// of `StrVal` and would retire this field. Left in place here because
-    /// removing it is a behaviour change, not a type port.
-    exact_src: Option<Vec<u8>>,
     /// True when compiling an `eval` code string: the top-level script returns
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
@@ -257,8 +243,12 @@ struct Compiler {
 /// every intermediate level. `None` if no enclosing function binds `name`.
 fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
     let (parent, outer) = chain.split_last()?;
-    // Direct parent holds the cell as a local.
-    if let Some((_, reg)) = parent.cell_locals.iter().find(|(n, _)| n == name) {
+    // Direct parent holds the cell as a local. Scanned BACKWARDS: `cell_locals`
+    // is weakest-binding-first, so the last match is the innermost one in scope
+    // at the child's creation point — the binding `resolve` would pick in the
+    // parent. Taking the first match handed a closure inside `{ let a; }` the
+    // OUTER `a`'s cell.
+    if let Some((_, reg)) = parent.cell_locals.iter().rfind(|(n, _)| n == name) {
         return Some(UpvalSource::ParentLocal(*reg));
     }
     // Parent already captured it as an upvalue.

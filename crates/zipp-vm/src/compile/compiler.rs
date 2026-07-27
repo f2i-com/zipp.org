@@ -33,7 +33,6 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             hoisted_set: rustc_hash::FxHashSet::default(),
             source,
-            exact_src: None,
             eval_mode: false,
             eval_inherit_super: None,
             in_field_init: false,
@@ -373,7 +372,18 @@ impl Compiler {
             // its register into a cell so the arrow grabs the live cell as an upvalue.
             // (No-op when a formal named `arguments` suppressed the binding — the
             // arrow then captures the PARAMETER like any other name.)
-            if capture::nested_uses_arguments(body) {
+            //
+            // A body (or parameter default) that may DIRECT-EVAL needs the same
+            // treatment: `free_vars` cannot look inside the eval string, so
+            // nothing else marks `arguments` as used, and an unboxed binding is
+            // absent from the eval site map — `function(){ return eval("arguments") }`
+            // threw ReferenceError. A closure in a PARAMETER default is created
+            // before the body runs and captures the same object, which the
+            // body-only scan never sees.
+            if capture::nested_uses_arguments(body)
+                || body_refs_eval
+                || params_ast.is_some_and(capture::params_nested_use_arguments)
+            {
                 if let Some(r) = fc.arguments_reg {
                     fc.uses_arguments = true;
                     fc.emit(Instr::MakeCell { reg: r });
@@ -984,8 +994,12 @@ impl Compiler {
         fc.in_async = is_async;
         fc.reserve_arguments(); // class methods/ctors bind `arguments`
         // A nested arrow reading `arguments` captures this method's arguments
-        // object lexically — materialize + box it (see compile_function_body).
-        if capture::nested_uses_arguments(body) {
+        // object lexically — materialize + box it (see compile_function_body,
+        // whose direct-eval / parameter-default cases apply here identically).
+        if capture::nested_uses_arguments(body)
+            || cls_body_refs_eval
+            || params_ast.is_some_and(capture::params_nested_use_arguments)
+        {
             if let Some(r) = fc.arguments_reg {
                 fc.uses_arguments = true;
                 fc.emit(Instr::MakeCell { reg: r });

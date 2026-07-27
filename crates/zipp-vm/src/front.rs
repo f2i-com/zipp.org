@@ -19,7 +19,7 @@
 
 use crate::parse::ast::{Goal, Program};
 use crate::parse::parser::ParseOptions;
-use crate::parse::stmt::parse;
+use crate::parse::stmt::{parse, parse_exact};
 
 fn err_str(e: crate::parse::parser::SyntaxError) -> String {
     format!("SyntaxError: {}", e.msg.strip_prefix("SyntaxError: ").unwrap_or(&e.msg))
@@ -85,9 +85,18 @@ pub(crate) struct EvalFlags {
     pub allow_super: bool,
 }
 
-pub(crate) fn parse_eval(src: &str, flags: EvalFlags) -> Result<Program, String> {
-    parse(
+/// `exact` is the WTF-8 original of `src` when the code STRING held a lone
+/// surrogate — `src` is then the lossy view of it, and only a regex literal
+/// can carry such a code unit through to runtime (see
+/// [`crate::parse::lexer::Lexer::set_exact_src`]).
+pub(crate) fn parse_eval(
+    src: &str,
+    exact: Option<&[u8]>,
+    flags: EvalFlags,
+) -> Result<Program, String> {
+    parse_exact(
         src,
+        exact,
         ParseOptions {
             goal: Goal::EvalScript,
             force_strict: flags.force_strict,

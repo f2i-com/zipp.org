@@ -316,6 +316,45 @@ impl<'p> Vm<'p> {
             }
             return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
         }
+        // Every REMAINING exotic (Map, Set, Date, Promise, ArrayBuffer, DataView, a
+        // generator, a boxed Number/Boolean/Symbol wrapper, …) has no exotic own
+        // properties of its own: the only ones it can have are those ASSIGNED to it,
+        // and every such kind keeps them in the generic arr_props side table — the
+        // store getOwnPropertyNames/getOwnPropertyDescriptor already read. Without
+        // this the fallback below reported none, so `var m = new Map(); m.x = 1`
+        // was invisible to Object.keys/values/entries, for-in and JSON.stringify
+        // while `Object.getOwnPropertyNames(m)` and `m.hasOwnProperty("x")` both
+        // saw it. Values go through Get so a defineProperty'd getter runs.
+        // (A Class keeps its statics in ClassData, so it stays on the tail path.)
+        if obj.is_heap() && !matches!(self.heap.get(obj.heap_index()), HeapObj::Class(_)) {
+            let names: Vec<String> = match self.arr_props.get(&obj.heap_index()) {
+                Some(m) => spec_key_order(&m.keys)
+                    .into_iter()
+                    .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
+                    .map(|i| m.keys[i].clone())
+                    .collect(),
+                None => Vec::new(),
+            };
+            let mut out: Vec<Value> = Vec::with_capacity(names.len());
+            for k in names {
+                match what {
+                    EnumWhat::Keys => {
+                        let kv = self.alloc_str(k);
+                        out.push(kv);
+                    }
+                    EnumWhat::Values => {
+                        let v = self.get_member(obj, &k, obj)?;
+                        out.push(v);
+                    }
+                    EnumWhat::Entries => {
+                        let v = self.get_member(obj, &k, obj)?;
+                        let kv = self.alloc_str(k);
+                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))));
+                    }
+                }
+            }
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+        }
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Array(items) => {

@@ -56,6 +56,19 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether a RegExp's struct-backed `lastIndex` is writable. A
+    /// `defineProperty` records the cleared flag in `arr_props` — but so does
+    /// `Object.freeze(re)`, which runs DefinePropertyOrThrow over every own key
+    /// and `lastIndex` is the only one a RegExp has. Because the slot lives in
+    /// the struct rather than in the side table, freeze left no per-key entry
+    /// behind and the flag read as writable: a frozen global regex silently
+    /// advanced `lastIndex` instead of throwing.
+    pub(crate) fn regexp_last_index_writable(&self, idx: u32) -> bool {
+        self.arr_props.get(&idx).map_or(true, |m| {
+            !m.frozen && m.pos("lastIndex").map_or(true, |i| m.attrs[i].writable)
+        })
+    }
+
     /// True when `String.prototype.replace`'s internal regex fast path is
     /// UNOBSERVABLE for instance `re`: its [[Prototype]] is exactly
     /// %RegExp.prototype%, it has no own exec/flags/@@replace overrides, and
@@ -105,6 +118,13 @@ impl<'p> Vm<'p> {
             return false;
         }
         if !(last_index.is_number() && last_index.as_f64() == 0.0) {
+            return false;
+        }
+        // `@@replace` step 8.b is `Set(rx, "lastIndex", 0, true)` for a GLOBAL
+        // regex. The fast path skips it because `lastIndex` is already 0 — which
+        // is unobservable only while the property is writable; on a frozen regex
+        // that Set is a TypeError, and the fast path swallowed it.
+        if flags.contains('g') && !self.regexp_last_index_writable(re) {
             return false;
         }
         // `@@replace` also reads `global` and `unicode` off the INSTANCE, so a
@@ -316,6 +336,12 @@ impl<'p> Vm<'p> {
         let chars: Vec<char> = source.chars().collect();
         let mut out = String::new();
         let mut i = 0;
+        // A `/` inside a character class needs no escape — RegularExpressionClassChar
+        // admits it literally — and escaping it there made `new RegExp("[/]").source`
+        // report `[\/]`. An unescaped `[` opens the class and the next unescaped `]`
+        // closes it (classes do not nest for this purpose: `/[[]/]/` really does end
+        // its class at the first `]`).
+        let mut in_class = false;
         while i < chars.len() {
             let c = chars[i];
             if c == '\\' && i + 1 < chars.len() {
@@ -336,7 +362,15 @@ impl<'p> Vm<'p> {
                 continue;
             }
             match c {
-                '/' => out.push_str("\\/"),
+                '[' => {
+                    in_class = true;
+                    out.push(c);
+                }
+                ']' => {
+                    in_class = false;
+                    out.push(c);
+                }
+                '/' if !in_class => out.push_str("\\/"),
                 '\n' => out.push_str("\\n"),
                 '\r' => out.push_str("\\r"),
                 '\u{2028}' => out.push_str("\\u2028"),
@@ -362,6 +396,8 @@ impl<'p> Vm<'p> {
         let cps: Vec<u32> = crate::heap::wtf8_code_points(bytes).collect();
         let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 4);
         let mut i = 0;
+        // Same character-class rule as `escaped_source`: `/` is literal inside `[…]`.
+        let mut in_class = false;
         while i < cps.len() {
             let c = cps[i];
             if c == u32::from('\\') && i + 1 < cps.len() {
@@ -371,7 +407,15 @@ impl<'p> Vm<'p> {
                 continue;
             }
             match c {
-                0x2F => out.extend_from_slice(b"\\/"),
+                0x5B => {
+                    in_class = true;
+                    out.push(b'[');
+                }
+                0x5D => {
+                    in_class = false;
+                    out.push(b']');
+                }
+                0x2F if !in_class => out.extend_from_slice(b"\\/"),
                 0x0A => out.extend_from_slice(b"\\n"),
                 0x0D => out.extend_from_slice(b"\\r"),
                 0x2028 => out.extend_from_slice(b"\\u2028"),
@@ -872,19 +916,32 @@ impl<'p> Vm<'p> {
         // `input_val` + the result pieces below live in Rust locals across a
         // possible `lastIndex.valueOf` re-entry — hold GC off until we return.
         let _gc = self.gc_lock_guard();
-        // ONE heap.get for both the flag-derived bits AND the lastIndex slot
-        // (they share the same RegExp object). On a real RegExp the
-        // Get(R,"lastIndex") can never run user code: `lastIndex` is a
-        // non-configurable own DATA property whose value's source of truth is
-        // the heap slot (defineProperty writes the value through; only attrs
-        // live in arr_props) — so read the slot directly.
-        let (global, sticky, has_indices, unicode, li_v) = match self.heap.get(re_idx) {
-            HeapObj::RegExp { flags, last_index, .. } => (
+        // Get(R,"lastIndex") — on a real RegExp this can never run user code:
+        // `lastIndex` is a non-configurable own DATA property whose value's
+        // source of truth is the heap slot (defineProperty writes the value
+        // through; only attrs live in arr_props) — so read the slot directly.
+        let li_v = match self.heap.get(re_idx) {
+            HeapObj::RegExp { last_index, .. } => *last_index,
+            _ => {
+                return Err(Thrown(
+                    "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
+                ))
+            }
+        };
+        // ToLength(Get(R,"lastIndex")) is RegExpBuiltinExec step 4 and it
+        // PRECEDES the [[OriginalFlags]] / [[RegExpMatcher]] reads of steps
+        // 5-11: a `lastIndex.valueOf` may call `R.compile(pattern, flags)`,
+        // which replaces both, and the run must use what it left behind. The
+        // flag bits used to be fused into the same heap.get as the slot, so a
+        // recompile that added `g` never updated lastIndex and one that dropped
+        // `y` still clobbered it.
+        let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+        let (global, sticky, has_indices, unicode) = match self.heap.get(re_idx) {
+            HeapObj::RegExp { flags, .. } => (
                 flags.contains('g'),
                 flags.contains('y'),
                 flags.contains('d'),
                 flags.contains('u') || flags.contains('v'),
-                *last_index,
             ),
             _ => {
                 return Err(Thrown(
@@ -893,25 +950,8 @@ impl<'p> Vm<'p> {
             }
         };
         let stateful = global || sticky;
-        // ToLength(Get(R,"lastIndex")) — read UNCONDITIONALLY per
-        // RegExpBuiltinExec, but used as the search START only for a
-        // global/sticky regex (a non-stateful regex always starts at 0).
-        // When NOT stateful AND lastIndex already holds a plain Number (the
-        // common case — we wrote it, or `re.lastIndex = n` stored a number),
-        // ToLength is a pure arithmetic clamp whose RESULT is discarded: skip
-        // it. A non-Number lastIndex (e.g. `{valueOf(){throw}}` or a string)
-        // still runs ToLength so its observable coercion / throw fires exactly
-        // as before — only the unobservable numeric clamp is elided.
-        let start = if !stateful && li_v.is_number() {
-            0
-        } else {
-            let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
-            if stateful {
-                li
-            } else {
-                0
-            }
-        };
+        // Step 9: a non-global, non-sticky regex always searches from 0.
+        let start = if stateful { li } else { 0 };
         // ASCII subjects match in place over the heap bytes (offsets == unit
         // indices); anything else encodes the subject ONCE per exec.
         // `lastIndex` is already a unit index engine-wide, so it is the
@@ -1364,7 +1404,11 @@ impl<'p> Vm<'p> {
             }
             _ => Vec::new(),
         };
-        let callable = repl.is_heap() && self.heap.as_callable(repl.heap_index()).is_some();
+        // IsCallable(replaceValue) — the full predicate, not just a compiled
+        // Func/Closure: a bound function, a native, a class, or a Proxy of any
+        // of them is a functional replacer too, and testing only the two
+        // compiled shapes ToString'd it into a literal template instead.
+        let callable = self.is_callable(repl);
         let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
         // No match ⇒ the result is the subject unchanged (T0.4): return it as-is,
         // after the observable `ToString(replaceValue)` above, skipping the full
@@ -1484,7 +1528,11 @@ impl<'p> Vm<'p> {
                 None => Vec::new(),
             }
         };
-        let callable = repl.is_heap() && self.heap.as_callable(repl.heap_index()).is_some();
+        // IsCallable(replaceValue) — the full predicate, not just a compiled
+        // Func/Closure: a bound function, a native, a class, or a Proxy of any
+        // of them is a functional replacer too, and testing only the two
+        // compiled shapes ToString'd it into a literal template instead.
+        let callable = self.is_callable(repl);
         let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
         // No match ⇒ the result is the subject unchanged (T0.4): return it as-is,
         // after the observable `ToString(replaceValue)`, skipping the subject

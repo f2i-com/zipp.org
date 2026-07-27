@@ -22,7 +22,79 @@ fn regexp_flag_char(key: &str) -> Option<char> {
     })
 }
 
+/// The %RegExp.prototype% getter a RegExp instance's `key` resolves to. These
+/// ten names are ACCESSORS on the prototype — an instance owns none of them —
+/// so `Get(re, key)` is an ordinary prototype-chain lookup, not an internal-slot
+/// read.
+fn regexp_intrinsic_accessor(key: &str) -> Option<u16> {
+    Some(match key {
+        "source" => native::REGEXP_GET_SOURCE,
+        "flags" => native::REGEXP_GET_FLAGS,
+        "global" => native::REGEXP_GET_GLOBAL,
+        "ignoreCase" => native::REGEXP_GET_IGNORECASE,
+        "multiline" => native::REGEXP_GET_MULTILINE,
+        "dotAll" => native::REGEXP_GET_DOTALL,
+        "unicode" => native::REGEXP_GET_UNICODE,
+        "unicodeSets" => native::REGEXP_GET_UNICODESETS,
+        "sticky" => native::REGEXP_GET_STICKY,
+        "hasIndices" => native::REGEXP_GET_HASINDICES,
+        _ => return None,
+    })
+}
+
+/// Where `Get(re, key)` lands for one of those ten names when the instance has
+/// no own override.
+enum RegExpAccessor {
+    /// The chain still holds the intrinsic getter — answer from the slots.
+    Intrinsic,
+    /// Something shadows it (a subclass getter, a redefined prototype slot).
+    Override(Value, PropAttr),
+    /// No such property anywhere on the chain — Get is `undefined`.
+    Absent,
+}
+
 impl<'p> Vm<'p> {
+    /// Walk a RegExp instance's PROTOTYPE CHAIN for one of %RegExp.prototype%'s
+    /// accessor names, reporting whether the intrinsic getter is still what a
+    /// spec `Get` would reach. The common instance sits directly on
+    /// %RegExp.prototype% with the slot untouched, so this is one map lookup.
+    fn regexp_accessor_source(
+        &self,
+        obj_idx: u32,
+        key: &str,
+        getter_id: u16,
+    ) -> RegExpAccessor {
+        let mut p = self.proto_of.get(&obj_idx).copied().unwrap_or(
+            if self.regexp_proto != 0 {
+                Value::heap(self.regexp_proto)
+            } else {
+                Value::NULL
+            },
+        );
+        for _ in 0..32 {
+            if !p.is_heap() {
+                break;
+            }
+            let pi = p.heap_index();
+            let entry = match self.heap.get(pi) {
+                HeapObj::Object(m) => m.pos(key).map(|i| (m.vals[i], m.attrs[i])),
+                _ => None,
+            };
+            if let Some((raw, attr)) = entry {
+                let intrinsic = raw.is_heap()
+                    && matches!(self.heap.get(raw.heap_index()),
+                        HeapObj::Native(id) if *id == getter_id);
+                return if intrinsic {
+                    RegExpAccessor::Intrinsic
+                } else {
+                    RegExpAccessor::Override(raw, attr)
+                };
+            }
+            p = self.proto_of.get(&pi).copied().unwrap_or(Value::NULL);
+        }
+        RegExpAccessor::Absent
+    }
+
     /// Like `proto_member`, but ACCESSOR-AWARE: when the property found on the
     /// chain is a getter (e.g. a user `Object.defineProperty(TA.prototype,
     /// "constructor", {get})`), it is invoked with `receiver`. Used by the
@@ -856,41 +928,17 @@ impl<'p> Vm<'p> {
                     return Ok(raw);
                 }
             }
-            // `get RegExp.prototype.flags` (no own override): build the string by
-            // reading each per-flag accessor off the RECEIVER in canonical order — so
-            // a throwing `global`/`unicode`/… getter or a per-flag own override is
-            // observed (e.g. by `@@match`/`@@replace`, which read Get(rx,"flags")),
-            // rather than synthesizing from the internal flag string.
-            if key == "flags" {
-                // Spec Get resolves to %RegExp.prototype%'s `flags` accessor.
-                // When that slot was REPLACED (a defineProperty'd getter or data
-                // property, possibly on a custom prototype chain), defer to it —
-                // only the intrinsic accessor synthesizes from the per-flag
-                // getters below (`''.matchAll(/a/g)` must observe a redefined
-                // RegExp.prototype.flags returning undefined).
-                let mut p = self.proto_of.get(&obj.heap_index()).copied().unwrap_or(
-                    if self.regexp_proto != 0 {
-                        Value::heap(self.regexp_proto)
-                    } else {
-                        Value::NULL
-                    },
-                );
-                for _ in 0..32 {
-                    if !p.is_heap() {
-                        break;
-                    }
-                    let pi = p.heap_index();
-                    let entry = match self.heap.get(pi) {
-                        HeapObj::Object(m) => m.pos("flags").map(|i| (m.vals[i], m.attrs[i])),
-                        _ => None,
-                    };
-                    if let Some((raw, attr)) = entry {
-                        let intrinsic = raw.is_heap()
-                            && matches!(self.heap.get(raw.heap_index()),
-                                HeapObj::Native(id) if *id == native::REGEXP_GET_FLAGS);
-                        if intrinsic {
-                            break;
-                        }
+            // `source`, `flags` and the eight flag booleans are ACCESSORS on
+            // %RegExp.prototype%, so the spec Get resolves them through the
+            // prototype chain. Answering them from the internal slots outright
+            // made `class R extends RegExp { get global() { return true; } }`
+            // report the pattern's own flags, and left `re.flags` as `""` after
+            // `delete RegExp.prototype.flags` (it must be `undefined` — that is
+            // what turns `"a".split(/a/)` into the spec's SyntaxError).
+            if let Some(getter_id) = regexp_intrinsic_accessor(key) {
+                match self.regexp_accessor_source(obj.heap_index(), key, getter_id) {
+                    RegExpAccessor::Absent => return Ok(Value::UNDEFINED),
+                    RegExpAccessor::Override(raw, attr) => {
                         return if attr.accessor {
                             if raw == Value::UNDEFINED {
                                 Ok(Value::UNDEFINED)
@@ -901,8 +949,16 @@ impl<'p> Vm<'p> {
                             Ok(raw)
                         };
                     }
-                    p = self.proto_of.get(&pi).copied().unwrap_or(Value::NULL);
+                    // Intrinsic: fall through to the slot-backed answers below.
+                    RegExpAccessor::Intrinsic => {}
                 }
+            }
+            // `get RegExp.prototype.flags` (intrinsic): build the string by
+            // reading each per-flag accessor off the RECEIVER in canonical order — so
+            // a throwing `global`/`unicode`/… getter or a per-flag own override is
+            // observed (e.g. by `@@match`/`@@replace`, which read Get(rx,"flags")),
+            // rather than synthesizing from the internal flag string.
+            if key == "flags" {
                 let mut out = String::new();
                 for (prop, ch) in [
                     ("hasIndices", 'd'),

@@ -713,6 +713,7 @@ impl<'p> Vm<'p> {
         // explicit statement scan is gone.
         let ast = crate::front::parse_eval(
             code,
+            exact_src,
             crate::front::EvalFlags {
                 force_strict,
                 allow_new_target: force_new_target_ok,
@@ -797,7 +798,6 @@ impl<'p> Vm<'p> {
                 .map(|(_, _, o)| o.clone())
                 .unwrap_or_default(),
             eval_scope_idx.is_some(),
-            exact_src,
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),

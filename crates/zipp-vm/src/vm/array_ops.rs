@@ -31,11 +31,24 @@ impl<'p> Vm<'p> {
         let snapshot = self.array_snapshot(idx);
         // The receiver passed to the callback as its 3rd argument.
         let receiver = Value::heap(idx);
+        // map/filter step 5: ArraySpeciesCreate(O, len | 0) runs BEFORE the first
+        // callback, so the `constructor`/@@species Gets and the species
+        // constructor observe the array as it was; each result element is then
+        // defined on the target as it is produced. Only a CUSTOM species yields a
+        // target — the ordinary-array answer (`None`) keeps the dense `out` Vec,
+        // so the hot path is unchanged.
+        let species_target = match mode {
+            EachMode::Map => self.array_species_create(receiver, snapshot.len())?,
+            EachMode::Filter => self.array_species_create(receiver, 0)?,
+            EachMode::ForEach => None,
+        };
         // The fused kernels inline the callback over (element, index) only and run
         // with `this`=undefined, so they cannot honour a thisArg, a 3rd "array"
         // parameter, or `arguments`. Disable them when the callback could observe
         // any of those (the per-element path below handles every case correctly).
-        let kernel_ok = this_arg.is_undefined();
+        // A species target also rules them out: they fill `out` densely instead of
+        // running CreateDataPropertyOrThrow per element.
+        let kernel_ok = this_arg.is_undefined() && species_target.is_none();
         let collect = matches!(mode, EachMode::Map | EachMode::Filter);
         let mut out: Vec<Value> =
             if collect { Vec::with_capacity(snapshot.len()) } else { Vec::new() };
@@ -180,31 +193,53 @@ impl<'p> Vm<'p> {
         }
 
         let mut err = None;
+        // The next index to write on the result: `out.len()` when buffering, and
+        // the same count when a kernel already filled the head of `out`.
+        let mut n = out.len();
         for i in start..snapshot.len() {
             // Live read (the callback may have mutated this element or shortened the
             // array): a present index uses its current value; an index now past the
-            // live length is absent — `map` keeps a placeholder so its result length
-            // stays the original, `filter`/`forEach` skip it (HasProperty is false).
+            // live length is absent — `map` skips it but still advances the result
+            // index (the gap stays a hole), `filter`/`forEach` skip it entirely.
             let v = match self.array_dense_or_proto_get(idx, i)? {
                 Some(v) => v,
                 None => {
                     if matches!(mode, EachMode::Map) {
-                        out.push(Value::UNDEFINED);
+                        if species_target.is_none() {
+                            out.push(Value::HOLE);
+                        }
+                        n += 1;
                     }
                     continue;
                 }
             };
             let args = [v, Value::int(i as i32), receiver];
             match self.run_cb_elem(native, win, cb, &args, this_arg) {
-                Ok(r) => match mode {
-                    EachMode::Map => out.push(r),
-                    EachMode::Filter => {
-                        if self.truthy(r) {
-                            out.push(v);
+                Ok(r) => {
+                    let keep = match mode {
+                        EachMode::Map => Some(r),
+                        EachMode::Filter => {
+                            if self.truthy(r) {
+                                Some(v)
+                            } else {
+                                None
+                            }
                         }
+                        EachMode::ForEach => None,
+                    };
+                    if let Some(val) = keep {
+                        match species_target {
+                            Some(a) => {
+                                if let Err(e) = self.create_data_property_or_throw(a, n, val) {
+                                    err = Some(e);
+                                    break;
+                                }
+                            }
+                            None => out.push(val),
+                        }
+                        n += 1;
                     }
-                    EachMode::ForEach => {}
-                },
+                }
                 Err(e) => {
                     err = Some(e);
                     break;
@@ -219,13 +254,10 @@ impl<'p> Vm<'p> {
         }
         match mode {
             EachMode::ForEach => Ok(Some(Value::UNDEFINED)),
-            // map does ArraySpeciesCreate(O, len) — `out.len()` is the source length
-            // in the dense path; filter does ArraySpeciesCreate(O, 0).
-            EachMode::Map => {
-                let n = out.len();
-                Ok(Some(self.array_from_species(receiver, out, n)?))
-            }
-            EachMode::Filter => Ok(Some(self.array_from_species(receiver, out, 0)?)),
+            _ => Ok(Some(match species_target {
+                Some(a) => a,
+                None => Value::heap(self.heap.alloc(HeapObj::Array(out))),
+            })),
         }
     }
 
@@ -305,6 +337,29 @@ impl<'p> Vm<'p> {
             ));
         }
         Ok(Some(self.construct(species, &[Value::num(len as f64)])?))
+    }
+
+    /// Append one concat element at the running index `n`: define it on the
+    /// species target immediately (its [[DefineOwnProperty]] is observable), or
+    /// buffer it for the dense ArrayCreate result. A HOLE marks an ABSENT source
+    /// index — it is never defined, but `n` still advances so the gap survives.
+    fn concat_emit(
+        &mut self,
+        target: Option<Value>,
+        out: &mut Vec<Value>,
+        n: &mut usize,
+        v: Value,
+    ) -> Result<(), Thrown> {
+        match target {
+            Some(a) => {
+                if !v.is_hole() {
+                    self.create_data_property_or_throw(a, *n, v)?;
+                }
+            }
+            None => out.push(v),
+        }
+        *n += 1;
+        Ok(())
     }
 
     /// CreateDataPropertyOrThrow(O, ToString(index), value): install a fresh
@@ -540,18 +595,22 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::UNDEFINED))
             }
             "map" => {
-                // map does ArraySpeciesCreate(O, len); for a non-array O that is
-                // ArrayCreate(len), which throws RangeError when len > 2^32-1 — and
-                // it happens BEFORE any element is visited. (forEach/some/every/
-                // reduce create no array, and filter creates length 0, so only map
-                // validates here.)
-                // ArrayCreate(len) requires len <= 2^32-1; a larger finite length OR a
-                // non-finite one (Infinity, via ToLength → 2^53-1) is a RangeError.
-                if lenf > 4_294_967_295.0 {
+                // Step 5: ArraySpeciesCreate(O, len) runs BEFORE the first
+                // callback, and each result element is defined on the target as
+                // it is produced — a species constructor, and the target's
+                // defineProperty, are observable and may mutate the source. (The
+                // buffer-then-define shape ran every Get and every callback
+                // first, then the `constructor` lookup.)
+                let target = self.array_species_create(this, len)?;
+                // The ArrayCreate(len) inside ArraySpeciesCreate requires
+                // len <= 2^32-1; a larger finite length OR a non-finite one
+                // (Infinity, via ToLength → 2^53-1) is a RangeError. It only
+                // applies when no custom species took over the allocation.
+                if target.is_none() && lenf > 4_294_967_295.0 {
                     return Err(Thrown("RangeError: Invalid array length".into()));
                 }
-                // `out` is materialised DENSELY, so unlike the probe-only arms
-                // above its length is bounded by what the host can hold: a
+                // The result is materialised DENSELY, so unlike the probe-only
+                // arms above its length is bounded by what the host can hold: a
                 // 2^32-1 result would be 34 GB. V8 answers with a sparse array;
                 // zipp has no sparse result representation here, so it reports
                 // the documented RangeError rather than OOM-aborting the
@@ -565,25 +624,46 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                let mut out = vec![Value::UNDEFINED; len];
+                // A HOLE placeholder keeps an ABSENT source index absent in the
+                // result (`1 in [1,,3].map(f)` is false); an UNDEFINED one made
+                // the result dense.
+                let mut out = if target.is_some() { Vec::new() } else { vec![Value::HOLE; len] };
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get(this, k)? {
-                        out[k] = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        match target {
+                            Some(a) => self.create_data_property_or_throw(a, k, r)?,
+                            None => out[k] = r,
+                        }
                     }
                 }
-                Ok(Some(self.array_from_species(this, out, len)?))
+                Ok(Some(match target {
+                    Some(a) => a,
+                    None => Value::heap(self.heap.alloc(HeapObj::Array(out))),
+                }))
             }
             "filter" => {
+                // Step 5: ArraySpeciesCreate(O, 0) precedes the first callback,
+                // and each kept element is defined as it is selected.
+                let target = self.array_species_create(this, 0)?;
                 let mut out = Vec::new();
+                let mut n = 0usize;
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                         if self.truthy(r) {
-                            out.push(val);
+                            match target {
+                                Some(a) => self.create_data_property_or_throw(a, n, val)?,
+                                None => out.push(val),
+                            }
+                            n += 1;
                         }
                     }
                 }
-                Ok(Some(self.array_from_species(this, out, 0)?))
+                Ok(Some(match target {
+                    Some(a) => a,
+                    None => Value::heap(self.heap.alloc(HeapObj::Array(out))),
+                }))
             }
             "some" => {
                 for k in 0..len {
@@ -752,7 +832,9 @@ impl<'p> Vm<'p> {
                     len - 1
                 };
                 while k >= 0 {
-                    if self.has_property(this, idxv(k)) {
+                    // Proxy-aware HasProperty: a `has` trap must dispatch, and its
+                    // abrupt completion propagate (the &self form swallows both).
+                    if self.has_property_dyn(this, idxv(k))? {
                         let v = self.get_index(this, idxv(k))?;
                         if self.values_strict_eq(v, search) {
                             return Ok(Some(Value::num(k as f64))); // index may exceed i32 (length up to 2^53-1)
@@ -774,7 +856,7 @@ impl<'p> Vm<'p> {
                         if self.same_value_zero(v, search) {
                             return Ok(Some(Value::bool(true)));
                         }
-                    } else if self.has_property(this, idxv(k)) {
+                    } else if self.has_property_dyn(this, idxv(k))? {
                         let v = self.get_index(this, idxv(k))?;
                         if self.values_strict_eq(v, search) {
                             return Ok(Some(Value::num(k as f64))); // index may exceed i32 (length up to 2^53-1)
@@ -1524,17 +1606,21 @@ impl<'p> Vm<'p> {
         }
         // Likewise route the SEARCH methods off the dense fast path when the array
         // carries a side table (a defineProperty'd index accessor must have its getter
-        // invoked) or a virtual (sparse) length. HOLES only matter when a prototype
-        // could supply the missing index (indexOf/lastIndexOf consult HasProperty,
-        // includes Gets the chain): gate the O(len) hole scan behind the cheap
-        // proto-index flags — the plain-chain dense scans below handle holes
-        // in place (skip for indexOf/lastIndexOf, read-as-undefined for includes),
-        // instead of paying a full-array hole pre-scan on EVERY call.
+        // invoked) or a virtual (sparse) length. A REPLACED prototype also routes
+        // unconditionally: its HasProperty/Get are observable (a Proxy `has` trap) for
+        // every index the array does not own — including the indices a throwing or
+        // mutating `fromIndex` coercion has just removed, which the dense scan can
+        // never probe because it walks the LIVE Vec rather than the length captured
+        // before the coercion. On the plain Array.prototype chain only a HOLE exposes
+        // the prototype, so that case stays gated behind the cheap proto-index flag —
+        // the dense scans below handle holes in place (skip for indexOf/lastIndexOf,
+        // read-as-undefined for includes) instead of paying a full-array hole
+        // pre-scan on EVERY call.
         if matches!(name, "indexOf" | "lastIndexOf" | "includes")
             && (self.arr_props.contains_key(&idx)
                 || self.array_js_len.contains_key(&idx)
-                || ((self.array_proto_has_index || self.proto_of.contains_key(&idx))
-                    && self.array_has_holes(idx)))
+                || self.proto_of.contains_key(&idx)
+                || (self.array_proto_has_index && self.array_has_holes(idx)))
         {
             return self.array_like_search(Value::heap(idx), name, args);
         }
@@ -1584,23 +1670,26 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // shift/reverse mutate via the raw Vec — correct only when every slot is
-        // a plain own data element. A side table (accessor/attribute overrides),
-        // or holes that an inherited prototype index could cover, must run the
-        // spec HasProperty/Get/Set/Delete protocol (same gating as the callback
-        // and search families above).
-        if matches!(name, "shift" | "reverse")
+        // The in-place mutators move elements through the raw Vec — correct only
+        // when every slot is a plain own data element. A side table (accessor/
+        // attribute overrides), or holes that an inherited prototype index could
+        // cover, must run the spec HasProperty/Get/Set/Delete protocol (same
+        // gating as the callback and search families above): a `Vec::remove`/
+        // `Vec::splice`/`Vec::pop` cannot see a non-writable element (its Set must
+        // throw) nor a non-configurable one (its DeletePropertyOrThrow must throw).
+        if matches!(name, "shift" | "reverse" | "pop" | "unshift" | "splice")
             && (self.arr_props.contains_key(&idx)
                 || (self.array_has_holes(idx)
                     && (self.array_proto_has_index || self.proto_of.contains_key(&idx))))
         {
             return self.array_like_mutate(Value::heap(idx), name, args);
         }
-        // push/unshift Set a NEW index; when a prototype carries integer indices, that
-        // Set may hit a prototype setter (OrdinarySet, handled by set_index via the
-        // abstract al_set path). The fast Vec append below bypasses set_index, so route
-        // to the abstract path then. Gated on the flag, so the common fast path stands.
-        if (name == "push" || name == "unshift") && self.array_proto_has_index {
+        // push/unshift/splice Set a NEW index; when a prototype carries integer
+        // indices, that Set may hit a prototype setter (OrdinarySet, handled by
+        // set_index via the abstract al_set path). The fast Vec paths below bypass
+        // set_index, so route to the abstract path then. Gated on the flag, so the
+        // common fast path stands.
+        if matches!(name, "push" | "unshift" | "splice") && self.array_proto_has_index {
             return self.array_like_mutate(Value::heap(idx), name, args);
         }
         // A VIRTUAL-length (sparse) array's mutators must read and write `length`
@@ -1665,6 +1754,12 @@ impl<'p> Vm<'p> {
                         "TypeError: TypedArray is detached or out of bounds".into(),
                     ));
                 }
+                // LengthOfArrayLike is step 2, BEFORE the separator coerces: a
+                // `sep.toString` that shrinks the array still joins `len` slots.
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
                 // ToString the separator (undefined -> ","), and ToString each
                 // element — invoking a custom `toString`/`@@toPrimitive`, not the
                 // infallible `display`. (to_js_string short-circuits primitives to
@@ -1674,16 +1769,23 @@ impl<'p> Vm<'p> {
                 } else {
                     self.to_js_string(arg0)?
                 };
-                // Non-clean (side table / holes): per-index proto-aware Get —
-                // an inherited Array.prototype[k] at a hole joins its VALUE.
-                let snapshot = if self.arr_props.contains_key(&idx) || self.array_has_holes(idx)
-                {
-                    self.array_snapshot_get(idx)?
-                } else {
-                    self.array_snapshot(idx)
-                };
-                let mut parts: Vec<String> = Vec::with_capacity(snapshot.len());
-                for v in snapshot {
+                // Get(O,k) and ToString(element) INTERLEAVE, one index at a time:
+                // an element's `toString` that installs a prototype index, or that
+                // mutates the array, must be observed by the LATER reads. Reading
+                // every element up front froze them at their pre-toString values.
+                // A side table (defineProperty'd index accessor) makes the dense
+                // slot an unreliable placeholder, so those receivers always take
+                // the proto-aware HasProperty+Get path; everything else reads the
+                // dense slot and only defers for a hole / out-of-range index.
+                let side_table = self.arr_props.contains_key(&idx);
+                let mut parts: Vec<String> = Vec::with_capacity(len.min(4096));
+                for k in 0..len {
+                    let v = if side_table {
+                        self.array_iter_get(Value::heap(idx), k)?
+                    } else {
+                        self.array_dense_or_proto_get(idx, k)?
+                    };
+                    let v = v.unwrap_or(Value::UNDEFINED);
                     parts.push(if v.is_nullish() { String::new() } else { self.to_js_string(v)? });
                 }
                 Ok(Some(self.alloc_str(parts.join(&sep))))
@@ -1832,6 +1934,12 @@ impl<'p> Vm<'p> {
                 // Gets precede every @@isConcatSpreadable Get below.
                 let species_target = self.array_species_create(this_val, 0)?;
                 let mut out: Vec<Value> = Vec::new();
+                // Spec `n`, the next index on the result. With a species target the
+                // element is defined the moment it is read (step 5.c.iv is inside
+                // the element loop) — a target whose defineProperty mutates the
+                // SOURCE must be observed by the later reads; buffering every Get
+                // first made those reads stale.
+                let mut n: usize = 0;
                 for e in std::iter::once(this_val).chain(args.iter().copied()) {
                     if self.is_concat_spreadable(e)? {
                         // A CLEAN real array spreads via its dense storage (fast).
@@ -1846,20 +1954,22 @@ impl<'p> Vm<'p> {
                         } else {
                             None
                         };
-                        if let Some(n) = arr_n {
+                        if let Some(elen) = arr_n {
                             let eidx = e.heap_index();
-                            if !self.arr_props.contains_key(&eidx)
+                            if species_target.is_none()
+                                && !self.arr_props.contains_key(&eidx)
                                 && !self.arguments_objs.contains_key(&eidx)
                                 && !self.array_has_holes(eidx)
                             {
                                 let snap = self.array_snapshot(eidx);
+                                n += snap.len();
                                 out.extend(snap);
                             } else {
-                                for k in 0..n {
-                                    match self.array_iter_get(e, k)? {
-                                        Some(v) => out.push(v),
-                                        None => out.push(Value::HOLE),
-                                    }
+                                for k in 0..elen {
+                                    let v = self
+                                        .array_iter_get(e, k)?
+                                        .unwrap_or(Value::HOLE);
+                                    self.concat_emit(species_target, &mut out, &mut n, v)?;
                                 }
                             }
                         } else {
@@ -1868,29 +1978,24 @@ impl<'p> Vm<'p> {
                             // Step 5.c.iii: n + len > 2^53-1 is a TypeError BEFORE
                             // any element read (a MAX_SAFE_INTEGER-length spreadable
                             // must not loop 9e15 Gets).
-                            if out.len() as i64 + len > (1i64 << 53) - 1 {
+                            if n as i64 + len > (1i64 << 53) - 1 {
                                 return Err(Thrown(
                                     "TypeError: concat result length exceeds 2**53 - 1".into(),
                                 ));
                             }
                             for k in 0..len {
                                 let el = self.get_prop(e, &k.to_string())?;
-                                out.push(el);
+                                self.concat_emit(species_target, &mut out, &mut n, el)?;
                             }
                         }
                     } else {
-                        out.push(e);
+                        self.concat_emit(species_target, &mut out, &mut n, e)?;
                     }
                 }
                 match species_target {
                     None => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out))))),
                     Some(a) => {
-                        let n = out.len();
-                        for (i, v) in out.into_iter().enumerate() {
-                            if !v.is_hole() {
-                                self.create_data_property_or_throw(a, i, v)?;
-                            }
-                        }
+                        // Step 6: Set(A, "length", n, true).
                         self.set_prop(a, "length", Value::num(n as f64), true)?;
                         Ok(Some(a))
                     }
@@ -2366,9 +2471,15 @@ impl<'p> Vm<'p> {
                     (d.max(0) as usize).min(len - start)
                 };
                 let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
+                // Step 8: ArraySpeciesCreate(O, actualDeleteCount) precedes every
+                // element read and the mutation itself — a `constructor`/@@species
+                // getter, and the species constructor, must observe the array as it
+                // was BEFORE the splice (they ran after it, seeing the new length).
+                let species_target = self.array_species_create(Value::heap(idx), del)?;
                 let removed: Vec<Value> = match self.heap.get_mut(idx) {
+                    // Re-clamp to the current length (a coercion valueOf, or the
+                    // species constructor just called, may have resized).
                     HeapObj::Array(items) => {
-                        // Re-clamp to the current length (a coercion valueOf may have resized).
                         let n = items.len();
                         let st = start.min(n);
                         let en = (start + del).min(n);
@@ -2377,10 +2488,22 @@ impl<'p> Vm<'p> {
                     _ => Vec::new(),
                 };
                 self.heap.bump_version(idx); // length/contents changed
-                // splice returns the removed elements via
-                // ArraySpeciesCreate(O, actualDeleteCount).
                 let n = removed.len();
-                Ok(Some(self.array_from_species_len(Value::heap(idx), removed, n, true)?))
+                match species_target {
+                    None => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(removed))))),
+                    Some(a) => {
+                        for (i, v) in removed.into_iter().enumerate() {
+                            // A HOLE marks an ABSENT source index: it stays absent
+                            // on A rather than being defined as undefined.
+                            if !v.is_hole() {
+                                self.create_data_property_or_throw(a, i, v)?;
+                            }
+                        }
+                        // Step 10: Set(A, "length", actualDeleteCount, true).
+                        self.set_prop(a, "length", Value::num(n as f64), true)?;
+                        Ok(Some(a))
+                    }
+                }
             }
             // Array iterators (real iterator objects with .next(), proto =
             // %ArrayIteratorPrototype%). values() is also the default @@iterator.

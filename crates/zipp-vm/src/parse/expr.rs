@@ -739,24 +739,42 @@ impl<'s> Parser<'s> {
                 Ok(Expr::Str(v))
             }
             TokenKind::Regex { .. } => {
+                let start = self.cur().span.start;
                 let tok = self.bump_after_operand()?;
                 let TokenKind::Regex { pattern, flags } = tok.kind else { unreachable!() };
+                // EARLY ERROR (12.9.5): the FlagText of a RegularExpressionLiteral
+                // may hold no code point outside `dgimsuvy` and none of them
+                // twice, and `u`/`v` select mutually exclusive grammars. This is
+                // a SYNTAX error for the whole program — `/./G` must never run —
+                // whereas the RegExp CONSTRUCTOR raises the same conditions as a
+                // runtime SyntaxError from its own validation (`build_regexp`).
+                let mut seen = String::with_capacity(flags.len());
+                for c in flags.chars() {
+                    if !"dgimsuvy".contains(c) {
+                        return Err(SyntaxError::new(
+                            format!("SyntaxError: invalid regular expression flag '{c}'"),
+                            start,
+                        ));
+                    }
+                    if seen.contains(c) {
+                        return Err(SyntaxError::new(
+                            format!("SyntaxError: duplicate regular expression flag '{c}'"),
+                            start,
+                        ));
+                    }
+                    seen.push(c);
+                }
+                if seen.contains('u') && seen.contains('v') {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: the regular expression flags 'u' and 'v' are mutually exclusive",
+                        start,
+                    ));
+                }
                 // Canonical flag order, not source order: `/re/yu` reports its
                 // flags as "uy" (the `flags` getter enumerates in a fixed
                 // order, and `toString` goes through it), and the engine
-                // stores what it reports. Unknown letters keep their relative
-                // order at the end so the validator still names them.
-                let mut canon = String::with_capacity(flags.len());
-                for c in "dgimsuvy".chars() {
-                    if flags.contains(c) {
-                        canon.push(c);
-                    }
-                }
-                for c in flags.chars() {
-                    if !"dgimsuvy".contains(c) {
-                        canon.push(c);
-                    }
-                }
+                // stores what it reports.
+                let canon: String = "dgimsuvy".chars().filter(|c| seen.contains(*c)).collect();
                 Ok(Expr::Regex { pattern, flags: canon.into_boxed_str() })
             }
             TokenKind::Template { .. } => {

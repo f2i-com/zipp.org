@@ -216,7 +216,7 @@ impl Emitter {
                             self.emit_insn(Insn::Char(c))
                         } else {
                             core::debug_assert!(
-                                unicode::fold_code_point(c, self.result.flags.unicode) == c,
+                                unicode::fold_code_point(c, self.result.flags.unicode_mode()) == c,
                                 "Char {:x} should be folded",
                                 c
                             );
@@ -330,7 +330,7 @@ impl Emitter {
                     &Node::WordBoundary { invert, icase } => {
                         // Note `icase` is the node's effective flag (modifier groups may
                         // scope it); the unicode flag cannot be modifier-scoped.
-                        if self.result.flags.unicode && icase {
+                        if self.result.flags.unicode_mode() && icase {
                             self.emit_insn(Insn::WordBoundaryUnicodeICase { invert })
                         } else {
                             self.emit_insn(Insn::WordBoundary { invert })

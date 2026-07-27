@@ -144,7 +144,16 @@ pub(crate) fn fold_code_point(cu: u32, unicode: bool) -> u32 {
     if unicode {
         return fold(cu);
     }
-    uppercase(cu)
+    // Canonicalize step 9: a code unit >= 128 whose uppercase mapping lands
+    // BELOW 128 canonicalizes to itself. Without the guard `/s/i` matched
+    // U+017F (LATIN SMALL LETTER LONG S, which uppercases to "S") and `/k/i`
+    // matched U+212A — the case closure across the ASCII boundary is what the
+    // `u`/`v` flags buy, and a legacy pattern must not get it.
+    let up = uppercase(cu);
+    if cu >= 128 && up < 128 {
+        return cu;
+    }
+    up
 }
 
 pub fn fold(cu: u32) -> u32 {
@@ -191,10 +200,26 @@ fn uppercase(cu: u32) -> u32 {
     }
 }
 
+/// The transform table Canonicalize (22.2.2.9.2) runs on: simple case folding
+/// under `u`/`v`, plain toUppercase otherwise.
+fn canon_table(unicode: bool) -> &'static [FoldRange] {
+    if unicode { &FOLDS } else { &TO_UPPERCASE }
+}
+
+/// Whether `cu -> cs` is a transform Canonicalize actually performs. Only the
+/// non-unicode direction can decline: step 9 keeps a code unit >= 128 whose
+/// uppercase mapping is ASCII as itself, so a legacy `/[s]/i` does not grow to
+/// cover U+017F the way `/[s]/iu` does.
+#[inline]
+fn canon_applies(cu: u32, cs: u32, unicode: bool) -> bool {
+    unicode || cu < 128 || cs >= 128
+}
+
 // Add all folded characters in the given interval to the given code point set.
 // This skips characters which fold to themselves.
-fn fold_interval(iv: Interval, recv: &mut CodePointSet) {
-    let overlaps = FOLDS.equal_range_by(|tr| {
+fn fold_interval(iv: Interval, unicode: bool, recv: &mut CodePointSet) {
+    let table = canon_table(unicode);
+    let overlaps = table.equal_range_by(|tr| {
         if tr.first() > iv.last {
             Ordering::Greater
         } else if tr.last() < iv.first {
@@ -203,7 +228,7 @@ fn fold_interval(iv: Interval, recv: &mut CodePointSet) {
             Ordering::Equal
         }
     });
-    for fr in &FOLDS[overlaps] {
+    for fr in &table[overlaps] {
         debug_assert!(
             fr.transformed_from().overlaps(iv),
             "Interval does not overlap transform"
@@ -217,7 +242,7 @@ fn fold_interval(iv: Interval, recv: &mut CodePointSet) {
             // Optimization: when modulo is 1, every character in range gets transformed
             for cu in first_trans..(last_trans + 1) {
                 let cs = fr.add_delta(cu);
-                if cs != cu {
+                if cs != cu && canon_applies(cu, cs, unicode) {
                     recv.add_one(cs);
                 }
             }
@@ -229,7 +254,9 @@ fn fold_interval(iv: Interval, recv: &mut CodePointSet) {
             let mut cu = start_aligned;
             while cu <= last_trans {
                 let cs = fr.add_delta(cu);
-                recv.add_one(cs);
+                if canon_applies(cu, cs, unicode) {
+                    recv.add_one(cs);
+                }
                 cu += modulo;
             }
         }
@@ -238,10 +265,10 @@ fn fold_interval(iv: Interval, recv: &mut CodePointSet) {
 
 /// Find all characters that fold into the given interval and add them to the given code point set.
 /// This skips characters which fold to themselves.
-fn unfold_interval(iv: Interval, recv: &mut CodePointSet) {
+fn unfold_interval(iv: Interval, unicode: bool, recv: &mut CodePointSet) {
     // Note: We still need to check all ranges because the relationship between
     // transformed_from and transformed_to intervals can be complex
-    for tr in FOLDS.iter() {
+    for tr in canon_table(unicode).iter() {
         if !iv.overlaps(tr.transformed_to()) {
             continue;
         }
@@ -252,7 +279,7 @@ fn unfold_interval(iv: Interval, recv: &mut CodePointSet) {
 
         let mut process_cp = |cp| {
             let tcp = tr.apply(cp);
-            if tcp != cp && iv.contains(tcp) {
+            if tcp != cp && iv.contains(tcp) && canon_applies(cp, tcp, unicode) {
                 recv.add_one(cp);
             }
         };
@@ -302,7 +329,11 @@ pub fn unfold_char(c: u32) -> Vec<u32> {
 
 pub(crate) fn unfold_uppercase_char(c: u32) -> Vec<u32> {
     let mut res = vec![c];
-    let fcp = uppercase(c);
+    // Every step here goes through `fold_code_point`, never the raw table:
+    // the equivalence class is the one Canonicalize induces, so U+017F stays
+    // alone (its ASCII uppercase is not its canonical value) instead of being
+    // unfolded into `s`/`S` and matching `/s/i`.
+    let fcp = fold_code_point(c, false);
     if fcp != c {
         res.push(fcp);
     }
@@ -311,8 +342,7 @@ pub(crate) fn unfold_uppercase_char(c: u32) -> Vec<u32> {
             continue;
         }
         for cp in tr.transformed_from().codepoints() {
-            let tcp = tr.apply(cp);
-            if tcp == fcp {
+            if fold_code_point(cp, false) == fcp {
                 res.push(cp);
             }
         }
@@ -322,17 +352,23 @@ pub(crate) fn unfold_uppercase_char(c: u32) -> Vec<u32> {
     res
 }
 
-// Fold every character in \p input, then find all the prefolds.
-pub fn add_icase_code_points(mut input: CodePointSet) -> CodePointSet {
+/// Close a set under Canonicalize: the result holds every character whose
+/// canonical value is the canonical value of a member, which is what lets the
+/// matcher test raw membership instead of canonicalizing at every step.
+///
+/// `unicode` is HasEitherUnicodeFlag, NOT decoration — a legacy `i` pattern
+/// canonicalizes with toUppercase and the step-9 ASCII guard, so `/[k]/i` must
+/// not grow to cover U+212A even though `/[k]/iu` does.
+pub fn add_icase_code_points(mut input: CodePointSet, unicode: bool) -> CodePointSet {
     let mut folded = input.clone();
     for iv in input.intervals() {
-        fold_interval(*iv, &mut folded)
+        fold_interval(*iv, unicode, &mut folded)
     }
 
     // Reuse input storage.
     input.clone_from(&folded);
     for iv in folded.intervals() {
-        unfold_interval(*iv, &mut input);
+        unfold_interval(*iv, unicode, &mut input);
     }
     input
 }
@@ -547,7 +583,7 @@ mod tests {
                 }
                 let mut input = CodePointSet::new();
                 input.add(Interval { first, last });
-                let folded = add_icase_code_points(input);
+                let folded = add_icase_code_points(input, true);
                 assert_eq!(folded, expected);
                 from = last;
             }
@@ -584,7 +620,7 @@ mod tests {
                     }
                 }
                 let mut cps = CodePointSet::default();
-                fold_interval(Interval { first, last }, &mut cps);
+                fold_interval(Interval { first, last }, true, &mut cps);
                 assert_eq!(cps.intervals(), expected.intervals());
 
                 from = last;

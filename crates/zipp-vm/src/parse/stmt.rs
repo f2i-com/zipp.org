@@ -23,8 +23,14 @@ fn is_labelled_function(s: &Stmt) -> bool {
 
 /// Parse a complete program.
 pub fn parse(src: &str, opts: ParseOptions) -> PResult<Program> {
+    parse_exact(src, None, opts)
+}
+
+/// As [`parse`], plus the EXACT WTF-8 bytes `src` is a lossy view of — see
+/// [`crate::parse::lexer::Lexer::set_exact_src`].
+pub fn parse_exact(src: &str, exact: Option<&[u8]>, opts: ParseOptions) -> PResult<Program> {
     let goal = opts.goal;
-    let mut p = Parser::new(src, opts)?;
+    let mut p = Parser::new_exact(src, exact, opts)?;
     p.parse_program(goal)
 }
 
@@ -984,18 +990,46 @@ impl<'s> Parser<'s> {
                 } else {
                     None
                 };
-                let mut decls = vec![Declarator { id: pat, init }];
-                while self.eat(Punct::Comma, true)? {
-                    let p2 = self.cur().span.start;
-                    let id = self.parse_binding_pattern()?;
-                    self.declare_pattern(&id, kind, p2)?;
-                    let init =
-                        if self.eat(Punct::Eq, true)? { Some(self.parse_assign()?) } else { None };
-                    decls.push(Declarator { id, init });
+                // Annex B B.3.5 (Initializers in ForIn Statement Heads):
+                //   for ( var BindingIdentifier Initializer in Expression ) Statement
+                // Sloppy code only, `var` only, ONE simple BindingIdentifier only,
+                // and for-IN only — the sibling negative tests require
+                // `for (a = 0 in {})`, `for (let a = 0 in {})`, `for (var [a] = 0 in
+                // {})` and the strict-mode form to stay SyntaxErrors, and no such
+                // production exists for for-of. Everything downstream (the B.3.6
+                // "assign before the object expression" step, free-var analysis)
+                // already handles a `ForTarget::Var` declarator carrying an init.
+                if kind == VarKind::Var
+                    && init.is_some()
+                    && !self.ctx.strict
+                    && matches!(pat, Pattern::Ident(_))
+                    && self.at_kw(Keyword::In)
+                {
+                    self.bump_before_operand()?;
+                    self.ctx.in_ = saved_in;
+                    let right = self.parse_expr_full()?;
+                    self.expect(Punct::RParen, true)?;
+                    let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
+                    let left =
+                        ForTarget::Var(VarDecl { kind, decls: vec![Declarator { id: pat, init }] });
+                    Stmt::ForIn { left, right, body }
+                } else {
+                    let mut decls = vec![Declarator { id: pat, init }];
+                    while self.eat(Punct::Comma, true)? {
+                        let p2 = self.cur().span.start;
+                        let id = self.parse_binding_pattern()?;
+                        self.declare_pattern(&id, kind, p2)?;
+                        let init = if self.eat(Punct::Eq, true)? {
+                            Some(self.parse_assign()?)
+                        } else {
+                            None
+                        };
+                        decls.push(Declarator { id, init });
+                    }
+                    self.ctx.in_ = saved_in;
+                    self.expect(Punct::Semi, true)?;
+                    self.parse_for_classic(Some(ForInit::Var(VarDecl { kind, decls })))?
                 }
-                self.ctx.in_ = saved_in;
-                self.expect(Punct::Semi, true)?;
-                self.parse_for_classic(Some(ForInit::Var(VarDecl { kind, decls })))?
             }
         } else {
             let pos = self.cur().span.start;

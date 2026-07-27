@@ -131,20 +131,28 @@ impl<'a> FnCompiler<'a> {
     /// from: cell-backed locals in scope, plus a SHARED handle to this
     /// function's upvalue list (so a grandchild can both read and transitively
     /// extend it via ParentUpval re-sourcing).
+    ///
+    /// The list is ordered WEAKEST BINDING FIRST — self-name, then the scope
+    /// stack outermost-to-innermost, and within a scope in declaration order.
+    /// Consumers (`capture_source`, the direct-eval site map) scan it BACKWARDS,
+    /// so that order is exactly `resolve`'s shadowing order: a closure created
+    /// inside `{ let a; }` under an outer `let a` must capture the INNER cell.
     pub(crate) fn snapshot(&self) -> EnclosingFn {
         let mut cell_locals = Vec::new();
+        // A named-function-expression self-binding that was boxed (captured by a
+        // nested closure) is also visible to that closure as an upvalue source.
+        // It lives OUTSIDE the param/var scope, so it goes in first: every local
+        // shadows it (`var f = function g(){ let g = 1; return () => g; }`).
+        if let Some((name, reg)) = &self.self_name {
+            if self.cell_regs.contains(reg) {
+                cell_locals.push((name.clone(), *reg));
+            }
+        }
         for scope in &self.scopes {
             for (name, reg) in scope {
                 if self.cell_regs.contains(reg) {
                     cell_locals.push((name.clone(), *reg));
                 }
-            }
-        }
-        // A named-function-expression self-binding that was boxed (captured by a
-        // nested closure) is also visible to that closure as an upvalue source.
-        if let Some((name, reg)) = &self.self_name {
-            if self.cell_regs.contains(reg) {
-                cell_locals.push((name.clone(), *reg));
             }
         }
         EnclosingFn { cell_locals, upvalues: self.upvalues.clone() }

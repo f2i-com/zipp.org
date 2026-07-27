@@ -128,8 +128,13 @@ impl<'p> Vm<'p> {
                         )));
                     }
                     // [[DefineOwnProperty]] invariant (10.5.6 steps 16-21): validate
-                    // the truthy trap result against the target's descriptor.
-                    let target_desc = self.object_get_own_property_descriptor(target, key);
+                    // the truthy trap result against the target's descriptor —
+                    // ? target.[[GetOwnProperty]](P), so a Proxy target recurses
+                    // through ITS trap rather than reading past it.
+                    let target_desc = match self.proxy_gopd(target, key)? {
+                        Some(d) => d,
+                        None => self.object_get_own_property_descriptor(target, key),
+                    };
                     let extensible = self.is_extensible(target)?;
                     let setting_config_false = cf == Some(false);
                     if target_desc == Value::UNDEFINED {
@@ -182,6 +187,20 @@ impl<'p> Vm<'p> {
                                     }
                                 }
                             }
+                        }
+                        // Step 17.a proper: the clauses above are the frequently-hit
+                        // subset (they keep their precise messages); the general
+                        // IsCompatiblePropertyDescriptor catches what they miss — an
+                        // enumerable flip, a data/accessor kind change, and a
+                        // getter/setter swap on a non-configurable target property.
+                        if !self.is_compatible_property_descriptor(
+                            extensible,
+                            (value, get, set, wr, en, cf),
+                            target_desc,
+                        )? {
+                            return Err(Thrown(
+                                "TypeError: proxy 'defineProperty' reported a descriptor incompatible with the target's".into(),
+                            ));
                         }
                     }
                     Ok(())

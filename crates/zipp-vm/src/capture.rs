@@ -210,6 +210,18 @@ pub fn nested_uses_arguments(body: &[Stmt]) -> bool {
     nested_free.contains("arguments")
 }
 
+/// The same, for the PARAMETER list: a closure written as a parameter default
+/// (`function f(a = () => arguments.length)`) is created before the body runs
+/// and captures the same `arguments` object, so the binding has to be boxed
+/// before `bind_params` — the body-only scan above never sees it.
+pub fn params_nested_use_arguments(params: &Params) -> bool {
+    let mut nested_free = HashSet::new();
+    for item in &params.items {
+        collect_nested_free_pattern(item, &mut nested_free);
+    }
+    nested_free.contains("arguments")
+}
+
 // ── bound-name collection (this scope only; does NOT descend into nested fns) ──
 
 fn collect_bound_in_body(body: &[Stmt], out: &mut HashSet<String>) {

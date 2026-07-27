@@ -104,7 +104,6 @@ pub fn compile_eval(
     // eval's variable environment (see `Compiler::eval_caller_var`).
     caller_outer_scope: Vec<String>,
     fn_var_env: bool,
-    exact_src: Option<&[u8]>,
 ) -> R<Program> {
     // MODULE early errors (ModuleDeclarationInstantiation): duplicate
     // LexicallyDeclaredNames (let/const/class AND top-level function — module
@@ -199,10 +198,6 @@ pub fn compile_eval(
         }
     }
     let mut c = Compiler::new(source.to_string());
-    // EXACT WTF-8 source bytes (eval of a string holding lone surrogates):
-    // lets regex literals recover their exact pattern text. None (free) for
-    // well-formed sources.
-    c.exact_src = exact_src.map(<[u8]>::to_vec);
     c.eval_mode = true;
     c.eval_locals = !is_module;
     // A module body is an ASYNC context: top-level `await` compiles and the

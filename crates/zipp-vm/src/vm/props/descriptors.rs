@@ -34,61 +34,101 @@ impl<'p> Vm<'p> {
                 None => Ok(Some(self.object_get_own_property_descriptor(target, key))),
             },
             Some(trap) => {
+                // `r` / `target_desc` are un-rooted heap Values held across the
+                // trap call and ToPropertyDescriptor's own re-entries.
+                let _gc = self.gc_lock_guard();
                 let kv = self.key_to_value(key);
                 let r = self.call_value(trap, handler, &[target, kv])?;
-                // The target's own property + extensibility drive the [[GetOwnProperty]]
-                // invariants. (Only checked for an ordinary Object target; an exotic
-                // target skips them, matching the prior lenient behavior.)
-                let (ordinary, t_own, t_cfg, t_wr, t_acc, t_ext) =
-                    match self.heap.get(target.heap_index()) {
-                        HeapObj::Object(m) => {
-                            let ext = m.extensible;
-                            match m.pos(key) {
-                                Some(i) => (
-                                    true,
-                                    true,
-                                    m.attrs[i].configurable,
-                                    m.attrs[i].writable,
-                                    m.attrs[i].accessor,
-                                    ext,
-                                ),
-                                None => (true, false, false, false, false, ext),
-                            }
-                        }
-                        _ => (false, false, false, false, false, true),
-                    };
+                // Step 10: the trap result must be an Object or undefined — checked
+                // BEFORE the target's [[GetOwnProperty]], which a Proxy target makes
+                // observable.
+                if !r.is_undefined() && !self.is_object_value(r) {
+                    return Err(Thrown(
+                        "TypeError: proxy 'getOwnPropertyDescriptor' trap must return an object or undefined".into(),
+                    ));
+                }
+                // Step 11: targetDesc = ? target.[[GetOwnProperty]](P). A Proxy
+                // target recurses through ITS trap; every other kind — Array,
+                // TypedArray, a callable, an exotic — answers from the ordinary
+                // path. Reading only `HeapObj::Object`'s map (as this did) meant an
+                // exotic target skipped EVERY invariant below.
+                let target_desc = match self.proxy_gopd(target, key)? {
+                    Some(d) => d,
+                    None => self.object_get_own_property_descriptor(target, key),
+                };
+                let t_own = !target_desc.is_undefined();
+                let t_cfg = t_own && {
+                    let v = self.get_prop(target_desc, "configurable")?;
+                    self.truthy(v)
+                };
                 if r.is_undefined() {
-                    // Can't report a non-configurable own prop (or any own prop of a
-                    // non-extensible target) as non-existent.
-                    if ordinary && t_own && (!t_cfg || !t_ext) {
+                    // Step 12: can't report a non-configurable own prop (or any own
+                    // prop of a non-extensible target) as non-existent. IsExtensible
+                    // runs only once the configurable test has passed — on a Proxy
+                    // target that is an observable trap.
+                    if t_own && (!t_cfg || !self.is_extensible(target)?) {
                         return Err(Thrown(
                             "TypeError: proxy getOwnPropertyDescriptor cannot report an existing non-configurable or non-extensible-target property as undefined".into(),
                         ));
                     }
                     return Ok(Some(Value::UNDEFINED));
                 }
+                let t_ext = self.is_extensible(target)?;
                 // ToPropertyDescriptor (read_descriptor) requires an object, then we
                 // re-emit a COMPLETE descriptor (missing fields take their defaults).
                 let (value, get, set, wr, en, cf) = self.read_descriptor(r)?;
                 // IsCompatiblePropertyDescriptor's extensibility clause: the trap
                 // cannot report a property the target lacks when the target is
                 // non-extensible (10.5.5 steps 20-21 with targetDesc undefined).
-                if ordinary && !t_own && !t_ext {
+                if !t_own && !t_ext {
                     return Err(Thrown(
                         "TypeError: proxy getOwnPropertyDescriptor reported a new property on a non-extensible target".into(),
                     ));
                 }
-                // A non-configurable reported descriptor requires a matching
+                let is_accessor = get.is_some() || set.is_some();
+                // Step 18: IsCompatiblePropertyDescriptor against the COMPLETED
+                // result descriptor (step 17 gives every absent field its default),
+                // so an enumerable / data-vs-accessor / value / getter mismatch on a
+                // non-configurable target property is rejected — none of which the
+                // hand-rolled clauses below cover.
+                let completed = if is_accessor {
+                    (
+                        None,
+                        Some(get.unwrap_or(Value::UNDEFINED)),
+                        Some(set.unwrap_or(Value::UNDEFINED)),
+                        None,
+                        Some(en.unwrap_or(false)),
+                        Some(cf.unwrap_or(false)),
+                    )
+                } else {
+                    (
+                        Some(value.unwrap_or(Value::UNDEFINED)),
+                        None,
+                        None,
+                        Some(wr.unwrap_or(false)),
+                        Some(en.unwrap_or(false)),
+                        Some(cf.unwrap_or(false)),
+                    )
+                };
+                if !self.is_compatible_property_descriptor(t_ext, completed, target_desc)? {
+                    return Err(Thrown(
+                        "TypeError: proxy getOwnPropertyDescriptor reported a descriptor incompatible with the target's".into(),
+                    ));
+                }
+                // Step 20: a non-configurable reported descriptor requires a matching
                 // non-configurable target property (and, for a non-writable data
                 // descriptor, a non-writable target).
-                if ordinary && !cf.unwrap_or(false) {
+                if !cf.unwrap_or(false) {
                     if !t_own || t_cfg {
                         return Err(Thrown(
                             "TypeError: proxy getOwnPropertyDescriptor reported a non-configurable descriptor for a configurable or non-existent property".into(),
                         ));
                     }
-                    let is_accessor = get.is_some() || set.is_some();
-                    if !is_accessor && !wr.unwrap_or(false) && !t_acc && t_wr {
+                    let t_wr = {
+                        let v = self.get_prop(target_desc, "writable")?;
+                        self.truthy(v)
+                    };
+                    if !is_accessor && !wr.unwrap_or(false) && t_wr {
                         return Err(Thrown(
                             "TypeError: proxy getOwnPropertyDescriptor reported a non-writable descriptor for a writable property".into(),
                         ));
@@ -200,14 +240,12 @@ impl<'p> Vm<'p> {
             }
         }
         // A RegExp's `lastIndex` is a writable, non-enumerable, non-configurable own
-        // data property (a `defineProperty` may have cleared its writable flag).
+        // data property (a `defineProperty` or an `Object.freeze` may have cleared
+        // its writable flag).
         if key == "lastIndex" {
             if let HeapObj::RegExp { last_index, .. } = self.heap.get(idx) {
                 let v = *last_index;
-                let writable = self
-                    .arr_props
-                    .get(&idx)
-                    .map_or(true, |m| m.pos("lastIndex").map_or(true, |i| m.attrs[i].writable));
+                let writable = self.regexp_last_index_writable(idx);
                 return self.make_data_descriptor(v, writable, false, false);
             }
         }
@@ -688,11 +726,18 @@ impl<'p> Vm<'p> {
                         );
                     }
                 }
-                // A boxed Number/Boolean/Symbol/BigInt wrapper (kind != 0; kind 0 =
-                // String is handled above) has no exotic own properties — only the
-                // ones assigned to the wrapper, in the arr_props side table. (e.g.
-                // `Object.assign(12, "ab")` boxes the target and copies "0"/"1".)
-                HeapObj::Boxed { .. } => {
+                // Every REMAINING heap kind — a boxed Number/Boolean/Symbol/BigInt
+                // wrapper (kind != 0; kind 0 = String is handled above), Map, Set,
+                // Date, Promise, ArrayBuffer, DataView, a generator, … — has no
+                // exotic own properties of its own: the only ones it can have are
+                // those ASSIGNED to it, which every such kind keeps in the generic
+                // arr_props side table (the same store getOwnPropertyDescriptor and
+                // hasOwnProperty read). Without this arm the catch-all reported no
+                // keys at all, so `var m = new Map(); m.x = 1` was invisible to
+                // getOwnPropertyNames / Object.keys / for-in / JSON.stringify while
+                // `m.hasOwnProperty("x")` said true. (`Object.assign(12, "ab")`
+                // boxes the target and copies "0"/"1" the same way.)
+                _ => {
                     if let Some(m) = self.arr_props.get(&idx) {
                         keys.extend(
                             spec_key_order(&m.keys)
@@ -703,7 +748,6 @@ impl<'p> Vm<'p> {
                         );
                     }
                 }
-                _ => {}
             }
         }
         let names: Vec<Value> = keys.into_iter().map(|k| self.alloc_str(k)).collect();
@@ -1083,6 +1127,87 @@ impl<'p> Vm<'p> {
         Ok(self.object_get_prototype_of(obj))
     }
 
+    /// IsCompatiblePropertyDescriptor(extensible, Desc, current) — 6.2.6.4, i.e.
+    /// ValidateAndApplyPropertyDescriptor with O = undefined (validate only, apply
+    /// nothing). `desc` is the candidate's read_descriptor tuple (a field is
+    /// "present" iff it is `Some`); `current` is the target's own descriptor
+    /// OBJECT, `undefined` when it has none.
+    ///
+    /// Only the Proxy [[GetOwnProperty]] / [[DefineOwnProperty]] invariants need
+    /// it, so the answer is a plain bool and the caller raises the trap-specific
+    /// TypeError. The ordinary define path validates inline against its own
+    /// storage instead.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn is_compatible_property_descriptor(
+        &mut self,
+        extensible: bool,
+        desc: (Option<Value>, Option<Value>, Option<Value>, Option<bool>, Option<bool>, Option<bool>),
+        current: Value,
+    ) -> Result<bool, Thrown> {
+        let (value, get, set, writable, enumerable, configurable) = desc;
+        // No existing property: only extensibility decides.
+        if current.is_undefined() {
+            return Ok(extensible);
+        }
+        let c_cfg = {
+            let v = self.get_prop(current, "configurable")?;
+            self.truthy(v)
+        };
+        // A configurable existing property accepts any redefinition.
+        if c_cfg {
+            return Ok(true);
+        }
+        if configurable == Some(true) {
+            return Ok(false);
+        }
+        let c_en = {
+            let v = self.get_prop(current, "enumerable")?;
+            self.truthy(v)
+        };
+        if enumerable.is_some_and(|e| e != c_en) {
+            return Ok(false);
+        }
+        let d_accessor = get.is_some() || set.is_some();
+        let d_data = value.is_some() || writable.is_some();
+        let c_accessor = self.has_own_property(current, "get") || self.has_own_property(current, "set");
+        // A GENERIC descriptor (neither data nor accessor fields) may narrow
+        // either kind; anything else must keep the existing kind.
+        if (d_accessor || d_data) && d_accessor != c_accessor {
+            return Ok(false);
+        }
+        if c_accessor {
+            if let Some(g) = get {
+                let cg = self.get_prop(current, "get")?;
+                if !self.same_value(g, cg) {
+                    return Ok(false);
+                }
+            }
+            if let Some(s) = set {
+                let cs = self.get_prop(current, "set")?;
+                if !self.same_value(s, cs) {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        let c_wr = {
+            let v = self.get_prop(current, "writable")?;
+            self.truthy(v)
+        };
+        if !c_wr {
+            if writable == Some(true) {
+                return Ok(false);
+            }
+            if let Some(v) = value {
+                let cv = self.get_prop(current, "value")?;
+                if !self.same_value(v, cv) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Read a property-descriptor object's fields (present-or-absent) for
     /// `Object.defineProperty`. Throws if `desc` is not an object.
     pub(crate) fn read_descriptor(
@@ -1100,47 +1225,59 @@ impl<'p> Vm<'p> {
         // descriptor whose value/writable/enumerable/configurable/get/set is
         // INHERITED (or an accessor on the prototype) is recognized. Each field's
         // value is then fetched with get_prop (which also walks the chain + runs
-        // getters). Gather presence first (so the &mut get_prop calls don't clash).
-        let p_value = self.has_property_str(desc, "value");
-        let p_get = self.has_property_str(desc, "get");
-        let p_set = self.has_property_str(desc, "set");
-        let p_writable = self.has_property_str(desc, "writable");
-        let p_enumerable = self.has_property_str(desc, "enumerable");
-        let p_configurable = self.has_property_str(desc, "configurable");
-        let value = if p_value { Some(self.get_prop(desc, "value")?) } else { None };
-        let get = if p_get { Some(self.get_prop(desc, "get")?) } else { None };
-        let set = if p_set { Some(self.get_prop(desc, "set")?) } else { None };
-        let writable = if p_writable {
-            let v = self.get_prop(desc, "writable")?;
-            Some(self.truthy(v))
-        } else {
-            None
-        };
-        let enumerable = if p_enumerable {
+        // getters).
+        //
+        // The reads follow ToPropertyDescriptor (6.2.6.5) EXACTLY: enumerable,
+        // configurable, value, writable, get, set — each [[HasProperty]]
+        // immediately followed by its [[Get]], and each accessor's callability
+        // checked before the next field is probed. Batching the six Has calls
+        // ahead of the six Gets (and validating at the end) is unobservable for a
+        // plain descriptor but wrong for one whose fields are traps or getters.
+        // The Has must also be the FALLIBLE, proxy-aware operation: with the
+        // infallible walk a Proxy descriptor read as entirely empty, so
+        // `Object.defineProperty({}, "x", proxyDesc)` performed no observable
+        // operation at all.
+        let enumerable = if self.has_property_str_dyn(desc, "enumerable")? {
             let v = self.get_prop(desc, "enumerable")?;
             Some(self.truthy(v))
         } else {
             None
         };
-        let configurable = if p_configurable {
+        let configurable = if self.has_property_str_dyn(desc, "configurable")? {
             let v = self.get_prop(desc, "configurable")?;
             Some(self.truthy(v))
         } else {
             None
         };
-        // ToPropertyDescriptor validation (6.2.5.5 steps 13-21): a present getter
-        // or setter must be callable (or `undefined`), and an accessor descriptor
-        // may not also carry data fields (`value`/`writable`).
-        if let Some(g) = get {
+        let value =
+            if self.has_property_str_dyn(desc, "value")? { Some(self.get_prop(desc, "value")?) } else { None };
+        let writable = if self.has_property_str_dyn(desc, "writable")? {
+            let v = self.get_prop(desc, "writable")?;
+            Some(self.truthy(v))
+        } else {
+            None
+        };
+        // Steps 12.b / 14.b: a present getter or setter must be callable (or
+        // `undefined`), rejected before the NEXT field is read.
+        let get = if self.has_property_str_dyn(desc, "get")? {
+            let g = self.get_prop(desc, "get")?;
             if g != Value::UNDEFINED && !self.is_callable(g) {
                 return Err(Thrown("TypeError: Getter must be a function".into()));
             }
-        }
-        if let Some(s) = set {
+            Some(g)
+        } else {
+            None
+        };
+        let set = if self.has_property_str_dyn(desc, "set")? {
+            let s = self.get_prop(desc, "set")?;
             if s != Value::UNDEFINED && !self.is_callable(s) {
                 return Err(Thrown("TypeError: Setter must be a function".into()));
             }
-        }
+            Some(s)
+        } else {
+            None
+        };
+        // Step 15: an accessor descriptor may not also carry data fields.
         if (get.is_some() || set.is_some()) && (value.is_some() || writable.is_some()) {
             return Err(Thrown(
                 "TypeError: Invalid property descriptor. Cannot both specify accessors and a value or writable attribute"

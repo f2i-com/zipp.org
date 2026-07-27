@@ -14,9 +14,10 @@
 //!   full reparse (`crate::annexb_call_target_rewrite`), whose own comment
 //!   admits it mishandles a strict function inside a sloppy script.
 //! - **Exact source.** A string or regex may contain lone surrogates, which
-//!   Rust's `String` cannot hold; the engine carries a parallel WTF-8 buffer
-//!   (`compile/mod.rs` `exact_src`) to work around it. [`token::StrVal`] holds
-//!   UTF-16 units when it has to, so that buffer can go away.
+//!   Rust's `String` cannot hold. [`token::StrVal`] holds UTF-16 units when it
+//!   has to, and the lexer takes the WTF-8 original of an `eval` code string
+//!   alongside the lossy `&str` view of it (`lexer::Lexer::set_exact_src`), so
+//!   the compiler no longer carries a parallel source buffer of its own.
 //!
 //! This IS the engine's front end: every path from source text to bytecode
 //! parses here (see `crate::front` for the four entry points). It was built
@@ -139,8 +140,7 @@ mod tests {
 
     #[test]
     fn lone_surrogates_survive() {
-        // `String` cannot hold this; the engine's `exact_src` buffer exists
-        // because of it.
+        // `String` cannot hold this, which is what `StrVal::Utf16` is for.
         match &lex_all(r#" "\uD800" "#)[0] {
             TokenKind::Str(StrVal::Utf16(units)) => assert_eq!(units, &[0xD800]),
             other => panic!("expected raw UTF-16, got {other:?}"),

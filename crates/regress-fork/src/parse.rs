@@ -73,7 +73,7 @@ impl ClassSet {
 
     fn node(self, icase: bool, negate_set: bool) -> ir::Node {
         let codepoints = if icase {
-            unicode::add_icase_code_points(self.codepoints)
+            unicode::add_icase_code_points(self.codepoints, true)
         } else {
             self.codepoints
         };
@@ -341,11 +341,16 @@ fn codepoints_from_class(ct: CharacterClassType, positive: bool) -> CodePointSet
 
 /// \return a Bracket for a given character escape (positive or negative).
 /// For icase mode, we expand the positive set first, then invert if needed.
-fn make_bracket_class(ct: CharacterClassType, positive: bool, icase: bool) -> ir::Node {
+fn make_bracket_class(
+    ct: CharacterClassType,
+    positive: bool,
+    icase: bool,
+    unicode: bool,
+) -> ir::Node {
     // Get the positive (non-inverted) set, perform any icase expansion, then maybe invert.
     let mut cps = codepoints_from_class_positive(ct);
     if icase {
-        cps = unicode::add_icase_code_points(cps);
+        cps = unicode::add_icase_code_points(cps, unicode);
     }
     if !positive {
         cps = cps.inverted();
@@ -353,14 +358,27 @@ fn make_bracket_class(ct: CharacterClassType, positive: bool, icase: bool) -> ir
     ir::Node::Bracket(BracketContents { invert: false, cps })
 }
 
-fn add_class_atom(bc: &mut BracketContents, atom: ClassAtom) {
+fn add_class_atom(bc: &mut BracketContents, atom: ClassAtom, icase: bool, unicode: bool) {
     match atom {
         ClassAtom::CodePoint(c) => bc.cps.add_one(c),
         ClassAtom::CharacterClass {
             class_type,
             positive,
         } => {
-            bc.cps.add_set(codepoints_from_class(class_type, positive));
+            // Same order as `make_bracket_class`, and for the same reason:
+            // WordCharacters (22.2.2.6.2) already CONTAINS the ignoreCase
+            // extras — under `iu`, U+017F and U+212A canonicalize into `\w` —
+            // so `\W` is the complement of the CLOSED set. Inverting first and
+            // leaving the closure to the `]` handler put them back, which made
+            // `/[^\W]/iu` reject U+017F.
+            let mut cps = codepoints_from_class_positive(class_type);
+            if icase {
+                cps = unicode::add_icase_code_points(cps, unicode);
+            }
+            if !positive {
+                cps = cps.inverted();
+            }
+            bc.cps.add_set(cps);
         }
         ClassAtom::Range { iv, negate } => {
             if negate {
@@ -463,7 +481,7 @@ where
     /// Fold a character if icase.
     fn fold_if_icase(&self, c: u32) -> u32 {
         if self.flags.icase {
-            unicode::fold_code_point(c, self.flags.unicode)
+            unicode::fold_code_point(c, self.flags.unicode_mode())
         } else {
             c
         }
@@ -850,7 +868,8 @@ where
                 Some(']') => {
                     self.consume(']');
                     if self.flags.icase {
-                        result.cps = unicode::add_icase_code_points(result.cps);
+                        result.cps =
+                            unicode::add_icase_code_points(result.cps, self.flags.unicode_mode());
                     }
                     return Ok(ir::Node::Bracket(result));
                 }
@@ -864,14 +883,15 @@ where
 
             // Check for a dash; we may have a range.
             if !self.try_consume('-') {
-                add_class_atom(&mut result, first);
+                add_class_atom(&mut result, first, self.flags.icase, self.flags.unicode_mode());
                 continue;
             }
 
             let Some(second) = self.try_consume_bracket_class_atom()? else {
                 // No second atom. For example: [a-].
-                add_class_atom(&mut result, first);
-                add_class_atom(&mut result, ClassAtom::CodePoint(u32::from('-')));
+                let (ic, um) = (self.flags.icase, self.flags.unicode_mode());
+                add_class_atom(&mut result, first, ic, um);
+                add_class_atom(&mut result, ClassAtom::CodePoint(u32::from('-')), ic, um);
                 continue;
             };
 
@@ -896,9 +916,10 @@ where
             }
 
             // If it does not match a range treat as any match single characters.
-            add_class_atom(&mut result, first);
-            add_class_atom(&mut result, ClassAtom::CodePoint(u32::from('-')));
-            add_class_atom(&mut result, second);
+            let (ic, um) = (self.flags.icase, self.flags.unicode_mode());
+            add_class_atom(&mut result, first, ic, um);
+            add_class_atom(&mut result, ClassAtom::CodePoint(u32::from('-')), ic, um);
+            add_class_atom(&mut result, second, ic, um);
         }
     }
 
@@ -1522,9 +1543,9 @@ where
                     _ => error("Invalid character escape"),
                 }
             }
-            // CharacterEscape :: RegExpUnicodeEscapeSequence
+            // CharacterEscape :: RegExpUnicodeEscapeSequence[?UnicodeMode]
             'u' => {
-                if let Some(c) = self.try_escape_unicode_sequence() {
+                if let Some(c) = self.try_escape_unicode_sequence(self.flags.unicode_mode()) {
                     Ok(c)
                 } else if !self.flags.unicode {
                     // CharacterEscape :: IdentityEscape :: SourceCharacterIdentityEscape
@@ -1588,6 +1609,7 @@ where
                     CharacterClassType::Digits,
                     c == 'd' as u32,
                     self.flags.icase,
+                    self.flags.unicode_mode(),
                 ))
             }
 
@@ -1597,6 +1619,7 @@ where
                     CharacterClassType::Spaces,
                     c == 's' as u32,
                     self.flags.icase,
+                    self.flags.unicode_mode(),
                 ))
             }
 
@@ -1606,6 +1629,7 @@ where
                     CharacterClassType::Words,
                     c == 'w' as u32,
                     self.flags.icase,
+                    self.flags.unicode_mode(),
                 ))
             }
 
@@ -1631,7 +1655,7 @@ where
                                 cps = cps.inverted();
                                 invert = false;
                             }
-                            cps = unicode::add_icase_code_points(cps);
+                            cps = unicode::add_icase_code_points(cps, self.flags.unicode_mode());
                         }
                         Ok(ir::Node::Bracket(BracketContents { invert, cps }))
                     }
@@ -1751,12 +1775,21 @@ where
         }
     }
 
+    /// RegExpUnicodeEscapeSequence (22.2.1). `unicode_mode` is the grammar's
+    /// `[UnicodeMode]` parameter, and it is NOT decoration: without `u`/`v` the
+    /// only production is `u Hex4Digits`. Both the braced `u{ CodePoint }` form
+    /// and the lead+trail SURROGATE PAIR form are `[+UnicodeMode]`-only, so in a
+    /// non-unicode pattern `/\u{2}/` is the identity escape `u` followed by the
+    /// quantifier `{2}` (it matches `"uu"`), and a lead escape followed by a
+    /// trail escape is two independent code units matched over UCS-2 input,
+    /// not one astral character. A group NAME passes true whatever the flags
+    /// are: its production is `\ RegExpUnicodeEscapeSequence[+UnicodeMode]`.
     #[allow(clippy::branches_sharing_code)]
-    fn try_escape_unicode_sequence(&mut self) -> Option<u32> {
+    fn try_escape_unicode_sequence(&mut self, unicode_mode: bool) -> Option<u32> {
         let mut orig_input = self.input.clone();
 
         // Support \u{X..X} (Unicode CodePoint)
-        if self.try_consume('{') {
+        if unicode_mode && self.try_consume('{') {
             let mut s = String::new();
             loop {
                 match self.next().and_then(char::from_u32) {
@@ -1798,7 +1831,7 @@ where
             }
             match u16::from_str_radix(&s, 16) {
                 Ok(u) => {
-                    if (0xD800..=0xDBFF).contains(&u) {
+                    if unicode_mode && (0xD800..=0xDBFF).contains(&u) {
                         // Found a high surrogate. Try to parse a low surrogate next
                         // to see if we can rebuild the original `char`
 
@@ -1859,7 +1892,10 @@ where
 
         if let Some(mut c) = self.next().and_then(char::from_u32) {
             if c == '\\' && self.try_consume('u') {
-                if let Some(escaped) = self.try_escape_unicode_sequence().and_then(char::from_u32) {
+                // RegExpIdentifierStart :: \ RegExpUnicodeEscapeSequence[+UnicodeMode]
+                // — a group NAME always gets the full grammar, flags or not.
+                if let Some(escaped) = self.try_escape_unicode_sequence(true).and_then(char::from_u32)
+                {
                     c = escaped;
                 } else {
                     self.input = orig_input;
@@ -1881,8 +1917,9 @@ where
         loop {
             if let Some(mut c) = self.next().and_then(char::from_u32) {
                 if c == '\\' && self.try_consume('u') {
+                    // RegExpIdentifierPart :: \ RegExpUnicodeEscapeSequence[+UnicodeMode]
                     if let Some(escaped) =
-                        self.try_escape_unicode_sequence().and_then(char::from_u32)
+                        self.try_escape_unicode_sequence(true).and_then(char::from_u32)
                     {
                         c = escaped;
                     } else {

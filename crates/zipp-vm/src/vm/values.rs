@@ -20,6 +20,16 @@ impl<'p> Vm<'p> {
         self.has_property(obj, k)
     }
 
+    /// Proxy-aware, THROWING `[[HasProperty]]` for a fixed string key — the
+    /// fallible twin of `has_property_str`. ToPropertyDescriptor must use this:
+    /// a descriptor that is itself a Proxy answers every field through its `has`
+    /// trap, and the infallible walk (which cannot dispatch a trap) reported such
+    /// a descriptor as entirely empty.
+    pub(crate) fn has_property_str_dyn(&mut self, obj: Value, key: &str) -> Result<bool, Thrown> {
+        let k = self.alloc_str(key.to_string());
+        self.has_property_dyn(obj, k)
+    }
+
     pub(crate) fn has_property(&self, obj: Value, key: Value) -> bool {
         if !obj.is_heap() {
             return false;
@@ -154,7 +164,6 @@ impl<'p> Vm<'p> {
                     None => false,
                 }
             }
-            HeapObj::Map { .. } | HeapObj::Set(_) => self.display(key) == "size",
             // Static members (data + `static get`/`set` accessors) are own
             // properties of the class value and are inherited up the chain.
             HeapObj::Class(_) => {
@@ -250,10 +259,22 @@ impl<'p> Vm<'p> {
                         HeapObj::Date(_) => self.date_proto,
                         HeapObj::Promise { .. } => self.promise_proto,
                         HeapObj::RegExp { .. } => self.regexp_proto,
+                        // Map/Set previously answered ONLY `"size"` from a
+                        // dedicated arm, so neither their assigned own props
+                        // (`m.x = 1`) nor their inherited methods (`"has" in m`)
+                        // were visible to `in`/Reflect.has — and a for-in whose
+                        // prototype is a Map dropped every inherited key (the
+                        // per-iteration liveness re-check uses this walk).
+                        HeapObj::Map { .. } => self.map_proto,
+                        HeapObj::Set(_) => self.set_proto,
                         HeapObj::WeakMap { .. } => self.weakmap_proto,
                         HeapObj::WeakSet(_) => self.weakset_proto,
                         HeapObj::WeakRef(_) => self.weakref_proto,
                         HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
+                        HeapObj::Generator { .. } => self.gen_proto,
+                        HeapObj::AsyncGenerator(_) => self.asyncgen_proto,
+                        HeapObj::Iterator { proto, .. } => *proto,
+                        HeapObj::IterHelper { .. } => self.iterator_helper_proto,
                         _ => 0,
                     };
                     (bp != 0).then_some(Value::heap(bp))

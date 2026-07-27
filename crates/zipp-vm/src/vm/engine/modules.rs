@@ -213,7 +213,7 @@ impl<'p> Vm<'p> {
         let code = std::fs::read_to_string(&path)
             .map_err(|_| Thrown("TypeError: module not found".into()))?;
         let ast = crate::front::parse_module(&code).map_err(Thrown)?;
-        let prog = match crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), false, None) {
+        let prog = match crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), false) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
             // evaluation pipeline (not built yet): surface a host TypeError —
@@ -1117,7 +1117,7 @@ impl<'p> Vm<'p> {
         let Ok(ast) = crate::front::parse_module(&code) else {
             return false;
         };
-        let Ok(prog) = crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), false, None) else {
+        let Ok(prog) = crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), false) else {
             return false;
         };
         prog.functions

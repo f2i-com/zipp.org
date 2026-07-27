@@ -469,8 +469,20 @@ pub struct Parser<'s> {
 
 impl<'s> Parser<'s> {
     pub fn new(src: &'s str, opts: ParseOptions) -> PResult<Parser<'s>> {
+        Parser::new_exact(src, None, opts)
+    }
+
+    /// As [`Parser::new`], plus the EXACT WTF-8 bytes `src` is a lossy view of
+    /// — see [`Lexer::set_exact_src`]. Only `eval` of a code string holding a
+    /// lone surrogate has any.
+    pub fn new_exact(
+        src: &'s str,
+        exact: Option<&'s [u8]>,
+        opts: ParseOptions,
+    ) -> PResult<Parser<'s>> {
         let mut lx = Lexer::new(src);
         lx.set_html_comments(opts.goal != Goal::Module);
+        lx.set_exact_src(exact);
         // A program starts in operand position, so a leading `/` is a regex.
         let tok = lx.next_token(true)?;
         let ctx = Ctx {

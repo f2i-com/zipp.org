@@ -34,11 +34,9 @@ impl Span {
 ///
 /// JS strings are sequences of UTF-16 code units and may contain LONE
 /// SURROGATES — `"\uD800"` is a legal, observable one-unit string. Rust's
-/// `String` cannot hold one, which is why the engine currently carries a
-/// parallel WTF-8 buffer (`compile/mod.rs` `exact_src`) just to recover escaped
-/// regex source. Representing the rare case explicitly removes the need for it,
-/// while the overwhelmingly common well-formed case stays a plain `String` and
-/// costs nothing.
+/// `String` cannot hold one. Representing the rare case explicitly is what
+/// lets a lone surrogate reach the compiler at all, while the overwhelmingly
+/// common well-formed case stays a plain `String` and costs nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StrVal {
     /// Well-formed UTF-8; the common case.

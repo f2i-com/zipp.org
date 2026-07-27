@@ -3,9 +3,9 @@
 The ECMAScript regex engine. This is a FORK, not a vendored copy waiting to be
 dropped: `zipp-vm` calls `Regex::from_unicode_byteopt` (`src/api.rs`), which
 does not exist upstream, so the crates.io crate does not compile against this
-code at all. On top of that it carries three correctness patches for bugs
-test262 hits (`built-ins/RegExp/regexp-modifiers`, `named-groups`,
-`property-escapes`).
+code at all. On top of that it carries six correctness patches for bugs test262
+hits (`built-ins/RegExp/regexp-modifiers`, `named-groups`, `property-escapes`,
+and the `staging/sm/RegExp` unicode-flag cluster).
 
 ## Why not a different crate
 
@@ -32,7 +32,7 @@ gap has to be closed eventually.
   PCRE/upstream-shaped coverage, and the 2,063 RegExp files in test262 exercise
   the ES semantics this engine actually has to satisfy. The smaller targeted
   suites (escape/pattern/replacement/syntax-error/anchored) are kept.
-- **Re-upgrading**: re-apply the three patches below (or drop whichever has been
+- **Re-upgrading**: re-apply the patches below (or drop whichever has been
   upstreamed) and regenerate `unicodetables_unknown.rs`.
 
 All patches are intended to be upstreamable.
@@ -104,3 +104,62 @@ SyntaxError.
   `Script/Script_Extensions = Unknown | Zzzz` to that table before the
   normal table lookup.
 - `src/lib.rs`: `mod unicodetables_unknown;`
+
+## Patch B4: `[UnicodeMode]` is a real grammar parameter for `\u`
+
+`try_escape_unicode_sequence` applied the whole RegExpUnicodeEscapeSequence
+grammar whatever the flags were, but three of its productions are
+`[+UnicodeMode]`-only (22.2.1). Without `u`/`v` the only one that exists is
+`u Hex4Digits`, so `/\u{2}/` is the identity escape `u` followed by the
+quantifier `{2}` — it matches `"uu"` — and a lead escape followed by a trail
+escape is two independent code units matched over UCS-2 input, not one astral
+character. regress read both the braced form and the lead+trail pair
+unconditionally, so those patterns compiled to a single astral `Char` that a
+code-unit subject can never match.
+
+- `src/parse.rs`: `try_escape_unicode_sequence` takes the parameter; the
+  CharacterEscape call site passes `flags.unicode_mode()`, while the two
+  RegExpIdentifier call sites pass `true` — a group NAME's production is
+  `\ RegExpUnicodeEscapeSequence[+UnicodeMode]` regardless of the flags.
+
+## Patch B5: non-unicode Canonicalize, and `v` canonicalizes like `u`
+
+Two halves of one defect: regress canonicalized non-unicode `i` with a raw
+`toUppercase`, and treated `v` as non-unicode for case.
+
+- `src/unicode.rs`: `fold_code_point` implements Canonicalize step 9 — a code
+  unit >= 128 whose uppercase mapping lands below 128 canonicalizes to itself,
+  so `/s/i` must not match U+017F nor `/k/i` U+212A. Every consumer had to
+  learn the same rule or it reintroduced the matches the guard removed:
+  `unfold_uppercase_char` (the optimizer's `CharSet` lowering) builds its
+  equivalence class through `fold_code_point` rather than the raw
+  `TO_UPPERCASE` table, and `add_icase_code_points` — which pre-closes a
+  BRACKET so the matcher can test raw membership — takes the mode and walks
+  `TO_UPPERCASE` with the guard instead of `FOLDS` unconditionally (`/[s]/i`
+  and `/[a-z]/i` matched U+017F).
+- `src/api.rs`: new `Flags::unicode_mode()` (HasEitherUnicodeFlag). `v` picks a
+  different *grammar* from `u` but the same *character model*, so every case
+  decision asks it: input construction (`api.rs`, `classicalbacktrack.rs`),
+  `fold_if_icase` (`parse.rs`), the optimizer walk, and the
+  `WordBoundaryUnicodeICase` choice (`emit.rs`).
+
+## Patch B6: `\W` inside a character class is complemented AFTER the case closure
+
+WordCharacters (22.2.2.6.2) already contains the ignoreCase extras — under
+`iu`, U+017F and U+212A canonicalize into `\w` — so `\W` is the complement of
+the *closed* set. `make_bracket_class` (the standalone `\W` atom) had this
+right; `add_class_atom` (`\W` inside `[...]`) inverted first and left the
+closure to the `]` handler, which put the extras back and made `/[^\W]/iu`
+reject U+017F.
+
+- `src/parse.rs`: `add_class_atom` takes the effective `icase` plus the mode
+  (`make_bracket_class` grew the mode too, for B5) and uses
+  `make_bracket_class`'s order: positive set, closure, then invert.
+
+Still wrong, and NOT covered by these patches: the `v`-grammar
+`consume_class_set_expression` path builds `\W` the same inverted-then-closed
+way this patch fixed for the `[...]` grammar, so `/[^\W]/vi` and `/[\W]/vi`
+still answer the wrong way round for U+017F and U+212A. Separately, `\u`
+followed by something that is not four hex digits is still accepted as an
+IdentityEscape under `v` (`/\u/v` should be a SyntaxError) — the surrounding
+arms test `flags.unicode` where they mean `flags.unicode_mode()`.

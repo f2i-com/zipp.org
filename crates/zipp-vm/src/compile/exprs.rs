@@ -176,13 +176,12 @@ impl<'a> FnCompiler<'a> {
                 // string, already in the spec's canonical order.
                 //
                 // EXACT-source recovery: a lone surrogate written literally in
-                // the pattern now lives in the `StrVal` itself, so it reaches the
+                // the pattern lives in the `StrVal` itself, so it reaches the
                 // constant pool through the WTF-8-decoding slot (`str_const`).
-                // NOTE: this REPLACES the old `exact_src` span arithmetic —
-                // `Expr::Regex` carries no span (only `Function`/`Arrow`/`Class`
-                // do), and it needs none: the parser hands over the exact code
-                // units instead of the lossy U+FFFD view the compiler used to
-                // have to repair by slicing the source buffer.
+                // The LEXER does the recovery (`Lexer::set_exact_src`), which is
+                // why `Expr::Regex` needs no span of its own: the parser hands
+                // over the exact code units rather than the lossy U+FFFD view
+                // the compiler used to repair by slicing a parallel buffer.
                 let text = pattern.to_lossy_string();
                 let pat = self.str_const(pattern);
                 // EARLY ERROR: a RegularExpressionLiteral must parse under the

@@ -23,8 +23,7 @@
 //! says it directly.
 //!
 //! **Strings are [`StrVal`], not `String`.** A literal may contain lone
-//! surrogates. The engine currently carries a parallel WTF-8 buffer
-//! (`compile/mod.rs` `exact_src`) purely to recover them.
+//! surrogates, which a `String` cannot hold.
 //!
 //! **No parenthesized-expression node.** Parenthesization is observable in
 //! exactly two places — it makes an assignment target non-simple, and it
@@ -657,8 +656,7 @@ mod tests {
         };
         assert!(matches!(annexb, Expr::Assign { target: Target::Call(_), .. }));
 
-        // 2. A lone surrogate in a literal. `String` cannot hold one, which is
-        //    why the compiler carries a parallel WTF-8 buffer (`exact_src`).
+        // 2. A lone surrogate in a literal, which `String` cannot hold.
         let lone = Expr::Str(StrVal::from_utf16(vec![0xD800]));
         match lone {
             Expr::Str(StrVal::Utf16(u)) => assert_eq!(u, vec![0xD800]),

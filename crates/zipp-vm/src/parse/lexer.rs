@@ -54,12 +54,28 @@ pub struct Lexer<'s> {
     /// and `<!--` is a comparison, both of which fail to parse — which is the
     /// SyntaxError the module tests want.
     html_comments: bool,
+    /// The EXACT WTF-8 source, when `src` is a lossy view of it. See
+    /// [`Lexer::set_exact_src`].
+    exact: Option<&'s [u8]>,
 }
 
 impl<'s> Lexer<'s> {
     /// Turn Annex B HTML-like comments off — the Module goal has none.
     pub fn set_html_comments(&mut self, on: bool) {
         self.html_comments = on;
+    }
+
+    /// Hand the lexer the EXACT WTF-8 bytes of a source `str` that could not
+    /// hold them: `eval` of a code string containing a lone surrogate arrives
+    /// as `src` with U+FFFD in its place. Both encodings are three bytes, so
+    /// the two buffers index identically and only the token readers that must
+    /// reproduce source text verbatim consult this one.
+    ///
+    /// Must be set before the first token is read (a program may open with a
+    /// regex literal), and the slice must be the same length as `src`.
+    pub fn set_exact_src(&mut self, exact: Option<&'s [u8]>) {
+        debug_assert!(exact.is_none_or(|e| e.len() == self.src.len()));
+        self.exact = exact;
     }
 
     pub fn new(src: &'s str) -> Lexer<'s> {
@@ -69,6 +85,7 @@ impl<'s> Lexer<'s> {
             saw_newline: false,
             legacy_escape: false,
             html_comments: true,
+            exact: None,
         };
         // A leading BOM is whitespace, not part of the first token.
         if lx.src.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -749,10 +766,18 @@ impl<'s> Lexer<'s> {
             }
             self.pos += w;
         }
-        let pattern_bytes = &self.src[body_start..body_end];
+        // The pattern is the EXACT source text between the slashes, and a
+        // regex is the one literal whose text may hold a lone surrogate that
+        // survives to runtime (`/<U+DC38>/.source`). `src` is a `&str` and
+        // cannot carry one, so when the caller supplied the WTF-8 original
+        // (see [`Lexer::set_exact_src`]) the pattern is sliced out of THAT.
+        let pattern_bytes = self
+            .exact
+            .and_then(|e| e.get(body_start..body_end))
+            .unwrap_or(&self.src[body_start..body_end]);
         let pattern = match std::str::from_utf8(pattern_bytes) {
             Ok(s) => StrVal::Utf8(s.to_string()),
-            Err(_) => StrVal::Utf8(String::from_utf8_lossy(pattern_bytes).into_owned()),
+            Err(_) => StrVal::from_utf16(crate::heap::wtf8_units_iter(pattern_bytes).collect()),
         };
         let flags = String::from_utf8_lossy(&self.src[flags_start..self.pos]).into_owned();
         Ok(TokenKind::Regex { pattern, flags })
