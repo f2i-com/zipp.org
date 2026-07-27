@@ -6,3 +6,6 @@
 
 # Generated wasm-bindgen glue for the node harnesses (see crates/zipp-wasm/tests/node/README.md)
 crates/zipp-wasm/tests/node/pkg/
+
+# Agent worktrees and session state
+.claude/
