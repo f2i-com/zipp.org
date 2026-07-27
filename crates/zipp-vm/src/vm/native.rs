@@ -464,9 +464,14 @@ pub const TEMPORAL_M_BASE: u16 = 400;
 pub const TEMPORAL_DURATION_FROM: u16 = 410;
 pub const TEMPORAL_DURATION_COMPARE: u16 = 411;
 /// Temporal.PlainDate.prototype methods at PD_M_BASE + index.
+///
+/// The June-2024 proposal removals (`getISOFields`, `getCalendar`,
+/// `withPlainDate`, the `epochSeconds`/`epochMicroseconds` accessors, …) are
+/// absent from these tables — dropping the NAME is what un-exposes the method;
+/// the implementation arms are left in place and simply unreachable.
 pub const PLAINDATE_METHODS: &[&str] = &[
     "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
-    "getISOFields", "toPlainDateTime", "toZonedDateTime", "withCalendar", "toPlainYearMonth",
+    "toPlainDateTime", "toZonedDateTime", "withCalendar", "toPlainYearMonth",
     "toPlainMonthDay",
 ];
 pub const PD_M_BASE: u16 = 420;
@@ -475,7 +480,7 @@ pub const PLAINDATE_COMPARE: u16 = 449;
 /// Temporal.PlainTime.prototype methods at PT_M_BASE + index.
 pub const PLAINTIME_METHODS: &[&str] = &[
     "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON",
-    "valueOf", "getISOFields",
+    "valueOf",
 ];
 pub const PT_M_BASE: u16 = 450;
 pub const PLAINTIME_FROM: u16 = 470;
@@ -483,8 +488,7 @@ pub const PLAINTIME_COMPARE: u16 = 471;
 /// Temporal.PlainDateTime.prototype methods at PDT_M_BASE + index.
 pub const PLAINDATETIME_METHODS: &[&str] = &[
     "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON",
-    "valueOf", "toPlainDate", "toPlainTime", "getISOFields", "toZonedDateTime", "withCalendar",
-    "withPlainDate", "toPlainYearMonth", "toPlainMonthDay",
+    "valueOf", "toPlainDate", "toPlainTime", "toZonedDateTime", "withCalendar",
 ];
 pub const PDT_M_BASE: u16 = 472;
 pub const PLAINDATETIME_FROM: u16 = 490;
@@ -492,7 +496,7 @@ pub const PLAINDATETIME_COMPARE: u16 = 491;
 /// Temporal.Instant.prototype methods at INST_M_BASE + index.
 pub const INSTANT_METHODS: &[&str] = &[
     "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON", "valueOf",
-    "toZonedDateTimeISO", "toZonedDateTime",
+    "toZonedDateTimeISO",
 ];
 pub const INST_M_BASE: u16 = 492;
 pub const INST_FROM: u16 = 505;
@@ -504,15 +508,14 @@ pub const INST_COMPARE: u16 = 510;
 /// Temporal.PlainYearMonth.prototype methods at PYM_M_BASE + index.
 pub const PLAINYEARMONTH_METHODS: &[&str] = &[
     "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
-    "toPlainDate", "getISOFields",
+    "toPlainDate",
 ];
 pub const PYM_M_BASE: u16 = 512;
 pub const PLAINYEARMONTH_FROM: u16 = 524;
 pub const PLAINYEARMONTH_COMPARE: u16 = 525;
 /// Temporal.PlainMonthDay.prototype methods at PMD_M_BASE + index.
-pub const PLAINMONTHDAY_METHODS: &[&str] = &[
-    "with", "equals", "toString", "toJSON", "valueOf", "toPlainDate", "getISOFields",
-];
+pub const PLAINMONTHDAY_METHODS: &[&str] =
+    &["with", "equals", "toString", "toJSON", "valueOf", "toPlainDate"];
 pub const PMD_M_BASE: u16 = 528;
 pub const PLAINMONTHDAY_FROM: u16 = 536;
 /// Temporal.ZonedDateTime.prototype methods at ZDT_M_BASE + index. Instance is
@@ -521,7 +524,7 @@ pub const PLAINMONTHDAY_FROM: u16 = 536;
 pub const ZONEDDATETIME_METHODS: &[&str] = &[
     "with", "withPlainTime", "withTimeZone", "withCalendar", "add", "subtract", "until",
     "since", "round", "equals", "toString", "toJSON", "toLocaleString", "valueOf",
-    "startOfDay", "toInstant", "toPlainDate", "toPlainTime", "toPlainDateTime", "getISOFields",
+    "startOfDay", "toInstant", "toPlainDate", "toPlainTime", "toPlainDateTime",
 ];
 pub const ZDT_M_BASE: u16 = 660;
 pub const ZDT_FROM: u16 = 680;
@@ -598,6 +601,23 @@ pub const INTL_NF_FORMAT_RANGE_TO_PARTS: u16 = 919;
 pub const INTL_DTF_FORMAT_RANGE: u16 = 920;
 pub const INTL_DTF_FORMAT_RANGE_TO_PARTS: u16 = 921;
 pub const INTL_DURATION_FORMAT_TO_PARTS: u16 = 922;
+/// `Intl.Locale.prototype.variants` / `.firstDayOfWeek` — two accessors added to
+/// Intl.Locale after LOCALE_ACCESSORS' 581..591 block was already boxed in by
+/// INTL_NF_FORMAT_GET at 592, so they get their own ids.
+pub const INTL_LOCALE_GET_VARIANTS: u16 = 923;
+pub const INTL_LOCALE_GET_FIRSTDAY: u16 = 924;
+/// The Intl.Locale-info methods, at INTL_LOCALE_INFO_BASE + index of
+/// LOCALE_INFO_METHODS.
+pub const INTL_LOCALE_INFO_BASE: u16 = 925;
+pub const LOCALE_INFO_METHODS: &[&str] = &[
+    "getCalendars", "getCollations", "getHourCycles", "getNumberingSystems", "getTimeZones",
+    "getTextInfo", "getWeekInfo",
+];
+/// `%Segments.prototype%.containing` and the two iterator ids behind
+/// `%Segments.prototype%[@@iterator]`.
+pub const INTL_SEGMENTS_CONTAINING: u16 = 933;
+pub const INTL_SEGMENTS_ITERATOR: u16 = 934;
+pub const INTL_SEGMENT_ITER_NEXT: u16 = 935;
 /// Intl service kinds (index into VM.intl_ctors / intl_protos).
 pub const INTL_NUMBERFORMAT: u8 = 0;
 pub const INTL_DATETIMEFORMAT: u8 = 1;
@@ -648,8 +668,8 @@ pub const TEMPORAL_GETTER_FIELDS: &[&str] = &[
 ];
 pub const TEMP_G_ZONEDDATETIME: &[&str] = &[
     "calendarId", "timeZoneId", "year", "month", "monthCode", "day", "hour", "minute",
-    "second", "millisecond", "microsecond", "nanosecond", "epochSeconds", "epochMilliseconds",
-    "epochMicroseconds", "epochNanoseconds", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek",
+    "second", "millisecond", "microsecond", "nanosecond", "epochMilliseconds",
+    "epochNanoseconds", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek",
     "hoursInDay", "daysInWeek", "daysInMonth", "daysInYear", "monthsInYear", "inLeapYear",
     "offset", "offsetNanoseconds", "era", "eraYear",
 ];
@@ -670,8 +690,7 @@ pub const TEMP_G_PLAINDATETIME: &[&str] = &[
     "nanosecond", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek", "daysInMonth", "daysInYear",
     "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId", "era", "eraYear",
 ];
-pub const TEMP_G_INSTANT: &[&str] =
-    &["epochMilliseconds", "epochNanoseconds", "epochSeconds", "epochMicroseconds"];
+pub const TEMP_G_INSTANT: &[&str] = &["epochMilliseconds", "epochNanoseconds"];
 pub const TEMP_G_PLAINYEARMONTH: &[&str] = &[
     "year", "month", "monthCode", "daysInMonth", "daysInYear", "monthsInYear", "inLeapYear",
     "era", "eraYear", "calendarId",
@@ -886,6 +905,11 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     // Intl.Locale.prototype subtag getters — accessor functions named "get <prop>".
     if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16).contains(&id) {
         return Some((LOCALE_ACCESSOR_GET_NAMES[(id - INTL_LOCALE_GET_BASE) as usize], 0));
+    }
+    // Intl.Locale-info methods: ordinary built-ins named after themselves.
+    if (INTL_LOCALE_INFO_BASE..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16).contains(&id)
+    {
+        return Some((LOCALE_INFO_METHODS[(id - INTL_LOCALE_INFO_BASE) as usize], 0));
     }
     // Temporal.<Type>.prototype method natives: name + length as own properties.
     for (base, methods) in [
@@ -1182,6 +1206,11 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         INTL_SEGMENTER_SEGMENT => ("segment", 1),
         INTL_NF_FORMAT_GET | INTL_DTF_FORMAT_GET => ("get format", 0),
         INTL_COLLATOR_COMPARE_GET => ("get compare", 0),
+        INTL_LOCALE_GET_VARIANTS => ("get variants", 0),
+        INTL_LOCALE_GET_FIRSTDAY => ("get firstDayOfWeek", 0),
+        INTL_SEGMENTS_CONTAINING => ("containing", 1),
+        INTL_SEGMENTS_ITERATOR => ("[Symbol.iterator]", 0),
+        INTL_SEGMENT_ITER_NEXT => ("next", 0),
         _ => return None,
     })
 }

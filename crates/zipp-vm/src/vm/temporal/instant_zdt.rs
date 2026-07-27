@@ -127,6 +127,7 @@ impl<'p> Vm<'p> {
         name: &str,
         args: &[Value],
     ) -> Result<Option<Value>, Thrown> {
+        let cal = self.cal_of(idx);
         match name {
             "valueOf" => Err(Thrown(
                 "TypeError: Called Temporal.ZonedDateTime.prototype.valueOf which always throws"
@@ -147,11 +148,13 @@ impl<'p> Vm<'p> {
             }
             "toPlainDateTime" => {
                 let f = self.zdt_local(idx);
-                Ok(Some(self.make_plain_date_time(f)?))
+                let r = self.make_plain_date_time(f)?;
+                Ok(Some(self.tag_cal(r, cal)))
             }
             "toPlainDate" => {
                 let f = self.zdt_local(idx);
-                Ok(Some(self.make_plain_date(f[0], f[1], f[2])?))
+                let r = self.make_plain_date(f[0], f[1], f[2])?;
+                Ok(Some(self.tag_cal(r, cal)))
             }
             "toPlainTime" => {
                 let f = self.zdt_local(idx);
@@ -174,7 +177,8 @@ impl<'p> Vm<'p> {
                 let other = self.zoned_date_time_from(other_v, Value::UNDEFINED)?;
                 let oi = other.heap_index();
                 let eq = self.zdt_epoch_ns(idx) == self.zdt_epoch_ns(oi)
-                    && self.tz_canon(idx) == self.tz_canon(oi);
+                    && self.tz_canon(idx) == self.tz_canon(oi)
+                    && cal == self.cal_of(oi);
                 Ok(Some(Value::bool(eq)))
             }
             "withTimeZone" => {
@@ -182,19 +186,21 @@ impl<'p> Vm<'p> {
                 let (id, offset) =
                     self.parse_tz_arg(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 let ns = self.zdt_epoch_ns(idx).unwrap_or(0);
-                Ok(Some(self.alloc_zdt(ns, offset, id)?))
+                let r = self.alloc_zdt(ns, offset, id)?;
+                Ok(Some(self.tag_cal(r, cal)))
             }
             "withCalendar" => {
-                // ISO 8601 only — accept "iso8601"/a calendar-bearing Temporal,
-                // reject a wrong type (TypeError) or other calendar (RangeError).
-                // The argument is REQUIRED: undefined is a TypeError here.
-                let cal = args.first().copied().unwrap_or(Value::UNDEFINED);
-                if cal == Value::UNDEFINED {
+                // Accept a calendar id / a calendar-bearing Temporal; reject a wrong
+                // type (TypeError) or an unimplemented calendar (RangeError). The
+                // argument is REQUIRED: undefined is a TypeError here.
+                let cv = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if cv == Value::UNDEFINED {
                     return Err(Thrown("TypeError: withCalendar requires a calendar argument".into()));
                 }
-                self.validate_calendar_value(cal)?;
+                let ncal = self.validate_calendar_value(cv)?;
                 let (ns, off) = (self.zdt_epoch_ns(idx).unwrap_or(0), self.zdt_offset_ns(idx));
-                Ok(Some(self.make_zoned_date_time_raw(ns, off, idx)?))
+                let r = self.make_zoned_date_time_raw(ns, off, idx)?;
+                Ok(Some(self.tag_cal(r, ncal)))
             }
             "withPlainTime" => {
                 let tv = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -207,7 +213,8 @@ impl<'p> Vm<'p> {
                 let off = self.zdt_offset_ns(idx);
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS + time_to_ns(&time);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                Ok(Some(self.alloc_zdt(local - off as i128, off, id)?))
+                let r = self.alloc_zdt(local - off as i128, off, id)?;
+                Ok(Some(self.tag_cal(r, cal)))
             }
             "add" | "subtract" => {
                 // Fixed-offset zones: apply the same calendar/clock arithmetic as
@@ -228,14 +235,14 @@ impl<'p> Vm<'p> {
                         * sign as i128;
                 let carry = tns.div_euclid(DAY_NS) as i64;
                 let nt = ns_to_time(tns.rem_euclid(DAY_NS));
-                let tm = (lf[0] + dur[0] * sign) * 12 + (lf[1] - 1) + dur[1] * sign;
-                let ny0 = tm.div_euclid(12);
-                let nmo = tm.rem_euclid(12) + 1;
-                if reject && lf[2] > days_in_month(ny0, nmo) {
-                    return Err(Thrown("RangeError: date arithmetic overflows the month".into()));
-                }
-                let nd0 = lf[2].min(days_in_month(ny0, nmo));
-                let ed = iso_to_epoch_days(ny0, nmo, nd0) + (dur[2] * 7 + dur[3]) * sign + carry;
+                // The years/months step happens in CALENDAR space.
+                let (cy, cm, cd) = cal_from_iso(cal, lf[0], lf[1], lf[2]);
+                let (ay, am, ad) =
+                    cal_add_year_month(cal, cy, cm, cd, dur[0] * sign, dur[1] * sign, reject)
+                        .ok_or_else(|| {
+                            Thrown("RangeError: date arithmetic overflows the month".into())
+                        })?;
+                let ed = cal_to_epoch_days(cal, ay, am, ad) + (dur[2] * 7 + dur[3]) * sign + carry;
                 let off = self.zdt_offset_ns(idx);
                 let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
@@ -247,7 +254,8 @@ impl<'p> Vm<'p> {
                         "RangeError: ZonedDateTime result is outside the supported range".into(),
                     ));
                 }
-                Ok(Some(self.alloc_zdt(result_ns, off, id)?))
+                let r = self.alloc_zdt(result_ns, off, id)?;
+                Ok(Some(self.tag_cal(r, cal)))
             }
             "until" | "since" => {
                 // DifferenceZonedDateTime works in the RECEIVER's zone: re-express
@@ -257,6 +265,12 @@ impl<'p> Vm<'p> {
                 // same local time spuriously equal). Default largestUnit is "hour".
                 let other = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let oz = self.zoned_date_time_from(other, Value::UNDEFINED)?;
+                if self.cal_of(oz.heap_index()) != cal {
+                    return Err(Thrown(
+                        "RangeError: cannot compute a difference between date-times in different calendars"
+                            .into(),
+                    ));
+                }
                 let of = {
                     let o_ns = self.zdt_epoch_ns(oz.heap_index()).unwrap_or(0);
                     let my_off = self.zdt_offset_ns(idx);
@@ -315,7 +329,7 @@ impl<'p> Vm<'p> {
                 // sign-negated rounding mode, then negate the result.
                 let (dt1, dt2) = (f, of);
                 let eff = if name == "since" { negate_mode(&mode) } else { mode.clone() };
-                let df = difference_datetime(dt1, dt2, &largest);
+                let df = difference_datetime_cal(cal, dt1, dt2, &largest);
                 let mut out = if rank(&largest) >= rank("day") {
                     let total_ns = (df[3] as i128) * DAY_NS
                         + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
@@ -343,10 +357,10 @@ impl<'p> Vm<'p> {
                     let rounded = round_increment(total_ns, inc_ns, &eff);
                     balance_duration_ns(rounded, &largest)?
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
-                    round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
+                    round_relative_datetime_diff(cal, dt1, dt2, &smallest, &largest, inc, &eff)?
                         .map(|x| x as f64)
                 } else {
-                    round_datetime_diff_daytime(dt1, df, &smallest, &largest, inc, &eff)
+                    round_datetime_diff_daytime(cal, dt1, df, &smallest, &largest, inc, &eff)
                         .map(|x| x as f64)
                 };
                 if name == "since" {
@@ -388,7 +402,8 @@ impl<'p> Vm<'p> {
                 let ed = iso_to_epoch_days(f[0], f[1], f[2]) + day_carry;
                 let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                Ok(Some(self.alloc_zdt(local - off as i128, off, id)?))
+                let r = self.alloc_zdt(local - off as i128, off, id)?;
+                Ok(Some(self.tag_cal(r, cal)))
             }
             "with" => {
                 // Merge date/time fields from the bag over the current local
@@ -403,72 +418,101 @@ impl<'p> Vm<'p> {
                 // honoured, month/monthCode agreement is enforced, and a calendar-
                 // invalid code is deferred until after the options bag is read.
                 let mut month_valid = true;
+                let mut month_conflict = false;
                 let mut any = false;
-                let mut read_slot = |vm: &mut Self, nm: &str, slot: usize, f: &mut [i64; 9], any: &mut bool| -> Result<(), Thrown> {
+                // Which date slots the bag actually supplied — the date part must
+                // merge in CALENDAR space, so the raw values cannot just overwrite
+                // the ISO wall-clock.
+                let mut date_raw: [Option<i64>; 3] = [None; 3];
+                let mut read_slot = |vm: &mut Self, nm: &str, slot: usize, f: &mut [i64; 9], any: &mut bool, date_raw: &mut [Option<i64>; 3]| -> Result<(), Thrown> {
                     let v = if slot == 1 {
-                        vm.read_month_field_raw(bag)?.map(|(mm, valid)| {
+                        vm.read_month_field_raw(bag, cal)?.map(|(mm, valid, conflict)| {
                             month_valid = valid;
+                            month_conflict = conflict;
                             mm
                         })
                     } else {
                         vm.opt_int_field(bag, nm)?
                     };
                     if let Some(x) = v {
-                        f[slot] = x;
+                        if slot < 3 {
+                            date_raw[slot] = Some(x);
+                        } else {
+                            f[slot] = x;
+                        }
                         *any = true;
                     }
                     Ok(())
                 };
-                read_slot(self, "day", 2, &mut f, &mut any)?;
-                read_slot(self, "hour", 3, &mut f, &mut any)?;
-                read_slot(self, "microsecond", 7, &mut f, &mut any)?;
-                read_slot(self, "millisecond", 6, &mut f, &mut any)?;
-                read_slot(self, "minute", 4, &mut f, &mut any)?;
-                read_slot(self, "month", 1, &mut f, &mut any)?;
-                read_slot(self, "nanosecond", 8, &mut f, &mut any)?;
+                read_slot(self, "day", 2, &mut f, &mut any, &mut date_raw)?;
+                let (era, era_year) = self.read_era_fields(bag, cal)?;
+                any |= era.is_some() || era_year.is_some();
+                read_slot(self, "hour", 3, &mut f, &mut any, &mut date_raw)?;
+                read_slot(self, "microsecond", 7, &mut f, &mut any, &mut date_raw)?;
+                read_slot(self, "millisecond", 6, &mut f, &mut any, &mut date_raw)?;
+                read_slot(self, "minute", 4, &mut f, &mut any, &mut date_raw)?;
+                read_slot(self, "month", 1, &mut f, &mut any, &mut date_raw)?;
+                read_slot(self, "nanosecond", 8, &mut f, &mut any, &mut date_raw)?;
                 // The bag's `offset` field sits at its alphabetical slot (after
                 // nanosecond, before second); a bad string is a RangeError, a
                 // non-string a TypeError. Its presence also satisfies the
                 // "at least one recognized property" requirement.
                 let bag_off = self.validate_bag_offset_field(bag)?;
-                read_slot(self, "second", 5, &mut f, &mut any)?;
-                read_slot(self, "year", 0, &mut f, &mut any)?;
+                read_slot(self, "second", 5, &mut f, &mut any, &mut date_raw)?;
+                read_slot(self, "year", 0, &mut f, &mut any, &mut date_raw)?;
                 if !any && bag_off.is_none() {
                     return Err(Thrown(
                         "TypeError: with() requires at least one recognized property".into(),
                     ));
                 }
+                if era.is_some() != era_year.is_some() {
+                    return Err(Thrown("TypeError: era and eraYear must be given together".into()));
+                }
+                // Merge the date in calendar space (NonIsoFieldKeysToIgnore: an
+                // era+eraYear pair and `year` are mutually exclusive inputs).
+                let (ccy, ccm, ccd) = cal_from_iso(cal, f[0], f[1], f[2]);
+                let ny = if era.is_some() || date_raw[0].is_some() {
+                    Self::resolve_cal_year(cal, era.as_deref(), era_year, date_raw[0])?
+                } else {
+                    ccy
+                };
+                let nm = date_raw[1].unwrap_or(ccm);
+                let nd = date_raw[2].unwrap_or(ccd);
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
-                if f[1] < 1 || f[2] < 1 {
+                if nm < 1 || nd < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
                 // Validate the resolution options. ZonedDateTime.with defaults the offset
                 // option to "prefer" (unlike `from`, which defaults to "reject").
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let (off_opt, reject) = self.read_zdt_options(options, "prefer")?;
-                // A well-formed-but-calendar-invalid monthCode ("M08L", "M13") is
-                // rejected only after the options bag has been read.
+                // A month/monthCode conflict, or a well-formed-but-calendar-invalid
+                // monthCode ("M08L", "M13"), is rejected only after the options bag.
+                if month_conflict {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
                 if !month_valid {
-                    return Err(Thrown(
-                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
-                    ));
+                    return Err(Thrown(format!(
+                        "RangeError: monthCode is not valid for the {} calendar",
+                        cal.id()
+                    )));
                 }
                 // InterpretTemporalDateTimeFields: apply overflow to the upper bounds of
                 // the merged date/time fields ("reject" throws, "constrain" clamps).
                 let maxes = [23, 59, 59, 999, 999, 999];
+                let (iy, im, id2) = cal_date_to_iso(cal, ny, nm, nd, reject)
+                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
+                f[0] = iy;
+                f[1] = im;
+                f[2] = id2;
                 if reject {
-                    if !(1..=12).contains(&f[1]) || f[2] > days_in_month(f[0], f[1]) {
-                        return Err(Thrown("RangeError: invalid date fields".into()));
-                    }
                     for (i, &mx) in maxes.iter().enumerate() {
                         if f[3 + i] < 0 || f[3 + i] > mx {
                             return Err(Thrown("RangeError: time field out of range".into()));
                         }
                     }
                 } else {
-                    f[1] = f[1].min(12);
-                    f[2] = f[2].min(days_in_month(f[0], f[1]));
                     for (i, &mx) in maxes.iter().enumerate() {
                         f[3 + i] = f[3 + i].clamp(0, mx);
                     }
@@ -502,7 +546,8 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                Ok(Some(self.alloc_zdt(instant, zone_off, id)?))
+                let r = self.alloc_zdt(instant, zone_off, id)?;
+                Ok(Some(self.tag_cal(r, cal)))
             }
             _ => Ok(None),
         }
@@ -525,6 +570,10 @@ impl<'p> Vm<'p> {
         }
         if let Some(tz) = self.zdt_tz.get(&src).copied() {
             self.zdt_tz.insert(idx, tz);
+        }
+        // The derived instance keeps the source's calendar (withCalendar re-tags).
+        if let Some(cal) = self.temporal_cal.get(&src).copied() {
+            self.temporal_cal.insert(idx, cal);
         }
         Ok(Value::heap(idx))
     }
@@ -561,7 +610,8 @@ impl<'p> Vm<'p> {
                 // (null/boolean/number/bigint/symbol) is a TypeError — not coerced.
                 let (id, offset) = self.parse_tz_arg(bag.tz)?;
                 let (off_opt, reject) = self.read_zdt_options(options, "reject")?;
-                let f = Self::finish_pdt_fields(&bag, reject)?;
+                let cal = bag.cal;
+                let f = self.finish_pdt_fields(&bag, reject)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
                 // Offset agreement: a bag `offset` is reconciled with the zone's offset
@@ -583,7 +633,8 @@ impl<'p> Vm<'p> {
                         }
                     },
                 };
-                return Ok(self.alloc_zdt(local - eff as i128, offset, id)?);
+                let r = self.alloc_zdt(local - eff as i128, offset, id)?;
+                return Ok(self.tag_cal(r, cal));
             }
         }
         // An Object was handled above; only a String is parseable. Any other value —
@@ -602,6 +653,7 @@ impl<'p> Vm<'p> {
         if !temporal_string_ok(&s, false, true) {
             return Err(Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")));
         }
+        let cal = self.calendar_from_annotation(&s)?;
         let (f, str_offset, id, zone_offset, behaviour) = parse_zdt_string(&s)
             .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
         let (off_opt, _reject) = self.read_zdt_options(options, "reject")?;
@@ -640,7 +692,8 @@ impl<'p> Vm<'p> {
                 }
             }
         };
-        Ok(self.alloc_zdt(local - eff as i128, zone_offset, id)?)
+        let r = self.alloc_zdt(local - eff as i128, zone_offset, id)?;
+        Ok(self.tag_cal(r, cal))
     }
 
     /// Allocate a ZonedDateTime from epoch ns, offset, and an (owned) tz id.
@@ -739,11 +792,15 @@ impl<'p> Vm<'p> {
     /// Zoned string anchors are validated here: the epoch must be a representable
     /// instant, and an explicit-offset string is additionally subject to
     /// CheckISODaysRange on its wall date.
-    pub(crate) fn relative_to_dt(&mut self, rel: Value) -> Result<([i64; 9], bool, i64), Thrown> {
+    pub(crate) fn relative_to_dt(
+        &mut self,
+        rel: Value,
+    ) -> Result<([i64; 9], bool, i64, Cal), Thrown> {
         if rel.is_heap() {
             if matches!(self.heap.get(rel.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
                 let idx = rel.heap_index();
-                return Ok((self.zdt_local(idx), true, self.zdt_offset_ns(idx)));
+                let cal = self.cal_of(idx);
+                return Ok((self.zdt_local(idx), true, self.zdt_offset_ns(idx), cal));
             }
             // A property bag is read in ONE PrepareCalendarFields pass (calendar,
             // then the fields alphabetically with offset and timeZone at their
@@ -762,11 +819,12 @@ impl<'p> Vm<'p> {
                     let (_id, o) = self.parse_tz_arg(bag.tz)?;
                     off = o;
                 }
-                let mut f = Self::finish_pdt_fields(&bag, false)?;
+                let cal = bag.cal;
+                let mut f = self.finish_pdt_fields(&bag, false)?;
                 if !zoned {
                     f[3..9].fill(0);
                 }
-                return Ok((f, zoned, off));
+                return Ok((f, zoned, off, cal));
             }
         }
         // A plain STRING relativeTo (ToRelativeTemporalObject) uses a LOOSER grammar
@@ -824,7 +882,7 @@ impl<'p> Vm<'p> {
                         "RangeError: relativeTo '{s}' is outside the representable range"
                     )));
                 }
-                return Ok((f, true, eff));
+                return Ok((f, true, eff, self.calendar_from_annotation(st)?));
             }
             let mut f = parse_iso_datetime(main)
                 .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")))?;
@@ -836,13 +894,13 @@ impl<'p> Vm<'p> {
                     "RangeError: relativeTo '{s}' is outside the representable range"
                 )));
             }
-            return Ok((f, false, 0));
+            return Ok((f, false, 0, self.calendar_from_annotation(st)?));
         }
         // Temporal instances (PlainDate/PlainDateTime) and other coercibles:
         // a plain anchor is a PlainDate, so any time-of-day is dropped.
-        let mut f = self.to_plain_date_time(rel)?;
+        let (mut f, cal) = self.to_plain_date_time_cal(rel)?;
         f[3..9].fill(0);
-        Ok((f, false, 0))
+        Ok((f, false, 0, cal))
     }
 
     /// Validate a ZonedDateTime-like property bag's `offset` field: if present it
@@ -906,13 +964,13 @@ impl<'p> Vm<'p> {
         if fa[..4].iter().all(|&x| x == 0.0) && fb[..4].iter().all(|&x| x == 0.0) {
             return Ok(order(dur_day_time_ns(&fa), dur_day_time_ns(&fb)));
         }
-        if let Some((start, zoned, off)) = start {
+        if let Some((start, zoned, off, cal)) = start {
             // Both anchored end-points must be representable (lenient on the
             // plain start: compare uses day-granular date arithmetic).
-            check_relative_target(start, &fa, zoned, off, false)?;
-            check_relative_target(start, &fb, zoned, off, false)?;
-            let e1 = dur_end_epoch_ns(start, &fa);
-            let e2 = dur_end_epoch_ns(start, &fb);
+            check_relative_target(cal, start, &fa, zoned, off, false)?;
+            check_relative_target(cal, start, &fb, zoned, off, false)?;
+            let e1 = dur_end_epoch_ns(cal, start, &fa);
+            let e2 = dur_end_epoch_ns(cal, start, &fb);
             return Ok(order(e1, e2));
         }
         if fa[..3].iter().any(|&x| x != 0.0) || fb[..3].iter().any(|&x| x != 0.0) {
@@ -929,6 +987,7 @@ impl<'p> Vm<'p> {
     /// via epoch nanoseconds), and the re-balance to largestUnit are all shared.
     pub(crate) fn round_duration_relative(
         &mut self,
+        cal: Cal,
         f: [i64; 10],
         start: [i64; 9],
         smallest: &str,
@@ -938,7 +997,7 @@ impl<'p> Vm<'p> {
         zoned: bool,
         off: i64,
     ) -> Result<[i64; 10], Thrown> {
-        let end = dt_add_dur(start, f);
+        let end = dt_add_dur(cal, start, f);
         let order = [
             "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
             "microsecond", "nanosecond",
@@ -955,7 +1014,7 @@ impl<'p> Vm<'p> {
             // the TIME remainder is then rounded against the real zoned day.
             let df = difference_datetime(start, end, "day");
             let s: i128 = if Self::duration_sign(&df) < 0 { -1 } else { 1 };
-            let start_dt = dt_add_dur(start, [0, 0, 0, df[3], 0, 0, 0, 0, 0, 0]);
+            let start_dt = dt_add_dur(cal, start, [0, 0, 0, df[3], 0, 0, 0, 0, 0, 0]);
             let start_epoch = dt_epoch_ns(start_dt) - off as i128;
             let end_epoch = start_epoch + s * DAY_NS;
             if start_epoch.abs() > NS_MAX_INSTANT || end_epoch.abs() > NS_MAX_INSTANT {
@@ -986,12 +1045,12 @@ impl<'p> Vm<'p> {
             Ok(balance_duration_ns(rounded, largest)?.map(Self::dur_to_i64))
         } else if matches!(smallest, "year" | "month" | "week") {
             // Calendar largestUnit + calendar smallestUnit → NudgeToCalendarUnit.
-            round_relative_datetime_diff(start, end, smallest, largest, inc, mode)
+            round_relative_datetime_diff(cal, start, end, smallest, largest, inc, mode)
         } else {
             // Calendar largestUnit + day/time smallestUnit → round the day+time
             // remainder and roll an overflowing day up into the calendar units.
-            let df = difference_datetime(start, end, largest);
-            Ok(round_datetime_diff_daytime(start, df, smallest, largest, inc, mode))
+            let df = difference_datetime_cal(cal, start, end, largest);
+            Ok(round_datetime_diff_daytime(cal, start, df, smallest, largest, inc, mode))
         }
     }
 
@@ -1056,7 +1115,7 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(options) {
                     return Err(Thrown("TypeError: options must be an object or undefined".into()));
                 }
-                let cal_suf = self.calendar_name_suffix(options)?;
+                let cal_suf = self.calendar_name_suffix(options, self.cal_of(idx))?;
                 let fsd = self.read_fsd(options)?;
                 let off_opt = self.opt_string(options, "offset", "auto", &["auto", "never"])?;
                 let mode = self.read_rounding_mode_opt(options)?;

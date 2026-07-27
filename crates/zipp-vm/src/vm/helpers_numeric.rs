@@ -125,11 +125,20 @@ pub(crate) fn len_value(n: usize) -> Value {
     }
 }
 
+/// One `StrWhiteSpaceChar`: WhiteSpace ∪ LineTerminator. Unicode
+/// `White_Space` — what `str::trim_start` used — differs in exactly two
+/// characters: it omits U+FEFF (ZWNBSP), leaving
+/// `parseInt("\u{FEFF}8675309")` at NaN, and it includes U+0085 (NEL), which
+/// is not JS whitespace at all (`parseInt("\u{85}8")` must be NaN).
+fn str_white_space(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{FEFF}'
+}
+
 /// JS `parseInt(s, radix)`: skip leading whitespace, an optional sign, an
 /// optional `0x` prefix (radix 16), then digits in `radix` (default 10); stop at
 /// the first invalid digit. `NaN` if no digits parse. `radix == 0` means "auto".
 pub(crate) fn parse_int(s: &str, radix: i32) -> f64 {
-    let b = s.trim_start().as_bytes();
+    let b = s.trim_start_matches(str_white_space).as_bytes();
     let mut i = 0;
     let mut sign = 1.0;
     if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
@@ -179,7 +188,7 @@ pub(crate) fn parse_int(s: &str, radix: i32) -> f64 {
 /// decimal-float prefix (sign, digits, `.`, exponent, or `Infinity`). `NaN` if
 /// none.
 pub(crate) fn parse_float(s: &str) -> f64 {
-    let t = s.trim_start();
+    let t = s.trim_start_matches(str_white_space);
     let b = t.as_bytes();
     let mut end = 0;
     if end < b.len() && (b[end] == b'+' || b[end] == b'-') {

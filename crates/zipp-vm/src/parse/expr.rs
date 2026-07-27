@@ -370,7 +370,20 @@ impl<'s> Parser<'s> {
 
     /// Precedence climbing. `min` is the lowest binding power this call accepts.
     fn parse_binary(&mut self, min: u8) -> PResult<Expr> {
-        let mut left = self.parse_unary()?;
+        // `[+In] PrivateIdentifier in ShiftExpression` is a production of
+        // RelationalExpression, NOT a PrimaryExpression: the private name is
+        // legal only where a RelationalExpression is admissible (`min <= 9`,
+        // relational's own precedence) and only with `[+In]`. Parsing it as a
+        // primary let `typeof #f in o`, `-#f in o`, `1 + #f in o` and
+        // `for (#f in o;;)` through.
+        let mut left = if min <= 9 && self.ctx.in_ {
+            match self.try_parse_private_in()? {
+                Some(e) => e,
+                None => self.parse_unary()?,
+            }
+        } else {
+            self.parse_unary()?
+        };
         loop {
             // `in` and `instanceof` are keywords at binary precedence, and `in`
             // is suppressed inside a `for` head.
@@ -395,6 +408,41 @@ impl<'s> Parser<'s> {
             left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
         }
         Ok(left)
+    }
+
+    /// `RelationalExpression : [+In] PrivateIdentifier in ShiftExpression`.
+    ///
+    /// Returns `None` when the current token is not a private name, so the
+    /// caller falls through to the ordinary operand. The `in` is mandatory —
+    /// a private name in any other expression position is an early error.
+    fn try_parse_private_in(&mut self) -> PResult<Option<Expr>> {
+        if !matches!(self.cur().kind, TokenKind::Ident { private: true, .. }) {
+            return Ok(None);
+        }
+        let start = self.cur().span.start;
+        let tok = self.bump_after_operand()?;
+        let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+        if !self.at_kw(Keyword::In) {
+            return Err(SyntaxError::new("SyntaxError: unexpected private name", start));
+        }
+        self.bump_before_operand()?;
+        // A ShiftExpression: `#f in #f in o` (RelationalExpression) and
+        // `#f in () => {}` (AssignmentExpression) are both out of grammar. The
+        // first falls out of `min = 10`; the second needs an explicit test
+        // because parentheses leave no trace in the AST — comparing the arrow's
+        // own span against the operand start distinguishes the illegal
+        // `#f in () => {}` from the legal `#f in (() => {})`.
+        let rhs_start = self.cur().span.start;
+        let object = self.parse_binary(10)?;
+        if let Expr::Arrow(a) = &object {
+            if a.span.start == rhs_start {
+                return Err(SyntaxError::new(
+                    "SyntaxError: the right operand of a private-name 'in' must be a ShiftExpression",
+                    rhs_start,
+                ));
+            }
+        }
+        Ok(Some(Expr::PrivateIn { name: name.into_boxed_str(), object: Box::new(object) }))
     }
 
     // ---- unary / update ----------------------------------------------------
@@ -594,8 +642,15 @@ impl<'s> Parser<'s> {
         // `new.target`
         if self.at(Punct::Dot) {
             self.bump_after_operand()?;
+            // `target` is a bolded terminal of `NewTarget : new . target`, so it
+            // must appear exactly as written — `new.target` is a
+            // SyntaxError. `ident_name()` returns the COOKED name, which cannot
+            // tell the two apart, so the token is inspected directly.
+            let unescaped_target = matches!(&self.cur().kind,
+                TokenKind::Ident { name, had_escape: false, private: false, .. }
+                    if &**name == "target");
             let name = self.ident_name()?;
-            if &*name != "target" {
+            if &*name != "target" || !unescaped_target {
                 return Err(SyntaxError::new("SyntaxError: expected 'new.target'", pos));
             }
             if !self.ctx.new_target {
@@ -606,6 +661,12 @@ impl<'s> Parser<'s> {
             }
             return Ok(Expr::NewTarget);
         }
+        // Does the callee start with the `import` keyword ITSELF? A
+        // parenthesized expression leaves no trace in the AST, so testing the
+        // parsed callee alone also rejected the legal `new (import(''))` —
+        // there the ImportCall is a PrimaryExpression, hence a MemberExpression,
+        // and the failure is a runtime TypeError.
+        let bare_import = self.at_kw(Keyword::Import);
         // The callee is a MemberExpression — it takes member accesses but NOT
         // calls, so `new a.b()` applies `new` to `a.b`, not to `a.b()`.
         let mut callee =
@@ -615,7 +676,7 @@ impl<'s> Parser<'s> {
         // the callee. Checked BEFORE the member loop so `new import('m').p` is
         // caught too. (`new import.meta` stays legal — that is a MetaProperty,
         // a runtime TypeError rather than a SyntaxError.)
-        if matches!(callee, Expr::ImportCall { .. }) {
+        if bare_import && matches!(callee, Expr::ImportCall { .. }) {
             return Err(SyntaxError::new(
                 "SyntaxError: 'new' cannot be applied to an import call",
                 pos,
@@ -635,6 +696,12 @@ impl<'s> Parser<'s> {
                     prop: MemberProp::Computed(idx),
                     optional: false,
                 }));
+            } else if matches!(self.cur().kind, TokenKind::Template { .. }) {
+                // `MemberExpression : MemberExpression TemplateLiteral` — a
+                // tagged template is itself a MemberExpression, so ``new tag`t` ``
+                // constructs the TAG'S RESULT, not the tag.
+                let quasi = self.parse_template()?;
+                callee = Expr::TaggedTemplate { tag: Box::new(callee), quasi: Box::new(quasi) };
             } else {
                 break;
             }
@@ -661,6 +728,10 @@ impl<'s> Parser<'s> {
     /// `import.source.UNKNOWN` and `import.defer()` erroring as they must.
     fn parse_import_call(&mut self, phase: ImportPhase) -> PResult<Expr> {
         self.expect(Punct::LParen, true)?;
+        // Both arguments are `AssignmentExpression[+In]` — see `parse_args`;
+        // `for (p = import('./x.js', 'k' in {});;)` is legal.
+        let saved_in = self.ctx.in_;
+        self.ctx.in_ = true;
         let spec = self.parse_assign_full()?;
         let options = if self.eat(Punct::Comma, true)? && !self.at(Punct::RParen) {
             let o = self.parse_assign_full()?;
@@ -669,6 +740,7 @@ impl<'s> Parser<'s> {
         } else {
             None
         };
+        self.ctx.in_ = saved_in;
         self.expect(Punct::RParen, false)?;
         Ok(Expr::ImportCall { spec: Box::new(spec), options, phase })
     }
@@ -800,15 +872,13 @@ impl<'s> Parser<'s> {
             TokenKind::Punct(Punct::LBracket) => self.parse_array_literal(),
             TokenKind::Punct(Punct::LBrace) => self.parse_object_literal(),
             TokenKind::Ident { private: true, .. } => {
-                // A private name is only a primary in `#x in obj`.
-                let tok = self.bump_after_operand()?;
-                let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
-                if !self.at_kw(Keyword::In) {
-                    return Err(SyntaxError::new("SyntaxError: unexpected private name", start));
-                }
-                self.bump_before_operand()?;
-                let object = self.parse_binary(10)?;
-                Ok(Expr::PrivateIn { name: name.into_boxed_str(), object: Box::new(object) })
+                // A private name is never a PrimaryExpression — the only
+                // expression production that admits one is
+                // `RelationalExpression : [+In] PrivateIdentifier in
+                // ShiftExpression`, handled in `parse_binary`. Reaching here
+                // means the private name sits somewhere that production cannot
+                // cover (`!#x`, `(#x) in o`, `typeof #x in o`, …).
+                Err(SyntaxError::new("SyntaxError: unexpected private name", start))
             }
             TokenKind::Ident { kw, had_escape, .. } => {
                 // Escaped spellings are identifiers, never keywords, so they
@@ -982,7 +1052,10 @@ impl<'s> Parser<'s> {
         if self.ctx.yield_ && kw == Keyword::Yield {
             return Err(self.err_here("SyntaxError: 'yield' is reserved inside a generator"));
         }
-        if self.ctx.await_ && kw == Keyword::Await {
+        // The [Await] parameter, plus 13.1.1's goal-level rule: in a Module
+        // `await` is never an Identifier, not even inside a nested non-async
+        // `function` (which clears `ctx.await_`).
+        if (self.ctx.await_ || self.goal == Goal::Module) && kw == Keyword::Await {
             return Err(self.err_here(
                 "SyntaxError: 'await' is reserved inside an async function or module",
             ));
@@ -1006,6 +1079,10 @@ impl<'s> Parser<'s> {
         // A head chunk ending in `${` is followed by an Expression, so a `/`
         // there is a regex; a TemplateTail is an operand, so it is division.
         self.bump(!done)?;
+        // A substitution is a full `Expression[+In]` — see `parse_args`;
+        // `for (x = `${1 in {}}`;;)` is legal.
+        let saved_in = self.ctx.in_;
+        self.ctx.in_ = true;
         while !done {
             exprs.push(self.parse_expr_full()?);
             // The `}` that closes a substitution is not a punctuator here — the
@@ -1020,6 +1097,7 @@ impl<'s> Parser<'s> {
             quasis.push(TemplateElement { cooked, raw: raw.into_boxed_str() });
             done = tail;
         }
+        self.ctx.in_ = saved_in;
         Ok(TemplateLit { quasis, exprs })
     }
 
@@ -1219,7 +1297,11 @@ impl<'s> Parser<'s> {
     fn at_property_name_start(&self) -> bool {
         matches!(
             self.cur().kind,
-            TokenKind::Ident { .. } | TokenKind::Str(_) | TokenKind::Num(_)
+            // `NumericLiteral : DecimalBigIntegerLiteral` — a BigInt is a
+            // LiteralPropertyName like any other number, so `{ get 5n(){} }`
+            // has to reach the accessor path rather than falling through and
+            // re-reading `get` as a shorthand property.
+            TokenKind::Ident { .. } | TokenKind::Str(_) | TokenKind::Num(_) | TokenKind::BigInt(_)
         ) || self.at(Punct::LBracket)
     }
 
@@ -1241,8 +1323,18 @@ impl<'s> Parser<'s> {
             // key rather than inventing a BigInt one.
             TokenKind::BigInt(digits) => {
                 self.bump_after_operand()?;
-                let n: f64 = digits.parse().unwrap_or(f64::NAN);
-                Ok(PropKey::Num(n))
+                // …but a BigInt's ToString is EXACT, and f64 is not:
+                // `{999999999999999999n: 1}` keys "999999999999999999", never
+                // the rounded "1000000000000000000". 15 decimal digits is the
+                // widest that always fits in an f64 (10^15 < 2^53), so anything
+                // longer carries its own digits (the lexer has already
+                // normalised `0x`/`0o`/`0b`/`_` to decimal).
+                if digits.len() <= 15 {
+                    let n: f64 = digits.parse().unwrap_or(f64::NAN);
+                    Ok(PropKey::Num(n))
+                } else {
+                    Ok(PropKey::Str(StrVal::Utf8(digits)))
+                }
             }
             TokenKind::Ident { private: true, name, .. } => {
                 self.bump_after_operand()?;

@@ -120,12 +120,20 @@ impl<'p> Vm<'p> {
         self.require_object_coercible(props)?;
         let props = self.to_object(props)?;
         let pidx = props.heap_index();
+        // ObjectDefineProperties step 3 is `props.[[OwnPropertyKeys]]()`, so the
+        // walk is in OWN-KEY order — array indices ascending, then the string
+        // keys in insertion order, then the symbol keys — NOT the raw insertion
+        // order, in which zipp interleaves its `@@`-prefixed symbol keys with
+        // the string ones. The difference is observable as the order of the
+        // [[DefineOwnProperty]] calls on a Proxy target.
         let enum_keys = |m: &ObjMap| -> Vec<String> {
-            m.keys
+            let ordered = spec_key_order(&m.keys);
+            let live = |i: &usize| m.attrs[*i].enumerable;
+            ordered
                 .iter()
-                .zip(m.attrs.iter())
-                .filter(|(_, a)| a.enumerable)
-                .map(|(k, _)| k.clone())
+                .filter(|i| live(i) && !is_hidden_key(&m.keys[**i]))
+                .chain(ordered.iter().filter(|i| live(i) && is_hidden_key(&m.keys[**i])))
+                .map(|i| m.keys[*i].clone())
                 .collect()
         };
         // A PROXY descriptor bag follows the spec protocol exactly:

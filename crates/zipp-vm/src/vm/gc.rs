@@ -405,6 +405,7 @@ impl Vm<'_> {
         self.fn_props.retain(|&k, _| marks[k as usize]);
         self.arr_props.retain(|&k, _| marks[k as usize]);
         self.zdt_tz.retain(|&k, _| marks[k as usize]);
+        self.temporal_cal.retain(|&k, _| marks[k as usize]);
         // Idx-keyed FLAG sets must drop dead keys too, or a recycled slot
         // inherits the previous occupant's state (a fresh function would
         // report its name/length intrinsic deleted; a fresh array a frozen

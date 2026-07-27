@@ -735,7 +735,13 @@ impl<'s> Parser<'s> {
         if self.ctx.yield_ && kw == Keyword::Yield {
             return false;
         }
-        if self.ctx.await_ && kw == Keyword::Await {
+        // 13.1.1: `Identifier : IdentifierName but not ReservedWord` is also a
+        // Syntax Error "if the goal symbol of the syntactic grammar is Module
+        // and the StringValue of IdentifierName is `await`" — independently of
+        // the [Await] parameter, which a nested non-async `function` clears.
+        // So `function f() { var await; }` is an error in a module and legal in
+        // a script.
+        if (self.ctx.await_ || self.goal == Goal::Module) && kw == Keyword::Await {
             return false;
         }
         true
@@ -770,6 +776,45 @@ impl<'s> Parser<'s> {
         Ok(name.into_boxed_str())
     }
 
+    /// Can the current token continue an ExpressionStatement whose expression
+    /// is complete so far? ASI is defined negatively — a semicolon appears only
+    /// where the offending token has no parse — so this is the exact test.
+    ///
+    /// The complement is listed because it is the short, closed one: everything
+    /// that can follow a completed operand is an operator, a member/call
+    /// opener, or a template (a StringLiteral is a MemberExpression, so
+    /// `` "x"`y` `` is a tagged template).
+    fn tok_continues_expression(&self) -> bool {
+        use Punct as P;
+        if matches!(self.tok.kind, TokenKind::Template { .. }) {
+            return true;
+        }
+        if self.tok.is_kw(Keyword::In) || self.tok.is_kw(Keyword::Instanceof) {
+            return true;
+        }
+        match self.tok.kind.as_punct() {
+            Some(p) => !matches!(
+                p,
+                P::LBrace
+                    | P::RBrace
+                    | P::RParen
+                    | P::RBracket
+                    | P::Semi
+                    | P::DotDotDot
+                    | P::Colon
+                    | P::Arrow
+                    // `++`/`--` carry [no LineTerminator here], and this test is
+                    // only reached with a newline in between.
+                    | P::PlusPlus
+                    | P::MinusMinus
+                    | P::Bang
+                    | P::Tilde
+                    | P::At
+            ),
+            None => false,
+        }
+    }
+
     // ---- directive prologue ------------------------------------------------
 
     /// Parse a directive prologue, returning the directives and whether it
@@ -802,10 +847,16 @@ impl<'s> Parser<'s> {
             let save_pos = self.lx.pos();
             let TokenKind::Str(value) = save.kind.clone() else { unreachable!() };
             self.bump_after_operand()?;
+            // A newline is ASI's PRECONDITION, not its test: 11.9.1 inserts a
+            // semicolon only before a token that cannot be parsed as part of
+            // the production, and `in`, `instanceof`, `+`, `.`, `(` … all can.
+            // Cutting the statement at the newline made `'a'\n+'b'` two
+            // statements — a directive `'a'` and `+'b'` — so the program
+            // silently evaluated to NaN instead of "ab".
             let terminated = self.at(Punct::Semi)
                 || self.at(Punct::RBrace)
                 || self.at_eof()
-                || self.tok.newline_before;
+                || (self.tok.newline_before && !self.tok_continues_expression());
             if !terminated {
                 // Not a directive after all; rewind so the expression parser
                 // sees the string.

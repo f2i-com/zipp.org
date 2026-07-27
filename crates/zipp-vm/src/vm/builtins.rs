@@ -298,13 +298,15 @@ impl<'p> Vm<'p> {
                 t.is_heap() && t != this && self.is_callable(t)
             });
         // Step 4 IsArray(O) pierces proxy targets (revoked throws) — "Array".
-        if this.is_heap()
+        // It picks the builtinTag and nothing more: returning here skipped step
+        // 15's `Get(O, @@toStringTag)`, which is UNCONDITIONAL and observable
+        // through the proxy's `get` trap.
+        let proxy_array = this.is_heap()
             && self.proxy_parts(this.heap_index()).is_some()
-            && self.value_is_array_throwing(this)?
-        {
-            return Ok("Array".to_string());
-        }
-        let builtin = if this.is_heap() {
+            && self.value_is_array_throwing(this)?;
+        let builtin = if proxy_array {
+            "Array"
+        } else if this.is_heap() {
             match self.heap.get(this.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "String",
                 // An `arguments` exotic ([[ParameterMap]]) tags "Arguments" even
@@ -2160,8 +2162,17 @@ impl<'p> Vm<'p> {
                 let result = match name {
                     // union / symmetricDifference always iterate the other set.
                     "union" => {
-                        let mut r = this_items.clone();
-                        for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                        // The copy of O.[[SetData]] is step 5, AFTER
+                        // GetKeysIterator (step 4) — so a `next` GETTER that
+                        // mutates the receiver still shapes the result.
+                        let it = self.set_rec_keys_iter(&other_real, other_keys, a0)?;
+                        let mut r: Vec<Value> = match self.heap.get(idx) {
+                            HeapObj::Set(items) => {
+                                items.iter().copied().filter(|v| !v.is_hole()).collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        for v in self.set_rec_drain(&other_real, it)? {
                             if !mem(&r, v, self) {
                                 r.push(v);
                             }
@@ -2173,14 +2184,36 @@ impl<'p> Vm<'p> {
                         // the spec decides remove-vs-keep by SetDataHas(O.[[SetData]], key)
                         // — the LIVE receiver, which the keys() iterator may have mutated —
                         // not by the result. (See symmetricDifference set-like-class-mutation.)
-                        let okeys = self.set_rec_keys(&other_real, other_keys, a0)?;
-                        let o_live: Vec<Value> = match self.heap.get(idx) {
-                            HeapObj::Set(items) => items.iter().copied().filter(|v| !v.is_hole()).collect(),
+                        // Same step order as union: GetKeysIterator, THEN copy
+                        // O.[[SetData]] into the result.
+                        let it = self.set_rec_keys_iter(&other_real, other_keys, a0)?;
+                        let mut r: Vec<Value> = match self.heap.get(idx) {
+                            HeapObj::Set(items) => {
+                                items.iter().copied().filter(|v| !v.is_hole()).collect()
+                            }
                             _ => Vec::new(),
                         };
-                        let mut r = this_items.clone();
-                        for v in okeys {
-                            if mem(&o_live, v, self) {
+                        // LAZY, for the same reason as intersection's else arm:
+                        // the live test must run between two steps.
+                        let mut real_pos = 0usize;
+                        loop {
+                            let v = match it {
+                                None => {
+                                    let items = other_real.as_deref().unwrap_or(&[]);
+                                    if real_pos >= items.len() {
+                                        break;
+                                    }
+                                    real_pos += 1;
+                                    items[real_pos - 1]
+                                }
+                                Some((kiter, next)) => {
+                                    match self.set_rec_step(kiter, next)? {
+                                        Some(v) => v,
+                                        None => break,
+                                    }
+                                }
+                            };
+                            if self.set_has_live(idx, v) {
                                 // In O → remove it from the result if present.
                                 r.retain(|&x| !self.same_value_zero(x, v));
                             } else if !mem(&r, v, self) {
@@ -2195,15 +2228,48 @@ impl<'p> Vm<'p> {
                     "intersection" => {
                         let mut r: Vec<Value> = Vec::new();
                         if this_size <= other_size {
-                            for &e in &this_items {
-                                if self.set_rec_has(&other_real, other_has, a0, e)? && !mem(&r, e, self) {
+                            // Walk O.[[SetData]] LIVE by index, re-reading its
+                            // length each step. `other`'s has() may delete an
+                            // element and re-add it, which moves it to the END
+                            // of the list — so the SAME element is visited
+                            // twice, which the spec calls out in a NOTE.
+                            let mut index = 0usize;
+                            loop {
+                                let e = match self.heap.get(idx) {
+                                    HeapObj::Set(items) if index < items.len() => items[index],
+                                    _ => break,
+                                };
+                                index += 1;
+                                if e.is_hole() {
+                                    continue; // tombstoned (deleted) slot
+                                }
+                                if self.set_rec_has(&other_real, other_has, a0, e)?
+                                    && !mem(&r, e, self)
+                                {
                                     r.push(e);
                                 }
                             }
                         } else {
-                            for v in self.set_rec_keys(&other_real, other_keys, a0)? {
-                                if mem(&this_items, v, self) && !mem(&r, v, self) {
-                                    r.push(v);
+                            // LAZY: `SetDataHas(O.[[SetData]], next)` runs
+                            // between two `IteratorStepValue` calls, so a
+                            // generator `keys()` that mutates the receiver
+                            // after yielding must not affect the keys it
+                            // already yielded.
+                            let it = self.set_rec_keys_iter(&other_real, other_keys, a0)?;
+                            match it {
+                                None => {
+                                    for v in other_real.clone().unwrap_or_default() {
+                                        if self.set_has_live(idx, v) && !mem(&r, v, self) {
+                                            r.push(v);
+                                        }
+                                    }
+                                }
+                                Some((kiter, next)) => {
+                                    while let Some(v) = self.set_rec_step(kiter, next)? {
+                                        if self.set_has_live(idx, v) && !mem(&r, v, self) {
+                                            r.push(v);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2260,7 +2326,10 @@ impl<'p> Vm<'p> {
                             let items = items.clone();
                             let mut ok = true;
                             for v in items {
-                                if !mem(&this_items, v, self) {
+                                // `SetDataHas(O.[[SetData]], next)` — the LIVE
+                                // receiver: the keys iterator's `value` getter
+                                // may add the very element about to be tested.
+                                if !self.set_has_live(idx, v) {
                                     ok = false;
                                     break;
                                 }
@@ -2280,7 +2349,7 @@ impl<'p> Vm<'p> {
                             let next = self.get_prop(kiter, "next")?;
                             let mut ok = true;
                             while let Some(v) = self.iterator_step_with(kiter, next)? {
-                                if !mem(&this_items, v, self) {
+                                if !self.set_has_live(idx, v) {
                                     ok = false;
                                     self.iterator_close(kiter)?;
                                     break;
@@ -2313,7 +2382,8 @@ impl<'p> Vm<'p> {
                         } else if let Some(items) = &other_real {
                             let items = items.clone();
                             for v in items {
-                                if mem(&this_items, v, self) {
+                                // `SetDataHas(O.[[SetData]], nextValue)`: live.
+                                if self.set_has_live(idx, v) {
                                     disjoint = false;
                                     break;
                                 }
@@ -2328,7 +2398,7 @@ impl<'p> Vm<'p> {
                             }
                             let next = self.get_prop(kiter, "next")?;
                             while let Some(v) = self.iterator_step_with(kiter, next)? {
-                                if mem(&this_items, v, self) {
+                                if self.set_has_live(idx, v) {
                                     disjoint = false;
                                     self.iterator_close(kiter)?;
                                     break;
@@ -2371,8 +2441,40 @@ impl<'p> Vm<'p> {
         keys_fn: Value,
         obj: Value,
     ) -> Result<Vec<Value>, Thrown> {
-        if let Some(items) = real {
-            return Ok(items.clone());
+        let it = self.set_rec_keys_iter(real, keys_fn, obj)?;
+        self.set_rec_drain(real, it)
+    }
+
+    /// `SetDataHas(O.[[SetData]], v)` against the LIVE receiver.
+    ///
+    /// Every spec step that consults the receiver mid-iteration reads
+    /// `O.[[SetData]]` itself, not a copy — an `other` whose `has`, `next` or
+    /// `value` runs user code can add to or delete from the receiver in
+    /// between, and that must be visible.
+    fn set_has_live(&self, set_idx: u32, v: Value) -> bool {
+        match self.heap.get(set_idx) {
+            HeapObj::Set(items) => {
+                items.iter().any(|x| !x.is_hole() && self.same_value_zero(*x, v))
+            }
+            _ => false,
+        }
+    }
+
+    /// `GetKeysIterator(otherRec)` on its own: call `keys()`, require an object,
+    /// then read and validate `next`. `None` for a real Set, whose elements are
+    /// read directly.
+    ///
+    /// Split from the drain below because `union` and `symmetricDifference` copy
+    /// `O.[[SetData]]` *between* the two — a `next` getter that clears the
+    /// receiver and adds a new element must be reflected in the result.
+    fn set_rec_keys_iter(
+        &mut self,
+        real: &Option<Vec<Value>>,
+        keys_fn: Value,
+        obj: Value,
+    ) -> Result<Option<(Value, Value)>, Thrown> {
+        if real.is_some() {
+            return Ok(None);
         }
         let kiter = self.call_value(keys_fn, obj, &[])?;
         // GetSetRecord treats the `keys()` result as an ALREADY-OBTAINED Iterator
@@ -2384,19 +2486,40 @@ impl<'p> Vm<'p> {
         if !self.is_callable(next) {
             return Err(Thrown("TypeError: set-like keys() iterator has no next method".into()));
         }
+        Ok(Some((kiter, next)))
+    }
+
+    /// One `IteratorStepValue(keysIter)`. `None` once the iterator is done.
+    fn set_rec_step(&mut self, kiter: Value, next: Value) -> Result<Option<Value>, Thrown> {
+        let res = self.call_value(next, kiter, &[])?;
+        if !self.is_object_value(res) {
+            return Err(Thrown("TypeError: iterator result is not an object".into()));
+        }
+        let done = self.get_prop(res, "done")?;
+        if self.truthy(done) {
+            return Ok(None);
+        }
+        let v = self.get_prop(res, "value")?;
+        // -0 normalises to +0 for SameValueZero membership.
+        Ok(Some(if v.is_number() && v.as_f64() == 0.0 { Value::int(0) } else { v }))
+    }
+
+    /// Drain the iterator [`Self::set_rec_keys_iter`] returned.
+    ///
+    /// Only for the branches whose per-element test reads NOTHING live — the
+    /// ones that consult `O.[[SetData]]` must step lazily instead, or a
+    /// generator's later mutations would decide earlier elements.
+    fn set_rec_drain(
+        &mut self,
+        real: &Option<Vec<Value>>,
+        it: Option<(Value, Value)>,
+    ) -> Result<Vec<Value>, Thrown> {
+        let Some((kiter, next)) = it else {
+            return Ok(real.clone().unwrap_or_default());
+        };
         let mut out = Vec::new();
-        loop {
-            let res = self.call_value(next, kiter, &[])?;
-            if !self.is_object_value(res) {
-                return Err(Thrown("TypeError: iterator result is not an object".into()));
-            }
-            let done = self.get_prop(res, "done")?;
-            if self.truthy(done) {
-                break;
-            }
-            let v = self.get_prop(res, "value")?;
-            // -0 normalises to +0 for SameValueZero membership.
-            out.push(if v.is_number() && v.as_f64() == 0.0 { Value::int(0) } else { v });
+        while let Some(v) = self.set_rec_step(kiter, next)? {
+            out.push(v);
         }
         Ok(out)
     }

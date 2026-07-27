@@ -2756,19 +2756,35 @@ impl<'p> Vm<'p> {
                             // IcEntry guards only on the version).
                             self.heap.bump_version(idx);
                         }
-                        // A TypedArray on a RESIZABLE buffer can never lose
+                        // A TypedArray whose LENGTH CAN CHANGE can never lose
                         // extensibility: [[PreventExtensions]] returns false
-                        // when IsTypedArrayFixedLength is false (a length-
-                        // tracking view, or ANY view over a resizable buffer)
-                        // — so preventExtensions/seal/freeze all throw. A
-                        // fixed-buffer TypedArray with elements still rejects
-                        // FREEZE (its indices are writable, non-configurable).
+                        // when IsTypedArrayFixedLength is false, so
+                        // preventExtensions/seal/freeze all throw. Keying that
+                        // on "the buffer is resizable" was too broad — a
+                        // fixed-length view onto a GROWABLE SharedArrayBuffer
+                        // can never shrink, and must succeed.
                         HeapObj::TypedArray { buffer, .. }
-                            if self.ab_max.contains_key(buffer) =>
+                            if !self.ta_is_fixed_length(idx, *buffer) =>
                         {
                             return Err(Thrown(
-                                "TypeError: Cannot prevent extensions on a TypedArray backed by a resizable ArrayBuffer".into(),
+                                "TypeError: Cannot prevent extensions on a TypedArray whose length can change".into(),
                             ));
+                        }
+                        // SetIntegrityLevel then redefines every index property
+                        // with configurable: false (and, for freeze, writable:
+                        // false), both of which an integer-indexed exotic
+                        // [[DefineOwnProperty]] rejects outright. So a NON-EMPTY
+                        // TypedArray can be preventExtensions'd but never sealed
+                        // or frozen; an empty one has no index property to
+                        // redefine and succeeds.
+                        HeapObj::TypedArray { .. }
+                            if id != OBJ_PREVENT_EXT
+                                && self.ta_effective_len(idx).unwrap_or(0) > 0 =>
+                        {
+                            let m = if id == OBJ_FREEZE { "freeze" } else { "seal" };
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot {m} a TypedArray that has elements"
+                            )));
                         }
                         _ => {
                             let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
@@ -3415,6 +3431,15 @@ impl<'p> Vm<'p> {
                     return Ok(Value::bool(b));
                 }
                 let idx = a0.heap_index();
+                // An integer-indexed exotic [[PreventExtensions]] RETURNS false
+                // when IsTypedArrayFixedLength is false — it does not throw.
+                // Only `Object.preventExtensions` turns that false into a
+                // TypeError; `Reflect.preventExtensions` reports it.
+                if let HeapObj::TypedArray { buffer, .. } = self.heap.get(idx) {
+                    if !self.ta_is_fixed_length(idx, *buffer) {
+                        return Ok(Value::bool(false));
+                    }
+                }
                 if matches!(self.heap.get(idx), HeapObj::Object(_)) {
                     if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                         m.extensible = false;
@@ -4126,9 +4151,13 @@ impl<'p> Vm<'p> {
                 // abrupt; then radix = ToInt32(ToNumber(radix)) (NaN/±Infinity → 0,
                 // i.e. the default base). ToString runs BEFORE the radix coercion.
                 let s = self.to_js_string(a0)?;
+                // R is `ToInt32(radix)` — a MODULO 2^32 wrap. Rust's `as i32`
+                // on a float SATURATES instead, so `parseInt("0x10", 1e308)`
+                // became radix -1 (an out-of-range NaN) where ToInt32 gives 0,
+                // i.e. the default base.
                 let radix = if args.len() >= 2 {
                     let r = self.to_number_coerce(a1)?;
-                    if r.is_finite() { r as i64 as i32 } else { 0 }
+                    crate::vm::helpers_num2::to_int32(r)
                 } else {
                     0
                 };
@@ -4771,15 +4800,16 @@ impl<'p> Vm<'p> {
                 // its fields, but a string/primitive must parse/reject FIRST (a
                 // non-string primitive → TypeError, an invalid ISO string → RangeError),
                 // so overflow is read only once the item is known-processable.
-                let (y, m, d) = if self.is_object_value(a0) {
+                let ((y, m, d), cal) = if self.is_object_value(a0) {
                     // Object: read the bag fields, THEN options.overflow (order-of-ops).
-                    self.to_plain_date_overflow(a0, Some(a1))?
+                    self.to_plain_date_cal(a0, Some(a1))?
                 } else {
-                    let r = self.to_plain_date(a0)?;
+                    let r = self.to_plain_date_cal(a0, None)?;
                     self.read_overflow(a1)?;
                     r
                 };
-                self.make_plain_date(y, m, d)?
+                let r = self.make_plain_date(y, m, d)?;
+                self.tag_cal(r, cal)
             }
             PLAINDATE_COMPARE => {
                 let a = self.to_plain_date(a0)?;
@@ -4840,13 +4870,14 @@ impl<'p> Vm<'p> {
                     // the deferred monthCode/range validation (order-of-ops).
                     let bag = self.read_pdt_bag(a0, false)?;
                     let reject = self.read_overflow(a1)?;
-                    Self::finish_pdt_fields(&bag, reject)?
+                    (self.finish_pdt_fields(&bag, reject)?, bag.cal)
                 } else {
-                    let r = self.to_plain_date_time(a0)?;
+                    let r = self.to_plain_date_time_cal(a0)?;
                     self.read_overflow(a1)?;
                     r
                 };
-                self.make_plain_date_time(f)?
+                let r = self.make_plain_date_time(f.0)?;
+                self.tag_cal(r, f.1)
             }
             PLAINDATETIME_COMPARE => {
                 let a = self.to_plain_date_time_limited(a0)?;
@@ -4918,15 +4949,16 @@ impl<'p> Vm<'p> {
             }
             PLAINYEARMONTH_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
-                let (y, m, rd) = if self.is_object_value(a0) {
+                let ((y, m, rd), cal) = if self.is_object_value(a0) {
                     // Object: read the bag fields, THEN options.overflow (order-of-ops).
                     self.to_plain_year_month_overflow(a0, Some(a1))?
                 } else {
-                    let r = self.to_plain_year_month(a0)?;
+                    let r = self.to_plain_year_month_overflow(a0, None)?;
                     self.read_overflow(a1)?;
                     r
                 };
-                self.make_plain_year_month(y, m, rd)?
+                let r = self.make_plain_year_month(y, m, rd)?;
+                self.tag_cal(r, cal)
             }
             PLAINYEARMONTH_COMPARE => {
                 let a = self.to_plain_year_month(a0)?;
@@ -4981,15 +5013,16 @@ impl<'p> Vm<'p> {
             }
             PLAINMONTHDAY_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
-                let (ry, m, d) = if self.is_object_value(a0) {
+                let ((ry, m, d), cal) = if self.is_object_value(a0) {
                     // Object: read the bag fields, THEN options.overflow (order-of-ops).
                     self.to_plain_month_day_overflow(a0, Some(a1))?
                 } else {
-                    let r = self.to_plain_month_day(a0)?;
+                    let r = self.to_plain_month_day_overflow(a0, None)?;
                     self.read_overflow(a1)?;
                     r
                 };
-                self.make_plain_month_day(m, d, ry)?
+                let r = self.make_plain_month_day(m, d, ry)?;
+                self.tag_cal(r, cal)
             }
             // Temporal.Now — no timezone DB, so a named zone reports UTC, but a
             // numeric-offset zone shifts the wall-clock. The time-zone arg is
@@ -5092,13 +5125,17 @@ impl<'p> Vm<'p> {
             }
             INTL_SUPPORTED_LOCALES_OF => {
                 let list = self.canonicalize_locale_list(a0)?;
-                // SupportedLocales: GetOptionsObject on the 2nd argument, then
-                // GetOption(options, "localeMatcher", …) — both observable, and
-                // both skipped before (an invalid matcher silently succeeded).
-                if a1 != Value::UNDEFINED && !self.is_object_value(a1) {
-                    return Err(Thrown("TypeError: Options must be an object or undefined".into()));
-                }
-                self.opt_string(a1, "localeMatcher", "best fit", &["lookup", "best fit"])?;
+                // SupportedLocales step 1 is `? ToObject(options)`, NOT
+                // GetOptionsObject: `supportedLocalesOf([], 7)` wraps the number
+                // and still reads `localeMatcher` off Object.prototype. Only
+                // null/undefined are special (undefined skips, null throws).
+                let options = if a1 == Value::UNDEFINED {
+                    a1
+                } else {
+                    self.require_object_coercible(a1)?;
+                    self.to_object(a1)?
+                };
+                self.opt_string(options, "localeMatcher", "best fit", &["lookup", "best fit"])?;
                 let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
                 Value::heap(self.heap.alloc(HeapObj::Array(items)))
             }
@@ -5151,6 +5188,7 @@ impl<'p> Vm<'p> {
                 let ms = if a0 == Value::UNDEFINED {
                     (Self::now_epoch_ns() / 1_000_000) as f64
                 } else {
+                    self.dtf_check_calendar(resolved, a0, "format")?;
                     self.dtf_time_value(a0)?
                 };
                 let s = self.dtf_format(resolved, ms);
@@ -5161,6 +5199,7 @@ impl<'p> Vm<'p> {
                 let ms = if a0 == Value::UNDEFINED {
                     (Self::now_epoch_ns() / 1_000_000) as f64
                 } else {
+                    self.dtf_check_calendar(resolved, a0, "formatToParts")?;
                     self.dtf_time_value(a0)?
                 };
                 let parts: Vec<(String, String, &str)> = self
@@ -5184,6 +5223,8 @@ impl<'p> Vm<'p> {
                         "TypeError: {name} endpoints must be of the same type"
                     )));
                 }
+                self.dtf_check_calendar(resolved, a0, name)?;
+                self.dtf_check_calendar(resolved, a1, name)?;
                 let x = self.dtf_time_value(a0)?;
                 let y = self.dtf_time_value(a1)?;
                 let parts = self.dtf_range_parts(resolved, x, y);
@@ -5195,9 +5236,30 @@ impl<'p> Vm<'p> {
                 }
             }
             INTL_COLLATOR_COMPARE => {
-                let _ = self.intl_this(this, INTL_COLLATOR, "compare")?;
+                let resolved = self.intl_this(this, INTL_COLLATOR, "compare")?;
                 let a = self.to_js_string(a0)?;
                 let b = self.to_js_string(a1)?;
+                // There is no DUCET/CLDR collation here — this is an NFC
+                // code-point comparison. The two option-driven transforms that
+                // do NOT need collation weights are applied: `ignorePunctuation`
+                // drops the characters CLDR treats as variable (whitespace,
+                // punctuation and symbols), and `sensitivity: "base"/"accent"`
+                // case-folds.
+                let ignore_punct = self.intl_slot(resolved, "ignorePunctuation") == Value::bool(true);
+                let sens = self.display(self.intl_slot(resolved, "sensitivity"));
+                let prep = |s: &str| -> String {
+                    use unicode_normalization::UnicodeNormalization;
+                    let s: String = s.nfc().collect();
+                    let s: String = if ignore_punct {
+                        s.chars()
+                            .filter(|c| !crate::vm::intl::is_variable_collation_char(*c))
+                            .collect()
+                    } else {
+                        s
+                    };
+                    if sens == "base" || sens == "accent" { s.to_lowercase() } else { s }
+                };
+                let (a, b) = (prep(&a), prep(&b));
                 Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
             }
             INTL_PLURAL_SELECT => {
@@ -5208,58 +5270,101 @@ impl<'p> Vm<'p> {
             }
             INTL_PLURAL_SELECT_RANGE => {
                 let _ = self.intl_this(this, INTL_PLURALRULES, "selectRange")?;
+                // ResolvePluralRange steps 3-5: an absent endpoint is a
+                // TypeError and a NaN one a RangeError, both BEFORE any
+                // formatting (neither was checked at all).
+                if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
+                    return Err(Thrown(
+                        "TypeError: selectRange requires both a start and an end".into(),
+                    ));
+                }
+                let x = self.to_number(a0)?;
+                let y = self.to_number(a1)?;
+                if x.is_nan() || y.is_nan() {
+                    return Err(Thrown("RangeError: selectRange endpoints must not be NaN".into()));
+                }
                 self.alloc_str("other".to_string())
             }
-            INTL_LIST_FORMAT => {
-                let resolved = self.intl_this(this, INTL_LISTFORMAT, "format")?;
-                let items = self.iterate_to_vec(a0)?;
-                let mut strs: Vec<String> = Vec::with_capacity(items.len());
-                for v in items {
-                    strs.push(self.to_js_string(v)?);
-                }
+            INTL_LIST_FORMAT | INTL_LIST_FORMAT_TO_PARTS => {
+                let to_parts = id == INTL_LIST_FORMAT_TO_PARTS;
+                let name = if to_parts { "formatToParts" } else { "format" };
+                let resolved = self.intl_this(this, INTL_LISTFORMAT, name)?;
+                let strs = self.string_list_from_iterable(a0)?;
                 let t = self.display(self.intl_slot(resolved, "type"));
                 let conj = if t == "disjunction" { "or" } else { "and" };
-                let s = format_list_en(&strs, conj);
-                self.alloc_str(s)
-            }
-            INTL_LIST_FORMAT_TO_PARTS => {
-                let resolved = self.intl_this(this, INTL_LISTFORMAT, "formatToParts")?;
-                let items = self.iterate_to_vec(a0)?;
-                let mut strs: Vec<String> = Vec::with_capacity(items.len());
-                for v in items {
-                    strs.push(self.to_js_string(v)?);
+                // CreatePartsFromList: the element/literal decomposition IS the
+                // format string, so both entry points derive from one splitter.
+                let parts = list_parts_en(&strs, conj);
+                if to_parts {
+                    let ps: Vec<(String, String, &str)> =
+                        parts.into_iter().map(|(t, v)| (t.to_string(), v, "")).collect();
+                    self.intl_parts_array(&ps)
+                } else {
+                    let s: String = parts.into_iter().map(|(_, v)| v).collect();
+                    self.alloc_str(s)
                 }
-                let t = self.display(self.intl_slot(resolved, "type"));
-                let conj = if t == "disjunction" { "or" } else { "and" };
-                let s = format_list_en(&strs, conj);
-                let mut part = ObjMap::new();
-                let ty = self.alloc_str("literal".to_string());
-                part.set("type", ty);
-                let sv = self.alloc_str(s);
-                part.set("value", sv);
-                let p = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(part))));
-                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
             }
             INTL_RTF_FORMAT | INTL_RTF_FORMAT_TO_PARTS => {
-                let _ = self.intl_this(this, INTL_RELATIVETIMEFORMAT, "format")?;
+                let to_parts = id == INTL_RTF_FORMAT_TO_PARTS;
+                let name = if to_parts { "formatToParts" } else { "format" };
+                let _ = self.intl_this(this, INTL_RELATIVETIMEFORMAT, name)?;
                 let v = self.to_number(a0)?;
-                let unit = self.to_js_string(a1)?;
-                let s = format_relative_time_en(v, &unit);
-                if id == INTL_RTF_FORMAT {
-                    self.alloc_str(s)
+                // PartitionRelativeTimePattern step 2: a non-finite value is a
+                // RangeError (it was formatted as "in NaN days" before).
+                if !v.is_finite() {
+                    return Err(Thrown("RangeError: relative time value must be finite".into()));
+                }
+                // SingularRelativeTimeUnit: ToString first (so a Symbol is a
+                // TypeError), then the eight allowed units in either number —
+                // anything else, including "decade" and "millisecond", is a
+                // RangeError.
+                let unit_raw = self.to_js_string(a1)?;
+                let unit = unit_raw.strip_suffix('s').unwrap_or(&unit_raw).to_string();
+                if !["second", "minute", "hour", "day", "week", "month", "quarter", "year"]
+                    .contains(&unit.as_str())
+                {
+                    return Err(Thrown(format!("RangeError: invalid unit: {unit_raw}")));
+                }
+                // The value is rendered by the service's own number formatting
+                // (so 1000 groups as "1,000"); the surrounding pattern is the
+                // en "always" pattern — the CLDR dateFields for other locales,
+                // widths and the numeric:"auto" literals are data zipp lacks.
+                let n = v.abs();
+                let plural = (n - 1.0).abs() > f64::EPSILON;
+                let unit_str = if plural { format!("{unit}s") } else { unit.clone() };
+                // The interpolated number is decomposed like NumberFormat's, and
+                // every one of ITS parts (but none of the surrounding literals)
+                // carries the singular `unit` field.
+                let mut parts: Vec<(String, String, &str)> = vec![];
+                if v >= 0.0 {
+                    parts.push(("literal".into(), "in ".into(), ""));
+                }
+                for (t, val) in grouped_decimal_parts(n) {
+                    parts.push((t.to_string(), val, unit.as_str()));
+                }
+                parts.push((
+                    "literal".into(),
+                    if v < 0.0 { format!(" {unit_str} ago") } else { format!(" {unit_str}") },
+                    "",
+                ));
+                if to_parts {
+                    self.intl_parts_array_keyed(&parts, "unit")
                 } else {
-                    let mut part = ObjMap::new();
-                    let ty = self.alloc_str("literal".to_string());
-                    part.set("type", ty);
-                    let sv = self.alloc_str(s);
-                    part.set("value", sv);
-                    let p = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(part))));
-                    Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+                    let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+                    self.alloc_str(s)
                 }
             }
             INTL_DISPLAYNAMES_OF => {
                 let resolved = self.intl_this(this, INTL_DISPLAYNAMES, "of")?;
                 let code = self.to_js_string(a0)?;
+                let ty = self.display(self.intl_slot(resolved, "type"));
+                // Step 5: IsValidDisplayNamesCode — a malformed code is a
+                // RangeError before any lookup. None of these were checked, so
+                // `of("00")`/`of("seconds")` silently echoed the code back.
+                let code = crate::vm::intl::canonical_display_names_code(&ty, &code)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid {ty} code: {code}")))?;
+                // The display names themselves are CLDR data this engine does
+                // not ship, so every code takes the [[Fallback]] path.
                 let fb = self.display(self.intl_slot(resolved, "fallback"));
                 if fb == "none" {
                     Value::UNDEFINED
@@ -5268,13 +5373,36 @@ impl<'p> Vm<'p> {
                 }
             }
             INTL_LOCALE_TOSTRING => {
+                // [[Locale]] — the FULL canonical tag, extensions included.
                 let resolved = self.intl_this(this, INTL_LOCALE, "toString")?;
-                self.intl_slot(resolved, "baseName")
+                self.intl_slot(resolved, "@@tag")
             }
             INTL_LOCALE_MAXIMIZE | INTL_LOCALE_MINIMIZE => {
-                let resolved = self.intl_this(this, INTL_LOCALE, "maximize")?;
-                let bn = self.intl_slot(resolved, "baseName");
-                self.make_locale(bn, Value::UNDEFINED)?
+                // Add/RemoveLikelySubtags needs the CLDR likelySubtags table,
+                // which this engine does not ship: the tag comes back unchanged
+                // rather than being silently mis-expanded.
+                let name = if id == INTL_LOCALE_MAXIMIZE { "maximize" } else { "minimize" };
+                let resolved = self.intl_this(this, INTL_LOCALE, name)?;
+                let tag = self.display(self.intl_slot(resolved, "@@tag"));
+                match crate::vm::locale_tag::parse_lang_tag(&tag) {
+                    Some(t) => self.alloc_locale(&t),
+                    None => this,
+                }
+            }
+            INTL_LOCALE_GET_VARIANTS => {
+                let resolved = self.intl_this(this, INTL_LOCALE, "variants")?;
+                self.intl_slot(resolved, "variants")
+            }
+            INTL_LOCALE_GET_FIRSTDAY => {
+                let resolved = self.intl_this(this, INTL_LOCALE, "firstDayOfWeek")?;
+                self.intl_slot(resolved, "firstDayOfWeek")
+            }
+            _ if (INTL_LOCALE_INFO_BASE..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16)
+                .contains(&id) =>
+            {
+                let which = LOCALE_INFO_METHODS[(id - INTL_LOCALE_INFO_BASE) as usize];
+                let resolved = self.intl_this(this, INTL_LOCALE, which)?;
+                self.locale_info(resolved, which)?
             }
             INTL_SEGMENTER_SEGMENT => {
                 let _ = self.intl_this(this, INTL_SEGMENTER, "segment")?;

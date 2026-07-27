@@ -1083,9 +1083,19 @@ impl<'p> Vm<'p> {
                         let consts = &self.func(func_id as usize).string_constants;
                         let excluded =
                             &consts[exclude_start as usize..exclude_start as usize + exclude_count as usize];
-                        // A Proxy source: trap-aware CopyDataProperties (ownKeys
-                        // → gopd → get per key, excluded keys never probed).
-                        if s.is_heap() && self.proxy_parts(s.heap_index()).is_some() {
+                        // Only an ORDINARY object (or a string, handled below)
+                        // can be walked straight off its ObjMap. Every other
+                        // source — a Proxy's traps, but equally an Array's or a
+                        // TypedArray's own INDEX properties, which live outside
+                        // any ObjMap — needs the general CopyDataProperties
+                        // (ownKeys → gopd → get per key, excluded keys never
+                        // probed). `let {...r} = ['x','y']` produced `{}`.
+                        if s.is_heap()
+                            && !matches!(
+                                self.heap.get(s.heap_index()),
+                                HeapObj::Object(_) | HeapObj::Str(_) | HeapObj::Cons { .. }
+                            )
+                        {
                             let m = self.copy_data_properties_rest(s, excluded)?;
                             let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                             self.set(base, dst, v);
@@ -1135,8 +1145,14 @@ impl<'p> Vm<'p> {
                             let kv = self.get(base, keys_base + i);
                             excluded.push(self.to_property_key(kv)?);
                         }
-                        // A Proxy source: trap-aware CopyDataProperties.
-                        if s.is_heap() && self.proxy_parts(s.heap_index()).is_some() {
+                        // See `ObjectRest`: anything but an ordinary object or a
+                        // string goes through the general CopyDataProperties.
+                        if s.is_heap()
+                            && !matches!(
+                                self.heap.get(s.heap_index()),
+                                HeapObj::Object(_) | HeapObj::Str(_) | HeapObj::Cons { .. }
+                            )
+                        {
                             let m = self.copy_data_properties_rest(s, &excluded)?;
                             let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                             self.set(base, dst, v);
@@ -2202,10 +2218,14 @@ impl<'p> Vm<'p> {
                                 // then radix = ToInt32(ToNumber(radix)) (NaN/±Infinity
                                 // → 0 = default base).
                                 let s = self.to_js_string(a0)?;
+                                // ToInt32 WRAPS mod 2^32; Rust's `as i32` on a
+                                // float saturates, which turned
+                                // `parseInt("0x10", 1e308)` into an
+                                // out-of-range radix (NaN) instead of 0.
                                 let radix = if argc >= 2 {
                                     let rv = self.get(base, arg_base + 1);
                                     let r = self.to_number_coerce(rv)?;
-                                    if r.is_finite() { r as i64 as i32 } else { 0 }
+                                    crate::vm::helpers_num2::to_int32(r)
                                 } else {
                                     0
                                 };

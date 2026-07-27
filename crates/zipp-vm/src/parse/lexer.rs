@@ -205,6 +205,8 @@ impl<'s> Lexer<'s> {
     /// line terminator was crossed (which ASI and the no-LineTerminator-here
     /// restrictions are defined in terms of).
     fn skip_trivia(&mut self) -> LResult<()> {
+        // Where this run began — see the `-->` arm below.
+        let run_start = self.pos;
         loop {
             if self.at_end() {
                 return Ok(());
@@ -256,10 +258,19 @@ impl<'s> Lexer<'s> {
                     }
                     // B.1.1: SingleLineHTMLCloseComment is only recognised where
                     // a LineTerminator precedes it — and the START of the source
-                    // counts, since the production is reachable from the first
-                    // InputElement. At pos 0 nothing has been "seen" yet.
+                    // counts, since `HTMLCloseComment` is itself an alternative
+                    // of `InputElementHashbangOrRegExp`.
+                    //
+                    // `HTMLCloseComment :: WhiteSpaceSequence[opt]
+                    // SingleLineDelimitedCommentSequence[opt] -->`, so leading
+                    // spaces and single-line block comments are part of the
+                    // production: `   --> x` and `/*a*/ /*b*/--> x` on line 1
+                    // are comments too. Testing `self.pos == 0` demanded the
+                    // `-->` be the source's very first byte; what actually
+                    // matters is that only trivia has been crossed since the
+                    // start, which is exactly "this trivia run began at 0".
                     b'-' if self.html_comments
-                        && (self.saw_newline || self.pos == 0)
+                        && (self.saw_newline || run_start == 0)
                         && self.peek_at(1) == b'-'
                         && self.peek_at(2) == b'>' =>
                     {
@@ -823,6 +834,18 @@ impl<'s> Lexer<'s> {
                     self.pos = p;
                     self.reject_ident_after(start)?;
                     return Ok(TokenKind::Num(NumLit { value: v, kind: NumKind::LegacyOctal }));
+                }
+                // `NonOctalDecimalIntegerLiteral :: 0 NonOctalDecimalDigits`
+                // reads `DecimalDigits[~Sep]`, so a numeric separator anywhere
+                // in the INTEGER part is an error even though `1_0` is fine:
+                // `08_0` and `09_0` are SyntaxErrors. A separator in the
+                // FRACTION (`08.5_0`) is still legal, which is why this only
+                // looks at the digit run scanned above.
+                if p < self.src.len() && self.src[p] == b'_' {
+                    return Err(LexError::new(
+                        "numeric separator in a legacy decimal literal",
+                        start,
+                    ));
                 }
                 kind = NumKind::NonOctalDecimal;
             }

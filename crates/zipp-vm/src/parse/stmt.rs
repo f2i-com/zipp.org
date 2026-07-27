@@ -208,6 +208,11 @@ impl<'s> Parser<'s> {
         }
         self.expect(Punct::LBrace, false)?;
         while !self.at(Punct::RBrace) {
+            let ipos = self.cur().span.start;
+            // Recorded BEFORE the name is consumed: without an `as` clause the
+            // imported name is also the local binding, and that decision needs
+            // the token, not the string.
+            let could_bind = self.is_binding_ident();
             let imported = self.parse_module_export_name()?;
             let (local, lpos) = if self.eat_kw(Keyword::As, false)? {
                 self.binding_ident()?
@@ -217,7 +222,19 @@ impl<'s> Parser<'s> {
                 let ModuleExportName::Ident(n) = &imported else {
                     return Err(self.err_here("SyntaxError: a string module name requires 'as'"));
                 };
-                (n.clone(), self.cur().span.start)
+                // `ImportSpecifier : ImportedBinding`, and an ImportedBinding is
+                // a BindingIdentifier — so every BindingIdentifier early error
+                // applies, including "not `eval`/`arguments` in strict code"
+                // (module code always is). `parse_module_export_name` reads any
+                // IdentifierName, because `export { default as d }` needs it to,
+                // so nothing else was enforcing them on this path.
+                if !could_bind || &**n == "eval" || &**n == "arguments" {
+                    return Err(SyntaxError::new(
+                        format!("SyntaxError: '{n}' cannot be used as an imported binding"),
+                        ipos,
+                    ));
+                }
+                (n.clone(), ipos)
             };
             self.declare(&local.clone(), BindKind::Import, lpos)?;
             out.push(ImportSpecifier::Named { imported, local });
@@ -272,6 +289,15 @@ impl<'s> Parser<'s> {
 
     fn parse_module_export_name(&mut self) -> PResult<ModuleExportName> {
         if let TokenKind::Str(s) = self.cur().kind.clone() {
+            // `ModuleExportName : StringLiteral` — a Syntax Error if
+            // IsStringWellFormedUnicode of its StringValue is false. `StrVal`
+            // falls back to the UTF-16 representation for exactly the strings
+            // UTF-8 cannot hold, i.e. the ones carrying a lone surrogate.
+            if matches!(s, StrVal::Utf16(_)) {
+                return Err(self.err_here(
+                    "SyntaxError: a module export name must be well-formed Unicode",
+                ));
+            }
             self.bump_after_operand()?;
             return Ok(ModuleExportName::Str(s));
         }
@@ -372,8 +398,23 @@ impl<'s> Parser<'s> {
             // and binds nothing here, so it is exempt.
             if source.is_none() {
                 for sp in &specifiers {
-                    if let ModuleExportName::Ident(n) = &sp.local {
-                        self.pending_export_locals.push((n.clone(), pos));
+                    match &sp.local {
+                        ModuleExportName::Ident(n) => {
+                            self.pending_export_locals.push((n.clone(), pos));
+                        }
+                        // `ExportDeclaration : export NamedExports ;` — "a
+                        // Syntax Error if ReferencedBindings of NamedExports
+                        // contains any ModuleExportName". A StringLiteral names
+                        // no local binding, so it is only meaningful in the
+                        // re-export form: `export { "foo" as "bar" }` is an
+                        // early error, `export { "foo" as "bar" } from "m"` is
+                        // not.
+                        ModuleExportName::Str(_) => {
+                            return Err(SyntaxError::new(
+                                "SyntaxError: a string export name requires a 'from' clause",
+                                pos,
+                            ));
+                        }
                     }
                 }
             }
@@ -382,6 +423,23 @@ impl<'s> Parser<'s> {
         // `export var/let/const/function/class …` — the declaration binds
         // exactly as it would without the `export`.
         let decl = self.parse_stmt_list_item()?;
+        // …and its ExportedNames are its BoundNames, which 16.2.3.1 requires to
+        // be unique across the whole ModuleItemList. Nothing was recording them,
+        // so `export var a, a;` — one declaration naming `a` twice — parsed.
+        let mut names = Vec::new();
+        match &decl {
+            Stmt::VarDecl(d) => {
+                for dc in &d.decls {
+                    collect_pattern_names(&dc.id, &mut names);
+                }
+            }
+            Stmt::FnDecl(f) => names.extend(f.name.clone()),
+            Stmt::ClassDecl(c) => names.extend(c.name.clone()),
+            _ => {}
+        }
+        for n in names {
+            self.record_export_name(&ModuleExportName::Ident(n), pos)?;
+        }
         Ok(ExportDecl::Decl(Box::new(decl)))
     }
 
@@ -442,7 +500,7 @@ impl<'s> Parser<'s> {
             }
             return Ok(Stmt::ClassDecl(Box::new(c)));
         }
-        if let Some(kind) = self.at_var_decl_start()? {
+        if let Some(kind) = self.at_var_decl_start(false)? {
             let d = self.parse_var_decl(kind)?;
             self.semicolon()?;
             return Ok(Stmt::VarDecl(d));
@@ -456,7 +514,11 @@ impl<'s> Parser<'s> {
     /// `{`, or an identifier. `let` alone, `let.a`, `let(x)` are the sloppy-mode
     /// IDENTIFIER `let`. `let [` is ALWAYS a declaration, even as a statement
     /// body, because the alternative reading is banned.
-    fn at_var_decl_start(&mut self) -> PResult<Option<VarKind>> {
+    ///
+    /// `in_for_head` carries the explicit-resource-management proposal's
+    /// `ForDeclaration : using [no LineTerminator here] [lookahead ≠ of]
+    /// ForBinding` — see the `using of` note below.
+    fn at_var_decl_start(&mut self, in_for_head: bool) -> PResult<Option<VarKind>> {
         if self.at_kw(Keyword::Var) {
             self.bump_after_operand()?;
             return Ok(Some(VarKind::Var));
@@ -468,9 +530,20 @@ impl<'s> Parser<'s> {
         if self.at_kw(Keyword::Let) {
             let save = self.save();
             self.bump_after_operand()?;
+            // `let await` inside an async function / `let yield` inside a
+            // generator: the word is not a BindingIdentifier there, but the
+            // LexicalDeclaration is still the ONLY reading — `let await` is not
+            // an expression either, and no LineTerminator restriction pushes it
+            // to one. Committing here makes `binding_ident` raise; falling back
+            // to the identifier `let` silently accepted `let\nawait 0;`.
+            let reserved_word_binding = matches!(&self.cur().kind,
+                TokenKind::Ident { name, private: false, .. }
+                    if (self.ctx.await_ && &**name == "await")
+                        || (self.ctx.yield_ && &**name == "yield"));
             let is_decl = self.at(Punct::LBracket)
                 || self.at(Punct::LBrace)
-                || self.is_binding_ident();
+                || self.is_binding_ident()
+                || reserved_word_binding;
             if is_decl {
                 return Ok(Some(VarKind::Let));
             }
@@ -485,7 +558,22 @@ impl<'s> Parser<'s> {
             let save = self.save();
             let at = self.cur().span.start;
             self.bump_after_operand()?;
-            if !self.cur().newline_before && self.is_binding_ident() {
+            // `for (using of of …)` is ALWAYS the identifier `using` iterated
+            // over `of …`: a ForDeclaration carries `[lookahead ≠ of]` after
+            // `using`, because `of` is otherwise a perfectly good ForBinding and
+            // the two readings are indistinguishable. The restriction sits on
+            // ForDeclaration, which only a for-OF head uses — so it needs the
+            // `of` KEYWORD after the binding too, or `for (using of = null;;)`
+            // (a LexicalDeclaration in a classic head, binding `of`) would be
+            // mis-read as an expression.
+            let mut using_of_of = false;
+            if in_for_head && self.at_contextual("of") {
+                let after_binding = self.save();
+                self.bump_after_operand()?;
+                using_of_of = self.at_contextual("of");
+                self.restore(after_binding);
+            }
+            if !using_of_of && !self.cur().newline_before && self.is_binding_ident() {
                 self.check_using_position(at)?;
                 return Ok(Some(VarKind::Using));
             }
@@ -500,6 +588,9 @@ impl<'s> Parser<'s> {
             if is_using {
                 let at = self.cur().span.start;
                 self.bump_after_operand()?;
+                // NO `[lookahead ≠ of]` here: `await` cannot be an identifier
+                // where this arm runs, so `for (await using of of [])` has only
+                // one reading — the declaration binding `of`.
                 if !self.cur().newline_before && self.is_binding_ident() {
                     self.check_using_position(at)?;
                     return Ok(Some(VarKind::AwaitUsing));
@@ -926,6 +1017,7 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_for(&mut self) -> PResult<Stmt> {
+        let for_pos = self.cur().span.start;
         self.bump_before_operand()?;
         // `for await (… of …)`
         let is_await = if self.at_kw(Keyword::Await) && self.ctx.await_ {
@@ -939,6 +1031,14 @@ impl<'s> Parser<'s> {
 
         // An empty init: `for (;;)`.
         if self.at(Punct::Semi) {
+            // `for await` exists in ONE production, `for await ( … of … )`;
+            // `for await (;;)` and `for await (x in y)` have no grammar at all.
+            if is_await {
+                return Err(SyntaxError::new(
+                    "SyntaxError: 'for await' requires an 'of' loop head",
+                    for_pos,
+                ));
+            }
             self.bump_before_operand()?;
             let out = self.parse_for_classic(None)?;
             self.scopes.pop()?;
@@ -949,7 +1049,7 @@ impl<'s> Parser<'s> {
         let saved_in = self.ctx.in_;
         self.ctx.in_ = false;
 
-        let out = if let Some(kind) = self.at_var_decl_start()? {
+        let out = if let Some(kind) = self.at_var_decl_start(true)? {
             let pos = self.cur().span.start;
             let pat = self.parse_binding_pattern()?;
             self.declare_pattern(&pat, kind, pos)?;
@@ -1090,6 +1190,14 @@ impl<'s> Parser<'s> {
             }
         };
         self.scopes.pop()?;
+        // See the `for await (;;)` note above: any head that did not turn out to
+        // be a for-of leaves `for await` without a production.
+        if is_await && !matches!(out, Stmt::ForOf { .. }) {
+            return Err(SyntaxError::new(
+                "SyntaxError: 'for await' requires an 'of' loop head",
+                for_pos,
+            ));
+        }
         Ok(out)
     }
 
@@ -1166,13 +1274,36 @@ impl<'s> Parser<'s> {
                         sc.simple_catch_param = Some(n.clone());
                     }
                 }
-                self.declare_pattern(&p, VarKind::Let, pos)?;
+                // Not `declare_pattern`: a CatchParameter is a
+                // BindingIdentifier, not a LexicalDeclaration, so the "`let` is
+                // not a valid name" rule does not apply — `catch (let) {}` is
+                // legal in sloppy code (strictness is enforced by the binding
+                // reader, which rejects `let` as a reserved word under strict).
+                let mut names = Vec::new();
+                collect_pattern_names(&p, &mut names);
+                for n in names {
+                    self.declare(&n, BindKind::Let, pos)?;
+                }
                 self.expect(Punct::RParen, true)?;
                 Some(p)
             } else {
                 None
             };
-            let body = self.parse_block_body()?;
+            // The handler's Block is read DIRECTLY into the Catch scope rather
+            // than through `parse_block_body`, which would push a Block scope of
+            // its own and bury the parameter one level up. 14.15.1 compares
+            // BoundNames of CatchParameter against the LexicallyDeclaredNames of
+            // that very Block, so the two have to share a scope for
+            // `catch (x) { let x; }` to be the SyntaxError it is. `{ let x }`
+            // nested one deeper still pushes its own scope and stays legal, and
+            // `simple_catch_param` lives on this scope so Annex B B.3.5
+            // (`catch (e) { var e }`) is untouched.
+            self.expect(Punct::LBrace, true)?;
+            let mut body = Vec::new();
+            while !self.at(Punct::RBrace) && !self.at_eof() {
+                body.push(self.parse_stmt_list_item()?);
+            }
+            self.expect(Punct::RBrace, false)?;
             self.scopes.pop()?;
             Some(CatchClause { param, body })
         } else {

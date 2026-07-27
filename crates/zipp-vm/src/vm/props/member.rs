@@ -1188,24 +1188,15 @@ impl<'p> Vm<'p> {
         // Temporal.PlainDate getters; methods via the prototype.
         if let HeapObj::Temporal { kind: 1, .. } = self.heap.get(obj.heap_index()) {
             let (y, m, d) = self.plain_date_fields(obj.heap_index()).unwrap_or((0, 0, 0));
+            let cal = self.cal_of(obj.heap_index());
+            if let Some(v) = self.cal_date_getter(cal, (y, m, d), key) {
+                return Ok(v);
+            }
             return Ok(match key {
-                "year" => Value::num(y as f64),
-                "month" => Value::num(m as f64),
-                "day" => Value::num(d as f64),
+                // The weekday is calendar-independent: every calendar implemented
+                // here shares the ISO seven-day week.
                 "dayOfWeek" => Value::num(iso_day_of_week(y, m, d) as f64),
-                "dayOfYear" => {
-                    Value::num((iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1) as f64)
-                }
-                "weekOfYear" => Value::num(iso_week_of_year(y, m, d) as f64),
-                "yearOfWeek" => Value::num(iso_year_of_week(y, m, d) as f64),
-                "daysInMonth" => Value::num(days_in_month(y, m) as f64),
-                "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
                 "daysInWeek" => Value::num(7.0),
-                "monthsInYear" => Value::num(12.0),
-                "inLeapYear" => Value::bool(is_leap_year(y)),
-                "monthCode" => self.alloc_str(format!("M{m:02}")),
-                "calendarId" => self.alloc_str("iso8601".to_string()),
-                "era" | "eraYear" => Value::UNDEFINED,
                 _ => self.proto_member(self.plaindate_proto, key),
             });
         }
@@ -1227,10 +1218,11 @@ impl<'p> Vm<'p> {
         if let HeapObj::Temporal { kind: 3, .. } = self.heap.get(obj.heap_index()) {
             let f = self.pdt_fields(obj.heap_index()).unwrap_or([0; 9]);
             let (y, m, d) = (f[0], f[1], f[2]);
+            let cal = self.cal_of(obj.heap_index());
+            if let Some(v) = self.cal_date_getter(cal, (y, m, d), key) {
+                return Ok(v);
+            }
             return Ok(match key {
-                "year" => Value::num(y as f64),
-                "month" => Value::num(m as f64),
-                "day" => Value::num(d as f64),
                 "hour" => Value::num(f[3] as f64),
                 "minute" => Value::num(f[4] as f64),
                 "second" => Value::num(f[5] as f64),
@@ -1238,19 +1230,7 @@ impl<'p> Vm<'p> {
                 "microsecond" => Value::num(f[7] as f64),
                 "nanosecond" => Value::num(f[8] as f64),
                 "dayOfWeek" => Value::num(iso_day_of_week(y, m, d) as f64),
-                "dayOfYear" => {
-                    Value::num((iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1) as f64)
-                }
-                "weekOfYear" => Value::num(iso_week_of_year(y, m, d) as f64),
-                "yearOfWeek" => Value::num(iso_year_of_week(y, m, d) as f64),
-                "daysInMonth" => Value::num(days_in_month(y, m) as f64),
-                "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
                 "daysInWeek" => Value::num(7.0),
-                "monthsInYear" => Value::num(12.0),
-                "inLeapYear" => Value::bool(is_leap_year(y)),
-                "monthCode" => self.alloc_str(format!("M{m:02}")),
-                "calendarId" => self.alloc_str("iso8601".to_string()),
-                "era" | "eraYear" => Value::UNDEFINED,
                 _ => self.proto_member(self.plaindatetime_proto, key),
             });
         }
@@ -1269,29 +1249,27 @@ impl<'p> Vm<'p> {
         }
         // Temporal.PlainYearMonth getters; methods via the prototype.
         if let HeapObj::Temporal { kind: 5, fields } = self.heap.get(obj.heap_index()) {
-            let (y, m) = (fields[0], fields[1]);
-            return Ok(match key {
-                "year" => Value::num(y as f64),
-                "month" => Value::num(m as f64),
-                "monthCode" => self.alloc_str(format!("M{m:02}")),
-                "daysInMonth" => Value::num(days_in_month(y, m) as f64),
-                "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
-                "monthsInYear" => Value::num(12.0),
-                "inLeapYear" => Value::bool(is_leap_year(y)),
-                "era" | "eraYear" => Value::UNDEFINED,
-                "calendarId" => self.alloc_str("iso8601".to_string()),
-                _ => self.proto_member(self.plainyearmonth_proto, key),
-            });
+            let (y, m, rd) = (fields[0], fields[1], *fields.get(2).unwrap_or(&1));
+            let cal = self.cal_of(obj.heap_index());
+            // The reference ISO day is day 1 OF THE CALENDAR MONTH, so projecting
+            // the stored ISO date lands on the right calendar year/month.
+            if let Some(v) = self.cal_date_getter(cal, (y, m, rd), key) {
+                return Ok(v);
+            }
+            return Ok(self.proto_member(self.plainyearmonth_proto, key));
         }
         // Temporal.PlainMonthDay getters; methods via the prototype.
         if let HeapObj::Temporal { kind: 6, fields } = self.heap.get(obj.heap_index()) {
-            let (m, d) = (fields[1], fields[2]);
-            return Ok(match key {
-                "monthCode" => self.alloc_str(format!("M{m:02}")),
-                "day" => Value::num(d as f64),
-                "calendarId" => self.alloc_str("iso8601".to_string()),
-                _ => self.proto_member(self.plainmonthday_proto, key),
-            });
+            let (y, m, d) = (fields[0], fields[1], fields[2]);
+            let cal = self.cal_of(obj.heap_index());
+            // PlainMonthDay exposes only monthCode/day/calendarId; the stored
+            // reference ISO year is what makes the projection well-defined.
+            if matches!(key, "monthCode" | "day" | "calendarId") {
+                if let Some(v) = self.cal_date_getter(cal, (y, m, d), key) {
+                    return Ok(v);
+                }
+            }
+            return Ok(self.proto_member(self.plainmonthday_proto, key));
         }
         // Temporal.ZonedDateTime getters; methods via the prototype.
         if let HeapObj::Temporal { kind: 7, .. } = self.heap.get(obj.heap_index()) {
@@ -1300,10 +1278,11 @@ impl<'p> Vm<'p> {
             let (y, m, d) = (f[0], f[1], f[2]);
             let epoch = self.zdt_epoch_ns(idx).unwrap_or(0);
             let off = self.zdt_offset_ns(idx);
+            let cal = self.cal_of(idx);
+            if let Some(v) = self.cal_date_getter(cal, (y, m, d), key) {
+                return Ok(v);
+            }
             return Ok(match key {
-                "year" => Value::num(y as f64),
-                "month" => Value::num(m as f64),
-                "day" => Value::num(d as f64),
                 "hour" => Value::num(f[3] as f64),
                 "minute" => Value::num(f[4] as f64),
                 "second" => Value::num(f[5] as f64),
@@ -1311,15 +1290,7 @@ impl<'p> Vm<'p> {
                 "microsecond" => Value::num(f[7] as f64),
                 "nanosecond" => Value::num(f[8] as f64),
                 "dayOfWeek" => Value::num(iso_day_of_week(y, m, d) as f64),
-                "dayOfYear" => {
-                    Value::num((iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1) as f64)
-                }
-                "weekOfYear" => Value::num(iso_week_of_year(y, m, d) as f64),
-                "yearOfWeek" => Value::num(iso_year_of_week(y, m, d) as f64),
-                "daysInMonth" => Value::num(days_in_month(y, m) as f64),
-                "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
                 "daysInWeek" => Value::num(7.0),
-                "monthsInYear" => Value::num(12.0),
                 "hoursInDay" => {
                     // (startOfDay(tomorrow) − startOfDay(today)) / 1h. A fixed-offset
                     // (incl. UTC) zone's day is exactly 24h, but the next day's start
@@ -1339,10 +1310,6 @@ impl<'p> Vm<'p> {
                     }
                     Value::num(((tomorrow_start - today_start) / 3_600_000_000_000) as f64)
                 }
-                "inLeapYear" => Value::bool(is_leap_year(y)),
-                "monthCode" => self.alloc_str(format!("M{m:02}")),
-                "calendarId" => self.alloc_str("iso8601".to_string()),
-                "era" | "eraYear" => Value::UNDEFINED,
                 // FLOOR division (toward −∞), not truncation, for negative epochs.
                 "epochSeconds" => Value::num(epoch.div_euclid(1_000_000_000) as f64),
                 "epochMilliseconds" => Value::num(epoch.div_euclid(1_000_000) as f64),
@@ -1373,14 +1340,13 @@ impl<'p> Vm<'p> {
         // compare) with this = the instance.
         if let HeapObj::Intl { kind, .. } = self.heap.get(obj.heap_index()) {
             let proto = self.intl_protos[*kind as usize];
-            let found = self.own_member(proto, key).or_else(|| {
-                if self.obj_proto != 0 {
-                    self.own_member(self.obj_proto, key)
-                } else {
-                    None
-                }
+            // An Intl instance is an ordinary object as far as property access
+            // goes: an assigned own property lives in the generic arr_props side
+            // table (see `set_prop`) and shadows the prototype.
+            let own = self.arr_props.get(&obj.heap_index()).and_then(|m| {
+                m.pos(key).map(|i| (m.attrs[i], m.vals[i]))
             });
-            if let Some((attr, raw)) = found {
+            if let Some((attr, raw)) = own {
                 if attr.accessor {
                     return if raw == Value::UNDEFINED {
                         Ok(Value::UNDEFINED)
@@ -1390,7 +1356,14 @@ impl<'p> Vm<'p> {
                 }
                 return Ok(raw);
             }
-            return Ok(Value::UNDEFINED);
+            // Walk the REAL chain when a subclass / setPrototypeOf replaced it
+            // (`class F extends Intl.ListFormat {}` puts F.prototype in front of
+            // the service prototype); otherwise start at the service prototype.
+            let start = match self.proto_of.get(&obj.heap_index()) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                _ => proto,
+            };
+            return self.proto_member_get(start, key, receiver);
         }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
         // match so an accessor's getter can be invoked outside the heap borrow.

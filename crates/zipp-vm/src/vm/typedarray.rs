@@ -148,6 +148,20 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `IsTypedArrayFixedLength(O)`: is this view's length settled for good?
+    ///
+    /// False for a length-tracking view, and false for ANY view onto a
+    /// resizable ArrayBuffer — that buffer can SHRINK, taking a fixed window
+    /// out of bounds. A growable *Shared*ArrayBuffer can only get longer, so a
+    /// fixed-length view onto one stays fixed. This is what decides whether
+    /// `[[PreventExtensions]]` may succeed.
+    pub(crate) fn ta_is_fixed_length(&self, ta_idx: u32, buffer: u32) -> bool {
+        if self.ta_tracking.contains(&ta_idx) {
+            return false;
+        }
+        !self.ab_max.contains_key(&buffer) || self.shared_buffers.contains(&buffer)
+    }
+
     pub(crate) fn ta_effective_len(&self, ta_idx: u32) -> Option<usize> {
         let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
             HeapObj::TypedArray { buffer, kind, byte_offset, length } => {

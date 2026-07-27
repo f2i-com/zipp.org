@@ -553,46 +553,12 @@ pub(crate) fn parse_iso_month_day(s: &str) -> Option<(i64, i64, i64)> {
     Some((1972, m, d))
 }
 
-/// Canonicalize a BCP-47 language tag (pragmatic: validates structure, lowercases
-/// the language, Titlecases a 4-letter script subtag, uppercases a 2-letter region;
-/// subtags after a singleton extension are lowercased). Returns None if malformed.
+/// Canonicalize a BCP-47 language tag. Structure and ordering only — the CLDR
+/// alias tables (`iw`→`he`, `art-lojban`→`jbo`, …) are locale data this engine
+/// does not ship, so an aliased tag round-trips unchanged. See `locale_tag.rs`
+/// for the grammar. Returns None if the tag is not structurally valid.
 pub(crate) fn canonicalize_locale(tag: &str) -> Option<String> {
-    let tag = tag.trim();
-    if tag.is_empty() {
-        return None;
-    }
-    let parts: Vec<&str> = tag.split('-').collect();
-    for p in &parts {
-        if p.is_empty() || p.len() > 8 || !p.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return None;
-        }
-    }
-    let lang = parts[0];
-    let ll = lang.len();
-    if !(lang.chars().all(|c| c.is_ascii_alphabetic()) && ((2..=3).contains(&ll) || (5..=8).contains(&ll)))
-    {
-        return None;
-    }
-    let mut out = vec![lang.to_ascii_lowercase()];
-    let mut seen_singleton = false;
-    for p in &parts[1..] {
-        if p.len() == 1 {
-            seen_singleton = true;
-            out.push(p.to_ascii_lowercase());
-        } else if seen_singleton {
-            out.push(p.to_ascii_lowercase());
-        } else if p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()) {
-            let s = p.to_ascii_lowercase();
-            out.push(format!("{}{}", s[..1].to_ascii_uppercase(), &s[1..]));
-        } else if (p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic()))
-            || (p.len() == 3 && p.chars().all(|c| c.is_ascii_digit()))
-        {
-            out.push(p.to_ascii_uppercase());
-        } else {
-            out.push(p.to_ascii_lowercase());
-        }
-    }
-    Some(out.join("-"))
+    crate::vm::locale_tag::canonicalize_tag(tag)
 }
 
 /// The resolved NumberFormat slots that drive FormatNumeric. Passed as a struct
@@ -600,6 +566,10 @@ pub(crate) fn canonicalize_locale(tag: &str) -> Option<String> {
 /// digit target, a fraction-digit target, or both under morePrecision).
 pub(crate) struct NumFmtParams<'a> {
     pub style: &'a str,
+    /// "standard" | "scientific" | "engineering" | "compact". `compact` needs
+    /// the CLDR compact-decimal patterns, which this engine does not ship, so it
+    /// formats as `standard`.
+    pub notation: &'a str,
     pub min_int: i64,
     pub min_frac: Option<i64>,
     pub max_frac: Option<i64>,
@@ -812,6 +782,24 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
     }
     let mode = fold_rounding_mode(p.rounding_mode, neg);
     let (int_s, frac_s) = exact_decimal(x);
+    // ComputeExponent (ECMA-402 15.5.11): scientific puts one digit before the
+    // point, engineering rounds that exponent down to a multiple of three. The
+    // mantissa is produced by SHIFTING the decimal string, not by dividing —
+    // `x / 1e-6` would re-introduce binary error into an exact decimal.
+    let magnitude: Option<i64> = match p.notation {
+        "scientific" | "engineering" => {
+            let is_zero_in = int_s.bytes().all(|b| b == b'0') && frac_s.bytes().all(|b| b == b'0');
+            Some(if is_zero_in { 0 } else { decimal_exponent(&int_s, &frac_s) - 1 })
+        }
+        _ => None,
+    };
+    let exp_for = |m: i64| if p.notation == "engineering" { m.div_euclid(3) * 3 } else { m };
+    let exponent = magnitude.map(exp_for);
+    let (orig_int, orig_frac) = (int_s.clone(), frac_s.clone());
+    let (int_s, frac_s) = match exponent {
+        Some(e) => shift_decimal(&int_s, &frac_s, e),
+        None => (int_s, frac_s),
+    };
     // The fraction-digit and significant-digit targets are separate roundings;
     // "morePrecision"/"lessPrecision" run both and pick between them, "auto"
     // only ever has one configured.
@@ -862,8 +850,28 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
     while (ip.len() as i64) < p.min_int {
         ip.insert(0, '0');
     }
+    // ComputeExponent steps 8-11: rounding the mantissa can carry it up a digit
+    // (9.99 at one fraction digit becomes 10.0). When it does, the exponent is
+    // recomputed from magnitude+1 — which for engineering may or may not move,
+    // since it re-floors to a multiple of three.
+    let mut exponent = exponent;
+    if let (Some(e), Some(m)) = (exponent, magnitude) {
+        let rounded_zero = ip.bytes().all(|b| b == b'0') && fp.bytes().all(|b| b == b'0');
+        let new_mag = decimal_exponent(&ip, &fp) - 1;
+        if !rounded_zero && new_mag != m - e {
+            let e2 = exp_for(m + 1);
+            if e2 != e {
+                let (i2, f2) = shift_decimal(&orig_int, &orig_frac, e2);
+                let (i3, f3) = round_decimal_at(&i2, &f2, fp.len() as i64, mode);
+                ip = i3;
+                fp = f3;
+                exponent = Some(e2);
+            }
+        }
+    }
     let is_zero = ip.bytes().all(|b| b == b'0') && fp.bytes().all(|b| b == b'0');
-    let grouped = if p.grouping && ip.len() > 3 {
+    // The scientific/engineering pattern has no grouping separators.
+    let grouped = if p.grouping && exponent.is_none() && ip.len() > 3 {
         let len = ip.len();
         let first = match len % 3 {
             0 => 3,
@@ -885,10 +893,40 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
         res.push('.');
         res.push_str(&fp);
     }
+    if let Some(e) = exponent {
+        // The en scientific pattern's exponent separator is "E"; the exponent
+        // itself carries a minus but never a plus.
+        res.push('E');
+        if e < 0 {
+            res.push('-');
+        }
+        res.push_str(&e.abs().to_string());
+    }
     if p.style == "percent" {
         res.push('%');
     }
     decorate(res, neg, is_zero, false)
+}
+
+/// Move a decimal string's point `e` places to the LEFT (i.e. divide by 10^e),
+/// exactly. `shift_decimal("543", "211", 3)` is `("0", "543211")`.
+fn shift_decimal(int_s: &str, frac_s: &str, e: i64) -> (String, String) {
+    let digits: String = format!("{int_s}{frac_s}");
+    let point = int_s.len() as i64 - e;
+    let (int, frac) = if point <= 0 {
+        let pad = "0".repeat((-point) as usize);
+        (String::from("0"), format!("{pad}{digits}"))
+    } else if point as usize >= digits.len() {
+        let pad = "0".repeat(point as usize - digits.len());
+        (format!("{digits}{pad}"), String::new())
+    } else {
+        (digits[..point as usize].to_string(), digits[point as usize..].to_string())
+    };
+    // "0.000345" shifted by -6 is "0000345"; the mantissa must read "345"
+    // (minimumIntegerDigits re-pads afterwards if it asks for more).
+    let trimmed = int.trim_start_matches('0');
+    let int = if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() };
+    (int, frac)
 }
 
 /// A short currency symbol for the common codes (en-US "symbol" display); unknown
@@ -905,31 +943,63 @@ pub(crate) fn currency_symbol(code: &str) -> String {
     }
 }
 
-/// en-US list formatting: "a", "a and b", "a, b, and c" (conj = "and"/"or").
-pub(crate) fn format_list_en(items: &[String], conj: &str) -> String {
-    match items.len() {
-        0 => String::new(),
-        1 => items[0].clone(),
-        2 => format!("{} {} {}", items[0], conj, items[1]),
-        n => {
-            let head = items[..n - 1].join(", ");
-            format!("{head}, {conj} {}", items[n - 1])
+/// CreatePartsFromList for the en LONG conjunction/disjunction list patterns —
+/// the only pattern set this engine has. `format` joins these; `formatToParts`
+/// wraps them. The short/narrow widths and the `unit` type need CLDR
+/// listPatterns, so they format identically to `long` here.
+pub(crate) fn list_parts_en(items: &[String], conj: &str) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = vec![];
+    let n = items.len();
+    for (i, it) in items.iter().enumerate() {
+        if i > 0 {
+            let lit = if n == 2 {
+                format!(" {conj} ")
+            } else if i == n - 1 {
+                format!(", {conj} ")
+            } else {
+                ", ".to_string()
+            };
+            out.push(("literal", lit));
         }
+        out.push(("element", it.clone()));
     }
+    out
 }
 
-/// en-US relative-time formatting (numeric "always"): "in N units" / "N units ago".
-pub(crate) fn format_relative_time_en(value: f64, unit: &str) -> String {
-    let base = unit.strip_suffix('s').unwrap_or(unit);
-    let n = value.abs();
-    let plural = (n - 1.0).abs() > f64::EPSILON; // anything but exactly 1 → plural
-    let unit_str = if plural { format!("{base}s") } else { base.to_string() };
-    let num = if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n}") };
-    if value < 0.0 {
-        format!("{num} {unit_str} ago")
+/// A non-negative finite number as the typed parts RelativeTimeFormat's embedded
+/// NumberFormat produces for the value it interpolates: integer runs separated by
+/// `group` parts, then `decimal`/`fraction` ("in 1,000 seconds" is
+/// integer "1", group ",", integer "000").
+pub(crate) fn grouped_decimal_parts(n: f64) -> Vec<(&'static str, String)> {
+    let s = if n.fract() == 0.0 && n.abs() < 9.007e15 {
+        format!("{}", n as i64)
     } else {
-        format!("in {num} {unit_str}")
+        format!("{n}")
+    };
+    let (int, frac) = match s.split_once('.') {
+        Some((i, f)) => (i.to_string(), Some(f.to_string())),
+        None => (s, None),
+    };
+    let mut out: Vec<(&'static str, String)> = vec![];
+    let len = int.len();
+    let first = match len % 3 {
+        0 => 3.min(len),
+        r => r,
+    };
+    let mut i = 0usize;
+    while i < len {
+        let take = if i == 0 { first } else { 3 };
+        if i > 0 {
+            out.push(("group", ",".to_string()));
+        }
+        out.push(("integer", int[i..i + take].to_string()));
+        i += take;
     }
+    if let Some(f) = frac {
+        out.push(("decimal", ".".to_string()));
+        out.push(("fraction", f));
+    }
+    out
 }
 
 /// Minimal en duration formatting: non-zero fields joined as "N unit, …".
@@ -961,68 +1031,15 @@ pub(crate) fn normalize_unit(u: &str, auto_to: &str) -> String {
 }
 
 /// DifferenceISODate: the duration FROM date1 TO date2 as [years,months,weeks,days]
-/// for the given largestUnit ("year"/"month"/"week"/"day"). Sign-aware. Mirrors the
-/// Temporal reference algorithm (constrain-add probing for the year/month split).
+/// for the given largestUnit ("year"/"month"/"week"/"day"). The ISO calendar is
+/// just one calendar, so this is `cal_difference_date` at `Cal::Iso` — keeping a
+/// second copy of the month-probing rule here is how the two drifted apart.
 pub(crate) fn difference_iso_date(
     d1: (i64, i64, i64),
     d2: (i64, i64, i64),
     largest: &str,
 ) -> [i64; 4] {
-    let cmp = |a: (i64, i64, i64), b: (i64, i64, i64)| -> i64 {
-        let (ea, eb) = (iso_to_epoch_days(a.0, a.1, a.2), iso_to_epoch_days(b.0, b.1, b.2));
-        (ea > eb) as i64 - (ea < eb) as i64
-    };
-    if largest == "day" || largest == "week" {
-        let mut days = iso_to_epoch_days(d2.0, d2.1, d2.2) - iso_to_epoch_days(d1.0, d1.1, d1.2);
-        let mut weeks = 0;
-        if largest == "week" {
-            weeks = days / 7;
-            days %= 7;
-        }
-        return [0, 0, weeks, days];
-    }
-    // year / month
-    let sign = -cmp(d1, d2); // +1 if d2 after d1
-    if sign == 0 {
-        return [0, 0, 0, 0];
-    }
-    let (y1, m1, dd1) = d1;
-    // (y1,m1,dd1) + (yy years, mm months), day constrained to the target month.
-    let add_ym = |yy: i64, mm: i64| -> (i64, i64, i64) {
-        let total = y1 * 12 + (m1 - 1) + yy * 12 + mm;
-        let ny = total.div_euclid(12);
-        let nm = total.rem_euclid(12) + 1;
-        (ny, nm, dd1.min(days_in_month(ny, nm)))
-    };
-    let mut years = d2.0 - y1;
-    let mut mid = add_ym(years, 0);
-    if -cmp(mid, d2) == 0 {
-        return if largest == "year" { [years, 0, 0, 0] } else { [0, years * 12, 0, 0] };
-    }
-    let mut months = d2.1 - m1;
-    if -cmp(mid, d2) != sign {
-        years -= sign;
-        months += sign * 12;
-    }
-    mid = add_ym(years, months);
-    let mid_sign = -cmp(mid, d2);
-    if mid_sign == 0 {
-        return if largest == "year" {
-            [years, months, 0, 0]
-        } else {
-            [0, years * 12 + months, 0, 0]
-        };
-    }
-    if mid_sign != sign {
-        months -= sign;
-        mid = add_ym(years, months);
-    }
-    let days = iso_to_epoch_days(d2.0, d2.1, d2.2) - iso_to_epoch_days(mid.0, mid.1, mid.2);
-    if largest == "year" {
-        [years, months, 0, days]
-    } else {
-        [0, years * 12 + months, 0, days]
-    }
+    crate::vm::temporal::cal_difference_date(crate::vm::temporal::Cal::Iso, d1, d2, largest)
 }
 
 /// DifferenceISODateTime: duration FROM dt1 TO dt2 as a 10-field Duration for the

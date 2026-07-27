@@ -2367,27 +2367,40 @@ impl<'p> Vm<'p> {
                 Ok(Some(acc))
             }
             "flatMap" => {
-                // map(cb) then flatten one level (array results spliced in).
+                // The same FlattenIntoArray walk the array-LIKE receiver takes
+                // (see the `flat`/`flatMap` arm above), not a dense snapshot:
+                // step 5.b is `HasProperty(source, P)` on the LIVE receiver, so
+                // a mapper that shrinks the array — `a.flatMap(e => { a.length
+                // = 3; return e; })` — must stop visiting the removed indices.
+                let receiver = Value::heap(idx);
+                // LengthOfArrayLike precedes the IsCallable check (step 2, then 3).
+                let lv = self.get_prop(receiver, "length")?;
+                let lf = self.to_number_coerce(lv)?;
+                let source_len = if lf.is_nan() || lf <= 0.0 {
+                    0usize
+                } else {
+                    (lf.trunc().min(9_007_199_254_740_991.0) as usize)
+                        .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                };
                 let cb = arg0;
                 if !self.is_callable(cb) {
                     return Err(Thrown("TypeError: flatMap mapper is not a function".into()));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let receiver = Value::heap(idx);
-                let snapshot = self.array_snapshot(idx);
-                let mut out: Vec<Value> = Vec::new();
-                for (i, v) in snapshot.iter().enumerate() {
-                    let r = self.call_value(cb, this_arg, &[*v, Value::int(i as i32), receiver])?;
-                    if r.is_heap() {
-                        if let HeapObj::Array(items) = self.heap.get(r.heap_index()) {
-                            out.extend(items.iter().copied());
-                            continue;
+                // ArraySpeciesCreate(O, 0) is step 4 — before the walk, and its
+                // `constructor` / @@species Gets are observable there.
+                let target = self.array_species_create(receiver, 0)?;
+                let mut out = Vec::new();
+                self.flatten_into_array(&mut out, receiver, source_len, 1, Some((cb, this_arg)))?;
+                match target {
+                    Some(a) => {
+                        for (i, v) in out.into_iter().enumerate() {
+                            self.create_data_property_or_throw(a, i, v)?;
                         }
+                        Ok(Some(a))
                     }
-                    out.push(r);
+                    None => Ok(Some(self.alloc_array_current_realm(out))),
                 }
-                // flatMap builds the result via ArraySpeciesCreate(O, 0).
-                Ok(Some(self.array_from_species(receiver, out, 0)?))
             }
             "findLast" | "findLastIndex" => {
                 let cb = arg0;

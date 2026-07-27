@@ -792,6 +792,9 @@ impl<'s> Parser<'s> {
             super::token::TokenKind::Ident { .. }
                 | super::token::TokenKind::Str(_)
                 | super::token::TokenKind::Num(_)
+                // `NumericLiteral : DecimalBigIntegerLiteral` — see
+                // `at_property_name_start`; `class C { get 5n(){} }` needs it too.
+                | super::token::TokenKind::BigInt(_)
         ) || self.at(Punct::LBracket)
     }
 

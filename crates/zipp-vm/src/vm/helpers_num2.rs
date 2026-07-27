@@ -67,8 +67,8 @@ pub(crate) fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
         M::Cosh => x.cosh(),
         M::Tanh => x.tanh(),
         M::Asinh => x.asinh(),
-        M::Acosh => x.acosh(),
-        M::Atanh => x.atanh(),
+        M::Acosh => acosh(x),
+        M::Atanh => atanh(x),
         // Math.clz32: leading zeros of ToUint32(x). Math.fround: round to f32.
         M::Clz32 => to_uint32(x).leading_zeros() as f64,
         M::Fround => x as f32 as f64,
@@ -77,6 +77,61 @@ pub(crate) fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
         M::Hypot => x.abs(),
         M::Pow | M::Atan2 | M::Imul => f64::NAN,
     }
+}
+
+/// `Math.acosh(x)`.
+///
+/// Rust's `f64::acosh` is `ln(x + sqrt(x-1)*sqrt(x+1))`, whose argument is
+/// `1 + tiny` for x just above 1 — the addition to 1 throws away every bit of
+/// `tiny` below 2^-52, so `acosh(1.0000000000000013)` came out
+/// 5.1619136520741884e-8 against the correct 5.1619136559035694e-8 (a relative
+/// error near 1e-9, orders of magnitude past the 2-ULP the tests allow).
+/// Reassociating around `ln_1p` keeps the small term small.
+fn acosh(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x < 1.0 {
+        return f64::NAN;
+    }
+    // Beyond 2^28, x*x overflows the useful range and acosh(x) → ln(2x).
+    if x >= 268_435_456.0 {
+        return x.ln() + std::f64::consts::LN_2;
+    }
+    if x > 2.0 {
+        return (2.0 * x - 1.0 / (x + (x * x - 1.0).sqrt())).ln();
+    }
+    let t = x - 1.0; // exact for 1 ≤ x ≤ 2 (Sterbenz)
+    (t + (2.0 * t + t * t).sqrt()).ln_1p()
+}
+
+/// `Math.atanh(x)`.
+///
+/// Rust's `f64::atanh` applies `0.5 * ln_1p(2x / (1 - x))` to the SIGNED
+/// argument. For x near -1 that leaves `1 - x ≈ 2`, so the quotient lands a
+/// few ULP from -1 and `ln_1p` is handed a value with almost no significant
+/// bits left: `atanh(-0.9999999999999983)` came out -17.395445210310893 instead
+/// of -17.36094877456742. Folding the sign FIRST puts the cancelling term in
+/// the denominator, where `1 - |x|` is exact.
+fn atanh(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    let a = x.abs();
+    if a > 1.0 {
+        return f64::NAN;
+    }
+    if a == 1.0 {
+        return f64::INFINITY.copysign(x);
+    }
+    let t = if a < 0.5 {
+        // Split so that small |x| does not cancel inside the quotient:
+        // 2a + 2a²/(1-a) == 2a/(1-a), but the leading term stays exact.
+        0.5 * (2.0 * a + 2.0 * a * a / (1.0 - a)).ln_1p()
+    } else {
+        0.5 * ((a + a) / (1.0 - a)).ln_1p()
+    };
+    t.copysign(x)
 }
 
 /// `Math.f16round(x)`: round `x` to the nearest IEEE-754 binary16 (half) value
@@ -666,7 +721,9 @@ pub(crate) fn to_fixed(n: f64, f: usize) -> String {
         // `(1e21).toFixed(2)` is "1e+21", not "1000000000000000000000".
         return fmt_f64(n);
     }
-    let neg = n.is_sign_negative();
+    // Step 10 is `If x < 0`, not "if the sign bit is set" — so `-0` carries no
+    // sign (`(-0).toFixed(2)` is "0.00") while `-0.0001` still does ("-0.00").
+    let neg = n < 0.0;
     // Exact decimal of |n| with 30 guard digits past `f`; the digit at index `f`
     // (first dropped) decides the rounding, and the formatter computes it exactly.
     let s = format!("{:.*}", f + 30, n.abs());

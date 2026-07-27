@@ -1675,8 +1675,18 @@ impl<'p> Vm<'p> {
             let mut vals = Vec::with_capacity(kvals.len());
             for kv in kvals {
                 let ks = self.key_of(kv);
-                if !self.own_is_enumerable(iterable, &ks) {
-                    continue;
+                // Step 6.a is `Let desc be ? promises.[[GetOwnProperty]](key)`,
+                // an internal method — so on a Proxy it fires the
+                // getOwnPropertyDescriptor trap and its throw REJECTS the
+                // result promise. Reading the enumerable flag off the ordinary
+                // slot skipped the trap entirely and the promise fulfilled.
+                match self.own_is_enumerable_dyn(iterable, &ks) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(Thrown(msg)) => {
+                        self.reject_with_thrown(result, &msg);
+                        return Ok(Value::heap(result));
+                    }
                 }
                 let v = match self.get_member(iterable, &ks, iterable) {
                     Ok(v) => v,

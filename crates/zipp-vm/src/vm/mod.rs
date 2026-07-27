@@ -1078,6 +1078,12 @@ pub struct Vm<'p> {
     /// layout can't hold a heap reference). The instance's `fields` are
     /// `[epochNs hi, epochNs lo, offsetNanoseconds]`.
     zdt_tz: std::collections::HashMap<u32, Value>,
+    /// The `[[Calendar]]` slot of every calendar-bearing Temporal instance, as a
+    /// `Cal` discriminant keyed by heap index. Absent means `iso8601`, so an
+    /// ISO-only program never touches this map. Instances always store their
+    /// *ISO* date in `fields`; the calendar is the view applied on read
+    /// (see `vm/temporal/calendar.rs`).
+    temporal_cal: std::collections::HashMap<u32, u8>,
     intl_ns: u32,
     intl_ctors: [u32; 10],
     intl_protos: [u32; 10],
@@ -1236,6 +1242,7 @@ mod builtins;
 mod values;
 mod temporal;
 mod intl;
+mod locale_tag;
 mod iterhelpers;
 mod proxy_regexp;
 mod typedarray;

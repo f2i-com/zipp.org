@@ -280,6 +280,7 @@ impl<'p> Vm<'p> {
             zoneddatetime_ctor: 0,
             zoneddatetime_proto: 0,
             zdt_tz: std::collections::HashMap::new(),
+            temporal_cal: std::collections::HashMap::new(),
             intl_ns: 0,
             intl_ctors: [0; 10],
             intl_protos: [0; 10],

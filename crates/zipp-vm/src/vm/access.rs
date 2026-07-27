@@ -1409,6 +1409,10 @@ impl<'p> Vm<'p> {
                 // reporting success; `defineProperty` already used this table.
                 | HeapObj::Generator { .. }
                 | HeapObj::AsyncGenerator(_)
+                // An Intl service instance is exotic too, and a subclass of one
+                // must still take ordinary own properties
+                // (`class F extends Intl.ListFormat {}; f.x = 1`).
+                | HeapObj::Intl { .. }
         ) {
             // (`re.lastIndex = …` was handled above; a `re.exec = fn` override or
             // any `re.x = …` lands in the side table. RegExp accessor keys

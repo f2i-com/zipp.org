@@ -424,8 +424,9 @@ impl<'p> Vm<'p> {
             let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
             let d = self.temporal_ctor_int(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-            self.validate_calendar_identifier(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self.validate_calendar_identifier(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_plain_date(y, m, d)?;
+            let r = self.tag_cal(r, cal);
             let over = self.newtarget_proto_override(new_target, cv, self.plaindate_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -451,8 +452,9 @@ impl<'p> Vm<'p> {
                     *slot = self.temporal_ctor_int(v)?;
                 }
             }
-            self.validate_calendar_identifier(args.get(9).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self.validate_calendar_identifier(args.get(9).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_plain_date_time(f)?;
+            let r = self.tag_cal(r, cal);
             let over = self.newtarget_proto_override(new_target, cv, self.plaindatetime_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -469,12 +471,13 @@ impl<'p> Vm<'p> {
             // (year, month, calendar?, referenceISODay=1)
             let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-            self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let rd = match args.get(3).copied() {
                 Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1,
             };
             let r = self.make_plain_year_month(y, m, rd)?;
+            let r = self.tag_cal(r, cal);
             let over = self.newtarget_proto_override(new_target, cv, self.plainyearmonth_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -482,18 +485,20 @@ impl<'p> Vm<'p> {
             // (month, day, calendar?, referenceISOYear=1972)
             let m = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let d = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-            self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let ry = match args.get(3).copied() {
                 Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1972,
             };
             let r = self.make_plain_month_day(m, d, ry)?;
+            let r = self.tag_cal(r, cal);
             let over = self.newtarget_proto_override(new_target, cv, self.plainmonthday_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.zoneddatetime_ctor && ci != 0 {
-            self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_zoned_date_time(args)?;
+            let r = self.tag_cal(r, cal);
             let over = self.newtarget_proto_override(new_target, cv, self.zoneddatetime_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
@@ -1017,6 +1022,27 @@ impl<'p> Vm<'p> {
                 self.proto_of.insert(oidx, sub_proto);
             }
             return Ok(true);
+        }
+        // `class M extends Intl.<service>`: the service instance is an exotic
+        // `HeapObj::Intl`, and every prototype method brand-checks for it, so
+        // build the real one and move it into the subclass instance (`new
+        // MyNF("en").format(1)` otherwise threw "incompatible receiver" — the
+        // instance was still a plain Object). `Reflect.construct` already worked;
+        // only the derived-`super()` path lands here.
+        if cval.is_heap() && self.intl_ctors[0] != 0 {
+            if let Some(kind) =
+                self.intl_ctors.iter().position(|&c| c != 0 && c == cval.heap_index())
+            {
+                let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let tv = self.make_intl(kind as u8, locales, options)?;
+                let cloned = self.heap.get(tv.heap_index()).clone();
+                *self.heap.get_mut(oidx) = cloned;
+                if sub_proto.is_heap() {
+                    self.proto_of.insert(oidx, sub_proto);
+                }
+                return Ok(true);
+            }
         }
         // `class B extends Boolean/Number/String/Date/RegExp`: construct() already
         // implements each builtin's argument semantics (truthy boxing, ToNumber,

@@ -53,75 +53,103 @@ impl<'p> Vm<'p> {
         };
         let mut o = ObjMap::new();
         for (k, v) in pairs {
+            // resolvedOptions() must hand back a FRESH object graph each call:
+            // `pluralCategories` is an array, and two calls returning the same
+            // array would let a caller mutate the instance's slot.
+            let v = match v.is_heap().then(|| self.heap.get(v.heap_index())) {
+                Some(HeapObj::Array(items)) => {
+                    let items = items.clone();
+                    Value::heap(self.heap.alloc(HeapObj::Array(items)))
+                }
+                _ => v,
+            };
             o.set(&k, v);
         }
         Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
     }
 
-    /// CanonicalizeLocaleList(locales) → the requested tags (canonical). Accepts
-    /// undefined (→ empty), a string, an Intl.Locale, or an array of those.
+    /// The `[[Locale]]` slot of an Intl.Locale instance, if `v` is one.
+    /// CanonicalizeLocaleList and the Locale constructor both take the FULL
+    /// canonical tag from a Locale argument, extensions included — not its
+    /// baseName.
+    pub(crate) fn locale_slot_tag(&self, v: Value) -> Option<String> {
+        if !v.is_heap() {
+            return None;
+        }
+        if let HeapObj::Intl { kind: native::INTL_LOCALE, resolved } = *self.heap.get(v.heap_index()) {
+            return Some(self.display(self.intl_slot(resolved, "@@tag")));
+        }
+        None
+    }
+
+    /// CanonicalizeLocaleList(locales) (ECMA-402 9.2.1). `undefined` → empty; a
+    /// String or Intl.Locale → a one-element list; anything else is ToObject'd
+    /// and walked as an array-like.
+    ///
+    /// The element type check is load-bearing: only a String or an Object may
+    /// appear (`[undefined]`, `[null]`, `[1]`, `[Symbol()]` are each a
+    /// TypeError), and a hole is skipped via HasProperty rather than being
+    /// coerced. Reading a non-heap element's `heap_index()` used to index the
+    /// heap directly, which panicked outright on `[0.1]`.
     pub(crate) fn canonicalize_locale_list(&mut self, locales: Value) -> Result<Vec<String>, Thrown> {
         let mut out: Vec<String> = vec![];
-        let mut push_tag = |out: &mut Vec<String>, s: &str| -> Result<(), Thrown> {
-            match canonicalize_locale(s) {
-                Some(c) => {
-                    if !out.contains(&c) {
-                        out.push(c);
-                    }
-                    Ok(())
-                }
-                None => Err(Thrown(format!("RangeError: Incorrect locale information: {s}"))),
-            }
-        };
         if locales == Value::UNDEFINED {
             return Ok(out);
         }
-        // A bare string is treated as a one-element list.
-        if locales.is_heap() {
-            if let HeapObj::Intl { kind: native::INTL_LOCALE, resolved } =
-                *self.heap.get(locales.heap_index())
-            {
-                let bn = self.intl_slot(resolved, "baseName");
-                let s = self.display(bn);
-                push_tag(&mut out, &s)?;
-                return Ok(out);
-            }
-            if self.heap.is_str_like(locales.heap_index()) {
-                let s = self.heap.str_cow(locales.heap_index()).unwrap().into_owned();
-                push_tag(&mut out, &s)?;
-                return Ok(out);
-            }
-        } else if !locales.is_heap() {
-            // primitive non-string → ToObject would make a wrapper with no indices.
+        if let Some(tag) = self.locale_slot_tag(locales) {
+            out.push(tag);
             return Ok(out);
         }
-        // Array-like: read length then each element.
-        let len_v = self.get_prop(locales, "length")?;
-        let len = self.to_number(len_v)?.max(0.0) as usize;
+        if locales.is_heap() && self.heap.is_str_like(locales.heap_index()) {
+            let s = self.heap.str_cow(locales.heap_index()).unwrap().into_owned();
+            out.push(canonicalize_locale(&s).ok_or_else(|| {
+                Thrown(format!("RangeError: Incorrect locale information provided: {s}"))
+            })?);
+            return Ok(out);
+        }
+        // Step 4: ToObject — `null`/`undefined` are a TypeError here, not an
+        // empty list, and a primitive boxes into a wrapper with no indices.
+        self.require_object_coercible(locales)?;
+        let obj = self.to_object(locales)?;
+        let len_v = self.get_prop(obj, "length")?;
+        // ToLength: NaN/negative clamp to 0, and the loop caps at a length no
+        // array-like can actually reach so a bogus 2^53 does not hang.
+        // ToPrimitive FIRST for an OBJECT length — the infallible `to_number`
+        // cannot run a user `valueOf`/`toString`, so `{length: {valueOf(){throw}}}`
+        // silently read as an empty list instead of propagating. (Primitives skip
+        // it: `to_primitive_number(undefined)` would try to read its `valueOf`.)
+        let len_v = if self.is_object_value(len_v) {
+            self.to_primitive_number(len_v)?
+        } else {
+            len_v
+        };
+        let len_f = self.to_number(len_v)?;
+        let len = if len_f.is_nan() || len_f <= 0.0 { 0u64 } else { len_f.min(9.007e15) as u64 };
         for i in 0..len {
-            let el = self.get_index(locales, Value::int(i as i32))?;
-            if el == Value::UNDEFINED {
+            let key = Value::num(i as f64);
+            if !self.has_property_dyn(obj, key)? {
                 continue;
             }
-            if el.is_heap() {
-                if let HeapObj::Intl { kind: native::INTL_LOCALE, resolved } =
-                    *self.heap.get(el.heap_index())
-                {
-                    let bn = self.intl_slot(resolved, "baseName");
-                    let s = self.display(bn);
-                    push_tag(&mut out, &s)?;
-                    continue;
+            let el = self.get_index(obj, key)?;
+            if let Some(tag) = self.locale_slot_tag(el) {
+                if !out.contains(&tag) {
+                    out.push(tag);
                 }
+                continue;
             }
-            if !el.is_heap() || !self.heap.is_str_like(el.heap_index()) {
-                if !matches!(self.heap.get(el.heap_index()), HeapObj::Object(_)) {
-                    return Err(Thrown(
-                        "TypeError: locale list elements must be strings or objects".into(),
-                    ));
-                }
+            let is_string = el.is_heap() && self.heap.is_str_like(el.heap_index());
+            if !is_string && !self.is_object_value(el) {
+                return Err(Thrown(
+                    "TypeError: locale list elements must be strings or objects".into(),
+                ));
             }
             let s = self.to_js_string(el)?;
-            push_tag(&mut out, &s)?;
+            let c = canonicalize_locale(&s).ok_or_else(|| {
+                Thrown(format!("RangeError: Incorrect locale information provided: {s}"))
+            })?;
+            if !out.contains(&c) {
+                out.push(c);
+            }
         }
         Ok(out)
     }
@@ -596,7 +624,7 @@ impl<'p> Vm<'p> {
         // (`new Intl.NumberFormat("en", "foo")` is legal), and only null throws.
         // Everything newer rejects any non-object outright.
         let options = match kind {
-            INTL_NUMBERFORMAT | INTL_DATETIMEFORMAT | INTL_COLLATOR | INTL_PLURALRULES => {
+            INTL_NUMBERFORMAT | INTL_DATETIMEFORMAT | INTL_COLLATOR | INTL_RELATIVETIMEFORMAT => {
                 if options == Value::UNDEFINED {
                     options
                 } else {
@@ -615,6 +643,13 @@ impl<'p> Vm<'p> {
         };
         // Step 3. `localeMatcher` is read (and range-checked) first by every
         // service, and is deliberately NOT reflected in resolvedOptions.
+        // InitializeCollator is the one exception: it reads `usage` first,
+        // because the usage decides which locale data would be looked up.
+        let collator_usage = if kind == INTL_COLLATOR {
+            Some(self.opt_string(options, "usage", "sort", &["sort", "search"])?)
+        } else {
+            None
+        };
         self.opt_string(options, "localeMatcher", "best fit", &["lookup", "best fit"])?;
         let locale = requested.into_iter().next().unwrap_or_else(|| "en".to_string());
         let loc = self.alloc_str(locale.clone());
@@ -897,35 +932,58 @@ impl<'p> Vm<'p> {
                 }
             }
             INTL_COLLATOR => {
-                let usage =
-                    self.opt_string(options, "usage", "sort", &["sort", "search"])?;
-                let uv = self.alloc_str(usage);
-                r.set("usage", uv);
+                // Read order after `usage`/`localeMatcher`: collation, numeric,
+                // caseFirst, sensitivity, ignorePunctuation. `collation` and
+                // `ignorePunctuation` were not read at all before, so their
+                // throwing getters never ran and `{ignorePunctuation: true}` was
+                // silently ignored.
+                let collation = self.opt_string_opt(options, "collation", &[])?;
+                if let Some(ref c) = collation {
+                    if !is_well_formed_type_code(c) {
+                        return Err(Thrown(format!("RangeError: invalid collation: {c}")));
+                    }
+                }
+                let numeric = self.opt_bool_opt(options, "numeric")?;
+                let case_first =
+                    self.opt_string_opt(options, "caseFirst", &["upper", "lower", "false"])?;
                 let sens = self.opt_string(
                     options,
                     "sensitivity",
                     "variant",
                     &["base", "accent", "case", "variant"],
                 )?;
+                let ignore_punct = self.opt_bool_opt(options, "ignorePunctuation")?;
+                // resolvedOptions table order: locale, usage, sensitivity,
+                // ignorePunctuation, collation, numeric, caseFirst.
+                let uv = self.alloc_str(collator_usage.unwrap_or_else(|| "sort".to_string()));
+                r.set("usage", uv);
                 let sv = self.alloc_str(sens);
                 r.set("sensitivity", sv);
-                r.set("ignorePunctuation", Value::bool(false));
-                let col = self.alloc_str("default".to_string());
+                // No CLDR ignorePunctuation defaults (Thai/Lao want `true`), so
+                // an unset option resolves to `false` — the root behaviour.
+                r.set("ignorePunctuation", Value::bool(ignore_punct.unwrap_or(false)));
+                // Only the root collation is implemented, so a requested `-u-co-`
+                // / `collation` value that is not it resolves to "default"
+                // rather than being echoed back as if it were honoured.
+                let requested = collation.or_else(|| unicode_ext_value(&locale, "co"));
+                let col = self.alloc_str(match requested.as_deref() {
+                    // "standard"/"search" are never valid as a resolved collation.
+                    Some("standard") | Some("search") | None => "default".to_string(),
+                    Some(_) => "default".to_string(),
+                });
                 r.set("collation", col);
-                let nf = if options == Value::UNDEFINED {
-                    false
-                } else {
-                    let v = self.get_prop(options, "numeric")?;
-                    v != Value::UNDEFINED && self.truthy(v)
-                };
-                r.set("numeric", Value::bool(nf));
-                let cf = self.opt_string(
-                    options,
-                    "caseFirst",
-                    "false",
-                    &["upper", "lower", "false"],
-                )?;
-                let cfv = self.alloc_str(cf);
+                // `-u-kn` with no value IS the canonical spelling of `-u-kn-true`,
+                // so key presence (not a "true" value) is what turns it on.
+                let kn = numeric.unwrap_or_else(|| {
+                    unicode_ext_has_key(&locale, "kn")
+                        && unicode_ext_value(&locale, "kn").as_deref() != Some("false")
+                });
+                r.set("numeric", Value::bool(kn));
+                let kf = case_first
+                    .or_else(|| unicode_ext_value(&locale, "kf"))
+                    .filter(|s| ["upper", "lower", "false"].contains(&s.as_str()))
+                    .unwrap_or_else(|| "false".to_string());
+                let cfv = self.alloc_str(kf);
                 r.set("caseFirst", cfv);
             }
             INTL_PLURALRULES => {
@@ -938,10 +996,19 @@ impl<'p> Vm<'p> {
                     "standard",
                     &["standard", "scientific", "engineering", "compact"],
                 )?;
-                let _ = self.opt_string(options, "compactDisplay", "short", &["short", "long"])?;
+                let compact_display =
+                    self.opt_string(options, "compactDisplay", "short", &["short", "long"])?;
                 let digits = self.read_number_format_digit_options(options, 0, 3, &notation)?;
                 let tv = self.alloc_str(t);
                 r.set("type", tv);
+                // resolvedOptions table order: type, notation, then the digit
+                // block. `notation` was resolved but never reported.
+                let nv = self.alloc_str(notation.clone());
+                r.set("notation", nv);
+                if notation == "compact" {
+                    let cv = self.alloc_str(compact_display);
+                    r.set("compactDisplay", cv);
+                }
                 self.store_digit_options(&mut r, &digits);
                 // PluralRules has no `numberingSystem` in its resolvedOptions table.
                 let cats = ["one", "other"]
@@ -969,13 +1036,27 @@ impl<'p> Vm<'p> {
                 r.set("style", sv);
             }
             INTL_RELATIVETIMEFORMAT => {
+                // Read order: localeMatcher (above), numberingSystem, style,
+                // numeric — the sequence `constructor/options-order` asserts.
+                // `numberingSystem` was never read, so its throwing getter never
+                // ran and an ill-formed value never threw.
+                let ns_opt = self.opt_string_opt(options, "numberingSystem", &[])?;
+                if let Some(ref n) = ns_opt {
+                    if !is_well_formed_type_code(n) {
+                        return Err(Thrown(format!("RangeError: invalid numberingSystem: {n}")));
+                    }
+                }
                 let st = self.opt_string(options, "style", "long", &["long", "short", "narrow"])?;
                 let sv = self.alloc_str(st);
                 r.set("style", sv);
                 let nm = self.opt_string(options, "numeric", "always", &["always", "auto"])?;
                 let nmv = self.alloc_str(nm);
                 r.set("numeric", nmv);
-                let ns = self.alloc_str("latn".to_string());
+                let ns = self.alloc_str(resolve_available(
+                    ns_opt.or_else(|| unicode_ext_value(&locale, "nu")),
+                    AVAILABLE_NUMBERING_SYSTEMS,
+                    "latn",
+                ));
                 r.set("numberingSystem", ns);
             }
             INTL_SEGMENTER => {
@@ -985,32 +1066,153 @@ impl<'p> Vm<'p> {
                 r.set("granularity", gv);
             }
             INTL_DISPLAYNAMES => {
-                // type is required for DisplayNames.
-                let t = self.opt_string(
+                // Read order: style, type, fallback, languageDisplay. `style`
+                // comes FIRST — an invalid style must RangeError even though the
+                // (required) `type` is what a missing options bag trips on.
+                let st = self.opt_string(options, "style", "long", &["long", "short", "narrow"])?;
+                let t = self.opt_string_opt(
                     options,
                     "type",
-                    "",
                     &["language", "region", "script", "currency", "calendar", "dateTimeField"],
                 )?;
-                if t.is_empty() {
-                    return Err(Thrown("TypeError: Intl.DisplayNames type option is required".into()));
-                }
+                let t = t.ok_or_else(|| {
+                    Thrown("TypeError: Intl.DisplayNames type option is required".into())
+                })?;
+                let fb = self.opt_string(options, "fallback", "code", &["code", "none"])?;
+                let ld =
+                    self.opt_string(options, "languageDisplay", "dialect", &["dialect", "standard"])?;
+                // resolvedOptions table order: locale, style, type, fallback,
+                // languageDisplay (the last only for type "language").
+                let sv = self.alloc_str(st);
+                r.set("style", sv);
+                let is_language = t == "language";
                 let tv = self.alloc_str(t);
                 r.set("type", tv);
-                let st = self.opt_string(options, "style", "long", &["long", "short", "narrow"])?;
-                let sv = self.alloc_str(st);
-                r.set("style", sv);
-                let fb = self.opt_string(options, "fallback", "code", &["code", "none"])?;
                 let fbv = self.alloc_str(fb);
                 r.set("fallback", fbv);
+                if is_language {
+                    let ldv = self.alloc_str(ld);
+                    r.set("languageDisplay", ldv);
+                }
             }
             INTL_DURATIONFORMAT => {
+                // Read order: localeMatcher (above), numberingSystem, style, then
+                // the ten (unit, unitDisplay) pairs in table order, then
+                // fractionalDigits — asserted by constructor-options-order.
+                let ns_opt = self.opt_string_opt(options, "numberingSystem", &[])?;
+                if let Some(ref n) = ns_opt {
+                    if !is_well_formed_type_code(n) {
+                        return Err(Thrown(format!("RangeError: invalid numberingSystem: {n}")));
+                    }
+                }
                 let st =
                     self.opt_string(options, "style", "short", &["long", "short", "narrow", "digital"])?;
+                // GetUnitOptions (ECMA-402 Table 1). `values` widens for the time
+                // units, and `digital_base` is the style a "digital" duration
+                // gives that unit.
+                const UNITS: [(&str, bool, bool); 10] = [
+                    // (unit, allows numeric/2-digit, allows 2-digit)
+                    ("years", false, false),
+                    ("months", false, false),
+                    ("weeks", false, false),
+                    ("days", false, false),
+                    ("hours", true, true),
+                    ("minutes", true, true),
+                    ("seconds", true, true),
+                    ("milliseconds", true, false),
+                    ("microseconds", true, false),
+                    ("nanoseconds", true, false),
+                ];
+                let mut resolved_units: Vec<(String, String)> = vec![];
+                let mut prev_style = String::new();
+                for (unit, numeric_ok, two_digit_ok) in UNITS {
+                    let mut allowed: Vec<&str> = vec!["long", "short", "narrow"];
+                    if numeric_ok {
+                        allowed.push("numeric");
+                    }
+                    if two_digit_ok {
+                        allowed.push("2-digit");
+                    }
+                    let requested = self.opt_string_opt(options, unit, &allowed)?;
+                    // Step 6: once a unit is numeric-like, every later time unit
+                    // must be too — a "long" after a "numeric" is a RangeError.
+                    if let Some(ref s) = requested {
+                        if matches!(prev_style.as_str(), "numeric" | "2-digit")
+                            && !matches!(s.as_str(), "numeric" | "2-digit")
+                        {
+                            return Err(Thrown(format!(
+                                "RangeError: {unit} style {s} cannot follow a numeric unit"
+                            )));
+                        }
+                    }
+                    // GetUnitOptions' display default is "always" unless a rule
+                    // below relaxes it — an EXPLICIT style therefore keeps
+                    // "always" (`{hours:"numeric"}` ⇒ hoursDisplay "always").
+                    let mut display_default = "always";
+                    let is_digital_core = matches!(unit, "hours" | "minutes" | "seconds");
+                    let style = match requested {
+                        Some(s) => s,
+                        None if st == "digital" => {
+                            if !is_digital_core {
+                                display_default = "auto";
+                            }
+                            if numeric_ok { "numeric".to_string() } else { "short".to_string() }
+                        }
+                        None if matches!(prev_style.as_str(), "fractional" | "numeric" | "2-digit") => {
+                            // Step 3.b.i: after a numeric-like unit every later
+                            // time unit is numeric too, and only minutes/seconds
+                            // stay "always".
+                            if !matches!(unit, "minutes" | "seconds") {
+                                display_default = "auto";
+                            }
+                            "numeric".to_string()
+                        }
+                        None => {
+                            display_default = "auto";
+                            if st == "long" || st == "narrow" { st.clone() } else { "short".to_string() }
+                        }
+                    };
+                    // Step 8.b: minutes/seconds following a numeric-like unit
+                    // render as "2-digit".
+                    let style = if matches!(prev_style.as_str(), "numeric" | "2-digit")
+                        && matches!(unit, "minutes" | "seconds")
+                        && matches!(style.as_str(), "numeric" | "2-digit")
+                    {
+                        "2-digit".to_string()
+                    } else {
+                        style
+                    };
+                    // Step 4: a "numeric" sub-second unit is really a fraction of
+                    // the second before it, so it is only shown when non-zero.
+                    if style == "numeric" && !two_digit_ok && numeric_ok {
+                        display_default = "auto";
+                    }
+                    let disp_key = format!("{unit}Display");
+                    let display =
+                        self.opt_string(options, &disp_key, display_default, &["auto", "always"])?;
+                    prev_style = style.clone();
+                    resolved_units.push((style, display));
+                }
+                let frac = self.opt_int_opt(options, "fractionalDigits", 0, 9)?;
+                // resolvedOptions table order: locale, numberingSystem, style,
+                // then each unit followed by its display, then fractionalDigits.
+                let nsv = self.alloc_str(resolve_available(
+                    ns_opt.or_else(|| unicode_ext_value(&locale, "nu")),
+                    AVAILABLE_NUMBERING_SYSTEMS,
+                    "latn",
+                ));
+                r.set("numberingSystem", nsv);
                 let sv = self.alloc_str(st);
                 r.set("style", sv);
-                let ns = self.alloc_str("latn".to_string());
-                r.set("numberingSystem", ns);
+                for ((unit, _, _), (style, display)) in UNITS.iter().zip(resolved_units) {
+                    let s = self.alloc_str(style);
+                    r.set(unit, s);
+                    let d = self.alloc_str(display);
+                    r.set(&format!("{unit}Display"), d);
+                }
+                if let Some(f) = frac {
+                    r.set("fractionalDigits", Value::num(f as f64));
+                }
             }
             _ => {}
         }
@@ -1022,98 +1224,310 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(idx))
     }
 
-    /// `new Intl.Locale(tag, options)` — parse the tag into its subtags.
+    /// `new Intl.Locale(tag, options)` (ECMA-402 14.1.1).
+    ///
+    /// The tag is parsed structurally (`locale_tag.rs`), then `UpdateLanguageId`
+    /// replaces language/script/region/variants from `options`, then
+    /// `ApplyUnicodeExtensionToTag` folds calendar/collation/firstDayOfWeek/
+    /// hourCycle/caseFirst/numeric/numberingSystem into the `-u-` extension. The
+    /// option READ order is the one `constructor-getter-order` asserts:
+    /// the four language-id parts, then the extension keys in `-u-` key order
+    /// (ca, co, fw, hc, kf, kn, nu).
     pub(crate) fn make_locale(&mut self, tag: Value, options: Value) -> Result<Value, Thrown> {
-        let base = if tag.is_heap() {
-            if let HeapObj::Intl { kind: native::INTL_LOCALE, resolved } =
-                *self.heap.get(tag.heap_index())
-            {
-                self.display(self.intl_slot(resolved, "baseName"))
-            } else if self.heap.is_str_like(tag.heap_index()) {
-                self.heap.str_cow(tag.heap_index()).unwrap().into_owned()
-            } else {
-                return Err(Thrown("TypeError: Locale tag must be a string or Locale".into()));
+        use crate::vm::locale_tag as lt;
+        let base = match self.locale_slot_tag(tag) {
+            Some(t) => t,
+            None => {
+                // Step 7: a non-Locale, non-Object tag is a TypeError BEFORE any
+                // ToString — but an ordinary object is ToString'd (its toString
+                // runs, and its exception must win over the options reads).
+                if !(tag.is_heap() && self.heap.is_str_like(tag.heap_index()))
+                    && !self.is_object_value(tag)
+                {
+                    return Err(Thrown("TypeError: Locale tag must be a string or an object".into()));
+                }
+                self.to_js_string(tag)?
             }
-        } else {
-            return Err(Thrown("TypeError: Locale tag must be a string or Locale".into()));
         };
-        let canon = canonicalize_locale(&base)
+        let mut t = lt::parse_lang_tag(&base)
             .ok_or_else(|| Thrown(format!("RangeError: invalid language tag: {base}")))?;
-        // Split off any -u- extension; the leading part is the baseName.
-        let (base_part, _ext) = match canon.split_once("-u-") {
-            Some((b, e)) => (b.to_string(), Some(e.to_string())),
-            None => (canon.clone(), None),
-        };
-        let parts: Vec<&str> = base_part.split('-').collect();
-        let language = parts.first().copied().unwrap_or("und").to_string();
-        let mut script = String::new();
-        let mut region = String::new();
-        for p in &parts[1..] {
-            if p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()) {
-                script = p.to_string();
-            } else if (p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic()))
-                || (p.len() == 3 && p.chars().all(|c| c.is_ascii_digit()))
-            {
-                region = p.to_string();
+        // ── UpdateLanguageId ──
+        if let Some(l) = self.opt_string_opt(options, "language", &[])? {
+            if !lt::is_language_subtag(&l) {
+                return Err(Thrown(format!("RangeError: invalid language option: {l}")));
+            }
+            t.language = l.to_ascii_lowercase();
+        }
+        if let Some(s) = self.opt_string_opt(options, "script", &[])? {
+            if !lt::is_script_subtag(&s) {
+                return Err(Thrown(format!("RangeError: invalid script option: {s}")));
+            }
+            let l = s.to_ascii_lowercase();
+            t.script = format!("{}{}", l[..1].to_ascii_uppercase(), &l[1..]);
+        }
+        if let Some(rg) = self.opt_string_opt(options, "region", &[])? {
+            if !lt::is_region_subtag(&rg) {
+                return Err(Thrown(format!("RangeError: invalid region option: {rg}")));
+            }
+            t.region = if rg.bytes().all(|b| b.is_ascii_digit()) {
+                rg.clone()
+            } else {
+                rg.to_ascii_uppercase()
+            };
+        }
+        if let Some(v) = self.opt_string_opt(options, "variants", &[])? {
+            // `variants` is the whole "-"-joined run: every subtag must match
+            // unicode_variant_subtag and none may repeat.
+            let mut seen: Vec<String> = vec![];
+            for part in v.split('-') {
+                let lp = part.to_ascii_lowercase();
+                if !lt::is_variant_subtag(&lp) || seen.contains(&lp) {
+                    return Err(Thrown(format!("RangeError: invalid variants option: {v}")));
+                }
+                seen.push(lp);
+            }
+            seen.sort();
+            t.variants = seen;
+        }
+        // ── ApplyUnicodeExtensionToTag: the relevant extension keys, in key order ──
+        for (opt_name, key) in
+            [("calendar", "ca"), ("collation", "co"), ("firstDayOfWeek", "fw"), ("hourCycle", "hc")]
+        {
+            let raw = if key == "fw" {
+                // firstDayOfWeek also accepts the numeric weekday spellings
+                // (and `true`, which ToString's to "true" → the bare `-u-fw-`).
+                self.opt_string_opt(options, opt_name, &[])?.map(|s| lt::weekday_to_string(&s))
+            } else {
+                self.opt_string_opt(options, opt_name, &[])?
+            };
+            if let Some(v) = raw {
+                if key == "hc" && !["h11", "h12", "h23", "h24"].contains(&v.as_str()) {
+                    return Err(Thrown(format!("RangeError: invalid hourCycle option: {v}")));
+                }
+                if key != "hc" && !lt::is_type_sequence(&v) {
+                    return Err(Thrown(format!("RangeError: invalid {opt_name} option: {v}")));
+                }
+                t.set_u(key, Some(canon_ext_value(&v)));
             }
         }
+        if let Some(cf) = self.opt_string_opt(options, "caseFirst", &["upper", "lower", "false"])? {
+            t.set_u("kf", Some(canon_ext_value(&cf)));
+        }
+        // `numeric` is a BOOLEAN option: only its presence matters, and `true`
+        // canonicalizes to the bare `-u-kn`.
+        if let Some(n) = self.opt_bool_opt(options, "numeric")? {
+            t.set_u("kn", Some(if n { String::new() } else { "false".to_string() }));
+        }
+        if let Some(ns) = self.opt_string_opt(options, "numberingSystem", &[])? {
+            if !lt::is_type_sequence(&ns) {
+                return Err(Thrown(format!("RangeError: invalid numberingSystem option: {ns}")));
+            }
+            t.set_u("nu", Some(canon_ext_value(&ns)));
+        }
+        Ok(self.alloc_locale(&t))
+    }
+
+    /// Materialize a parsed tag as an `Intl.Locale` instance. The `resolved`
+    /// object doubles as the accessor backing store, so every getter's value is
+    /// stored here under its own property name; `@@tag` (hidden) is `[[Locale]]`.
+    pub(crate) fn alloc_locale(&mut self, t: &crate::vm::locale_tag::LangTag) -> Value {
+        use crate::vm::locale_tag as lt;
         let mut r = ObjMap::new();
-        let bn = self.alloc_str(base_part.clone());
+        let full = t.canonical();
+        let tv = self.alloc_str(full);
+        r.set("@@tag", tv);
+        let bn = self.alloc_str(t.base_name());
         r.set("baseName", bn);
-        let lv = self.alloc_str(language);
+        let lv = self.alloc_str(t.language.clone());
         r.set("language", lv);
-        r.set(
-            "script",
-            if script.is_empty() { Value::UNDEFINED } else { self.alloc_str(script) },
-        );
-        r.set(
-            "region",
-            if region.is_empty() { Value::UNDEFINED } else { self.alloc_str(region) },
-        );
-        // Options or -u- extension keys can override; read the common ones.
-        for (key, uext) in [
+        for (key, val) in
+            [("script", t.script.clone()), ("region", t.region.clone())]
+        {
+            let v = if val.is_empty() { Value::UNDEFINED } else { self.alloc_str(val) };
+            r.set(key, v);
+        }
+        let variants = if t.variants.is_empty() {
+            Value::UNDEFINED
+        } else {
+            self.alloc_str(t.variants.join("-"))
+        };
+        r.set("variants", variants);
+        for (key, uk) in [
             ("calendar", "ca"),
             ("collation", "co"),
+            ("firstDayOfWeek", "fw"),
             ("hourCycle", "hc"),
-            ("caseFirst", "kf"),
-            ("numberingSystem", "nu"),
         ] {
-            let from_opt = if options != Value::UNDEFINED {
-                let v = self.get_prop(options, key)?;
-                if v == Value::UNDEFINED { None } else { Some(self.to_js_string(v)?) }
-            } else {
-                None
+            // A bare `-u-ca` (no value) is not a resolved value: the getter
+            // reports undefined, exactly as if the key were absent.
+            let v = match t.u_value(uk) {
+                Some(s) if !s.is_empty() => self.alloc_str(s.to_string()),
+                _ => Value::UNDEFINED,
             };
-            let val = from_opt.or_else(|| {
-                _ext.as_ref().and_then(|e| {
-                    let toks: Vec<&str> = e.split('-').collect();
-                    toks.iter().position(|t| *t == uext).and_then(|i| toks.get(i + 1).map(|s| s.to_string()))
-                })
-            });
-            match val {
-                Some(s) => {
-                    let sv = self.alloc_str(s);
-                    r.set(key, sv);
-                }
-                None => {
-                    r.set(key, Value::UNDEFINED);
-                }
-            }
+            r.set(key, v);
         }
-        // numeric (kn) → boolean
-        let numeric = if options != Value::UNDEFINED {
-            let v = self.get_prop(options, "numeric")?;
-            if v != Value::UNDEFINED { Some(self.truthy(v)) } else { None }
-        } else {
-            None
+        // `-u-kf-true` canonicalizes to a bare `-u-kf`, whose caseFirst is "".
+        let cf = match t.u_value("kf") {
+            Some(s) => self.alloc_str(s.to_string()),
+            None => Value::UNDEFINED,
         };
-        r.set("numeric", Value::bool(numeric.unwrap_or(false)));
+        r.set("caseFirst", cf);
+        // `-u-kn` (bare) and `-u-kn-true` are both `numeric === true`.
+        r.set("numeric", Value::bool(matches!(t.u_value("kn"), Some(""))));
+        let ns = match t.u_value("nu") {
+            Some(s) if !s.is_empty() => self.alloc_str(s.to_string()),
+            _ => Value::UNDEFINED,
+        };
+        r.set("numberingSystem", ns);
+        // The 1..7 weekday `getWeekInfo` reports, when `-u-fw-` names one.
+        let fw_idx = t.u_value("fw").and_then(lt::weekday_index);
+        r.set("@@fwindex", match fw_idx {
+            Some(i) => Value::num(i as f64),
+            None => Value::UNDEFINED,
+        });
         let resolved = self.heap.alloc(HeapObj::Object(Box::new(r)));
         let idx = self.heap.alloc(HeapObj::Intl { kind: native::INTL_LOCALE, resolved });
         if self.intl_protos[native::INTL_LOCALE as usize] != 0 {
             self.proto_of.insert(idx, Value::heap(self.intl_protos[native::INTL_LOCALE as usize]));
         }
-        Ok(Value::heap(idx))
+        Value::heap(idx)
+    }
+
+    /// StringListFromIterable (ECMA-402 13.5.1) — Intl.ListFormat's argument
+    /// coercion. `undefined` is an empty list (NOT a TypeError), and a yielded
+    /// value that is not a String stops iteration at once with a TypeError,
+    /// after IteratorClose. Draining first and checking after would run the
+    /// iterator past the offending element, which `iterable-iteratorclose`
+    /// observes through the iterator's own step counter.
+    pub(crate) fn string_list_from_iterable(&mut self, iterable: Value) -> Result<Vec<String>, Thrown> {
+        if iterable == Value::UNDEFINED {
+            return Ok(vec![]);
+        }
+        let iter = self.get_iterator(iterable)?;
+        let next = if iter.is_heap()
+            && matches!(
+                self.heap.get(iter.heap_index()),
+                HeapObj::Object(_)
+                    | HeapObj::Proxy { .. }
+                    | HeapObj::Iterator { .. }
+                    | HeapObj::IterHelper { .. }
+            ) {
+            let n = self.get_prop(iter, "next")?;
+            self.is_callable(n).then_some(n)
+        } else {
+            None
+        };
+        let Some(next) = next else {
+            // A dense array / string / generator has no user-visible step
+            // function to observe, so the shared drain is equivalent there.
+            let vals = self.iterate_to_vec(iterable)?;
+            let mut out = Vec::with_capacity(vals.len());
+            for v in vals {
+                if !(v.is_heap() && self.heap.is_str_like(v.heap_index())) {
+                    return Err(Thrown("TypeError: list elements must be strings".into()));
+                }
+                out.push(self.heap.str_cow(v.heap_index()).unwrap().into_owned());
+            }
+            return Ok(out);
+        };
+        let mut out: Vec<String> = vec![];
+        loop {
+            let res = self.call_value(next, iter, &[])?;
+            if !self.is_object_value(res) {
+                return Err(Thrown("TypeError: iterator.next() returned a non-object".into()));
+            }
+            let done = self.get_prop(res, "done")?;
+            if self.truthy(done) {
+                break;
+            }
+            let v = self.get_prop(res, "value")?;
+            if !(v.is_heap() && self.heap.is_str_like(v.heap_index())) {
+                self.iterator_close_quiet(iter);
+                return Err(Thrown("TypeError: list elements must be strings".into()));
+            }
+            out.push(self.heap.str_cow(v.heap_index()).unwrap().into_owned());
+        }
+        Ok(out)
+    }
+
+    /// The Intl.Locale-info methods (`getCalendars` … `getWeekInfo`).
+    ///
+    /// ECMA-402 sources these from CLDR supplemental data, which this engine does
+    /// not ship. Rather than invent per-locale answers, each list reports what
+    /// **this engine actually implements** — the same sets `Intl.supportedValuesOf`
+    /// and the DateTimeFormat/Collator resolvedOptions surfaces report, so the
+    /// three agree — and the two purely structural rules (a region-less tag has no
+    /// time zones; `-u-fw-` overrides the first day of the week) are honoured
+    /// exactly.
+    pub(crate) fn locale_info(&mut self, resolved: u32, which: &str) -> Result<Value, Thrown> {
+        let tag = self.display(self.intl_slot(resolved, "@@tag"));
+        let strings = |vm: &mut Self, xs: &[&str]| -> Value {
+            let items: Vec<Value> = xs.iter().map(|s| vm.alloc_str(s.to_string())).collect();
+            Value::heap(vm.heap.alloc(HeapObj::Array(items)))
+        };
+        Ok(match which {
+            // CreateArrayFromListAndPreferred: a `-u-ca-` request that this
+            // engine supports leads the list.
+            "getCalendars" => {
+                let pref = self.display(self.intl_slot(resolved, "calendar")).to_ascii_lowercase();
+                let mut list: Vec<&str> = AVAILABLE_CALENDARS.to_vec();
+                if let Some(p) = list.iter().position(|c| *c == pref) {
+                    let c = list.remove(p);
+                    list.insert(0, c);
+                }
+                strings(self, &list)
+            }
+            "getNumberingSystems" => strings(self, AVAILABLE_NUMBERING_SYSTEMS),
+            // One collation, the one Collator.resolvedOptions() names. "standard"
+            // and "search" are excluded from this list by the spec.
+            "getCollations" => strings(self, &["default"]),
+            // The hour cycle DateTimeFormat resolves when nothing overrides it.
+            "getHourCycles" => strings(self, &["h12"]),
+            "getTimeZones" => {
+                // Structural rule: no region subtag → undefined, no data needed.
+                if self.intl_slot(resolved, "region") == Value::UNDEFINED {
+                    Value::UNDEFINED
+                } else {
+                    // There is no tz database here; UTC is the only zone the
+                    // engine implements, so it is the only one it can name.
+                    strings(self, &["UTC"])
+                }
+            }
+            "getTextInfo" => {
+                let script = self.display(self.intl_slot(resolved, "script"));
+                let dir = if self.intl_slot(resolved, "script") != Value::UNDEFINED
+                    && is_rtl_script(&script)
+                {
+                    "rtl"
+                } else {
+                    // Without likelySubtags a bare RTL language tag ("ar") cannot
+                    // be resolved to its script, so it reports "ltr" here.
+                    "ltr"
+                };
+                let mut o = ObjMap::new();
+                let d = self.alloc_str(dir.to_string());
+                o.set("direction", d);
+                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
+            }
+            _ => {
+                // getWeekInfo. `-u-fw-` is a structural override and is honoured;
+                // otherwise the CLDR *root* week data applies (first day Monday,
+                // weekend Saturday+Sunday) because there is no territory table to
+                // specialise it.
+                let first = match self.intl_slot(resolved, "@@fwindex") {
+                    v if v.is_number() => v.as_f64(),
+                    _ => 1.0,
+                };
+                let mut o = ObjMap::new();
+                o.set("firstDay", Value::num(first));
+                let weekend = Value::heap(
+                    self.heap.alloc(HeapObj::Array(vec![Value::num(6.0), Value::num(7.0)])),
+                );
+                o.set("weekend", weekend);
+                let _ = tag;
+                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
+            }
+        })
     }
 
     /// Intl.NumberFormat.prototype.format(value).
@@ -1136,8 +1550,10 @@ impl<'p> Vm<'p> {
         };
         let ug = self.intl_slot(resolved, "useGrouping");
         let grouping = ug != Value::bool(false) && self.display(ug) != "false";
+        let notation = self.display(self.intl_slot(resolved, "notation"));
         let params = NumFmtParams {
             style: &style,
+            notation: &notation,
             min_int: slot_int(self, "minimumIntegerDigits").unwrap_or(1),
             min_frac: slot_int(self, "minimumFractionDigits"),
             max_frac: slot_int(self, "maximumFractionDigits"),
@@ -1176,6 +1592,40 @@ impl<'p> Vm<'p> {
             }
         }
         None
+    }
+
+    /// HandleDateTimeValue's calendar guard: a `Temporal.*` argument is rendered
+    /// with the DateTimeFormat's own calendar, so its calendar must be either
+    /// `iso8601` (which any calendar can render) or exactly the format's.
+    /// Anything else is a RangeError — the formatter must not silently reinterpret
+    /// a Japanese date as a Gregorian one.
+    pub(crate) fn dtf_check_calendar(
+        &mut self,
+        resolved: u32,
+        v: Value,
+        name: &str,
+    ) -> Result<(), Thrown> {
+        // Only the calendar-BEARING Temporal types carry a calendar to clash.
+        if !self.dt_arg_kind(v).is_some_and(|k| matches!(k, 1 | 3 | 5 | 6 | 7)) {
+            return Ok(());
+        }
+        let cal = self.cal_of(v.heap_index());
+        if cal == crate::vm::temporal::Cal::Iso {
+            return Ok(());
+        }
+        let want = self.intl_slot(resolved, "calendar");
+        let want = if want.is_heap() {
+            self.heap.str_cow(want.heap_index()).map(|s| s.into_owned()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if cal.id() == want {
+            return Ok(());
+        }
+        Err(Thrown(format!(
+            "RangeError: {name} cannot format a {} date with the {want} calendar",
+            cal.id()
+        )))
     }
 
     /// HandleDateTimeValue: ToNumber + TimeClip for an ordinary time value (an
@@ -1237,16 +1687,28 @@ impl<'p> Vm<'p> {
     /// Wrap a (type, value[, source]) part list as the Array of plain objects the
     /// *ToParts methods return.
     pub(crate) fn intl_parts_array(&mut self, parts: &[(String, String, &str)]) -> Value {
+        self.intl_parts_array_keyed(parts, "source")
+    }
+
+    /// As `intl_parts_array`, but the third tuple slot lands under `key` —
+    /// `source` for the range formatters, `unit` for RelativeTimeFormat and
+    /// DurationFormat. An empty string omits the field entirely (a `literal`
+    /// between units belongs to neither).
+    pub(crate) fn intl_parts_array_keyed(
+        &mut self,
+        parts: &[(String, String, &str)],
+        key: &str,
+    ) -> Value {
         let mut out: Vec<Value> = Vec::with_capacity(parts.len());
-        for (ty, val, src) in parts {
+        for (ty, val, extra) in parts {
             let mut o = ObjMap::new();
             let t = self.alloc_str(ty.clone());
             o.set("type", t);
             let v = self.alloc_str(val.clone());
             o.set("value", v);
-            if !src.is_empty() {
-                let s = self.alloc_str(src.to_string());
-                o.set("source", s);
+            if !extra.is_empty() {
+                let s = self.alloc_str(extra.to_string());
+                o.set(key, s);
             }
             out.push(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o)))));
         }
@@ -1333,6 +1795,16 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
+        // Split off a scientific/engineering exponent before the mantissa is
+        // decomposed: it becomes its own exponentSeparator / exponentMinusSign /
+        // exponentInteger run at the very end of the part list.
+        let exponent = match rest.split_once('E') {
+            Some((mantissa, e)) => {
+                rest = mantissa;
+                Some(e.to_string())
+            }
+            None => None,
+        };
         let (int_str, frac_str) = match rest.split_once('.') {
             Some((i, f)) => (i, Some(f)),
             None => (rest, None),
@@ -1352,6 +1824,16 @@ impl<'p> Vm<'p> {
         if let Some(f) = frac_str {
             parts.push(("decimal".into(), ".".into()));
             parts.push(("fraction".into(), f.into()));
+        }
+        if let Some(e) = exponent {
+            parts.push(("exponentSeparator".into(), "E".into()));
+            match e.strip_prefix('-') {
+                Some(mag) => {
+                    parts.push(("exponentMinusSign".into(), "-".into()));
+                    parts.push(("exponentInteger".into(), mag.into()));
+                }
+                None => parts.push(("exponentInteger".into(), e)),
+            }
         }
         if let Some(s) = suffix {
             parts.push(s);
@@ -1373,18 +1855,46 @@ impl<'p> Vm<'p> {
         let (y, mo, d) = epoch_days_to_iso(days);
         let rem_ns = total_ms.rem_euclid(86_400_000) * 1_000_000;
         let t = ns_to_time(rem_ns); // [h, mi, s, ms, us, ns]
-        let has = |k: &str| matches!(self.heap.get(resolved), HeapObj::Object(m) if m.pos(k).is_some());
-        let has_date = has("year") || has("month") || has("day") || has("dateStyle") || has("weekday");
-        let has_time = has("hour") || has("minute") || has("second") || has("timeStyle");
+        let slot = |k: &str| -> Option<String> {
+            match self.heap.get(resolved) {
+                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
+                _ => None,
+            }
+        };
+        let has = |k: &str| slot(k).is_some();
+        // Only the components the resolved options actually carry are emitted:
+        // `{minute, second}` must format as "02:03", not as a whole date-time.
+        // (A `dateStyle`/`timeStyle` selects the full date / full time, since the
+        // per-style skeletons are CLDR data this engine does not have.)
+        let date_style = has("dateStyle");
+        let time_style = has("timeStyle");
+        let has_date = has("year") || has("month") || has("day") || has("weekday") || date_style;
+        let has_time = has("hour") || has("minute") || has("second") || time_style;
+        // A two-digit request pads; a numeric one does not.
+        let two = |k: &str, v: i64| -> String {
+            if slot(k).as_deref() == Some("2-digit") { format!("{v:02}") } else { v.to_string() }
+        };
         let mut out: Vec<(&'static str, String)> = vec![];
         // Neither a date nor a time component resolved (a dayPeriod- or
-        // timeZoneName-only request): still emit the default date pattern.
-        if has_date || !has_time {
-            out.push(("month", mo.to_string()));
-            out.push(("literal", "/".to_string()));
-            out.push(("day", d.to_string()));
-            out.push(("literal", "/".to_string()));
-            out.push(("year", y.to_string()));
+        // timeZoneName-only request): the date fields carry nothing to print.
+        if has_date {
+            let mut date: Vec<(&'static str, String)> = vec![];
+            if has("month") || date_style {
+                date.push(("month", two("month", mo)));
+            }
+            if has("day") || date_style {
+                if !date.is_empty() {
+                    date.push(("literal", "/".to_string()));
+                }
+                date.push(("day", two("day", d)));
+            }
+            if has("year") || date_style {
+                if !date.is_empty() {
+                    date.push(("literal", "/".to_string()));
+                }
+                date.push(("year", y.to_string()));
+            }
+            out.extend(date);
         }
         if has_time {
             let h24 = t[0];
@@ -1395,16 +1905,54 @@ impl<'p> Vm<'p> {
             } else {
                 (h24 - 12, "PM")
             };
-            if !out.is_empty() {
+            // hourCycle h23/h24 print the 24-hour clock and no day period.
+            let hc = slot("hourCycle").unwrap_or_else(|| "h12".to_string());
+            let is12 = hc == "h11" || hc == "h12";
+            let hour_val = match hc.as_str() {
+                "h11" => h24 % 12,
+                "h23" => h24,
+                "h24" => {
+                    if h24 == 0 { 24 } else { h24 }
+                }
+                _ => h12,
+            };
+            let mut time: Vec<(&'static str, String)> = vec![];
+            if has("hour") || time_style {
+                time.push(("hour", two("hour", hour_val)));
+            }
+            if has("minute") || time_style {
+                if !time.is_empty() {
+                    time.push(("literal", ":".to_string()));
+                }
+                time.push(("minute", format!("{:02}", t[1])));
+            }
+            if has("second") || time_style {
+                if !time.is_empty() {
+                    time.push(("literal", ":".to_string()));
+                }
+                time.push(("second", format!("{:02}", t[2])));
+            }
+            // fractionalSecondDigits attaches to the second as a `.`-separated
+            // `fractionalSecond` part, truncated (never rounded) to its width.
+            if let Some(f) = slot("fractionalSecondDigits") {
+                if let Ok(n) = f.parse::<usize>() {
+                    if n >= 1 && n <= 3 {
+                        let ms_str = format!("{:03}", t[3]);
+                        time.push(("literal", ".".to_string()));
+                        time.push(("fractionalSecond", ms_str[..n].to_string()));
+                    }
+                }
+            }
+            // The day period belongs to the HOUR field: `{minute, second}` is
+            // "02:03", not "02:03 PM".
+            if is12 && (has("hour") || time_style) {
+                time.push(("literal", "\u{202f}".to_string()));
+                time.push(("dayPeriod", ap.to_string()));
+            }
+            if !out.is_empty() && !time.is_empty() {
                 out.push(("literal", ", ".to_string()));
             }
-            out.push(("hour", h12.to_string()));
-            out.push(("literal", ":".to_string()));
-            out.push(("minute", format!("{:02}", t[1])));
-            out.push(("literal", ":".to_string()));
-            out.push(("second", format!("{:02}", t[2])));
-            out.push(("literal", "\u{202f}".to_string()));
-            out.push(("dayPeriod", ap.to_string()));
+            out.extend(time);
         }
         out
     }
@@ -1460,6 +2008,67 @@ fn resolve_available(requested: Option<String>, available: &[&str], default: &st
     }
 }
 
+/// The characters CLDR's root collation gives *variable* (shifted) weights —
+/// whitespace, punctuation and general symbols. `Intl.Collator`'s
+/// `ignorePunctuation` drops exactly these before comparing. Approximated from
+/// std's Unicode predicates: anything that is neither a letter/number nor a
+/// combining mark is variable. (Currency symbols and digits are variable in
+/// UCA only above variable-top; without weight tables the distinction is not
+/// observable through a code-point comparison.)
+pub(crate) fn is_variable_collation_char(c: char) -> bool {
+    !c.is_alphanumeric() && !unicode_normalization::char::is_combining_mark(c)
+}
+
+/// IsValidDisplayNamesCode + CanonicalCodeForDisplayNames (ECMA-402 12.5.2):
+/// validate `Intl.DisplayNames.prototype.of`'s argument against the instance's
+/// `type` and return it in canonical case, or `None` for a RangeError. Pure
+/// grammar — no display-name data is involved.
+pub(crate) fn canonical_display_names_code(ty: &str, code: &str) -> Option<String> {
+    match ty {
+        "language" => crate::vm::locale_tag::canonicalize_tag(code),
+        "region" => {
+            let ok = (code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic()))
+                || (code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()));
+            ok.then(|| code.to_ascii_uppercase())
+        }
+        "script" => (code.len() == 4 && code.bytes().all(|b| b.is_ascii_alphabetic())).then(|| {
+            let l = code.to_ascii_lowercase();
+            format!("{}{}", l[..1].to_ascii_uppercase(), &l[1..])
+        }),
+        "currency" => (code.len() == 3 && code.bytes().all(|b| b.is_ascii_alphabetic()))
+            .then(|| code.to_ascii_uppercase()),
+        "calendar" => is_well_formed_type_code(code).then(|| code.to_ascii_lowercase()),
+        // dateTimeField takes one of the twelve field names, verbatim.
+        _ => [
+            "era", "year", "quarter", "month", "weekOfYear", "weekday", "day", "dayPeriod",
+            "hour", "minute", "second", "timeZoneName",
+        ]
+        .contains(&code)
+        .then(|| code.to_string()),
+    }
+}
+
+/// The ISO 15924 script codes written right-to-left. This is a Unicode fact
+/// about the scripts themselves (their characters' Bidi_Class), not per-locale
+/// CLDR data, so `Intl.Locale.prototype.getTextInfo` can answer it from the
+/// script subtag alone.
+fn is_rtl_script(script: &str) -> bool {
+    matches!(
+        script,
+        "Adlm" | "Arab" | "Aran" | "Armi" | "Avst" | "Cprt" | "Egyp" | "Elym" | "Gara" | "Hatr"
+            | "Hebr" | "Hung" | "Khar" | "Lydi" | "Mand" | "Mani" | "Mend" | "Merc" | "Mero"
+            | "Narb" | "Nbat" | "Nkoo" | "Orkh" | "Palm" | "Phli" | "Phlp" | "Phnx" | "Prti"
+            | "Rohg" | "Samr" | "Sarb" | "Sogd" | "Sogo" | "Syrc" | "Thaa" | "Todr" | "Yezi"
+    )
+}
+
+/// A `-u-` keyword value as it is stored: lowercased, with the redundant
+/// explicit "true" dropped (`-u-kn-true` canonicalizes to `-u-kn`).
+fn canon_ext_value(v: &str) -> String {
+    let l = v.to_ascii_lowercase();
+    if l == "true" { String::new() } else { l }
+}
+
 /// A Unicode locale extension `type` value: 3-8 alphanumerics, optionally
 /// repeated (`islamic-civil`). Used to range-check the `calendar` /
 /// `numberingSystem` options before any data lookup (ECMA-402 IsWellFormed
@@ -1469,6 +2078,16 @@ pub(crate) fn is_well_formed_type_code(s: &str) -> bool {
         && s.split('-').all(|p| {
             (3..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric())
         })
+}
+
+/// Whether a canonical tag carries a `-u-<key>` keyword at all, with or without
+/// a value — `-u-kn` (the canonical form of `-u-kn-true`) has no value subtag,
+/// so `unicode_ext_value` alone cannot distinguish it from an absent key.
+pub(crate) fn unicode_ext_has_key(tag: &str, key: &str) -> bool {
+    match tag.split("-u-").nth(1) {
+        Some(ext) => ext.split('-').any(|t| t == key),
+        None => false,
+    }
 }
 
 /// Read a Unicode `-u-` extension keyword out of a canonical language tag

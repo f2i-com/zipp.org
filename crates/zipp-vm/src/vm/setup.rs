@@ -1663,12 +1663,14 @@ impl<'p> Vm<'p> {
             let itag = self.alloc_str("Temporal.Instant".to_string());
             let mut im = ObjMap::new();
             im.define("prototype", Value::heap(instant_proto), proto_attr);
+            // `fromEpochSeconds` / `fromEpochMicroseconds` were REMOVED from the
+            // proposal in June 2024 (only the millisecond and nanosecond
+            // entry points survive); the native ids stay so the dispatch arms
+            // keep compiling, they are simply no longer exposed.
             for (n, id) in [
                 ("from", INST_FROM),
                 ("fromEpochMilliseconds", INST_FROM_EPOCH_MS),
                 ("fromEpochNanoseconds", INST_FROM_EPOCH_NS),
-                ("fromEpochSeconds", INST_FROM_EPOCH_SEC),
-                ("fromEpochMicroseconds", INST_FROM_EPOCH_US),
                 ("compare", INST_COMPARE),
             ] {
                 let v = Value::heap(self.heap.alloc(HeapObj::Native(id)));
@@ -1999,6 +2001,25 @@ impl<'p> Vm<'p> {
                     Value::heap(self.heap.alloc(HeapObj::Native(INTL_LOCALE_GET_BASE + i as u16)));
                 if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
                     p.define(gname, getter, accessor_attr);
+                }
+            }
+            // `variants` / `firstDayOfWeek` live outside the LOCALE_ACCESSORS id
+            // block (it is boxed in by INTL_NF_FORMAT_GET), so they wire up here.
+            for (gname, gid) in [
+                ("variants", INTL_LOCALE_GET_VARIANTS),
+                ("firstDayOfWeek", INTL_LOCALE_GET_FIRSTDAY),
+            ] {
+                let getter = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
+                if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
+                    p.define(gname, getter, accessor_attr);
+                }
+            }
+            // The Intl.Locale-info methods (ordinary data-property built-ins).
+            for (i, mname) in native::LOCALE_INFO_METHODS.iter().enumerate() {
+                let f =
+                    Value::heap(self.heap.alloc(HeapObj::Native(INTL_LOCALE_INFO_BASE + i as u16)));
+                if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
+                    p.define(mname, f, method_attr);
                 }
             }
             // NumberFormat/DateTimeFormat `format` + Collator `compare`: spec says

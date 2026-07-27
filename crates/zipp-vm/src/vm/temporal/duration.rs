@@ -265,13 +265,14 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                if let Some((start, zoned, off)) = anchor {
-                    check_relative_target(start, &f, zoned, off, true)?;
+                if let Some((start, zoned, off, cal)) = anchor {
+                    check_relative_target(cal, start, &f, zoned, off, true)?;
                     if needs_cal {
                         // Calendar-relative totals stay on the i64 record (the
                         // calendar fields are small; exactness lives in the
                         // day+time paths).
                         return Ok(Some(Value::num(duration_total_relative(
+                            cal,
                             f.map(Self::dur_to_i64),
                             start,
                             &unit,
@@ -282,11 +283,11 @@ impl<'p> Vm<'p> {
                     // (truncated days + sign) as an instant, which must be
                     // representable even when the result itself is exact.
                     if zoned && unit == "day" {
-                        let diff_ns = dur_end_epoch_ns(start, &f) - dt_epoch_ns(start);
+                        let diff_ns = dur_end_epoch_ns(cal, start, &f) - dt_epoch_ns(start);
                         let s: i128 = if diff_ns < 0 { -1 } else { 1 };
                         let mut upper = [0i64; 10];
                         upper[3] = (diff_ns / DAY_NS + s) as i64;
-                        let upper_wall = dt_add_dur(start, upper);
+                        let upper_wall = dt_add_dur(cal, start, upper);
                         if (dt_epoch_ns(upper_wall) - off as i128).abs() > NS_MAX_INSTANT {
                             return Err(Thrown(
                                 "RangeError: Temporal result is outside the representable range"
@@ -422,11 +423,12 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                if let Some((start, zoned, off)) = anchor {
-                    check_relative_target(start, &f, zoned, off, true)?;
+                if let Some((start, zoned, off, cal)) = anchor {
+                    check_relative_target(cal, start, &f, zoned, off, true)?;
                     // Calendar-relative rounding stays on the i64 record; the
                     // exact range check above already ran on the f64 record.
                     let r = self.round_duration_relative(
+                        cal,
                         f.map(Self::dur_to_i64),
                         start,
                         &smallest,

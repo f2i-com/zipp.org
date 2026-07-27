@@ -14,8 +14,16 @@ use crate::value::Value;
 pub(crate) struct PdtBag {
     pub(crate) f: [i64; 9],
     month_code_invalid: bool,
+    month_conflict: bool,
     pub(crate) bag_off: Option<i64>,
     pub(crate) tz: Value,
+    /// The calendar the bag's `calendar` field selected, plus the calendar-space
+    /// year inputs it carried. `f[0..3]` holds the RAW year/month/day as read;
+    /// `finish_pdt_fields` resolves them into the stored ISO date.
+    pub(crate) cal: Cal,
+    era: Option<String>,
+    era_year: Option<i64>,
+    year: Option<i64>,
 }
 
 
@@ -85,12 +93,12 @@ fn annotations_valid(ann: &str) -> bool {
 /// Validate a Temporal ISO string for a given parser context: the annotation
 /// suffix must be well-formed, and (for the wall-clock "Plain" types) the string
 /// must not carry a `Z`/`z` UTC designator (a numeric offset is still allowed).
-/// `require_iso_calendar` (for the calendar-BEARING types — PlainDate/DateTime/
+/// `require_known_calendar` (for the calendar-BEARING types — PlainDate/DateTime/
 /// YearMonth/MonthDay/ZonedDateTime/Duration-relativeTo) additionally requires the
-/// FIRST `[u-ca=…]` calendar annotation, if present, to be the supported "iso8601"
-/// (so "…[u-ca=notacal]" / a date-like calendar name is a RangeError). The
-/// calendar-LESS types (Instant, PlainTime) ignore the calendar entirely.
-fn temporal_string_ok(s: &str, reject_utc_designator: bool, require_iso_calendar: bool) -> bool {
+/// FIRST `[u-ca=…]` calendar annotation, if present, to name a calendar this
+/// engine implements (so "…[u-ca=notacal]" / a date-like calendar name is a
+/// RangeError). The calendar-LESS types (Instant, PlainTime) ignore it entirely.
+fn temporal_string_ok(s: &str, reject_utc_designator: bool, require_known_calendar: bool) -> bool {
     let s = s.trim();
     let (main, ann) = match s.find('[') {
         Some(i) => (&s[..i], &s[i..]),
@@ -100,12 +108,12 @@ fn temporal_string_ok(s: &str, reject_utc_designator: bool, require_iso_calendar
         return false;
     }
     // The first calendar annotation is the resolved calendar; later `[u-ca=…]` are
-    // ignored. This ISO-only engine accepts only "iso8601".
-    if require_iso_calendar {
+    // ignored. It must name a calendar this engine implements.
+    if require_known_calendar {
         if let Some(p) = ann.find("u-ca=") {
             let val = &ann[p + 5..];
             match val.find(']') {
-                Some(end) if val[..end].eq_ignore_ascii_case("iso8601") => {}
+                Some(end) if calendar_by_id(&val[..end]).is_some() => {}
                 _ => return false,
             }
         }
@@ -126,14 +134,13 @@ fn temporal_string_ok(s: &str, reject_utc_designator: bool, require_iso_calendar
     true
 }
 
-/// Resolve a calendar string to its canonical id. The ISO-only engine accepts
-/// only "iso8601", but parsing the id lets an unsupported calendar error cleanly:
-/// "iso8601" in any ASCII case, a `[u-ca=…]` annotation embedded in an ISO
-/// string, or a bare ISO date / year-month / month-day string (→ iso8601).
+/// Resolve a calendar string to its calendar id (not yet checked for support):
+/// a bare identifier in any ASCII case, a `[u-ca=…]` annotation embedded in an
+/// ISO string, or a bare ISO date / year-month / month-day string (→ iso8601).
 fn calendar_id_from_string(s: &str) -> Option<String> {
     let s = s.trim();
-    if s.eq_ignore_ascii_case("iso8601") {
-        return Some("iso8601".to_string());
+    if calendar_by_id(s).is_some() {
+        return Some(s.to_string());
     }
     if let Some(p) = s.find("u-ca=") {
         let val = &s[p + 5..];
@@ -337,7 +344,7 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
 
 /// Add a Duration `f` ([y,mo,w,d,h,mi,s,ms,us,ns]) to a date-time `start`
 /// ([y,mo,d,h,mi,s,ms,us,ns]) with calendar constrain — the shared add path.
-fn dt_add_dur(start: [i64; 9], f: [i64; 10]) -> [i64; 9] {
+fn dt_add_dur(cal: Cal, start: [i64; 9], f: [i64; 10]) -> [i64; 9] {
     let tns = time_to_ns(&[start[3], start[4], start[5], start[6], start[7], start[8]])
         + (f[4] as i128) * 3_600_000_000_000
         + (f[5] as i128) * 60_000_000_000
@@ -347,11 +354,9 @@ fn dt_add_dur(start: [i64; 9], f: [i64; 10]) -> [i64; 9] {
         + (f[9] as i128);
     let carry = tns.div_euclid(DAY_NS) as i64;
     let nt = ns_to_time(tns.rem_euclid(DAY_NS));
-    let tm = (start[0] + f[0]) * 12 + (start[1] - 1) + f[1];
-    let ny0 = tm.div_euclid(12);
-    let nmo = tm.rem_euclid(12) + 1;
-    let nd0 = start[2].min(days_in_month(ny0, nmo));
-    let ed = iso_to_epoch_days(ny0, nmo, nd0) + f[2] * 7 + f[3] + carry;
+    let (cy, cm, cd) = cal_from_iso(cal, start[0], start[1], start[2]);
+    let (ay, am, ad) = cal_add_year_month(cal, cy, cm, cd, f[0], f[1], false).unwrap();
+    let ed = cal_to_epoch_days(cal, ay, am, ad) + f[2] * 7 + f[3] + carry;
     let (ny, nm, nd) = epoch_days_to_iso(ed);
     [ny, nm, nd, nt[0], nt[1], nt[2], nt[3], nt[4], nt[5]]
 }
@@ -373,13 +378,14 @@ fn dt_epoch_ns(dt: [i64; 9]) -> i128 {
 /// datetime bound: the minimum date -271821-04-19's midnight lands exactly ON the
 /// exclusive ISODateTimeWithinLimits bound and must throw before any arithmetic.
 fn check_relative_target(
+    cal: Cal,
     start: [i64; 9],
     f: &[f64; 10],
     is_zoned: bool,
     offset_ns: i64,
     strict_plain_start: bool,
 ) -> Result<(), Thrown> {
-    let end_ns = dur_end_epoch_ns(start, f);
+    let end_ns = dur_end_epoch_ns(cal, start, f);
     let ok = if is_zoned {
         (end_ns - offset_ns as i128).abs() <= NS_MAX_INSTANT
     } else {
@@ -411,9 +417,9 @@ fn dur_day_time_ns(f: &[f64; 10]) -> i128 {
 /// calendar part (y/mo/w, each below 2^32 by IsValidDuration so `as i64` is
 /// exact) goes through date math, the day+time portion adds in i128 — a huge
 /// sub-second field must not saturate through an i64 conversion.
-fn dur_end_epoch_ns(start: [i64; 9], f: &[f64; 10]) -> i128 {
+fn dur_end_epoch_ns(cal: Cal, start: [i64; 9], f: &[f64; 10]) -> i128 {
     let cal_end =
-        dt_add_dur(start, [f[0] as i64, f[1] as i64, f[2] as i64, 0, 0, 0, 0, 0, 0, 0]);
+        dt_add_dur(cal, start, [f[0] as i64, f[1] as i64, f[2] as i64, 0, 0, 0, 0, 0, 0, 0]);
     dt_epoch_ns(cal_end) + dur_day_time_ns(f)
 }
 
@@ -438,6 +444,7 @@ pub(crate) fn iso_datetime_ns_in_range(f: [i64; 9]) -> bool {
 /// into the calendar units. The `rounded == time_ns` short-circuit keeps the
 /// nanosecond-default case (and difference_datetime's day-borrow) byte-identical.
 fn round_datetime_diff_daytime(
+    cal: Cal,
     dt1: [i64; 9],
     df: [i64; 10],
     smallest: &str,
@@ -453,12 +460,12 @@ fn round_datetime_diff_daytime(
     }
     // Reconstruct the rounded endpoint (anchor at the kept year/month/week units, then
     // add the rounded day+time span) and re-decompose at largestUnit.
-    let anchor = dt_add_dur(dt1, [df[0], df[1], df[2], 0, 0, 0, 0, 0, 0, 0]);
+    let anchor = dt_add_dur(cal, dt1, [df[0], df[1], df[2], 0, 0, 0, 0, 0, 0, 0]);
     let total = dt_epoch_ns(anchor) + rounded;
     let (ey, em, ed) = epoch_days_to_iso(total.div_euclid(DAY_NS) as i64);
     let t = ns_to_time(total.rem_euclid(DAY_NS));
     let end = [ey, em, ed, t[0], t[1], t[2], t[3], t[4], t[5]];
-    difference_datetime(dt1, end, largest)
+    difference_datetime_cal(cal, dt1, end, largest)
 }
 
 /// Round the date-time difference dt1→dt2 to a calendar `smallest` unit
@@ -466,6 +473,7 @@ fn round_datetime_diff_daytime(
 /// but the fraction toward the next unit is measured in epoch NANOSECONDS, so
 /// the time-of-day contributes (NudgeToCalendarUnit for PlainDateTime/ZDT).
 fn round_relative_datetime_diff(
+    cal: Cal,
     dt1: [i64; 9],
     dt2: [i64; 9],
     smallest: &str,
@@ -483,7 +491,7 @@ fn round_relative_datetime_diff(
     // Decompose at largestUnit to KEEP the units above smallestUnit; only the
     // smallestUnit component is rounded (the sub-smallest remainder, including the
     // time-of-day, becomes the epoch-ns fraction toward the next increment).
-    let base = difference_datetime(dt1, dt2, largest);
+    let base = difference_datetime_cal(cal, dt1, dt2, largest);
     // smallestUnit = week: difference dumps the sub-month remainder into days, so
     // derive the whole-week count from the full sub-week day span.
     let sval = if si == 2 { (base[2] * 7 + base[3]) / 7 } else { base[si] };
@@ -493,13 +501,27 @@ fn round_relative_datetime_diff(
         d[si] = k;
         d
     };
-    let r1 = round_increment(sval as i128, inc, "trunc") as i64;
+    let mut r1 = round_increment(sval as i128, inc, "trunc") as i64;
+    // NudgeToCalendarUnit brackets the target between r1 and r1+increment. The
+    // difference above can UNDER-count when the anchor is at the end of a month
+    // (2023-05-31 → 2024-04-30 is 10 months + 30 days, yet 11 whole months from
+    // the anchor land exactly on it), so advance while the next increment still
+    // does not pass the target.
+    loop {
+        let nxt = r1 + inc as i64 * sign;
+        let e = dt_epoch_ns(dt_add_dur(cal, dt1, mk(nxt)));
+        if (sign > 0 && e <= ns2) || (sign < 0 && e >= ns2) {
+            r1 = nxt;
+        } else {
+            break;
+        }
+    }
     let r2 = r1 + inc as i64 * sign;
-    let lower = dt_add_dur(dt1, mk(r1));
+    let lower = dt_add_dur(cal, dt1, mk(r1));
     let ld = dt_epoch_ns(lower);
     // The r2 endpoint is a CalendarDateAdd(constrain) that must lie within the ISO
     // date limits — a huge increment can push it past the range (RangeError).
-    let upper = dt_add_dur(dt1, mk(r2));
+    let upper = dt_add_dur(cal, dt1, mk(r2));
     if !iso_date_in_range(upper[0], upper[1], upper[2]) {
         return Err(Thrown(
             "RangeError: rounded date is outside the valid ISO range".into(),
@@ -516,18 +538,27 @@ fn round_relative_datetime_diff(
     if si == 2 {
         return Ok([base[0], base[1], picked, 0, 0, 0, 0, 0, 0, 0]);
     }
-    // Re-balance the kept-larger + rounded-smallest endpoint to largestUnit.
-    let end = dt_add_dur(dt1, mk(picked));
-    let d = difference_iso_date((dt1[0], dt1[1], dt1[2]), (end[0], end[1], end[2]), largest);
-    let mut f = [0i64; 10];
-    f[..4].copy_from_slice(&d);
+    // BubbleRelativeDuration: the result is the kept larger units plus the rounded
+    // smallest unit; only a smallest unit that reached a whole larger one folds up.
+    // (Re-differencing the endpoint would re-introduce the end-of-month under-count.)
+    let mut f = mk(picked);
+    if si == 1 && largest == "year" {
+        let miy = cal_months_in_year(cal, dt1[0]);
+        f[0] += f[1] / miy;
+        f[1] %= miy;
+    }
     Ok(f)
 }
 
 /// `Duration.total(unit)` relative to a start date-time: the (possibly fractional)
 /// total of the duration measured in `unit`, computed via the calendar at `start`.
-fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> Result<f64, Thrown> {
-    let end_ns = dt_epoch_ns(dt_add_dur(start, f));
+fn duration_total_relative(
+    cal: Cal,
+    f: [i64; 10],
+    start: [i64; 9],
+    unit: &str,
+) -> Result<f64, Thrown> {
+    let end_ns = dt_epoch_ns(dt_add_dur(cal, start, f));
     let start_ns = dt_epoch_ns(start);
     let diff = end_ns - start_ns;
     match unit {
@@ -546,7 +577,7 @@ fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> Result<
             // day-of-month clamping accumulate and corrupt the unit length).
             let mut whole = 0i64;
             for _ in 0..2_000_000 {
-                let cand = dt_epoch_ns(dt_add_dur(start, units(whole + sign)));
+                let cand = dt_epoch_ns(dt_add_dur(cal, start, units(whole + sign)));
                 if (sign > 0 && cand > end_ns) || (sign < 0 && cand < end_ns) {
                     break;
                 }
@@ -557,14 +588,14 @@ fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> Result<
             // (past the duration's end) is the one that can exceed the date range; it
             // must be representable (inclusive ±(nsMaxInstant+nsPerDay), so the
             // day-granular min/max date boundary itself is still accepted).
-            let far = dt_add_dur(start, units(whole + sign));
+            let far = dt_add_dur(cal, start, units(whole + sign));
             if dt_epoch_ns(far).abs() > NS_MAX_INSTANT + DAY_NS {
                 return Err(Thrown(
                     "RangeError: Temporal result is outside the representable range".into(),
                 ));
             }
             // The fraction is the signed progress over the anchor-based unit length.
-            let lower_ns = dt_epoch_ns(dt_add_dur(start, units(whole)));
+            let lower_ns = dt_epoch_ns(dt_add_dur(cal, start, units(whole)));
             let upper_ns = dt_epoch_ns(far);
             if upper_ns != lower_ns {
                 // whole + sign·(end-lower)/(upper-lower) as one correctly-rounded
@@ -648,6 +679,58 @@ fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String, i64, i8)> {
     Some((f, offset_ns, tz_id, tz_offset, behaviour))
 }
 
+/// DifferenceISODateTime measured in a calendar: identical to
+/// `difference_datetime` except the date part is decomposed with the calendar's
+/// years/months. (A largestUnit below "day" never reaches the date split, so
+/// those cases route straight through.)
+fn difference_datetime_cal(cal: Cal, dt1: [i64; 9], dt2: [i64; 9], largest: &str) -> [i64; 10] {
+    if cal == Cal::Iso
+        || matches!(
+            largest,
+            "hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond"
+        )
+    {
+        return difference_datetime(dt1, dt2, largest);
+    }
+    let time1 = time_to_ns(&[dt1[3], dt1[4], dt1[5], dt1[6], dt1[7], dt1[8]]);
+    let time2 = time_to_ns(&[dt2[3], dt2[4], dt2[5], dt2[6], dt2[7], dt2[8]]);
+    let mut time_diff = time2 - time1;
+    let date1 = (dt1[0], dt1[1], dt1[2]);
+    let e1 = iso_to_epoch_days(date1.0, date1.1, date1.2);
+    let e2 = iso_to_epoch_days(dt2[0], dt2[1], dt2[2]);
+    let date_sign = (e2 > e1) as i64 - (e2 < e1) as i64;
+    let mut date2 = (dt2[0], dt2[1], dt2[2]);
+    // Borrow a day when the time part runs opposite to the date direction.
+    if time_diff != 0 && date_sign != 0 && time_diff.signum() != date_sign as i128 {
+        date2 = epoch_days_to_iso(iso_to_epoch_days(date2.0, date2.1, date2.2) - date_sign);
+        time_diff += (date_sign as i128) * DAY_NS;
+    }
+    let mut df = [0i64; 10];
+    df[..4].copy_from_slice(&cal_difference_date(cal, date1, date2, largest));
+    let tsign = time_diff.signum() as i64;
+    let t = ns_to_time(time_diff.abs());
+    for i in 0..6 {
+        df[4 + i] = t[i] * tsign;
+    }
+    df
+}
+
+/// Whether a Temporal ISO string carries a FULL date (year-month-day), as
+/// opposed to the dateless `YYYY-MM` / `MM-DD` shorthands. Only a full date can
+/// be reinterpreted in a non-ISO calendar, so this gates the calendar
+/// annotation on the PlainYearMonth/PlainMonthDay string paths.
+fn temporal_string_has_date(s: &str) -> bool {
+    temporal_string_date(s).is_some()
+}
+
+/// The full (year, month, day) of a Temporal ISO string, or `None` for the
+/// dateless `YYYY-MM` / `MM-DD` shorthands.
+fn temporal_string_date(s: &str) -> Option<(i64, i64, i64)> {
+    let main = s.trim().split('[').next().unwrap_or("");
+    let date_part = main.split(['T', 't', ' ']).next().unwrap_or("");
+    parse_iso_date(date_part)
+}
+
 /// Format a UTC offset (nanoseconds) as `±HH:MM` (or `±HH:MM:SS` when needed).
 fn format_offset(ns: i64) -> String {
     let sign = if ns < 0 { '-' } else { '+' };
@@ -661,6 +744,8 @@ fn format_offset(ns: i64) -> String {
 }
 
 // submodules (split out of the former monolithic temporal.rs)
+mod calendar;
+pub(crate) use calendar::*;
 mod duration;
 mod plain_date;
 mod plain_time;
