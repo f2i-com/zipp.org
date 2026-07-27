@@ -305,7 +305,7 @@ impl<'s> Parser<'s> {
             if self.at_kw(Keyword::Function) {
                 let fstart = self.cur().span.start;
                 self.bump_after_operand()?;
-                let f = self.parse_function_rest(false, fstart)?;
+                let f = self.parse_function_rest(false, false, fstart)?;
                 return Ok(ExportDecl::Default(ExportDefault::Function(Box::new(f))));
             }
             if self.at_kw(Keyword::Async) {
@@ -314,7 +314,7 @@ impl<'s> Parser<'s> {
                 self.bump_after_operand()?;
                 if self.at_kw(Keyword::Function) && !self.cur().newline_before {
                     self.bump_after_operand()?;
-                    let f = self.parse_function_rest(true, fstart)?;
+                    let f = self.parse_function_rest(true, false, fstart)?;
                     return Ok(ExportDecl::Default(ExportDefault::Function(Box::new(f))));
                 }
                 self.restore(save);
@@ -405,7 +405,7 @@ impl<'s> Parser<'s> {
         if self.at_kw(Keyword::Function) {
             let start = self.cur().span.start;
             self.bump_after_operand()?;
-            let f = self.parse_function_rest(false, start)?;
+            let f = self.parse_function_rest(false, false, start)?;
             if let Some(n) = &f.name {
                 let bk = fn_bind_kind(&f);
                 self.declare(&n.clone(), bk, start)?;
@@ -419,7 +419,7 @@ impl<'s> Parser<'s> {
             // `async function` only when no LineTerminator intervenes.
             if self.at_kw(Keyword::Function) && !self.cur().newline_before {
                 self.bump_after_operand()?;
-                let f = self.parse_function_rest(true, start)?;
+                let f = self.parse_function_rest(true, false, start)?;
                 if let Some(n) = &f.name {
                     self.declare(&n.clone(), BindKind::GenFunction, start)?;
                 }
@@ -737,7 +737,7 @@ impl<'s> Parser<'s> {
                 // after parsing.
                 Keyword::Function if !self.ctx.strict && self.stmt_pos != StmtPos::Nested => {
                     self.bump_after_operand()?;
-                    let f = self.parse_function_rest(false, start)?;
+                    let f = self.parse_function_rest(false, false, start)?;
                     if f.is_generator {
                         return Err(SyntaxError::new(
                             "SyntaxError: declaration not allowed in this position",
@@ -755,6 +755,16 @@ impl<'s> Parser<'s> {
                     "SyntaxError: declaration not allowed in this position",
                     start,
                 )),
+                // `let [` has no reading at all in a Statement position: the
+                // lexical declaration is not a Statement, and ExpressionStatement
+                // excludes it by lookahead (14.5), which is why even the element
+                // access `let[0] = 1` on a sloppy-mode variable named `let` is an
+                // error here. Every other `let` — `let;`, `let.a`, `let(x)` — is
+                // the ordinary identifier and falls through.
+                Keyword::Let if self.let_bracket_ahead()? => Err(SyntaxError::new(
+                    "SyntaxError: lexical declaration not allowed in this position",
+                    start,
+                )),
                 // `async [no LineTerminator here] function` is in
                 // ExpressionStatement's lookahead restriction, and there is no
                 // Annex B carve-out for it, so in a Statement position it is an
@@ -769,6 +779,18 @@ impl<'s> Parser<'s> {
             },
             _ => self.parse_expr_or_labeled(),
         }
+    }
+
+    /// Does `let [` start here? Peeks without consuming — see
+    /// [`Self::async_function_ahead`]. A LineTerminator between the two does not
+    /// break the sequence: ASI never applies to a token that could continue the
+    /// statement, so `let \n [a] = 0` is still `let [`.
+    fn let_bracket_ahead(&mut self) -> PResult<bool> {
+        let save = self.save();
+        self.bump_after_operand()?;
+        let hit = self.at(Punct::LBracket);
+        self.restore(save);
+        Ok(hit)
     }
 
     /// Does `async [no LineTerminator here] function` start here? Peeks without
@@ -977,9 +999,37 @@ impl<'s> Parser<'s> {
             }
         } else {
             let pos = self.cur().span.start;
+            // A for-in/of head is a TARGET position — `for ({a = 1} of x);` is
+            // legal — so a CoverInitializedName recorded while parsing it is
+            // discharged once `in`/`of` proves the pattern reading. `parse_expr`
+            // (not `_full`) is deliberate: finalizing here would raise the error
+            // before that proof arrives. The classic-`for` arm below has no such
+            // proof coming, so it raises. Stashing the enclosing region's error
+            // first keeps an inner one from being mistaken for it.
+            let outer_po = self.cover.pattern_only.take();
+            // The restriction below is a LOOKAHEAD one, so it must be decided
+            // from the token, not the parsed expression: an escaped
+            // `async` is not the contextual `async` and stays legal.
+            let head_bare_async = self.at_contextual("async");
             let e = self.parse_expr()?;
             if self.at_kw(Keyword::In) || self.at_kw(Keyword::Of) {
                 let of = self.at_kw(Keyword::Of);
+                // `for ( [lookahead ∉ { let [, async of }] LHS of …)`. Three
+                // things narrow it, each with its own test262 file: it does NOT
+                // apply to `for await (async of …)` (no ambiguity to resolve
+                // there), nor to an escaped `async`, nor to a parenthesized
+                // `(async)` — parens make the head's first token `(`, so
+                // requiring the expression to be exactly `Expr::Ident("async")`
+                // alongside the token check excludes that case too.
+                if of
+                    && !is_await
+                    && head_bare_async
+                    && matches!(&e, Expr::Ident(n) if &**n == "async")
+                {
+                    return Err(self
+                        .err_here("SyntaxError: 'async' is not a valid for-of loop target"));
+                }
+                self.cover.pattern_only = outer_po;
                 self.bump_before_operand()?;
                 self.ctx.in_ = saved_in;
                 let target = self.expr_to_target(e, true, pos)?;
@@ -993,6 +1043,13 @@ impl<'s> Parser<'s> {
                     Stmt::ForIn { left, right, body }
                 }
             } else {
+                // Not a for-in/of after all: the head was an ordinary
+                // expression, so a pending CoverInitializedName is now final.
+                if let Some(err) = self.cover.pattern_only.take() {
+                    self.cover.pattern_only = outer_po;
+                    return Err(err);
+                }
+                self.cover.pattern_only = outer_po;
                 self.ctx.in_ = saved_in;
                 self.expect(Punct::Semi, true)?;
                 self.parse_for_classic(Some(ForInit::Expr(e)))?

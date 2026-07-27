@@ -641,6 +641,17 @@ impl Vm<'_> {
                 for &v in &c.computed_field_keys {
                     m_val!(v);
                 }
+                // The ctor / field-thunk upvalue CELLS are roots exactly like a
+                // Closure's `upvalues` (marked at the Closure arm above): nothing
+                // else references them once the defining frame has returned, so
+                // leaving them out swept the cells a nested class closed over and
+                // `new C()` then read a recycled slot (`this.t === undefined`).
+                for &u in &c.ctor_upvalues {
+                    m_idx!(u);
+                }
+                for &u in &c.field_thunk_upvalues {
+                    m_idx!(u);
+                }
                 if let Some(p) = c.parent {
                     m_idx!(p);
                 }

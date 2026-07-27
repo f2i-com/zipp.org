@@ -525,6 +525,23 @@ impl<'p> Vm<'p> {
         Ok(self.has_own_property(obj, key))
     }
 
+    /// `[[GetOwnProperty]](key).[[Enumerable]]` honouring a Proxy — the gopd trap
+    /// is user JS, so the infallible `own_is_enumerable` (&self) can't reach it.
+    /// A trap that reports the property absent (`undefined` descriptor) is `false`,
+    /// not a deref of nothing.
+    pub(crate) fn own_is_enumerable_dyn(&mut self, obj: Value, key: &str) -> Result<bool, Thrown> {
+        if obj.is_heap() && self.proxy_parts(obj.heap_index()).is_some() {
+            return Ok(match self.proxy_gopd(obj, key)? {
+                Some(desc) if desc != Value::UNDEFINED => {
+                    let e = self.get_prop(desc, "enumerable")?;
+                    self.truthy(e)
+                }
+                _ => false,
+            });
+        }
+        Ok(self.own_is_enumerable(obj, key))
+    }
+
     /// `obj.propertyIsEnumerable(key)` — true if `key` is an own enumerable
     /// property. Array indices are enumerable; `length` is not.
     pub(crate) fn own_is_enumerable(&self, obj: Value, key: &str) -> bool {
@@ -585,7 +602,9 @@ impl<'p> Vm<'p> {
             }
             // A String wrapper's char indices are own ENUMERABLE props; `length` is
             // non-enumerable; an assigned own prop lives in the arr_props side table.
-            HeapObj::Boxed { kind: 0, .. } => {
+            // A raw string PRIMITIVE takes the same path — the callers ToObject it
+            // first, and ToObject("s") is a String exotic object with those indices.
+            HeapObj::Boxed { kind: 0, .. } | HeapObj::Str(_) | HeapObj::Cons { .. } => {
                 if key == "length" {
                     false
                 } else if self
@@ -844,6 +863,14 @@ impl<'p> Vm<'p> {
                 }
                 self.call_value(next, iter, &[])?
             };
+            // IteratorNext step 4: a non-Object result is a TypeError. Without it
+            // `done`/`value` were read off a primitive as undefined, so `var [a] =
+            // it` bound undefined instead of throwing — and with a `...rest` (no
+            // element bound) `max` is unbounded, so the never-done loop spun until
+            // it exhausted memory.
+            if !self.is_object_value(res) {
+                return Err(Thrown("TypeError: iterator result is not an object".into()));
+            }
             let done = self.get_prop(res, "done")?;
             if self.truthy(done) {
                 iter_done = true;

@@ -774,16 +774,17 @@ impl<'p> Vm<'p> {
             m.define("@@toStringTag", helper_tag, tag_data);
         }
         // %GeneratorPrototype% — generator instances delegate here. next/return/
-        // throw + @@iterator (self) + @@toStringTag "Generator"; chains to
-        // %Iterator.prototype% so a generator inherits the helper methods
-        // (`g().map(...)`, `g().take(n)`, …).
+        // throw + @@toStringTag "Generator"; chains to %Iterator.prototype% so a
+        // generator inherits the helper methods (`g().map(...)`, `g().take(n)`, …).
+        // @@iterator is deliberately NOT an own property (ES 27.5.1 lists only
+        // constructor/next/return/throw/@@toStringTag): it is inherited from
+        // %Iterator.prototype%, which getOwnPropertySymbols observes.
         let gen_proto = build(
             self,
             &[
                 ("next", native::GEN_NEXT),
                 ("return", native::GEN_RETURN),
                 ("throw", native::GEN_THROW),
-                ("@@iterator", ITER_SELF),
             ],
             None,
         );

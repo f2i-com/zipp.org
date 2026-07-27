@@ -977,7 +977,13 @@ impl<'a> FnCompiler<'a> {
                 // anonymous fn/arrow/class after the identifier LHS (IsIdentifierRef),
                 // matching plain `=`. `compile_named_init` no-ops to `expr_into` for a
                 // non-anonymous RHS, so a named/expression RHS is unaffected.
-                let v = self.compile_named_init(dst, value, &name)?;
+                // A PARENTHESIZED target is not an IdentifierRef, so `(x) ??= f`
+                // leaves the function anonymous — same rule as plain `=` above.
+                let v = if lhs_covered {
+                    self.expr_into(value, dst)?
+                } else {
+                    self.compile_named_init(dst, value, &name)?
+                };
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }

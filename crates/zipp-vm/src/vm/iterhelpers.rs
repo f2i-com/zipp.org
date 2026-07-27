@@ -884,8 +884,10 @@ impl<'p> Vm<'p> {
     /// integerLimit (incl. -∞) is a RangeError; +∞ means "all".
     fn iter_limit_arg(&mut self, v: Value) -> Result<i64, Thrown> {
         // ToNumber so an object limit's valueOf/@@toPrimitive runs (a throwing one
-        // propagates); a Symbol/BigInt is a TypeError.
-        let n = self.to_number_coerce(v)?;
+        // propagates); a Symbol/BigInt is a TypeError. `to_number_coerce` shares the
+        // deliberately BigInt-lenient `to_number` (needed for `1n < 2`), so
+        // `take(1n)` silently became 1 — the strict variant is the real ToNumber.
+        let n = self.to_number_strict(v)?;
         if n.is_nan() {
             return Err(Thrown("RangeError: take/drop limit must not be NaN".into()));
         }

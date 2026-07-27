@@ -27,27 +27,44 @@ fn prop_name(key: &PropKey) -> Option<&str> {
 impl<'s> Parser<'s> {
     /// A function after its `function` keyword has been consumed. `start` is the
     /// offset of `function` (or of `async`, for an async function) so the span
-    /// covers the whole production.
-    pub(crate) fn parse_function_rest(&mut self, is_async: bool, start: u32) -> PResult<Function> {
+    /// covers the whole production. `is_expr` distinguishes a FunctionExpression
+    /// from a FunctionDeclaration, which differ only in how the name is read.
+    pub(crate) fn parse_function_rest(
+        &mut self,
+        is_async: bool,
+        is_expr: bool,
+        start: u32,
+    ) -> PResult<Function> {
         let is_generator = self.eat(Punct::Star, false)?;
         // A function EXPRESSION's own name is in scope inside its body but not
         // outside; a declaration's name binds in the enclosing scope. The caller
         // handles the second, so the name is just read here.
-        let name = if self.is_binding_ident_for_fn(is_generator, is_async) {
-            Some(self.binding_ident()?.0)
-        } else {
-            None
+        //
+        // The two also differ in which `[Yield]/[Await]` the name is read under.
+        // A FunctionDeclaration's is `BindingIdentifier[?Yield, ?Await]` — the
+        // ENCLOSING context — while every expression form names its OWN:
+        // `[~Yield, ~Await]` for `function` (15.2), `[+Yield, ~Await]` for
+        // `function*` (15.5), and correspondingly for the async forms (15.8,
+        // 15.9). So `function* g(){ (function yield(){}); }` is legal sloppy code
+        // and `(function* yield(){})` is not, which the enclosing-context
+        // approximation got backwards in both directions.
+        let name = {
+            let saved = (self.ctx.yield_, self.ctx.await_);
+            if is_expr {
+                self.ctx.yield_ = is_generator;
+                // `await` is never an Identifier in Module code (13.1.1), so
+                // there the relaxation does not apply.
+                self.ctx.await_ = is_async || self.goal == Goal::Module;
+            }
+            let n = if self.is_binding_ident() { Some(self.binding_ident()) } else { None };
+            (self.ctx.yield_, self.ctx.await_) = saved;
+            match n {
+                Some(r) => Some(r?.0),
+                None => None,
+            }
         };
         let (params, body) = self.parse_fn_tail(is_async, is_generator, false)?;
         Ok(Function { name, params, body, is_async, is_generator, span: Span::new(start, self.prev_end()) })
-    }
-
-    /// A function's own name is checked against the strictness and
-    /// yield/await-ness of the CONTEXT IT SITS IN for a declaration, but of its
-    /// OWN body for an expression. Approximated here as the enclosing context,
-    /// which is what the current engine does.
-    fn is_binding_ident_for_fn(&self, _gen: bool, _asyn: bool) -> bool {
-        self.is_binding_ident()
     }
 
     /// Parameters + body, with the context switched to the function's own.
@@ -332,6 +349,12 @@ impl<'s> Parser<'s> {
                 }
                 break;
             }
+            // Whether the key would pass as a BindingIdentifier has to be
+            // decided BEFORE it is consumed: a PropertyName may be any reserved
+            // word (`{if: x}` is fine), so by the time the missing `:` reveals
+            // this is shorthand the token that carried the keyword-ness is gone.
+            let key_pos = self.cur().span.start;
+            let key_bindable = self.is_binding_ident();
             let key = self.parse_prop_key()?;
             // Shorthand is "no colon", not "the key is an identifier" —
             // `{a: b}` has an identifier key and is NOT shorthand.
@@ -342,6 +365,24 @@ impl<'s> Parser<'s> {
                 let PropKey::Ident(n) = &key else {
                     return Err(self.err_here("SyntaxError: expected ':' in binding pattern"));
                 };
+                // `BindingProperty : SingleNameBinding` and
+                // `SingleNameBinding : BindingIdentifier Initializer_opt` — the
+                // shorthand form BINDS the name, so `var {if} = o` is an early
+                // error, as is `var {await} = o` in a static block and
+                // `var {eval} = o` under strict. The colon form escapes all of
+                // this because its value is parsed by `parse_binding_pattern`.
+                if !key_bindable {
+                    return Err(SyntaxError::new(
+                        format!("SyntaxError: '{n}' is not a valid binding name"),
+                        key_pos,
+                    ));
+                }
+                if self.ctx.strict && (&**n == "eval" || &**n == "arguments") {
+                    return Err(SyntaxError::new(
+                        format!("SyntaxError: '{n}' cannot be used as a binding in strict mode"),
+                        key_pos,
+                    ));
+                }
                 (Pattern::Ident(n.clone()), true)
             };
             let value = if self.eat(Punct::Eq, true)? {
@@ -375,6 +416,14 @@ impl<'s> Parser<'s> {
         let derived = superclass.is_some();
 
         self.expect(Punct::LBrace, true)?;
+        // `[In]` restores inside the braces — see `parse_args`. Nothing a
+        // ClassBody contains inherits it: a computed key is
+        // `AssignmentExpression[+In]`, a field's is `Initializer[+In]`, and a
+        // method body or static block is its own statement region. Without this
+        // `for (var C = class { ['a' in o](){} };;)` died on the `in`, because a
+        // `for` head parses with `[~In]` and the class never turned it back on.
+        let saved_in = self.ctx.in_;
+        self.ctx.in_ = true;
         let mut body = Vec::new();
         let mut saw_ctor = false;
         while !self.at(Punct::RBrace) && !self.at_eof() {
@@ -397,6 +446,7 @@ impl<'s> Parser<'s> {
         }
         let body_end = self.cur().span.start;
         self.expect(Punct::RBrace, false)?;
+        self.ctx.in_ = saved_in;
         self.ctx.strict = saved_strict;
         Self::check_class_body(&body, body_end)?;
         Ok(Class { name, superclass, body, span: Span::new(start, self.prev_end()) })
@@ -545,6 +595,12 @@ impl<'s> Parser<'s> {
             self.ctx.in_field_init = true;
             self.ctx.return_ = false;
             self.ctx.super_prop = true;
+            // A static block runs as a synthetic method (ClassStaticBlock-
+            // DefinitionEvaluation builds one), so it is function code and
+            // `new.target` is legal there — it evaluates to `undefined`. Without
+            // this a class at SCRIPT top level, where nothing has turned the flag
+            // on, rejected `static { v = new.target; }` outright.
+            self.ctx.new_target = true;
             // `await` is RESERVED inside a ClassStaticBlock — both as an
             // expression and as a binding — even though the block is not async
             // and cannot await anything. Setting `await_` is what makes both
@@ -630,6 +686,9 @@ impl<'s> Parser<'s> {
             self.ctx.in_field_init = true;
             self.ctx.return_ = false;
             self.ctx.super_prop = true;
+            // Like a static block, an initializer is the body of a synthetic
+            // method, so `new.target` is legal (and `undefined`) here too.
+            self.ctx.new_target = true;
             let v = self.parse_assign_full()?;
             self.ctx = saved;
             Some(v)

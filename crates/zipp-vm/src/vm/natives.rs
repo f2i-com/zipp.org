@@ -1174,20 +1174,7 @@ impl<'p> Vm<'p> {
                 let k = self.to_property_key(a0)?;
                 self.require_object_coercible(this)?; // ToObject(this)
                 self.ns_tdz_check(this, &k)?; // [[GetOwnProperty]] of uninit throws
-                // On a Proxy, [[GetOwnProperty]] runs the gopd trap (user JS), so
-                // own_is_enumerable (&self) can't reach it — consult proxy_gopd.
-                if this.is_heap() && self.proxy_parts(this.heap_index()).is_some() {
-                    let en = match self.proxy_gopd(this, &k)? {
-                        Some(desc) => {
-                            let e = self.get_prop(desc, "enumerable")?;
-                            self.truthy(e)
-                        }
-                        None => false,
-                    };
-                    Value::bool(en)
-                } else {
-                    Value::bool(self.own_is_enumerable(this, &k))
-                }
+                Value::bool(self.own_is_enumerable_dyn(this, &k)?)
             }
             // isPrototypeOf: a non-object argument is `false` BEFORE ToObject(this).
             PROTO_IS_PROTO_OF => {
@@ -1691,6 +1678,13 @@ impl<'p> Vm<'p> {
                 self.alloc_str(out)
             }
             REGEXP_TO_STRING => {
+                // 22.2.6.14 step 2: a non-Object receiver is a TypeError before any
+                // Get — a primitive would otherwise render as "/undefined/undefined".
+                if !self.is_object_value(this) {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.toString called on a non-object".into(),
+                    ));
+                }
                 let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::RegExp { source, flags, .. }) => {
                         // Spec reads the `flags` getter, which assembles the
@@ -1712,10 +1706,13 @@ impl<'p> Vm<'p> {
                         }
                         (self.escaped_source(&s), f)
                     }
+                    // Steps 3-4 interleave each Get with its ToString: `source`'s
+                    // toString runs before `flags` is even read.
                     _ => {
                         let s = self.get_prop(this, "source")?;
+                        let src = self.to_js_string(s)?;
                         let f = self.get_prop(this, "flags")?;
-                        (self.to_js_string(s)?, self.to_js_string(f)?)
+                        (src, self.to_js_string(f)?)
                     }
                 };
                 self.alloc_str(format!("/{src}/{flg}"))
@@ -2006,18 +2003,28 @@ impl<'p> Vm<'p> {
                         "TypeError: Function.prototype.bind called on a non-callable".into(),
                     ));
                 }
-                // Spec 20.2.3.2 steps 3-5: HasOwnProperty(Target, "length") →
-                // Get(Target, "length"), then Get(Target, "name") — both
-                // OBSERVABLE (a throwing accessor propagates before the bound
-                // function exists). The values themselves resolve lazily from
-                // the target (existing name/length machinery), so only the Gets
-                // are performed here.
+                // Spec 20.2.3.2 step 3 is BoundFunctionCreate, whose first step is
+                // `Target.[[GetPrototypeOf]]()` — a bound function INHERITS its
+                // target's prototype (`class D extends C` ⇒ `D.bind(null)`'s proto
+                // is C), not %Function.prototype%. It runs before the length/name
+                // reads below, so a Proxy target's getPrototypeOf trap fires first
+                // — and its result is then held un-rooted across those (re-entrant)
+                // reads, so GC has to stay suspended until it lands in `proto_of`.
+                let _gc = self.gc_lock_guard();
+                let bound_proto = self.object_get_prototype_of(this);
+                // Steps 4-6: HasOwnProperty(Target, "length") → Get(Target,
+                // "length"), then Get(Target, "name") — both OBSERVABLE (a
+                // throwing accessor propagates before the bound function exists).
+                // The values themselves resolve lazily from the target (existing
+                // name/length machinery), so only the Gets are performed here.
                 if self.has_own_property(this, "length") {
                     let _ = self.get_prop(this, "length")?;
                 }
                 let _ = self.get_prop(this, "name")?;
                 let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
-                Value::heap(self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound }))
+                let idx = self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound });
+                self.proto_of.insert(idx, bound_proto);
+                Value::heap(idx)
             }
             FN_TO_STRING => {
                 if !this.is_heap() {

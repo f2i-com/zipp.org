@@ -165,6 +165,11 @@ impl<'p> Vm<'p> {
 
     /// Read a string option (returns `default` if undefined); validates against
     /// `allowed` when non-empty (→ RangeError) — read and validate in one step.
+    ///
+    /// GetOption (ECMA-402 9.2.13) step 3 returns `default` for an ABSENT option
+    /// *without* consulting `values`: only a value the caller actually supplied is
+    /// range-checked. Validating the default too made every componentless
+    /// `Intl.DateTimeFormat(loc, {})` throw on its own `""` weekday.
     pub(crate) fn opt_string(
         &mut self,
         options: Value,
@@ -172,7 +177,14 @@ impl<'p> Vm<'p> {
         default: &str,
         allowed: &[&str],
     ) -> Result<String, Thrown> {
-        let s = self.opt_string_raw(options, key, default)?;
+        if options == Value::UNDEFINED {
+            return Ok(default.to_string());
+        }
+        let v = self.get_prop(options, key)?;
+        if v == Value::UNDEFINED {
+            return Ok(default.to_string());
+        }
+        let s = self.to_js_string(v)?;
         self.unit_allowed(&s, key, allowed)?;
         Ok(s)
     }

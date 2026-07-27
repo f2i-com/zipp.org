@@ -1375,6 +1375,13 @@ impl<'p> Vm<'p> {
                 | HeapObj::RegExp { .. }
                 | HeapObj::ArrayBuffer { .. }
                 | HeapObj::DataView { .. }
+                // Generators are ORDINARY objects — `it.next = f` must shadow
+                // %GeneratorPrototype%.next (the `yield*` protocol reads the
+                // monkeypatched one). Omitting them fell through to the `_ => {}`
+                // at the bottom, which silently dropped the write while still
+                // reporting success; `defineProperty` already used this table.
+                | HeapObj::Generator { .. }
+                | HeapObj::AsyncGenerator(_)
         ) {
             // (`re.lastIndex = …` was handled above; a `re.exec = fn` override or
             // any `re.x = …` lands in the side table. RegExp accessor keys

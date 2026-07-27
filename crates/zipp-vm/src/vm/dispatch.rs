@@ -285,21 +285,10 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::LoadNewTarget { dst } => {
-                        let mut nt =
-                            self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
-                        if nt == Value::UNDEFINED {
-                            // An ARROW frame has no own [[NewTarget]] — read the
-                            // lexically-captured one of its closure (recorded at
-                            // MakeArrow inside a constructed activation).
-                            let callee =
-                                self.frames.last().map(|f| f.callee).unwrap_or(Value::UNDEFINED);
-                            if callee.is_heap() {
-                                if let Some(&v) = self.closure_new_target.get(&callee.heap_index())
-                                {
-                                    nt = v;
-                                }
-                            }
-                        }
+                        // An ARROW frame has no own [[NewTarget]] — frame_new_target
+                        // reads the lexically-captured one of its closure (recorded
+                        // at MakeArrow inside a constructed activation).
+                        let nt = self.frame_new_target();
                         self.set(base, dst, nt);
                         ip += 1;
                     }
@@ -2377,6 +2366,17 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
+                            // GetMethod step 3: a @@hasInstance that is PRESENT but
+                            // not callable is a TypeError — it never falls back to
+                            // OrdinaryHasInstance. Only undefined/null count as
+                            // absent. A plain-object RHS reached the same TypeError
+                            // by accident (kind 0 below), but a callable RHS — a
+                            // Proxy over a function, say — silently answered `false`.
+                            if hi != Value::UNDEFINED && hi != Value::NULL && !self.is_callable(hi) {
+                                return Err(Thrown(
+                                    "TypeError: Symbol.hasInstance handler is not callable".into(),
+                                ));
+                            }
                         }
                         // A class uses its `extends` chain; a constructor FUNCTION
                         // checks whether `F.prototype` is in `v`'s prototype chain.
@@ -4176,12 +4176,11 @@ impl<'p> Vm<'p> {
                             let inherit =
                                 (home_class != u32::MAX).then_some((home_class, super_static));
                             // The caller activation's new.target and (for an
-                            // object-literal method) its [[HomeObject]].
-                            let caller_nt = self
-                                .frames
-                                .last()
-                                .map(|f| f.new_target)
-                                .unwrap_or(Value::UNDEFINED);
+                            // object-literal method) its [[HomeObject]]. Read it
+                            // through frame_new_target so an eval in an ARROW body
+                            // sees the arrow's lexically-captured new.target rather
+                            // than the arrow frame's own (always undefined) slot.
+                            let caller_nt = self.frame_new_target();
                             let caller_home = if super_home_obj {
                                 self.frames
                                     .last()
@@ -4688,12 +4687,17 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        // A native or bound method value (e.g. inherited from a
+                        // A native, bound or PROXY method value (e.g. inherited from a
                         // prototype) is invoked via call_value with this = recv.
+                        // `resolve_callable` below only knows Func/Closure, so a
+                        // Proxy over a function reached it as "is not a function".
                         if prop.is_heap()
                             && (matches!(
                                 self.heap.get(prop.heap_index()),
-                                HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::BoundResolver { .. }
+                                HeapObj::Native(_)
+                                    | HeapObj::Bound { .. }
+                                    | HeapObj::BoundResolver { .. }
+                                    | HeapObj::Proxy { .. }
                             ) || (self.fn_proto != 0 && prop.heap_index() == self.fn_proto))
                         {
                             let argv: Vec<Value> =
@@ -4759,11 +4763,15 @@ impl<'p> Vm<'p> {
                         // Else resolve the method off the receiver (own/inherited)
                         // and call it with `this = recv`.
                         let method = self.get_index(recv, k)?;
-                        // A native / bound / resolver method value runs via call_value.
+                        // A native / bound / resolver / Proxy method value runs via
+                        // call_value (resolve_callable knows only Func/Closure).
                         if method.is_heap()
                             && (matches!(
                                 self.heap.get(method.heap_index()),
-                                HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::BoundResolver { .. }
+                                HeapObj::Native(_)
+                                    | HeapObj::Bound { .. }
+                                    | HeapObj::BoundResolver { .. }
+                                    | HeapObj::Proxy { .. }
                             ) || (self.fn_proto != 0 && method.heap_index() == self.fn_proto))
                         {
                             let argv: Vec<Value> =
@@ -6304,6 +6312,21 @@ impl<'p> Vm<'p> {
             HeapObj::Closure { upvalues, .. } => upvalues[idx as usize],
             _ => panic!("UpvalGet/Set in a frame without a closure"),
         }
+    }
+
+    /// The running activation's [[NewTarget]]. An ARROW frame has none of its own,
+    /// so it falls back to the one its closure captured lexically at MakeArrow —
+    /// without this, `new.target` reads `undefined` for every arrow.
+    #[inline]
+    pub(crate) fn frame_new_target(&self) -> Value {
+        let (nt, callee) = match self.frames.last() {
+            Some(f) => (f.new_target, f.callee),
+            None => return Value::UNDEFINED,
+        };
+        if nt != Value::UNDEFINED || !callee.is_heap() {
+            return nt;
+        }
+        self.closure_new_target.get(&callee.heap_index()).copied().unwrap_or(nt)
     }
 
     /// The per-iteration for-in liveness re-check (EnumerateObjectProperties): is

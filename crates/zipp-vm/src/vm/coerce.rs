@@ -736,6 +736,24 @@ impl<'p> Vm<'p> {
         self.heap.alloc_str(s)
     }
 
+    /// ToPrimitive(v, NUMBER) for the relational operators. IsLessThan (7.2.13
+    /// step 1) passes hint `number`, unlike `+`/`==` which pass `default` — so a
+    /// `@@toPrimitive` hook sees "number", and a Date compares by its timestamp
+    /// (`valueOf` first) rather than by its `toString`. Primitives short-circuit:
+    /// this is the hot path for every loop bound.
+    #[inline]
+    fn to_primitive_rel(&mut self, v: Value) -> Result<Value, Thrown> {
+        if !v.is_heap()
+            || matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
+            )
+        {
+            return Ok(v);
+        }
+        self.to_primitive_number(v)
+    }
+
     #[inline]
     pub(crate) fn cmp_lt(&mut self, base: usize, a: u16, b: u16, left_first: bool) -> Result<bool, Thrown> {
         let va = self.get(base, a);
@@ -749,12 +767,12 @@ impl<'p> Vm<'p> {
         // `>` passes the registers SWAPPED (b,a) with left_first=false, so the
         // original left operand `b` is ToPrimitive'd before `a` (spec LeftFirst).
         let (va, vb) = if left_first {
-            let pa = self.to_primitive_default(va)?;
-            let pb = self.to_primitive_default(vb)?;
+            let pa = self.to_primitive_rel(va)?;
+            let pb = self.to_primitive_rel(vb)?;
             (pa, pb)
         } else {
-            let pb = self.to_primitive_default(vb)?;
-            let pa = self.to_primitive_default(va)?;
+            let pb = self.to_primitive_rel(vb)?;
+            let pa = self.to_primitive_rel(va)?;
             (pa, pb)
         };
         if let Some(o) = self.str_relational(va, vb) {
@@ -775,12 +793,12 @@ impl<'p> Vm<'p> {
         // ToPrimitive the SOURCE left operand first (see cmp_lt). `>=` swaps the
         // registers (b,a) with left_first=false so `b` coerces before `a`.
         let (va, vb) = if left_first {
-            let pa = self.to_primitive_default(va)?;
-            let pb = self.to_primitive_default(vb)?;
+            let pa = self.to_primitive_rel(va)?;
+            let pb = self.to_primitive_rel(vb)?;
             (pa, pb)
         } else {
-            let pb = self.to_primitive_default(vb)?;
-            let pa = self.to_primitive_default(va)?;
+            let pb = self.to_primitive_rel(vb)?;
+            let pa = self.to_primitive_rel(va)?;
             (pa, pb)
         };
         if let Some(o) = self.str_relational(va, vb) {

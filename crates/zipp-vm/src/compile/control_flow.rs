@@ -659,6 +659,13 @@ impl<'a> FnCompiler<'a> {
         // reserve it WITHOUT auto-boxing; box it after if a nested closure
         // captures the binding (the value is present by then).
         let catch_start = self.here();
+        // The try block's completion value dies with it: `try Block Catch` returns
+        // UpdateEmpty(CatchClauseEvaluation, undefined) when B is a throw
+        // completion — B.[[Value]] is the exception, never the block's V. Only the
+        // unwind reaches here, so resetting V at catch entry discards exactly the
+        // abandoned try-block value (`eval("try{'t';throw 0}catch(e){}")` ⇒
+        // undefined) while a normally-completing try keeps its own ('t').
+        self.reset_loop_completion();
         self.push_scope();
         // The VM deposits the thrown value into `e_reg`. For `catch (id)` that IS
         // the binding; for `catch ([a,b])` / `catch ({e})` it's a scratch slot we

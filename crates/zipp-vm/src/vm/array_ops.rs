@@ -2567,8 +2567,9 @@ impl<'p> Vm<'p> {
     /// Stable bottom-up merge sort driven by a JS comparator (`cmp(a,b) < 0` ⇒
     /// `a` before `b`). O(n log n) comparisons — vs the old insertion sort's
     /// O(n²), which dominated `Array.sort` for non-trivial sizes. Stable: on a tie
-    /// (and on `<= 0`) the LEFT run's element wins, preserving original order. The
-    /// comparator re-enters the VM (`call_value`) and may throw (propagated).
+    /// (on `<= 0`, and on the NaN that SortCompare maps to +0) the LEFT run's
+    /// element wins, preserving original order. The comparator re-enters the VM
+    /// (`call_value`) and may throw — from the call or from its own ToNumber.
     pub(crate) fn comparator_sort(&mut self, items: &mut [Value], cmp: Value) -> Result<(), Thrown> {
         let n = items.len();
         if n < 2 {
@@ -2607,7 +2608,24 @@ impl<'p> Vm<'p> {
                             break 'outer;
                         }
                     };
-                    if c.as_f64() <= 0.0 {
+                    // SortCompare steps 5-7: the comparator result goes through
+                    // ToNumber (a string/boolean coerces, an object's valueOf runs,
+                    // a BigInt/Symbol is a TypeError) and a NaN result becomes +0 —
+                    // i.e. "unordered", which must keep the stable left-run order.
+                    // `as_f64` alone reported every non-number AND every NaN as
+                    // "greater", so `sort(() => NaN)` reversed adjacent pairs.
+                    let ord = if c.is_number() {
+                        c.as_f64()
+                    } else {
+                        match self.to_number_strict(c) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                err = Some(e);
+                                break 'outer;
+                            }
+                        }
+                    };
+                    if !(ord > 0.0) {
                         b[k] = a[l];
                         l += 1;
                     } else {

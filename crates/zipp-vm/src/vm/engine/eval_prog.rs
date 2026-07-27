@@ -90,6 +90,14 @@ impl<'p> Vm<'p> {
             if let Some(c) = cd.ctor.as_mut() {
                 *c += base_func;
             }
+            // The deferred instance-field thunk of a derived class with an
+            // explicit ctor is a func id too — left unrebased it named a MAIN
+            // program function, so `eval("class D extends B { x = 1; … }")`
+            // re-entered whatever proto happened to sit at that index (typically
+            // the eval body itself → stack overflow).
+            if let Some(t) = cd.field_thunk.as_mut() {
+                *t += base_func;
+            }
             for lst in [
                 &mut cd.methods,
                 &mut cd.getters,
@@ -117,6 +125,11 @@ impl<'p> Vm<'p> {
                     | Instr::MakeArrow { func_id, .. } => {
                         *func_id += base_func;
                     }
+                    // A computed class member (`class C { [k](){} }`) carries its
+                    // proto as a bare func id, NOT as a MakeFunc — it is installed
+                    // by this op after the key is evaluated, so it needs the same
+                    // offset as every other func-id operand.
+                    Instr::ClassAddMember { func, .. } => *func += base_func,
                     Instr::LoadGlobal { idx, .. }
                     | Instr::LoadGlobalOrUndefined { idx, .. }
                     | Instr::StoreGlobal { idx, .. }
@@ -139,15 +152,19 @@ impl<'p> Vm<'p> {
                     Instr::LoadUpvalDyn { name, .. } | Instr::StoreUpvalDyn { name, .. } => {
                         *name = gmap[*name as usize];
                     }
-                    // Class-id operands: the class itself, and every `super`
-                    // reference (which names its home class).
-                    Instr::MakeClass { class_id, .. } => *class_id += base_class,
+                    // Class-id operands: the class itself, the class inner-name
+                    // read (`C` inside `class C`), and every `super` reference
+                    // (which names its home class).
+                    Instr::MakeClass { class_id, .. }
+                    | Instr::LoadClassValue { class_id, .. } => *class_id += base_class,
                     Instr::SuperCtor { home_class_id, .. }
                     | Instr::SuperCtorSpread { home_class_id, .. }
                     | Instr::SuperMethod { home_class_id, .. }
                     | Instr::SuperGet { home_class_id, .. }
                     | Instr::SuperGetComputed { home_class_id, .. }
                     | Instr::SuperMethodComputed { home_class_id, .. }
+                    | Instr::SuperMethodSpread { home_class_id, .. }
+                    | Instr::SuperMethodComputedSpread { home_class_id, .. }
                     | Instr::SuperSet { home_class_id, .. }
                     | Instr::SuperSetComputed { home_class_id, .. } => {
                         // The SENTINEL marks "the eval caller's home class": swap

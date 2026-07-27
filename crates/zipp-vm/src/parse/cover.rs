@@ -163,13 +163,19 @@ impl<'s> Parser<'s> {
         // legal in its block body, and `break`/`continue`/labels do NOT reach
         // out of it (`x => { break; }` inside a loop is still an error).
         self.ctx.await_ = is_async;
-        self.ctx.in_ = true;
         self.ctx.return_ = true;
         self.ctx.in_loop = false;
         self.ctx.in_switch = false;
         let body = if self.at(Punct::LBrace) {
+            // `ConciseBody : { FunctionBody }` — a fresh statement region, so
+            // `[In]` is on inside it however the arrow was reached.
+            self.ctx.in_ = true;
             ArrowBody::Block(self.parse_fn_body_with_params(Some(&params))?)
         } else {
+            // `ConciseBody[In] : ExpressionBody[?In, ~Await]` INHERITS `[In]`, so
+            // in a `for` head the `in` of `for (x => 0 in 1;;)` can belong
+            // neither to the body nor to a relational expression headed by an
+            // arrow — it is a SyntaxError, not an `in` test on a function.
             ArrowBody::Expr(Box::new(self.parse_assign_full()?))
         };
         self.ctx = saved;

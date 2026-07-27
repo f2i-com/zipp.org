@@ -375,8 +375,16 @@ impl<'a> FnCompiler<'a> {
                 // the subset yet. The by-name lowerings below fire only for the
                 // PRISTINE global builtin — a user binding of the same name
                 // (`function TypeError() {}`) takes the generic value path.
+                // A spread anywhere in the arguments disqualifies EVERY by-name
+                // lowering below: they all reach for `args.first()` or
+                // `eval_args_contiguous`, which either hard-errors ("spread
+                // arguments are not in the zipp-vm subset yet") or silently drops
+                // the spread — `new Map(...[[[1,2]]])` built an empty Map. The
+                // generic `NewSpread` path at the bottom constructs the same
+                // builtin correctly, so route spread calls there.
+                let has_spread = args.iter().any(|a| matches!(a, ast::Arg::Spread(_)));
                 let id_opt = match &**callee {
-                    ast::Expr::Ident(id) if self.builtin_unshadowed(id) => Some(id),
+                    ast::Expr::Ident(id) if !has_spread && self.builtin_unshadowed(id) => Some(id),
                     _ => None,
                 };
                 if let Some(id) = id_opt {
@@ -528,7 +536,7 @@ impl<'a> FnCompiler<'a> {
                 if cv != callee_reg {
                     self.emit(Instr::Move { dst: callee_reg, src: cv });
                 }
-                if args.iter().any(|a| matches!(a, ast::Arg::Spread(_))) {
+                if has_spread {
                     let args_arr = self.build_spread_args(args)?;
                     self.emit(Instr::NewSpread { dst, callee: callee_reg, args: args_arr });
                     self.next_reg = save; // reclaim the callee temp (+ arg scratch)

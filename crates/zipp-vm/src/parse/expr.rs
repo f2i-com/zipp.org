@@ -460,6 +460,14 @@ impl<'s> Parser<'s> {
             let pos = self.cur().span.start;
             self.bump_before_operand()?;
             let arg = self.parse_unary()?;
+            // `ExponentiationExpression : UpdateExpression ** …` — an
+            // AwaitExpression is a UnaryExpression, so it is no more legal as an
+            // unparenthesized `**` base than `-a ** b` is.
+            if self.at(Punct::StarStar) {
+                return Err(self.err_here(
+                    "SyntaxError: unary operator before '**' requires parentheses",
+                ));
+            }
             // Legal here, but illegal in the arrow parameters this region might
             // still turn out to be — so record it rather than deciding now.
             self.cover
@@ -807,7 +815,7 @@ impl<'s> Parser<'s> {
                     }
                     Keyword::Function => {
                         self.bump_after_operand()?;
-                        let f = self.parse_function_rest(false, start)?;
+                        let f = self.parse_function_rest(false, true, start)?;
                         Ok(Expr::Function(Box::new(f)))
                     }
                     Keyword::Async => {
@@ -819,7 +827,7 @@ impl<'s> Parser<'s> {
                         self.bump_after_operand()?;
                         if self.at_kw(Keyword::Function) && !self.cur().newline_before {
                             self.bump_after_operand()?;
-                            let f = self.parse_function_rest(true, start)?;
+                            let f = self.parse_function_rest(true, true, start)?;
                             return Ok(Expr::Function(Box::new(f)));
                         }
                         self.restore(save);

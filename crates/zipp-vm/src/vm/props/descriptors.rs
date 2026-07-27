@@ -381,13 +381,32 @@ impl<'p> Vm<'p> {
             match self.heap.get(idx) {
                 // Private names (stored as "#x") are not reflectable own properties.
                 HeapObj::Object(m) => {
-                    keys.extend(
-                        spec_key_order(&m.keys)
-                            .into_iter()
-                            .map(|i| &m.keys[i])
-                            .filter(|k| !is_hidden_key(k))
-                            .cloned(),
-                    );
+                    // %Array.prototype% is an Array exotic object, so its `length`
+                    // is a real own property — modelled here as the virtual
+                    // `arr_proto_len` slot rather than an ObjMap entry (see the
+                    // getOwnPropertyDescriptor arm above). Emit it in its spec
+                    // position: after the integer indices, before the methods
+                    // (`length` is created by ArrayCreate, i.e. first of the string
+                    // keys). Without this, ownKeys contradicted the
+                    // getOwnPropertyDescriptor/hasOwnProperty answers.
+                    let mut virtual_len =
+                        self.arr_proto != 0 && idx == self.arr_proto && m.pos("length").is_none();
+                    for k in spec_key_order(&m.keys)
+                        .into_iter()
+                        .map(|i| &m.keys[i])
+                        .filter(|k| !is_hidden_key(k))
+                    {
+                        if virtual_len
+                            && canonical_index_str(k).map_or(true, |n| n >= 4_294_967_295)
+                        {
+                            keys.push("length".to_string());
+                            virtual_len = false;
+                        }
+                        keys.push(k.clone());
+                    }
+                    if virtual_len {
+                        keys.push("length".to_string());
+                    }
                     // The GLOBAL object: builtin globals (Object, Math, NaN, …)
                     // and the program's INITIALIZED var/function globals are
                     // slot-backed routed own properties, not ObjMap entries —

@@ -125,14 +125,20 @@ impl<'p> Vm<'p> {
                 "bind" => {
                     let this = args.first().copied().unwrap_or(Value::UNDEFINED);
                     let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
-                    // Spec 20.2.3.2 steps 3-5 (mirrors FN_BIND): the
-                    // HasOwnProperty(length) → Get(length) → Get(name) reads are
-                    // OBSERVABLE; a throwing accessor propagates here.
+                    // Spec 20.2.3.2 steps 3-6 (mirrors FN_BIND): BoundFunctionCreate
+                    // takes the bound function's [[Prototype]] from the TARGET, and
+                    // the HasOwnProperty(length) → Get(length) → Get(name) reads that
+                    // follow it are OBSERVABLE; a throwing accessor propagates here.
+                    // GC stays suspended while the proto is held un-rooted across
+                    // those re-entrant reads.
+                    let _gc = self.gc_lock_guard();
+                    let bound_proto = self.object_get_prototype_of(recv);
                     if self.has_own_property(recv, "length") {
                         let _ = self.get_prop(recv, "length")?;
                     }
                     let _ = self.get_prop(recv, "name")?;
                     let b = self.heap.alloc(HeapObj::Bound { target: recv, this, args: bound });
+                    self.proto_of.insert(b, bound_proto);
                     return Ok(Some(Value::heap(b)));
                 }
                 _ => {}
@@ -176,20 +182,7 @@ impl<'p> Vm<'p> {
             }
             "propertyIsEnumerable" => {
                 let key = self.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-                // On a Proxy, [[GetOwnProperty]] runs the gopd trap (which can be
-                // user JS), so own_is_enumerable (&self) can't reach it — consult
-                // proxy_gopd and report the descriptor's [[Enumerable]].
-                if recv.is_heap() && self.proxy_parts(recv.heap_index()).is_some() {
-                    let en = match self.proxy_gopd(recv, &key)? {
-                        Some(desc) => {
-                            let e = self.get_prop(desc, "enumerable")?;
-                            self.truthy(e)
-                        }
-                        None => false,
-                    };
-                    return Ok(Some(Value::bool(en)));
-                }
-                return Ok(Some(Value::bool(self.own_is_enumerable(recv, &key))));
+                return Ok(Some(Value::bool(self.own_is_enumerable_dyn(recv, &key)?)));
             }
             "isPrototypeOf" => {
                 let target = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -520,14 +513,18 @@ impl<'p> Vm<'p> {
         // ValidateTypedArray: nearly every TypedArray prototype method throws a
         // TypeError when the view is out of bounds — a detached buffer, or (on a
         // resizable buffer that shrank) an offset/length that no longer fits.
-        // subarray is the one exception (it just builds another view). The
-        // Uint8Array base64/hex methods are also excluded: they aren't handled
+        // subarray is the one exception (it just builds another view). `set` is a
+        // second: 23.2.3.26 does only RequireInternalSlot on entry and defers the
+        // out-of-bounds check to SetTypedArrayFrom*, i.e. AFTER
+        // ToIntegerOrInfinity(offset) — so `detachedTA.set(null, {valueOf(){throw}})`
+        // must surface the valueOf's throw, not a TypeError. Its arm re-checks.
+        // The Uint8Array base64/hex methods are also excluded: they aren't handled
         // here (they fall through to their prototype Natives) and have their own
         // spec-ordered checks — e.g. toBase64 reads its options object BEFORE
         // observing detachedness, so the blanket check must not preempt that.
         if !matches!(
             name,
-            "subarray" | "toHex" | "setFromHex" | "toBase64" | "setFromBase64"
+            "subarray" | "set" | "toHex" | "setFromHex" | "toBase64" | "setFromBase64"
         ) && self.ta_effective_len(idx).is_none()
         {
             return Err(Thrown(format!(
