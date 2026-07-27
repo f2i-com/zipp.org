@@ -383,6 +383,48 @@ impl<'p> Vm<'p> {
     /// Symbol keys are excluded; built-in prototype methods are non-enumerable so
     /// they never appear. Returns a HeapObj::Array of string keys. (Object.keys/
     /// values/entries stay own-only via object_enum_own — only for-in walks up.)
+    /// Is `idx` a prototype level that a `for-in` can stop at outright?
+    ///
+    /// True only when the level is a plain object, every own key is
+    /// non-enumerable AND hidden-key-free bookkeeping is unnecessary because the
+    /// level TERMINATES the chain (its own prototype is null). Both halves
+    /// matter: a level with non-enumerable keys still SHADOWS the same names on
+    /// farther prototypes, so stopping early is only sound when there is no
+    /// farther prototype.
+    ///
+    /// Memoised against the heap version, so adding an enumerable property to
+    /// `Object.prototype` — which `for-in` must then observe — invalidates it.
+    fn for_in_level_barren(&mut self, idx: u32) -> bool {
+        let ver = self.heap.version_of(idx);
+        if self.for_in_barren.get(&idx) == Some(&ver) {
+            return true;
+        }
+        // Must terminate the chain: an explicit proto entry means more levels.
+        match self.proto_of.get(&idx) {
+            Some(p) if p.is_heap() => return false,
+            Some(_) => {}
+            // No entry means the DEFAULT proto, which for a non-%Object.prototype%
+            // object is %Object.prototype% itself — i.e. more chain.
+            None if idx != self.obj_proto => return false,
+            None => {}
+        }
+        // The exotic carriers keep the general path.
+        if (idx == self.global_this && self.global_this != 0)
+            || self.module_namespaces.contains_key(&idx)
+            || !self.deferred_ns_state.is_empty()
+        {
+            return false;
+        }
+        let barren = match self.heap.get(idx) {
+            HeapObj::Object(m) => (0..m.len()).all(|i| !m.attr_at(i).enumerable),
+            _ => false,
+        };
+        if barren {
+            self.for_in_barren.insert(idx, ver);
+        }
+        barren
+    }
+
     pub(crate) fn for_in_keys(&mut self, obj: Value) -> Result<Value, Thrown> {
         // `out` holds heap key strings while object_enum_own / object_own_property_names
         // re-enter and allocate — suspend GC for the scope.
@@ -471,6 +513,14 @@ impl<'p> Vm<'p> {
                 }
                 cur = self.object_get_prototype_of(cur);
                 if cur == Value::NULL {
+                    break;
+                }
+                // A terminal, wholly non-enumerable prototype contributes no
+                // keys and can shadow nothing (there is nothing beyond it), so
+                // the walk can stop. `%Object.prototype%` is that level for
+                // almost every object, and re-deriving it per `for-in` was the
+                // bulk of the ~151ns fixed cost.
+                if cur.is_heap() && self.for_in_level_barren(cur.heap_index()) {
                     break;
                 }
                 continue;

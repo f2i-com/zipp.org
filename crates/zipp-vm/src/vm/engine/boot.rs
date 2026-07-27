@@ -99,6 +99,7 @@ impl<'p> Vm<'p> {
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
             jit_shape_slot: rustc_hash::FxHashMap::default(),
+            for_in_barren: rustc_hash::FxHashMap::default(),
             regexp_string_iters: std::collections::HashMap::new(),
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),

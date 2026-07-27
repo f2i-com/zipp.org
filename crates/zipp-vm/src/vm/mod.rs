@@ -368,6 +368,18 @@ pub struct Vm<'p> {
     /// slot for all time. Bounded, because shapes are bounded (`shape::SHAPE_MAX`)
     /// and sites are finite; entries are pure memo and may be dropped freely.
     jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
+    /// Prototype objects known to contribute NOTHING to a `for-in`: no own key
+    /// is enumerable, and none can shadow a farther level because the walk ends
+    /// there. Keyed by heap index, valued by the heap version the answer was
+    /// computed at, so any structural change to the object invalidates it.
+    ///
+    /// This exists for one shape, which is almost every shape:
+    /// `obj -> %Object.prototype% -> null`. `%Object.prototype%` carries a dozen
+    /// own methods, all non-enumerable, and the walk re-derived that on EVERY
+    /// `for-in` — running `spec_key_order` over its whole key list and testing
+    /// each key. Measured, `for (k in o)` on a one-key object cost 185ns against
+    /// node's 3.
+    for_in_barren: rustc_hash::FxHashMap<u32, u32>,
     /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index:
     /// (matcher regexp heap idx, subject string, flag bits — bit0 global, bit1
     /// fullUnicode (`u`/`v`, captured at creation per CreateRegExpStringIterator),

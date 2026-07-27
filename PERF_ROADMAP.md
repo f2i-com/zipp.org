@@ -1316,6 +1316,51 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B48 — B36's for-in fixed cost: it was the prototype walk, not the allocations
+
+B36 fitted `for-in` at **A = 134ns fixed + 30.5ns/key** and guessed the fixed
+term was ~10 per-call allocations (`out`, `plain_levels`, `emit`,
+`spec_key_order`'s vectors, the result Array). It was not — B29 had already shown
+that removing allocations from this path measures ~0, and the guess ignored it.
+
+Re-fitted on the current tree: **A = 151ns, B = 34.3ns/key**. The fixed term is
+the engine re-deriving, on EVERY `for-in`, that `%Object.prototype%` contributes
+nothing — running `spec_key_order` over its dozen own methods and testing each
+for enumerability and hidden-key-ness, every time.
+
+`for_in_level_barren` memoises that per (heap index, heap VERSION). Both halves
+of the predicate are load-bearing:
+
+  * every own key non-enumerable, AND
+  * the level TERMINATES the chain (its own prototype is null).
+
+The second is what makes stopping sound. A level with non-enumerable keys still
+SHADOWS those names on farther prototypes, so an early exit is only correct when
+there is nothing farther.
+
+| own keys | 1 | 2 | 4 | 8 | 16 | 64 |
+|---|---|---|---|---|---|---|
+| before (ns/for-in) | 178 | 202 | 277 | 420 | 720 | 2347 |
+| after | **121** | **145** | **200** | **353** | **600** | 2293 |
+
+Fixed cost 151ns -> ~90ns; **-32% on the small-object case** that dominates real
+`for-in` traffic, tapering to nothing at 64 keys where the marginal term rules.
+**`json-large` -1.7%** — its `walk()` phase is a for-in over thousands of small
+objects, and this is the first change in the B33/B36 family to move a bench at
+all.
+
+Versioning is the whole safety argument, so it is tested directly: 200,000 warm
+iterations to bury the memo, then `Object.prototype.INJECTED = 42`, which the
+next `for-in` must observe. Also checked against node: a non-enumerable addition
+staying invisible, custom prototype chains, own-non-enumerable shadowing a proto
+enumerable, `Object.create(null)`, a three-level chain, a Proxy in the chain, and
+array `for-in` with a named extra property. Both tiers.
+
+**What is left of B36:** the 34.3ns/key MARGINAL term, which is `k.clone()` +
+`alloc_str` + the result-array push per key, plus the iteration protocol that
+consumes it. B29 says the allocations there are not the cost either, so the next
+person should time the protocol before touching them.
+
 ### B47 — B33-F landed: Map/Set iterator results elided too
 
 | loop | before | after | node |
