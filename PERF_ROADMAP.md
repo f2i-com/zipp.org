@@ -1316,6 +1316,178 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B50 — The three JIT admission lists had drifted apart, and converging them
+naively is a WASH: two ops win, one loses, and the suite mean hid both
+
+Three separate op whitelists gate the three mem paths, and they had silently
+diverged:
+
+| list | gates | was missing (of what another list already had) |
+|---|---|---|
+| `region_admit.rs::region_can_compile` | Tier B, one loop region | `LoadUndefined`, `LoadNull`, `TypeOf`, `LenOf`, `ForInKeys`, `IsArray` |
+| `proto_mem.rs::mem_can_compile` | Tier C, a WHOLE function | `CellGet/Set`, `UpvalGet/Set`, `Div`, `MathOp`, `SetProp`, `LoadUndefined` |
+| `region_int.rs::int_unadmitted_ips` | the INT tier | (correctly strict — not a divergence) |
+
+Tier C's gap is the expensive one, because a Tier C rejection **blacklists the
+whole function for the rest of the run** — its own source says so and it is
+still the right description. Admitting everything took blacklisted functions
+across the ten benches from **16 → 9**; what actually SHIPPED (see the probe
+below) takes them **16 → 13**, and `map-set-heavy`'s largest loop region
+([39,110], 71 ops), which three `LoadUndefined`s were declining, now compiles.
+`class-prototype-hot` goes to zero — its only blacklisted function was refused
+for `SetProp`, which the tier already reserved an IC site for (`compile`'s
+`n_sites` filter and the desync assertion at the end of `compile_proto_mem`
+both name it), i.e. it was gated out one line short of working.
+
+**First measurement of the whole batch: `tools/bench.py --ab`, paired medians
+of 9, ALL_CORRECT=1 — eight of ten rows SLOWER, mean +0.6%.**
+
+```
+async-promise-chain +1.4%   class-prototype-hot -0.7%   json-large    +2.5%
+map-set-heavy       +1.0%   markdown-render     +1.2%   parse-large-js +0.6%
+polymorphic-objects -1.8%   regex-log-scan      -0.1%   sparse-array   +0.9%
+typedarray-math     +1.1%                         mean  +0.6%
+```
+
+**Do not stop there, as I nearly did.** A suite mean hides opposite-signed
+per-op effects, and here it hid two real wins under one real loss. The probe
+that separates them uses a CONTROL ARM that is Tier C compiled in BOTH binaries,
+so machine load cancels and only the ratio matters
+(`scratchpad/tierc_probe.js`, 3M calls per arm, median of 3 interleaved rounds):
+
+| arm | old ratio vs control | new | |
+|---|---|---|---|
+| `MathOp` + `Div` | 8.23 | **5.67** | **−31%** |
+| `SetProp` | 11.42 | **9.42** | **−18%** |
+| one `UpvalGet` | 4.16 | 6.00 | **+44%** |
+| `UpvalGet` + `UpvalSet` | 6.10 | 6.71 | +10% |
+
+So the closure-cell admissions were paying for the other two. The mechanism is
+the shape of the tier, not the op: `jit_upval_get` is a win64 CALL that resolves
+the closure from `frames.last()`, does a heap get and a match — exactly the work
+the interpreter's arm does inline, with an FFI boundary added. Inside a Tier B
+loop region the surrounding ops are compiled and it nets out positive, which is
+why B10.3 was right to admit it THERE. Tier C's shape is a small function whose
+body is mostly the upvalue access, so the call overhead plus the native
+entry/exit is the whole story and it loses.
+
+`CellGet`/`UpvalGet`/`CellSet`/`UpvalSet` are therefore admitted to Tier B and
+NOT to Tier C, with that probe recorded at the rejection site.
+
+**Reaching a tier is not the same as being faster in it** — the generalisation
+of B39, and the thing to test per op before admitting anything anywhere.
+
+`emit_math_op` is now factored into `emit_misc.rs` and shared, with
+`math_op_emittable` shared by both admission checks, so that one op cannot
+drift again.
+
+**And the shipped subset is STILL a wash on the suite: mean +0.2%**, paired
+medians of 11, ALL_CORRECT=1, on a quieter box (`bench/ab_final2.json`):
+
+```
+async-promise-chain +2.0%   class-prototype-hot +0.2%   json-large    -4.7%
+map-set-heavy       -2.8%   markdown-render     +3.1%   parse-large-js -3.3%
+polymorphic-objects +1.5%   regex-log-scan      +1.5%   sparse-array   +4.5%
+typedarray-math     +0.1%                         mean  +0.2%
+```
+
+Five rows slower, four faster, one flat, no direction. So the two per-op wins
+are real and do not reach the suite — the functions they unblock are not hot
+enough to matter against everything else those benches do. **Kept on B44's
+precedent** (correct, closes a real divergence, has a measured per-op win, costs
+nothing) and NOT as a performance improvement. The honest one-line summary of
+this entry is: *the admission lists were wrong, fixing them is worth nothing
+here, and the diagnostic that fell out of it is the part to keep.*
+
+**That diagnostic is the by-product worth more than the change. Both admission
+checks reported only the FIRST op they could not handle.** That is actively
+misleading when prioritising — admitting Tier C's `UpvalGet` moved the blacklist
+count by exactly zero, because the same markdown-render functions were also
+using `UpvalSet`, `join` and `push`, which the first-only report had never
+shown. Under `ZIPP_JITDUMP` both scans now run to completion and print every
+offender. That turns "which op should I admit" from three build-measure cycles
+into one `grep`, and it is how this table — the state AFTER this change — was
+produced in a single run:
+
+```
+markdown-render  fn1  <- UpvalGet, UpvalSet     json-large  fn1 <- UpvalGet, UpvalSet
+                 fn6  <- TailCall                           fn5 <- TailCall
+                 fn8  <- substring/1, /2                    fn6 <- TailCall, NewObject,
+                 fn9  <- substring/2                              push, NewArray, SetIndex
+                 fn10 <- UpvalGet, push, join
+                 fn11 <- UpvalGet, UpvalSet,   parse-large-js fn1 <- UpvalGet, UpvalSet
+                         push                                 fn6 <- TailCall
+regex-log-scan   fn1  <- UpvalGet, UpvalSet                   fn8 <- push, NewArray
+class-prototype-hot, map-set-heavy: none left
+```
+
+`Cell*`/`Upval*` dominate what remains, and they are there ON PURPOSE per the
+probe above — so the next real items are `CallMethod` (general, via
+`jit_call_method_ic`: markdown-render fn8/fn9/fn10/fn11, parse fn8, json fn6)
+and `TailCall`. Both should be probed per-op BEFORE landing, not measured only
+on the suite afterwards.
+
+**A wrong answer this session nearly shipped, recorded because the review that
+should have caught it did not.** A survey agent found that
+`compile/assign.rs`'s plain `=` arm omits the `concat_key_literal_prefix`
+fusion that the READ (`exprs.rs:722`), the delete (`exprs.rs:1647`) and
+`assign_target` (`assign.rs:137`) all perform, so `o["k" + i] = v` builds and
+throws away a heap string per iteration while its own read fuses. Priced at
+~108ms of `polymorphic-objects` by an in-file control, and passed by an
+adversarial verifier explicitly asked to find a wrong answer. It is unsound,
+and ten lines of JS show it:
+
+```js
+var o = {}, log = [];
+function k(){ log.push("key"); return { toString(){ log.push("keyToString"); return "X" } } }
+function v(){ log.push("val"); return 7 }
+o["p" + k()] = v();
+// node and zipp at HEAD: key,keyToString,val      fused: key,val,keyToString
+```
+
+`SetIndexConcat` performs the concatenation — and therefore the key's
+observable `ToPrimitive`/`ToString` — at the STORE, which is after the RHS.
+The three sites that already fuse are all safe for the same reason: none of
+them has an operand left to evaluate after the key. This one does.
+Fixing it needs the observable coercion hoisted before the RHS while leaving a
+primitive for the op to concatenate purely — i.e. a new opcode with
+ToPrimitive(DEFAULT) semantics (`ToPropKey` is the STRING hint and would call
+`toString` before `valueOf`). Not a quick win; do not re-attempt it as a
+one-line change.
+
+**Refuted or closed by the same survey, so nobody re-derives them:**
+
+* **B32 open item 1 (pinned-receiver multi-def, for `xorshift`) is NEGATIVE.**
+  The tier it would unlock measures **1.65× slower** than the MEM tier the loop
+  takes today, so landing it costs `typedarray-math` ~35ms. Delete the item.
+* **B5.1 (`.length` hoist to live-in registers) is worth 0ms on every named
+  bench.** `typedarray-math` contains no `.length` at all, and holds every
+  container in a global, which the existing `LoadGlobal` hoist already covers.
+* **B5.2b (`matchAll` iterator step) HAS LANDED** — the `fast0` path in
+  `proxy_regexp.rs`. Re-measured at ~10ms, not the ~552ms still recorded
+  against it. That was the largest phantom in this file.
+* **B10.1's prize was already collected in the helper.** Making the hole answer
+  call-free inline in codegen is worth ~6.6ms of `sparse-array`, ≈0.1% of the
+  suite.
+* **B10.4 and B4 hit a NESTING TRAP.** Admitting `NewObject`, or
+  `GetIterator`+`IterPrime`, moves ZERO regions on this suite: every such op
+  sits in a region that also contains a second unadmitted op (`IterNext` and
+  the `PushFinally`/`PopFinally`/`IterCloseFinally` quartet for the for-of
+  regions; `LenOf`+`ForInKeys`+`DeleteIndexConcat` for polymorphic-objects
+  [122,229]), so the region declines again at the next op. The full-blocker
+  dump above is what makes this checkable in one run.
+
+**Still open and independently verified, in prize order** — these are the real
+backlog, and none of them is an admission change:
+
+| item | prize | where |
+|---|---|---|
+| accessor inlining declines on `super.v` | **~300ms** (band 250–385) | `class-prototype-hot`; `jit_plans.rs::build_accessor_shape` handles no super, where `build_method_shape` does. Hazard: an accessor's setter lives in `attrs[slot].setter`, NOT `vals`, so the method case's `holder_vals_ptr[holder_slot] == fn_bits` re-check does not transfer to the setter arm |
+| the match result's `arr_props` side table | **~190ms** | `regex-log-scan`; B33-C's mechanism at 5× its recorded price — 456ns to CREATE the entry vs 115ns for a first property on a plain object. Effort XL |
+| `o["k" + i] = v` fusion, done soundly | ~108ms | `polymorphic-objects`; see the wrong answer above |
+| `ToPropKey` invisible to `writes_reg`/`instr_uses` | ~39ms | `typedarray-math` `normalize`; the ONE site in the whole suite where `read-only live-in used where a number isn't required` fires |
+| `typeof` allocates its result string | ~45ms suite-wide | `type_of` already returns `&'static str`; 8 permanent interned slots would do it |
+
 ### B49 — B36's MARGINAL term: 40% of it IS allocation, and interning it does
 not pay — CLOSED after three attempts
 

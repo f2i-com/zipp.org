@@ -25,6 +25,25 @@ pub(crate) fn region_can_compile(
     if e <= s || e >= code.len() {
         return false;
     }
+    // Under `ZIPP_JITDUMP` the scan runs to completion and reports EVERY op it
+    // has no arm for, rather than stopping at the first. The first-only report
+    // was actively misleading when prioritising admission work: it names one op,
+    // that op gets admitted, and the region is still declined by the next one —
+    // so a change that looked like it would unblock a region unblocked nothing.
+    // Behaviour is unchanged when the flag is off (`dump` is false, and every
+    // rejection returns immediately exactly as before).
+    let dump = std::env::var_os("ZIPP_JITDUMP").is_some();
+    let mut ok = true;
+    macro_rules! reject {
+        ($($arg:tt)*) => {{
+            if dump {
+                eprintln!($($arg)*);
+                ok = false;
+            } else {
+                return false;
+            }
+        }};
+    }
     // The back-edge must be an unconditional jump to the header (canonical
     // while/for shape). This guarantees no fall-through past `end`, so the only
     // out-of-region control transfers are explicit jump targets (loop exit /
@@ -110,34 +129,26 @@ pub(crate) fn region_can_compile(
             // allocate (a non-numeric arg already bailed), so no pinned-pointer
             // re-fetch is needed.
             Instr::MathOp { op, argc, .. } => {
-                let ok = match argc {
-                    // `Math.imul(x)` (one arg) diverges: the unary helper returns
-                    // NaN, but the interpreter coerces the missing 2nd arg to
-                    // `to_uint32(NaN)==0` and yields 0. Decline so the interpreter
-                    // runs it (every other unary op agrees at argc==1).
-                    1 => !matches!(op, MathFn::Imul),
-                    2 => matches!(
-                        op,
-                        MathFn::Pow
-                            | MathFn::Atan2
-                            | MathFn::Imul
-                            | MathFn::Min
-                            | MathFn::Max
-                            | MathFn::Hypot
-                    ),
-                    _ => false,
-                };
-                if !ok {
-                    if std::env::var_os("ZIPP_JITDUMP").is_some() {
-                        eprintln!("[decline] MathOp arity {argc} op {op:?} at region [{start},{end}]");
-                    }
-                    return false;
+                // Exactly what `emit_math_op` implements — shared with Tier C's
+                // check so the two admission lists cannot drift apart again.
+                if !math_op_emittable(op, argc) {
+                    reject!("[decline] MathOp arity {argc} op {op:?} at region [{start},{end}]");
                 }
             }
             // `LoadBool` — materialise the boolean Value bits inline (a single
             // store; call-free, pure). Unblocks loops carrying a bool literal
             // (parser flags, `done=false`).
             Instr::LoadBool { .. } => {}
+            // `undefined` / `null` as constants — one store of the canonical
+            // bits each, the same shape as `LoadBool` above and call-free. Both
+            // were simply absent, and the cost of that is not proportional to
+            // how trivial they are: a single `LoadUndefined` declines the WHOLE
+            // region, so map-set-heavy's largest loop ([39,110], 71 ops) ran
+            // interpreted for want of three of them. The int/regalloc planners
+            // still reject the region through their own catch-alls — these bits
+            // are not an i64 or an f64 — so it takes the MEM path, exactly as
+            // `LoadBool` does.
+            Instr::LoadUndefined { .. } | Instr::LoadNull { .. } => {}
             // `CheckCoercible` — RequireObjectCoercible before a member access
             // (`objs[i&3].area()` emits one). MEM path: a null/undefined operand
             // bails to the interpreter (which throws the TypeError); any other
@@ -187,10 +198,7 @@ pub(crate) fn region_can_compile(
             // hole-aware `if (i in packed)` loops.
             Instr::HasProp { brand: false, .. } => {}
             Instr::HasProp { brand: true, .. } => {
-                if std::env::var_os("ZIPP_JITDUMP").is_some() {
-                    eprintln!("[decline] HasProp brand-check at region [{start},{end}]");
-                }
-                return false;
+                reject!("[decline] HasProp brand-check at region [{start},{end}]");
             }
             Instr::LoadConst { idx, .. } => {
                 // Numeric constants run in the f64 region; a single-ASCII-char
@@ -217,20 +225,17 @@ pub(crate) fn region_can_compile(
                         if const_strs.is_some() && single_char_const_bits(proto, c).is_some() => {}
                     Some(_) if const_strs.is_some_and(|m| m.contains_key(&idx)) => {}
                     _ => {
-                        if std::env::var_os("ZIPP_JITDUMP").is_some() {
-                            eprintln!("[decline] non-region LoadConst at region [{start},{end}]");
-                        }
-                        return false;
+                        reject!("[decline] non-region LoadConst at region [{start},{end}]");
                     }
                 }
             }
             ref other => {
-                if std::env::var_os("ZIPP_JITDUMP").is_some() {
-                    eprintln!("[decline] {other:?} at region [{start},{end}]");
-                }
-                return false;
+                reject!("[decline] {other:?} at region [{start},{end}]");
             }
         }
+    }
+    if !ok {
+        return false;
     }
     // NOTE: helpers that can allocate (`StrConcat`/`StrAppendInPlace`) or run
     // user code (`Call`/`CallMethod`) USED to be forbidden alongside

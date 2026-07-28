@@ -495,6 +495,18 @@ pub(crate) fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
+            Instr::LoadUndefined { dst } => {
+                dynasm!(ops
+                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::LoadNull { dst } => {
+                dynasm!(ops
+                    ; mov rax, QWORD Value::NULL.bits() as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
             Instr::CheckCoercible { src } => {
                 // RequireObjectCoercible: a null/undefined operand bails to the
                 // interpreter (which throws the TypeError exactly); every other
@@ -510,53 +522,10 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::MathOp { dst, op, arg_base, argc } => {
-                // Pure `Math.<op>`. Operands are loaded as numbers (Int/double);
-                // a non-numeric operand BAILS to the interpreter, which runs the
-                // full ToNumber coercion (a user valueOf). So the helpers below
-                // never run user code and never allocate — no r13/r14/TA refetch.
-                // Result boxed via `emit_box_num` (mirrors the interpreter's
-                // `Value::num(r)` exactly: exact-int narrows, -0/NaN preserved).
-                if argc == 1 {
-                    load_num_xmm(&mut ops, arg_base, 0, bail);
-                    dynasm!(ops
-                        ; movq rdx, xmm0                  // arg f64 bits (arg1)
-                        ; mov ecx, op as i32              // MathFn code (repr(u8), arg0)
-                        ; mov rax, QWORD heap.math_unary as i64
-                        ; call rax
-                        ; movq xmm0, rax                  // result f64 bits
-                    );
-                    emit_box_num(&mut ops, dst);
-                } else if matches!(op, MathFn::Imul) {
-                    // `Math.imul(a,b)` INLINE — a 32-bit signed multiply, no FFI:
-                    // ToInt32 both operands (a non-int-coercible operand BAILS, so
-                    // the interpreter runs the full ToNumber incl. a user valueOf —
-                    // matching the helper), then `imul` (low 32 bits, signed) boxed
-                    // as Int. The low 32 bits of the product are identical whether
-                    // the inputs were ToInt32 or ToUint32, so this equals the
-                    // interpreter's `math_two(Imul)` exactly. (Twin of the Bitwise
-                    // ops above — the dominant op in every hash/PRNG hot loop.)
-                    load_toint32(&mut ops, arg_base, bail);
-                    dynasm!(ops ; mov r8d, eax);
-                    load_toint32(&mut ops, arg_base + 1, bail);
-                    dynasm!(ops ; mov ecx, eax ; mov eax, r8d ; imul eax, ecx);
-                    box_eax(&mut ops, dst);
-                } else {
-                    // EXACTLY two args (region_can_compile gated the op set).
-                    load_num_xmm(&mut ops, arg_base, 0, bail);
-                    load_num_xmm(&mut ops, arg_base + 1, 1, bail);
-                    dynasm!(ops
-                        ; movq rdx, xmm0                  // arg0 f64 bits (arg1)
-                        ; movq r8, xmm1                   // arg1 f64 bits (arg2)
-                        ; mov ecx, op as i32              // MathFn code (arg0)
-                        ; mov rax, QWORD heap.math_two as i64
-                        ; call rax
-                        ; movq xmm0, rax
-                    );
-                    emit_box_num(&mut ops, dst);
-                }
-                emit_region_bail(&mut ops, ip, bail, epilogue);
-            }
+            Instr::MathOp { dst, op, arg_base, argc } => emit_math_op(
+                &mut ops, ip, bail, epilogue, dst, op, arg_base, argc,
+                heap.math_unary, heap.math_two,
+            ),
             Instr::CellGet { dst, cell } => {
                 // Per-op captured-cell read (jit_cell_get). NEVER hoisted: a
                 // Call/CallMethod earlier in the region may have run an inner

@@ -26,6 +26,26 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         if std::env::var_os("ZIPP_JITLOG").is_some() { eprintln!("[tierC-reject] rest/arguments"); }
         return false;
     }
+    // Under `ZIPP_JITDUMP` the scan runs to completion and reports EVERY op this
+    // tier has no arm for, instead of stopping at the first. Reporting only the
+    // first is actively misleading when prioritising: admitting `UpvalGet` here
+    // moved markdown-render's blacklist count by exactly zero, because the same
+    // three functions were also using `UpvalSet`, `join` and `push` — which the
+    // first-only report had never shown. Behaviour is unchanged when the flag is
+    // off.
+    let dump = std::env::var_os("ZIPP_JITDUMP").is_some();
+    let mut ok = true;
+    macro_rules! reject {
+        ($($arg:tt)*) => {{
+            if dump {
+                eprintln!($($arg)*);
+                ok = false;
+            } else {
+                if std::env::var_os("ZIPP_JITLOG").is_some() { eprintln!($($arg)*); }
+                return false;
+            }
+        }};
+    }
     for instr in &proto.code {
         match *instr {
             Instr::LoadInt { .. }
@@ -38,6 +58,13 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             | Instr::StoreGlobalResolved { .. }
             | Instr::GetIndex { .. }
             | Instr::GetProp { .. }
+            // `o.x = v` — the region's 8-way IC write, minus the setter-inline
+            // prefix and the TA refetch (Tier C has neither). The IC site budget
+            // already counted SetProp (`compile`'s `n_sites` filter and the
+            // desync assertion at the end of this function both name it), so the
+            // op was gated out one line short of working. It is
+            // class-prototype-hot's ONLY blacklisted function.
+            | Instr::SetProp { .. }
             | Instr::AddInt { .. }
             | Instr::Add { .. }
             | Instr::Sub { .. }
@@ -67,17 +94,52 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // silent: the whole function is blacklisted and INTERPRETED for the
             // rest of the run, so one `h ^= h << 13` costs the entire body.
             | Instr::Bitwise { .. }
-            | Instr::Not { .. } => {}
+            | Instr::Not { .. }
+            // `undefined` as a constant — a single store of the canonical bits,
+            // the exact shape of the `LoadNull` arm right above. It was in
+            // NEITHER admission list, which is what kept map-set-heavy's
+            // [39,110] region interpreted: three `LoadUndefined`s were its only
+            // remaining blocker on the mem path.
+            | Instr::LoadUndefined { .. }
+            // `/` — `dbinop` handles it on the always-f64 path (JS `/` has no
+            // integer form), the same call the region path makes.
+            | Instr::Div { .. } => {}
+            // NOT admitted here, though the emitters exist below and the REGION
+            // path (Tier B) has carried them since B10.3: `CellGet`/`UpvalGet`/
+            // `CellSet`/`UpvalSet`. Admitting them MEASURED SLOWER — see B50.
+            //
+            // Each is a win64 CALL per op (`jit_upval_get` resolves the closure
+            // from `frames.last()`, then a heap get and a match), which is the
+            // same work the interpreter's arm does inline and without an FFI
+            // boundary. In a Tier B loop region the surrounding ops are compiled
+            // and it nets out positive; in Tier C the shape is a SMALL function
+            // whose body is mostly the upvalue access, so the call overhead plus
+            // the native entry/exit is all there is, and it loses:
+            //
+            //   in-file control, ratio against a Tier-C-compiled control arm
+            //   (so machine load cancels), median of 3 interleaved rounds:
+            //     one UpvalGet        4.16 -> 6.00   (+44%)
+            //     UpvalGet + UpvalSet 6.10 -> 6.71   (+10%)
+            //   against, in the same probe:
+            //     MathOp + Div        8.23 -> 5.67   (-31%)
+            //     SetProp            11.42 -> 9.42   (-18%)
+            //
+            // Reaching a tier is not the same as being faster in it. Do not
+            // re-admit these without a per-op probe of that shape.
+            // `Math.<op>(…)` — the shared `emit_math_op`, gated by the same
+            // predicate the region path uses.
+            Instr::MathOp { op, argc, .. } => {
+                if !math_op_emittable(op, argc) {
+                    reject!("[tierC-reject] MathOp arity {argc} op {op:?}");
+                }
+            }
             // General plain call `f(args…)` — `this = undefined`.
             Instr::Call { .. } => {}
             // v1 method calls: ONLY the 1-arg `charCodeAt` (dedicated helper).
             Instr::CallMethod { name, argc, .. } => {
                 let key = proto.string_constants.get(name as usize).map(|s| s.as_str());
                 if !(argc == 1 && key == Some("charCodeAt")) {
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
-                        eprintln!("[tierC-reject] CallMethod {key:?} argc={argc}");
-                    }
-                    return false;
+                    reject!("[tierC-reject] CallMethod {key:?} argc={argc}");
                 }
             }
             // Numeric / single-ASCII-char / pre-interned multi-char string
@@ -88,21 +150,15 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                 Some(&c) if single_char_const_bits(proto, c).is_some() => {}
                 _ if const_strs.contains_key(&idx) => {}
                 _ => {
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
-                        eprintln!("[tierC-reject] LoadConst (non-numeric, non-interned string)");
-                    }
-                    return false;
+                    reject!("[tierC-reject] LoadConst (non-numeric, non-interned string)");
                 }
             },
             ref other => {
-                if std::env::var_os("ZIPP_JITLOG").is_some() {
-                    eprintln!("[tierC-reject] op {other:?}");
-                }
-                return false;
+                reject!("[tierC-reject] op {other:?}");
             }
         }
     }
-    true
+    ok
 }
 
 /// Compile the WHOLE body of `proto` to native code via the memory-path op
@@ -252,6 +308,12 @@ pub(crate) fn compile_proto_mem(
             Instr::LoadNull { dst } => {
                 dynasm!(ops
                     ; mov rax, QWORD Value::NULL.bits() as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::LoadUndefined { dst } => {
+                dynasm!(ops
+                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
@@ -405,6 +467,15 @@ pub(crate) fn compile_proto_mem(
                 // overflow concern.
                 dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Mul, int_hint)
             }
+            Instr::Div { dst, a, b } => {
+                // Always f64 — JS `/` has no integer form (mirrors the region arm
+                // and the interpreter).
+                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div, false)
+            }
+            Instr::MathOp { dst, op, arg_base, argc } => emit_math_op(
+                &mut ops, ip, bail, epilogue, dst, op, arg_base, argc,
+                heap.math_unary, heap.math_two,
+            ),
             Instr::Add { dst, a, b } => {
                 // Int+Int fast path, then f64, then the `jit_concat` fallback
                 // (string concat / coercion — the interpreter's `add_values`),
@@ -691,6 +762,76 @@ pub(crate) fn compile_proto_mem(
                 );
                 // The miss/slow helpers may have allocated (versions Vec) or
                 // frame-called a getter (nested compile) — re-derive r13/r14.
+                emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                dynasm!(ops ; => cont);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+                ic_site += 1;
+            }
+            Instr::SetProp { obj, name, val } => {
+                // 8-way inline cache, CALL-FREE on hit. The region arm verbatim,
+                // minus the setter-inline prefix and the TA refetch. Unlike
+                // GetProp the helper only ever fills OWN ways here (identity +
+                // receiver version fully guard an own writable data slot: any
+                // redefinition / freeze / delete / proto change bumps the
+                // version), so the probe has no hop chain to walk.
+                let off = (ic_site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
+                let packed = ((heap.func_id as u64) << 32) | name as u64;
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let probe = ops.new_dynamic_label();
+                let next = ops.new_dynamic_label();
+                let cont = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(obj)]          // receiver bits
+                    ; lea r9, [r14 + off]
+                    ; mov r8d, JIT_IC_WAYS as i32
+                    ; => probe
+                    ; cmp rax, [r9]                       // identity
+                    ; jne => next
+                    ; mov ecx, eax                        // recv heap idx
+                    ; mov edx, [r13 + rcx*4]              // live recv version
+                    ; cmp edx, [r9 + 16]
+                    ; jne => next
+                    ; mov rcx, [r9 + 8]                   // vals_ptr
+                    // Mask the hop count out of `slot_nhops` before indexing —
+                    // see the region arm: an unmasked hop count would make this
+                    // a wild STORE, not merely a wrong read.
+                    ; mov edx, [r9 + 20]
+                    ; and edx, 0x00FF_FFFF                // slot (low 24)
+                    ; mov r10, [rbx + dreg(val)]          // val_bits
+                    ; mov [rcx + rdx*8], r10              // vals[slot] = val (CALL-FREE)
+                    ; jmp => cont
+                    ; => next
+                    ; add r9, JIT_IC_STRIDE as i32
+                    ; dec r8d
+                    ; jnz => probe
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, rax                        // obj_bits
+                    ; mov r8, [rbx + dreg(val)]           // val_bits
+                    ; mov r9, QWORD packed as i64         // (func_id<<32)|name_idx
+                    ; mov QWORD [rsp + 32], ic_site as i32 // 5th arg: site_idx (stack)
+                    ; mov rax, QWORD heap.set_prop_miss as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD PROP_VIA_IC as i64
+                    ; cmp rax, r10
+                    ; jne => cont
+                    // ── setter / class receiver: interpreter-IC slow helper
+                    // (may frame-call a setter — user code).
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, rbx                        // caller window base
+                    ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                    ; mov r9, QWORD (((name as u64) << 32) | ((obj as u64) << 16) | val as u64) as i64
+                    ; mov rax, QWORD heap.set_prop_slow as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 dynasm!(ops ; => cont);
                 emit_region_bail(&mut ops, ip, bail, epilogue);

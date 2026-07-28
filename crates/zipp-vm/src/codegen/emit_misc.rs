@@ -111,6 +111,93 @@ pub(crate) fn store_xmm(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
     );
 }
 
+/// `regs[dst] = Math.<op>(args…)` for the mem paths. Operands are loaded as
+/// numbers (Int/double); a non-numeric operand BAILS to the interpreter, which
+/// runs the full ToNumber coercion (a user `valueOf`). So the helpers here never
+/// run user code and never allocate — no r13/r14/TA refetch is owed. The result
+/// is boxed by `emit_box_num`, which mirrors the interpreter's `Value::num(r)`
+/// exactly (exact-int narrows, `-0`/NaN preserved).
+///
+/// SHARED by the region path (Tier B) and the whole-function path (Tier C).
+/// It lived only in `region_mem.rs`, so Tier C rejected every `Math.*` call and
+/// blacklisted the containing function for the whole run — which cost
+/// markdown-render, parse-large-js and json-large one function each. Copying it
+/// would have widened the divergence PERF_ROADMAP B43 already warns about
+/// ("the emitter exists in TWO byte-identical copies — factor before editing"),
+/// so it is factored here instead.
+///
+/// The caller must have gated the op/arity set (`argc == 1` and not `Imul`, or
+/// `argc == 2` and one of Pow/Atan2/Imul/Min/Max/Hypot) — the arms below assume
+/// it, exactly as the region admission check guarantees.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_math_op(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    epilogue: dynasmrt::DynamicLabel,
+    dst: u16,
+    op: MathFn,
+    arg_base: u16,
+    argc: u16,
+    math_unary: usize,
+    math_two: usize,
+) {
+    if argc == 1 {
+        load_num_xmm(ops, arg_base, 0, bail);
+        dynasm!(ops
+            ; movq rdx, xmm0                  // arg f64 bits (arg1)
+            ; mov ecx, op as i32              // MathFn code (repr(u8), arg0)
+            ; mov rax, QWORD math_unary as i64
+            ; call rax
+            ; movq xmm0, rax                  // result f64 bits
+        );
+        emit_box_num(ops, dst);
+    } else if matches!(op, MathFn::Imul) {
+        // `Math.imul(a,b)` INLINE — a 32-bit signed multiply, no FFI: ToInt32
+        // both operands (a non-int-coercible operand BAILS, so the interpreter
+        // runs the full ToNumber incl. a user valueOf — matching the helper),
+        // then `imul` (low 32 bits, signed) boxed as Int. The low 32 bits of the
+        // product are identical whether the inputs were ToInt32 or ToUint32, so
+        // this equals the interpreter's `math_two(Imul)` exactly.
+        load_toint32(ops, arg_base, bail);
+        dynasm!(ops ; mov r8d, eax);
+        load_toint32(ops, arg_base + 1, bail);
+        dynasm!(ops ; mov ecx, eax ; mov eax, r8d ; imul eax, ecx);
+        box_eax(ops, dst);
+    } else {
+        // EXACTLY two args (the admission check gated the op set).
+        load_num_xmm(ops, arg_base, 0, bail);
+        load_num_xmm(ops, arg_base + 1, 1, bail);
+        dynasm!(ops
+            ; movq rdx, xmm0                  // arg0 f64 bits (arg1)
+            ; movq r8, xmm1                   // arg1 f64 bits (arg2)
+            ; mov ecx, op as i32              // MathFn code (arg0)
+            ; mov rax, QWORD math_two as i64
+            ; call rax
+            ; movq xmm0, rax
+        );
+        emit_box_num(ops, dst);
+    }
+    emit_region_bail(ops, ip, bail, epilogue);
+}
+
+/// The op/arity subset `emit_math_op` implements. Shared by both mem paths'
+/// admission checks so they cannot drift apart again.
+///
+/// `Math.imul(x)` (ONE arg) diverges and is excluded: the unary helper returns
+/// NaN, but the interpreter coerces the missing 2nd arg to `to_uint32(NaN) == 0`
+/// and yields 0. Every other unary op agrees at argc == 1.
+pub(crate) fn math_op_emittable(op: MathFn, argc: u16) -> bool {
+    match argc {
+        1 => !matches!(op, MathFn::Imul),
+        2 => matches!(
+            op,
+            MathFn::Pow | MathFn::Atan2 | MathFn::Imul | MathFn::Min | MathFn::Max | MathFn::Hypot
+        ),
+        _ => false,
+    }
+}
+
 /// `regs[dst] = regs[a] <op> regs[b]`. Add/Sub/Mul take an INT fast path when
 /// both operands are Int-tagged (32-bit op + overflow check, result boxed Int —
 /// exactly the interpreter's `checked_add/sub/mul` fast path), falling to the
