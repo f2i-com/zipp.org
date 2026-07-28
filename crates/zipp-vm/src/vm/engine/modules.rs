@@ -107,6 +107,11 @@ impl<'p> Vm<'p> {
         }
         if mtype.is_none() {
             if let Some(&ns) = self.module_cache.get(&path) {
+                if let Some(e) = self.module_cycle_error(&path) {
+                    let msg = self.throw_message(e);
+                    self.pending_throw = Some(e);
+                    return Err(Thrown(msg));
+                }
                 // A cached module that SUSPENDED (top-level await): later
                 // importers settle from the same body promise — never from
                 // the incomplete namespace directly.
@@ -491,7 +496,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     IN::DeferNamespace => {
-                        let ns = self.deferred_namespace_for(&dep_raw)?;
+                        let ns = self.deferred_namespace_for(&dep_raw, e.mtype.as_deref())?;
                         ns_writes.push((e.local_slot, ns));
                     }
                     IN::SideEffect => {
@@ -1246,6 +1251,67 @@ impl<'p> Vm<'p> {
             }
         }
         false
+    }
+
+    /// The permanent evaluation error of an already-EVALUATED module.
+    pub(crate) fn module_cycle_error(&mut self, path: &std::path::PathBuf) -> Option<Value> {
+        if let Some(&e) = self.module_errors.get(path) {
+            return Some(e);
+        }
+        fn rejected(vm: &Vm<'_>, v: Value) -> Option<Value> {
+            if !v.is_heap() {
+                return None;
+            }
+            match vm.heap.get(v.heap_index()) {
+                HeapObj::Promise {
+                    state: crate::heap::PromiseState::Rejected,
+                    result,
+                    ..
+                } => Some(*result),
+                _ => None,
+            }
+        }
+        if let Some(&(bp, _)) = self.module_body_promise.get(path) {
+            if let Some(r) = rejected(self, bp) {
+                if let HeapObj::Promise { handled, .. } = self.heap.get_mut(bp.heap_index()) {
+                    *handled = true;
+                }
+                self.module_errors.insert(path.clone(), r);
+                return Some(r);
+            }
+            if bp.is_heap()
+                && matches!(
+                    self.heap.get(bp.heap_index()),
+                    HeapObj::Promise { state: crate::heap::PromiseState::Pending, .. }
+                )
+            {
+                return None;
+            }
+        }
+        if self.executing_modules.contains(path) || self.module_loading.contains(path) {
+            return None;
+        }
+        let mut peers: Vec<(std::path::PathBuf, Value)> = self
+            .module_body_promise
+            .iter()
+            .filter(|(p2, _)| p2.as_path() != path.as_path())
+            .filter_map(|(p2, &(b2, _))| rejected(self, b2).map(|r| (p2.clone(), r)))
+            .collect();
+        if peers.is_empty() {
+            return None;
+        }
+        peers.sort_by(|a, b| a.0.cmp(&b.0));
+        for (p2, r) in peers {
+            let mut fwd = std::collections::HashSet::new();
+            let mut back = std::collections::HashSet::new();
+            if self.module_graph_reaches(path, &p2, &mut fwd)
+                && self.module_graph_reaches(&p2, path, &mut back)
+            {
+                self.module_errors.insert(path.clone(), r);
+                return Some(r);
+            }
+        }
+        None
     }
 
     pub(crate) fn prescan_module_requests(

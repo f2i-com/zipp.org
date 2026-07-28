@@ -772,6 +772,7 @@ impl<'p> Vm<'p> {
                 ("some", ITER_SOME),
                 ("every", ITER_EVERY),
                 ("find", ITER_FIND),
+                ("join", ITER_JOIN),
                 ("@@iterator", ITER_SELF),
                 ("@@dispose", ITER_DISPOSE),
             ],

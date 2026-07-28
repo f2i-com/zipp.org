@@ -776,6 +776,37 @@ impl<'a> FnCompiler<'a> {
                     } else {
                         self.emit(Instr::StoreGlobal { idx: slot, src: v });
                     }
+                    // A `using`/`await using` at a MODULE's top level binds to a
+                    // module slot and takes this branch, not the local-binding one
+                    // that registers disposables further down — so the resource was
+                    // never added to the scope. The body still opened one and still
+                    // ran DisposeScope on exit; it just had nothing in it, and the
+                    // declaration silently behaved like `const`. Register it here
+                    // too, on the same value that was just stored.
+                    //
+                    // (`using` at a SCRIPT top level is a SyntaxError -- there is no
+                    // defined disposal point for it -- so this only ever fires for a
+                    // module, where the end of the body IS that point.)
+                    let using_async = match d.kind {
+                        ast::VarKind::Using => Some(false),
+                        ast::VarKind::AwaitUsing => Some(true),
+                        _ => None,
+                    };
+                    if let (Some(is_async_using), Some(scope_reg)) =
+                        (using_async, self.using_scope_reg)
+                    {
+                        if is_async_using {
+                            self.emit(Instr::RegisterAsyncDisposable {
+                                scope: scope_reg,
+                                val: v,
+                            });
+                        } else {
+                            self.emit(Instr::RegisterDisposable {
+                                scope: scope_reg,
+                                val: v,
+                            });
+                        }
+                    }
                 } else {
                     let target = self.with_resolve_target(name, &with_objs);
                     let tmp = self.temp();

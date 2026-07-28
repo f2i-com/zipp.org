@@ -4071,7 +4071,7 @@ impl<'p> Vm<'p> {
             }
             // ES2025 Iterator Helpers (%Iterator.prototype%).
             ITER_MAP | ITER_FILTER | ITER_TAKE | ITER_DROP | ITER_FLATMAP | ITER_REDUCE
-            | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND => {
+            | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND | ITER_JOIN => {
                 self.iter_helper_method(id, this, args)?
             }
             ITER_HELPER_NEXT => {

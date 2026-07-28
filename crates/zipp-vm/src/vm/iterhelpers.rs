@@ -1020,6 +1020,38 @@ impl<'p> Vm<'p> {
                 }
                 Ok(self.alloc_array_current_realm(out))
             }
+            ITER_JOIN => {
+                let sep = if a0 == Value::UNDEFINED {
+                    ",".to_string()
+                } else {
+                    match self.to_js_string(a0) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            self.iterator_close_quiet(this);
+                            return Err(e);
+                        }
+                    }
+                };
+                let next = self.iter_direct_next(this)?;
+                let mut out = String::new();
+                let mut first = true;
+                while let Some(v) = self.ih_step(this, next)? {
+                    if !first {
+                        out.push_str(&sep);
+                    }
+                    first = false;
+                    if !v.is_nullish() {
+                        match self.to_js_string(v) {
+                            Ok(s) => out.push_str(&s),
+                            Err(e) => {
+                                self.iterator_close_quiet(this);
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                Ok(self.alloc_str(out))
+            }
             ITER_FOREACH => {
                 let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;

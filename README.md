@@ -30,55 +30,42 @@ wasm32 are built and tested.
 Both figures are measured on this repo, not estimated. Neither is finished —
 they are the current state.
 
-**Conformance — 99.995% of test262**, 95,841 of 95,846 required executions
+**Conformance — 99.997% of test262**, 95,939 of 95,942 required executions
 (ECMA-262 + `staging`, run in both sloppy and strict mode as `INTERPRETING.md`
 requires). Both tiers produce a **byte-identical** failure set, which is the
 cheapest evidence that a JIT change has not quietly diverged:
 
 | slice | executions | pass |
 |---|---|---|
-| ECMA-262 + staging, both modes | 95,846 | 95,841 (99.995%) |
+| ECMA-262 + staging, both modes | 95,942 | 95,939 (99.997%) |
 | intl402 (opt-in, `--include-intl402`) | 6,682 | 6,474 (96.9%) |
+
+Measured against tc39/test262 `defaaf15` (2026-07-27). The suite moves, so the
+commit is part of the number: it is worth re-pinning whenever this figure is.
 
 That is up from 96.97% under `oxc_parser`, and the increase is the whole reason
 the engine grew its own front end.
 
-The denominator is 95,846, not the 95,848 previously published here. Two of
-those executions were a leftover scratch file from a crashed sweep, left in the
-test262 checkout under a naming scheme that predates the `.zipptmp-` prefix the
-runner now skips. It happened to be a harness+test concatenation, so it parsed,
-ran, and scored as a passing test — the exact phantom that prefix exists to
-prevent, dating from before the prefix existed. Deleting it removes exactly two
-passes and two executions, confirmed by running its directory both ways.
+**3 executions still fail, and neither remaining cause is a live engine defect.
+Both are structural, and one of them is unfixable by construction.**
 
-**5 executions still fail, and not one of them is a live engine defect.** That
-claim is only worth making because the previous 30 were each diagnosed against
-the spec text and cross-checked against V8 rather than assumed — which is how it
-emerged that 22 of them were defects in this repo's own harness and checkout, and
-that one long-standing "we are more correct than V8" note was simply wrong.
-
-* **A test262 test fixed upstream after this checkout (2).** The
-  `TypedArray.prototype.slice` species test runs the whole arg-factory matrix,
-  including an immutable `ArrayBuffer`, where `ValidateTypedArray` in ~write~
-  mode is *required* to throw. zipp throws, and passes the sibling test that
-  asserts exactly that throw; node "passes" only because V8 has no
-  `transferToImmutable`, so its harness never builds that case. Upstream agrees —
-  tc39/test262 `250f204f` (2026-07-08), *"Exclude immutable ArrayBuffers from
-  Typed Array tests that expect mutability"* — and the vendored checkout is
-  `de8e621c` (2026-06-11), four weeks older. Updating it closes these two.
-* **A test262 test that encodes removed spec text (1).**
+* **The suite contains two tests with opposite expectations (1).**
   `annexB/language/function-code/block-decl-func-skip-arguments.js` quotes the
   ES2017 step `Append "arguments" to parameterNames`, deleted in ES2018 when the
-  arguments object moved to a separate `paramBindings` list. V8 fails it too.
-  zipp *used* to pass it, and this README used to cite that as being more
-  conformant than node; it was the reverse. The engine now implements the
-  current text — `function f(){ { function arguments(){} } return typeof
-  arguments }` is `"function"` — so this test is red on purpose.
+  arguments object moved to a separate `paramBindings` list, and requires that a
+  block `function arguments(){}` NOT overwrite the arguments object.
+  `staging/sm/regress/regress-602621.js` requires that it DOES, which is the
+  current text. No engine can pass both; V8 fails the same one. zipp used to pass
+  it, and this README used to cite that as being more conformant than node — it
+  was the reverse. This one is red on purpose.
 * **Only the `en` CLDR locale ships (2).** `staging/sm/String/internalUsage.js`
   wants `Intl.DateTimeFormat("de").format(t)` to give `2.1.1970`. Carrying one
   hand-written German pattern to turn this green is exactly the approximation
   this project refuses (see the intl402 note below); it stays red until real
   CLDR data lands.
+
+That is the ceiling for this checkout: 95,940 of 95,942 without shipping CLDR
+data, and 95,941 is unreachable at any effort.
 
 Getting here meant fixing the harness as well as the engine, and the two engine
 bugs that mattered most were both **tier divergences** — the JIT disagreeing with
@@ -98,6 +85,17 @@ the interpreter, which is the failure mode this project gates hardest against:
 Both were latent long before this run and reachable from ordinary
 `$262.evalScript`; running the harness as a real separate script is what finally
 made them fire.
+
+Moving the vendored suite forward a month (`de8e621c` → `defaaf15`) added 96
+executions and surfaced two genuine gaps, both now closed:
+**`Iterator.prototype.join`** was simply unimplemented (36 executions — the
+helper is new enough that V8 24.12 does not have it either, so the suite, not
+node, is the oracle), and a **`using`/`await using` at a module's top level was
+never disposed** (6). It bound to a module slot, which took the global-binding
+path in the compiler rather than the local one that registers disposables — so
+the body dutifully opened a resource scope, ran `DisposeScope` on exit, and had
+nothing in it. The declaration silently behaved like `const`. Block and function
+scope were always correct, which is exactly why it went unnoticed.
 
 Decorators — for a long time the single largest gap, at ~34 executions — are
 now implemented end to end: the parser, the decoration runtime, and the

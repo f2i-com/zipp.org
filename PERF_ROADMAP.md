@@ -35,40 +35,53 @@ are in B58.
 
 ## 1. Where the project actually is
 
-### Conformance — 99.995% test262, 96.9% intl402
+### Conformance — 99.997% test262, 96.9% intl402
 
 | slice | executions | pass | fail |
 |---|---|---|---|
-| ECMA-262 + `staging`, sloppy **and** strict | 95,846 | 95,841 (99.995%) | 5 |
+| ECMA-262 + `staging`, sloppy **and** strict | 95,942 | 95,939 (99.997%) | 3 |
 | `intl402` (opt-in) | 6,682 | 6,474 (96.9%) | 208 |
 
 Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
 
-The main-suite denominator dropped by 2 (95,848 → 95,846) when a leftover
-scratch file from a crashed sweep was deleted from the test262 checkout. It
-predated the `.zipptmp-` prefix the walk now skips, and being a harness+test
-concatenation it ran and scored as a pass — the exact phantom the prefix exists
-to prevent, still present from before the prefix existed.
+The main-suite denominator moved twice, both times for a reason worth recording.
+It dropped by 2 (95,848 → 95,846) when a leftover scratch file from a crashed
+sweep was deleted from the test262 checkout: it predated the `.zipptmp-` prefix
+the walk now skips, and being a harness+test concatenation it ran and scored as a
+pass — the exact phantom that prefix exists to prevent, still present from before
+the prefix existed. It then rose to 95,942 when the vendored suite was updated to
+`defaaf15`. Quote the test262 commit alongside the percentage; without it the
+number is not reproducible.
 
 The intl402 denominator changed because the runner was not parsing YAML
 list-form `flags:` — roughly half that suite silently never ran, so the old
 16.9% was measured against a half-skipped suite.
 
-**30 → 5.** What the 30 turned out to be, once each was diagnosed against the
-spec text and reproduced against V8 rather than assumed — and what closing them
-took:
+**30 → 3**, across two steps: closing the original 30, then moving the vendored
+suite a month forward (`de8e621c` → `defaaf15`, +96 executions) and closing what
+that surfaced. Each was diagnosed against the spec text and reproduced against V8
+rather than assumed:
 
 | cause | was | now | how |
 |---|---|---|---|
 | runner made the *harness* strict | 19 | 0 | harness is a separate realm script; the directive goes on the test text alone |
+| `Iterator.prototype.join` unimplemented | 36 | 0 | new helper; the suite is the oracle — V8 24.12 does not have it either |
+| `using` at MODULE top level never disposed | 6 | 0 | module-slot binding took the global path, which never emitted `RegisterDisposable` |
 | Windows `core.autocrlf` checkout | 3 | 0 | `core.autocrlf=false` + renormalise; `import-bytes` fixtures were inflated LF→CRLF |
 | `matchAll` skipped `Get(@@match)` | 2 | 0 | observable `IsRegExp` on the primitive path; matcher-clone fast path bails when `@@match` is patched |
 | Annex B `arguments` | 2 | 0 | `"arguments"` blocks the var binding only, never the `SetMutableBinding` |
+| upstream test predates the feature | 2 | 0 | closed by the checkout update (`250f204f`) |
 | `en`-only CLDR | 2 | 2 | needs real CLDR data; refusing to hand-write one German pattern |
-| upstream test predates the feature | 2 | 2 | fixed upstream in `250f204f` (2026-07-08); vendored checkout is four weeks older |
-| ES2017 text the spec deleted | 0 | 1 | `block-decl-func-skip-arguments.js` is red *on purpose* now; V8 fails it too |
+| ES2017 text the spec deleted | 0 | 1 | `block-decl-func-skip-arguments.js` is red *on purpose*; V8 fails it too |
 
-None of the remaining 5 is a live engine defect. Three engine bugs were fixed
+**The last one is unfixable, and worth stating plainly: the suite contains two
+tests with opposite expectations.** `block-decl-func-skip-arguments.js` requires
+that a block `function arguments(){}` NOT overwrite the arguments object;
+`staging/sm/regress/regress-602621.js` requires that it DOES, which is the
+current text. So 95,942/95,942 does not exist for any engine. The reachable
+ceiling here is 95,940 — the remaining 2 are CLDR data.
+
+None of the remaining 3 is a live engine defect. Three engine bugs were fixed
 along the way, and **two of them were tier divergences** — the JIT disagreeing
 with the interpreter, which is the failure mode this file has warned about since
 the first JIT landed. Both were latent long before this work and reachable from
@@ -373,7 +386,7 @@ This track did not exist in the previous roadmap; test262 was only a gate. It is
 now the shorter of the two tracks and should go first — the work is bounded and
 the payoff is a headline number.
 
-**Status 2026-07-29: 938 → 5 failures (99.0% → 99.995%), and intl402 2,778 →
+**Status 2026-07-29: 938 → 3 failures (99.0% → 99.997%), and intl402 2,778 →
 208 (16.9% → 96.9%).** Every step gated against the checked-in baseline with
 zero regressions, both tiers byte-identical, `cargo test --workspace --release`
 green at 421. **None of the 5 is a live engine defect** — 2 are fixed upstream in

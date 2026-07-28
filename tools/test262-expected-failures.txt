@@ -1,5 +1,3 @@
 annexB/language/function-code/block-decl-func-skip-arguments.js [sloppy]
-built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js [sloppy]
-built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js [strict]
 staging/sm/String/internalUsage.js [sloppy]
 staging/sm/String/internalUsage.js [strict]

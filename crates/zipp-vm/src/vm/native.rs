@@ -185,6 +185,8 @@ pub const ITER_ZIPKEYED: u16 = 682;
 /// `%Iterator.prototype% [ @@dispose ]()` — calls the iterator's `return` (if any)
 /// and returns undefined (explicit resource management).
 pub const ITER_DISPOSE: u16 = 683;
+/// `Iterator.prototype.join(separator)`.
+pub const ITER_JOIN: u16 = 684;
 // The test262 `$262` host object.
 pub const DOLLAR262_DETACH: u16 = 620;
 pub const DOLLAR262_GC: u16 = 621;
@@ -1132,6 +1134,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         ITER_SOME => ("some", 1),
         ITER_EVERY => ("every", 1),
         ITER_FIND => ("find", 1),
+        ITER_JOIN => ("join", 1),
         ITER_HELPER_NEXT => ("next", 0),
         ITER_HELPER_RETURN => ("return", 0),
         ITER_FROM => ("from", 1),
