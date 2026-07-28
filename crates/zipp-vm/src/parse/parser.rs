@@ -478,6 +478,10 @@ pub struct Parser<'s> {
     /// derived class that both declare `accessor x` get DISTINCT slots on the
     /// same instance (private names are keyed by string).
     pub(crate) accessor_seq: u32,
+    /// A DecoratorList parsed before `export` (`@dec export class C {}`) or after
+    /// it (`export @dec class C {}`), waiting for the ClassDeclaration it
+    /// belongs to: `(offset of the first `@`, the list)`.
+    pub(crate) pending_class_decorators: Option<(u32, Vec<super::ast::Expr>)>,
 }
 
 impl<'s> Parser<'s> {
@@ -525,6 +529,7 @@ impl<'s> Parser<'s> {
             exported_names: Vec::new(),
             pending_export_locals: Vec::new(),
             accessor_seq: 0,
+            pending_class_decorators: None,
         })
     }
 

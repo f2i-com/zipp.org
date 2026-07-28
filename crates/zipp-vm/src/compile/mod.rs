@@ -39,6 +39,82 @@ use crate::vm::STRING_CONST_BIT;
 
 type R<T> = Result<T, String>;
 
+/// What `compile_class_fn` needs to know about a DECORATED class to emit the
+/// instance-element part of its constructor / field thunk. `None` for every
+/// undecorated class, which is the only shape existing code takes.
+pub(crate) struct DecFieldPlan<'x> {
+    /// The class whose runtime `DecState` the ops resolve through.
+    pub class_id: u32,
+    /// Parallel to the `fields` slice: the decorated-element index of that
+    /// field, when it has decorators. (An auto-accessor's entry names its
+    /// PRIVATE BACKING SLOT — that is the storage a returned `init` feeds.)
+    pub named: &'x [Option<u16>],
+    /// Parallel to the `computed_inits` slice: same, for `@dec [k] = v`.
+    pub computed: &'x [Option<u16>],
+    /// Whether the class has any decorated instance METHOD / getter / setter,
+    /// i.e. whether `instanceMethodExtraInitializers` can be non-empty. A
+    /// decorated field or auto-accessor does NOT count: its `addInitializer`
+    /// callbacks are per-element and run right after that element is defined.
+    pub run_inits: bool,
+}
+
+/// Which class-definition-time key evaluation a [`ClassStep`] performs.
+pub(crate) enum StepKey {
+    /// The element's key is a compile-time name; nothing to evaluate.
+    None,
+    /// Index into the `computed` (computed-key member) list.
+    Member(usize),
+    /// Index into the `computed_fields` list.
+    Field(usize),
+}
+
+/// One class element that needs work at class-definition time, in DOCUMENT
+/// order: its decorator expressions and/or its computed ClassElementName.
+///
+/// The two used to be driven by two SEPARATE loops (all computed member keys,
+/// then all computed field keys), which is not document order —
+/// `class C { [a] = 1; [b]() {} }` evaluated `b` before `a`. Decorators make
+/// that observable in a second way (each element's decorators must be evaluated
+/// immediately before its own key), so both now come off this one ordered list.
+pub(crate) struct ClassStep<'b> {
+    pub decorators: &'b [ast::Expr],
+    /// Index into `DecPlan::elements`, when the element is decorated.
+    pub dec_elem: Option<u16>,
+    /// Which of ClassDefinitionEvaluation's four decoration loops this element
+    /// belongs to: 0 = static non-field, 1 = instance non-field, 2 = static
+    /// field, 3 = instance field. Elements are DECORATED in that group order
+    /// (document order within a group), which is not document order overall.
+    pub dec_group: u8,
+    pub key: StepKey,
+}
+
+/// Everything `build_class_into` needs from `compile_class`.
+pub(crate) struct CompiledClass<'b> {
+    pub class_id: u32,
+    pub static_fields: Vec<(String, Option<&'b ast::Expr>)>,
+    /// (key expr, func id, kind, auto-accessor setter func id) per computed member.
+    pub computed: Vec<(&'b ast::Expr, u32, u8, Option<u32>)>,
+    /// (key expr, initializer, is_static) per computed-key FIELD.
+    pub computed_fields: Vec<(&'b ast::Expr, Option<&'b ast::Expr>, bool)>,
+    pub static_block_fns: Vec<u32>,
+    /// Source order of STATIC elements: (0=named field, 1=computed field,
+    /// 2=static block) -> index into its vec.
+    pub static_order: Vec<(u8, usize)>,
+    pub steps: Vec<ClassStep<'b>>,
+    /// Parallel to `static_fields`: the decorated-element index of that field.
+    pub dec_static_named: Vec<Option<u16>>,
+    /// Parallel to `computed_fields`: same.
+    pub dec_computed: Vec<Option<u16>>,
+    /// Whether the class carries any decorator at all (class or element).
+    pub has_dec: bool,
+    /// Source order of INSTANCE fields: (0 = named field, 1 = computed field)
+    /// -> index into its vec. The two used to be emitted as two back-to-back
+    /// loops, so `class C { [a] = 1; b = 2 }` ran `b`'s initializer before
+    /// `a`'s; this is the instance twin of `static_order`, which never had that
+    /// bug.
+    pub instance_order: Vec<(u8, usize)>,
+}
+
 /// Shared, mutable upvalue list of a function: (name, where-the-cell-comes-from).
 /// Shared via `Rc<RefCell>` so a deeply-nested function can append upvalues to
 /// an ancestor (transitive capture): an intermediate function that only *passes

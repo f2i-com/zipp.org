@@ -173,7 +173,7 @@ impl<'p> Vm<'p> {
         // object (arr_props) — not only a plain Object.
         let keys: Vec<String> = match self.heap.get(pidx) {
             HeapObj::Object(m) => enum_keys(m),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                 self.fn_props.get(&pidx).map(enum_keys).unwrap_or_default()
             }
             // A boxed String (e.g. `Object.create(O, "abc")` → ToObject) exposes its

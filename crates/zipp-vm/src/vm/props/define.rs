@@ -554,7 +554,7 @@ impl<'p> Vm<'p> {
         let target = match self.heap.get(idx) {
             HeapObj::Object(_) => 0u8,
             HeapObj::Class(_) => 1,
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => 2,
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => 2,
             HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
                 return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
             }

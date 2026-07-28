@@ -1363,7 +1363,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Cons { .. } => {
                     self.heap.str_cow(v.heap_index()).map(|c| c.into_owned()).unwrap_or_default()
                 }
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                     "function".into()
                 }
                 HeapObj::Cell(inner) => self.display(*inner),
@@ -1538,7 +1538,7 @@ impl<'p> Vm<'p> {
                     format!("[Function: {name}]")
                 }
             }
-            HeapObj::Native(_) => "[Function (native)]".into(),
+            HeapObj::Native(_) | HeapObj::NativeClosure { .. } => "[Function (native)]".into(),
             HeapObj::Cell(inner) => self.inspect_nested(*inner),
             HeapObj::EvalScope(_) => "[object EvalScope]".into(),
             HeapObj::Array(items) => {

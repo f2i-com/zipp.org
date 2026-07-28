@@ -205,6 +205,45 @@ pub enum Instr {
     /// in registers `keys_base..keys_base+n` (each ToPropertyKey-coerced) — used
     /// when an object-rest pattern has a computed sibling key (`{[k]: a, ...r}`).
     ObjectRestDyn { dst: Reg, src: Reg, keys_base: Reg, n: u16 },
+    /// Record the evaluated ClassElementName of decorated element `elem` into the
+    /// class's `DecState::keys`, so `context.name` is the very String/Symbol the
+    /// key expression produced. Emitted only for a COMPUTED decorated key (a
+    /// static one is already in `DecElemDef::name`); the key is ToPropertyKey'd
+    /// by the member/field op that consumes the same register, so this op only
+    /// stores what it is given.
+    DecKey { class: Reg, elem: u16, key: Reg, class_id: u32 },
+    /// Apply decorated element `elem`'s decorators — the `argc` values in
+    /// `[arg_base, arg_base+argc)`, in REVERSE list order (`@a @b m(){}` calls
+    /// `b` first and passes its result to `a`) — and write the results back:
+    /// a method/getter/setter's replacement onto the class, a field's or
+    /// auto-accessor's returned initializer into `DecState::field_inits[elem]`.
+    DecElem { class: Reg, elem: u16, arg_base: Reg, argc: u16, class_id: u32 },
+    /// Apply the class's own decorators (the `argc` values in `[arg_base,
+    /// arg_base+argc)`, reverse order) to the class in `class`, leaving the
+    /// possibly-replaced value in `class`. Runs after every element is decorated
+    /// and BEFORE the static field initializers, so `@dec class C { static x = 1 }`
+    /// initializes `x` on the class the decorator returned.
+    DecClass { class: Reg, arg_base: Reg, argc: u16 },
+    /// Run one of the class's `addInitializer` lists with `this` set to the
+    /// receiver. `which`: 0 = instance METHOD/getter/setter list (receiver =
+    /// reg 0, the new object; emitted at the head of the constructor's / field
+    /// thunk's element initialization), 1 = static method/getter/setter list
+    /// (receiver = the class in `recv`, after class decoration and before the
+    /// static field initializers), 2 = class (receiver = the class, the very last
+    /// step of ClassDefinitionEvaluation), 3 = the PER-ELEMENT list of decorated
+    /// element `elem` (a field or auto-accessor), run immediately after that one
+    /// element has been defined — `elem` is ignored for 0/1/2.
+    ///
+    /// `class_id` names the class whose `DecState` holds the list; for the
+    /// instance form it is resolved through `class_values` exactly as `FieldInit`
+    /// resolves a computed field key.
+    DecInits { class_id: u32, which: u8, elem: u16, recv: Reg },
+    /// Pipe a decorated field's initial value through the initializer chain the
+    /// element's decorators returned: `val = init(val)` with `this` = `recv`, in
+    /// chain order (innermost decorator first). A no-op when no decorator
+    /// returned an initializer, which is why the undecorated field path never
+    /// grows a branch.
+    DecField { class_id: u32, elem: u16, val: Reg, recv: Reg },
     /// `dst = <the class value for classes[class_id]>` — materialize a class.
     /// `parent` is the register holding the superclass value (`extends P`), or
     /// `None`; the new class links to it for inherited lookup + instanceof.
@@ -1351,6 +1390,48 @@ pub struct ClassDef {
     /// instance list because a static private's brand lives on the class
     /// VALUE, not on instances (kind bit 8 at MakeClass registration).
     pub static_field_names: Vec<String>,
+    /// The class's decorators, or `None` when it has none — which is every class
+    /// in practically all existing code, so the whole decoration path is gated on
+    /// one `Option` check rather than on empty `Vec`s.
+    pub dec_plan: Option<Box<DecPlan>>,
+}
+
+/// The compile-time shape of a decorated class: what is decorated and how many
+/// decorators each element carries. The decorator VALUES are not here — they are
+/// arbitrary expressions evaluated at class-definition time into registers.
+#[derive(Clone, Debug, Default)]
+pub struct DecPlan {
+    /// `@a @b class C {}` → 2. Their values are evaluated BEFORE the heritage
+    /// (DecoratorList of a ClassDeclaration is evaluated before ClassTail) and
+    /// applied after every element is decorated and installed.
+    pub class_decorators: u32,
+    /// Decorated class ELEMENTS in DOCUMENT order (the order their decorator
+    /// expressions and keys must be evaluated in).
+    pub elements: Vec<DecElemDef>,
+}
+
+/// One decorated class element.
+#[derive(Clone, Debug)]
+pub struct DecElemDef {
+    /// 0 = method, 1 = getter, 2 = setter, 3 = field, 4 = auto-accessor.
+    pub kind: u8,
+    pub is_static: bool,
+    pub is_private: bool,
+    /// The element's static key, `#`-prefixed for a private name. Empty when the
+    /// key is computed — the runtime then reads `DecState::keys[i]`, which the
+    /// `DecKey` op filled when the key expression was evaluated.
+    pub name: String,
+    pub computed: bool,
+    /// The element's key was WRITTEN as a computed well-known-symbol
+    /// (`[Symbol.iterator]`) and constant-folded to the engine's reserved
+    /// `"@@iterator"` spelling. `context.name` must be handed the Symbol, but a
+    /// string-literal key that merely spells `"@@iterator"` must not be — the two
+    /// are indistinguishable from `name` alone.
+    pub sym_key: bool,
+    /// For an auto-accessor: the unspellable private backing slot the get/set pair
+    /// reads and writes (`#accessor@N`), which is the storage a returned `init`
+    /// initializer feeds and what `access.get/set` must touch.
+    pub storage: String,
 }
 
 /// The eight possible results of JS `typeof`, indexed by `TypeOfIs::code`.

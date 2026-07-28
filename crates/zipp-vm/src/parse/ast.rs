@@ -491,6 +491,10 @@ pub struct Class {
     pub superclass: Option<Box<Expr>>,
     pub body: Vec<ClassMember>,
     pub span: Span,
+    /// `@a @b class C {}` — the class's own DecoratorList, in source order.
+    /// Evaluated BEFORE the heritage (a ClassDeclaration's DecoratorList is
+    /// evaluated before its ClassTail) and applied last, in reverse.
+    pub decorators: Vec<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,6 +511,10 @@ pub struct ClassMethod {
     pub kind: MethodKind,
     pub func: Box<Function>,
     pub is_static: bool,
+    /// The element's DecoratorList in source order (empty when undecorated).
+    /// Never non-empty for `MethodKind::Constructor` — decorating a constructor
+    /// is an early SyntaxError, enforced in `parse_class_member`.
+    pub decorators: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -529,6 +537,8 @@ pub struct ClassField {
     /// early errors see a single element under `key` — `accessor #x` declares
     /// `#x` exactly once — and so a COMPUTED key is evaluated exactly once.
     pub accessor: Option<Box<AutoAccessor>>,
+    /// The element's DecoratorList in source order (empty when undecorated).
+    pub decorators: Vec<Expr>,
 }
 
 /// The get/set pair an auto-accessor desugars to. Both bodies are synthesized

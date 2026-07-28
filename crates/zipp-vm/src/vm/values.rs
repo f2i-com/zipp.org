@@ -228,7 +228,7 @@ impl<'p> Vm<'p> {
                 // Function-object descriptor).
                 if matches!(
                     self.heap.get(idx),
-                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
+                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                 ) && self.fn_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
                 {
                     return true;
@@ -279,7 +279,7 @@ impl<'p> Vm<'p> {
                         HeapObj::Func(_)
                         | HeapObj::Closure { .. }
                         | HeapObj::Bound { .. }
-                        | HeapObj::Native(_) => self.fn_proto,
+                        | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self.fn_proto,
                         HeapObj::Boxed { kind: 0, .. } => self.str_proto,
                         HeapObj::Boxed { kind: 1, .. } => self.num_proto,
                         HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
@@ -1036,7 +1036,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Func(_)
                     | HeapObj::Closure { .. }
                     | HeapObj::Bound { .. }
-                    | HeapObj::Native(_) => self.fn_proto,
+                    | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self.fn_proto,
                     HeapObj::Boxed { kind: 0, .. } => self.str_proto,
                     HeapObj::Boxed { kind: 1, .. } => self.num_proto,
                     HeapObj::Boxed { kind: 2, .. } => self.bool_proto,

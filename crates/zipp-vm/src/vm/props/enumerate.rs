@@ -276,7 +276,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_)
                     | HeapObj::Closure { .. }
                     | HeapObj::Bound { .. }
-                    | HeapObj::Native(_)
+                    | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
             )
         {
             let idx = obj.heap_index();
@@ -377,7 +377,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }
                 | HeapObj::Bound { .. }
-                | HeapObj::Native(_) => match self.fn_props.get(&obj.heap_index()) {
+                | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => match self.fn_props.get(&obj.heap_index()) {
                     Some(m) => spec_key_order(&m.keys)
                         .into_iter()
                         .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))

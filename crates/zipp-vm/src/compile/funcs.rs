@@ -389,8 +389,26 @@ impl<'a> FnCompiler<'a> {
     /// `cls`: evaluate `extends`, `MakeClass`, then install static fields and
     /// computed-key members. Shared by class declarations and class expressions.
     pub(crate) fn build_class_into(&mut self, class: &ast::Class, cls: Reg, name: Option<&str>) -> R<()> {
-        let (class_id, static_fields, computed, computed_fields, static_block_fns, static_order) =
-            self.compile_class(class, name)?;
+        let CompiledClass {
+            class_id,
+            static_fields,
+            computed,
+            computed_fields,
+            static_block_fns,
+            static_order,
+            steps,
+            dec_static_named,
+            dec_computed,
+            has_dec,
+            instance_order: _,
+        } = self.compile_class(class, name)?;
+        // The CLASS's own DecoratorList is evaluated FIRST — before the heritage.
+        // `ClassDeclaration : DecoratorList class BindingIdentifier ClassTail`
+        // evaluates the list, then ClassTail (which is where `extends` lives), so
+        // `@log class C extends (side(), P) {}` calls `log`'s expression before
+        // `side()`. The values must survive the whole class body, so their
+        // registers are allocated once here and never reclaimed until the end.
+        let class_decs = self.eval_decorator_list(&class.decorators)?;
         // Evaluate the superclass value (`extends P`) into a temp the VM links in.
         let parent_reg = if let Some(sc) = &class.superclass {
             let t = self.temp();
@@ -434,65 +452,139 @@ impl<'a> FnCompiler<'a> {
         if parent_reg.is_some() {
             self.next_reg -= 1; // reclaim the parent temp
         }
-        // PHASE 1 — evaluate every ClassElementName in source position: computed
-        // member keys install the members; computed FIELD keys evaluate ONCE
-        // (an instance key parks on the class for the ctor's FieldInit; a
-        // static key parks in a register that phase 2 consumes).
-        for (key, func, kind, pair) in &computed {
-            let save = self.next_reg;
-            let Some(sfid) = pair else {
-                let kr = self.expr(key)?;
-                self.emit(Instr::ClassAddMember {
-                    class: cls,
-                    key: kr,
-                    func: *func,
-                    kind: *kind,
-                });
-                self.next_reg = save;
-                continue;
-            };
-            // An auto-accessor installs TWO members from ONE ClassElementName,
-            // so `accessor [k] = v` must evaluate `k` once AND ToPropertyKey it
-            // once — a key whose `toString` counts calls sees exactly one. The
-            // key goes into a fresh temp (`expr` may hand back a live local's
-            // register) so the KEY_WRITEBACK bit can leave the coerced key
-            // there for the setter's instruction to reuse.
-            let kt = self.temp();
-            let v = self.expr_into(key, kt)?;
-            if v != kt {
-                self.emit(Instr::Move { dst: kt, src: v });
+        // PHASE 1 — walk the class elements in DOCUMENT order, evaluating each
+        // one's DecoratorList and then its ClassElementName. Computed member keys
+        // install the members; computed FIELD keys evaluate ONCE (an instance key
+        // parks on the class for the ctor's FieldInit; a static key parks in a
+        // register that phase 2 consumes).
+        //
+        // Document order matters twice over: a decorator expression must run
+        // immediately before its own element's key, and the two key kinds used to
+        // be driven by two separate loops — so `class C { [a] = 1; [b](){} }`
+        // evaluated `b` before `a`.
+        let mut parked: Vec<Option<Reg>> = vec![None; computed_fields.len()];
+        // (decoration group, element index, decorator register block) for phase 1b.
+        let mut elem_decs: Vec<(u8, u16, Reg, u16)> = Vec::new();
+        for step in &steps {
+            // The element's decorators FIRST (spec ClassElementEvaluation:
+            // DecoratorListEvaluation precedes the key).
+            let (dbase, dn) = self.eval_decorator_list(step.decorators)?;
+            if let Some(elem) = step.dec_elem {
+                elem_decs.push((step.dec_group, elem, dbase, dn));
             }
-            self.emit(Instr::ClassAddMember {
-                class: cls,
-                key: kt,
-                func: *func,
-                kind: *kind | KEY_WRITEBACK,
-            });
-            self.emit(Instr::ClassAddMember {
-                class: cls,
-                key: kt,
-                func: *sfid,
-                kind: if *kind == 4 { 5 } else { 2 },
-            });
-            self.next_reg = save;
-        }
-        let mut parked: Vec<Option<Reg>> = Vec::with_capacity(computed_fields.len());
-        for (key, _init, is_static) in &computed_fields {
-            if *is_static {
-                // Survives until phase 2 (not reclaimed).
-                let kr = self.temp();
-                let v = self.expr_into(key, kr)?;
-                if v != kr {
-                    self.emit(Instr::Move { dst: kr, src: v });
+            match step.key {
+                StepKey::None => {}
+                StepKey::Member(i) => {
+                    let (key, func, kind, pair) = &computed[i];
+                    let save = self.next_reg;
+                    // A DECORATED element needs its resolved key at decoration
+                    // time (`context.name`), which only a temp can carry — and
+                    // `DecKey` ToPropertyKeys in place, so the member op below
+                    // consumes an already-coerced key and the element's
+                    // ToPropertyKey still runs exactly once observably.
+                    let needs_temp = pair.is_some() || step.dec_elem.is_some();
+                    if !needs_temp {
+                        let kr = self.expr(key)?;
+                        self.emit(Instr::ClassAddMember {
+                            class: cls,
+                            key: kr,
+                            func: *func,
+                            kind: *kind,
+                        });
+                        self.next_reg = save;
+                        continue;
+                    }
+                    // An auto-accessor installs TWO members from ONE
+                    // ClassElementName, so `accessor [k] = v` must evaluate `k`
+                    // once AND ToPropertyKey it once — a key whose `toString`
+                    // counts calls sees exactly one. The key goes into a fresh
+                    // temp (`expr` may hand back a live local's register) so the
+                    // KEY_WRITEBACK bit can leave the coerced key there for the
+                    // setter's instruction to reuse.
+                    let kt = self.temp();
+                    let v = self.expr_into(key, kt)?;
+                    if v != kt {
+                        self.emit(Instr::Move { dst: kt, src: v });
+                    }
+                    if let Some(elem) = step.dec_elem {
+                        self.emit(Instr::DecKey { class: cls, elem, key: kt, class_id });
+                    }
+                    self.emit(Instr::ClassAddMember {
+                        class: cls,
+                        key: kt,
+                        func: *func,
+                        kind: *kind | if pair.is_some() { KEY_WRITEBACK } else { 0 },
+                    });
+                    if let Some(sfid) = pair {
+                        self.emit(Instr::ClassAddMember {
+                            class: cls,
+                            key: kt,
+                            func: *sfid,
+                            kind: if *kind == 4 { 5 } else { 2 },
+                        });
+                    }
+                    self.next_reg = save;
                 }
-                parked.push(Some(kr));
-            } else {
-                let save = self.next_reg;
-                let kr = self.expr(key)?;
-                self.emit(Instr::PushFieldKey { class: cls, key: kr });
-                self.next_reg = save;
-                parked.push(None);
+                StepKey::Field(i) => {
+                    let (key, _init, is_static) = &computed_fields[i];
+                    if *is_static {
+                        // Survives until phase 2 (not reclaimed).
+                        let kr = self.temp();
+                        let v = self.expr_into(key, kr)?;
+                        if v != kr {
+                            self.emit(Instr::Move { dst: kr, src: v });
+                        }
+                        if let Some(elem) = step.dec_elem {
+                            self.emit(Instr::DecKey { class: cls, elem, key: kr, class_id });
+                        }
+                        parked[i] = Some(kr);
+                    } else {
+                        let save = self.next_reg;
+                        let kr = match step.dec_elem {
+                            // `DecKey` writes the coerced key back, so it needs a
+                            // temp it may clobber.
+                            Some(elem) => {
+                                let kt = self.temp();
+                                let v = self.expr_into(key, kt)?;
+                                if v != kt {
+                                    self.emit(Instr::Move { dst: kt, src: v });
+                                }
+                                self.emit(Instr::DecKey { class: cls, elem, key: kt, class_id });
+                                kt
+                            }
+                            None => self.expr(key)?,
+                        };
+                        self.emit(Instr::PushFieldKey { class: cls, key: kr });
+                        self.next_reg = save;
+                    }
+                }
             }
+        }
+        // PHASE 1b — APPLY the element decorators. A second pass, because
+        // ClassDefinitionEvaluation evaluates every element (decorators + key +
+        // method) before decorating any of them.
+        //
+        // The pass runs in FOUR GROUPS, not document order: static non-fields,
+        // instance non-fields, static fields, instance fields — the four separate
+        // loops the spec spells out. A stable sort keeps document order inside
+        // each group. Flat document order is observably different the moment a
+        // class mixes a decorated field with a decorated method, and it is what
+        // Babel's 2023-11 transform and TypeScript's __esDecorate both produce.
+        elem_decs.sort_by_key(|&(group, ..)| group);
+        for (_, elem, dbase, dn) in elem_decs {
+            self.emit(Instr::DecElem { class: cls, elem, arg_base: dbase, argc: dn, class_id });
+        }
+        // PHASE 1c — the CLASS decorators, then the static `addInitializer`
+        // callbacks. Both precede the static field initializers: a class
+        // decorator may REPLACE the class, and `@dec class C { static x = 1 }`
+        // must put `x` on the replacement (which is what `cls` now holds).
+        if has_dec {
+            self.emit(Instr::DecClass {
+                class: cls,
+                arg_base: class_decs.0,
+                argc: class_decs.1,
+            });
+            self.emit(Instr::DecInits { class_id, which: 1, elem: 0, recv: cls });
         }
         // PHASE 2 — run the STATIC field initializers and `static {}` blocks in
         // SOURCE order (spec ClassDefinitionEvaluation: one interleaved list; an
@@ -539,8 +631,27 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::LoadConst { dst: kr, idx: cidx });
                         self.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
                     }
+                    // A decorated static field's value goes through the
+                    // initializer chain its decorators returned, with `this` =
+                    // the class (which by now is the DECORATED class).
+                    let v = match dec_static_named.get(idx).copied().flatten() {
+                        Some(elem) => {
+                            let t = self.temp();
+                            self.emit(Instr::Move { dst: t, src: v });
+                            self.emit(Instr::DecField { class_id, elem, val: t, recv: cls });
+                            t
+                        }
+                        None => v,
+                    };
                     let name_idx = self.string_name(fname);
                     self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
+                    // InitializeFieldOrAccessor: this element's OWN
+                    // `addInitializer` callbacks run once it is defined and
+                    // before the next static element, so `this[name]` is already
+                    // set and the following static field is not.
+                    if let Some(elem) = dec_static_named.get(idx).copied().flatten() {
+                        self.emit(Instr::DecInits { class_id, which: 3, elem, recv: cls });
+                    }
                     self.next_reg = save;
                 }
                 1 => {
@@ -570,9 +681,21 @@ impl<'a> FnCompiler<'a> {
                     self.super_static = prev_ss;
                     self.cx.in_strict = prev_strict;
                     self.this_override = None;
+                    let vr = match dec_computed.get(idx).copied().flatten() {
+                        Some(elem) => {
+                            let t = self.temp();
+                            self.emit(Instr::Move { dst: t, src: vr });
+                            self.emit(Instr::DecField { class_id, elem, val: t, recv: cls });
+                            t
+                        }
+                        None => vr,
+                    };
                     // A static field may not be named `prototype` (TypeError); the
                     // op ToPropertyKeys the (already-evaluated) key and checks it.
                     self.emit(Instr::ClassStaticField { class: cls, key: kr, val: vr });
+                    if let Some(elem) = dec_computed.get(idx).copied().flatten() {
+                        self.emit(Instr::DecInits { class_id, which: 3, elem, recv: cls });
+                    }
                     self.next_reg = save;
                 }
                 _ => {
@@ -595,8 +718,87 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
+        // The class `addInitializer` callbacks are the LAST step of
+        // ClassDefinitionEvaluation — the point at which the class is fully
+        // defined (decorated, with its static elements initialized), which is
+        // exactly the guarantee the proposal gives them.
+        if has_dec {
+            self.emit(Instr::DecInits { class_id, which: 2, elem: 0, recv: cls });
+        }
         self.cx.private_names_stack.pop();
         Ok(())
+    }
+
+    /// Evaluate a DecoratorList left to right into a CONTIGUOUS register block of
+    /// PAIRS — `[fn0, recv0, fn1, recv1, …]` — returning `(base, count)` where
+    /// count is the number of decorators. The block is allocated up front so a
+    /// decorator's own scratch registers cannot land between two of them, and it
+    /// is deliberately NOT reclaimed: a class decorator's value has to survive
+    /// the entire class body, and an element's has to survive until the
+    /// decoration pass.
+    ///
+    /// `recv` is the decorator's `[[Receiver]]`. DecoratorEvaluation keeps the
+    /// REFERENCE it evaluated, and ApplyDecorators calls through it, so `@a.b`
+    /// invokes `b` as a method of `a` — `this` inside it is `a`, not undefined.
+    /// Only a Reference has a base, so a bare `@a` and a `@a.b()` call (whose
+    /// Evaluation produces a value) get `undefined`.
+    fn eval_decorator_list(&mut self, list: &[ast::Expr]) -> R<(Reg, u16)> {
+        if list.is_empty() {
+            return Ok((0, 0));
+        }
+        let base = self.next_reg;
+        for _ in 0..list.len() * 2 {
+            self.temp();
+        }
+        let floor = self.next_reg;
+        for (i, d) in list.iter().enumerate() {
+            self.next_reg = floor;
+            let dst = base + (i * 2) as Reg;
+            let recv = dst + 1;
+            // `@(a.b)` parses to the same Member node as `@a.b` — the
+            // parenthesized production covers a MemberExpression, so it keeps the
+            // reference too. `super.x` and an optional chain are excluded: neither
+            // can appear in the Decorator grammar, and `super`'s receiver is not
+            // its object expression.
+            let bound = match d {
+                ast::Expr::Member(m)
+                    if !m.optional && !matches!(m.object, ast::Expr::Super) =>
+                {
+                    let o = self.expr_into(&m.object, recv)?;
+                    if o != recv {
+                        self.emit(Instr::Move { dst: recv, src: o });
+                    }
+                    match &m.prop {
+                        ast::MemberProp::Ident(p) => {
+                            let name = self.string_name(p);
+                            self.emit(Instr::GetProp { dst, obj: recv, name });
+                        }
+                        ast::MemberProp::Private(p) => {
+                            self.check_private_declared(p)?;
+                            let name = self.string_name(&private_key(p));
+                            self.emit(Instr::GetProp { dst, obj: recv, name });
+                        }
+                        ast::MemberProp::Computed(k) => {
+                            let save = self.next_reg;
+                            let kr = self.expr(k)?;
+                            self.emit(Instr::GetIndex { dst, obj: recv, key: kr });
+                            self.next_reg = save;
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if !bound {
+                let v = self.expr(d)?;
+                if v != dst {
+                    self.emit(Instr::Move { dst, src: v });
+                }
+                self.emit(Instr::LoadUndefined { dst: recv });
+            }
+        }
+        self.next_reg = floor;
+        Ok((base, list.len() as u16))
     }
 
     /// A class expression (`let C = class { … }`, `x = class extends B {}`):
@@ -617,14 +819,7 @@ impl<'a> FnCompiler<'a> {
         &mut self,
         class: &'b ast::Class,
         name: Option<&str>,
-    ) -> R<(
-        u32,
-        Vec<(String, Option<&'b ast::Expr>)>,
-        Vec<(&'b ast::Expr, u32, u8, Option<u32>)>,
-        Vec<(&'b ast::Expr, Option<&'b ast::Expr>, bool)>,
-        Vec<u32>,
-        Vec<(u8, usize)>,
-    )> {
+    ) -> R<CompiledClass<'b>> {
         // A named class expression keeps its own name; an anonymous one inherits
         // the binding it's assigned to (NamedEvaluation), else the "<class>" stub.
         let cname = class
@@ -652,6 +847,7 @@ impl<'a> FnCompiler<'a> {
             source: String::new(), // filled in below once the body is compiled
             instance_field_names: Vec::new(),
             static_field_names: Vec::new(),
+            dec_plan: None,
         });
         self.cx.class_names.push((cname.clone(), class_id));
         // The methods/ctor/field-inits of this class close over the function that
@@ -722,6 +918,78 @@ impl<'a> FnCompiler<'a> {
         // do.
         let mut computed: Vec<(&'b ast::Expr, &'b ast::Function, u8, Option<&'b ast::Function>)> =
             Vec::new();
+        // ── decorators ──
+        // `plan` collects one DecElemDef per decorated element, in document
+        // order; `steps` records for each element what class-definition-time work
+        // it needs (its decorator expressions and/or its computed key), also in
+        // document order. `dec_*` map a decorated FIELD back to its element index
+        // so the constructor's initializer sequence can find its chain.
+        let mut plan = crate::bytecode::DecPlan {
+            class_decorators: class.decorators.len() as u32,
+            elements: Vec::new(),
+        };
+        let mut steps: Vec<ClassStep<'b>> = Vec::new();
+        let mut dec_named: Vec<Option<u16>> = Vec::new();
+        let mut dec_static_named: Vec<Option<u16>> = Vec::new();
+        let mut dec_computed: Vec<Option<u16>> = Vec::new();
+        let mut dec_instance_computed: Vec<Option<u16>> = Vec::new();
+        // Source order of the INSTANCE field lists — the twin of `static_order`,
+        // so a decorated or undecorated `[a] = 1; b = 2` initializes a then b.
+        let mut instance_order: Vec<(u8, usize)> = Vec::new();
+        // Push a `DecElemDef` for the element about to be compiled and return its
+        // index, or `None` when it carries no decorators. `computed` is only a
+        // GUESS here — `class_key_name` folds `["a"]`, `[1]` and
+        // `[Symbol.iterator]` to a compile-time name, and such an element takes
+        // the static-name path (no `DecKey` op). `dec_fix_key!` below corrects it
+        // once the branch that consumed the key has run.
+        macro_rules! dec_elem {
+            ($kind:expr, $is_static:expr, $key:expr, $decs:expr, $storage:expr) => {{
+                if $decs.is_empty() {
+                    None
+                } else {
+                    let (nm, computed) = match class_key_name($key) {
+                        Ok(n) if computed_key($key).is_none() => (n, false),
+                        _ => (String::new(), true),
+                    };
+                    plan.elements.push(crate::bytecode::DecElemDef {
+                        kind: $kind,
+                        is_static: $is_static,
+                        is_private: nm.starts_with('#')
+                            || matches!($key, ast::PropKey::Private(_)),
+                        name: nm,
+                        computed,
+                        sym_key: false,
+                        storage: $storage,
+                    });
+                    Some((plan.elements.len() - 1) as u16)
+                }
+            }};
+        }
+        // Settle a decorated element's key AFTER its branch has run: `went`
+        // records whether the element actually took the computed path. A folded
+        // literal key (`@dec ["m"]() {}`) did not, and marking it computed left
+        // the runtime reading an unset `DecState::keys` slot — `context.name`
+        // came out `undefined` and a method decorator's replacement was installed
+        // under the key "undefined", i.e. silently dropped.
+        macro_rules! dec_fix_key {
+            ($de:expr, $key:expr, $went:expr) => {
+                if let Some(ix) = $de {
+                    if !$went {
+                        let nm = class_key_name($key).unwrap_or_default();
+                        let e = &mut plan.elements[ix as usize];
+                        e.is_private = nm.starts_with('#');
+                        // Only `[Symbol.x]` — a computed MEMBER expression —
+                        // folds to a Symbol. A `"@@x"` string key, computed or
+                        // not, is a string key that merely spells the engine's
+                        // internal convention, and `context.name` must say so.
+                        e.sym_key = nm.starts_with("@@")
+                            && matches!($key, ast::PropKey::Computed(ast::Expr::Member(_)));
+                        e.name = nm;
+                        e.computed = false;
+                    }
+                }
+            };
+        }
         // NOTE: `ClassMember` has exactly three variants (Method / Field /
         // StaticBlock), so the old trailing `_ => Err("unsupported class member
         // in the zipp-vm subset")` arm is gone — it would now be an unreachable
@@ -747,6 +1015,14 @@ impl<'a> FnCompiler<'a> {
                         ast::MethodKind::Method if m.is_static => 3u8,
                         ast::MethodKind::Method => 0u8,
                     };
+                    let dkind = match m.kind {
+                        ast::MethodKind::Get => crate::vm::decorators::DK_GETTER,
+                        ast::MethodKind::Set => crate::vm::decorators::DK_SETTER,
+                        _ => crate::vm::decorators::DK_METHOD,
+                    };
+                    let de =
+                        dec_elem!(dkind, m.is_static, &m.key, m.decorators, String::new());
+                    let computed_before = computed.len();
                     match class_key_name(&m.key) {
                         Ok(name) => {
                             // A public INSTANCE member takes (or keeps) its
@@ -820,6 +1096,22 @@ impl<'a> FnCompiler<'a> {
                             computed.push((key, &*m.func, kind, None));
                         }
                     }
+                    let went = computed.len() != computed_before;
+                    dec_fix_key!(de, &m.key, went);
+                    // Only elements with class-definition-time work get a step:
+                    // a decorator list, a computed key, or both.
+                    if de.is_some() || went {
+                        steps.push(ClassStep {
+                            decorators: &m.decorators,
+                            dec_elem: de,
+                            dec_group: if m.is_static { 0 } else { 1 },
+                            key: if went {
+                                StepKey::Member(computed_before)
+                            } else {
+                                StepKey::None
+                            },
+                        });
+                    }
                 }
                 // `accessor x = v` — the auto-accessor of proposal-decorators.
                 // One element, three pieces: a private backing FIELD (same
@@ -832,11 +1124,27 @@ impl<'a> FnCompiler<'a> {
                 ast::ClassMember::Field(p) if p.accessor.is_some() => {
                     let acc = p.accessor.as_ref().unwrap();
                     let slot = private_key(&acc.storage);
+                    // An auto-accessor decorator's returned `init` feeds the
+                    // BACKING SLOT, not the public key — so the element index is
+                    // recorded against the private field, which is always a
+                    // statically-named one even when the accessor's key is
+                    // computed.
+                    let de = dec_elem!(
+                        crate::vm::decorators::DK_ACCESSOR,
+                        p.is_static,
+                        &p.key,
+                        p.decorators,
+                        slot.clone()
+                    );
+                    let computed_before = computed.len();
                     if p.is_static {
                         static_fields.push((slot, p.value.as_ref()));
+                        dec_static_named.push(de);
                         static_order.push((0, static_fields.len() - 1));
                     } else {
                         fields.push((slot, p.value.as_ref()));
+                        dec_named.push(de);
+                        instance_order.push((0, fields.len() - 1));
                     }
                     match class_key_name(&p.key) {
                         Ok(name) => {
@@ -876,8 +1184,33 @@ impl<'a> FnCompiler<'a> {
                             computed.push((key, &*acc.getter, kind, Some(&*acc.setter)));
                         }
                     }
+                    let went = computed.len() != computed_before;
+                    dec_fix_key!(de, &p.key, went);
+                    if de.is_some() || went {
+                        steps.push(ClassStep {
+                            decorators: &p.decorators,
+                            dec_elem: de,
+                            // An auto-accessor is an ~accessor~ element, which
+                            // ClassDefinitionEvaluation decorates in the NON-field
+                            // loop even though its storage is a field.
+                            dec_group: if p.is_static { 0 } else { 1 },
+                            key: if went {
+                                StepKey::Member(computed_before)
+                            } else {
+                                StepKey::None
+                            },
+                        });
+                    }
                 }
                 ast::ClassMember::Field(p) => {
+                    let de = dec_elem!(
+                        crate::vm::decorators::DK_FIELD,
+                        p.is_static,
+                        &p.key,
+                        p.decorators,
+                        String::new()
+                    );
+                    let cf_before = computed_fields_ordered.len();
                     match class_key_name(&p.key) {
                         // A COMPUTED key whose literal folds to a "#..." STRING
                         // is a PUBLIC property that merely looks private — route it
@@ -888,10 +1221,14 @@ impl<'a> FnCompiler<'a> {
                             let key = computed_key(&p.key)
                                 .ok_or("unsupported computed class field key")?;
                             computed_fields_ordered.push((key, p.value.as_ref(), p.is_static));
+                            dec_computed.push(de);
                             if p.is_static {
                                 static_order.push((1, computed_fields_ordered.len() - 1));
                             } else {
                                 instance_computed_inits.push(p.value.as_ref());
+                                dec_instance_computed.push(de);
+                                instance_order
+                                    .push((1, instance_computed_inits.len() - 1));
                             }
                         }
                         // A COMPUTED static key whose literal folds to "prototype" is
@@ -907,25 +1244,49 @@ impl<'a> FnCompiler<'a> {
                             let key = computed_key(&p.key)
                                 .ok_or("unsupported computed class field key")?;
                             computed_fields_ordered.push((key, p.value.as_ref(), true));
+                            dec_computed.push(de);
                             static_order.push((1, computed_fields_ordered.len() - 1));
                         }
                         // Static string key.
                         Ok(name) if p.is_static => {
                             static_fields.push((name, p.value.as_ref()));
+                            dec_static_named.push(de);
                             static_order.push((0, static_fields.len() - 1));
                         }
                         // Instance string key.
-                        Ok(name) => fields.push((name, p.value.as_ref())),
+                        Ok(name) => {
+                            fields.push((name, p.value.as_ref()));
+                            dec_named.push(de);
+                            instance_order.push((0, fields.len() - 1));
+                        }
                         // Computed key `[expr] = v` — evaluated once at class def.
                         Err(e) => {
                             let Some(key) = computed_key(&p.key) else { return Err(e) };
                             computed_fields_ordered.push((key, p.value.as_ref(), p.is_static));
+                            dec_computed.push(de);
                             if p.is_static {
                                 static_order.push((1, computed_fields_ordered.len() - 1));
                             } else {
                                 instance_computed_inits.push(p.value.as_ref());
+                                dec_instance_computed.push(de);
+                                instance_order
+                                    .push((1, instance_computed_inits.len() - 1));
                             }
                         }
+                    }
+                    let went = computed_fields_ordered.len() != cf_before;
+                    dec_fix_key!(de, &p.key, went);
+                    if de.is_some() || went {
+                        steps.push(ClassStep {
+                            decorators: &p.decorators,
+                            dec_elem: de,
+                            dec_group: if p.is_static { 2 } else { 3 },
+                            key: if went {
+                                StepKey::Field(cf_before)
+                            } else {
+                                StepKey::None
+                            },
+                        });
                     }
                 }
                 ast::ClassMember::StaticBlock(b) => {
@@ -977,11 +1338,13 @@ impl<'a> FnCompiler<'a> {
                 Some(&func.params),
                 &[],
                 &[],
+                &[],
                 body,
                 super_class_id,
                 false, // instance method: super resolves via the prototype chain
                 func.is_generator,
                 func.is_async,
+                None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
             let fid = self.cx.functions.len() as u32;
@@ -1003,11 +1366,13 @@ impl<'a> FnCompiler<'a> {
                 Some(&func.params),
                 &[],
                 &[],
+                &[],
                 body,
                 super_class_id,
                 false, // instance getter: super resolves via the prototype chain
                 false, // getters are never generators
                 false, // getters are never async
+                None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
             let fid = self.cx.functions.len() as u32;
@@ -1029,11 +1394,13 @@ impl<'a> FnCompiler<'a> {
                 Some(&func.params),
                 &[],
                 &[],
+                &[],
                 body,
                 super_class_id,
                 false, // instance setter: super resolves via the prototype chain
                 false, // setters are never generators
                 false, // setters are never async
+                None,
             )?;
             proto.source = self.cx.src_slice(func.span.start, func.span.end);
             let fid = self.cx.functions.len() as u32;
@@ -1051,11 +1418,13 @@ impl<'a> FnCompiler<'a> {
                 Some(&func.params),
                 &[],
                 &[],
+                &[],
                 body,
                 super_class_id,
                 true, // static method: `super.x` resolves via the class's [[Prototype]] (parent class)
                 func.is_generator,
                 func.is_async,
+                None,
             )?;
             proto.source =
                 method_source(self.cx.src_slice(func.span.start, func.span.end), true);
@@ -1078,11 +1447,13 @@ impl<'a> FnCompiler<'a> {
                 Some(&func.params),
                 &[],
                 &[],
+                &[],
                 body,
                 super_class_id,
                 true, // static getter: `super.x` resolves via the class's [[Prototype]]
                 false,
                 false,
+                None,
             )?;
             proto.source =
                 method_source(self.cx.src_slice(func.span.start, func.span.end), true);
@@ -1104,11 +1475,13 @@ impl<'a> FnCompiler<'a> {
                 Some(&func.params),
                 &[],
                 &[],
+                &[],
                 body,
                 super_class_id,
                 true, // static setter: `super.x` resolves via the class's [[Prototype]]
                 false,
                 false,
+                None,
             )?;
             proto.source =
                 method_source(self.cx.src_slice(func.span.start, func.span.end), true);
@@ -1139,12 +1512,39 @@ impl<'a> FnCompiler<'a> {
         let defer_fields = has_explicit_ctor;
         let empty_fields = Vec::new();
         let empty_cinits = Vec::new();
-        let (ctor_fields, ctor_cinits) = if defer_fields {
-            (&empty_fields, &empty_cinits)
+        let empty_order: Vec<(u8, usize)> = Vec::new();
+        let (ctor_fields, ctor_cinits, ctor_order) = if defer_fields {
+            (&empty_fields, &empty_cinits, &empty_order)
         } else {
-            (&fields, &instance_computed_inits)
+            (&fields, &instance_computed_inits, &instance_order)
         };
-        let ctor = if has_explicit_ctor || !fields.is_empty() || !instance_computed_inits.is_empty() {
+        // The decorator side of instance element initialization. `run_inits` also
+        // FORCES a ctor/thunk to exist: `@dec m(){}` with no fields at all still
+        // needs somewhere to run the instance `addInitializer` callbacks from.
+        // Only METHOD-ish elements feed `instanceMethodExtraInitializers`; a
+        // decorated field or auto-accessor already has a field entry (so a thunk
+        // exists) and runs its own callbacks from its `DecInits{which:3}`.
+        let run_inits = plan.elements.iter().any(|e| {
+            !e.is_static
+                && !matches!(
+                    e.kind,
+                    crate::vm::decorators::DK_FIELD | crate::vm::decorators::DK_ACCESSOR
+                )
+        });
+        let dec_plan_fields = (!plan.elements.is_empty()).then(|| DecFieldPlan {
+            class_id,
+            named: &dec_named,
+            computed: &dec_instance_computed,
+            run_inits,
+        });
+        // With an explicit ctor the fields moved to the thunk, and so did the
+        // extra-initializer run — the thunk IS InitializeInstanceElements there.
+        let ctor_dec = if defer_fields { None } else { dec_plan_fields.as_ref() };
+        let ctor = if has_explicit_ctor
+            || !fields.is_empty()
+            || !instance_computed_inits.is_empty()
+            || (run_inits && !defer_fields)
+        {
             let (params, rest, body) = match ctor_fn {
                 Some(f) => function_parts(f)?,
                 None => (Vec::new(), None, &[][..]),
@@ -1158,11 +1558,13 @@ impl<'a> FnCompiler<'a> {
                 params_ast,
                 ctor_fields,
                 ctor_cinits,
+                ctor_order,
                 body,
                 super_class_id,
                 false, // a constructor's super is the instance prototype chain
                 false, // a constructor is never a generator
                 false, // a constructor is never async
+                ctor_dec,
             )?;
             if let Some(cf) = ctor_fn {
                 proto.source = self.cx.src_slice(cf.span.start, cf.span.end);
@@ -1174,7 +1576,7 @@ impl<'a> FnCompiler<'a> {
             None
         };
         let field_thunk = if defer_fields
-            && (!fields.is_empty() || !instance_computed_inits.is_empty())
+            && (!fields.is_empty() || !instance_computed_inits.is_empty() || run_inits)
         {
             let proto = self.cx.compile_class_fn(
                 &format!("{cname}.<instance_fields>"),
@@ -1183,11 +1585,13 @@ impl<'a> FnCompiler<'a> {
                 None,
                 &fields,
                 &instance_computed_inits,
+                &instance_order,
                 &[],
                 super_class_id,
                 false, // instance fields: super via the instance prototype chain
                 false,
                 false,
+                dec_plan_fields.as_ref(),
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1210,11 +1614,13 @@ impl<'a> FnCompiler<'a> {
                     Some(&f.params),
                     &[],
                     &[],
+                    &[],
                     body,
                     super_class_id,
                     is_static, // static computed members get the parent-class super base
                     f.is_generator,
                     f.is_async,
+                    None,
                 )?;
                 proto.source =
                     method_source(self.cx.src_slice(f.span.start, f.span.end), is_static);
@@ -1276,11 +1682,13 @@ impl<'a> FnCompiler<'a> {
                 None,
                 &[],
                 &[],
+                &[],
                 body,
                 super_class_id,
                 true, // a static block's `super.x` resolves via the class's [[Prototype]]
                 false,
                 false,
+                None,
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1312,10 +1720,24 @@ impl<'a> FnCompiler<'a> {
             source: self.cx.src_slice(class.span.start, class.span.end),
             instance_field_names,
             static_field_names,
+            dec_plan: (plan.class_decorators > 0 || !plan.elements.is_empty())
+                .then(|| Box::new(plan.clone())),
         };
         self.cx.class_enclosing = saved_enclosing;
         self.cx.class_derived = saved_derived;
-        Ok((class_id, static_fields, computed_defs, computed_fields_ordered, static_block_fns, static_order))
+        Ok(CompiledClass {
+            class_id,
+            static_fields,
+            computed: computed_defs,
+            computed_fields: computed_fields_ordered,
+            static_block_fns,
+            static_order,
+            steps,
+            dec_static_named,
+            dec_computed,
+            has_dec: plan.class_decorators > 0 || !plan.elements.is_empty(),
+            instance_order,
+        })
     }
 
     /// The enclosing-function chain to hand a function nested in THIS one: our

@@ -1281,6 +1281,7 @@ mod helpers_json;
 pub(crate) mod helpers_num2;
 mod gc;
 mod ic;
+pub(crate) mod decorators;
 
 pub(crate) use bigint::*;
 pub(crate) use ic::{GetAct, SetAct, RET_DISCARD};

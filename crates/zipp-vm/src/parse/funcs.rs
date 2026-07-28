@@ -403,11 +403,91 @@ impl<'s> Parser<'s> {
         Ok(Pattern::Object { props, rest })
     }
 
+    // ---- decorators --------------------------------------------------------
+
+    /// `DecoratorList : DecoratorList_opt Decorator` — every `@…` at the current
+    /// position, in SOURCE order (which is also their evaluation order).
+    ///
+    /// `Decorator` is deliberately NOT `LeftHandSideExpression`: the grammar
+    /// admits only three shapes, so `@a[b]`, `@a.b(1).c` and `@a\`t\`` have no
+    /// parse at all and must stay SyntaxErrors rather than becoming runtime
+    /// TypeErrors.
+    pub(crate) fn parse_decorators(&mut self) -> PResult<Vec<Expr>> {
+        let mut out = Vec::new();
+        while self.at(Punct::At) {
+            self.bump_before_operand()?; // `@` — an operand follows
+            out.push(self.parse_decorator()?);
+        }
+        Ok(out)
+    }
+
+    /// The DecoratorList for a ClassDeclaration about to be parsed: either one
+    /// left pending by `@dec export …` or one written right here (`export @dec
+    /// class …`). Returns the offset of its first `@` (so the class's
+    /// [[SourceText]] can start there) or `None` when there are no decorators.
+    pub(crate) fn take_class_decorators(&mut self) -> PResult<(Option<u32>, Vec<Expr>)> {
+        if let Some((at, list)) = self.pending_class_decorators.take() {
+            return Ok((Some(at), list));
+        }
+        if self.at(Punct::At) {
+            let at = self.cur().span.start;
+            return Ok((Some(at), self.parse_decorators()?));
+        }
+        Ok((None, Vec::new()))
+    }
+
+    /// One `Decorator`:
+    ///   `@ DecoratorMemberExpression`         — `a`, `a.b`, `a.#p`, `a.b.c`
+    ///   `@ DecoratorParenthesizedExpression`  — `( Expression )`
+    ///   `@ DecoratorCallExpression`           — `a.b(args)`
+    fn parse_decorator(&mut self) -> PResult<Expr> {
+        if self.at(Punct::LParen) {
+            // `@ ( Expression )` — the one form that admits arbitrary syntax.
+            // Parsed as the full comma-Expression the production names, so
+            // `@(a, b)` takes `b`; the `[In]` restriction of an enclosing `for`
+            // head does not reach inside the parens.
+            self.bump_before_operand()?;
+            let saved_in = self.ctx.in_;
+            self.ctx.in_ = true;
+            let e = self.parse_expr()?;
+            self.ctx.in_ = saved_in;
+            self.expect(Punct::RParen, false)?;
+            return Ok(e);
+        }
+        // DecoratorMemberExpression: an IdentifierReference followed by any
+        // number of `.IdentifierName` / `.PrivateIdentifier` hops.
+        let (name, _) = self.binding_ident_or_reference()?;
+        let mut e = Expr::Ident(name);
+        while self.at(Punct::Dot) {
+            self.bump_after_operand()?;
+            let prop = self.member_prop_public()?;
+            e = Expr::Member(Box::new(Member { object: e, prop, optional: false }));
+        }
+        // …optionally ONE argument list, and nothing after it: `@a.b(1)` is a
+        // DecoratorCallExpression, `@a(1).b` and `@a(1)(2)` are not.
+        if self.at(Punct::LParen) {
+            let args = self.parse_args_public()?;
+            e = Expr::Call(Box::new(CallExpr { callee: e, args, optional: false }));
+        }
+        Ok(e)
+    }
+
     // ---- classes -----------------------------------------------------------
 
     /// A class after its `class` keyword. A class body is ALWAYS strict, even
     /// inside sloppy code.
     pub(crate) fn parse_class_rest(&mut self, start: u32) -> PResult<Class> {
+        self.parse_class_rest_dec(start, Vec::new())
+    }
+
+    /// `parse_class_rest` for a class that carried a DecoratorList before its
+    /// `class` keyword (already parsed by the caller, since the list is what
+    /// told the caller a class was coming).
+    pub(crate) fn parse_class_rest_dec(
+        &mut self,
+        start: u32,
+        decorators: Vec<Expr>,
+    ) -> PResult<Class> {
         let saved_strict = self.ctx.strict;
         self.ctx.strict = true;
 
@@ -465,7 +545,13 @@ impl<'s> Parser<'s> {
         self.ctx.in_ = saved_in;
         self.ctx.strict = saved_strict;
         Self::check_class_body(&body, body_end)?;
-        Ok(Class { name, superclass, body, span: Span::new(start, self.prev_end()) })
+        Ok(Class {
+            name,
+            superclass,
+            body,
+            span: Span::new(start, self.prev_end()),
+            decorators,
+        })
     }
 
     /// §15.7.1 ClassBody early errors, plus §15.4.1's constructor rules. All of
@@ -582,7 +668,50 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_class_member(&mut self, derived: bool) -> PResult<ClassMember> {
+        let dec_start = self.cur().span.start;
+        // `ClassElement : DecoratorList_opt static_opt MethodDefinition` — the
+        // list precedes `static`, and a ClassStaticBlock has no DecoratorList
+        // production at all.
+        let decorators = self.parse_decorators()?;
+        // The member's [[SourceText]] starts at the `static`/name, not at the
+        // decorators: `Function.prototype.toString` on a decorated method returns
+        // the MethodDefinition, and `method_source`'s `static ` strip below
+        // assumes the slice begins there.
         let start = self.cur().span.start;
+        let mut m = self.parse_class_member_inner(derived, start)?;
+        if !decorators.is_empty() {
+            match &mut m {
+                ClassMember::Method(cm) => {
+                    // §15.7.1: `It is a Syntax Error if … ClassElement is
+                    // DecoratorList MethodDefinition and PropName of
+                    // MethodDefinition is "constructor"`. Decorating the
+                    // constructor has no meaning — the class decorator is the
+                    // hook for the whole class.
+                    if cm.kind == MethodKind::Constructor {
+                        return Err(SyntaxError::new(
+                            "SyntaxError: a class constructor may not be decorated",
+                            dec_start,
+                        ));
+                    }
+                    cm.decorators = decorators;
+                }
+                ClassMember::Field(cf) => cf.decorators = decorators,
+                ClassMember::StaticBlock(_) => {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: a class static block may not be decorated",
+                        dec_start,
+                    ))
+                }
+            }
+        }
+        Ok(m)
+    }
+
+    fn parse_class_member_inner(
+        &mut self,
+        derived: bool,
+        start: u32,
+    ) -> PResult<ClassMember> {
         let is_static = if self.at_kw(Keyword::Static) {
             let save = self.save();
             self.bump_after_operand()?;
@@ -668,6 +797,7 @@ impl<'s> Parser<'s> {
                         kind,
                         func: Box::new(func),
                         is_static,
+                        decorators: Vec::new(),
                     }));
                 }
                 self.restore(save);
@@ -708,6 +838,7 @@ impl<'s> Parser<'s> {
                 kind: if is_ctor { MethodKind::Constructor } else { MethodKind::Method },
                 func: Box::new(func),
                 is_static,
+                decorators: Vec::new(),
             }));
         }
 
@@ -729,7 +860,7 @@ impl<'s> Parser<'s> {
             None
         };
         self.semicolon()?;
-        Ok(ClassMember::Field(ClassField { key, value, is_static, accessor: None }))
+        Ok(ClassMember::Field(ClassField { key, value, is_static, accessor: None, decorators: Vec::new() }))
     }
 
     /// The `[Await]` parameter for a FieldDefinition's Initializer.
@@ -819,6 +950,7 @@ impl<'s> Parser<'s> {
                 getter: Box::new(getter),
                 setter: Box::new(setter),
             })),
+            decorators: Vec::new(),
         }))
     }
 

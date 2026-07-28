@@ -1326,6 +1326,93 @@ pub struct ClassData {
     /// class evaluation a distinct private-name identity (so two classes that both
     /// declare `#m` don't collide). 0 = unbranded.
     pub private_brand: u64,
+    /// The compile-time class id this value was materialized from — the same id
+    /// `MakeClass` and the decorator ops carry. Lets running code identify WHICH
+    /// evaluation of a class it belongs to (`class_values` only remembers the
+    /// most recent one).
+    pub class_id: u32,
+    /// Live decoration state, allocated by `MakeClass` only when the class's
+    /// `ClassDef` carries a decorator plan. `None` for every undecorated class
+    /// (i.e. all of them today), so nothing on the hot class path pays for it.
+    pub dec: Option<Box<DecState>>,
+}
+
+/// The per-EVALUATION decoration state of a decorated class: what the decorator
+/// calls produced, read back by the field-initializer and extra-initializer ops.
+///
+/// Lives on `ClassData` rather than beside the compile-time `ClassDef` because
+/// every entry here is a `Value` produced by USER code at class-definition time —
+/// two evaluations of the same `class` source have different ones.
+#[derive(Clone, Debug)]
+pub struct DecState {
+    /// Per decorated element (indexed by its position in
+    /// `ClassDef::dec_plan.elements`): `elementRecord.[[Initializers]]`, i.e. the
+    /// initializer chain the element's field / auto-accessor decorators returned.
+    /// The spec PREPENDS each one, so the OUTERMOST decorator's initializer ends
+    /// up first and runs first: `@a @b x = V` yields `b(a(V))`. Applied left to
+    /// right to the field's initial value with `this` = the receiver. Empty for a
+    /// method/getter/setter.
+    pub field_inits: Vec<Vec<Value>>,
+    /// Per decorated element: `elementRecord.[[ExtraInitializers]]` — the
+    /// `addInitializer` callbacks of a FIELD or ACCESSOR element. These are
+    /// per-element, not shared: InitializeFieldOrAccessor runs them with
+    /// `this` = the receiver immediately AFTER that one element is defined, so a
+    /// `@dec x` initializer sees `this.x` already set (and a later field not yet).
+    pub elem_extra: Vec<Vec<Value>>,
+    /// Per decorated element: the ToPropertyKey'd key, recorded when the element's
+    /// ClassElementName is evaluated. A computed key is not knowable at compile
+    /// time, and `context.name` must be the very Symbol/String the key evaluated to.
+    pub keys: Vec<Value>,
+    /// `instanceMethodExtraInitializers`: the `addInitializer` callbacks of
+    /// INSTANCE METHOD / GETTER / SETTER elements only. Run with `this` = the new
+    /// instance at the head of instance element initialization, before any field.
+    pub instance_extra: Vec<Value>,
+    /// `staticMethodExtraInitializers`: same, for STATIC method/getter/setter
+    /// elements. Run with `this` = the (decorated) class after class decoration
+    /// and before the static field initializers.
+    pub static_extra: Vec<Value>,
+    /// …and from the CLASS decorators, run with `this` = the (decorated) class
+    /// after static elements — the last step of ClassDefinitionEvaluation.
+    pub class_extra: Vec<Value>,
+    /// The class's `[Symbol.metadata]` object, shared by every `context.metadata`
+    /// of this evaluation (decorator-metadata proposal). Its [[Prototype]] is the
+    /// superclass's own metadata object, so a subclass's decorators read through
+    /// to the base class's metadata. `UNDEFINED` until MakeClass creates it.
+    pub metadata: Value,
+    /// The `decorationState.[[Finished]]` guard, as a GENERATION counter.
+    ///
+    /// The spec creates a FRESH `decorationState` per decorator call and finishes
+    /// it the instant that decorator returns, so a context object stashed by one
+    /// decorator is already closed when the NEXT one runs — not merely when the
+    /// class is done. Each `addInitializer` closure captures the generation it was
+    /// built at; the counter is bumped after every decorator call, so a stale
+    /// context's `addInitializer` throws a TypeError exactly when the spec says.
+    pub gen: u32,
+    /// The value a class decorator returned in place of the class, or `UNDEFINED`
+    /// when the class was not replaced. `LoadClassValue` resolves the class's own
+    /// INNER binding through this: ClassDefinitionEvaluation performs
+    /// `classEnv.InitializeBinding(classBinding, F)` AFTER `F` is set to the
+    /// decorated value, so `class C { static who() { return C } }` under
+    /// `@replace` must see the replacement, not the class it was handed.
+    pub replacement: Value,
+}
+
+impl DecState {
+    /// Sized for `n` decorated elements, so `field_inits`/`keys` can be indexed
+    /// by element index without bounds juggling at every use site.
+    pub fn new(n: usize) -> Self {
+        DecState {
+            field_inits: vec![Vec::new(); n],
+            elem_extra: vec![Vec::new(); n],
+            keys: vec![Value::UNDEFINED; n],
+            instance_extra: Vec::new(),
+            static_extra: Vec::new(),
+            class_extra: Vec::new(),
+            metadata: Value::UNDEFINED,
+            gen: 0,
+            replacement: Value::UNDEFINED,
+        }
+    }
 }
 
 /// Boxed payload of a [`HeapObj::AsyncState`] (see that variant's docs). Boxed for
@@ -1612,6 +1699,22 @@ pub enum HeapObj {
     /// `Object.defineProperty`, `Array.isArray`, `Object.prototype.hasOwnProperty`,
     /// `Function.prototype.call`, etc. when accessed as values (not just called).
     Native(u16),
+    /// A built-in function that CARRIES STATE: a native id plus the `Value`s it
+    /// closes over (`Vm::call_native_closure` receives both).
+    ///
+    /// `Native` is a bare id, so every stateful builtin this engine has needed so
+    /// far became its OWN `HeapObj` variant (`BoundResolver`, `CombinatorResolver`)
+    /// — each costing ~18 arms across typeof / IsCallable / ToPrimitive /
+    /// Object.prototype.toString / property access / GC trace / three call-dispatch
+    /// fast paths. This is the general form: a new stateful builtin now costs one
+    /// arm of `call_native_closure` and nothing else. Introduced for the decorator
+    /// context's `addInitializer` and `access.{has,get,set}`, which are per-element
+    /// closures over the class value, the element name and its kind.
+    ///
+    /// `name`/`length` are the CreateBuiltinFunction values (the spec names these
+    /// closures — "addInitializer", "get", "set", "has"), since a state-carrying
+    /// native has no entry in the static `native::static_name_length` table.
+    NativeClosure { id: u16, state: Vec<Value>, name: &'static str, length: u8 },
     /// A dense array.
     Array(Vec<Value>),
     /// A plain object.

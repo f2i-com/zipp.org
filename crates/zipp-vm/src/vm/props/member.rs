@@ -335,6 +335,11 @@ impl<'p> Vm<'p> {
             HeapObj::BoundResolver { .. } | HeapObj::CombinatorResolver { .. } => {
                 Some((String::new(), 1.0))
             }
+            // CreateBuiltinFunction(closure, length, name, …) — a state-carrying
+            // builtin carries both inline, since it has no static-table entry.
+            HeapObj::NativeClosure { name, length, .. } => {
+                Some(((*name).to_string(), *length as f64))
+            }
             HeapObj::Class(c) => {
                 let len = c
                     .ctor
@@ -462,7 +467,7 @@ impl<'p> Vm<'p> {
         let is_class = matches!(self.heap.get(fi), HeapObj::Class(_));
         let is_callable = matches!(
             self.heap.get(fi),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
         );
         if !is_class && !is_callable {
             return;
@@ -534,7 +539,7 @@ impl<'p> Vm<'p> {
                     || c.static_getters.iter().any(|(k, _)| k == key)
                     || c.static_setters.iter().any(|(k, _)| k == key)
             }
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                 self.fn_props.get(&idx).is_some_and(|m| m.pos(key).is_some())
             }
             _ => false,
@@ -1695,7 +1700,7 @@ impl<'p> Vm<'p> {
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
             _ if matches!(
                 self.heap.get(obj.heap_index()),
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
             ) =>
             {
                 // An own property in the fn_props bag (incl. an explicitly defined

@@ -978,11 +978,15 @@ impl Compiler {
         params_ast: Option<&ast::Params>,
         fields: &[(String, Option<&ast::Expr>)],
         computed_inits: &[Option<&ast::Expr>],
+        // `field_order`: source order of the two field lists — (0 = `fields`,
+        // 1 = `computed_inits`) -> index. Empty when there are no instance fields.
+        field_order: &[(u8, usize)],
         body: &[ast::Stmt],
         super_class: Option<u32>,
         super_static: bool,
         is_generator: bool,
         is_async: bool,
+        dec: Option<&DecFieldPlan<'_>>,
     ) -> R<FuncProto> {
         check_params_yield_await(params_ast, is_generator, is_async)?;
         // A nested closure in the method body may capture the method's own
@@ -1088,11 +1092,29 @@ impl Compiler {
         if is_generator {
             fc.emit(Instr::GenStart);
         }
-        // Instance field initializers: `this.field = expr` (this = reg 0).
-        // `arguments` is an early SyntaxError inside an initializer (and in any
-        // direct eval / arrow it contains).
-        for (fname, finit) in fields {
+        // InitializeInstanceElements: `constructor.[[Initializers]]` — the
+        // `addInitializer` callbacks of this class's decorated instance METHODS,
+        // getters and setters — run with `this` = the new object at the HEAD of
+        // instance element initialization, before any field. (A `@bound` method's
+        // initializer must be able to run before a field initializer that reads
+        // the bound method.) A decorated FIELD or ACCESSOR's callbacks are not in
+        // this list: they run right after their own element, below.
+        if let Some(d) = dec.filter(|d| d.run_inits) {
+            fc.emit(Instr::DecInits { class_id: d.class_id, which: 0, elem: 0, recv: 0 });
+        }
+        // Instance field initializers in SOURCE order (`this.field = expr`, this =
+        // reg 0). `arguments` is an early SyntaxError inside an initializer (and
+        // in any direct eval / arrow it contains).
+        for &(which, i) in field_order {
             let save = fc.next_reg;
+            // A named field carries its own key; a computed one took its key at
+            // class-definition time and is stored positionally on the class.
+            let (fname, finit, dec_elem) = if which == 0 {
+                let (n, e) = &fields[i];
+                (Some(n), *e, dec.and_then(|d| d.named.get(i).copied().flatten()))
+            } else {
+                (None, computed_inits[i], dec.and_then(|d| d.computed.get(i).copied().flatten()))
+            };
             let v = match finit {
                 Some(e) => {
                     fc.cx.in_field_init = true;
@@ -1107,41 +1129,62 @@ impl Compiler {
                 }
             };
             // NamedEvaluation for anonymous initializers (incl. "#field" names).
-            if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
-                let kr = fc.temp();
-                let idx = fc.add_string_const(fname);
-                fc.emit(Instr::LoadConst { dst: kr, idx });
-                fc.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
+            if let Some(fname) = fname {
+                if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
+                    let kr = fc.temp();
+                    let idx = fc.add_string_const(fname);
+                    fc.emit(Instr::LoadConst { dst: kr, idx });
+                    fc.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
+                }
             }
-            let name_idx = fc.string_name(fname);
-            // DefineField (CreateDataPropertyOrThrow) for PUBLIC fields — never
-            // a [[Set]] (an inherited setter must not run; a Proxy receiver's
-            // defineProperty trap must). Private "#fields" keep the plain store
-            // (private semantics bypass proxies entirely).
-            if fname.starts_with('#') {
-                fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v });
-            } else {
-                fc.emit(Instr::DefineField { obj: 0, name: name_idx, val: v });
-            }
-            fc.next_reg = save;
-        }
-        // Computed instance fields (`[k] = v`): the key was evaluated at class
-        // definition and stored on the class; init the i-th here as `this[key]=v`.
-        for (i, finit) in computed_inits.iter().enumerate() {
-            let save = fc.next_reg;
-            let v = match finit {
-                Some(e) => fc.expr(e)?,
-                None => {
+            // A decorated field's value passes through whatever initializers its
+            // decorators returned before it is defined. `DecField` writes back
+            // through its `val` operand, so the value is first copied into a
+            // temp — `fc.expr` may have handed back a live LOCAL's register.
+            let v = match dec_elem {
+                Some(elem) => {
                     let t = fc.temp();
-                    fc.emit(Instr::LoadUndefined { dst: t });
+                    fc.emit(Instr::Move { dst: t, src: v });
+                    fc.emit(Instr::DecField {
+                        class_id: dec.unwrap().class_id,
+                        elem,
+                        val: t,
+                        recv: 0,
+                    });
                     t
                 }
+                None => v,
             };
-            fc.emit(Instr::FieldInit {
-                key_index: i as u16,
-                val: v,
-                class_id: fc.super_class.unwrap_or(u32::MAX),
-            });
+            match fname {
+                // DefineField (CreateDataPropertyOrThrow) for PUBLIC fields —
+                // never a [[Set]] (an inherited setter must not run; a Proxy
+                // receiver's defineProperty trap must). Private "#fields" keep
+                // the plain store (private semantics bypass proxies entirely).
+                Some(fname) => {
+                    let name_idx = fc.string_name(fname);
+                    if fname.starts_with('#') {
+                        fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v });
+                    } else {
+                        fc.emit(Instr::DefineField { obj: 0, name: name_idx, val: v });
+                    }
+                }
+                None => fc.emit(Instr::FieldInit {
+                    key_index: i as u16,
+                    val: v,
+                    class_id: fc.super_class.unwrap_or(u32::MAX),
+                }),
+            }
+            // InitializeFieldOrAccessor runs the element's OWN extraInitializers
+            // last, so a `@dec x` initializer observes `this.x` already set and
+            // the NEXT field still absent.
+            if let Some(elem) = dec_elem {
+                fc.emit(Instr::DecInits {
+                    class_id: dec.unwrap().class_id,
+                    which: 3,
+                    elem,
+                    recv: 0,
+                });
+            }
             fc.next_reg = save;
         }
         // …and only now the parameter prologue, when the base-class field

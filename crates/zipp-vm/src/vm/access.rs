@@ -53,7 +53,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }
                 | HeapObj::Class(_)
-                | HeapObj::Native(_)
+                | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                 | HeapObj::Bound { .. }
                 | HeapObj::Wrapped { .. }
                 | HeapObj::BoundResolver { .. }
@@ -340,7 +340,7 @@ impl<'p> Vm<'p> {
         // (defineProperties/15.2.3.7-6-a-12's verifyProperty deletion probe).
         if matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
         ) {
             if let Some(m) = self.fn_props.get(&idx) {
                 if let Some(p) = m.pos(key) {
@@ -378,7 +378,7 @@ impl<'p> Vm<'p> {
             }
             // A function's assigned own property (`delete fn.x`) — the
             // non-configurable case already returned false above.
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                 self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key))
             }
             // Every other exotic heap kind (TypedArray, DataView, ArrayBuffer,
@@ -1134,7 +1134,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
             // An Array's named props — and an exotic object's defineProperty'd own
             // props (Map/Set/Date/Promise/…) — live in the arr_props side table.
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::Class(_) => None,
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::Class(_) => None,
             _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attrs[i])),
         };
         if let Some(a) = own_attr {
@@ -1199,7 +1199,7 @@ impl<'p> Vm<'p> {
         // function props live in fn_props, so check via has_own_property).
         || (matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
         ) && !self.has_own_property(obj, key));
         if needs_proto_walk {
             match self.proto_chain_set(idx, key, val, obj)? {
@@ -1243,7 +1243,7 @@ impl<'p> Vm<'p> {
         // lives in a side table (functions carry no inline property map).
         if matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
         ) {
             // `caller`/`arguments` on a restricted function (anything but a legacy
             // sloppy ordinary one) are the inherited %ThrowTypeError% accessors —

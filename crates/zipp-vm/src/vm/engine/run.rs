@@ -374,6 +374,14 @@ impl<'p> Vm<'p> {
                 }
                 return self.call_native(id, this, args);
             }
+            // A state-carrying builtin (a decorator context's `addInitializer` /
+            // `access.get` / …): the captured state is cloned out before the call
+            // so the heap is not borrowed across it — the closure body re-enters
+            // the VM (it calls user code) and may allocate or GC.
+            if let HeapObj::NativeClosure { id, state, .. } = self.heap.get(callee.heap_index()) {
+                let (id, state) = (*id, state.clone());
+                return self.call_native_closure(id, &state, this, args);
+            }
         }
         // A native resolve/reject function settles its bound promise.
         if callee.is_heap() {

@@ -305,6 +305,19 @@ pub const ANNEXB_REF_ERROR_NAME: &str = "__zipp_annexb_ref_error__";
 /// natives added by ongoing engine work.
 pub const HOST_CALL: u16 = 950;
 pub const HOST_CALL_NAME: &str = "__zippHostCall";
+
+// ── decorator context closures (proposal-decorators) ────────────────────────
+// Each is a `HeapObj::NativeClosure`, not a bare `Native`: they close over the
+// class value, the element key and the element's kind, which a stateless native
+// id cannot carry. See `Vm::call_native_closure`.
+/// `context.addInitializer(fn)` — state: [class, which(0=inst/1=static/2=class)].
+pub const DEC_ADD_INITIALIZER: u16 = 940;
+/// `context.access.get(target)` — state: [class, key, isPrivate, isStatic].
+pub const DEC_ACCESS_GET: u16 = 941;
+/// `context.access.set(target, value)` — same state as DEC_ACCESS_GET.
+pub const DEC_ACCESS_SET: u16 = 942;
+/// `context.access.has(target)` — same state as DEC_ACCESS_GET.
+pub const DEC_ACCESS_HAS: u16 = 943;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -750,6 +763,10 @@ pub const WELL_KNOWN_SYMBOLS: &[(&str, &str)] = &[
     ("unscopables", "@@unscopables"),
     ("dispose", "@@dispose"),
     ("asyncDispose", "@@asyncDispose"),
+    // decorator-metadata: `C[Symbol.metadata]` is where a decorated class's
+    // shared metadata object is published, and `context.metadata` is what the
+    // decorators write into it.
+    ("metadata", "@@metadata"),
 ];
 // Math methods as first-class values: id = MATH_METHOD_BASE + index into
 // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the

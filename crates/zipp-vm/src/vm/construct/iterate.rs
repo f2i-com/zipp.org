@@ -348,7 +348,7 @@ impl<'p> Vm<'p> {
         }
         v.is_heap()
             && match self.heap.get(v.heap_index()) {
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                     true
                 }
                 // The native resolve/reject functions (new Promise executor args,
@@ -466,7 +466,7 @@ impl<'p> Vm<'p> {
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
-            | HeapObj::Native(_)
+            | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
             | HeapObj::BoundResolver { .. }
             | HeapObj::CombinatorResolver { .. } => {
                 self.fn_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
@@ -592,7 +592,7 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
-            | HeapObj::Native(_) => self
+            | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self
                 .fn_props
                 .get(&obj.heap_index())
                 .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))

@@ -370,7 +370,7 @@ impl<'p> Vm<'p> {
                 }
             }
             // A function's assigned own properties (`fn.x = y`).
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                 // A legacy sloppy function's own `caller`/`arguments`: a LIVE
                 // value read from the stack, reported with the fixed attributes
                 // engines give them (nothing about them is writable or
@@ -625,7 +625,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. }
-                | HeapObj::Native(_) => {
+                | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                     // length, name, then prototype are created at function-definition
                     // time, so they keep their chronological-FIRST position even after
                     // a defineProperty moves the override into the fn_props bag (which
@@ -775,7 +775,7 @@ impl<'p> Vm<'p> {
                 // Callables keep their own props in fn_props; every other exotic
                 // heap kind (TypedArray, DataView, Map, Date, ...) keeps them in
                 // arr_props — surface their "@@" symbol keys too.
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => self
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self
                     .fn_props
                     .get(&obj.heap_index())
                     .map_or(Vec::new(), |m| {
@@ -976,7 +976,7 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::BoundResolver { .. }
             | HeapObj::CombinatorResolver { .. }
-            | HeapObj::Native(_) => (None, false, 1),
+            | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => (None, false, 1),
             HeapObj::Array(_) => (None, false, 2),
             _ => (None, false, 3),
         };

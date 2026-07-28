@@ -534,6 +534,15 @@ impl Vm<'_> {
                 }
                 m_val!(*this_val);
             }
+            // A NativeClosure's whole point is the `Value`s it captured — a
+            // decorator context's `addInitializer` holds the class value, its
+            // `access.get` holds the class and the key. Missing this arm sweeps
+            // the class out from under a context object the user kept.
+            HeapObj::NativeClosure { state, .. } => {
+                for &v in state {
+                    m_val!(v);
+                }
+            }
             HeapObj::Cell(v) => m_val!(*v),
             HeapObj::EvalScope(m) => {
                 for v in m.values() {
@@ -662,6 +671,32 @@ impl Vm<'_> {
                 }
                 for &u in &c.field_thunk_upvalues {
                     m_idx!(u);
+                }
+                // Decoration state: every entry is a user-supplied Value the
+                // class still owes work to (field-initializer chains that run at
+                // the next `new`, addInitializer callbacks, the resolved keys and
+                // the metadata object). Unreachable from anywhere else once the
+                // defining frame has returned.
+                if let Some(d) = &c.dec {
+                    for chain in d.field_inits.iter().chain(d.elem_extra.iter()) {
+                        for &v in chain {
+                            m_val!(v);
+                        }
+                    }
+                    for &v in d
+                        .keys
+                        .iter()
+                        .chain(d.instance_extra.iter())
+                        .chain(d.static_extra.iter())
+                        .chain(d.class_extra.iter())
+                    {
+                        m_val!(v);
+                    }
+                    m_val!(d.metadata);
+                    // The decorated class is reachable from the ORIGINAL only
+                    // through here once the defining frame has returned — but
+                    // `LoadClassValue` still resolves the inner binding to it.
+                    m_val!(d.replacement);
                 }
                 if let Some(p) = c.parent {
                     m_idx!(p);

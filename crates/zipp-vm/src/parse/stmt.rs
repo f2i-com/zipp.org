@@ -62,6 +62,37 @@ impl<'s> Parser<'s> {
     ///
     /// `import` is also an EXPRESSION (`import(spec)`, `import.meta`), so the
     /// declaration form is only taken when the next token cannot continue one.
+    /// `@dec export class C {}` / `@dec export default class {}` — the caller has
+    /// already consumed the DecoratorList and now asks whether an `export`
+    /// follows. Returns `None` (leaving the list with the caller) when it does
+    /// not, so a plain `@dec class C {}` still takes the caller's own path.
+    fn parse_module_decl_decorated(
+        &mut self,
+        start: u32,
+        decorators: &[Expr],
+    ) -> PResult<Option<Stmt>> {
+        if self.goal != Goal::Module
+            || !self.scopes.at_module_top_level()
+            || !self.at_kw(Keyword::Export)
+        {
+            return Ok(None);
+        }
+        self.pending_class_decorators = Some((start, decorators.to_vec()));
+        let pos = self.cur().span.start;
+        self.bump_after_operand()?;
+        let r = self.parse_export_rest(pos)?;
+        // A DecoratorList before `export something-that-is-not-a-class` has no
+        // production; the class arms below CONSUME the pending list, so anything
+        // still sitting here means it never reached one.
+        if let Some((at, _)) = self.pending_class_decorators.take() {
+            return Err(SyntaxError::new(
+                "SyntaxError: decorators must precede a class",
+                at,
+            ));
+        }
+        Ok(Some(Stmt::Export(Box::new(r))))
+    }
+
     fn parse_module_decl(&mut self) -> PResult<Option<Stmt>> {
         if self.goal != Goal::Module {
             return Ok(None);
@@ -351,11 +382,17 @@ impl<'s> Parser<'s> {
                 }
                 self.restore(save);
             }
-            if self.at_kw(Keyword::Class) {
-                let cstart = self.cur().span.start;
-                self.bump_after_operand()?;
-                let c = self.parse_class_rest(cstart)?;
-                return Ok(ExportDecl::Default(ExportDefault::Class(Box::new(c))));
+            // `export default @dec class {}` — the list may also have preceded
+            // `export`, in which case `pending_class_decorators` already holds it.
+            if self.at(Punct::At) || self.at_kw(Keyword::Class) {
+                let (cstart, decorators) = self.take_class_decorators()?;
+                if self.at_kw(Keyword::Class) {
+                    let cstart = cstart.unwrap_or_else(|| self.cur().span.start);
+                    self.bump_after_operand()?;
+                    let c = self.parse_class_rest_dec(cstart, decorators)?;
+                    return Ok(ExportDecl::Default(ExportDefault::Class(Box::new(c))));
+                }
+                return Err(self.err_here("SyntaxError: decorators must precede a class"));
             }
             let e = self.parse_assign_full()?;
             self.semicolon()?;
@@ -463,6 +500,26 @@ impl<'s> Parser<'s> {
         // here through the Block, and the brace is what makes it a declaration
         // again rather than an Annex B clause.
         self.stmt_pos = StmtPos::ListItem;
+        // `ClassDeclaration : DecoratorList_opt class …`. The DecoratorList is the
+        // only thing that can start a statement with `@`, so seeing one commits to
+        // a class declaration (or a decorated `export`, handled by
+        // `parse_module_decl` once the list is parsed).
+        if self.at(Punct::At) {
+            let start = self.cur().span.start;
+            let decorators = self.parse_decorators()?;
+            if let Some(m) = self.parse_module_decl_decorated(start, &decorators)? {
+                return Ok(m);
+            }
+            if !self.at_kw(Keyword::Class) {
+                return Err(self.err_here("SyntaxError: decorators must precede a class"));
+            }
+            self.bump_after_operand()?;
+            let c = self.parse_class_rest_dec(start, decorators)?;
+            if let Some(n) = &c.name {
+                self.declare(&n.clone(), BindKind::Class, start)?;
+            }
+            return Ok(Stmt::ClassDecl(Box::new(c)));
+        }
         if let Some(m) = self.parse_module_decl()? {
             return Ok(m);
         }
@@ -492,9 +549,12 @@ impl<'s> Parser<'s> {
             self.restore(save);
         }
         if self.at_kw(Keyword::Class) {
-            let start = self.cur().span.start;
+            // A DecoratorList that preceded an `export` (`@dec export class C {}`)
+            // was parsed before the `export` keyword and is claimed here.
+            let (dstart, decorators) = self.take_class_decorators()?;
+            let start = dstart.unwrap_or_else(|| self.cur().span.start);
             self.bump_after_operand()?;
-            let c = self.parse_class_rest(start)?;
+            let c = self.parse_class_rest_dec(start, decorators)?;
             if let Some(n) = &c.name {
                 self.declare(&n.clone(), BindKind::Class, start)?;
             }

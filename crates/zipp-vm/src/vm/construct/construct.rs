@@ -907,15 +907,6 @@ impl<'p> Vm<'p> {
             // The explicit constructor runs its own `super(...)`; a ctor that
             // returns an object/array replaces the instance.
             if let Some(fid) = ctor {
-                let f = self.ctor_value(fid, &ctor_ups);
-                // The ctor (incl. field initializers) runs in the class body's private
-                // scope: give its function value the class's lexical brand chain so
-                // `this.#x` + classes defined in field initializers resolve.
-                if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
-                    if f.is_heap() {
-                        self.method_brand.insert(f.heap_index(), brands);
-                    }
-                }
                 // A BASE class's InitializeInstanceElements runs at
                 // [[Construct]] entry (a DERIVED class's at super() completion) —
                 // brand first, then the field initializers, and BOTH before the
@@ -924,6 +915,22 @@ impl<'p> Vm<'p> {
                 if parent.is_none() && !extends_null {
                     self.brand_instance(obj, cv);
                     self.run_field_thunk(obj, cv)?;
+                }
+                // The ctor function value is materialized AFTER the field thunk,
+                // not before: the thunk runs user code (field initializers), so a
+                // collection can land between the two — and a Value held only in
+                // a Rust local is not a GC root. Built first, `class A { x = {};
+                // constructor(){} }` under ZIPP_GC_STRESS=1 swept this very
+                // function and called whatever object reused its slot
+                // ("[object Object] is not a function").
+                let f = self.ctor_value(fid, &ctor_ups);
+                // The ctor (incl. field initializers) runs in the class body's private
+                // scope: give its function value the class's lexical brand chain so
+                // `this.#x` + classes defined in field initializers resolve.
+                if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
+                    if f.is_heap() {
+                        self.method_brand.insert(f.heap_index(), brands);
+                    }
                 }
                 // A DERIVED ctor's `this` is in TDZ until its `super(...)`
                 // completes (the SuperCtor ops remove the mark).

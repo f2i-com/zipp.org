@@ -205,6 +205,13 @@ impl<'p> Vm<'p> {
                             *class_id += base_class;
                         }
                     }
+                    // The decorator ops address their class the same way: by
+                    // compile-time class id, which shifts past the main
+                    // program's class table exactly like MakeClass's.
+                    Instr::DecKey { class_id, .. }
+                    | Instr::DecElem { class_id, .. }
+                    | Instr::DecInits { class_id, .. }
+                    | Instr::DecField { class_id, .. } => *class_id += base_class,
                     _ => {}
                 }
             }

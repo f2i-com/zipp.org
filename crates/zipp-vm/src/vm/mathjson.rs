@@ -415,7 +415,7 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
-            | HeapObj::Native(_)
+            | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
             | HeapObj::Symbol { .. } => return Ok(false),
             HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
                 return Err(Thrown("TypeError: Do not know how to serialize a BigInt".into()))

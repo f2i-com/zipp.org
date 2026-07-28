@@ -317,7 +317,22 @@ impl<'p> Vm<'p> {
                         // blocks + arrows within them). None = accessed before the
                         // class value is initialized (e.g. `class C extends C`) → TDZ.
                         match self.class_values.get(class_id as usize).copied().flatten() {
-                            Some(v) => self.set(base, dst, v),
+                            // A class DECORATOR may have replaced the class:
+                            // ClassDefinitionEvaluation binds classBinding to the
+                            // decorated value, so the inner name means the
+                            // replacement. `class_values` keeps the original —
+                            // that is what carries the DecState and the computed
+                            // field keys — so the hop lives here and nowhere else.
+                            Some(v) => {
+                                let v = match self.heap.get(v.heap_index()) {
+                                    HeapObj::Class(c) => match &c.dec {
+                                        Some(d) if d.replacement.is_heap() => d.replacement,
+                                        _ => v,
+                                    },
+                                    _ => v,
+                                };
+                                self.set(base, dst, v)
+                            }
                             None => {
                                 return Err(Thrown(
                                     "ReferenceError: class binding accessed before initialization"
@@ -1516,6 +1531,8 @@ impl<'p> Vm<'p> {
                             field_thunk: cd.field_thunk,
                             field_thunk_upvalues,
                             private_brand,
+                            class_id,
+                            dec: None,
                         }))));
                         self.brand_owner.insert(private_brand, v.heap_index());
                         // Remember it so `super` in a derived class can reach it.
@@ -1533,7 +1550,83 @@ impl<'p> Vm<'p> {
                         // child's realm tag (its brand-check TypeErrors etc. then
                         // adopt the child's constructor identity).
                         self.realm_tag_new(v.heap_index());
+                        // A DECORATED class gets its per-evaluation decoration
+                        // state (and its `[Symbol.metadata]` object, whose
+                        // prototype is the superclass's) here — before any
+                        // decorator can run, since `context.metadata` is handed
+                        // to the very first one.
+                        let n_elems = self
+                            .class_def(class_id as usize)
+                            .dec_plan
+                            .as_ref()
+                            .map(|p| p.elements.len());
+                        if let Some(n) = n_elems {
+                            self.dec_init_state(v, n, parent_idx);
+                        }
                         self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::DecKey { class, elem, key, class_id: _ } => {
+                        let cv = self.get(base, class);
+                        let kraw = self.get(base, key);
+                        // ToPropertyKey HERE and write the result back, so the
+                        // member/field op that consumes the same register sees an
+                        // already-coerced key: the element's ClassElementName is
+                        // coerced exactly ONCE observably (a key object counting
+                        // its `toString` calls must see one), and `context.name`
+                        // is the resulting String/Symbol rather than the raw
+                        // object.
+                        let k = self.coerce_index_key(kraw)?;
+                        self.set(base, key, k);
+                        self.dec_record_key(cv, elem as usize, k);
+                        ip += 1;
+                    }
+                    Instr::DecElem { class, elem, arg_base, argc, class_id } => {
+                        let cv = self.get(base, class);
+                        // The register block is (decorator, receiver) PAIRS: a
+                        // `@a.b` decorator is called as a method of `a`.
+                        let decs: Vec<(Value, Value)> = (0..argc)
+                            .map(|i| {
+                                (
+                                    self.get(base, arg_base + i * 2),
+                                    self.get(base, arg_base + i * 2 + 1),
+                                )
+                            })
+                            .collect();
+                        self.dec_apply_element(cv, class_id, elem as usize, &decs)?;
+                        ip += 1;
+                    }
+                    Instr::DecClass { class, arg_base, argc } => {
+                        let cv = self.get(base, class);
+                        let decs: Vec<(Value, Value)> = (0..argc)
+                            .map(|i| {
+                                (
+                                    self.get(base, arg_base + i * 2),
+                                    self.get(base, arg_base + i * 2 + 1),
+                                )
+                            })
+                            .collect();
+                        let out = self.dec_apply_class(cv, &decs)?;
+                        self.set(base, class, out);
+                        ip += 1;
+                    }
+                    Instr::DecInits { class_id, which, elem, recv } => {
+                        let r = self.get(base, recv);
+                        self.dec_run_inits(class_id, which, elem as usize, r)?;
+                        ip += 1;
+                    }
+                    Instr::DecField { class_id, elem, val, recv } => {
+                        // `v = init(v)` per initializer, innermost decorator
+                        // first. The running value goes back into its register
+                        // after every step so it stays a GC root across the next
+                        // call — this runs per decorated field per `new`, so
+                        // pinning the collector instead would be a real cost.
+                        for f in self.dec_field_inits(class_id, elem as usize) {
+                            let v = self.get(base, val);
+                            let r = self.get(base, recv);
+                            let out = self.call_value(f, r, &[v])?;
+                            self.set(base, val, out);
+                        }
                         ip += 1;
                     }
                     Instr::ClassAddMember { class, key, func, kind } => {
@@ -4730,7 +4823,7 @@ impl<'p> Vm<'p> {
                             // "not a function". %Function.prototype% is also a callable.
                             if matches!(
                                 self.heap.get(callee_v.heap_index()),
-                                HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::CombinatorResolver { .. }
+                                HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::CombinatorResolver { .. }
                             ) || (self.fn_proto != 0 && callee_v.heap_index() == self.fn_proto)
                             {
                                 let argv: Vec<Value> =
@@ -5008,7 +5101,7 @@ impl<'p> Vm<'p> {
                         if prop.is_heap()
                             && (matches!(
                                 self.heap.get(prop.heap_index()),
-                                HeapObj::Native(_)
+                                HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                                     | HeapObj::Bound { .. }
                                     | HeapObj::BoundResolver { .. }
                                     | HeapObj::Proxy { .. }
@@ -5082,7 +5175,7 @@ impl<'p> Vm<'p> {
                         if method.is_heap()
                             && (matches!(
                                 self.heap.get(method.heap_index()),
-                                HeapObj::Native(_)
+                                HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                                     | HeapObj::Bound { .. }
                                     | HeapObj::BoundResolver { .. }
                                     | HeapObj::Proxy { .. }

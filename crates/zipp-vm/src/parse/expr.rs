@@ -673,6 +673,17 @@ impl<'s> Parser<'s> {
         Ok(e)
     }
 
+    /// `member_prop` / `parse_args` for the DECORATOR grammar, which lives in
+    /// `parse/funcs.rs` (with the rest of the class parsing) and so cannot reach
+    /// this module's private helpers.
+    pub(crate) fn member_prop_public(&mut self) -> PResult<MemberProp> {
+        self.member_prop()
+    }
+
+    pub(crate) fn parse_args_public(&mut self) -> PResult<Vec<Arg>> {
+        self.parse_args()
+    }
+
     fn member_prop(&mut self) -> PResult<MemberProp> {
         if let TokenKind::Ident { private: true, .. } = &self.cur().kind {
             let tok = self.bump_after_operand()?;
@@ -826,6 +837,18 @@ impl<'s> Parser<'s> {
         // The `(` branch re-sets it after its contents are parsed.
         self.parenthesized = false;
         let start = self.cur().span.start;
+        // `ClassExpression : DecoratorList_opt class …` — a decorated class
+        // EXPRESSION (`x = @dec class {}`, `f(@dec class C {})`). Nothing else in
+        // PrimaryExpression starts with `@`, so this is unambiguous.
+        if self.at(Punct::At) {
+            let decorators = self.parse_decorators()?;
+            if !self.at_kw(Keyword::Class) {
+                return Err(self.err_here("SyntaxError: decorators must precede a class"));
+            }
+            self.bump_after_operand()?;
+            let c = self.parse_class_rest_dec(start, decorators)?;
+            return Ok(Expr::Class(Box::new(c)));
+        }
         // Dispatch on a BORROW of the token; the taking arms consume it through
         // `bump`, which returns the old token, so payloads MOVE. The previous
         // shape cloned the whole TokenKind — String contents included — for
@@ -1059,7 +1082,7 @@ impl<'s> Parser<'s> {
 
     /// An IdentifierReference. Looser than a binding: `eval`/`arguments` may be
     /// READ in strict mode, only bound-to is an error.
-    fn binding_ident_or_reference(&mut self) -> PResult<(Name, u32)> {
+    pub(crate) fn binding_ident_or_reference(&mut self) -> PResult<(Name, u32)> {
         let TokenKind::Ident { kw, had_escape, private: false, name } = &self.cur().kind else {
             return Err(self.err_here("SyntaxError: expected an identifier"));
         };

@@ -143,7 +143,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Wrapped { .. }
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. }
-                | HeapObj::Native(_)
+                | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                 | HeapObj::Iterator { .. }
                 | HeapObj::IterHelper { .. }
                 | HeapObj::Generator { .. }
@@ -460,7 +460,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Class(_)
                 | HeapObj::Bound { .. }
                 | HeapObj::Wrapped { .. }
-                | HeapObj::Native(_)
+                | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                 | HeapObj::Proxy { .. }
         ) {
             let k = self.key_of(key);

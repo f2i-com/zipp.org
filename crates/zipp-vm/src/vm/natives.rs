@@ -267,7 +267,7 @@ impl<'p> Vm<'p> {
                         HeapObj::Func(_)
                         | HeapObj::Closure { .. }
                         | HeapObj::Bound { .. }
-                        | HeapObj::Native(_) => self.fn_props.get(&h),
+                        | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
                         _ => self.arr_props.get(&h),
                     };
                     side.and_then(|m| m.pos(&key).map(|i| m.attrs[i].accessor)).unwrap_or(false)
@@ -295,7 +295,7 @@ impl<'p> Vm<'p> {
                             HeapObj::Func(_)
                             | HeapObj::Closure { .. }
                             | HeapObj::Bound { .. }
-                            | HeapObj::Native(_) => self.fn_props.get(&h),
+                            | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
                             _ => self.arr_props.get(&h),
                         };
                         match side.and_then(|m| {
@@ -433,7 +433,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
             }
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                 self.fn_props
                     .get(&ridx)
                     .and_then(|m| m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable)))
@@ -521,6 +521,9 @@ impl<'p> Vm<'p> {
                 // (staging/sm/Function/function-toString-builtin-name.js).
                 .or_else(|| native::math_method(*nid).map(|(n, _, _)| n.to_string()))
                 .unwrap_or_default(),
+            // A state-carrying builtin has no entry in the static id tables — it
+            // stores its CreateBuiltinFunction name inline.
+            HeapObj::NativeClosure { name, .. } => (*name).to_string(),
             // A constructor global (Array, Date, …) is modelled as an is_ctor
             // Object whose `name` is a real own property — same omission as above.
             HeapObj::Object(m) if m.is_ctor => m
@@ -2527,7 +2530,7 @@ impl<'p> Vm<'p> {
                     }
                     // A class value renders as its whole `class … { … }` source.
                     HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
-                    HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } => None,
+                    HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } => None,
                     // A constructor global (Array, Date, Temporal.Instant, …) is stored
                     // as an is_ctor Object — it is callable and `typeof` "function", so it
                     // renders in the `[native code]` form rather than throwing. So does
@@ -3086,7 +3089,7 @@ impl<'p> Vm<'p> {
                             HeapObj::Func(_)
                                 | HeapObj::Closure { .. }
                                 | HeapObj::Bound { .. }
-                                | HeapObj::Native(_)
+                                | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                         ) {
                             self.fn_props.get(&a0.heap_index())
                         } else {
@@ -3279,7 +3282,7 @@ impl<'p> Vm<'p> {
                                     | HeapObj::Closure { .. }
                                     | HeapObj::Bound { .. }
                                     | HeapObj::Wrapped { .. }
-                                    | HeapObj::Native(_)
+                                    | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
                             ) {
                                 if let Some(fm) = self.fn_props.get_mut(&idx) {
                                     match id {
