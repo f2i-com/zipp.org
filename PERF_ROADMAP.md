@@ -35,14 +35,36 @@ are in B58.
 
 ## 1. Where the project actually is
 
-### Conformance — 99.91% test262, 96.9% intl402
+### Conformance — 99.97% test262, 96.9% intl402
 
 | slice | executions | pass | fail |
 |---|---|---|---|
-| ECMA-262 + `staging`, sloppy **and** strict | 95,848 | 95,766 (99.91%) | 82 |
+| ECMA-262 + `staging`, sloppy **and** strict | 95,846 | 95,816 (99.97%) | 30 |
 | `intl402` (opt-in) | 6,682 | 6,474 (96.9%) | 208 |
 
 Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
+
+The main-suite denominator dropped by 2 (95,848 → 95,846) when a leftover
+scratch file from a crashed sweep was deleted from the test262 checkout. It
+predated the `.zipptmp-` prefix the walk now skips, and being a harness+test
+concatenation it ran and scored as a pass — the exact phantom the prefix exists
+to prevent, still present from before the prefix existed.
+
+Of the 30, **only 6 are engine defects** (`matchAll` @@match lookups 2, `en`-only
+CLDR 2, Annex B `arguments` 2). 19 are this repo's runner making the *harness*
+strict — `INTERPRETING.md` puts the directive on the test file and evaluates
+`includes` as separate sloppy scripts. On a conformant assembly both engines
+pass all 19; on the bytes this runner emits zipp passes 0 and V8 passes 3. 3
+more are a Windows `core.autocrlf` checkout inflating `import-bytes` fixtures,
+and 2 are an upstream test that predates immutable `ArrayBuffer`. Fixing the
+runner and the checkout is worth 22 executions and no engine work.
+
+One genuine defect surfaced while proving that, and it is invisible to the
+current runner: inside a **strict** `$262.evalScript`, assigning to a `var`
+declared without an initializer throws `ReferenceError`, though the binding
+exists (`"x" in globalThis` is true), the sloppy form works, and an initialised
+`var x = 5` reads back fine. Not in the 30; worth fixing before the runner is
+corrected, since a conformant runner reaches it.
 
 The intl402 denominator changed because the runner was not parsing YAML
 list-form `flags:` — roughly half that suite silently never ran, so the old
@@ -50,16 +72,27 @@ list-form `flags:` — roughly half that suite silently never ran, so the old
 
 What is left, and it is a different SHAPE from the long tail this section used
 to describe. Decorators — once the largest single item — are implemented. So
-are all fifteen Temporal calendars and the IANA time zone database. A
-meaningful share of the residue is now zipp being deliberately MORE conformant
-than node:
+are all fifteen Temporal calendars and the IANA time zone database. At 30
+executions the residue is small enough to classify exhaustively rather than
+estimate, so these are counts, not `~` figures, each reproduced against V8:
 
 | cause | executions | note |
 |---|---|---|
-| fixable engine bugs | ~45 | no cluster over ~6; re-classified from scratch |
-| unimplemented features | ~13 | Float16Array, RegExp legacy statics, import-source |
-| harness / test262 artifacts | ~14 | node fails identically on the same source |
-| **zipp is right, node is wrong** | ~10 | Annex B `arguments`, ICU4C hebrew, chinese, a V8 2^53 bound |
+| runner makes the harness strict | 19 | runner's assembly: zipp 0/19, V8 3/19. `INTERPRETING.md` assembly: **both 19/19** |
+| Windows `core.autocrlf` checkout | 3 | `import-bytes` fixtures inflated LF→CRLF; normalise them and all 5 pass |
+| upstream test predates the feature | 2 | `TypedArray` slice species vs immutable `ArrayBuffer`; zipp passes the sibling test asserting the throw |
+| **fixable engine bugs** | **6** | `matchAll` @@match lookups 2, `en`-only CLDR 2, Annex B `arguments` 2 |
+
+The previous version of this table estimated ~45 fixable engine bugs and claimed
+~10 executions where "zipp is right, node is wrong" — naming Annex B `arguments`
+first. That claim was **false**, and it survived because it was never re-checked
+against the spec text. `paramNames` has not been mutated to contain `"arguments"`
+since ES2018 (a separate `paramBindings` list carries it), so Annex B's guard
+does not fire, and the `SetMutableBinding` at block-declaration evaluation always
+runs. node is right; zipp is wrong. The test262 test zipp *passes* here quotes
+the removed ES2017 step, which is why V8 fails it. This is the fourth time an
+entry in this file was refuted by re-measurement, and the first where the
+refuted entry was a claim of superiority.
 
 The intl402 remainder is data, not logic: CLDR content (patterns, unit display
 names with plural selection, collation order, plural categories) and the
@@ -300,9 +333,13 @@ This track did not exist in the previous roadmap; test262 was only a gate. It is
 now the shorter of the two tracks and should go first — the work is bounded and
 the payoff is a headline number.
 
-**Status 2026-07-28: 938 → 82 failures (99.0% → 99.91%), and intl402 2,778 →
+**Status 2026-07-29: 938 → 30 failures (99.0% → 99.97%), and intl402 2,778 →
 208 (16.9% → 96.9%).** Every step gated against the checked-in baseline with
-zero regressions. What the work actually taught, beyond the number:
+zero regressions; the 2026-07-29 run reproduced the 30-failure baseline exactly,
+on both tiers. Of those 30, 24 are not engine defects at all (19 runner, 3
+checkout, 2 upstream test) — so the remaining engine work in this track is 6
+executions, and the largest single lever left is fixing the runner. What the
+work actually taught, beyond the number:
 
 * **Cluster, then fix.** The wins came from root causes, not assertions. One
   sentence — "nothing created inside a child realm carried that realm's
@@ -313,11 +350,17 @@ zero regressions. What the work actually taught, beyond the number:
   `Intl.DateTimeFormat` was never unconstructable — and a cluster estimated at
   10 executions delivered 0. Re-classify at each new failure count; a list
   written at 396 failures is worthless at 151.
-* **node is a good oracle, not an authority.** Four divergences are deliberate
-  and proved: Annex B `arguments`, the ICU4C hebrew calendar, a V8
-  `DurationFormat` 2^53 bound, and the chinese calendar (where test262's own
-  expectations back zipp against ICU). 100.0% is therefore not the target —
-  matching node on these would mean becoming LESS conformant.
+* **node is a good oracle, not an authority — but "node is wrong" is a claim,
+  and claims get checked.** Three divergences are deliberate and proved: the
+  ICU4C hebrew calendar, a V8 `DurationFormat` 2^53 bound, and the chinese
+  calendar (where test262's own expectations back zipp against ICU). A fourth,
+  Annex B `arguments`, was carried here for months and is simply **wrong** —
+  see §1. It was believed because zipp passed a test262 test that node fails,
+  which felt like proof; the test encodes ES2017 wording removed in ES2018. A
+  passing test is evidence about the test as much as about the engine. When the
+  divergence is "we are more correct than V8", read the current spec text before
+  writing it down — that is the one direction where nobody files a bug against
+  you.
 * **Ship the semantics or ship the honest error.** Decorators sat at a flat
   SyntaxError for a long time, and that was correct: a parser that accepts
   `@dec` and drops the semantics turns a missing feature into silently wrong

@@ -30,30 +30,83 @@ wasm32 are built and tested.
 Both figures are measured on this repo, not estimated. Neither is finished —
 they are the current state.
 
-**Conformance — 99.91% of test262**, 95,766 of 95,848 required executions
+**Conformance — 99.97% of test262**, 95,816 of 95,846 required executions
 (ECMA-262 + `staging`, run in both sloppy and strict mode as `INTERPRETING.md`
 requires). Both tiers produce a **byte-identical** failure set, which is the
 cheapest evidence that a JIT change has not quietly diverged:
 
 | slice | executions | pass |
 |---|---|---|
-| ECMA-262 + staging, both modes | 95,848 | 95,766 (99.91%) |
+| ECMA-262 + staging, both modes | 95,846 | 95,816 (99.97%) |
 | intl402 (opt-in, `--include-intl402`) | 6,682 | 6,474 (96.9%) |
 
 That is up from 96.97% under `oxc_parser`, and the increase is the whole reason
 the engine grew its own front end.
 
-82 executions still fail — and a meaningful share of them are cases where zipp
-is deliberately MORE conformant than node, not less:
+The denominator is 95,846, not the 95,848 previously published here. Two of
+those executions were a leftover scratch file from a crashed sweep, left in the
+test262 checkout under a naming scheme that predates the `.zipptmp-` prefix the
+runner now skips. It happened to be a harness+test concatenation, so it parsed,
+ran, and scored as a passing test — the exact phantom that prefix exists to
+prevent, dating from before the prefix existed. Deleting it removes exactly two
+passes and two executions, confirmed by running its directory both ways.
 
-* **Annex B block functions named `arguments` (2).** B.3.2.4 step 1.a.ii's
-  `parameterNames does not contain F` condition gates the whole step, and
-  FunctionDeclarationInstantiation puts `"arguments"` in parameterNames. zipp is
-  right; matching node would mean becoming non-conformant.
-* **The `chinese` calendar (22 disagreeing date-runs).** test262's own
-  expectations back zipp against ICU — see the calendar note below.
-* **The ICU4C `hebrew` calendar (6 dates)** and **a V8 `DurationFormat` 2^53
-  bound**, both with the divergence proved rather than assumed.
+30 executions still fail. Each has been diagnosed against the spec text and
+cross-checked against V8 rather than assumed, and the result is uncomfortable:
+**only 6 of the 30 are the engine's fault.** The other 24 — 22 of them defects
+in this repo's own harness or checkout — are counted as failures anyway, because
+the gate is the gate until they are fixed.
+
+* **The runner's strict-mode assembly (19).** `tools/run_test262.py` puts
+  `"use strict";` above the concatenated harness, which makes the *harness*
+  strict. `INTERPRETING.md` says the directive is inserted at the head of the
+  test file, and that `includes` are evaluated in the realm *prior to* the test —
+  as separate, sloppy scripts. All 19 reach a SpiderMonkey helper whose
+  "lenient" half uses a **direct** `eval`, which inherits its caller's
+  strictness, so it is the harness's strictness, not the test's, that decides
+  the outcome. Measured both ways, per engine:
+
+  | assembly | zipp | V8 |
+  |---|---|---|
+  | this runner's (`"use strict";` + harness + test, one script) | 0 / 19 | 3 / 19 |
+  | `INTERPRETING.md` (harness sloppy in the realm, then the test) | 19 / 19 | 19 / 19 |
+
+  So these 19 are measuring the harness, not the engine. (16 of zipp's 19 pass
+  directly; the other three need a one-line workaround for an unrelated bug —
+  inside a *strict* `$262.evalScript`, assigning to a `var` declared without an
+  initializer throws `ReferenceError` even though the binding exists. That is a
+  real defect, found while checking this, and it is not reachable from the
+  runner's own assembly.)
+* **A Windows `core.autocrlf` checkout (3).** `import-bytes` asserts exact byte
+  lengths, and git rewrote the three *text* fixtures LF→CRLF on checkout
+  (139→142, 12→13, 13→14 bytes). The `.png` and empty `.bin` fixtures git left
+  alone — and those two tests pass. Normalise the three and all five pass.
+* **A test262 test that predates the feature it now trips over (2).** The
+  `TypedArray.prototype.slice` species test runs the whole arg-factory matrix,
+  including an immutable `ArrayBuffer`, where `ValidateTypedArray` in ~write~
+  mode is *required* to throw. zipp throws, and passes the sibling test that
+  asserts exactly that throw. node "passes" only because V8 has no
+  `transferToImmutable`, so its harness never builds that case at all.
+
+The six that are real:
+
+* **`String.prototype.matchAll` (2)** skips the two spec-mandated
+  `Get(regexp, @@match)` lookups on its fast path.
+* **Only the `en` CLDR locale ships (2)**, so `Intl.DateTimeFormat("de")`
+  formats `1/2/1970` where node gives `2.1.1970`.
+* **Annex B block functions named `arguments` (2)** — and this is the item this
+  section used to claim as a win over node. It was wrong. zipp treats a
+  block-level `function arguments(){}` as entirely non-promotable. The spec
+  suppresses only the *var binding*: the guard reads `paramNames`, which since
+  ES2018 never contains `"arguments"` (a separate `paramBindings` list carries
+  it), and the `SetMutableBinding` performed when the block declaration is
+  evaluated sits *outside* the `"arguments"` guard, so it always runs.
+  `function f(){ { function arguments(){} } return typeof arguments }` is
+  `"function"`; zipp says `"object"`. The test262 test zipp passes here,
+  `annexB/language/function-code/block-decl-func-skip-arguments.js`, quotes the
+  ES2017 step `Append "arguments" to parameterNames` — removed in ES2018 — which
+  is why V8 fails it. Fixing the engine will turn that test red, and it is the
+  one that should then be baselined.
 
 Decorators — for a long time the single largest gap, at ~34 executions — are
 now implemented end to end: the parser, the decoration runtime, and the
@@ -92,16 +145,28 @@ The IANA time zone database is vendored — `vm/temporal/tzdata.rs`, generated b
 `tools/gen_tzdata.py` from release 2026c, with the source URL and sha512 in the
 header. Generated rather than hand-written so the provenance is checkable.
 
+Two further intl402 divergences are deliberate and were proved rather than
+assumed: the ICU4C `hebrew` calendar (6 dates) and a V8 `DurationFormat` 2^53
+bound. They live here, in the intl402 slice — an earlier version of this section
+listed them, and the `chinese` disagreements above, among the *main-suite*
+failures, which was simply a filing error.
+
 What remains is genuinely data-bound and is left failing rather than guessed
 at: CLDR content (date patterns, unit display names with plural selection,
 collation order, plural categories) and the Unicode algorithm data behind
-`Segmenter` (UAX #29) and `Collator` (UCA/DUCET). Where a table *is* carried,
-it comes from the real upstream source and is verified value-by-value against
-node's ICU.
+`Segmenter` (UAX #29) and `Collator` (UCA/DUCET). The 208 failures concentrate
+where that data is thickest — `NumberFormat` 88, `DateTimeFormat` 40, Temporal
+30, `RelativeTimeFormat` 14, `ListFormat` 10, and a tail of 26 across
+`Segmenter`, `Collator`, `PluralRules`, `DurationFormat` and `BigInt`. Where a
+table *is* carried, it comes from the real upstream source and is verified
+value-by-value against node's ICU.
 
 `tools/test262-expected-failures.txt` is the checked-in baseline, so a
 regression is a diff rather than a remembered number. Run both tiers — a JIT
-change that only *appears* correct is the common failure mode here.
+change that only *appears* correct is the common failure mode here. On a
+Windows checkout that baseline is stored LF and checked out CRLF, so a plain
+`diff` against the runner's LF output reports **every** line as changed and the
+gate reads as a total regression; strip `\r` before comparing.
 
 **Performance — cold geomean 1.90× zipp/node (95% CI 1.87×–1.92×)** on the
 ten programs in `bench/real/`, 15 counterbalanced paired observations, every
@@ -449,7 +514,8 @@ The standing gate for any engine change — see `PERF_ROADMAP.md` §2:
 cargo build --release
 cargo test --workspace --release
 python tools/run_test262.py --t262 <path> --dump-fails fails.txt
-diff <(sort fails.txt) <(sort tools/test262-expected-failures.txt)   # REG=0
+diff <(sort fails.txt) \
+     <(tr -d '\r' < tools/test262-expected-failures.txt | sort)      # REG=0
 ZIPP_NOJIT=1 python tools/run_test262.py …             # and again, interpreter only
 python tools/bench.py --reps 15                        # ALL_CORRECT=1
 python tools/bench.py --reps 15 --readme               # + the tables above
