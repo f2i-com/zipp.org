@@ -35,11 +35,11 @@ are in B58.
 
 ## 1. Where the project actually is
 
-### Conformance — 99.997% test262, 96.9% intl402
+### Conformance — 99.993% test262, 96.9% intl402
 
 | slice | executions | pass | fail |
 |---|---|---|---|
-| ECMA-262 + `staging`, sloppy **and** strict | 95,942 | 95,939 (99.997%) | 3 |
+| ECMA-262 + `staging`, sloppy **and** strict | 95,942 | 95,935 (99.993%) | 7 |
 | `intl402` (opt-in) | 6,682 | 6,474 (96.9%) | 208 |
 
 Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
@@ -74,14 +74,19 @@ rather than assumed:
 | `en`-only CLDR | 2 | 2 | needs real CLDR data; refusing to hand-write one German pattern |
 | ES2017 text the spec deleted | 0 | 1 | `block-decl-func-skip-arguments.js` is red *on purpose*; V8 fails it too |
 
-**The last one is unfixable, and worth stating plainly: the suite contains two
+**One of these is unfixable, and worth stating plainly: the suite contains two
 tests with opposite expectations.** `block-decl-func-skip-arguments.js` requires
 that a block `function arguments(){}` NOT overwrite the arguments object;
 `staging/sm/regress/regress-602621.js` requires that it DOES, which is the
-current text. So 95,942/95,942 does not exist for any engine. The reachable
-ceiling here is 95,940 — the remaining 2 are CLDR data.
+current text. So 95,942/95,942 does not exist for any engine; the ceiling is
+95,941.
 
-None of the remaining 3 is a live engine defect. Three engine bugs were fixed
+Of the remaining 7: 1 is that contradiction, 2 are CLDR data, and **4 are a real
+open engine defect** — module `[[EvaluationError]]` is recorded only on the
+synchronous rejection path, so a module that suspends at top-level `await` and
+rejects later memoises nothing, and a later `import()` of an already-fulfilled
+member of an errored cycle resolves instead of re-throwing. The two `import-defer`
+failures sit in the same code. Three other engine bugs were fixed
 along the way, and **two of them were tier divergences** — the JIT disagreeing
 with the interpreter, which is the failure mode this file has warned about since
 the first JIT landed. Both were latent long before this work and reachable from
@@ -386,7 +391,7 @@ This track did not exist in the previous roadmap; test262 was only a gate. It is
 now the shorter of the two tracks and should go first — the work is bounded and
 the payoff is a headline number.
 
-**Status 2026-07-29: 938 → 3 failures (99.0% → 99.997%), and intl402 2,778 →
+**Status 2026-07-29: 938 → 7 failures (99.0% → 99.993%), and intl402 2,778 →
 208 (16.9% → 96.9%).** Every step gated against the checked-in baseline with
 zero regressions, both tiers byte-identical, `cargo test --workspace --release`
 green at 421. **None of the 5 is a live engine defect** — 2 are fixed upstream in
