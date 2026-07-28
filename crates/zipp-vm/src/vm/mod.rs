@@ -1085,8 +1085,8 @@ pub struct Vm<'p> {
     /// (see `vm/temporal/calendar.rs`).
     temporal_cal: std::collections::HashMap<u32, u8>,
     intl_ns: u32,
-    intl_ctors: [u32; 10],
-    intl_protos: [u32; 10],
+    intl_ctors: [u32; native::INTL_KINDS],
+    intl_protos: [u32; native::INTL_KINDS],
     /// realm id (0 = main) → that realm's `%Intl%.[[FallbackSymbol]]`. Rooted
     /// indirectly: every entry is also in `symbol_keys`.
     intl_fallback_syms: std::collections::HashMap<u32, Value>,
@@ -1246,6 +1246,9 @@ mod values;
 mod temporal;
 mod intl;
 mod locale_tag;
+mod cldr_alias;
+mod cldr_alias_data;
+mod segmenter;
 mod iterhelpers;
 mod proxy_regexp;
 mod typedarray;

@@ -61,6 +61,15 @@ pub fn free_vars_arrow(params: &[String], body: &ArrowBody) -> HashSet<String> {
     }
 }
 
+/// Every name an EXPRESSION references, ignoring what it binds internally.
+/// Deliberately over-approximate (a name bound by a nested function still shows
+/// up): the one caller uses it as a "could this possibly see X?" guard.
+pub fn expr_refs_all(e: &Expr) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    expr_refs(e, &mut refs);
+    refs
+}
+
 /// Whether any parameter DEFAULT expression references `name` (free) — used
 /// to detect a possible direct eval in the parameter scope.
 pub fn params_reference(name: &str, params: &Params) -> bool {

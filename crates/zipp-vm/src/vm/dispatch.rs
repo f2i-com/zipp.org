@@ -4190,6 +4190,30 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::DeleteGlobal { dst, slot } => {
+                        // Dynamic-first, like the LoadGlobalDyn family: a sloppy
+                        // FUNCTION-context eval's `var` lives in the caller
+                        // activation's EvalScope, and 19.2.1.3 step 9.d.ii.1
+                        // creates it with deletable = true — so `delete` must
+                        // REMOVE it and let the name fall back to the outer
+                        // binding, not answer false against a global slot that
+                        // was never the binding
+                        // (staging/sm/eval/exhaustive-fun-*: `eval('delete y')`
+                        // inside a function the eval itself declared).
+                        if let Some(name) = self.global_slot_name(slot) {
+                            if let Some(fi) = self.frames.len().checked_sub(1) {
+                                if let Some(sc) = self.frame_eval_scope(fi) {
+                                    let removed = match self.heap.get_mut(sc) {
+                                        HeapObj::EvalScope(m) => m.remove(&name).is_some(),
+                                        _ => false,
+                                    };
+                                    if removed {
+                                        self.set(base, dst, Value::bool(true));
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         // Sloppy `delete <global>`: a DECLARED global binding
                         // (program var/function/class/let/const slot) is
                         // non-configurable → false; everything else (implicit
@@ -5780,6 +5804,7 @@ impl<'p> Vm<'p> {
                                     | HeapObj::Proxy { .. }
                                     | HeapObj::Iterator { .. }
                                     | HeapObj::IterHelper { .. }
+                                    | HeapObj::Intl { .. }
                             ) {
                             self.get_prop(it, "next")?
                         } else {
@@ -5873,7 +5898,12 @@ impl<'p> Vm<'p> {
                         // a `break` simply stops calling it. The cached prologue
                         // [[NextMethod]] (IterPrime) is used when present; the
                         // uncached (destructuring) sites re-fetch per step.
-                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
+                        // `HeapObj::Intl` is in the list for %SegmentIterator%:
+                        // it is an ordinary object with a `next` method, and
+                        // without it `for (v of segmenter.segment(s))` fell
+                        // through to the positional walk below and reported the
+                        // iterator itself as "not iterable".
+                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } | HeapObj::Intl { .. }) {
                             let next = if next != u16::MAX {
                                 self.get(base, next)
                             } else {

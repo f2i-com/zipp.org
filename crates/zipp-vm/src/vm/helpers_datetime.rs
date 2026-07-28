@@ -817,30 +817,40 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
             round_decimal_at(&int_s, &frac_s, k, mode)
         }
     });
-    let by_sig = p.max_sig.map(|sd| {
-        let k = sd - decimal_exponent(&int_s, &frac_s);
-        round_decimal_at(&int_s, &frac_s, k, mode)
-    });
-    // Digit-count of a candidate, used to pick the more/less precise one.
-    let precision = |v: &(String, String)| -> usize { v.1.trim_end_matches('0').len() };
-    let (mut ip, mut fp) = match (by_frac, by_sig) {
-        (Some(f), Some(s)) => {
-            if p.rounding_priority == "lessPrecision" {
-                if precision(&f) <= precision(&s) { f } else { s }
-            } else {
-                if precision(&f) >= precision(&s) { f } else { s }
-            }
+    // The fraction digit each candidate rounds AT: `maximumFractionDigits` for
+    // ToRawFixed, and `maximumSignificantDigits - <integer digits>` for
+    // ToRawPrecision. It is the negation of the spec's [[RoundingMagnitude]],
+    // which is what FormatNumericToString compares — NOT the digit count of the
+    // rounded result. The difference is visible whenever the significant-digit
+    // maximum is the untouched default 21: `{minimumSignificantDigits: 2,
+    // minimumFractionDigits: 2, roundingPriority: "morePrecision"}` formats 1 as
+    // "1.0" (significant wins, magnitude -20 against -3) even though the
+    // fraction candidate "1.00" has more digits.
+    let k_sig = p.max_sig.map(|sd| sd - decimal_exponent(&int_s, &frac_s));
+    let by_sig = k_sig.map(|k| round_decimal_at(&int_s, &frac_s, k, mode));
+    let use_sig = match (p.max_frac, k_sig) {
+        // sResult.[[RoundingMagnitude]] ≤ fResult.[[RoundingMagnitude]] is
+        // `-k_sig ≤ -max_frac`, i.e. `k_sig ≥ max_frac`; morePrecision takes the
+        // significant candidate then, lessPrecision takes the other one.
+        (Some(kf), Some(ks)) => {
+            if p.rounding_priority == "lessPrecision" { ks < kf } else { ks >= kf }
         }
-        (Some(f), None) => f,
-        (None, Some(s)) => s,
-        (None, None) => round_decimal_at(&int_s, &frac_s, 3, mode),
+        (None, Some(_)) => true,
+        _ => false,
     };
-    // Pad/strip the fraction to the configured minimum. Under significant-digit
-    // rounding the minimum comes from minimumSignificantDigits instead.
-    let min_frac = match (p.min_frac, p.min_sig) {
-        (Some(m), _) => m,
-        (None, Some(sd)) => (sd - decimal_exponent(&ip, &fp)).max(0),
-        (None, None) => 0,
+    let (mut ip, mut fp) = match (use_sig, by_sig, by_frac) {
+        (true, Some(s), _) => s,
+        (_, _, Some(f)) => f,
+        (_, Some(s), None) => s,
+        _ => round_decimal_at(&int_s, &frac_s, 3, mode),
+    };
+    // Pad/strip the fraction to the configured minimum — of the SAME candidate
+    // that won, so a morePrecision result rounded to significant digits pads to
+    // `minimumSignificantDigits` and not to `minimumFractionDigits`.
+    let min_frac = if use_sig {
+        p.min_sig.map(|sd| (sd - decimal_exponent(&ip, &fp)).max(0)).unwrap_or(0)
+    } else {
+        p.min_frac.unwrap_or(0)
     };
     while (fp.len() as i64) < min_frac {
         fp.push('0');

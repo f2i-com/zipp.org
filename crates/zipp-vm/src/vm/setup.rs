@@ -2062,6 +2062,27 @@ impl<'p> Vm<'p> {
                     o.define(name, getter, accessor_attr);
                 }
             }
+            // %Segments.prototype% and %SegmentIterator.prototype%. Neither is
+            // reachable from `Intl` — `Intl.Segmenter.prototype.segment` is the
+            // only way to get an object with either as its [[Prototype]] — but
+            // both are ordinary objects with the usual descriptors, and
+            // %SegmentIterator.prototype% inherits from %IteratorPrototype%
+            // (so `[...segments]` and the iterator helpers work) and carries the
+            // "Segmenter String Iterator" toStringTag.
+            let segments_proto = build(
+                self,
+                &[("containing", INTL_SEGMENTS_CONTAINING), ("@@iterator", INTL_SEGMENTS_ITERATOR)],
+                None,
+            );
+            self.proto_of.insert(segments_proto, Value::heap(obj_proto));
+            self.intl_protos[native::INTL_SEGMENTS as usize] = segments_proto;
+            let seg_iter_proto = build(self, &[("next", INTL_SEGMENT_ITER_NEXT)], None);
+            self.proto_of.insert(seg_iter_proto, Value::heap(self.iterator_proto_root));
+            self.intl_protos[native::INTL_SEGMENT_ITERATOR as usize] = seg_iter_proto;
+            let seg_tag = self.alloc_str("Segmenter String Iterator".to_string());
+            if let HeapObj::Object(p) = self.heap.get_mut(seg_iter_proto) {
+                p.define("@@toStringTag", seg_tag, fn_attr);
+            }
             let gcl = Value::heap(self.heap.alloc(HeapObj::Native(INTL_GET_CANONICAL_LOCALES)));
             intl_ns_map.define("getCanonicalLocales", gcl, method_attr);
             let svo = Value::heap(self.heap.alloc(HeapObj::Native(INTL_SUPPORTED_VALUES_OF)));

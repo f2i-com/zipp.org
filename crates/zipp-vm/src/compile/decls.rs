@@ -658,9 +658,20 @@ impl<'a> FnCompiler<'a> {
             // EVAL root: `var x` where x is a CALLER binding — the declaration
             // is a no-op (the binding exists); an initializer assigns THROUGH
             // the captured cell (sloppy direct eval's var env is the caller's).
+            //
+            // Only a SLOPPY eval, though. 19.2.1.1 PerformEval gives a STRICT
+            // eval a NewDeclarativeEnvironment of its own for varEnv, so its
+            // `var x` SHADOWS the caller's rather than assigning through it
+            // (`script_binds_globals` is exactly "the eval's vars are not its
+            // own"). Without this gate,
+            //     function h(){ var x = 2; return eval("'use strict'; var x = 4; x"); }
+            // wrote 4 into h's `x` while the eval's own reads saw the fresh
+            // (undefined) local — two bindings for one name
+            // (staging/sm/eval/exhaustive-fun-*-strictcode).
             if self.is_script
                 && !d.kind.is_lexical()
                 && self.scopes.len() == 1
+                && self.cx.script_binds_globals
                 && self.cx.eval_caller_var(name)
             {
                 if let Some(init) = &decl.init {

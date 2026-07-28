@@ -5426,28 +5426,7 @@ impl<'p> Vm<'p> {
                 let resolved = self.intl_this(this, INTL_COLLATOR, "compare")?;
                 let a = self.to_js_string(a0)?;
                 let b = self.to_js_string(a1)?;
-                // There is no DUCET/CLDR collation here — this is an NFC
-                // code-point comparison. The two option-driven transforms that
-                // do NOT need collation weights are applied: `ignorePunctuation`
-                // drops the characters CLDR treats as variable (whitespace,
-                // punctuation and symbols), and `sensitivity: "base"/"accent"`
-                // case-folds.
-                let ignore_punct = self.intl_slot(resolved, "ignorePunctuation") == Value::bool(true);
-                let sens = self.display(self.intl_slot(resolved, "sensitivity"));
-                let prep = |s: &str| -> String {
-                    use unicode_normalization::UnicodeNormalization;
-                    let s: String = s.nfc().collect();
-                    let s: String = if ignore_punct {
-                        s.chars()
-                            .filter(|c| !crate::vm::intl::is_variable_collation_char(*c))
-                            .collect()
-                    } else {
-                        s
-                    };
-                    if sens == "base" || sens == "accent" { s.to_lowercase() } else { s }
-                };
-                let (a, b) = (prep(&a), prep(&b));
-                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+                Value::num(self.collator_compare(resolved, &a, &b))
             }
             INTL_PLURAL_SELECT => {
                 let _ = self.intl_this(this, INTL_PLURALRULES, "select")?;
@@ -5575,14 +5554,22 @@ impl<'p> Vm<'p> {
                 self.intl_slot(resolved, "@@tag")
             }
             INTL_LOCALE_MAXIMIZE | INTL_LOCALE_MINIMIZE => {
-                // Add/RemoveLikelySubtags needs the CLDR likelySubtags table,
-                // which this engine does not ship: the tag comes back unchanged
-                // rather than being silently mis-expanded.
+                // Add/RemoveLikelySubtags (UTS #35 §4.3). A tag no likely-subtags
+                // row covers is its own maximum AND its own minimum — `xtg`
+                // must not expand to the root's `en-Latn-US`
+                // (Locale/likely-subtags-grandfathered.js).
                 let name = if id == INTL_LOCALE_MAXIMIZE { "maximize" } else { "minimize" };
                 let resolved = self.intl_this(this, INTL_LOCALE, name)?;
                 let tag = self.display(self.intl_slot(resolved, "@@tag"));
                 match crate::vm::locale_tag::parse_lang_tag(&tag) {
-                    Some(t) => self.alloc_locale(&t),
+                    Some(t) => {
+                        let out = if id == INTL_LOCALE_MAXIMIZE {
+                            crate::vm::cldr_alias::add_likely_subtags(&t)
+                        } else {
+                            crate::vm::cldr_alias::remove_likely_subtags(&t)
+                        };
+                        self.alloc_locale(&out.unwrap_or(t))
+                    }
                     None => this,
                 }
             }
@@ -5602,13 +5589,64 @@ impl<'p> Vm<'p> {
                 self.locale_info(resolved, which)?
             }
             INTL_SEGMENTER_SEGMENT => {
-                let _ = self.intl_this(this, INTL_SEGMENTER, "segment")?;
-                // Minimal Segments object (full grapheme/word segmentation TBD).
-                let s = self.to_js_string(a0)?;
-                let mut o = ObjMap::new();
-                let sv = self.alloc_str(s);
-                o.set("@@seginput", sv);
-                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
+                let seg = self.intl_this(this, INTL_SEGMENTER, "segment")?;
+                // CreateSegmentsObject: the Segments carries the segmenter and the
+                // ToString'd input, and nothing else — every boundary is recomputed
+                // on demand, which is what makes `containing` and a live iterator
+                // independent (next-mix-with-containing.js).
+                let g = self.display(self.intl_slot(seg, "granularity"));
+                self.make_segments(native::INTL_SEGMENTS, a0, &g, 0)?
+            }
+            INTL_SEGMENTS_ITERATOR => {
+                let s = self.intl_this(this, native::INTL_SEGMENTS, "[Symbol.iterator]")?;
+                // CreateSegmentIterator: a FRESH cursor each time, so nested
+                // `for…of` over the same Segments do not share a position
+                // (nested-next.js, next-inside-next.js).
+                let g = self.display(self.intl_slot(s, "granularity"));
+                let input = self.intl_slot(s, "input");
+                self.make_segments(native::INTL_SEGMENT_ITERATOR, input, &g, 0)?
+            }
+            INTL_SEGMENTS_CONTAINING => {
+                let s = self.intl_this(this, native::INTL_SEGMENTS, "containing")?;
+                let g = self.display(self.intl_slot(s, "granularity"));
+                let input = self.intl_slot(s, "input");
+                // Step 6 is ToIntegerOrInfinity, whose coercion can run user code,
+                // so it happens before the bounds test — and ±Infinity/NaN are
+                // handled by the same clamp (containing/out-of-bound-index.js).
+                // ToNumber is the STRICT one: a Symbol or BigInt index is a
+                // TypeError, not a silent 0 (containing/index-throws.js).
+                let n = self.to_number_strict(a0)?;
+                let n = if n.is_nan() {
+                    0
+                } else {
+                    n.trunc().clamp(-(i32::MAX as f64), i32::MAX as f64) as i64
+                };
+                let text = self.display(input);
+                match crate::vm::segmenter::segment_at(&text, &g, n) {
+                    Some((start, end)) => self.segment_data_object(input, &g, start, end),
+                    None => Value::UNDEFINED,
+                }
+            }
+            INTL_SEGMENT_ITER_NEXT => {
+                let it = self.intl_this(this, native::INTL_SEGMENT_ITERATOR, "next")?;
+                let g = self.display(self.intl_slot(it, "granularity"));
+                let input = self.intl_slot(it, "input");
+                let text = self.display(input);
+                let start = self.intl_slot(it, "index").as_f64() as usize;
+                let len = crate::heap::str_units(&text);
+                let (value, done) = if start >= len {
+                    (Value::UNDEFINED, true)
+                } else {
+                    let end = crate::vm::segmenter::segment_end(&text, &g, start);
+                    let v = self.segment_data_object(input, &g, start, end);
+                    // [[IteratedStringNextSegmentCodeUnitIndex]] advances only
+                    // after the data object is built.
+                    if let HeapObj::Object(m) = self.heap.get_mut(it) {
+                        m.set("index", Value::num(end as f64));
+                    }
+                    (v, false)
+                };
+                self.iter_result(value, done)
             }
             INTL_DURATION_FORMAT | INTL_DURATION_FORMAT_TO_PARTS => {
                 let to_parts = id == INTL_DURATION_FORMAT_TO_PARTS;

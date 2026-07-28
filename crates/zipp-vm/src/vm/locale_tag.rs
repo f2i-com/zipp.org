@@ -2,10 +2,9 @@
 //!
 //! This is the *grammar* half of ECMA-402's language-tag handling: it decides
 //! whether a tag is well formed and puts its subtags into canonical order and
-//! case. It deliberately carries **no CLDR alias data** — `iw`→`he`,
-//! `art-lojban`→`jbo`, `ru-SU`→`ru-RU` and the likely-subtags tables are locale
-//! data this engine does not ship, so those tags round-trip unchanged instead of
-//! being canonicalized. Everything here is derivable from the grammar alone.
+//! case. Everything here is derivable from the grammar alone; the registry
+//! half — `iw`→`he`, `art-lojban`→`jbo`, `ru-SU`→`ru-RU` and likely subtags —
+//! lives in `cldr_alias.rs` and runs after this, inside `canonicalize_tag`.
 //!
 //! Grammar implemented (UTS #35 §3.2):
 //! ```text
@@ -200,8 +199,12 @@ pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
     let mut i = 0usize;
     // ── unicode_language_id ──
     if parts[0].eq_ignore_ascii_case("root") {
-        t.language = "und".to_string();
-        i = 1;
+        // UTS-35's `unicode_language_id` admits a literal "root", but ECMA-402's
+        // IsStructurallyValidLanguageTag excludes exactly that alternative (it is
+        // CLDR's spelling of "und", not BCP-47's) — `Intl.getCanonicalLocales`,
+        // `new Intl.Locale` and `DisplayNames.prototype.of("root")` must each
+        // throw a RangeError rather than answer "und".
+        return None;
     } else if parts[0].len() == 1 {
         // An extension singleton in first place is not a language.
         return None;
@@ -346,6 +349,12 @@ fn parse_transform_ext(body: &[&str]) -> Option<String> {
         // A tlang: a full unicode_language_id, with its own duplicate-variant
         // rule ("de-t-en-emodeng-emodeng" is invalid).
         let end = body.iter().position(|p| is_tkey(p)).unwrap_or(body.len());
+        // `tlang` is spelled out in UTS-35 §3.7 WITHOUT the "root" alternative
+        // that `unicode_language_id` allows, so "en-t-root" is a RangeError
+        // even though "root" alone parses (transformed-ext-invalid.js).
+        if body[0].eq_ignore_ascii_case("root") {
+            return None;
+        }
         let tlang = parse_lang_tag(&body[..end].join("-"))?;
         if !tlang.other.is_empty() || tlang.has_u || !tlang.private.is_empty() {
             return None;
@@ -391,10 +400,15 @@ fn parse_transform_ext(body: &[&str]) -> Option<String> {
     Some(out.join("-"))
 }
 
-/// The public entry the rest of the VM uses: canonicalize a tag, or `None` if
-/// it is not structurally valid.
+/// The public entry the rest of the VM uses: CanonicalizeUnicodeLocaleId — the
+/// grammar canonicalization above followed by `cldr_alias`'s registry
+/// replacement (`iw`→`he`, `art-lojban`→`jbo`, `ru-SU`→`ru-RU`) — or `None` if
+/// the tag is not structurally valid.
 pub(crate) fn canonicalize_tag(tag: &str) -> Option<String> {
-    parse_lang_tag(tag).map(|t| t.canonical())
+    parse_lang_tag(tag).map(|mut t| {
+        crate::vm::cldr_alias::canonicalize(&mut t);
+        t.canonical()
+    })
 }
 
 /// `WeekdayToString(fw)` — ECMA-402 accepts the numeric weekday spellings for

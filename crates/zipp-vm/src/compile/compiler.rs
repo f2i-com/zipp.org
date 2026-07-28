@@ -280,6 +280,18 @@ impl Compiler {
         if body_refs_eval {
             self.dyn_global_zone = true;
         }
+        // A sloppy FUNCTION-context eval root: its `var`/function names live in
+        // the caller activation's dynamic EvalScope, never in a realm global.
+        // The zone must cover the functions the eval CREATES as well, not just
+        // its own top level — `fc.box_all_locals` below is per-FnCompiler and
+        // does not reach nested bodies, so
+        //     function h(){ return eval("var w = 5; (function(){ return w; })"); }
+        //     h()()          // ReferenceError: w is not defined
+        // compiled the inner `w` to a plain LoadGlobal that never consults the
+        // EvalScope (staging/sm/eval/exhaustive-fun-*, sm/regress/regress-554955-*).
+        if is_script && self.eval_fn_context {
+            self.dyn_global_zone = true;
+        }
         if body_refs_eval {
             let mut all: Vec<String> = params.to_vec();
             if let Some(r) = rest {
@@ -1036,8 +1048,39 @@ impl Compiler {
                 fc.cell_regs.insert(r);
             }
         }
+        // 10.2.2 [[Construct]] step 5: for a BASE class, InitializeInstanceElements
+        // runs on `thisArgument` BEFORE OrdinaryCallEvaluateBody — so the field
+        // initializers precede FunctionDeclarationInstantiation's parameter
+        // defaults. zipp inlines the initializers into the constructor, so the
+        // spec order is an EMISSION order here; emitting them after `bind_params`
+        // made `class A { x = "h" + g1(); constructor(o = g2()){} }` throw 20
+        // instead of 10 (staging/sm/fields/init-order.js).
+        //
+        // Guarded: this inlined form lets an initializer resolve a name to a
+        // PARAMETER register (already wrong — per 15.7.10 a field initializer is
+        // its own function and never sees the constructor's parameters), and
+        // hoisting it above `bind_params` would read that register unbound. When
+        // an initializer mentions a parameter name at all, keep the old order.
+        let mut param_names: HashSet<String> = params.iter().cloned().collect();
+        if let Some(r) = rest {
+            param_names.insert(r.to_string());
+        }
         if let Some(pa) = params_ast {
-            fc.bind_params(pa)?;
+            param_names.extend(param_pattern_leaves(pa));
+        }
+        let fields_first = params_ast.is_some()
+            && (!fields.is_empty() || !computed_inits.is_empty())
+            && !fields
+                .iter()
+                .filter_map(|(_, e)| *e)
+                .chain(computed_inits.iter().filter_map(|e| *e))
+                .any(|e| {
+                    capture::expr_refs_all(e).iter().any(|n| param_names.contains(n))
+                });
+        if !fields_first {
+            if let Some(pa) = params_ast {
+                fc.bind_params(pa)?;
+            }
         }
         // A generator method (sync OR async) runs its parameter prologue eagerly at
         // call and is created suspended here (a constructor is never a generator, so
@@ -1100,6 +1143,13 @@ impl Compiler {
                 class_id: fc.super_class.unwrap_or(u32::MAX),
             });
             fc.next_reg = save;
+        }
+        // …and only now the parameter prologue, when the base-class field
+        // initializers above had to precede it (see `fields_first`).
+        if fields_first {
+            if let Some(pa) = params_ast {
+                fc.bind_params(pa)?;
+            }
         }
         for s in body {
             if let ast::Stmt::FnDecl(f) = s {

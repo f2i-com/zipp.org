@@ -1048,6 +1048,22 @@ impl<'p> Vm<'p> {
             // length/byteLength/byteOffset as 0; a length-tracking view reflects
             // the buffer's current size.
             let eff = self.ta_effective_len(obj.heap_index());
+            // …but a FOREIGN receiver never gets them. 10.4.5 integer-indexed
+            // exotics own no `length`/`byteLength`/`byteOffset`/`buffer`: those
+            // are %TypedArray%.prototype accessors whose first step is
+            // ValidateTypedArray/RequireInternalSlot on the `this` value.
+            // Arriving here with `receiver != obj` means the lookup walked INTO
+            // this TypedArray from an ordinary object — `Object.create(ta).buffer`,
+            // `F.prototype = ta; new F().slice()`, `Reflect.get(ta, k, other)` —
+            // so the real getter would run on that receiver and throw
+            // (staging/sm/regress/regress-571014.js). BYTES_PER_ELEMENT is a
+            // genuine inherited DATA property and @@toStringTag returns undefined
+            // rather than throwing, so both stay reachable.
+            if receiver != obj && matches!(key, "length" | "byteLength" | "byteOffset" | "buffer") {
+                return Err(Thrown(format!(
+                    "TypeError: get %TypedArray%.prototype.{key} called on a value that is not a TypedArray"
+                )));
+            }
             // KNOWN DEVIATION: these six names are answered from the instance
             // without consulting the prototype chain, so
             // `Object.setPrototypeOf(ta, {length: 7}); ta.length` reports the
@@ -1099,6 +1115,27 @@ impl<'p> Vm<'p> {
             // methods/@@toStringTag from %SharedArrayBuffer.prototype%.
             let shared = self.shared_buffers.contains(&ai);
             let immut = self.immutable_buffers.contains(&ai);
+            // Same rule as the TypedArray arm above: an ArrayBuffer owns none of
+            // these — they are %ArrayBuffer.prototype% accessors that begin with
+            // RequireInternalSlot(this, [[ArrayBufferData]]). A lookup that
+            // reached this buffer through some OTHER object's prototype chain
+            // (`F.prototype = new ArrayBuffer(1); new F().byteLength`) must throw
+            // the getter's TypeError (staging/sm/regress/regress-571014.js).
+            if receiver != obj
+                && matches!(
+                    key,
+                    "byteLength"
+                        | "maxByteLength"
+                        | "resizable"
+                        | "growable"
+                        | "detached"
+                        | "immutable"
+                )
+            {
+                return Err(Thrown(format!(
+                    "TypeError: get ArrayBuffer.prototype.{key} called on a value that is not an ArrayBuffer"
+                )));
+            }
             return Ok(match key {
                 "byteLength" => Value::num(len as f64),
                 // An immutable buffer is fixed-size and never resizable.
@@ -1137,6 +1174,15 @@ impl<'p> Vm<'p> {
             let cur = self.array_buffer_len(buffer);
             let oob = detached
                 || if tracking { byte_offset > cur } else { byte_offset + byte_length > cur };
+            // %DataView.prototype%'s three accessors all start with
+            // RequireInternalSlot(this, [[DataView]]); a foreign receiver that
+            // merely inherits from this view must get that TypeError, not the
+            // view's own numbers (same rule as the TypedArray/ArrayBuffer arms).
+            if receiver != obj && matches!(key, "byteLength" | "byteOffset" | "buffer") {
+                return Err(Thrown(format!(
+                    "TypeError: get DataView.prototype.{key} called on a value that is not a DataView"
+                )));
+            }
             return Ok(match key {
                 "byteLength" | "byteOffset" if oob => {
                     return Err(Thrown(format!(

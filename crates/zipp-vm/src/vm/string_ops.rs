@@ -512,6 +512,16 @@ impl<'p> Vm<'p> {
                         let limit_raw = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                         return Ok(Some(self.call_value(m, arg0, &[Value::heap(idx), limit_raw])?));
                     }
+                    // GetMethod step 3: a present-but-NOT-CALLABLE @@split is a
+                    // TypeError, not a silent fall-through to the default
+                    // algorithm — `"a-a".split({[Symbol.split]: 1, toString(){…}})`
+                    // must throw (staging/sm/String/split-GetMethod.js).
+                    // undefined/null alone mean "no splitter".
+                    if !m.is_nullish() {
+                        return Err(Thrown(
+                            "TypeError: Symbol.split method is not a function".into(),
+                        ));
+                    }
                 }
                 // lim = ToUint32(ToNumber(limit)) — runs valueOf/@@toPrimitive and
                 // propagates a throw; `undefined` → no cap.
@@ -666,19 +676,22 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(self.heap.alloc_js(sub))))
             }
             "localeCompare" => {
-                // No full Intl collation, but canonically-equivalent strings
-                // MUST compare equal (spec: the comparison honors canonical
-                // equivalence) - compare NFC normal forms.
-                use unicode_normalization::UnicodeNormalization;
+                // ECMA-402 defines this as `Intl.Collator(locales, options)
+                // .compare(this, that)` — so it is routed through a real
+                // Collator rather than reimplemented. Two things follow that the
+                // old standalone NFC comparison got wrong: the `locales`/
+                // `options` arguments are validated (a bad tag or an invalid
+                // `sensitivity` throws exactly what the constructor throws), and
+                // the ordering cannot drift from `Intl.Collator.prototype.compare`
+                // (`localeCompare/{throws-same-exceptions-as,returns-same-results-as}
+                // -Collator.js`).
                 let other = self.to_js_string(arg0)?;
-                let a: String = s.nfc().collect();
-                let b: String = other.nfc().collect();
-                let ord = match a.cmp(&b) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Equal => 0,
-                    std::cmp::Ordering::Greater => 1,
-                };
-                Ok(Some(Value::int(ord)))
+                let locales = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let options = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let coll = self.make_intl(crate::vm::native::INTL_COLLATOR, locales, options)?;
+                let resolved = self.intl_this(coll, crate::vm::native::INTL_COLLATOR, "compare")?;
+                let ord = self.collator_compare(resolved, &s, &other);
+                Ok(Some(Value::int(ord as i32)))
             }
             "normalize" => {
                 // Validate the form; engine strings are already normalized for ASCII

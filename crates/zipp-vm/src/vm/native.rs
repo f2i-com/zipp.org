@@ -633,6 +633,14 @@ pub const INTL_SEGMENTER: u8 = 6;
 pub const INTL_LOCALE: u8 = 7;
 pub const INTL_DISPLAYNAMES: u8 = 8;
 pub const INTL_DURATIONFORMAT: u8 = 9;
+/// The two Segmenter helper objects. They have no constructor (their protos are
+/// %Segments.prototype% / %SegmentIterator.prototype%, reachable only through
+/// `Intl.Segmenter.prototype.segment`), but they ARE branded — `containing`
+/// and `next` do a RequireInternalSlot — so they take kinds like the services.
+pub const INTL_SEGMENTS: u8 = 10;
+pub const INTL_SEGMENT_ITERATOR: u8 = 11;
+/// Number of `intl_protos` / `intl_ctors` slots.
+pub const INTL_KINDS: usize = 12;
 /// Field names of a Temporal.Duration, in slot order.
 pub const DURATION_FIELDS: [&str; 10] = [
     "years", "months", "weeks", "days", "hours", "minutes", "seconds",

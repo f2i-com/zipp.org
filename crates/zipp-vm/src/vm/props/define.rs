@@ -647,7 +647,14 @@ impl<'p> Vm<'p> {
         } else {
             match self.heap.get(idx) {
                 HeapObj::Object(m) => m.extensible,
-                _ => true,
+                // A CALLABLE (or class) keeps its own props in fn_props, but
+                // preventExtensions/seal/freeze record its [[Extensible]] flag in
+                // the arr_props side table — which is exactly where
+                // `is_extensible` reads it. Answering an unconditional `true`
+                // here let `Object.preventExtensions(f);
+                // Object.defineProperty(f, "x", {value: 1})` succeed
+                // (staging/sm/object/extensibility-01.js).
+                _ => self.arr_props.get(&idx).map_or(true, |m| m.extensible),
             }
         };
         let (attr, stored) = self

@@ -1477,6 +1477,12 @@ impl<'p> Vm<'p> {
         };
         let mut t = lt::parse_lang_tag(&base)
             .ok_or_else(|| Thrown(format!("RangeError: invalid language tag: {base}")))?;
+        // ApplyOptionsToTag canonicalizes the tag BEFORE the options are applied
+        // and again after (steps 9 and 13), and the two passes are not
+        // interchangeable: `new Intl.Locale("und-Armn-SU", {language: "ru"})` is
+        // "ru-Armn-AM" because SU resolves through the likely region of
+        // *und-Armn*, not of ru (constructor-apply-options-canonicalizes-twice).
+        crate::vm::cldr_alias::canonicalize(&mut t);
         // ── UpdateLanguageId ──
         if let Some(l) = self.opt_string_opt(options, "language", &[])? {
             if !lt::is_language_subtag(&l) {
@@ -1515,6 +1521,9 @@ impl<'p> Vm<'p> {
             seen.sort();
             t.variants = seen;
         }
+        // ApplyOptionsToTag step 13 — a region supplied as an option is itself
+        // subject to the registries (`{region: "554"}` on "en" is "en-NZ").
+        crate::vm::cldr_alias::canonicalize(&mut t);
         // ── ApplyUnicodeExtensionToTag: the relevant extension keys, in key order ──
         for (opt_name, key) in
             [("calendar", "ca"), ("collation", "co"), ("firstDayOfWeek", "fw"), ("hourCycle", "hc")]
@@ -1550,7 +1559,115 @@ impl<'p> Vm<'p> {
             }
             t.set_u("nu", Some(canon_ext_value(&ns)));
         }
+        // The keyword types the options just wrote are canonicalized too, so
+        // `new Intl.Locale("en", {calendar: "islamicc"}).calendar` reports
+        // "islamic-civil" exactly as the `-u-ca-islamicc` spelling does
+        // (constructor-options-canonicalized.js). The language-id pass is
+        // idempotent by now, so re-running the whole thing is safe.
+        crate::vm::cldr_alias::canonicalize(&mut t);
         Ok(self.alloc_locale(&t))
+    }
+
+    /// CompareStrings for a resolved `Intl.Collator`.
+    ///
+    /// There is no DUCET/CLDR collation here — this is an NFC code-point
+    /// comparison. The two option-driven transforms that do NOT need collation
+    /// weights are applied: `ignorePunctuation` drops the characters CLDR treats
+    /// as variable (whitespace, punctuation and symbols), and
+    /// `sensitivity: "base"/"accent"` case-folds.
+    ///
+    /// Shared with `String.prototype.localeCompare`, which ECMA-402 specifies as
+    /// `Intl.Collator(locales, options).compare(this, that)` — so the two agree
+    /// by construction rather than by two copies of the same approximation
+    /// (`localeCompare/returns-same-results-as-Collator.js`).
+    pub(crate) fn collator_compare(&self, resolved: u32, a: &str, b: &str) -> f64 {
+        use unicode_normalization::UnicodeNormalization;
+        let ignore_punct = self.intl_slot(resolved, "ignorePunctuation") == Value::bool(true);
+        let sens = self.display(self.intl_slot(resolved, "sensitivity"));
+        let prep = |s: &str| -> String {
+            let s: String = s.nfc().collect();
+            let s: String = if ignore_punct {
+                s.chars().filter(|c| !is_variable_collation_char(*c)).collect()
+            } else {
+                s
+            };
+            if sens == "base" || sens == "accent" { s.to_lowercase() } else { s }
+        };
+        let (a, b) = (prep(a), prep(b));
+        if a < b {
+            -1.0
+        } else if a > b {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// CreateSegmentsObject / CreateSegmentIterator — the two branded objects
+    /// `Intl.Segmenter.prototype.segment` hands out. Both hold the same three
+    /// slots ([[SegmentsString]] / [[IteratedString]], the granularity, and the
+    /// iterator's cursor), so one constructor covers both; `kind` is what
+    /// `containing`/`next` brand-check against.
+    ///
+    /// `input` is ToString'd here, which is `segment`'s step 3 — a Symbol
+    /// argument is a TypeError, and an object's `toString` runs exactly once
+    /// (segment-tostring.js).
+    pub(crate) fn make_segments(
+        &mut self,
+        kind: u8,
+        input: Value,
+        granularity: &str,
+        index: usize,
+    ) -> Result<Value, Thrown> {
+        // A string argument is kept as-is (flattened) rather than round-tripped
+        // through `to_js_string`, whose lossy view would turn a lone surrogate
+        // into U+FFFD; ToString on a String is the identity anyway.
+        let sv = if input.is_heap() && self.heap.is_str_like(input.heap_index()) {
+            self.heap.flatten(input.heap_index());
+            input
+        } else {
+            let s = self.to_js_string(input)?;
+            self.alloc_str(s)
+        };
+        let mut r = ObjMap::new();
+        r.set("input", sv);
+        let g = self.alloc_str(granularity.to_string());
+        r.set("granularity", g);
+        r.set("index", Value::num(index as f64));
+        let resolved = self.heap.alloc(HeapObj::Object(Box::new(r)));
+        let idx = self.heap.alloc(HeapObj::Intl { kind, resolved });
+        if self.intl_protos[kind as usize] != 0 {
+            self.proto_of.insert(idx, Value::heap(self.intl_protos[kind as usize]));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    /// CreateSegmentDataObject: an ordinary object whose own property NAMES are
+    /// exactly `segment`, `index`, `input` — plus `isWordLike` at
+    /// `granularity: "word"` and at no other granularity, which
+    /// `segment-{grapheme,word,sentence}-iterable.js` each assert directly.
+    pub(crate) fn segment_data_object(
+        &mut self,
+        input: Value,
+        granularity: &str,
+        start: usize,
+        end: usize,
+    ) -> Value {
+        let piece = match self.heap.get(input.heap_index()) {
+            HeapObj::Str(js) => js.slice_units(start, end),
+            _ => return Value::UNDEFINED,
+        };
+        let seg = Value::heap(self.heap.alloc_js(piece));
+        let mut o = ObjMap::new();
+        o.set("segment", seg);
+        o.set("index", Value::num(start as f64));
+        o.set("input", input);
+        if granularity == "word" {
+            let text = self.display(input);
+            let wl = crate::vm::segmenter::is_word_like(&text, start);
+            o.set("isWordLike", Value::bool(wl));
+        }
+        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
     }
 
     /// Materialize a parsed tag as an `Intl.Locale` instance. The `resolved`
