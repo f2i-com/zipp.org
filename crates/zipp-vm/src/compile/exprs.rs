@@ -1395,6 +1395,41 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// Compile the OPERAND of a `typeof`, without the `TypeOf` itself.
+    ///
+    /// `typeof <unbound identifier>` must yield "undefined", NOT throw a
+    /// ReferenceError — and this holds when the identifier is wrapped in
+    /// parentheses (`typeof (f)`), which is no longer a node, so the operand IS
+    /// the identifier. A bare identifier that resolves to a global is read with
+    /// the non-throwing variant so the never-declared sentinel degrades to
+    /// undefined. (`undefined`/`NaN`/`Infinity` are literals, handled by
+    /// `expr`.) Factored so the bare `typeof x` and the fused
+    /// `typeof x === "lit"` compile the operand IDENTICALLY.
+    fn typeof_operand(&mut self, arg: &ast::Expr, dst: Reg) -> R<Reg> {
+        if let ast::Expr::Ident(id) = arg {
+            let n: &str = id;
+            if !matches!(n, "undefined" | "NaN" | "Infinity") {
+                if let Binding::Global(idx) = self.resolve(n) {
+                    // A DECLARED top-level lexical still observes its TDZ
+                    // through typeof (a ReferenceError) — only a name the
+                    // compiler never saw declared degrades to "undefined" via
+                    // the non-throwing load.
+                    let declared_lexical = self.cx.lexical_globals.contains(&(idx as u32))
+                        || self.cx.const_globals.contains(&(idx as u32));
+                    if declared_lexical {
+                        self.emit(Instr::LoadGlobal { dst, idx });
+                    } else if self.box_all_locals || self.cx.dyn_global_zone {
+                        self.emit(Instr::LoadGlobalOrUndefinedDyn { dst, idx });
+                    } else {
+                        self.emit(Instr::LoadGlobalOrUndefined { dst, idx });
+                    }
+                    return Ok(dst);
+                }
+            }
+        }
+        self.expr(arg)
+    }
+
     pub(crate) fn binary(
         &mut self,
         op: ast::BinaryOp,
@@ -1403,6 +1438,31 @@ impl<'a> FnCompiler<'a> {
         dst: Reg,
     ) -> R<Reg> {
         use ast::BinaryOp as Op;
+        // ── `typeof x === "lit"` → TypeOfIs ── (also `!==`, and the loose
+        // forms, which agree with strict when both sides are strings — one side
+        // is a string literal and `typeof` always produces a string). The
+        // unfused pair allocates a heap string per evaluation and then
+        // content-compares it; the fused op compares the classifier's
+        // `&'static str` and allocates nothing. A literal outside the eight
+        // possible results fuses as code 255 (never matches) so the operand's
+        // effects — including the non-throwing undeclared-global read — are
+        // preserved. Only a plain-Utf8 literal fuses: a lone-surrogate literal
+        // (`StrVal::Utf16`) cannot equal any typeof result but needs its
+        // special constant slot, so it keeps the generic path.
+        if matches!(op, Op::StrictEq | Op::StrictNotEq | Op::Eq | Op::NotEq) {
+            let fused = match (left, right) {
+                (ast::Expr::Unary { op: ast::UnaryOp::Typeof, arg }, ast::Expr::Str(StrVal::Utf8(lit))) => Some((arg, lit)),
+                (ast::Expr::Str(StrVal::Utf8(lit)), ast::Expr::Unary { op: ast::UnaryOp::Typeof, arg }) => Some((arg, lit)),
+                _ => None,
+            };
+            if let Some((arg, lit)) = fused {
+                let neg = matches!(op, Op::StrictNotEq | Op::NotEq);
+                let code = crate::bytecode::typeof_code(lit).unwrap_or(255);
+                let a = self.typeof_operand(arg, dst)?;
+                self.emit(Instr::TypeOfIs { dst, a, code, neg });
+                return Ok(dst);
+            }
+        }
         // `x instanceof Ctor`: only built-in constructors are recognised (the
         // engine has no user prototype chain). Decided structurally in the VM.
         if matches!(op, Op::Instanceof) {
@@ -1558,36 +1618,7 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             Op::Typeof => {
-                // `typeof <unbound identifier>` must yield "undefined", NOT throw
-                // a ReferenceError — and this holds when the identifier is wrapped
-                // in parentheses (`typeof (f)`), which is no longer a node, so the
-                // operand IS the identifier. A bare identifier that resolves to a
-                // global is read with the non-throwing variant so the
-                // never-declared sentinel degrades to undefined.
-                // (`undefined`/`NaN`/`Infinity` are literals, handled by `expr`.)
-                if let ast::Expr::Ident(id) = arg {
-                    let n: &str = id;
-                    if !matches!(n, "undefined" | "NaN" | "Infinity") {
-                        if let Binding::Global(idx) = self.resolve(n) {
-                            // A DECLARED top-level lexical still observes its
-                            // TDZ through typeof (a ReferenceError) — only a
-                            // name the compiler never saw declared degrades to
-                            // "undefined" via the non-throwing load.
-                            let declared_lexical = self.cx.lexical_globals.contains(&(idx as u32))
-                                || self.cx.const_globals.contains(&(idx as u32));
-                            if declared_lexical {
-                                self.emit(Instr::LoadGlobal { dst, idx });
-                            } else if self.box_all_locals || self.cx.dyn_global_zone {
-                                self.emit(Instr::LoadGlobalOrUndefinedDyn { dst, idx });
-                            } else {
-                                self.emit(Instr::LoadGlobalOrUndefined { dst, idx });
-                            }
-                            self.emit(Instr::TypeOf { dst, a: dst });
-                            return Ok(dst);
-                        }
-                    }
-                }
-                let a = self.expr(arg)?;
+                let a = self.typeof_operand(arg, dst)?;
                 self.emit(Instr::TypeOf { dst, a });
                 Ok(dst)
             }

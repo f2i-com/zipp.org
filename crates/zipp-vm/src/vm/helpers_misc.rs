@@ -1740,6 +1740,28 @@ pub(crate) extern "win64" fn jit_forin_live(
 /// # Safety
 /// `vm` is a valid `*mut Vm`; `v_bits` is a valid Value whose heap object (if
 /// any) is rooted in the caller's frame registers.
+/// Win64 helper for the fused `TypeOfIs` (`typeof a === "lit"`). `code_neg`
+/// packs `TypeOfIs::code` in the low byte and `neg` in bit 8. Returns the Bool
+/// Value bits. PURE — the classifier allocates nothing and runs no user code,
+/// so unlike `jit_typeof` (which builds a heap string) the caller owes no
+/// r13/r14 refetch; total — never deopts.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `v_bits` is a valid Value rooted in the caller.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_typeof_is(
+    vm: *mut core::ffi::c_void,
+    v_bits: u64,
+    code_neg: u32,
+) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    let t = vm.type_of(Value::from_bits(v_bits));
+    let m = crate::bytecode::TYPEOF_NAMES
+        .get((code_neg & 0xFF) as usize)
+        .is_some_and(|&n| n == t);
+    Value::bool(m != (code_neg & 0x100 != 0)).bits()
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_typeof(vm: *mut core::ffi::c_void, v_bits: u64) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };

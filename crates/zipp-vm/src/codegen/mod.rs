@@ -514,6 +514,7 @@ pub struct HeapHelperAddrs {
     /// returns the result Value bits (a heap string; compared by content via
     /// the `strict_eq` slow path). Allocates ⇒ post-call refetch when has_prop.
     pub typeof_str: usize,
+    pub typeof_is: usize,
     /// Tier C `IsArray` — `Array.isArray(v)`; returns Bool bits, or the deopt
     /// sentinel for the rare throwing case (revoked Proxy).
     pub is_array: usize,
@@ -565,6 +566,7 @@ impl HeapHelperAddrs {
             has_property: self.has_property,
             regs_fits: self.regs_fits,
             typeof_str: self.typeof_str,
+            typeof_is: self.typeof_is,
             is_array: self.is_array,
             len_of: self.len_of,
             forin_keys: self.forin_keys,

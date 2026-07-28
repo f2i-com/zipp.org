@@ -76,6 +76,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             | Instr::Eq { .. }
             | Instr::Ne { .. }
             | Instr::TypeOf { .. }
+            | Instr::TypeOfIs { .. }
             | Instr::IsArray { .. }
             | Instr::LenOf { .. }
             | Instr::ForInKeys { .. }
@@ -608,6 +609,20 @@ pub(crate) fn compile_proto_mem(
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
+            }
+            Instr::TypeOfIs { dst, a, code, neg } => {
+                // Fused typeof compare — the region arm verbatim. PURE (no
+                // alloc, no user code, total), so unlike `TypeOf` above it owes
+                // no refetch.
+                let code_neg = code as u32 | ((neg as u32) << 8);
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // value bits
+                    ; mov r8d, code_neg as i32            // code | neg<<8
+                    ; mov rax, QWORD heap.typeof_is as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax          // Bool Value bits
+                );
             }
             Instr::IsArray { dst, a } => {
                 // `Array.isArray(v)` → Bool bits; deopt sentinel for the rare

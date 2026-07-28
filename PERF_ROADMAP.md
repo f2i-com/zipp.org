@@ -1316,6 +1316,46 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B54 — `typeof x === "lit"` fuses to `TypeOfIs`: map-set-heavy −10%,
+json-large −4%
+
+B10.6(b) and the survey's JL-TYPEOF-FUSE, landed as one fused opcode instead of
+two half-fixes. The unfused pair allocates a heap string per evaluation
+(`alloc_str(type_of(v).to_string())`) and then content-compares it through the
+Eq machinery; `TypeOfIs { a, code, neg }` compares the classifier's `&'static
+str` against `TYPEOF_NAMES[code]` and allocates nothing. Fuses `===`, `!==`,
+and the loose forms (equal by construction: one side is a string literal and
+`typeof` always yields a string), in both operand orders.
+
+The two details that make it exactly equivalent, not just close:
+
+* The operand of a fused `typeof <bare ident>` compiles through the SAME
+  factored `typeof_operand` path as the unfused form, so `typeof undeclared
+  === "undefined"` keeps its non-throwing `LoadGlobalOrUndefined` read and a
+  TDZ'd lexical still throws.
+* A literal that is not one of the eight results fuses as code 255 — matches
+  nothing — rather than declining, so the operand's side effects still run.
+  Comparing BY CONTENT against `type_of`'s return means the fused op cannot
+  diverge from the unfused pair (including `[[IsHTMLDDA]]` → "undefined").
+
+JIT: `jit_typeof_is` is PURE (no alloc, no user code, total — no bail, no
+refetch), admitted to the region MEM path and Tier C. The bare `TypeOf` stays
+un-admitted in regions: it allocates, and after this fusion it is rare.
+
+**Measured (quiet window, paired medians of 11): map-set-heavy 1457 → 1318ms
+(−9.6%), json-large 804 → 773ms (−3.9%).** A second 9-rep suite run under a
+load spike reproduced both target rows (−10.4%, −4.4%) with off-target rows
+swinging ±10% — the agreement of the two target rows across both runs is the
+evidence, the suite means are not. map-set-heavy's −10% exceeds the ~26ms its
+1.33M allocations price at B37's ~20ns; the remainder is presumably GC
+pressure (2.7M fewer transient strings per run) — not decomposed further.
+
+NOT done here, deliberately: interning the 8 result strings for the BARE
+`typeof x` (B10.6(b)'s other half). After the fusion the bare form's remaining
+traffic is storing `typeof v` into collections (map-set-heavy still does), but
+B49 killed three interning attempts on GC-root/probe-cost grounds — re-derive
+the arithmetic before touching it.
+
 ### B53 — `ToPropKey` is now visible to the regalloc planner: the normalize
 loop reaches the unboxed tier, typedarray-math −15% under load
 

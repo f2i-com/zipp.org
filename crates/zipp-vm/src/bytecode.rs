@@ -65,6 +65,15 @@ pub enum Instr {
     /// `dst = globals[idx]`, but the never-declared sentinel reads as `undefined`
     /// instead of throwing. Emitted for `typeof <ident>`, where an unbound name
     /// must yield "undefined" rather than a ReferenceError.
+    /// `dst = (typeof a) === TYPEOF_NAMES[code]` (`neg` flips it) — the fused
+    /// form of `TypeOf` + `Eq`-against-a-string-literal, which is how `typeof`
+    /// is almost always consumed. The unfused pair allocates a heap string per
+    /// evaluation and then content-compares it; this compares the `&'static
+    /// str` the classifier returns and allocates nothing. `code` indexes
+    /// [`TYPEOF_NAMES`]; a literal that is not a possible `typeof` result
+    /// compiles with code 255, which matches nothing (the comparison is a
+    /// constant, but the operand is still evaluated for its effects).
+    TypeOfIs { dst: Reg, a: Reg, code: u8, neg: bool },
     LoadGlobalOrUndefined { dst: Reg, idx: u32 },
     /// Dynamic-first variants for code in a contains-direct-eval function (or
     /// an eval program): consult the activation's EvalScope (frame field or
@@ -1331,4 +1340,22 @@ pub struct ClassDef {
     /// instance list because a static private's brand lives on the class
     /// VALUE, not on instances (kind bit 8 at MakeClass registration).
     pub static_field_names: Vec<String>,
+}
+
+/// The eight possible results of JS `typeof`, indexed by `TypeOfIs::code`.
+/// Compared by CONTENT against what `Vm::type_of` returns, so the fused op can
+/// never diverge from the unfused `TypeOf` — including the `[[IsHTMLDDA]]`
+/// exotic (`document.all`), whose `type_of` answers "undefined" and therefore
+/// matches code 3 here exactly as the unfused pair would.
+pub const TYPEOF_NAMES: [&str; 8] = [
+    "number", "string", "boolean", "undefined", "object", "function", "symbol", "bigint",
+];
+
+/// Compile-time mapping of a string literal to its `TypeOfIs::code`. `None`
+/// for any other literal — the comparison can then never be true, which the
+/// compiler encodes as code 255 (matches nothing) rather than declining the
+/// fusion, so the operand's evaluation (and a `typeof undeclared`'s
+/// non-throwing read) is preserved.
+pub fn typeof_code(lit: &str) -> Option<u8> {
+    TYPEOF_NAMES.iter().position(|&n| n == lit).map(|i| i as u8)
 }

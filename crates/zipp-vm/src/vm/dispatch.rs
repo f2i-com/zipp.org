@@ -976,6 +976,20 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::TypeOfIs { dst, a, code, neg } => {
+                        // Fused `typeof a === "lit"`: compare the classifier's
+                        // `&'static str` by content — no heap string, no Eq
+                        // dispatch, and by construction identical to what the
+                        // unfused pair computes (code 255 indexes nothing and
+                        // so never matches).
+                        let va = self.get(base, a);
+                        let t = self.type_of(va);
+                        let m = crate::bytecode::TYPEOF_NAMES
+                            .get(code as usize)
+                            .is_some_and(|&n| n == t);
+                        self.set(base, dst, Value::bool(m != neg));
+                        ip += 1;
+                    }
                     Instr::IsArray { dst, a } => {
                         let v = self.get(base, a);
                         let is_arr = self.value_is_array_throwing(v)?;
@@ -6302,6 +6316,7 @@ impl<'p> Vm<'p> {
             has_property: jit_has_property as usize,
             regs_fits: jit_regs_fits as usize,
             typeof_str: jit_typeof as usize,
+            typeof_is: crate::vm::helpers_misc::jit_typeof_is as usize,
             is_array: jit_is_array as usize,
             len_of: jit_len_of as usize,
             forin_keys: jit_forin_keys as usize,

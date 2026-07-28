@@ -828,6 +828,29 @@ mod tests {
     }
 
     #[test]
+    fn typeof_is_fusion_semantics() {
+        // `typeof x === "lit"` fuses to TypeOfIs (no heap string, no Eq). Pins:
+        // a hot mixed-type JIT loop over all polarities; the undeclared-global
+        // non-throwing read surviving the fusion; a never-match literal still
+        // evaluating its operand's side effects; null ("object"), bigint,
+        // symbol. Expectations from node.
+        assert_jit_matches(
+            "var out=[];\
+             (function(){var arr=[1,'a',true,{},undefined,function(){}]; var c=0;\
+              for(var i=0;i<600000;i++){ var v=arr[i%6];\
+               if(typeof v==='number') c+=1; else if(typeof v==='string') c+=2;\
+               else if(typeof v!=='object') c+=3; else c+=4; }\
+              out.push(c);})();\
+             (function(){out.push(typeof notDeclaredXyz==='undefined', typeof notDeclaredXyz!=='undefined');})();\
+             (function(){var n=0; function eff(){n++;return 1;}\
+              for(var i=0;i<50000;i++){ if(typeof eff()==='nonsense') out.push('no'); } out.push(n);})();\
+             (function(){out.push(typeof null==='object', typeof 10n==='bigint', typeof Symbol()==='symbol');})();\
+             console.log(out.join('|'))",
+            &["1600000|true|false|50000|true|true|true"],
+        );
+    }
+
+    #[test]
     fn topropkey_regalloc_key_semantics() {
         // `x[i] *= v` emits ToPropKey, which the regalloc (f64) tier now
         // compiles as a register copy — sound ONLY because a numeric key is

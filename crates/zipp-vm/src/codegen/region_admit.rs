@@ -149,6 +149,12 @@ pub(crate) fn region_can_compile(
             // are not an i64 or an f64 — so it takes the MEM path, exactly as
             // `LoadBool` does.
             Instr::LoadUndefined { .. } | Instr::LoadNull { .. } => {}
+            // Fused `typeof a === "lit"` — MEM path via the PURE `jit_typeof_is`
+            // helper (no alloc, no user code, total). The UNFUSED `TypeOf` is
+            // still not admitted here: it allocates its result string, and after
+            // this fusion the bare form is rare enough not to be worth the
+            // refetch plumbing.
+            Instr::TypeOfIs { .. } => {}
             // `CheckCoercible` — RequireObjectCoercible before a member access
             // (`objs[i&3].area()` emits one). MEM path: a null/undefined operand
             // bails to the interpreter (which throws the TypeError); any other
@@ -651,6 +657,7 @@ pub(crate) struct HeapHelpers {
     pub(crate) regs_fits: usize,
     /// Tier C `TypeOf` helper (v bits → heap-string Value bits).
     pub(crate) typeof_str: usize,
+    pub(crate) typeof_is: usize,
     /// Tier C `IsArray` helper (v bits → Bool bits / deopt sentinel).
     pub(crate) is_array: usize,
     /// Tier C `LenOf` helper (obj bits → length Value bits).
