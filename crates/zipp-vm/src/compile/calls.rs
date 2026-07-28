@@ -539,8 +539,11 @@ impl<'a> FnCompiler<'a> {
                 let pid = self
                     .super_class
                     .ok_or("`super(...)` is only valid in a derived class constructor")?;
+                // GetSuperConstructor BEFORE the args (spec SuperCall order).
+                let ctor = self.temp();
+                self.emit(Instr::SuperCtorFetch { dst: ctor, home_class_id: pid });
                 let args_arr = self.build_spread_args(&c.args)?;
-                self.emit(Instr::SuperCtorSpread { home_class_id: pid, args: args_arr });
+                self.emit(Instr::SuperCtorSpread { ctor, home_class_id: pid, args: args_arr });
                 // `super(...)` evaluates to the new bound `this` (BindThisValue's
                 // result) — SuperCtorSpread rebinds reg 0 to it (call-expr-value).
                 self.emit(Instr::Move { dst, src: 0 });
@@ -659,8 +662,12 @@ impl<'a> FnCompiler<'a> {
                 .super_class
                 .ok_or("`super(...)` is only valid in a derived class constructor")?;
             // (Spread `super(...args)` is handled in the spread block above.)
+            // GetSuperConstructor BEFORE the args (spec SuperCall order: the
+            // fetch, then ArgumentListEvaluation, then the IsConstructor check).
+            let ctor = self.temp();
+            self.emit(Instr::SuperCtorFetch { dst: ctor, home_class_id: pid });
             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-            self.emit(Instr::SuperCtor { home_class_id: pid, arg_base, argc });
+            self.emit(Instr::SuperCtor { ctor, home_class_id: pid, arg_base, argc });
             // `super()` evaluates to the new bound `this` (BindThisValue's
             // result) — SuperCtor rebinds reg 0 to it (call-expr-value).
             self.emit(Instr::Move { dst, src: 0 });
@@ -672,10 +679,16 @@ impl<'a> FnCompiler<'a> {
                 if matches!(&m.object, Expr::Super) {
                     self.this_check();
                     let name = self.string_name(prop);
-                    let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                     if let Some(pid) = self.super_class {
-                        self.emit(Instr::SuperMethod { dst, home_class_id: pid, name, arg_base, argc });
+                        // MakeSuperPropertyReference captures GetSuperBase BEFORE
+                        // the argument list runs (an arg may retarget the home
+                        // object's prototype — superPropOrdering's testProp).
+                        let b = self.temp();
+                        self.emit(Instr::SuperBase { dst: b, home_class_id: pid });
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                        self.emit(Instr::SuperMethod { dst, base: b, home_class_id: pid, name, arg_base, argc });
                     } else if self.super_home_obj {
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                         self.emit(Instr::SuperMethodObj { dst, name, arg_base, argc });
                     } else {
                         return Err("`super.method(...)` is only valid in a method".into());
@@ -705,9 +718,11 @@ impl<'a> FnCompiler<'a> {
                 // eval — its program sees the caller's bindings AND the with
                 // chain (threaded through the eval-site map's hidden
                 // " with-object-N" cells). A with-object that DOES carry the
-                // name gets an ordinary call of that value with `this` = the
-                // with-object (accepted limit: a with-bound value that happens
-                // to BE %eval% is treated as indirect).
+                // name resolves the callee from it: when that VALUE is %eval%
+                // the call is STILL a direct eval (13.3.6.1 tests the
+                // reference's name and the callee value, not where the binding
+                // lives); any other value is an ordinary call with `this` =
+                // the with-object.
                 if &**id == "eval" && matches!(self.resolve("eval"), Binding::Global(_)) {
                     let save = self.next_reg;
                     let nidx = self.string_name("eval");
@@ -744,6 +759,17 @@ impl<'a> FnCompiler<'a> {
                     let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                     let jf = self.here();
                     self.emit(Instr::JumpIfFalse { cond: found, target: 0 });
+                    // A with-object carried `eval`: direct only when its value
+                    // IS %eval%; otherwise an ordinary call with `this` = the
+                    // with-object.
+                    let is_eval = self.temp();
+                    self.emit(Instr::IsEvalFn { dst: is_eval, src: callee_reg });
+                    let jf2 = self.here();
+                    self.emit(Instr::JumpIfFalse { cond: is_eval, target: 0 });
+                    let jd = self.here();
+                    self.emit(Instr::Jump { target: 0 });
+                    let with_call = self.here();
+                    self.patch_jump(jf2, with_call);
                     self.emit(Instr::CallWithThis {
                         dst,
                         callee: callee_reg,
@@ -755,6 +781,7 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::Jump { target: 0 });
                     let direct = self.here();
                     self.patch_jump(jf, direct);
+                    self.patch_jump(jd, direct);
                     let arg = if argc == 0 {
                         let r = self.temp();
                         self.emit(Instr::LoadUndefined { dst: r });
@@ -816,6 +843,45 @@ impl<'a> FnCompiler<'a> {
                     arg_base
                 };
                 self.emit_direct_eval(arg, dst, false);
+                return Ok(dst);
+            }
+            // `eval(code)` where `eval` names a LOCAL binding (a parameter or
+            // `var` of this or an enclosing function): STILL a direct eval
+            // when the binding's live value IS %eval% — 13.3.6.1 tests the
+            // reference's name and the callee VALUE, not where the binding
+            // lives (`function directArg(eval, s) { var a = 1; return
+            // eval(s); } directArg(eval, 'a+1')` ⇒ 2). Probe the value and
+            // branch; any other value is an ordinary call.
+            if &**id == "eval"
+                && matches!(
+                    self.resolve("eval"),
+                    Binding::Local(_) | Binding::LocalCell(_) | Binding::Upvalue(_)
+                )
+                && self.with_objs_for("eval").is_empty()
+            {
+                let save = self.next_reg;
+                let callee = self.expr(&c.callee)?;
+                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                let is_eval = self.temp();
+                self.emit(Instr::IsEvalFn { dst: is_eval, src: callee });
+                let jf = self.here();
+                self.emit(Instr::JumpIfFalse { cond: is_eval, target: 0 });
+                let arg = if argc == 0 {
+                    let r = self.temp();
+                    self.emit(Instr::LoadUndefined { dst: r });
+                    r
+                } else {
+                    arg_base
+                };
+                self.emit_direct_eval(arg, dst, false);
+                let je = self.here();
+                self.emit(Instr::Jump { target: 0 });
+                let indirect = self.here();
+                self.patch_jump(jf, indirect);
+                self.emit(Instr::Call { dst, callee, arg_base, argc });
+                let end = self.here();
+                self.patch_jump(je, end);
+                self.next_reg = save.max(dst + 1);
                 return Ok(dst);
             }
         }
@@ -1161,10 +1227,14 @@ impl<'a> FnCompiler<'a> {
                     if key != key_reg {
                         self.emit(Instr::Move { dst: key_reg, src: key });
                     }
-                    let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                     if let Some(pid) = is_class {
-                        self.emit(Instr::SuperMethodComputed { dst, home_class_id: pid, key: key_reg, arg_base, argc });
+                        // GetSuperBase after the key, BEFORE the argument list.
+                        let b = self.temp();
+                        self.emit(Instr::SuperBase { dst: b, home_class_id: pid });
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                        self.emit(Instr::SuperMethodComputed { dst, base: b, home_class_id: pid, key: key_reg, arg_base, argc });
                     } else {
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                         self.emit(Instr::SuperMethodObjComputed { dst, key: key_reg, arg_base, argc });
                     }
                     return Ok(dst);
@@ -1230,7 +1300,13 @@ impl<'a> FnCompiler<'a> {
             for scope in self.scopes.iter().rev() {
                 for (n, r) in scope.iter().rev() {
                     if self.cell_regs.contains(r) && seen.insert(n.clone()) {
-                        map.push((n.clone(), 0u8, *r));
+                        // Kind 3 marks a CATCH PARAMETER: the eval closes over
+                        // its cell like any caller binding (kind 0), but an
+                        // eval'd `var` of the same name still declares into the
+                        // function's varEnv (Annex B.3.5) instead of being
+                        // absorbed by the caller binding.
+                        let kind = if self.catch_param_regs.contains(r) { 3u8 } else { 0u8 };
+                        map.push((n.clone(), kind, *r));
                     }
                 }
             }
@@ -1339,8 +1415,12 @@ impl<'a> FnCompiler<'a> {
             // The eval's variable environment: GLOBAL only when the
             // call site is the script top level (a function/arrow/param
             // context keeps the old slot behavior until the dynamic
-            // caller-env lands).
-            var_env_is_global: self.is_script,
+            // caller-env lands). A sloppy FUNCTION-context eval root is
+            // NOT global either: its varEnv is the caller activation's
+            // EvalScope, so a direct eval nested inside it declares there
+            // too — `eval("eval('var x=1')")` in a function must not leak
+            // `x` to the realm global.
+            var_env_is_global: self.is_script && !self.cx.eval_fn_context,
             site,
             tail,
         });

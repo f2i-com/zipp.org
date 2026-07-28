@@ -166,6 +166,9 @@ impl<'p> Vm<'p> {
                 // `ic_super_get` (live, version-guarded). Pure (a read), so admitting
                 // it anywhere in the straight-line prefix is effect-free.
                 I::SuperGet { .. } => {}
+                // `GetSuperBase` capture for a SuperMethod/SuperSet — a pure read
+                // (the same lookup the interpreter's SuperBase op performs).
+                I::SuperBase { .. } => {}
                 // `super.<name> = val` write — the body's ONLY off-frame side
                 // effect. Resolved via `ic_super_set` and committed exactly once at
                 // run time (an inherited trivial setter over an own data slot); the
@@ -352,7 +355,14 @@ impl<'p> Vm<'p> {
                     let v = self.mi_super_get(fid, body_ip, home_class_id, name, recv)?;
                     regs[dst as usize] = v;
                 }
-                I::SuperSet { home_class_id, name, val } => {
+                I::SuperBase { dst, home_class_id } => {
+                    // The same live GetSuperBase the interpreter's op performs
+                    // (a pure read — a decline commits nothing).
+                    let is_static = self.func(fid as usize).super_static;
+                    let v = self.super_base(home_class_id, is_static);
+                    regs[dst as usize] = v;
+                }
+                I::SuperSet { home_class_id, name, val, base: _ } => {
                     // The body's only off-frame side effect. Commits exactly once
                     // (an inherited trivial setter over recv's own data slot) or
                     // declines BEFORE committing (None).
@@ -644,7 +654,7 @@ impl<'p> Vm<'p> {
         }
         let c = &p.code;
         // Plain `this.field = arg` (val register == the formal param, reg 1).
-        if let Instr::SetProp { obj: 0, name, val: 1 } = c.first()? {
+        if let Instr::SetProp { obj: 0, name, val: 1, strict: _ } = c.first()? {
             return Some((&p.string_constants[*name as usize], false));
         }
         // `this.field = (arg | 0)`: LoadInt 0 → Bitwise Or(arg, 0) → SetProp.
@@ -660,7 +670,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         match c.get(2)? {
-            Instr::SetProp { obj: 0, name, val } if *val == or_dst => {
+            Instr::SetProp { obj: 0, name, val, strict: _ } if *val == or_dst => {
                 Some((&p.string_constants[*name as usize], true))
             }
             _ => None,

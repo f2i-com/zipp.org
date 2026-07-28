@@ -1328,35 +1328,63 @@ impl<'p> Vm<'p> {
                 p.define("constructor", Value::heap(regexp_ctor), method_attr);
             }
             // Annex B legacy RegExp static accessors on the constructor. input/$_
-            // are read-write; the match-info accessors are read-only. A shared
-            // getter/setter brand-checks the %RegExp%-constructor receiver. All are
+            // are read-write; the match-info accessors are read-only. Each getter
+            // is a NativeClosure carrying its slot index into `regexp_last`
+            // ([input, lastMatch, lastParen, leftContext, rightContext, $1..$9]);
+            // the shared setter writes the input slot. All brand-check the
+            // %RegExp%-constructor receiver. All are
             // { enumerable:false, configurable:true }.
             {
-                let g = Value::heap(self.heap.alloc(HeapObj::Native(REGEXP_LEGACY_GET)));
                 let s = Value::heap(self.heap.alloc(HeapObj::Native(REGEXP_LEGACY_SET)));
-                let rw = PropAttr {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                    accessor: true,
-                    setter: s,
-                };
-                let ro = PropAttr {
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                    accessor: true,
-                    setter: Value::UNDEFINED,
-                };
-                let read_only = [
-                    "lastMatch", "$&", "lastParen", "$+", "leftContext", "$`", "rightContext",
-                    "$'", "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9",
+                // (property key, regexp_last slot) — input/$_ alias slot 0, the
+                // $-names alias their spelled-out twin.
+                let props: [(&str, usize); 19] = [
+                    ("input", 0),
+                    ("$_", 0),
+                    ("lastMatch", 1),
+                    ("$&", 1),
+                    ("lastParen", 2),
+                    ("$+", 2),
+                    ("leftContext", 3),
+                    ("$`", 3),
+                    ("rightContext", 4),
+                    ("$'", 4),
+                    ("$1", 5),
+                    ("$2", 6),
+                    ("$3", 7),
+                    ("$4", 8),
+                    ("$5", 9),
+                    ("$6", 10),
+                    ("$7", 11),
+                    ("$8", 12),
+                    ("$9", 13),
                 ];
+                let defs: Vec<(&str, Value, PropAttr)> = props
+                    .iter()
+                    .map(|&(key, slot)| {
+                        let g = Value::heap(self.heap.alloc(HeapObj::NativeClosure {
+                            id: REGEXP_LEGACY_GET,
+                            state: vec![Value::num(slot as f64)],
+                            name: "get",
+                            length: 0,
+                        }));
+                        let writable = slot == 0;
+                        (
+                            key,
+                            g,
+                            PropAttr {
+                                writable: false,
+                                enumerable: false,
+                                configurable: true,
+                                accessor: true,
+                                setter: if writable { s } else { Value::UNDEFINED },
+                            },
+                        )
+                    })
+                    .collect();
                 if let HeapObj::Object(m) = self.heap.get_mut(regexp_ctor) {
-                    m.define("input", g, rw);
-                    m.define("$_", g, rw);
-                    for k in read_only {
-                        m.define(k, g, ro);
+                    for (key, g, attr) in defs {
+                        m.define(key, g, attr);
                     }
                 }
             }
@@ -2589,7 +2617,7 @@ impl<'p> Vm<'p> {
         if self.host_262 {
             all.push(("$262", self.dollar262));
         }
-        // The 11 TypedArray constructors (Int8Array … BigUint64Array).
+        // The 12 TypedArray constructors (Int8Array … Float16Array).
         for (k, t) in native::TA_KINDS.iter().enumerate() {
             all.push((t.0, self.ta_ctors[k]));
         }

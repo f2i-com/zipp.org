@@ -1697,6 +1697,61 @@ impl<'a> FnCompiler<'a> {
                     Ok(dst)
                 }
             },
+            // `delete a?.b` / `delete a?.[k]`: the chain IS a reference — evaluate
+            // the object (nested `?.` links bail to `true`), short-circuit to
+            // `true` on a nullish base, otherwise delete the property for real.
+            // A chain ending in a call (`delete a?.()`) is not a reference and
+            // takes the generic evaluate-and-`true` path.
+            ast::Expr::Chain(inner) => match &**inner {
+                ast::Expr::Member(m)
+                    if !matches!(m.object, ast::Expr::Super)
+                        && !matches!(m.prop, ast::MemberProp::Private(_)) =>
+                {
+                    self.chain_bails.push(Vec::new());
+                    let res: R<Reg> = (|| {
+                        let o = self.expr(&m.object)?;
+                        let obj = self.alloc_reg();
+                        if o != obj {
+                            self.emit(Instr::Move { dst: obj, src: o });
+                        }
+                        if m.optional {
+                            self.emit_optional_check(obj);
+                        }
+                        let strict = self.cx.in_strict;
+                        match &m.prop {
+                            ast::MemberProp::Ident(p) => {
+                                let name = self.string_name(p);
+                                self.emit(Instr::DeleteProp { dst, obj, name, strict });
+                            }
+                            ast::MemberProp::Computed(k) => {
+                                let key = self.expr(k)?;
+                                self.emit(Instr::DeleteIndex { dst, obj, key, strict });
+                            }
+                            ast::MemberProp::Private(_) => unreachable!(),
+                        }
+                        Ok(dst)
+                    })();
+                    let bails = self.chain_bails.pop().unwrap();
+                    res?;
+                    if !bails.is_empty() {
+                        let jmp = self.here();
+                        self.emit(Instr::Jump { target: 0 });
+                        let true_at = self.here();
+                        self.emit(Instr::LoadBool { dst, val: true });
+                        let end = self.here();
+                        self.patch_jump(jmp, end);
+                        for b in bails {
+                            self.patch_jump(b, true_at);
+                        }
+                    }
+                    Ok(dst)
+                }
+                _ => {
+                    let _ = self.expr(arg)?;
+                    self.emit(Instr::LoadBool { dst, val: true });
+                    Ok(dst)
+                }
+            },
             // `delete <identifier>`: in strict mode an early SyntaxError; in sloppy
             // mode deleting a resolvable binding (var/let/const/param/function or a
             // declared global) yields `false` (non-configurable), while an
@@ -1725,46 +1780,7 @@ impl<'a> FnCompiler<'a> {
                 // `NaN`/`Infinity`/`undefined` are the only non-configurable builtin
                 // global properties; they're not tracked as compiler globals, so
                 // check them by name (a local of that name still resolves below).
-                if matches!(n, "NaN" | "Infinity" | "undefined") {
-                    self.emit(Instr::LoadBool { dst, val: false });
-                    return Ok(dst);
-                }
-                match self.resolve_existing(n) {
-                    Some(Binding::Local(_))
-                    | Some(Binding::LocalCell(_))
-                    | Some(Binding::Upvalue(_))
-                    | Some(Binding::ClassName(_)) => {
-                        self.emit(Instr::LoadBool { dst, val: false });
-                    }
-                    Some(Binding::Global(slot)) => {
-                        // A resolved GLOBAL defers to the runtime: DeleteGlobal
-                        // checks the PROGRAM's decl lists (an eval-compiled
-                        // `delete x` must see the program's `var x` as
-                        // non-configurable, and an eval-introduced var as
-                        // deletable — this compilation's own cx lists can't
-                        // tell) and removes a configurable binding.
-                        self.emit(Instr::DeleteGlobal { dst, slot });
-                    }
-                    // A binding of an ENCLOSING function is a declarative
-                    // record binding, so `delete` is false — but
-                    // `resolve_existing` reports it as unresolved (it does not
-                    // thread upvalues), which sent it to the global fallback
-                    // below and answered `true`. Costs one non-threading scan
-                    // of the enclosing chain, only on this arm.
-                    None if self.bound_in_enclosing(n) => {
-                        self.emit(Instr::LoadBool { dst, val: false });
-                    }
-                    None => {
-                        // Unreferenced-so-far name: allocate its global slot
-                        // (like an identifier reference would) so the runtime
-                        // check sees the LIVE binding — crucial for an eval'd
-                        // `delete x` whose `x` only exists in the outer
-                        // program. A never-declared name's fresh slot is
-                        // UNINITIALIZED, so DeleteGlobal is a true no-op.
-                        let slot = self.cx.global_slot(n) as u32;
-                        self.emit(Instr::DeleteGlobal { dst, slot });
-                    }
-                }
+                self.emit_static_delete(n, dst);
                 Ok(dst)
             }
             other => {
@@ -1809,7 +1825,11 @@ impl<'a> FnCompiler<'a> {
                     let nw = self.temp();
                     self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
                     match pid {
-                        Some(p) => self.emit(Instr::SuperSet { home_class_id: p, name, val: nw }),
+                        Some(p) => {
+                            let b = self.temp();
+                            self.emit(Instr::SuperBase { dst: b, home_class_id: p });
+                            self.emit(Instr::SuperSet { base: b, home_class_id: p, name, val: nw })
+                        }
                         None => self.emit(Instr::SuperSetObj { name, val: nw }),
                     }
                     self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
@@ -1840,7 +1860,11 @@ impl<'a> FnCompiler<'a> {
                     let nw = self.temp();
                     self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
                     match pid {
-                        Some(p) => self.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: nw }),
+                        Some(p) => {
+                            let b = self.temp();
+                            self.emit(Instr::SuperBase { dst: b, home_class_id: p });
+                            self.emit(Instr::SuperSetComputed { base: b, home_class_id: p, key: key_reg, val: nw })
+                        }
                         None => self.emit(Instr::SuperSetObjComputed { key: key_reg, val: nw }),
                     }
                     self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
@@ -1858,7 +1882,7 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
                     let nw = self.temp();
                     self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                    self.emit(Instr::SetProp { obj, name, val: nw });
+                    self.emit(Instr::SetProp { obj, name, val: nw, strict: self.cx.strict_expr_region > 0 });
                     self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
                     return Ok(dst);
                 }
@@ -1890,7 +1914,7 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
                     let nw = self.temp();
                     self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                    self.emit(Instr::SetProp { obj, name, val: nw });
+                    self.emit(Instr::SetProp { obj, name, val: nw, strict: self.cx.strict_expr_region > 0 });
                     self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
                     return Ok(dst);
                 }

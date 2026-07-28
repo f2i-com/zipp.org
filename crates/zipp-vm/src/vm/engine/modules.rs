@@ -213,7 +213,7 @@ impl<'p> Vm<'p> {
         let code = std::fs::read_to_string(&path)
             .map_err(|_| Thrown("TypeError: module not found".into()))?;
         let ast = crate::front::parse_module(&code).map_err(Thrown)?;
-        let prog = match crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), false) {
+        let prog = match crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), Vec::new(), false, false) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
             // evaluation pipeline (not built yet): surface a host TypeError —
@@ -472,14 +472,22 @@ impl<'p> Vm<'p> {
                         }
                     }
                     IN::Source => {
-                        // Slot + ModuleSource object were created in the
-                        // pre-pass. The LOADING phase still applies to a REAL
-                        // target (its request graph must resolve); the
-                        // synthetic `<module source>` host module needs
-                        // nothing further.
-                        if e.specifier != "<module source>" && !is_self && !in_flight {
-                            let mut seen = std::collections::HashSet::new();
-                            self.prescan_module_requests(&dep_canon, &mut seen)?;
+                        // The synthetic `<module source>` host module needs
+                        // nothing further. A REAL target is a Source Text
+                        // Module Record, and SourceTextModule.GetModuleSource
+                        // throws a SyntaxError at link time — only host-defined
+                        // module types carry a [[ModuleSource]] (source-phase
+                        // imports proposal). The target's request graph still
+                        // resolves FIRST: loading errors precede link errors.
+                        if e.specifier != "<module source>" {
+                            if !is_self && !in_flight {
+                                let mut seen = std::collections::HashSet::new();
+                                self.prescan_module_requests(&dep_canon, &mut seen)?;
+                            }
+                            return Err(Thrown(format!(
+                                "SyntaxError: The requested module '{}' does not provide a module source",
+                                e.specifier
+                            )));
                         }
                     }
                     IN::DeferNamespace => {
@@ -1117,7 +1125,7 @@ impl<'p> Vm<'p> {
         let Ok(ast) = crate::front::parse_module(&code) else {
             return false;
         };
-        let Ok(prog) = crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), false) else {
+        let Ok(prog) = crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), Vec::new(), false, false) else {
             return false;
         };
         prog.functions

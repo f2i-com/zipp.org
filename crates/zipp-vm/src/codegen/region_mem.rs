@@ -941,7 +941,7 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
-            Instr::SetProp { obj, name, val } => {
+            Instr::SetProp { obj, name, val, strict: _ } => {
                 // ── 8-way inline cache (CALL-FREE write on hit) ── like
                 // GetProp, but the helper only ever fills OWN ways here
                 // (identity + receiver version fully guard an own writable

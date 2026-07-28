@@ -1212,7 +1212,25 @@ impl<'p> Vm<'p> {
                 ProtoSet::Absorbed => return Ok(true), // TA chain node absorbed the index
                 ProtoSet::Proxy(false) => return self.reject_write(key, strict),
                 ProtoSet::NonWritable => return self.reject_write(key, strict),
-                ProtoSet::DataWrite => {} // no inherited accessor/proxy ⇒ own-data write
+                ProtoSet::DataWrite => {
+                    // The chain walk may have run user code — a proxy's missing
+                    // `set` trap is looked up on the HANDLER, whose getters fire
+                    // — that defined an own `key` on the receiver meanwhile.
+                    // OrdinarySetWithOwnDescriptor consults the receiver's own
+                    // descriptor AFTER the walk: an accessor, or a non-writable
+                    // data property, now present rejects the write
+                    // (staging/sm/Proxy/regress-bug1062349).
+                    let now_own = match self.heap.get(idx) {
+                        HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
+                        HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::Class(_) => None,
+                        _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attrs[i])),
+                    };
+                    if let Some(a) = now_own {
+                        if a.accessor || !a.writable {
+                            return self.reject_write(key, strict);
+                        }
+                    }
+                }
             }
         }
         // A class instance with an inherited `set x(v)` accessor: assigning a

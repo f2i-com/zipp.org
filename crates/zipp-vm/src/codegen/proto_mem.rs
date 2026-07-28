@@ -63,8 +63,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // already counted SetProp (`compile`'s `n_sites` filter and the
             // desync assertion at the end of this function both name it), so the
             // op was gated out one line short of working. It is
-            // class-prototype-hot's ONLY blacklisted function.
-            | Instr::SetProp { .. }
+            // class-prototype-hot's ONLY blacklisted function. A strict-FORCED
+            // write (strict ClassTail region in a sloppy function) declines:
+            // the slow helper reads strictness off the proto flag.
+            | Instr::SetProp { strict: false, .. }
             | Instr::AddInt { .. }
             | Instr::Add { .. }
             | Instr::Sub { .. }
@@ -806,7 +808,7 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
-            Instr::SetProp { obj, name, val } => {
+            Instr::SetProp { obj, name, val, strict: _ } => {
                 // 8-way inline cache, CALL-FREE on hit. The region arm verbatim,
                 // minus the setter-inline prefix and the TA refetch. Unlike
                 // GetProp the helper only ever fills OWN ways here (identity +

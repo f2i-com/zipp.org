@@ -2499,15 +2499,64 @@ impl<'p> Vm<'p> {
                 // Steps 4-6: HasOwnProperty(Target, "length") → Get(Target,
                 // "length"), then Get(Target, "name") — both OBSERVABLE (a
                 // throwing accessor propagates before the bound function exists).
-                // The values themselves resolve lazily from the target (existing
-                // name/length machinery), so only the Gets are performed here.
-                if self.has_own_property(this, "length") {
-                    let _ = self.get_prop(this, "length")?;
+                // HasOwnProperty goes through the DYNAMIC variant so a Proxy
+                // target's getOwnPropertyDescriptor trap fires (the plain
+                // `has_own_property` is trap-blind); the values themselves
+                // resolve lazily from the target for ordinary callables, so the
+                // Get results are only consumed by the Proxy snapshot below.
+                let mut length_get = None;
+                if self.has_own_property_dyn(this, "length")? {
+                    length_get = Some(self.get_prop(this, "length")?);
                 }
-                let _ = self.get_prop(this, "name")?;
+                let name_get = self.get_prop(this, "name")?;
                 let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
                 let idx = self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound });
                 self.proto_of.insert(idx, bound_proto);
+                // A PROXY target's name/length do not resolve through the lazy
+                // effective-name machinery (the trap results belong to the
+                // proxy, not the underlying callable): snapshot the spec values
+                // as EXPLICIT own properties — SetFunctionLength/Name's
+                // non-writable, non-enumerable, configurable pair — computed as
+                // "bound " + (String name, else "") and
+                // max(0, ToIntegerOrInfinity(length) − boundArgs)
+                // (bound-length-and-name.js).
+                if matches!(self.heap.get(this.heap_index()), HeapObj::Proxy { .. }) {
+                    let nbound = args.len().saturating_sub(1) as f64;
+                    let len = match length_get {
+                        Some(v) if v.is_int() => (v.as_int() as f64 - nbound).max(0.0),
+                        Some(v) if v.is_double() => {
+                            let d = v.as_f64();
+                            if d.is_nan() { 0.0 } else { (d.trunc() - nbound).max(0.0) }
+                        }
+                        _ => 0.0,
+                    };
+                    let tname = if name_get.is_heap() && self.heap.is_str_like(name_get.heap_index()) {
+                        self.display(name_get)
+                    } else {
+                        String::new()
+                    };
+                    let attr = PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    };
+                    let nv = self.alloc_str(format!("bound {tname}"));
+                    let lv = if len.is_finite() && len >= 0.0 && len <= i32::MAX as f64 && len.fract() == 0.0 {
+                        Value::int(len as i32)
+                    } else {
+                        Value::num(len)
+                    };
+                    let m = self.fn_props.entry(idx).or_insert_with(ObjMap::new_side_table);
+                    m.define("name", nv, attr);
+                    m.define("length", lv, attr);
+                    // The explicit pair IS the bound function's name/length —
+                    // suppress the synthesized intrinsics so they cannot
+                    // reappear if an explicit one is later deleted.
+                    self.deleted_callable_intrinsics.insert((idx, 0));
+                    self.deleted_callable_intrinsics.insert((idx, 1));
+                }
                 Value::heap(idx)
             }
             FN_TO_STRING => {
@@ -4290,27 +4339,19 @@ impl<'p> Vm<'p> {
                 self.setter_ignoring_proto_props(this, self.error_protos[0], "stack", a0)?;
                 Value::UNDEFINED
             }
-            REGEXP_LEGACY_GET => {
-                // GetLegacyRegExpStaticProperty: the receiver must be the %RegExp%
-                // constructor itself (SameValue(C, thisValue)); else TypeError. The
-                // value is the relevant last-match slot — not yet tracked, so the
-                // default empty string (the prop-desc / brand tests check shape +
-                // brand, not the captured value).
-                if !(this.is_heap() && this.heap_index() == self.regexp_ctor) {
-                    return Err(Thrown(
-                        "TypeError: RegExp legacy static getter called on a non-%RegExp% receiver".into(),
-                    ));
-                }
-                self.alloc_str(String::new())
-            }
             REGEXP_LEGACY_SET => {
-                // SetLegacyRegExpStaticProperty: same %RegExp%-constructor brand
-                // check; the assignment is accepted (not yet tracked → a no-op).
+                // SetLegacyRegExpStaticProperty (RegExp.input/$_ — the only
+                // writable legacy statics): same %RegExp%-constructor brand
+                // check; the assigned value becomes the statics' input slot.
                 if !(this.is_heap() && this.heap_index() == self.regexp_ctor) {
                     return Err(Thrown(
                         "TypeError: RegExp legacy static setter called on a non-%RegExp% receiver".into(),
                     ));
                 }
+                if self.regexp_last.is_empty() {
+                    self.regexp_last = vec![Value::UNDEFINED; 14];
+                }
+                self.regexp_last[0] = a0;
                 Value::UNDEFINED
             }
             // get %AbstractModuleSource%.prototype[@@toStringTag]: undefined for

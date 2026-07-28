@@ -34,6 +34,30 @@ pub fn parse_exact(src: &str, exact: Option<&[u8]>, opts: ParseOptions) -> PResu
     p.parse_program(goal)
 }
 
+/// Parse `src` as a STANDALONE FormalParameters list, requiring the whole
+/// string to be consumed. CreateDynamicFunction (`new Function` & kin) parses
+/// the parameter STRING on its own before the assembled source
+/// (spec step "Let params be ParseText(paramString, paramGrammar)"), so a
+/// comment, template, or `)` that would swallow the wrapper's own `) {` is a
+/// SyntaxError even when the combined source would parse
+/// (staging/sm/Function/invalid-parameter-list.js). Lenient by design: the
+/// assembled parse still enforces strictness and [Yield]/[Await] rules — this
+/// pass only catches what assembling would hide.
+pub fn parse_standalone_params(src: &str) -> PResult<()> {
+    // The trailing newline defends against a `//` comment in the last
+    // parameter (same trick as the Function-constructor wrapper itself).
+    let wrapped = format!("({src}\n)");
+    let mut p = Parser::new_exact(&wrapped, None, ParseOptions::default())?;
+    p.parse_params()?;
+    if !p.at_eof() {
+        return Err(SyntaxError::new(
+            "SyntaxError: unexpected token in formal parameter list",
+            p.cur().span.start,
+        ));
+    }
+    Ok(())
+}
+
 impl<'s> Parser<'s> {
     pub(crate) fn parse_program(&mut self, goal: Goal) -> PResult<Program> {
         let (directives, strict) = self.directive_prologue()?;

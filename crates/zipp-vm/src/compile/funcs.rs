@@ -398,6 +398,7 @@ impl<'a> FnCompiler<'a> {
             // strict code), regardless of the enclosing scope.
             let prev_strict = self.cx.in_strict;
             self.cx.in_strict = true;
+            self.cx.strict_expr_region += 1;
             // A NAMED class's own binding is in scope for the heritage.
             let heritage_named = class.name.as_ref().map(|n| n.to_string());
             let saved_hc = self.heritage_class.take();
@@ -422,6 +423,7 @@ impl<'a> FnCompiler<'a> {
             }
             self.heritage_class = saved_hc;
             self.cx.in_strict = prev_strict;
+            self.cx.strict_expr_region -= 1;
             let v = r?;
             if v != t {
                 self.emit(Instr::Move { dst: t, src: v });
@@ -447,6 +449,11 @@ impl<'a> FnCompiler<'a> {
         let mut parked: Vec<Option<Reg>> = vec![None; computed_fields.len()];
         // (decoration group, element index, decorator register block) for phase 1b.
         let mut elem_decs: Vec<(u8, u16, Reg, u16)> = Vec::new();
+        // Computed ClassElementNames (and element decorator expressions) are
+        // ClassTail code: strict, even when the enclosing function is sloppy.
+        let prev_strict_keys = self.cx.in_strict;
+        self.cx.in_strict = true;
+        self.cx.strict_expr_region += 1;
         for step in &steps {
             // The element's decorators FIRST (spec ClassElementEvaluation:
             // DecoratorListEvaluation precedes the key).
@@ -542,6 +549,8 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
+        self.cx.in_strict = prev_strict_keys;
+        self.cx.strict_expr_region -= 1;
         // PHASE 1b — APPLY the element decorators. A second pass, because
         // ClassDefinitionEvaluation evaluates every element (decorators + key +
         // method) before decorating any of them.
@@ -585,12 +594,18 @@ impl<'a> FnCompiler<'a> {
                     self.this_override = Some(cls);
                     let prev_strict = self.cx.in_strict;
                     self.cx.in_strict = true;
+                    self.cx.strict_expr_region += 1;
                     let (prev_sc, prev_ss) = (self.super_class, self.super_static);
                     self.super_class = Some(class_id);
                     self.super_static = true;
                     let saved_hc = self.heritage_class.take();
                     if let Some(n) = &static_self_name {
                         self.heritage_class = Some((n.clone(), class_id));
+                        // …and on the cx-level stack, so a nested function/arrow
+                        // inside the initializer also sees the inner binding
+                        // (class_names is popped when compile_class returns, so
+                        // without this `static field = () => C` lost the binding).
+                        self.cx.heritage_classes.push((n.clone(), class_id));
                     }
                     let v = match finit {
                         Some(e) => self.expr(e)?,
@@ -600,10 +615,14 @@ impl<'a> FnCompiler<'a> {
                             t
                         }
                     };
+                    if static_self_name.is_some() {
+                        self.cx.heritage_classes.pop();
+                    }
                     self.heritage_class = saved_hc;
                     self.super_class = prev_sc;
                     self.super_static = prev_ss;
                     self.cx.in_strict = prev_strict;
+                    self.cx.strict_expr_region -= 1;
                     self.this_override = None;
                     // NamedEvaluation: an anonymous fn/arrow/class initializer takes
                     // the field name (incl. the literal "#field" for privates).
@@ -626,7 +645,7 @@ impl<'a> FnCompiler<'a> {
                         None => v,
                     };
                     let name_idx = self.string_name(fname);
-                    self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
+                    self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v, strict: false });
                     // InitializeFieldOrAccessor: this element's OWN
                     // `addInitializer` callbacks run once it is defined and
                     // before the next static element, so `this[name]` is already
@@ -643,12 +662,14 @@ impl<'a> FnCompiler<'a> {
                     self.this_override = Some(cls);
                     let prev_strict = self.cx.in_strict;
                     self.cx.in_strict = true;
+                    self.cx.strict_expr_region += 1;
                     let (prev_sc, prev_ss) = (self.super_class, self.super_static);
                     self.super_class = Some(class_id);
                     self.super_static = true;
                     let saved_hc = self.heritage_class.take();
                     if let Some(n) = &static_self_name {
                         self.heritage_class = Some((n.clone(), class_id));
+                        self.cx.heritage_classes.push((n.clone(), class_id));
                     }
                     let vr = match init {
                         Some(e) => self.expr(e)?,
@@ -658,10 +679,14 @@ impl<'a> FnCompiler<'a> {
                             t
                         }
                     };
+                    if static_self_name.is_some() {
+                        self.cx.heritage_classes.pop();
+                    }
                     self.heritage_class = saved_hc;
                     self.super_class = prev_sc;
                     self.super_static = prev_ss;
                     self.cx.in_strict = prev_strict;
+                    self.cx.strict_expr_region -= 1;
                     self.this_override = None;
                     let vr = match dec_computed.get(idx).copied().flatten() {
                         Some(elem) => {
@@ -1707,6 +1732,10 @@ impl<'a> FnCompiler<'a> {
         };
         self.cx.class_enclosing = saved_enclosing;
         self.cx.class_derived = saved_derived;
+        // Pop this class's inner-binding entry: the stack must hold exactly the
+        // LEXICALLY ENCLOSING classes of the compile point (sibling classes
+        // compiled earlier must not leak their names into later code).
+        self.cx.class_names.pop();
         Ok(CompiledClass {
             class_id,
             static_fields,
@@ -1834,7 +1863,7 @@ impl<'a> FnCompiler<'a> {
         self.stash_arrow_child_with_shadows(&names, &a.body);
         let enclosing = self.child_enclosing();
         let mut proto =
-            self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class, self.super_static, self.super_home_obj)?;
+            self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class, self.super_static, self.super_home_obj, self.derived_class, self.in_derived_ctor)?;
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
         let has_upvalues = !proto.upvalues.is_empty();

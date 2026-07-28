@@ -31,6 +31,15 @@ use crate::value::Value;
 /// and the flat register file makes each frame cheap.
 const MAX_FRAMES: usize = 100_000;
 
+/// Hard cap on NESTED `run_loop` entries (native re-entries: builtin
+/// callbacks, generator/async resumes, direct evals, JIT bail-outs). Each one
+/// is a Rust frame on the OS stack — unlike interpreter calls, which stay flat
+/// inside one `run_loop` — so runaway recursion routed through a re-entry
+/// (e.g. a generator body that re-enters its driver) must hit this catchable
+/// RangeError before the native stack overflows. Sized with headroom under a
+/// 1 MiB main-thread stack (Windows) at ~200 B/nesting level.
+const MAX_RUN_LOOP_DEPTH: u32 = 4096;
+
 /// Extra global slots reserved past `global_count` as JIT scratch "field globals"
 /// for object scalar-replacement (SROA). A field-promoted region uses pool slots
 /// `[global_count, global_count + n_fields)`; regions reuse the pool (synced per
@@ -349,6 +358,12 @@ pub struct Vm<'p> {
     /// consumed into `Frame::is_eval` at frame setup (same one-shot idiom as
     /// `pending_new_target`). Lets the legacy `f.caller` walk skip eval frames.
     pending_eval_frame: bool,
+    /// One-shot "the NEXT do_eval compiles a CreateDynamicFunction wrapper"
+    /// flag, set by `build_function_kind` (`new Function` & kin) and consumed
+    /// into `compile_eval`'s `fn_ctor` (same one-shot idiom as
+    /// `pending_eval_frame`). Suppresses the "anonymous" wrapper's self-name
+    /// binding (constructor-binding.js).
+    pending_fn_ctor_eval: bool,
     /// Set by a `Yield` op to hand a generator's yielded value (+ the yield's
     /// bytecode ip, for the resume point) back to `generator_method`, which
     /// `.take()`s it to distinguish a suspension from a normal return.
@@ -424,6 +439,21 @@ pub struct Vm<'p> {
     /// match at a time, rather than matchAll eagerly collecting every match up
     /// front.
     regexp_string_iters: std::collections::HashMap<u32, (u32, Value, u8, bool)>,
+    /// RegExp legacy statics backing `RegExp.input`/`$_`/`lastMatch`/`$&`/
+    /// `lastParen`/`$+`/`leftContext`/`$``/`rightContext`/`$'`/`$1`–`$9`, laid
+    /// out as [input, lastMatch, lastParen, leftContext, rightContext, $1..$9]
+    /// (14 slots). Refreshed by every successful RegExpBuiltinExec; empty until
+    /// the first match (the accessors then yield their empty-string defaults).
+    regexp_last: Vec<Value>,
+    /// Native re-entry depth of `run_loop`: calls INSIDE one interpreter
+    /// invocation stay flat (frame push + re-loop), but every NESTED entry — a
+    /// builtin callback's `call_value`, a generator/async resume, a direct
+    /// eval, a JIT bail-out — is a real Rust frame on the OS stack. Runaway
+    /// recursion THROUGH those re-entries (a generator body re-entering its
+    /// driver) would overflow the native stack long before MAX_FRAMES, so the
+    /// nesting is capped (see MAX_RUN_LOOP_DEPTH) and surfaces as a catchable
+    /// RangeError instead.
+    run_loop_depth: u32,
     /// RegExp heap idx → EXACT WTF-8 bytes of its [[OriginalSource]], present
     /// ONLY when the pattern holds lone surrogates (the struct's `source:
     /// String` field is the LOSSY view — U+FFFD per surrogate). The `source`
@@ -544,6 +574,14 @@ pub struct Vm<'p> {
     /// gates on it — making get/has-own/descriptor all agree the property is gone.
     /// Empty in normal programs; cleared for a name when it's re-defined.
     deleted_globals: std::collections::HashSet<String>,
+    /// Global-slot indices that `CheckGlobalResolvable` (a strict `name = …` on
+    /// a name this program never declares) found UNRESOLVABLE when the reference
+    /// was created, i.e. before the RHS evaluated. PutValue's ReferenceError
+    /// fires only AFTER the RHS (an RHS throw wins), so the check records here
+    /// and the matching `StoreGlobalResolved` raises at store time. Nested
+    /// assignments stack (`a = (b = 1)`); a later check that finds the slot
+    /// resolvable clears any stale entry a caught RHS throw left behind.
+    strict_unresolvable_globals: Vec<u32>,
     /// Heap indices of arrays whose `length` was made non-writable via
     /// `Object.defineProperty(arr, "length", { writable: false })`. An array's
     /// length lives in the dense Vec with no per-array attribute state, so the
@@ -698,8 +736,8 @@ pub struct Vm<'p> {
     /// `ArrayBuffer`/`DataView` ctors + prototypes. 0 until setup.
     ta_base_ctor: u32,
     ta_base_proto: u32,
-    ta_ctors: [u32; 11],
-    ta_protos: [u32; 11],
+    ta_ctors: [u32; 12],
+    ta_protos: [u32; 12],
     arraybuffer_ctor: u32,
     arraybuffer_proto: u32,
     dataview_ctor: u32,

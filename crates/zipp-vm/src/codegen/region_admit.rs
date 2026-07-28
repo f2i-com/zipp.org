@@ -88,8 +88,11 @@ pub(crate) fn region_can_compile(
             // Heap property ops — handled by the MEMORY path via win64 helper
             // calls (the int/regalloc paths decline, so heap regions take the
             // mem path). A `Print`/etc. anywhere still rejects the region.
+            // A strict-FORCED SetProp (a strict ClassTail region inside a
+            // sloppy function) declines: the JIT slow path derives strictness
+            // from the proto flag, which cannot see that region.
             | Instr::GetProp { .. }
-            | Instr::SetProp { .. }
+            | Instr::SetProp { strict: false, .. }
             // Dense-array element read/write `a[i]` / `a[i]=v` — handled by the
             // MEMORY path via win64 helpers (the int/regalloc paths decline).
             | Instr::GetIndex { .. }

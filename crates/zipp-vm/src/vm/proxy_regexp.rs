@@ -244,8 +244,21 @@ impl<'p> Vm<'p> {
         named_defined: bool,
         pre: &str,
         post: &str,
-    ) -> String {
-        let mut out = String::with_capacity(tmpl.len());
+        limit: usize,
+    ) -> Result<String, Thrown> {
+        // `limit` caps the output in BYTES: a `$1`-heavy template applied to a
+        // huge capture would otherwise build an unbounded string (hang / OOM —
+        // staging/sm/String/replace-math.js). Same 2^28 bound as "repeat".
+        let mut out = String::with_capacity(tmpl.len().min(limit));
+        macro_rules! push {
+            ($s:expr) => {{
+                let s: &str = $s;
+                if s.len() > limit - out.len() {
+                    return Err(Thrown("RangeError: Invalid string length".into()));
+                }
+                out.push_str(s);
+            }};
+        }
         let bytes = tmpl.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -253,19 +266,19 @@ impl<'p> Vm<'p> {
                 let c = bytes[i + 1];
                 match c {
                     b'$' => {
-                        out.push('$');
+                        push!("$");
                         i += 2;
                     }
                     b'&' => {
-                        out.push_str(whole);
+                        push!(whole);
                         i += 2;
                     }
                     b'`' => {
-                        out.push_str(pre);
+                        push!(pre);
                         i += 2;
                     }
                     b'\'' => {
-                        out.push_str(post);
+                        push!(post);
                         i += 2;
                     }
                     b'<' => {
@@ -273,16 +286,16 @@ impl<'p> Vm<'p> {
                         // when named captures are present; otherwise (no groups
                         // object / namedCaptures undefined) "$<" is a literal.
                         if !named_defined {
-                            out.push('$');
+                            push!("$");
                             i += 1;
                         } else if let Some(end) = tmpl[i + 2..].find('>') {
                             let name = &tmpl[i + 2..i + 2 + end];
                             if let Some((_, Some(g))) = named.iter().find(|(n, _)| n == name) {
-                                out.push_str(g);
+                                push!(g);
                             }
                             i += 2 + end + 1;
                         } else {
-                            out.push('$');
+                            push!("$");
                             i += 1;
                         }
                     }
@@ -296,32 +309,33 @@ impl<'p> Vm<'p> {
                         };
                         if let Some(n) = two.filter(|&n| n >= 1 && n <= groups.len()) {
                             if let Some(g) = &groups[n - 1] {
-                                out.push_str(g);
+                                push!(g);
                             }
                             i += 3;
                         } else if d1 >= 1 && d1 <= groups.len() {
                             if let Some(g) = &groups[d1 - 1] {
-                                out.push_str(g);
+                                push!(g);
                             }
                             i += 2;
                         } else {
-                            out.push('$');
+                            push!("$");
                             i += 1;
                         }
                     }
                     _ => {
-                        out.push('$');
+                        push!("$");
                         i += 1;
                     }
                 }
             } else {
                 // copy one UTF-8 char
                 let ch = tmpl[i..].chars().next().unwrap();
-                out.push(ch);
+                let mut b = [0u8; 4];
+                push!(ch.encode_utf8(&mut b));
                 i += ch.len_utf8();
             }
         }
-        out
+        Ok(out)
     }
 
     /// RegExp instance property reads: `lastIndex`, `source` (empty → "(?:)"),
@@ -619,11 +633,15 @@ impl<'p> Vm<'p> {
                     named_defined,
                     &pre,
                     &post,
-                )
+                    (1usize << 28).saturating_sub(accumulated.len()),
+                )?
                 .into_bytes()
             };
             if position >= next_pos {
                 push_units(&mut accumulated, &u16s[next_pos..position]);
+                if replacement.len() > (1usize << 28).saturating_sub(accumulated.len()) {
+                    return Err(Thrown("RangeError: Invalid string length".into()));
+                }
                 crate::heap::wtf8_push(&mut accumulated, &replacement);
                 next_pos = position + match_len;
             }
@@ -1014,9 +1032,6 @@ impl<'p> Vm<'p> {
             // the (unobservable) result construction; throws if non-writable.
             self.regexp_write_last_index(re_idx, Value::num(mend as f64))?;
         }
-        if !build {
-            return Ok(Value::TRUE);
-        }
         // A unit-range slice of the subject: a byte slice of the heap string
         // for an ASCII subject, else a slice of the encoded unit buffer.
         let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
@@ -1027,6 +1042,33 @@ impl<'p> Vm<'p> {
             }
         };
         let whole = mk(self, mstart..mend);
+        // Annex B legacy RegExp statics (RegExp.input/$_, lastMatch/$&,
+        // lastParen/$+, leftContext/$`, rightContext/$', $1–$9): refreshed by
+        // EVERY successful RegExpBuiltinExec — `exec`, `test`, and the String /
+        // RegExp methods that funnel through this builtin.
+        {
+            let empty = self.alloc_str(String::new());
+            let mut rec = Vec::with_capacity(14);
+            rec.push(input_val);
+            rec.push(whole);
+            // lastParen: the LAST participating capture, "" when none did.
+            rec.push(match m.captures.iter().rev().find_map(|c| c.clone()) {
+                Some(r) => mk(self, r),
+                None => empty,
+            });
+            rec.push(mk(self, 0..mstart));
+            rec.push(mk(self, mend..subj_units));
+            for i in 0..9 {
+                rec.push(match m.captures.get(i).and_then(|c| c.clone()) {
+                    Some(r) => mk(self, r),
+                    None => empty,
+                });
+            }
+            self.regexp_last = rec;
+        }
+        if !build {
+            return Ok(Value::TRUE);
+        }
         let mut elems = Vec::with_capacity(1 + m.captures.len());
         elems.push(whole);
         for cap in &m.captures {
@@ -1466,6 +1508,9 @@ impl<'p> Vm<'p> {
                     .str_wtf8_cow(rv.heap_index())
                     .map(|c| c.into_owned())
                     .unwrap_or_default();
+                if bytes.len() > (1usize << 28).saturating_sub(out.len()) {
+                    return Err(Thrown("RangeError: Invalid string length".into()));
+                }
                 crate::heap::wtf8_push(&mut out, &bytes);
             } else {
                 // GetSubstitution over LOSSY views (the template + captures come
@@ -1488,7 +1533,8 @@ impl<'p> Vm<'p> {
                     !named.is_empty(),
                     &String::from_utf16_lossy(&u16s[..st]),
                     &String::from_utf16_lossy(&u16s[en..]),
-                );
+                    (1usize << 28).saturating_sub(out.len()),
+                )?;
                 crate::heap::wtf8_push(&mut out, rep.as_bytes());
             }
             last = en;
@@ -1596,6 +1642,9 @@ impl<'p> Vm<'p> {
                     .str_wtf8_cow(rv.heap_index())
                     .map(|c| c.into_owned())
                     .unwrap_or_default();
+                if bytes.len() > (1usize << 28).saturating_sub(out.len()) {
+                    return Err(Thrown("RangeError: Invalid string length".into()));
+                }
                 crate::heap::wtf8_push(&mut out, &bytes);
             } else {
                 // GetSubstitution directly over &str slices of the subject.
@@ -1616,7 +1665,8 @@ impl<'p> Vm<'p> {
                     !named.is_empty(),
                     &subject[..st],
                     &subject[en..],
-                );
+                    (1usize << 28).saturating_sub(out.len()),
+                )?;
                 crate::heap::wtf8_push(&mut out, rep.as_bytes());
             }
             last = en;

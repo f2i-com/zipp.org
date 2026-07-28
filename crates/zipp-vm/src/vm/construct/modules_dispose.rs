@@ -44,10 +44,24 @@ impl<'p> Vm<'p> {
             3 => "async function* ",
             _ => "function ",
         };
+        // CreateDynamicFunction parses the parameter STRING on its own as
+        // FormalParameters (whole string consumed) before the assembled
+        // source: a `/*`, backtick, or `)` in the params could otherwise
+        // swallow the wrapper's own `) {` and slip past the combined parse
+        // (invalid-parameter-list.js). Lexer-level messages carry no
+        // "SyntaxError:" prefix — add it so the error classifies correctly.
+        crate::parse::stmt::parse_standalone_params(&params).map_err(|e| {
+            Thrown(if e.msg.starts_with("SyntaxError") { e.msg } else { format!("SyntaxError: {}", e.msg) })
+        })?;
         // The newline before `)` defends against a `//` comment in the last
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.
         let source = format!("({prefix}anonymous({params}\n) {{\n{body}\n}})");
+        // CreateDynamicFunction builds the function from the separately-parsed
+        // params/body, so the "anonymous" name is SetFunctionName only — NO
+        // self-name binding (`typeof anonymous` inside is "undefined",
+        // constructor-binding.js). Flag the upcoming compile (one-shot).
+        self.pending_fn_ctor_eval = true;
         self.do_eval(&source, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)
     }
 

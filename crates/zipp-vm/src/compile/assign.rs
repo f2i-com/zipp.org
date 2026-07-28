@@ -130,7 +130,7 @@ impl<'a> FnCompiler<'a> {
                     let save = self.next_reg;
                     let obj = self.expr(&m.object)?;
                     let name = self.string_name(prop);
-                    self.emit(Instr::SetProp { obj, name, val: src });
+                    self.emit(Instr::SetProp { obj, name, val: src, strict: self.cx.strict_expr_region > 0 });
                     self.next_reg = save;
                     Ok(())
                 }
@@ -284,19 +284,25 @@ impl<'a> FnCompiler<'a> {
             self.apply_default_in_place_named(val, init, None)?;
         }
         match *key {
-            PreKey::Static(name) => self.emit(Instr::SetProp { obj, name, val }),
+            PreKey::Static(name) => self.emit(Instr::SetProp { obj, name, val, strict: self.cx.strict_expr_region > 0 }),
             PreKey::Computed(k) => self.emit(Instr::SetIndex { obj, key: k, val }),
             PreKey::Private(name) => self.emit(Instr::SetPrivate { obj, name, val }),
             // `obj` is the dummy from pre_member_ref — a SuperProperty store
             // routes through the class op (home_class_id) or the object-method
             // op ([[HomeObject]]) exactly as `super.x = v` does in `assign`.
             PreKey::Super(name) => match self.super_class {
-                Some(p) => self.emit(Instr::SuperSet { home_class_id: p, name, val }),
+                Some(p) => {
+                    let b = self.temp();
+                    self.emit(Instr::SuperBase { dst: b, home_class_id: p });
+                    self.emit(Instr::SuperSet { base: b, home_class_id: p, name, val })
+                }
                 None => self.emit(Instr::SuperSetObj { name, val }),
             },
             PreKey::SuperComputed(k) => match self.super_class {
                 Some(p) => {
-                    self.emit(Instr::SuperSetComputed { home_class_id: p, key: k, val })
+                    let b = self.temp();
+                    self.emit(Instr::SuperBase { dst: b, home_class_id: p });
+                    self.emit(Instr::SuperSetComputed { base: b, home_class_id: p, key: k, val })
                 }
                 None => self.emit(Instr::SuperSetObjComputed { key: k, val }),
             },
@@ -367,7 +373,7 @@ impl<'a> FnCompiler<'a> {
                     let save = self.next_reg;
                     let obj = self.expr(&m.object)?;
                     let name = self.string_name(prop);
-                    self.emit(Instr::SetProp { obj, name, val });
+                    self.emit(Instr::SetProp { obj, name, val, strict: self.cx.strict_expr_region > 0 });
                     self.next_reg = save;
                     Ok(())
                 }
@@ -772,15 +778,24 @@ impl<'a> FnCompiler<'a> {
                     }
                     self.this_check();
                     let name = self.string_name(prop);
+                    // MakeSuperPropertyReference captures GetSuperBase BEFORE the
+                    // RHS runs (it may retarget the home object's prototype —
+                    // superPropOrdering's testAssignProp). Object-method super
+                    // resolves its [[HomeObject]] base at the store op instead.
+                    let sb = pid.map(|p| {
+                        let b = self.temp();
+                        self.emit(Instr::SuperBase { dst: b, home_class_id: p });
+                        b
+                    });
                     // A super GET/SET routes to the class op (home_class_id) or the
                     // object-method op ([[HomeObject]]), depending on the lexical context.
                     let emit_get = |s: &mut Self, d: Reg| match pid {
                         Some(p) => s.emit(Instr::SuperGet { dst: d, home_class_id: p, name }),
                         None => s.emit(Instr::SuperGetObj { dst: d, name }),
                     };
-                    let emit_set = |s: &mut Self, v: Reg| match pid {
-                        Some(p) => s.emit(Instr::SuperSet { home_class_id: p, name, val: v }),
-                        None => s.emit(Instr::SuperSetObj { name, val: v }),
+                    let emit_set = |s: &mut Self, v: Reg| match (pid, sb) {
+                        (Some(p), Some(b)) => s.emit(Instr::SuperSet { base: b, home_class_id: p, name, val: v }),
+                        _ => s.emit(Instr::SuperSetObj { name, val: v }),
                     };
                     if is_logical {
                         emit_get(self, dst);
@@ -820,7 +835,7 @@ impl<'a> FnCompiler<'a> {
                         if v != dst {
                             self.emit(Instr::Move { dst, src: v });
                         }
-                        self.emit(Instr::SetProp { obj, name, val: dst });
+                        self.emit(Instr::SetProp { obj, name, val: dst, strict: self.cx.strict_expr_region > 0 });
                         let end = self.here();
                         self.patch_jump(j, end);
                     } else if matches!(op, AssignOp::Assign) {
@@ -828,7 +843,7 @@ impl<'a> FnCompiler<'a> {
                         if val != dst {
                             self.emit(Instr::Move { dst, src: val });
                         }
-                        self.emit(Instr::SetProp { obj, name, val: dst });
+                        self.emit(Instr::SetProp { obj, name, val: dst, strict: self.cx.strict_expr_region > 0 });
                     } else {
                         // Compound `obj.x op= v`: read obj.x, combine, write back.
                         let cur = self.temp();
@@ -837,7 +852,7 @@ impl<'a> FnCompiler<'a> {
                         let instr = compound_assign_instr(op, dst, cur, rhs)
                             .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                         self.emit(instr);
-                        self.emit(Instr::SetProp { obj, name, val: dst });
+                        self.emit(Instr::SetProp { obj, name, val: dst, strict: self.cx.strict_expr_region > 0 });
                     }
                     return Ok(dst);
                 }
@@ -853,7 +868,7 @@ impl<'a> FnCompiler<'a> {
                         if v != dst {
                             self.emit(Instr::Move { dst, src: v });
                         }
-                        self.emit(Instr::SetProp { obj, name, val: dst });
+                        self.emit(Instr::SetProp { obj, name, val: dst, strict: self.cx.strict_expr_region > 0 });
                         let end = self.here();
                         self.patch_jump(j, end);
                     } else if matches!(op, AssignOp::Assign) {
@@ -885,13 +900,20 @@ impl<'a> FnCompiler<'a> {
                     if key != key_reg {
                         self.emit(Instr::Move { dst: key_reg, src: key });
                     }
+                    // GetSuperBase after the key, BEFORE the RHS (superPropOrdering's
+                    // testElemAssign).
+                    let sb = pid.map(|p| {
+                        let b = self.temp();
+                        self.emit(Instr::SuperBase { dst: b, home_class_id: p });
+                        b
+                    });
                     let emit_get = |s: &mut Self, d: Reg| match pid {
                         Some(p) => s.emit(Instr::SuperGetComputed { dst: d, home_class_id: p, key: key_reg }),
                         None => s.emit(Instr::SuperGetObjComputed { dst: d, key: key_reg }),
                     };
-                    let emit_set = |s: &mut Self, v: Reg| match pid {
-                        Some(p) => s.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: v }),
-                        None => s.emit(Instr::SuperSetObjComputed { key: key_reg, val: v }),
+                    let emit_set = |s: &mut Self, v: Reg| match (pid, sb) {
+                        (Some(p), Some(b)) => s.emit(Instr::SuperSetComputed { base: b, home_class_id: p, key: key_reg, val: v }),
+                        _ => s.emit(Instr::SuperSetObjComputed { key: key_reg, val: v }),
                     };
                     if is_logical {
                         emit_get(self, dst);
@@ -1087,6 +1109,27 @@ impl<'a> FnCompiler<'a> {
                 // there may introduce a shadowing `var` — snapshot first).
                 let save_p = self.next_reg;
                 let snap = self.eval_snap_probe(&binding);
+                // A strict `name = …` on a global this program does NOT
+                // declare: ResolveBinding runs BEFORE the RHS evaluates — an
+                // eval-created (own-prop-backed) global resolves the reference,
+                // and an unresolvable name throws before any RHS side effect
+                // (`undeclared = (this.undeclared = 5)`). Probe now; store with
+                // the resolved form below (a program-DECLARED global keeps the
+                // checked store: its binding is non-configurable, so the
+                // store-time check can never disagree).
+                let resolved_first = matches!(
+                    &binding,
+                    Binding::Global(idx)
+                        if self.cx.in_strict
+                            && !self.cx.lexical_globals.contains(idx)
+                            && !self.cx.hoisted_globals.contains(idx)
+                            && !self.cx.decl_globals.contains(idx)
+                );
+                if resolved_first {
+                    if let Binding::Global(idx) = &binding {
+                        self.emit(Instr::CheckGlobalResolvable { idx: *idx });
+                    }
+                }
                 let v = if lhs_covered {
                     self.expr_into(value, dst)?
                 } else {
@@ -1095,7 +1138,7 @@ impl<'a> FnCompiler<'a> {
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
-                self.store_binding_snapped(&binding, dst, snap);
+                self.store_binding_snapped_ex(&binding, dst, snap, resolved_first);
                 self.next_reg = save_p;
                 Ok(dst)
             }

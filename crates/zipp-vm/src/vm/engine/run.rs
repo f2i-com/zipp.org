@@ -720,6 +720,38 @@ impl<'p> Vm<'p> {
             })
     }
 
+    /// True when the global OBJECT carries a REAL own property (an ObjMap entry,
+    /// e.g. from `Object.defineProperty(this, "x", {writable:false})`) behind
+    /// global slot `idx`. The slot fast path models every slot-backed binding as
+    /// a plain writable data property, so once real attributes exist the write
+    /// must route through [[Set]] on the global object instead. Cheap gate: one
+    /// heap load, with the name lookup only when the object has any real keys.
+    pub(crate) fn global_real_own_route(&self, idx: u32) -> bool {
+        if self.global_this == 0 {
+            return false;
+        }
+        let HeapObj::Object(m) = self.heap.get(self.global_this) else {
+            return false;
+        };
+        if m.keys.is_empty() {
+            return false;
+        }
+        let name = self
+            .program
+            .global_names
+            .get(idx as usize)
+            .or_else(|| {
+                self.eval_global_map
+                    .iter()
+                    .find(|(_, &v)| v == idx)
+                    .map(|(k, _)| k)
+            });
+        match name {
+            Some(n) => m.pos(n).is_some(),
+            None => false,
+        }
+    }
+
     pub(crate) fn do_eval(
         &mut self,
         code: &str,
@@ -738,11 +770,18 @@ impl<'p> Vm<'p> {
         param_collisions: Option<Vec<String>>,
         lexical_collisions: Vec<String>,
         // (ordered caller bindings, their cells, the subset that lives in a
-        // function ENCLOSING the caller — readable but not the eval's varEnv).
-        caller_scope: Option<(Vec<String>, Vec<Value>, Vec<String>)>,
+        // function ENCLOSING the caller — readable but not the eval's varEnv —
+        // and the subset that is a CATCH PARAMETER of the caller: an eval'd
+        // `var` of that name still declares into the caller's varEnv (Annex
+        // B.3.5) while reads/writes keep resolving to the param cell).
+        caller_scope: Option<(Vec<String>, Vec<Value>, Vec<String>, Vec<String>)>,
         eval_scope_idx: Option<u32>,
         exact_src: Option<&[u8]>,
     ) -> Result<Value, Thrown> {
+        // One-shot CreateDynamicFunction marker (set by build_function_kind):
+        // consumed HERE, at entry, so a parse failure below cannot leak it
+        // into an unrelated later eval.
+        let fn_ctor = std::mem::take(&mut self.pending_fn_ctor_eval);
         // 1. Parse: the true Script goal plus what only the call site knows
         // (caller strictness, new.target / super validity). `import`/`export`
         // are rejected by the parser itself under this goal, so the old
@@ -835,13 +874,21 @@ impl<'p> Vm<'p> {
             caller_home_obj.is_some(),
             caller_scope
                 .as_ref()
-                .map(|(n, _, _)| n.clone())
+                .map(|(n, _, _, _)| n.clone())
                 .unwrap_or_default(),
             caller_scope
                 .as_ref()
-                .map(|(_, _, o)| o.clone())
+                .map(|(_, _, o, _)| o.clone())
+                .unwrap_or_default(),
+            caller_scope
+                .as_ref()
+                .map(|(_, _, _, cp)| cp.clone())
                 .unwrap_or_default(),
             eval_scope_idx.is_some(),
+            // CreateDynamicFunction (`new Function` & kin): suppress the
+            // "anonymous" wrapper's self-name binding — one-shot, consumed
+            // at do_eval entry above.
+            fn_ctor,
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -855,7 +902,7 @@ impl<'p> Vm<'p> {
             caller_new_target,
             caller_home_obj,
             var_env_global,
-            caller_scope.map(|(_, c, _)| c),
+            caller_scope.map(|(_, c, _, _)| c),
             eval_scope_idx,
         )
         .map(|(v, _)| v)

@@ -685,6 +685,29 @@ impl<'a> FnCompiler<'a> {
                 }
                 continue;
             }
+            // EVAL root: `var x = init` where x is a caller CATCH PARAMETER
+            // (in `eval_catch_params`): the DECLARATION went to the caller's
+            // varEnv (the name is in `eval_dynamic_names` — Annex B.3.5), but
+            // the INITIALIZER resolves lexically to the NEARER param cell,
+            // exactly like a direct `catch (x) { var x = init; }`
+            // (staging/sm/lexical-environment/var-in-catch-body-annex-b-eval).
+            if self.is_script
+                && !d.kind.is_lexical()
+                && self.scopes.len() == 1
+                && self.cx.script_binds_globals
+                && self.cx.eval_catch_params.iter().any(|n| n == name)
+            {
+                if let Some(init) = &decl.init {
+                    let tmp = self.temp();
+                    let v = self.compile_named_init(tmp, init, name)?;
+                    let idx = self
+                        .resolve_upvalue(name)
+                        .ok_or("eval catch-param upvalue")?;
+                    self.emit(Instr::UpvalSet { idx, src: v });
+                    self.next_reg -= 1;
+                }
+                continue;
+            }
             // Annex B 3.5: `var foo = init` where `foo` is SHADOWED by a deeper
             // block binding (a catch parameter — the only legal shadow of a
             // var name): the hoisted function/global var binding is untouched

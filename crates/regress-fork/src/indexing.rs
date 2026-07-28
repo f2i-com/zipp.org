@@ -1,5 +1,5 @@
 use crate::bytesearch;
-use crate::cursor::Direction;
+use crate::cursor::{self, Direction};
 use crate::matchers::{self, CharProperties};
 #[cfg(feature = "utf16")]
 use crate::position::IndexPosition;
@@ -1085,6 +1085,27 @@ impl<'a> InputIndexer for Utf16Input<'a> {
         pos: &mut Self::Position,
         range: Range<Self::Position>,
     ) -> bool {
+        // Unicode mode: compare per CODE POINT, not per code unit — a
+        // backreference whose captured text ends in a lone lead surrogate must
+        // NOT match the lead half of a surrogate pair at the match position
+        // (ES 22.2.2.9 reads characters; staging/sm/RegExp/
+        // unicode-back-reference.js). Unit-wise comparison would call the
+        // shared first unit equal.
+        if self.unicode {
+            let ref_input = self.subinput(range);
+            let mut ref_pos = if Dir::FORWARD {
+                ref_input.left_end()
+            } else {
+                ref_input.right_end()
+            };
+            while let Some(c1) = cursor::next(&ref_input, _dir, &mut ref_pos) {
+                match cursor::next(self, _dir, pos) {
+                    Some(c2) if c1 == c2 => {}
+                    _ => return false,
+                }
+            }
+            return true;
+        }
         let len = range.end - range.start;
         let (start, end) = if Dir::FORWARD {
             if let Some(end) = self.try_move_right(*pos, len) {

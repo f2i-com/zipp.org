@@ -71,7 +71,10 @@ impl<'p> Vm<'p> {
             .iter()
             .enumerate()
             .filter_map(|(i, k)| {
-                canonical_index_str(k).filter(|ki| *ki >= new_len && !m.attrs[i].configurable)
+                // A spec array index is < 2^32-1: "4294967295"/"4294967296"
+                // are ORDINARY named properties — they never block a shrink.
+                canonical_index_str(k)
+                    .filter(|ki| *ki < 4_294_967_295 && *ki >= new_len && !m.attrs[i].configurable)
             })
             .max()
     }
@@ -87,7 +90,9 @@ impl<'p> Vm<'p> {
             let doomed: Vec<String> = m
                 .keys
                 .iter()
-                .filter(|k| canonical_index_str(k).is_some_and(|i| i >= n))
+                // Only true array indices (< 2^32-1) are swept by truncation;
+                // "4294967295"/"4294967296" are ordinary named props and stay.
+                .filter(|k| canonical_index_str(k).is_some_and(|i| i < 4_294_967_295 && i >= n))
                 .cloned()
                 .collect();
             for k in doomed {

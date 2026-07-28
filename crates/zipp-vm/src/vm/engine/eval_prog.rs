@@ -170,8 +170,10 @@ impl<'p> Vm<'p> {
                             *class_id += base_class;
                         }
                     }
-                    Instr::SuperCtor { home_class_id, .. }
+                    Instr::SuperCtorFetch { home_class_id, .. }
+                    | Instr::SuperCtor { home_class_id, .. }
                     | Instr::SuperCtorSpread { home_class_id, .. }
+                    | Instr::SuperBase { home_class_id, .. }
                     | Instr::SuperMethod { home_class_id, .. }
                     | Instr::SuperGet { home_class_id, .. }
                     | Instr::SuperGetComputed { home_class_id, .. }

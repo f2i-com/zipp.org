@@ -104,7 +104,17 @@ pub fn compile_eval(
     // caller rather than to the caller's own activation — readable, but not the
     // eval's variable environment (see `Compiler::eval_caller_var`).
     caller_outer_scope: Vec<String>,
+    // The subset of `caller_scope` that is a CATCH PARAMETER of the caller's
+    // activation: an eval'd `var` of that name still declares into the caller's
+    // varEnv (Annex B.3.5 — so the name sits in `caller_outer_scope` too, making
+    // `eval_caller_var` false), but the eval body's reads/writes resolve to the
+    // param CELL (it is lexically nearer than the new varEnv binding), never to
+    // the caller's dynamic EvalScope.
+    caller_catch_params: Vec<String>,
     fn_var_env: bool,
+    // CreateDynamicFunction compile: suppress the "anonymous" wrapper's
+    // self-name binding (see `Compiler::fn_ctor_no_self_name`).
+    fn_ctor: bool,
 ) -> R<Program> {
     // MODULE early errors (ModuleDeclarationInstantiation): duplicate
     // LexicallyDeclaredNames (let/const/class AND top-level function — module
@@ -201,6 +211,7 @@ pub fn compile_eval(
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
     c.eval_locals = !is_module;
+    c.fn_ctor_no_self_name = fn_ctor;
     // A module body is an ASYNC context: top-level `await` compiles and the
     // activation returns its body promise (read by the loader). No-await
     // bodies still complete synchronously.
@@ -251,6 +262,7 @@ pub fn compile_eval(
     }
     c.eval_caller_scope = caller_scope;
     c.eval_outer_scope = caller_outer_scope;
+    c.eval_catch_params = caller_catch_params;
     // DIRECT EVAL INSIDE `with`: the caller's eval-site map threads each active
     // with-object's hidden cell binding (" with-object-N") along with the
     // ordinary caller bindings, listed INNERMOST-FIRST. ResolveBinding for the

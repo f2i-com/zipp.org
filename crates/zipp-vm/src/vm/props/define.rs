@@ -724,9 +724,16 @@ impl<'p> Vm<'p> {
         let desc_is_data = value.is_some() || d_wr.is_some();
         let existing_is_accessor = existing.map_or(false, |(a, _)| a.accessor);
         let result_accessor = is_accessor || (!desc_is_data && existing_is_accessor);
+        // A KIND conversion (accessor -> data; data and accessor fields are
+        // mutually exclusive in a descriptor, so the reverse is `is_accessor`
+        // over a data property) does NOT inherit the other kind's fields:
+        // ValidateAndApplyPropertyDescriptor converts with [[Value]] undefined
+        // and [[Writable]] false unless the descriptor specifies them.
+        let convert_to_data = desc_is_data && existing_is_accessor;
         // Start from the existing attrs (redefine) or all-false (new property).
         let (mut wr, mut en, mut cf) = match existing {
-            Some((a, _)) => (a.writable, a.enumerable, a.configurable),
+            Some((a, _)) if !convert_to_data => (a.writable, a.enumerable, a.configurable),
+            Some((a, _)) => (false, a.enumerable, a.configurable),
             None => (false, false, false),
         };
         if let Some(b) = d_wr {
@@ -795,6 +802,10 @@ impl<'p> Vm<'p> {
         };
         let stored = if result_accessor {
             get.or(existing_get).unwrap_or(Value::UNDEFINED)
+        } else if convert_to_data {
+            // Accessor -> data: the getter is NOT carried over as the value —
+            // it defaults to undefined unless the descriptor specifies one.
+            value.unwrap_or(Value::UNDEFINED)
         } else {
             value.or(existing.map(|(_, v)| v)).unwrap_or(Value::UNDEFINED)
         };

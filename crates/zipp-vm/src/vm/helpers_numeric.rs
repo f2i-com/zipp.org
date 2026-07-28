@@ -20,6 +20,7 @@ pub(crate) fn ta_encode(kind: u8, f: f64) -> [u8; 8] {
         5 | 6 => out[..4].copy_from_slice(&(to_uint_modular(f, 32) as u32).to_le_bytes()),
         7 => out[..4].copy_from_slice(&(f as f32).to_le_bytes()),
         8 => out.copy_from_slice(&f.to_le_bytes()),
+        11 => out[..2].copy_from_slice(&crate::vm::helpers_num2::f64_to_f16_bits(f).to_le_bytes()),
         _ => {}
     }
     out

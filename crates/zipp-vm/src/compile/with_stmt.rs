@@ -271,6 +271,57 @@ impl<'a> FnCompiler<'a> {
         self.patch_jump(je, end);
     }
 
+    /// `delete <identifier>` with NO with-object in scope (or none carrying the
+    /// name): the static-binding delete semantics, shared by `delete_expr`'s
+    /// identifier arm and `delete_with`'s fall-through. A local/param/`let`/
+    /// `const`/function binding (or an enclosing function's) is non-configurable
+    /// → `false`; a global defers to the runtime DeleteGlobal, which checks the
+    /// PROGRAM's decl lists (an eval-compiled `delete x` must see the program's
+    /// `var x` as non-configurable, and an eval-introduced var as deletable —
+    /// this compilation's own cx lists can't tell) and actually REMOVES a
+    /// configurable binding (an implicit `x = 1` global, an eval var, a caller
+    /// activation's EvalScope entry). `NaN`/`Infinity`/`undefined` are the only
+    /// non-configurable builtin global properties; they're not tracked as
+    /// compiler globals, so check them by name.
+    pub(crate) fn emit_static_delete(&mut self, n: &str, dst: Reg) {
+        if matches!(n, "NaN" | "Infinity" | "undefined") {
+            self.emit(Instr::LoadBool { dst, val: false });
+            return;
+        }
+        match self.resolve_existing(n) {
+            Some(Binding::Local(_))
+            | Some(Binding::LocalCell(_))
+            | Some(Binding::Upvalue(_))
+            | Some(Binding::ClassName(_)) => {
+                self.emit(Instr::LoadBool { dst, val: false });
+            }
+            Some(Binding::Global(slot)) => {
+                self.emit(Instr::DeleteGlobal { dst, slot });
+            }
+            // A binding of an ENCLOSING function is a declarative record
+            // binding, so `delete` is false — but `resolve_existing` reports it
+            // as unresolved (it does not thread upvalues), which would send it
+            // to the global fallback below and answer `true`. Costs one
+            // non-threading scan of the enclosing chain, only on this arm.
+            None if self.bound_in_enclosing(n) => {
+                self.emit(Instr::LoadBool { dst, val: false });
+            }
+            None => {
+                // Unreferenced-so-far name: allocate its global slot (like an
+                // identifier reference would) so the runtime check sees the
+                // LIVE binding — crucial for an eval'd `delete x` whose `x`
+                // only exists in the outer program, and for a `with`-masked
+                // name (an @@unscopables-hidden property, or a sloppy
+                // eval-introduced var in this activation's EvalScope) the
+                // compile-time scope knows nothing about. A never-declared
+                // name's fresh slot is UNINITIALIZED, so DeleteGlobal is a
+                // true no-op.
+                let slot = self.cx.global_slot(n) as u32;
+                self.emit(Instr::DeleteGlobal { dst, slot });
+            }
+        }
+    }
+
     /// Emit a `with`-aware `delete name` into `dst`: delete from the first
     /// with-object (innermost first) that has the binding, else fall back to the
     /// static-binding delete semantics (mirrors `delete_expr`'s identifier arm).
@@ -290,21 +341,10 @@ impl<'a> FnCompiler<'a> {
             let nxt = self.here();
             self.patch_jump(jf, nxt);
         }
-        // Fallback: the static binding's delete result (no with-object had it).
-        let non_configurable = matches!(name, "NaN" | "Infinity" | "undefined")
-            || match self.resolve_existing(name) {
-                Some(Binding::Local(_))
-                | Some(Binding::LocalCell(_))
-                | Some(Binding::Upvalue(_))
-                | Some(Binding::ClassName(_)) => true,
-                Some(Binding::Global(slot)) => {
-                    self.cx.hoisted_set.contains(&slot)
-                        || self.cx.lexical_globals.contains(&slot)
-                        || self.cx.decl_globals.contains(&slot)
-                }
-                None => false,
-            };
-        self.emit(Instr::LoadBool { dst, val: !non_configurable });
+        // Fallback: the static binding's delete result (no with-object had it —
+        // an @@unscopables-hidden name reaches here too, and its OUTER binding
+        // is the delete target).
+        self.emit_static_delete(name, dst);
         let end = self.here();
         for je in end_jumps {
             self.patch_jump(je, end);

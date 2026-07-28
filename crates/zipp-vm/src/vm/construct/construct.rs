@@ -940,13 +940,27 @@ impl<'p> Vm<'p> {
                 // `new.target` for the class constructor body (the next frame entered).
                 self.pending_new_target = new_target;
                 let result = self.call_value(f, obj, args);
-                // Capture + clear the super() signal BEFORE propagating any throw,
-                // so a constructor that threw never leaves a stale entry (the heap
-                // index could later be reused by another instance).
-                let super_called = self.super_called.remove(&obj.heap_index());
-                self.this_tdz.remove(&obj.heap_index());
-                let super_this = self.super_this.remove(&obj.heap_index());
-                let ret = result?;
+                // The this-TDZ / super-called / return-override entries are NOT
+                // cleared here — not on success (a `super()` that ran already
+                // consumed what it needed), and never on a throw: the derived
+                // ctor's `this` environment OUTLIVES a failed construction when
+                // an arrow/eval closure captured it (staging/sm/class/
+                // derivedConstructorArrowEvalEscapeUninitialized): a later
+                // `super()` through the escaped arrow must initialize the shared
+                // binding, and a `this` read before that must throw ReferenceError.
+                // The entries key the placeholder's heap index; once nothing can
+                // reach the placeholder the GC's side-table retain pass prunes
+                // them, so a recycled heap slot never inherits a stale mark.
+                let ret = match result {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+                let super_called = self.super_called.contains(&obj.heap_index());
+                // The banked return-override is READ here, never removed: an arrow
+                // created before `super()` captured the placeholder `this` and
+                // must resolve through this mapping on every later `this` read
+                // (ThisCheck). The GC prunes the entry once the placeholder dies.
+                let super_this = self.super_this.get(&obj.heap_index()).copied();
                 // Any object return replaces the new instance.
                 if self.is_object_value(ret) {
                     // A return-override result receives this class's private brand.

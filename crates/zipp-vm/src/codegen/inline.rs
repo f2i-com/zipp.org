@@ -950,7 +950,7 @@ pub(crate) fn emit_mi_body(
             // accessor_fast_set). The body's ONLY effect; method_inline_body_ok
             // admits it ONLY as the last op before the terminator, so any earlier
             // op's number-guard bail re-runs the whole call cleanly.
-            Instr::SetProp { obj: 0, name, val } => {
+            Instr::SetProp { obj: 0, name, val, strict: _ } => {
                 let slot = field_slots.get(&name).copied().unwrap_or(0);
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(rg(val))]

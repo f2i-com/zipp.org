@@ -132,6 +132,24 @@ impl<'p> Vm<'p> {
             native::DEC_ACCESS_GET | native::DEC_ACCESS_SET | native::DEC_ACCESS_HAS => {
                 self.dec_access(id, state, a0, a1)
             }
+            // Annex B legacy RegExp static GETTER: state[0] is the slot index
+            // into `regexp_last` ([input, lastMatch, lastParen, leftContext,
+            // rightContext, $1..$9]). GetLegacyRegExpStaticProperty: the receiver
+            // must be the %RegExp% constructor itself; empty string before the
+            // first match.
+            native::REGEXP_LEGACY_GET => {
+                if !(_this.is_heap() && _this.heap_index() == self.regexp_ctor) {
+                    return Err(Thrown(
+                        "TypeError: RegExp legacy static getter called on a non-%RegExp% receiver"
+                            .into(),
+                    ));
+                }
+                let slot = state[0].as_f64() as usize;
+                match self.regexp_last.get(slot).copied() {
+                    Some(v) => Ok(v),
+                    None => Ok(self.alloc_str(String::new())),
+                }
+            }
             _ => Err(Thrown("TypeError: unknown native closure".into())),
         }
     }

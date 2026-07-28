@@ -356,6 +356,11 @@ impl Vm<'_> {
             root_idx!(*regexp);
             root_val!(*string);
         }
+        // The legacy RegExp statics' last-match record (input/match/capture
+        // strings) is live until the next match replaces it.
+        for v in &self.regexp_last {
+            root_val!(*v);
+        }
         for v in self.zdt_tz.values() {
             root_val!(*v);
         }
@@ -409,6 +414,13 @@ impl Vm<'_> {
         }
         // Drop side-table entries whose keyed object was reclaimed.
         self.proto_of.retain(|&k, _| marks[k as usize]);
+        // Derived-ctor `this` state: a thrown-off constructor leaves these
+        // entries behind deliberately (an escaped arrow may still complete the
+        // super() later); once the placeholder itself is dead the entries must
+        // go, or a recycled heap slot would inherit a TDZ mark / super() flag.
+        self.this_tdz.retain(|&k| marks[k as usize]);
+        self.super_called.retain(|&k| marks[k as usize]);
+        self.super_this.retain(|&k, _| marks[k as usize]);
         self.prototypes.retain(|&k, _| marks[k as usize]);
         self.fn_props.retain(|&k, _| marks[k as usize]);
         self.arr_props.retain(|&k, _| marks[k as usize]);

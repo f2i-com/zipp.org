@@ -357,17 +357,31 @@ pub enum Instr {
     /// positional via the `idx` cursor). The loop then `await`s `dst`, so a sync
     /// `{value,done}` passes straight through and an async one suspends.
     ForAwaitNext { dst: Reg, iter: Reg, idx: Reg },
-    /// `super(args…)`: run the lexical superclass's constructor contribution on
-    /// the current `this` (reg 0). `home_class_id` is the class the method belongs
-    /// to; its runtime `ClassData.parent` is the superclass to invoke (so an
-    /// `extends <arbitrary expression>` parent resolves dynamically).
-    SuperCtor { home_class_id: u32, arg_base: Reg, argc: u16 },
+    /// `dst = GetSuperConstructor()` for a `super(...)` call — fetched BEFORE the
+    /// argument list is evaluated (spec SuperCall order: GetNewTarget,
+    /// GetSuperConstructor, ArgumentListEvaluation, THEN IsConstructor check).
+    /// No constructor-ness check here; SuperCtor/SuperCtorSpread do that after
+    /// their args ran (call-proto-not-ctor, staging/sm/class/superCallOrder).
+    SuperCtorFetch { dst: Reg, home_class_id: u32 },
+    /// `super(args…)`: run the fetched superclass constructor (`ctor` — the
+    /// register a SuperCtorFetch filled before the args were evaluated) on the
+    /// current `this` (reg 0). IsConstructor is checked HERE, after the args.
+    SuperCtor { ctor: Reg, home_class_id: u32, arg_base: Reg, argc: u16 },
     /// `super(...args_array)`: like SuperCtor but spreads the elements of the
     /// array in `args` (`super(...xs)` in a derived constructor).
-    SuperCtorSpread { home_class_id: u32, args: Reg },
-    /// `dst = super.<name>(args…)`: call the named method found from the lexical
-    /// superclass up its chain, with `this` = the current frame's `this` (reg 0).
-    SuperMethod { dst: Reg, home_class_id: u32, name: u32, arg_base: Reg, argc: u16 },
+    SuperCtorSpread { ctor: Reg, home_class_id: u32, args: Reg },
+    /// `dst = GetSuperBase()` — the home object's LIVE [[Prototype]] for a
+    /// `super` property reference in a method of class `home_class_id`. Captured
+    /// into a register at MakeSuperPropertyReference time (BEFORE the call's
+    /// arguments / the assignment's RHS run — they may retarget the home
+    /// object's prototype, staging/sm/class/superPropOrdering); the
+    /// SuperMethod/SuperSet consumers read it from `base` instead of
+    /// re-resolving. May be UNDEFINED/null — consumers RequireObjectCoercible.
+    SuperBase { dst: Reg, home_class_id: u32 },
+    /// `dst = super.<name>(args…)`: call the named method found from the
+    /// captured super base (`base`, a SuperBase register) up its chain, with
+    /// `this` = the current frame's `this` (reg 0).
+    SuperMethod { dst: Reg, base: Reg, home_class_id: u32, name: u32, arg_base: Reg, argc: u16 },
     /// `dst = super.<name>`: read an inherited property (method value, or a getter
     /// invoked with `this` = the current frame's `this`) via the superclass's
     /// prototype.
@@ -375,13 +389,13 @@ pub enum Instr {
     /// `dst = super[key]`: computed form of SuperGet (`key` is a register).
     SuperGetComputed { dst: Reg, home_class_id: u32, key: Reg },
     /// `dst = super[key](args…)`: computed form of SuperMethod.
-    SuperMethodComputed { dst: Reg, home_class_id: u32, key: Reg, arg_base: Reg, argc: u16 },
-    /// `super.<name> = val`: if the superclass prototype chain has an inherited
-    /// setter, invoke it with `this` = the current receiver; otherwise create an
-    /// own property on the receiver.
-    SuperSet { home_class_id: u32, name: u32, val: Reg },
+    SuperMethodComputed { dst: Reg, base: Reg, home_class_id: u32, key: Reg, arg_base: Reg, argc: u16 },
+    /// `super.<name> = val`: if the captured super base's (`base`) prototype
+    /// chain has an inherited setter, invoke it with `this` = the current
+    /// receiver; otherwise create an own property on the receiver.
+    SuperSet { base: Reg, home_class_id: u32, name: u32, val: Reg },
     /// `super[key] = val`: computed form of SuperSet (`key` is a register).
-    SuperSetComputed { home_class_id: u32, key: Reg, val: Reg },
+    SuperSetComputed { base: Reg, home_class_id: u32, key: Reg, val: Reg },
     /// Set the `[[HomeObject]]` of an OBJECT-LITERAL method/accessor closure `method`
     /// to `home` (the object being built), so `super.x` inside it resolves via
     /// GetPrototypeOf(home). Emitted by the object-literal codegen for concise
@@ -718,7 +732,12 @@ pub enum Instr {
     /// (also resolves `.length` for arrays/strings).
     GetProp { dst: Reg, obj: Reg, name: u32 },
     /// `obj.<string_constants[name]> = val` — static property write.
-    SetProp { obj: Reg, name: u32, val: Reg },
+    /// `strict` forces PutValue strictness even when the enclosing FUNCTION is
+    /// sloppy: the ClassTail regions (heritage, computed keys, static field
+    /// initializers) are strict code compiled INLINE into the enclosing
+    /// function, whose proto-level `is_strict` flag cannot see it. Strict
+    /// protos keep `strict: false` here (the runtime ORs the func flag in).
+    SetProp { obj: Reg, name: u32, val: Reg, strict: bool },
     /// `obj.#name = val` — a PRIVATE field/element write (PrivateSet). Unlike
     /// SetProp it brand-checks first: if the private element is NOT present on
     /// `obj` (PrivateFieldFind/PrivateElementFind empty), throw a TypeError. Used
@@ -809,6 +828,28 @@ pub enum Instr {
     /// only it knows the caller's scope chain — a method-body `let C` shadows
     /// the class name, an enclosing function's `C` does not.
     DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, derived_ctor: bool, class_name_ok: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool, site: u16, tail: bool },
+
+    /// `dst = (src IS the realm's %eval% intrinsic)`. Lets a call site whose
+    /// callee reference is NAMED `eval` but does not resolve to the unshadowed
+    /// global (a local/param/upvalue binding, or a `with`-object property)
+    /// still take the direct-eval path when the live value is %eval%
+    /// (13.3.6.1 tests the reference's name and the callee VALUE, not where
+    /// the binding lives).
+    IsEvalFn { dst: Reg, src: Reg },
+
+    /// ResolveBinding for a strict `name = …` on a global the program does not
+    /// declare, probed BEFORE the RHS evaluates (the compiler emits this ahead
+    /// of the RHS and stores with StoreGlobalResolved after it). Does NOT
+    /// throw: an unresolvable probe is recorded in
+    /// `strict_unresolvable_globals` and the store raises the ReferenceError —
+    /// PutValue runs after the RHS, so an RHS exception must win
+    /// (`seen = act()` where act() throws propagates the act() throw —
+    /// staging/sm/Proxy/getPrototypeOf). Resolvable means: the slot is live, a
+    /// same-named own property of the global object backs it (an eval-created
+    /// var), it is a builtin, or the global object's PROTO CHAIN has it. A
+    /// property the RHS itself creates must NOT resolve the reference
+    /// (`undeclared = (this.undeclared = 5)` still throws).
+    CheckGlobalResolvable { idx: u32 },
 
     /// CreateDataPropertyOrThrow for a class FIELD initializer: an own
     /// {writable, enumerable, configurable} data property on the receiver —

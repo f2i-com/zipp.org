@@ -1,4 +1,4 @@
-﻿#![allow(unused_imports)]
+#![allow(unused_imports)]
 use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
@@ -19,6 +19,21 @@ impl<'p> Vm<'p> {
     /// propagates out (with `pending_throw` left set so an enclosing `run_loop`
     /// â€” e.g. the caller of a builtin callback â€” can still catch it).
     pub(crate) fn run_loop(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
+        // Native re-entry guard: a NESTED run_loop (builtin callback, generator
+        // resume, direct eval, JIT bail) is a real Rust frame, and runaway
+        // recursion through such re-entries would exhaust the OS stack before
+        // MAX_FRAMES ever fires. Cap the nesting so it throws a catchable
+        // RangeError (staging/sm/extensions/recursion.js) instead of crashing.
+        if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
+        self.run_loop_depth += 1;
+        let r = self.run_loop_body(stop_depth);
+        self.run_loop_depth -= 1;
+        r
+    }
+
+    fn run_loop_body(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
         loop {
             match self.dispatch_body(stop_depth) {
                 Ok(v) => return Ok(v),
@@ -81,6 +96,12 @@ impl<'p> Vm<'p> {
                 return true;
             }
             // No handler in this frame: discard it and its register window.
+            // Flush a MAPPED arguments object's live formal registers into its
+            // dense store first, or an escaped object reads stale entry values.
+            if self.frames[top].args_obj != u32::MAX {
+                let aidx = self.frames[top].args_obj;
+                self.args_sync_dense(aidx);
+            }
             let f = self.frames.pop().unwrap();
             self.regs.truncate(f.base);
         }
@@ -384,17 +405,35 @@ impl<'p> Vm<'p> {
                             // (`this.x = v` / `globalThis.x = v`) lives as an own
                             // property there, not in this slot. The global object's
                             // own properties ARE global bindings, so a bare read
-                            // resolves to it. Own-only: inherited Object.prototype
-                            // members (`toString`, â€¦) are NOT global bindings, so an
-                            // undeclared name still ReferenceErrors. Slot-only names
-                            // (`global_by_name`) are excluded by checking the ObjMap
-                            // directly, preserving their uninitialized ReferenceError.
+                            // resolves to it. Slot-only names (`global_by_name`)
+                            // are excluded by checking the ObjMap directly,
+                            // preserving their uninitialized ReferenceError.
                             let has_own = self.global_this != 0
                                 && matches!(
                                     self.heap.get(self.global_this),
                                     HeapObj::Object(m) if m.pos(&name).is_some()
                                 );
                             if !has_own {
+                                // HasBinding consults the global object's PROTO
+                                // CHAIN too (9.1.1.4.4 -> HasProperty on the
+                                // binding object): an inherited property — or a
+                                // Proxy prototype's `has` trap — resolves an
+                                // otherwise-undeclared name, and GetBindingValue
+                                // then reads it through [[Get]] with the global
+                                // object as receiver (staging/sm/Proxy/
+                                // global-receiver).
+                                let gobj = Value::heap(self.global_this);
+                                let proto = if self.global_this != 0 {
+                                    self.object_get_prototype_of(gobj)
+                                } else {
+                                    Value::NULL
+                                };
+                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                    let val = self.get_prop(gobj, &name)?;
+                                    self.set(base, dst, val);
+                                    ip += 1;
+                                    continue;
+                                }
                                 // Name the enclosing function, as the
                                 // not-a-function and property-read errors do:
                                 // Error.stack is empty, so a bare identifier is
@@ -420,17 +459,27 @@ impl<'p> Vm<'p> {
                         let v = self.globals[idx as usize];
                         let v = if v.is_uninitialized() {
                             // The binding may be own-prop-backed on the global
-                            // object (eval-created vars / `this.x = v`).
+                            // object (eval-created vars / `this.x = v`), or
+                            // resolvable through the global object's PROTO CHAIN
+                            // (a Proxy prototype's `has` trap / an inherited
+                            // property — HasBinding is HasProperty on the
+                            // binding object, chain included).
                             match self.global_slot_name(idx) {
-                                Some(name)
-                                    if self.global_this != 0
-                                        && matches!(
-                                            self.heap.get(self.global_this),
-                                            HeapObj::Object(m) if m.pos(&name).is_some()
-                                        ) =>
-                                {
+                                Some(name) if self.global_this != 0 => {
+                                    let has_own = matches!(
+                                        self.heap.get(self.global_this),
+                                        HeapObj::Object(m) if m.pos(&name).is_some()
+                                    );
                                     let gobj = Value::heap(self.global_this);
-                                    self.get_prop(gobj, &name)?
+                                    let proto = self.object_get_prototype_of(gobj);
+                                    if has_own
+                                        || (proto.is_heap()
+                                            && self.has_property_str_dyn(proto, &name)?)
+                                    {
+                                        self.get_prop(gobj, &name)?
+                                    } else {
+                                        Value::UNDEFINED
+                                    }
                                 }
                                 _ => Value::UNDEFINED,
                             }
@@ -457,6 +506,21 @@ impl<'p> Vm<'p> {
                                     HeapObj::Object(m) if m.pos(&name).is_some()
                                 );
                             if !has_own {
+                                // Chain fallback, as in LoadGlobal: a Proxy
+                                // prototype's `has` trap / an inherited property
+                                // resolves the name (HasBinding = HasProperty).
+                                let gobj = Value::heap(self.global_this);
+                                let proto = if self.global_this != 0 {
+                                    self.object_get_prototype_of(gobj)
+                                } else {
+                                    Value::NULL
+                                };
+                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                    let val = self.get_prop(gobj, &name)?;
+                                    self.set(base, dst, val);
+                                    ip += 1;
+                                    continue;
+                                }
                                 return Err(Thrown(format!(
                                     "ReferenceError: {name} is not defined"
                                 )));
@@ -478,15 +542,21 @@ impl<'p> Vm<'p> {
                         let v = self.globals[idx as usize];
                         let v = if v.is_uninitialized() {
                             match self.global_slot_name(idx) {
-                                Some(name)
-                                    if self.global_this != 0
-                                        && matches!(
-                                            self.heap.get(self.global_this),
-                                            HeapObj::Object(m) if m.pos(&name).is_some()
-                                        ) =>
-                                {
+                                Some(name) if self.global_this != 0 => {
+                                    let has_own = matches!(
+                                        self.heap.get(self.global_this),
+                                        HeapObj::Object(m) if m.pos(&name).is_some()
+                                    );
                                     let gobj = Value::heap(self.global_this);
-                                    self.get_prop(gobj, &name)?
+                                    let proto = self.object_get_prototype_of(gobj);
+                                    if has_own
+                                        || (proto.is_heap()
+                                            && self.has_property_str_dyn(proto, &name)?)
+                                    {
+                                        self.get_prop(gobj, &name)?
+                                    } else {
+                                        Value::UNDEFINED
+                                    }
                                 }
                                 _ => Value::UNDEFINED,
                             }
@@ -539,11 +609,39 @@ impl<'p> Vm<'p> {
                                     ip += 1;
                                     continue;
                                 }
+                                // A name the global object's PROTO CHAIN resolves
+                                // (an inherited accessor / non-writable data
+                                // property, or a Proxy prototype's `has` trap) is
+                                // assigned THROUGH [[Set]] on the global object,
+                                // not as a shadowing slot binding.
+                                let gobj = Value::heap(self.global_this);
+                                let proto = if self.global_this != 0 {
+                                    self.object_get_prototype_of(gobj)
+                                } else {
+                                    Value::NULL
+                                };
+                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                    self.set_prop(gobj, &name, v, false)?;
+                                    ip += 1;
+                                    continue;
+                                }
                                 // See StoreGlobal: re-creating a deleted binding
                                 // lifts DeleteGlobal's deletion record.
                                 if !self.deleted_globals.is_empty() {
                                     self.deleted_globals.remove(&name);
                                 }
+                            }
+                        } else if self.global_real_own_route(idx) {
+                            // A defineProperty'd REAL own property of the global
+                            // object (its attributes live on the object, not in
+                            // the slot) governs the write — route through [[Set]]
+                            // (staging/sm/Proxy/regress-bug1037770).
+                            let name = self.global_slot_name(idx).unwrap_or_default();
+                            if !self.global_name_is_lexical(&name) {
+                                let gobj = Value::heap(self.global_this);
+                                self.set_prop(gobj, &name, v, false)?;
+                                ip += 1;
+                                continue;
                             }
                         }
                         self.globals[idx as usize] = v;
@@ -577,6 +675,24 @@ impl<'p> Vm<'p> {
                                     ip += 1;
                                     continue;
                                 }
+                                // A name the global object's PROTO CHAIN resolves
+                                // (an inherited accessor / non-writable data
+                                // property, or a Proxy prototype's `has` trap) is
+                                // assigned THROUGH [[Set]] on the global object,
+                                // not as a shadowing slot binding
+                                // (staging/sm/object/proto-property-change-
+                                // writability-set, staging/sm/Proxy/global-receiver).
+                                let gobj = Value::heap(self.global_this);
+                                let proto = if self.global_this != 0 {
+                                    self.object_get_prototype_of(gobj)
+                                } else {
+                                    Value::NULL
+                                };
+                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                    self.set_prop(gobj, &name, v, false)?;
+                                    ip += 1;
+                                    continue;
+                                }
                                 // Re-CREATING a deleted binding (`delete Function;
                                 // Function = 1`) makes it a global-object property
                                 // again, so lift the deletion record DeleteGlobal
@@ -585,8 +701,64 @@ impl<'p> Vm<'p> {
                                     self.deleted_globals.remove(&name);
                                 }
                             }
+                        } else if self.global_real_own_route(idx) {
+                            // A defineProperty'd REAL own property of the global
+                            // object (its attributes live on the object, not in
+                            // the slot) governs the write — route through [[Set]]
+                            // (staging/sm/Proxy/regress-bug1037770). A global
+                            // LEXICAL binding is not an object property: the slot
+                            // stays authoritative for it.
+                            let name = self.global_slot_name(idx).unwrap_or_default();
+                            if !self.global_name_is_lexical(&name) {
+                                let gobj = Value::heap(self.global_this);
+                                self.set_prop(gobj, &name, v, false)?;
+                                ip += 1;
+                                continue;
+                            }
                         }
                         self.globals[idx as usize] = v;
+                        ip += 1;
+                    }
+                    Instr::CheckGlobalResolvable { idx } => {
+                        // ResolveBinding for a strict `name = …`, performed BEFORE
+                        // the RHS evaluates (the compiler emits this ahead of the
+                        // RHS and stores with StoreGlobalResolved after it). The
+                        // reference is resolvable when the slot is live, when a
+                        // same-named own property of the global object backs it
+                        // (an eval-created var), when it is a builtin, or when
+                        // the global object's PROTO CHAIN has it. An own prop the
+                        // RHS itself creates must NOT resolve it
+                        // (`undeclared = (this.undeclared = 5)` still throws).
+                        // The ReferenceError itself is DEFERRED to the store:
+                        // PutValue runs after the RHS, so an RHS exception must
+                        // win (`seen = act()` where act() throws propagates the
+                        // act() throw — staging/sm/Proxy/getPrototypeOf).
+                        if self.globals[idx as usize].is_uninitialized() {
+                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                            let own_backed = !self.global_name_is_lexical(&name)
+                                && self.global_this != 0
+                                && matches!(
+                                    self.heap.get(self.global_this),
+                                    HeapObj::Object(m) if m.pos(&name).is_some()
+                                );
+                            let mut resolvable = own_backed || self.global_by_name(&name).is_some();
+                            if !resolvable {
+                                let gobj = Value::heap(self.global_this);
+                                let proto = if self.global_this != 0 {
+                                    self.object_get_prototype_of(gobj)
+                                } else {
+                                    Value::NULL
+                                };
+                                resolvable =
+                                    proto.is_heap() && self.has_property_str_dyn(proto, &name)?;
+                            }
+                            if resolvable {
+                                // Drop any stale entry a caught RHS throw left.
+                                self.strict_unresolvable_globals.retain(|&i| i != idx);
+                            } else {
+                                self.strict_unresolvable_globals.push(idx);
+                            }
+                        }
                         ip += 1;
                     }
                     Instr::StoreGlobalStrict { idx, src } => {
@@ -611,9 +783,40 @@ impl<'p> Vm<'p> {
                                 )));
                             }
                             if self.global_by_name(&name).is_none() {
+                                // The reference can still resolve through the
+                                // global object's PROTO CHAIN — an inherited
+                                // property, or a Proxy prototype's `has` trap
+                                // (global-receiver, strict variant). Probing the
+                                // chain ONLY (never the own props) keeps
+                                // `undeclared = (this.undeclared = 5)` throwing.
+                                let gobj = Value::heap(self.global_this);
+                                let proto = if self.global_this != 0 {
+                                    self.object_get_prototype_of(gobj)
+                                } else {
+                                    Value::NULL
+                                };
+                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                    let v = self.get(base, src);
+                                    self.set_prop(gobj, &name, v, true)?;
+                                    ip += 1;
+                                    continue;
+                                }
                                 return Err(Thrown(format!(
                                     "ReferenceError: {name} is not defined"
                                 )));
+                            }
+                        } else if self.global_real_own_route(idx) {
+                            // A defineProperty'd REAL own property of the global
+                            // object governs the write — a strict assignment to
+                            // a non-writable one is a TypeError, never a slot
+                            // write (regress-bug1037770, strict analogue).
+                            let name = self.global_slot_name(idx).unwrap_or_default();
+                            if !self.global_name_is_lexical(&name) {
+                                let v = self.get(base, src);
+                                let gobj = Value::heap(self.global_this);
+                                self.set_prop(gobj, &name, v, true)?;
+                                ip += 1;
+                                continue;
                             }
                         }
                         // A $262.evalScript `const` is immutable once initialized.
@@ -629,6 +832,24 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::StoreGlobalResolved { idx, src } => {
+                        // A CheckGlobalResolvable emitted before the RHS found
+                        // this reference unresolvable: PutValue's ReferenceError
+                        // lands NOW — after the RHS ran (an RHS throw would have
+                        // won by never reaching this store).
+                        if !self.strict_unresolvable_globals.is_empty() {
+                            if let Some(p) = self
+                                .strict_unresolvable_globals
+                                .iter()
+                                .rposition(|&i| i == idx)
+                            {
+                                self.strict_unresolvable_globals.remove(p);
+                                let name =
+                                    self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                                return Err(Thrown(format!(
+                                    "ReferenceError: {name} is not defined"
+                                )));
+                            }
+                        }
                         // PutValue for a reference this same expression already
                         // ran GetValue on (`x++`, `x += 1`, `x ||= v`): 6.2.5.6
                         // step 1 cannot be reached — a Get that succeeded proves
@@ -682,6 +903,23 @@ impl<'p> Vm<'p> {
                             // lref--v--*.js). Dropping this let the store silently
                             // create a slot value instead.
                             if self.global_by_name(&name).is_none() {
+                                // The same proto-chain resolution
+                                // StoreGlobalStrict performs: an inherited
+                                // property still resolves the reference, and
+                                // the write lands through [[Set]] on the
+                                // global object.
+                                let gobj = Value::heap(self.global_this);
+                                let proto = if self.global_this != 0 {
+                                    self.object_get_prototype_of(gobj)
+                                } else {
+                                    Value::NULL
+                                };
+                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                                    let v = self.get(base, src);
+                                    self.set_prop(gobj, &name, v, true)?;
+                                    ip += 1;
+                                    continue;
+                                }
                                 return Err(Thrown(format!(
                                     "ReferenceError: {name} is not defined"
                                 )));
@@ -1837,14 +2075,38 @@ impl<'p> Vm<'p> {
                                 "ReferenceError: must call super constructor before accessing 'this' in a derived class constructor".into(),
                             ));
                         }
+                        // An arrow/eval closure that captured the derived ctor's
+                        // uninitialized `this` placeholder still holds that object
+                        // after a LATER `super()` (possibly from another escaped
+                        // closure) initialized the binding to a return-override
+                        // instance: resolve the read through the banked mapping.
+                        if v.is_heap() {
+                            if let Some(&produced) = self.super_this.get(&v.heap_index()) {
+                                self.set(base, src, produced);
+                            }
+                        }
                         ip += 1;
                     }
-                    Instr::SuperCtor { home_class_id, arg_base, argc } => {
-                        // GetSuperConstructor() is the LIVE [[GetPrototypeOf]] of
-                        // the class object: Object.setPrototypeOf(C, X) retargets
-                        // super(), and IsConstructor is checked AFTER the argument
-                        // registers were evaluated (call-proto-not-ctor).
-                        let parent = self.super_ctor_func(home_class_id)?;
+                    Instr::SuperCtorFetch { dst, home_class_id } => {
+                        // GetSuperConstructor() BEFORE the argument list runs
+                        // (spec SuperCall order): the LIVE [[GetPrototypeOf]] of
+                        // the class object — Object.setPrototypeOf(C, X) in an
+                        // argument must NOT retarget THIS super() call, and a
+                        // non-constructor parent is only reported by the SuperCtor
+                        // op after the args (call-proto-not-ctor).
+                        let f = self.super_ctor_fetch(home_class_id);
+                        self.set(base, dst, f);
+                        ip += 1;
+                    }
+                    Instr::SuperCtor { ctor, home_class_id, arg_base, argc } => {
+                        // IsConstructor is checked AFTER the argument registers
+                        // were evaluated (the fetch happened before them).
+                        let parent = self.get(base, ctor);
+                        if !self.is_constructor(parent) {
+                            return Err(Thrown(
+                                "TypeError: superclass is not a constructor".into(),
+                            ));
+                        }
                         let this = self.get(base, 0);
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
@@ -1859,8 +2121,13 @@ impl<'p> Vm<'p> {
                         self.super_ctor_complete(base, this, produced, home_class_id)?;
                         ip += 1;
                     }
-                    Instr::SuperCtorSpread { home_class_id, args } => {
-                        let parent = self.super_ctor_func(home_class_id)?;
+                    Instr::SuperCtorSpread { ctor, home_class_id, args } => {
+                        let parent = self.get(base, ctor);
+                        if !self.is_constructor(parent) {
+                            return Err(Thrown(
+                                "TypeError: superclass is not a constructor".into(),
+                            ));
+                        }
                         let this = self.get(base, 0);
                         let args_v = self.get(base, args);
                         let arg_vec = self.array_snapshot(args_v.heap_index());
@@ -1869,7 +2136,15 @@ impl<'p> Vm<'p> {
                         self.super_ctor_complete(base, this, produced, home_class_id)?;
                         ip += 1;
                     }
-                    Instr::SuperMethod { dst, home_class_id, name, arg_base, argc } => {
+                    Instr::SuperBase { dst, home_class_id } => {
+                        // GetSuperBase at MakeSuperPropertyReference time — the
+                        // compiler places this BEFORE the args/RHS of the
+                        // reference's use; the consumer reads the captured value.
+                        let v = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::SuperMethod { dst, base: base_reg, home_class_id, name, arg_base, argc } => {
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
@@ -1893,12 +2168,15 @@ impl<'p> Vm<'p> {
                                 break;
                             }
                         }
-                        // super.m() resolves m via the super base (the home object's
-                        // [[Prototype]]) with `this` = the receiver â€” like a normal
-                        // property get + call (and like SuperMethodComputed). This
-                        // reaches inherited methods, accessors, and base-class super
-                        // (â†’ %Object.prototype%), not just own parent-class methods.
-                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        // super.m() resolves m via the super base CAPTURED before
+                        // the argument list ran (SuperBase) with `this` = the
+                        // receiver — like a normal property get + call (and like
+                        // SuperMethodComputed). This reaches inherited methods,
+                        // accessors, and base-class super (→ %Object.prototype%),
+                        // not just own parent-class methods. (The IC above is
+                        // version-guarded on the same chain, so a base retargeted
+                        // during argument evaluation misses it and lands here.)
+                        let proto = self.get(base, base_reg);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -2007,10 +2285,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperMethodComputed { dst, home_class_id, key, arg_base, argc } => {
+                    Instr::SuperMethodComputed { dst, base: base_reg, home_class_id: _, key, arg_base, argc } => {
                         let kv = self.get(base, key);
-                        // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
-                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        // The base was captured right after the key ran, BEFORE
+                        // the argument list (SuperBase).
+                        let proto = self.get(base, base_reg);
                         let ks = self.to_property_key(kv)?;
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
@@ -2024,7 +2303,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperSet { home_class_id, name, val } => {
+                    Instr::SuperSet { base: base_reg, home_class_id, name, val } => {
                         let key =
                             self.func(func_id as usize).string_constants[name as usize].as_str();
                         let this = self.get(base, 0);
@@ -2033,7 +2312,9 @@ impl<'p> Vm<'p> {
                         // ── interpreter super-property IC ── a cached plain
                         // SETTER on the super chain frame-calls with `this` =
                         // the receiver and ret_dst = RET_DISCARD; data writes
-                        // (which go to the RECEIVER) stay on the slow path.
+                        // (which go to the RECEIVER) stay on the slow path. The
+                        // entry is version-guarded on the same chain the
+                        // SuperBase op captured, so a retargeted base misses it.
                         if let SetAct::Setter { fid, closure, setter } =
                             self.ic_super_set(func_id, ip, home_class_id, is_static, key)
                         {
@@ -2046,13 +2327,16 @@ impl<'p> Vm<'p> {
                         // PutValue strictness comes from the reference site (the
                         // enclosing function) — class methods are always strict.
                         let strict = self.func(func_id as usize).is_strict;
-                        self.super_set(home_class_id, &key, this, v, is_static, strict)?;
+                        let proto = self.get(base, base_reg);
+                        self.super_set_obj(proto, &key, this, v, strict)?;
                         ip += 1;
                     }
-                    Instr::SuperSetComputed { home_class_id, key, val } => {
+                    Instr::SuperSetComputed { base: base_reg, home_class_id: _, key, val } => {
                         let kv = self.get(base, key);
-                        // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
-                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        // The base was captured right after the key ran, BEFORE
+                        // the RHS (SuperBase) — but still before ToPropertyKey's
+                        // coercion, matching GetSuperBase-before-ToPropertyKey.
+                        let proto = self.get(base, base_reg);
                         let ks = self.to_property_key(kv)?;
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
@@ -4108,7 +4392,7 @@ impl<'p> Vm<'p> {
                         self.define_field(o, &key, v)?;
                         ip += 1;
                     }
-                    Instr::SetProp { obj, name, val } => {
+                    Instr::SetProp { obj, name, val, strict: site_strict } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
                         let key = self.func(func_id as usize)
@@ -4229,7 +4513,7 @@ impl<'p> Vm<'p> {
                             }
                             SetAct::None => {}
                         }
-                        let strict = self.func(func_id as usize).is_strict;
+                        let strict = self.func(func_id as usize).is_strict || site_strict;
                         self.set_prop(o, &key, v, strict)?;
                         ip += 1;
                     }
@@ -4520,6 +4804,18 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::heap(idx));
                         ip += 1;
                     }
+                    Instr::IsEvalFn { dst, src } => {
+                        // Identity probe for a callee reference NAMED `eval`
+                        // whose binding is not the unshadowed global: direct-eval
+                        // semantics apply only when the live VALUE is %eval%.
+                        let v = self.get(base, src);
+                        self.set(
+                            base,
+                            dst,
+                            Value::bool(v.is_heap() && v.heap_index() == self.eval_fn_idx),
+                        );
+                        ip += 1;
+                    }
                     Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, derived_ctor, class_name_ok, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site, tail } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
@@ -4548,6 +4844,30 @@ impl<'p> Vm<'p> {
                         if !(live.is_heap() && live.heap_index() == self.eval_fn_idx) {
                             if tail && self.try_tail_reuse(base, live, Value::UNDEFINED, &[a0])? {
                                 break; // re-snapshot the frame coordinates
+                            }
+                            // A rebound `eval` that is a PLAIN user function takes
+                            // the flat call path (push a frame, re-snapshot) — a
+                            // nested `call_value` run_loop per level would exhaust
+                            // the NATIVE stack long before MAX_FRAMES on runaway
+                            // recursion (`function eval(){ eval(); }`), turning a
+                            // catchable RangeError into a hard stack overflow.
+                            if let Ok((fid, closure)) = self.resolve_callable(live) {
+                                if !self.func(fid as usize).is_generator
+                                    && !self.func(fid as usize).is_async
+                                {
+                                    self.setup_call(
+                                        fid,
+                                        closure,
+                                        Value::UNDEFINED,
+                                        base,
+                                        arg,
+                                        1,
+                                        dst,
+                                        ip + 1,
+                                        live,
+                                    )?;
+                                    break;
+                                }
                             }
                             let r = self.call_value(live, Value::UNDEFINED, &[a0])?;
                             self.set(base, dst, r);
@@ -4593,16 +4913,28 @@ impl<'p> Vm<'p> {
                                     // scope keeps seeing it: the fresh scope this
                                     // activation's own eval declares into is
                                     // NESTED inside it, not a replacement.
+                                    // EXCEPTION: an eval-program frame's stamped
+                                    // scope IS its variable environment (sloppy
+                                    // direct eval in function code), so a nested
+                                    // direct eval declares into that SAME scope —
+                                    // `eval("eval('var x=1'); typeof x")` sees
+                                    // the `x`, and nothing leaks to the global.
                                     let outer = self.frame_eval_scope(fi);
-                                    let s = self.heap.alloc(HeapObj::EvalScope(
-                                        std::collections::HashMap::new(),
-                                    ));
-                                    self.frames[fi].eval_scope = s;
-                                    if let Some(p) = outer {
-                                        self.eval_scope_parent.insert(s, p);
+                                    if self.frames[fi].is_eval && outer.is_some() {
+                                        outer
+                                    } else {
+                                        let s = self.heap.alloc(HeapObj::EvalScope(
+                                            std::collections::HashMap::new(),
+                                        ));
+                                        self.frames[fi].eval_scope = s;
+                                        if let Some(p) = outer {
+                                            self.eval_scope_parent.insert(s, p);
+                                        }
+                                        Some(s)
                                     }
+                                } else {
+                                    Some(self.frames[fi].eval_scope)
                                 }
-                                Some(self.frames[fi].eval_scope)
                             } else {
                                 None
                             };
@@ -4645,8 +4977,16 @@ impl<'p> Vm<'p> {
                                         let mut names = Vec::with_capacity(map.len());
                                         let mut cells = Vec::with_capacity(map.len());
                                         let mut outer = Vec::new();
+                                        let mut catch_params = Vec::new();
                                         for (n, kind, idx) in map {
-                                            let cv = if kind == 0 {
+                                            let cv = if kind == 0 || kind == 3 {
+                                                // kind 0: a cell of THIS frame;
+                                                // kind 3: the same, but the
+                                                // binding is a CATCH PARAMETER —
+                                                // an eval'd `var` of that name
+                                                // still goes to the function's
+                                                // varEnv (Annex B.3.5), it just
+                                                // can't shadow the param cell.
                                                 self.get(base, idx)
                                             } else {
                                                 // kind 1/2: this frame's closure
@@ -4674,14 +5014,17 @@ impl<'p> Vm<'p> {
                                                 }
                                             };
                                             if cv.is_heap() {
-                                                if kind == 2 {
+                                                if kind == 2 || kind == 3 {
                                                     outer.push(n.clone());
+                                                }
+                                                if kind == 3 {
+                                                    catch_params.push(n.clone());
                                                 }
                                                 names.push(n);
                                                 cells.push(cv);
                                             }
                                         }
-                                        Some((names, cells, outer))
+                                        Some((names, cells, outer, catch_params))
                                     } else {
                                         None
                                     }
@@ -6677,6 +7020,16 @@ impl<'p> Vm<'p> {
     /// report `false` to keep executing the caller.
     #[inline]
     pub(crate) fn pop_frame_with(&mut self, ret: Value, stop_depth: usize) -> bool {
+        // A MAPPED arguments object that escapes this frame answers from its
+        // dense store once the frame is gone: flush the live formal registers
+        // into it BEFORE the window dies, or post-return reads see stale
+        // entry values (staging/sm/Function/strict-arguments.js).
+        if let Some(f) = self.frames.last() {
+            if f.args_obj != u32::MAX {
+                let aidx = f.args_obj;
+                self.args_sync_dense(aidx);
+            }
+        }
         let finished = self.frames.pop().expect("frame underflow");
         // Shrink the register file back to the caller's window top.
         self.regs.truncate(finished.base);

@@ -424,6 +424,9 @@ impl<'p> Vm<'p> {
             7 => Value::num(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64),
             8 => Value::num(f64::from_le_bytes(bytes)),
             9 => self.make_bigint(i64::from_le_bytes(bytes) as i128),
+            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes([
+                bytes[0], bytes[1],
+            ]))),
             _ => self.make_bigint(u64::from_le_bytes(bytes) as i128),
         }
     }
@@ -462,6 +465,9 @@ impl<'p> Vm<'p> {
             7 => fmt_f64(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
             8 => fmt_f64(f64::from_le_bytes(b.try_into().unwrap())),
             9 => i64::from_le_bytes(b.try_into().unwrap()).to_string(),
+            11 => fmt_f64(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes([
+                b[0], b[1],
+            ]))),
             _ => u64::from_le_bytes(b.try_into().unwrap()).to_string(),
         }
     }
@@ -638,8 +644,8 @@ impl<'p> Vm<'p> {
                             "TypeError: Atomics operation requires an Int32Array or BigInt64Array".into(),
                         ));
                     }
-                } else if matches!(*kind, 2 | 7 | 8) {
-                    // Uint8Clamped(2), Float32(7), Float64(8) are not integer types.
+                } else if matches!(*kind, 2 | 7 | 8 | 11) {
+                    // Uint8Clamped(2), Float32(7), Float64(8), Float16(11) are not integer types.
                     return Err(Thrown(
                         "TypeError: Atomics operation requires an integer TypedArray".into(),
                     ));

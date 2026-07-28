@@ -47,12 +47,14 @@ impl Compiler {
             eval_inherit_super_obj: false,
             eval_caller_scope: Vec::new(),
             eval_outer_scope: Vec::new(),
+            eval_catch_params: Vec::new(),
             eval_dynamic_names: std::collections::HashSet::new(),
             eval_fn_context: false,
             dyn_global_zone: false,
             force_strict: false,
             force_new_target_ok: false,
             in_strict: false,
+            strict_expr_region: 0,
             new_target_ok: false,
             class_enclosing: Vec::new(),
             class_derived: false,
@@ -61,6 +63,7 @@ impl Compiler {
             heritage_classes: Vec::new(),
             eval_visible_privates: std::collections::HashSet::new(),
             in_derived_ctor: false,
+            fn_ctor_no_self_name: false,
             const_globals: HashSet::new(),
             lexical_globals: HashSet::new(),
             decl_globals: HashSet::new(),
@@ -332,12 +335,28 @@ impl Compiler {
         // script top level (the eval inherits the caller's new.target validity).
         let parent_nt = self.new_target_ok;
         self.new_target_ok = !is_script || self.force_new_target_ok;
+        // CreateDynamicFunction (`new Function` & kin): the wrapper's
+        // "anonymous" name is a source-text artifact only — the created
+        // function gets SetFunctionName("anonymous") but NO self-name binding
+        // (its params/body are parsed and instantiated separately), so
+        // `typeof anonymous` inside is "undefined" (constructor-binding.js).
+        // Consume the one-shot flag on the FIRST function named "anonymous":
+        // compilation is depth-first, so that is the wrapper itself, never a
+        // same-named function nested in its parameter defaults or body.
+        let self_name = if self_name == Some("anonymous") && self.fn_ctor_no_self_name {
+            self.fn_ctor_no_self_name = false;
+            None
+        } else {
+            self_name
+        };
         // A body that references `eval` may direct-eval: box EVERY param and
         // function-scoped local so the eval program can close over the caller
-        // scope (cells outlive the frame for closures the eval creates).
+        // scope (cells outlive the frame for closures the eval creates). The
+        // reference scan must ALSO see a LOCALLY-bound `eval` (`var eval = f`)
+        // — a call through it is still a direct eval when its value is %eval%.
         let mut captured = captured;
         let body_refs_eval = !is_script
-            && (capture::free_vars(&[], body).contains("eval")
+            && (capture::stmts_refs_all(body).contains("eval")
                 || params_ast.is_some_and(|pa| capture::params_reference("eval", pa)));
         let saved_dyn_zone = self.dyn_global_zone;
         if body_refs_eval {
@@ -414,6 +433,11 @@ impl Compiler {
                 // direct eval in a DERIVED constructor may call `super()` —
                 // rejected outright while this flag defaulted to false.
                 fc.derived_class = ctx.derived_ctor;
+                // …and the eval SCRIPT itself runs with the caller's derived-ctor
+                // `this`-TDZ state: `this` reads are checked, arrows it defines
+                // inherit the context (compile_arrow_body reads this flag), and a
+                // NESTED direct eval re-inherits it (`eval("eval('super()')")`).
+                fc.in_derived_ctor = ctx.derived_ctor;
             }
         }
         // An object-literal concise method / accessor compiles with object-method
@@ -878,6 +902,34 @@ impl Compiler {
                     fc.declare_local(name); // boxes a cell if captured (undefined)
                 }
             }
+            // FunctionDeclarationInstantiation with parameter EXPRESSIONS (a
+            // non-simple list, sloppy mode): the body gets a SEPARATE var-env
+            // binding for a hoisted `var arguments`, initialized to the
+            // parameter environment's arguments object — so `var arguments = 0`
+            // does not clobber the `arguments` a parameter-default closure
+            // captured, while bare `var arguments;` still STARTS as that same
+            // object (arguments-parameter-shadowing.js). A simple parameter
+            // list (or strict mode) uses one environment, where the names stay
+            // shared — the skip in the loop above is then exactly right.
+            if !is_strict
+                && params_ast.is_some_and(|pa| !pa.simple)
+                && hv.contains("arguments")
+            {
+                if let Some(areg) = fc.arguments_reg {
+                    fc.uses_arguments = true;
+                    let body_reg = fc.declare_local("arguments");
+                    match (fc.cell_regs.contains(&areg), fc.cell_regs.contains(&body_reg)) {
+                        (false, false) => fc.emit(Instr::Move { dst: body_reg, src: areg }),
+                        (false, true) => fc.emit(Instr::CellSet { cell: body_reg, src: areg }),
+                        (true, false) => fc.emit(Instr::CellGet { dst: body_reg, cell: areg }),
+                        (true, true) => {
+                            let t = fc.alloc_reg();
+                            fc.emit(Instr::CellGet { dst: t, cell: areg });
+                            fc.emit(Instr::CellSet { cell: body_reg, src: t });
+                        }
+                    }
+                }
+            }
         }
 
         // Pre-create cells for captured function-body-level lexical (`let`/`const`/
@@ -1224,7 +1276,7 @@ impl Compiler {
                 Some(fname) => {
                     let name_idx = fc.string_name(fname);
                     if fname.starts_with('#') {
-                        fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v });
+                        fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v, strict: false });
                     } else {
                         fc.emit(Instr::DefineField { obj: 0, name: name_idx, val: v });
                     }
@@ -1325,6 +1377,8 @@ impl Compiler {
         super_class: Option<u32>,
         super_static: bool,
         super_home_obj: bool,
+        enclosing_derived: bool,
+        enclosing_in_derived_ctor: bool,
     ) -> R<FuncProto> {
         let parent_strict = self.in_strict;
         // Only a BLOCK body has a directive prologue: `x => "use strict"` is a
@@ -1370,9 +1424,15 @@ impl Compiler {
         fc.super_static = super_static;
         // An arrow inherits the enclosing method's derived-ness (so `super(...)` in an
         // arrow inside a derived constructor is allowed). `cx.class_derived` still
-        // reflects the enclosing class while its method bodies (and their arrows) compile.
-        fc.derived_class = fc.cx.class_derived;
-        fc.in_derived_ctor = fc.cx.in_derived_ctor;
+        // reflects the enclosing class while its method bodies (and their arrows) compile;
+        // the enclosing FnCompiler's own flag ALSO feeds in, so an arrow compiled inside
+        // a direct-eval script (whose root inherited derived-ness from the caller, while
+        // `cx.class_derived` is false) may still call `super()`.
+        fc.derived_class = fc.cx.class_derived || enclosing_derived;
+        // Same route for the `this`-TDZ check: the enclosing activation's
+        // derived-ctor-ness (a direct eval inside a derived ctor sets it on the
+        // eval root; plain nesting sees `cx.in_derived_ctor`).
+        fc.in_derived_ctor = fc.cx.in_derived_ctor || enclosing_in_derived_ctor;
         fc.in_async = a.is_async;
         fc.bind_params(&a.params)?;
         match &a.body {

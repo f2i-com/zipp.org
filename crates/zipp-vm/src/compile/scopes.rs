@@ -368,6 +368,16 @@ impl<'a> FnCompiler<'a> {
         if let Some(idx) = self.resolve_upvalue(name) {
             return Binding::Upvalue(idx);
         }
+        // An ENCLOSING class's inner binding: a class nested lexically inside
+        // another class's elements sees the outer class's name through the class
+        // scope chain (`class foo { m() { class bar { n() { foo } } } }`).
+        // `class_names` is a push/pop stack of exactly the lexically enclosing
+        // classes (innermost last). Nearer scopes — this function's locals, the
+        // current class's own name, and captured function locals (upvalues) —
+        // all shadow it, so this is checked after them but before globals.
+        if let Some((_, cid)) = self.cx.class_names.iter().rev().find(|(n, _)| n == name) {
+            return Binding::ClassName(*cid);
+        }
         if let Some(i) = self.cx.existing_global_slot(name) {
             return Binding::Global(i as u32);
         }
@@ -391,14 +401,36 @@ impl<'a> FnCompiler<'a> {
     /// next to the class binding and only `heritage_class` separates them.
     pub(crate) fn class_inner_name_visible(&self) -> bool {
         let Some(cid) = self.super_class else { return false };
-        let Some(name) = self
+        // The class's own name: normally the class_names stack entry for THIS
+        // class — but compile_class pops that entry when it returns, so an
+        // INLINE static field initializer (compiled afterwards) finds it in
+        // `heritage_class` instead (set around those initializers together
+        // with super_class).
+        let name = if let Some((n, hcid)) = &self.heritage_class {
+            if *hcid != cid {
+                return false;
+            }
+            n.as_str()
+        } else if let Some((n, _)) = self
             .cx
             .class_names
             .iter()
             .rev()
             .find(|(_, id)| *id == cid)
-            .map(|(n, _)| n.as_str())
-        else {
+        {
+            n.as_str()
+        } else if let Some((n, _)) = self
+            .cx
+            .heritage_classes
+            .iter()
+            .rev()
+            .find(|(_, id)| *id == cid)
+        {
+            // A function nested inside a static field initializer (the
+            // class_names entry is popped; the initializer pushes the name
+            // here exactly so nested functions keep the inner binding).
+            n.as_str()
+        } else {
             return false;
         };
         if self.heritage_class.as_ref().is_some_and(|(n, _)| n == name) {

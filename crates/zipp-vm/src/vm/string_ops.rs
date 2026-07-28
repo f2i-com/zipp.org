@@ -369,8 +369,12 @@ impl<'p> Vm<'p> {
                 let byte = u2b(&s, pos);
                 Ok(Some(Value::bool(s[byte..].contains(&needle))))
             }
-            "toUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
-            "toLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
+            "toUpperCase" => Ok(Some(Value::heap(
+                self.heap.alloc_js(case_map_exact(js_recv.as_bytes(), true)),
+            ))),
+            "toLowerCase" => Ok(Some(Value::heap(
+                self.heap.alloc_js(case_map_exact(js_recv.as_bytes(), false)),
+            ))),
             // NB: `slice` / `substring` are handled by the no-clone fast path in
             // the early match above (before the receiver is copied).
             "repeat" => {
@@ -995,6 +999,9 @@ impl<'p> Vm<'p> {
                 let sv = self.alloc_str(s.to_string());
                 let r = self.call_value(repl_v, Value::UNDEFINED, &[m, off, sv])?;
                 let rs = self.to_js_string(r)?;
+                if rs.len() > (1usize << 28).saturating_sub(out.len()) {
+                    return Err(Thrown("RangeError: Invalid string length".into()));
+                }
                 out.push_str(&rs);
             } else {
                 let rep = self.expand_replacement(
@@ -1005,7 +1012,8 @@ impl<'p> Vm<'p> {
                     false, // a string search has no named captures: `$<…>` is literal
                     &s[..pos],
                     &s[pos + search.len()..],
-                );
+                    (1usize << 28).saturating_sub(out.len()),
+                )?;
                 out.push_str(&rep);
             }
             last = pos + search.len();
@@ -1014,4 +1022,37 @@ impl<'p> Vm<'p> {
         Ok(self.alloc_str(out))
     }
 
+}
+
+/// `toUpperCase`/`toLowerCase` over the receiver's EXACT WTF-8 bytes. The
+/// lossy `&str` view decays each lone surrogate to U+FFFD, but case mapping is
+/// per UTF-16 code unit: a lone surrogate has no mapping and must survive
+/// unchanged (staging/sm/String/string-upper-lower-mapping.js). Each maximal
+/// well-formed segment maps through Rust's Unicode tables (which include the
+/// locale-independent context rules — final sigma needs the whole segment, so
+/// per-char mapping would be wrong); a surrogate's WTF-8 bytes copy through
+/// verbatim. A surrogate is neither cased nor case-ignorable, so it breaks the
+/// UCD context exactly where the segments break.
+fn case_map_exact(bytes: &[u8], upper: bool) -> crate::heap::JsStr {
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.extend_from_slice(if upper { s.to_uppercase() } else { s.to_lowercase() }.as_bytes());
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // The valid prefix is UTF-8 by construction.
+                let s = std::str::from_utf8(&rest[..valid]).unwrap();
+                out.extend_from_slice(if upper { s.to_uppercase() } else { s.to_lowercase() }.as_bytes());
+                // Copy the invalid (lone-surrogate) bytes verbatim and resume.
+                let skip = e.error_len().unwrap_or(rest.len() - valid);
+                out.extend_from_slice(&rest[valid..valid + skip]);
+                rest = &rest[valid + skip..];
+            }
+        }
+    }
+    crate::heap::JsStr::from_wtf8(out)
 }

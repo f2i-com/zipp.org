@@ -17,7 +17,20 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stats = std::env::var_os("ZIPP_SHAPESTATS").is_some();
-    let r = run(&args);
+    // Run the engine on a dedicated thread with a large stack. The interpreter
+    // keeps JS recursion in an explicit frame stack, but every NATIVE re-entry
+    // (a builtin callback, a generator/async resume, a direct eval, a JIT
+    // bail-out) is a real Rust frame — and the main thread gets only 1 MiB on
+    // Windows, which runaway recursion through such re-entries exhausts long
+    // before the engine's own depth guards can raise a catchable RangeError.
+    // 256 MiB of RESERVE (committed lazily by the OS) puts the engine's guards
+    // firmly in charge.
+    let r = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || run(&args))
+        .expect("spawn zipp worker thread")
+        .join()
+        .expect("zipp worker thread panicked");
     if stats {
         let (n, mx, tot) = zipp_vm::shape_stats();
         eprintln!("[shape] nodes={n} max_fanout={mx} edges={tot}");

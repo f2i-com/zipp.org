@@ -616,6 +616,13 @@ impl<'s> Parser<'s> {
                 let prop = self.member_prop()?;
                 e = Expr::Member(Box::new(Member { object: e, prop, optional: false }));
             } else if self.at(Punct::QuestionDot) {
+                // `super?.x` / `super?.[x]` are early SyntaxErrors: `super` is
+                // not a valid optional-chain base.
+                if matches!(&e, Expr::Super) {
+                    return Err(
+                        self.err_here("SyntaxError: 'super' cannot start an optional chain")
+                    );
+                }
                 saw_optional = true;
                 self.bump_after_operand()?;
                 if self.at(Punct::LParen) {

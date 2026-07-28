@@ -70,6 +70,19 @@ pub fn expr_refs_all(e: &Expr) -> HashSet<String> {
     refs
 }
 
+/// Every name a STATEMENT LIST references, ignoring what it binds — the
+/// statement-level analogue of `expr_refs_all`. Superset of `free_vars`: a
+/// LOCALLY-bound name the body still mentions (`var eval = f; … eval(s)`)
+/// shows up here, which is what a "may this body direct-eval?" guard needs —
+/// 13.3.6.1 directness tests the callee VALUE, not the binding's location.
+pub fn stmts_refs_all(body: &[Stmt]) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    for s in body {
+        stmt_refs(s, &mut refs);
+    }
+    refs
+}
+
 /// Whether any parameter DEFAULT expression references `name` (free) — used
 /// to detect a possible direct eval in the parameter scope.
 pub fn params_reference(name: &str, params: &Params) -> bool {

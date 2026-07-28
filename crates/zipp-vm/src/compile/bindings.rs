@@ -55,9 +55,15 @@ impl<'a> FnCompiler<'a> {
             }
             Binding::Upvalue(idx) => {
                 // A sloppy contains-direct-eval function: an eval-introduced
-                // function-scoped `var` shadows the captured name for READS.
-                if !self.cx.in_strict && self.box_all_locals {
-                    let name = self.upvalues.borrow()[*idx as usize].0.clone();
+                // function-scoped `var` shadows the captured name for READS —
+                // EXCEPT a caller CATCH PARAMETER the eval program captured:
+                // the param cell is lexically nearer than the eval's varEnv
+                // binding (Annex B.3.5), so it keeps the plain op.
+                let name = self.upvalues.borrow()[*idx as usize].0.clone();
+                if !self.cx.in_strict
+                    && self.box_all_locals
+                    && !self.cx.eval_catch_params.iter().any(|n| *n == name)
+                {
                     let slot = self.cx.global_slot(&name) as u32;
                     self.emit(Instr::LoadUpvalDyn { dst, idx: *idx, name: slot });
                 } else {
@@ -175,9 +181,14 @@ impl<'a> FnCompiler<'a> {
             }
             Binding::Upvalue(idx) => {
                 // A sloppy contains-direct-eval function: SetMutableBinding
-                // resolves at store time — an eval-introduced shadow wins.
-                if !self.cx.in_strict && self.box_all_locals {
-                    let name = self.upvalues.borrow()[*idx as usize].0.clone();
+                // resolves at store time — an eval-introduced shadow wins
+                // (a caller CATCH PARAMETER aside: the param cell stays the
+                // store target — see the load arm above).
+                let name = self.upvalues.borrow()[*idx as usize].0.clone();
+                if !self.cx.in_strict
+                    && self.box_all_locals
+                    && !self.cx.eval_catch_params.iter().any(|n| *n == name)
+                {
                     let slot = self.cx.global_slot(&name) as u32;
                     self.emit(Instr::StoreUpvalDyn { idx: *idx, src, name: slot });
                 } else {

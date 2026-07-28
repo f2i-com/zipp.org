@@ -163,3 +163,17 @@ still answer the wrong way round for U+017F and U+212A. Separately, `\u`
 followed by something that is not four hex digits is still accepted as an
 IdentityEscape under `v` (`/\u/v` should be a SyntaxError) — the surrounding
 arms test `flags.unicode` where they mean `flags.unicode_mode()`.
+
+## Patch B7: unicode-mode backreferences compare per code point, not per code unit
+
+`Utf16Input::subrange_eq` (the non-`i` backreference fast path) compared raw
+UTF-16 unit slices, so a backreference whose captured text ended in a lone
+lead surrogate matched the lead half of a surrogate pair at the match
+position — `/foo(.+)bar\1/u.exec("foo\uD834bar\uD834\uDC00")` matched, where
+ES 22.2.2.9 reads *characters* (code points) and the pair is a single code
+point, so the match must fail (staging/sm/RegExp/unicode-back-reference.js).
+
+- `src/indexing.rs`: in unicode mode `subrange_eq` walks both the reference
+  range and the input with `cursor::next` (code-point-wise, like
+  `backref_icase` already did); the unit-slice comparison is kept for the
+  non-unicode path.

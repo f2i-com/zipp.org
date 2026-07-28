@@ -195,6 +195,19 @@ impl<'p> Vm<'p> {
     /// the SuperCall site (after ArgumentListEvaluation; call-proto-not-ctor).
     pub(crate) fn super_ctor_func(&mut self, home_class_id: u32) -> Result<Value, Thrown> {
         let not_ctor = || Thrown("TypeError: superclass is not a constructor".into());
+        let f = self.super_ctor_fetch(home_class_id);
+        if !self.is_constructor(f) {
+            return Err(not_ctor());
+        }
+        Ok(f)
+    }
+
+    /// The fetch half of GetSuperConstructor() WITHOUT the IsConstructor check —
+    /// the spec evaluates the SuperCall's argument list BETWEEN the two, so the
+    /// compiler emits this (SuperCtorFetch) before the args and the check lands
+    /// in the SuperCtor op that runs after them. UNDEFINED when unresolvable
+    /// (the check then throws "superclass is not a constructor").
+    pub(crate) fn super_ctor_fetch(&mut self, home_class_id: u32) -> Value {
         // The RUNNING ctor's own class evaluation, not merely the latest one
         // bound to this class_id — see `running_class_value`.
         let home = self
@@ -202,13 +215,10 @@ impl<'p> Vm<'p> {
             .or_else(|| self.class_values.get(home_class_id as usize).copied().flatten());
         if let Some(h) = home.filter(|h| h.is_heap()) {
             if let Some(&p) = self.proto_of.get(&h.heap_index()) {
-                if !self.is_constructor(p) {
-                    return Err(not_ctor());
-                }
-                return Ok(p);
+                return p;
             }
         }
-        self.super_parent(home_class_id).ok_or_else(not_ctor)
+        self.super_parent(home_class_id).unwrap_or(Value::UNDEFINED)
     }
 
     /// The super BASE object for a `super.x` reference inside a method of class
@@ -556,11 +566,15 @@ impl<'p> Vm<'p> {
                 self.pending_new_target = new_target;
                 let r = self.call_value(f, obj, args)?;
                 // An undefined return yields super()'s produced this (a parent
-                // return-override banked by super_ctor_complete), else obj.
+                // return-override banked by super_ctor_complete), else obj. The
+                // banked mapping is READ, not removed: it doubles as the escaped-
+                // arrow `this` resolution (ThisCheck) for THIS activation, so it
+                // must survive a repeated super() attempt (which runs the parent
+                // ctor again before BindThisValue throws) — the GC prunes it once
+                // the placeholder is unreachable.
                 let result = if self.is_object_value(r) {
-                    self.super_this.remove(&obj.heap_index());
                     r
-                } else if let Some(st) = self.super_this.remove(&obj.heap_index()) {
+                } else if let Some(st) = self.super_this.get(&obj.heap_index()).copied() {
                     st
                 } else {
                     obj

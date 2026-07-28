@@ -605,8 +605,11 @@ impl<'p> Vm<'p> {
                 // it is produced — a species constructor, and the target's
                 // defineProperty, are observable and may mutate the source. (The
                 // buffer-then-define shape ran every Get and every callback
-                // first, then the `constructor` lookup.)
-                let target = self.array_species_create(this, len)?;
+                // first, then the `constructor` lookup.) The species length is
+                // the ToLength-clamped value (full_len), NOT the host iteration
+                // bound: a +Infinity length is 2^53-1 for the constructor, not
+                // the `as usize` saturation of `len`.
+                let target = self.array_species_create(this, full_len as usize)?;
                 // The ArrayCreate(len) inside ArraySpeciesCreate requires
                 // len <= 2^32-1; a larger finite length OR a non-finite one
                 // (Infinity, via ToLength → 2^53-1) is a RangeError. It only

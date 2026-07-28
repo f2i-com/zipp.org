@@ -406,7 +406,9 @@ pub const ERROR_NAMES: [&str; 8] = [
     "ReferenceError", "EvalError", "URIError", "AggregateError",
 ];
 /// TypedArray element kinds, indexed by `kind`: (ctor name, element byte size,
-/// is_bigint, is_float). Uint8Clamped (index 2) clamps on write.
+/// is_bigint, is_float). Uint8Clamped (index 2) clamps on write. Float16Array
+/// is LAST (index 11): several BigInt fast paths test `kind >= 9`, so the
+/// BigInt kinds must keep indices 9/10.
 pub const TA_KINDS: &[(&str, usize, bool, bool)] = &[
     ("Int8Array", 1, false, false),
     ("Uint8Array", 1, false, false),
@@ -419,6 +421,7 @@ pub const TA_KINDS: &[(&str, usize, bool, bool)] = &[
     ("Float64Array", 8, false, true),
     ("BigInt64Array", 8, true, false),
     ("BigUint64Array", 8, true, false),
+    ("Float16Array", 2, false, true),
 ];
 /// `%TypedArray%.prototype` method names, registered as Natives at
 /// `TA_METHOD_BASE + index` so the value form (`TypedArray.prototype.map`,

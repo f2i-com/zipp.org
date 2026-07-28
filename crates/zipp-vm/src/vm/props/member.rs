@@ -267,13 +267,18 @@ impl<'p> Vm<'p> {
             if !callee.is_heap() {
                 return Value::NULL; // top-level script: no caller function
             }
-            // A STRICT caller is censored — the legacy accessor must never leak
-            // a strict function's activation (censor-strict-caller.js).
-            let strict = match self.callable_func_id(callee.heap_index()) {
-                Some(f) => self.func(f as usize).is_strict,
+            // A RESTRICTED caller is censored — the legacy accessor must never
+            // leak a strict, generator, async, arrow, concise-method, bound, or
+            // native activation (censor-strict-caller.js,
+            // function-caller-restrictions.js).
+            let censored = match self.callable_func_id(callee.heap_index()) {
+                Some(f) => {
+                    let fd = self.func(f as usize);
+                    fd.is_strict || fd.is_generator || fd.is_async || fd.lexical_this || fd.non_constructable
+                }
                 None => true, // bound/native/class: not a legacy caller
             };
-            return if strict { Value::NULL } else { callee };
+            return if censored { Value::NULL } else { callee };
         }
         Value::NULL
     }
@@ -1014,7 +1019,12 @@ impl<'p> Vm<'p> {
                 };
                 return Ok(self.regexp_source_value(obj.heap_index(), &src));
             }
-            return Ok(self.proto_member(eff, key));
+            // Accessor-aware: an `exec`/`test`/… turned into a getter on
+            // %RegExp.prototype% (staging/sm/String/matchAll.js) is INVOKED with
+            // the RegExp as receiver — `proto_member` would hand back the raw
+            // getter function, and a method call would then invoke the GETTER
+            // with the call's arguments instead of its result.
+            return self.proto_member_get(eff, key, receiver);
         }
         // An Array's named (non-index) own properties (arr.foo, and a match
         // result's index/input/groups) live in arr_props and shadow the prototype.

@@ -204,6 +204,13 @@ struct Compiler {
     /// — `function o(){ var a=1; (function(){ eval("var a=5") })(); return a }`
     /// must still see 1.
     eval_outer_scope: Vec<String>,
+    /// The subset of `eval_caller_scope` that is a CATCH PARAMETER of the
+    /// caller's activation. Such a name is ALSO in `eval_outer_scope` (so a
+    /// top-level `var` of it declares into the caller's varEnv — Annex B.3.5),
+    /// but the eval body's reads/writes resolve to the param CELL (lexically
+    /// nearer than the new varEnv binding), never to the dynamic EvalScope —
+    /// their upvalue accesses must be the PLAIN ops, not the Dyn ones.
+    eval_catch_params: Vec<String>,
     /// FUNCTION-context sloppy eval: the eval's own var/function names that
     /// live in the caller's dynamic EvalScope (the Dyn global ops find them).
     eval_dynamic_names: std::collections::HashSet<String>,
@@ -228,6 +235,12 @@ struct Compiler {
     /// this into `FuncProto.is_strict`; the VM uses it to decide `this`
     /// substitution at the call site.
     in_strict: bool,
+    /// >0 while compiling a strict ClassTail region (heritage expression,
+    /// computed member/field keys, static field initializers) INLINE into an
+    /// enclosing function that may itself be sloppy. SetProp emissions consult
+    /// it for their `strict` operand (the proto-level `is_strict` flag can't
+    /// see these regions).
+    strict_expr_region: u32,
     /// The enclosing-function chain that the methods of the class CURRENTLY being
     /// compiled close over (set by `compile_class`, read by `compile_class_fn`).
     /// Empty at script level, so script-level class methods keep free vars as
@@ -258,6 +271,13 @@ struct Compiler {
     /// arrows lexically inside it). Gates `ThisCheck` emission on `this` reads
     /// and super-property references.
     in_derived_ctor: bool,
+    /// One-shot, set for a CreateDynamicFunction (`new Function` & kin) eval
+    /// compile: the FIRST function named "anonymous" (the wrapper — compilation
+    /// is depth-first, so it precedes any same-named function nested in its
+    /// parameter defaults or body) gets NO self-name binding. The created
+    /// function's params/body are parsed and instantiated separately, so
+    /// `typeof anonymous` inside it is "undefined" (constructor-binding.js).
+    fn_ctor_no_self_name: bool,
     /// Global slots bound by a top-level `const` (immutable): assignment to one
     /// is a runtime TypeError.
     const_globals: HashSet<u32>,
