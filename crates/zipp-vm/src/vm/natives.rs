@@ -433,7 +433,26 @@ impl<'p> Vm<'p> {
                 if !ext {
                     return Ok(false);
                 }
-                self.set_index(receiver, kv, value, false)?;
+                // CreateDataProperty(Receiver, P, V) — an OWN define, exactly as
+                // the Proxy-receiver branch above already does, and for the same
+                // reason. This used to be `set_index`, i.e. a full [[Set]], which
+                // walks the RECEIVER's prototype chain — so an inherited accessor
+                // of the same name ran its setter instead of being shadowed. For
+                // a class instance whose derived setter is `set v(x){ super.v =
+                // x }`, the super write falling through to the receiver (parent
+                // slot deleted, or replaced by a data property) re-entered that
+                // very setter: unbounded recursion, native stack overflow, and —
+                // under `panic = "abort"` — a dead process from two lines of JS.
+                // The same wrong path made `Reflect.set(t, k, v, receiver)` call
+                // a setter inherited by the receiver where the spec defines an
+                // own property and never consults the chain.
+                let mut m = crate::heap::ObjMap::new();
+                m.set("value", value);
+                m.set("writable", Value::TRUE);
+                m.set("enumerable", Value::TRUE);
+                m.set("configurable", Value::TRUE);
+                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                self.object_define_property(receiver, &key, desc)?;
                 Ok(true)
             }
             _ => {

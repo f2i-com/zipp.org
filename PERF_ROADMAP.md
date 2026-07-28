@@ -1316,6 +1316,64 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B52 — `super.v = x` inside a class setter inlines too: another −28.8%, and
+the soundness probe found a process-killing engine bug that predates it
+
+The B51 asymmetry, closed. The setter half needed what the getter half got for
+free: an accessor's setter lives in `attrs[slot].setter` (heap.rs:257), which
+the super guard set's `holder_vals_ptr[holder_slot]` re-check cannot reach. So
+`ic_super_setter_baked` bakes the ABSOLUTE address of that word into
+`holder_vals_ptr` (holder_slot = 0) and the emitter's identical `[ptr + slot*8]`
+re-read checks the live setter half. Deref safety is the vals argument verbatim:
+`attrs` reallocates only on a key add/delete, both bump the holder version, and
+the hop guards run first. An in-place swap of the setter half (`defineProperty`
+with a new `set`, keeping `get`) moves nothing and bumps nothing — ONLY the
+value compare catches it, which is why the re-check exists.
+
+Being a STORE, the op is effectful, so it obeys the same rule as the trivial
+setter's own `this._v = x`: admitted only as the LAST op before the terminator
+(no op may bail after the effect commits), and the inlined parent setter's own
+store is likewise its last op. One planner guard that is easy to miss: a
+class-syntax setter always has exactly one formal, but a `defineProperty`-
+installed one is an arbitrary function, and the emitter binds the value to
+sub-window reg 1 unconditionally — with 0 formals reg 1 is a LOCAL that must
+start undefined, so the plan requires `param_count == 1` rather than
+special-casing.
+
+**Measured, `tools/bench.py --ab` against the B51 binary, paired medians of 9:**
+
+| | old | new | |
+|---|---|---|---|
+| class-prototype-hot, alone | 804ms | 572ms | **−28.8%** |
+| class-prototype-hot, in the full suite | 761ms | 582ms | **−23.6%** |
+
+Suite mean −3.3%, but the off-target rows (markdown −13%, parse −16%, regex
++13%) are load noise from the concurrent conformance session — p10/p90 spreads
+of 50%+ — so claim the ROW, not the mean. B51+B52 together: the bench went
+~933ms → 572ms on a loaded box, and its historical 3.30× ratio is now in the
+~1.8× band. ≈−3% geomean per step, twice.
+
+**The bug the probe found is the better story.** Probe case "parent accessor
+replaced by a data property" crashed the PROCESS — on the baseline binary too,
+both tiers, so it predates this work. `super.v = x` falling through to the
+receiver (parent slot deleted or turned into data) must CreateDataProperty on
+the receiver — an OWN define. `reflect_set_on_receiver`'s no-own-property arm
+instead ran a full `set_index`, i.e. [[Set]], which walks the receiver's
+prototype chain, finds the derived class's own `set v`, and re-enters the very
+setter the write was falling back FROM: unbounded recursion, native stack
+overflow, and under `panic = "abort"` a dead process from two lines of JS. The
+same wrong path made `Reflect.set(t, k, v, receiver)` run a setter INHERITED by
+the receiver where the spec defines an own property and never consults the
+chain. Fixed by mirroring the Proxy-receiver branch fifteen lines up, which
+already did the define correctly. Verified against node across the 12-case
+setter probe + an 8-case Reflect.set probe, both tiers, GC stress; test262
+super/class/Reflect.set subsets byte-identical to the baseline binary (the
+crash shape simply isn't in the suite, which is how it survived).
+
+The lesson for the file: **the adversarial probe against node is what found a
+pre-existing crasher that 95k test262 executions never touched.** Write the
+probe before shipping the fast path, not after.
+
 ### B51 — `super.v` inside a class getter now inlines: class-prototype-hot −27%
 
 The first thing this session measured that MOVED. `build_accessor_shape` passed

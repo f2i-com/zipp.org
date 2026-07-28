@@ -832,52 +832,74 @@ impl<'p> Vm<'p> {
             self.ic_class_getter_fid(func_id, ip, recv_class)?
         };
         let callee = self.func(fid as usize);
-        // A GETTER body may read `super.v` (Stage 6). A SETTER may not: its
-        // `super.v = x` target lives in `attrs[slot].setter`, not `vals[slot]`,
-        // so the holder re-check the super guard set is built on does not reach
-        // it — see `ic_super_getter_baked`. A setter body still ends in a
+        // A GETTER body may read `super.v` (Stage 6) and a SETTER body may end
+        // in `super.v = x` (Stage 7) — `method_inline_body_ok` holds the
+        // per-op rules (the SuperSet is effectful, so last-op-only, and gated
+        // on allow_setprop). A setter body may equally still end in its own
         // SetProp{obj:0} store (allow_setprop=is_setter).
-        let allow_super = !is_setter;
-        let body_len = Self::method_inline_body_ok(callee, allow_super, is_setter)?;
+        let body_len = Self::method_inline_body_ok(callee, true, is_setter)?;
         let body: Vec<Instr> = callee.code[..body_len].to_vec();
         let field_slots = self.mi_bake_fields(ridx, &body, &callee.string_constants)?;
         let consts = Self::mi_bake_consts(&callee.constants, &body);
-        // ── bake each `super.v` read in the body (Stage 6) ──
+        // ── bake each `super.v` read / `super.v = x` write in the body ──
         // Identical in shape to `build_method_shape`'s `super.m()` loop: the
-        // resolved getter runs over a sub-window with the SAME receiver, so
-        // `mi_bake_fields` resolves its `this.<field>` against the same instance.
+        // resolved parent accessor runs over a sub-window with the SAME
+        // receiver, so `mi_bake_fields` resolves its `this.<field>` against the
+        // same instance. The two directions differ ONLY in the resolver — a
+        // getter lives in the holder's `vals[slot]`, a setter in
+        // `attrs[slot].setter` — and each resolver bakes the address its own
+        // re-check must read (see `ic_super_setter_baked`).
         let super_win = reg_window + callee.reg_count;
         let mut supers = rustc_hash::FxHashMap::default();
         let mut max_super_regs = 0u16;
         for (bi, instr) in body.iter().enumerate() {
-            if let Instr::SuperGet { home_class_id, name: sname, .. } = *instr {
-                let skey = &callee.string_constants[sname as usize];
-                let sr = self.ic_super_getter_baked(fid, bi, home_class_id, skey)?;
-                let scallee = self.func(sr.fid as usize);
-                // The super getter must itself be inlinable and have NO nested
-                // super, and it is a GETTER so it performs no store.
-                let sblen = Self::method_inline_body_ok(scallee, false, false)?;
-                let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
-                let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
-                let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
-                max_super_regs = max_super_regs.max(scallee.reg_count);
-                supers.insert(
-                    bi,
-                    crate::codegen::SuperInline {
-                        epoch_ptr: &self.mi_class_epoch as *const u32 as u64,
-                        epoch_val: self.mi_class_epoch,
-                        hops: sr.hops,
-                        holder_vals_ptr: sr.holder_vals_ptr,
-                        holder_slot: sr.holder_slot,
-                        fn_bits: sr.fn_bits,
-                        field_slots: sfields,
-                        consts: sconsts,
-                        body: sbody,
-                        callee_reg_count: scallee.reg_count,
-                        win_off: super_win,
-                    },
-                );
+            let (sr, sname, is_store) = match *instr {
+                Instr::SuperGet { home_class_id, name: sname, .. } => {
+                    let skey = &callee.string_constants[sname as usize];
+                    (self.ic_super_getter_baked(fid, bi, home_class_id, skey)?, sname, false)
+                }
+                Instr::SuperSet { home_class_id, name: sname, .. } => {
+                    let skey = &callee.string_constants[sname as usize];
+                    (self.ic_super_setter_baked(fid, bi, home_class_id, skey)?, sname, true)
+                }
+                _ => continue,
+            };
+            let _ = sname;
+            let scallee = self.func(sr.fid as usize);
+            // The parent accessor must itself be inlinable with NO nested
+            // super. A parent SETTER ends in its `this.<field> = x` store
+            // (allow_setprop), a parent GETTER performs no store.
+            //
+            // A class-syntax setter always has exactly one formal, but a
+            // `defineProperty`-installed one is an arbitrary function — and the
+            // emitter binds the value to sub-window reg 1 unconditionally. With
+            // 0 formals reg 1 is a LOCAL, which must start undefined, not hold
+            // the value; require exactly the one-param shape instead of
+            // special-casing it.
+            if is_store && scallee.param_count != 1 {
+                return None;
             }
+            let sblen = Self::method_inline_body_ok(scallee, false, is_store)?;
+            let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
+            let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
+            let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
+            max_super_regs = max_super_regs.max(scallee.reg_count);
+            supers.insert(
+                bi,
+                crate::codegen::SuperInline {
+                    epoch_ptr: &self.mi_class_epoch as *const u32 as u64,
+                    epoch_val: self.mi_class_epoch,
+                    hops: sr.hops,
+                    holder_vals_ptr: sr.holder_vals_ptr,
+                    holder_slot: sr.holder_slot,
+                    fn_bits: sr.fn_bits,
+                    field_slots: sfields,
+                    consts: sconsts,
+                    body: sbody,
+                    callee_reg_count: scallee.reg_count,
+                    win_off: super_win,
+                },
+            );
         }
         let win_top = if supers.is_empty() {
             reg_window + callee.reg_count
@@ -1002,6 +1024,13 @@ impl<'p> Vm<'p> {
                 // rule: outer body only, and the resolved super getter is
                 // re-scanned with the flag off so there is no nested super.
                 I::SuperGet { .. } if allow_super => {}
+                // `super.v = x` inside a class SETTER (Stage 7). Effectful — the
+                // parent setter's body commits a store — so it obeys the same
+                // last-op rule as the plain `this.<field> = val` store below: no
+                // later op may bail after the effect commits. Gated on
+                // allow_setprop too, so a GETTER body writing `super.v` (legal,
+                // bizarre) stays on the helper.
+                I::SuperSet { .. } if allow_super && allow_setprop && ix + 1 == term => {}
                 // A setter's `this.<field> = val` store (Stage 5): the body's ONLY
                 // effect, so it must be the LAST op before the terminator (no later
                 // op can decline AFTER the store commits — the no-deopt-after-effect

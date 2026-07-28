@@ -752,6 +752,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn super_setter_inline_invalidates() {
+        // A class SETTER whose body is `super.v = x` now inlines the parent
+        // setter (Stage 7). The arm's re-check reads `attrs[slot].setter` —
+        // NOT `vals[slot]`, which holds the getter half — via the absolute
+        // address `ic_super_setter_baked` bakes. Each case runs past the OSR
+        // threshold and then attacks one dependency:
+        //   1. swap ONLY the setter half in place (`defineProperty` keeping
+        //      the getter): no version bump, no realloc — only the value
+        //      compare on the baked address catches it.
+        //   2. replace the parent accessor with a DATA property, so the write
+        //      falls through to CreateDataProperty on the receiver.
+        //   3. delete it (strict: still no throw — absent means own create),
+        //      exercising the recursion fix in `reflect_set_on_receiver`.
+        //   4. `setPrototypeOf` swaps the chain the hop guards watch.
+        //   5. the parent setter's side effect must fire on every call.
+        // Expectations computed with node (B51: never by hand), and
+        // `assert_jit_matches` pins JIT == NOJIT first regardless.
+        assert_jit_matches(
+            "var out=[];\
+             (function(){class A{constructor(){this._v=0}get v(){return this._v}set v(x){this._v=x}}\
+              class B extends A{set v(x){super.v=x}get v(){return super.v}}var b=new B(),s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) Object.defineProperty(A.prototype,'v',{get:Object.getOwnPropertyDescriptor(A.prototype,'v').get,set:function(x){this._v=x*3},configurable:true}); b.v=i; s=(s+b.v)|0; }\
+              out.push(s);})();\
+             (function(){class A{constructor(){this._v=0}get v(){return this._v}set v(x){this._v=x}}\
+              class B extends A{set v(x){super.v=x}get v(){return this._v}}var b=new B(),s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) Object.defineProperty(A.prototype,'v',{value:1,writable:true,configurable:true}); b.v=i; s=(s+b.v)|0; }\
+              out.push(s+'/'+Object.prototype.hasOwnProperty.call(b,'v')+'/'+b._v);})();\
+             (function(){class A{constructor(){this._v=0}set v(x){this._v=x}get v(){return this._v}}\
+              class B extends A{set v(x){super.v=x}}var b=new B(),thrown=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) delete A.prototype.v; try{ b.v=i; }catch(e){ thrown++; } }\
+              out.push(thrown+'/'+Object.prototype.hasOwnProperty.call(b,'v')+'/'+b.v+'/'+b._v);})();\
+             (function(){class A{constructor(){this._v=0}set v(x){this._v=x}get v(){return this._v}}\
+              class B extends A{set v(x){super.v=x}get v(){return this._w||this._v}}var b=new B(),s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) Object.setPrototypeOf(B.prototype,{set v(x){this._w=x*7}}); b.v=3; }\
+              out.push(b._w+'/'+b._v);})();\
+             (function(){var n=0;class A{constructor(){this._v=0}set v(x){n++;this._v=x}get v(){return this._v}}\
+              class B extends A{set v(x){super.v=x}}var b=new B();\
+              for(var i=0;i<200000;i++) b.v=i; out.push(n);})();\
+             console.log(out.join('|'))",
+            &["-1539807552|-1474936480/true/99999|0/true/199999/99999|21/3|200000"],
+        );
+    }
+
+    #[test]
+    fn super_setter_inline_semantics() {
+        // Value identity through the inlined store (`-0`, object identity), a
+        // get-only parent (strict TypeError on EVERY call — the arm must not
+        // bake), the assignment expression's value being the RHS rather than
+        // the setter's return, and — the crash regression — `super.v = x`
+        // with NO `v` anywhere on the super chain must CreateDataProperty on
+        // the receiver rather than re-entering the receiver's own inherited
+        // setter. That re-entry was unbounded recursion, and under
+        // `panic = "abort"` it killed the process from two lines of JS
+        // (`reflect_set_on_receiver` used a full [[Set]] where the spec has
+        // an own define; found by this feature's soundness probe, present at
+        // least since e38ebb3).
+        assert_jit_matches(
+            "var out=[];\
+             (function(){class A{constructor(){this._v=1}set v(x){this._v=x}get v(){return this._v}}\
+              class B extends A{set v(x){super.v=x}get v(){return super.v}}var b=new B();\
+              for(var i=0;i<200000;i++) b.v=i; b.v=-0; out.push(Object.is(b.v,-0)); var o={t:1}; b.v=o; out.push(b.v===o);})();\
+             (function(){class A{get v(){return 1}}class B extends A{set v(x){super.v=x}}\
+              var b=new B(),t=0; for(var i=0;i<200000;i++){ try{ b.v=i; }catch(e){ t++; } } out.push(t);})();\
+             (function(){class A{set v(x){this._v=x}}class B extends A{set v(x){super.v=x}}\
+              var b=new B(); for(var i=0;i<200000;i++) b.v=i; out.push((b.v=77));})();\
+             (function(){class A{}class B extends A{set v(x){super.v=x}}\
+              var b=new B(); for(var i=0;i<200000;i++) b.v=i; b.v=6;\
+              var d=Object.getOwnPropertyDescriptor(b,'v');\
+              out.push(d.value+'/'+d.writable+'/'+d.enumerable+'/'+d.configurable);})();\
+             console.log(out.join('|'))",
+            &["true|true|200000|77|6/true/true/true"],
+        );
+    }
+
     // ── INT live-in interval contract ─────────────────────────────────────────
     // `emit_int_entry_load` admits an Int-tagged value OR a double holding an
     // exact integer in [-2^53, 2^53], so `plan_region` must seed the interval

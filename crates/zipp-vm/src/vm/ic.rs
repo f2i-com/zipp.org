@@ -1325,6 +1325,58 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// FILLED `SuperAcc` IC way for a `super.v = x` site — the SETTER twin of
+    /// `ic_super_getter_baked`, and the one place the getter/setter asymmetry
+    /// is load-bearing: an accessor slot keeps its getter in `vals[slot]` but
+    /// its setter in `attrs[slot].setter` (heap.rs:257), so the getter's
+    /// `holder_vals_ptr[holder_slot]` re-check reads the WRONG word for a
+    /// setter. Instead of a vals base + slot, this bakes the ABSOLUTE address
+    /// of `attrs[slot].setter` into `holder_vals_ptr` with `holder_slot = 0`,
+    /// so the emitter's re-check (`[ptr + slot*8] == fn_bits`) reads exactly
+    /// the live setter half.
+    ///
+    /// Deref safety is the same argument as vals: `attrs` reallocates only on
+    /// a key add/delete, both of which bump the holder's version, and the hop
+    /// version guards run before this address is dereferenced. An in-place
+    /// swap of the setter half (`defineProperty` with a new `set`, keeping
+    /// `get`) does NOT move the buffer — and is caught by the VALUE compare,
+    /// which is the whole point of the re-check.
+    pub(crate) fn ic_super_setter_baked(
+        &self,
+        func_id: u32,
+        ip: usize,
+        home_class_id: u32,
+        key: &str,
+    ) -> Option<MiSuperResolved> {
+        let home = self.class_values.get(home_class_id as usize).copied().flatten()?;
+        let site = self.ic_site(func_id, ip)?;
+        for e in &site.entries[..site.n as usize] {
+            if let IcEntry::SuperAcc { home: h, hops, slot } = *e {
+                if h == home && self.ic_super_chain_ok(&hops) {
+                    if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
+                        let s = slot as usize;
+                        if s < hm.keys.len() && hm.keys[s] == key && hm.attrs[s].accessor {
+                            let setter = hm.attrs[s].setter;
+                            // A setter-less accessor (`get` only) is a strict
+                            // TypeError / sloppy no-op — helper only.
+                            if let Some((fid, _closure)) = self.ic_plain_fn(setter) {
+                                return Some(MiSuperResolved {
+                                    fid,
+                                    hops: hops.0[..hops.1 as usize].to_vec(),
+                                    holder_vals_ptr: &hm.attrs[s].setter as *const Value
+                                        as u64,
+                                    holder_slot: 0,
+                                    fn_bits: setter.bits(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// IC for a `Call` site: callee identity (+ slot version) → (fid,
     /// closure) for a plain user function, skipping the Proxy/native/bound/
     /// ctor probes and flag loads. `None` ⇒ slow path.

@@ -815,7 +815,8 @@ pub(crate) fn emit_mi_body(
             // right word, and invoking the getter IS running its body with
             // `this` = this receiver — exactly what the method case does.
             // Resolution is what differs, and that happens in the planner
-            // (`ic_super_getter_baked`). SETTERS are not admitted here.
+            // (`ic_super_getter_baked`). The SETTER direction is the separate
+            // arm below.
             Instr::SuperMethod { dst: d, .. } | Instr::SuperGet { dst: d, .. } => {
                 let s = supers
                     .get(&bi)
@@ -880,6 +881,69 @@ pub(crate) fn emit_mi_body(
                         ; mov [rbx + dreg(rg(d))], rax
                     ),
                 }
+            }
+            // `super.v = x` inside a class SETTER (Stage 7) — the parent
+            // SETTER's body inlined over the sub-window. The guard block is the
+            // method/getter one verbatim, with one difference hidden in the
+            // baked plan rather than the emission: a setter lives in
+            // `attrs[slot].setter`, not `vals[slot]`, so
+            // `ic_super_setter_baked` bakes the ABSOLUTE address of that word
+            // into `holder_vals_ptr` (holder_slot = 0) and the same
+            // `[ptr + slot*8]` re-read below checks the right half of the
+            // accessor. Effectful — method_inline_body_ok admits this op only
+            // LAST, so every earlier op's bail re-runs the whole call before
+            // any store commits; within the sub-body, the parent setter's own
+            // store is likewise its last op.
+            Instr::SuperSet { val, .. } => {
+                let s = supers
+                    .get(&bi)
+                    .expect("build_accessor_shape baked a SuperInline for this op");
+                dynasm!(ops
+                    ; mov rcx, QWORD s.epoch_ptr as i64
+                    ; mov ecx, [rcx]
+                    ; cmp ecx, DWORD s.epoch_val as i32
+                    ; jne => fallback
+                );
+                for &(idx, ver) in &s.hops {
+                    dynasm!(ops
+                        ; mov edx, [r13 + (idx as i32) * 4]
+                        ; cmp edx, DWORD ver as i32
+                        ; jne => fallback
+                    );
+                }
+                // Setter REASSIGNMENT guard: `defineProperty` can swap the
+                // setter half in place (no version bump, no realloc), so only
+                // this value compare catches it — the version guards above
+                // only prove the address is safe to dereference.
+                dynasm!(ops
+                    ; mov rcx, QWORD s.holder_vals_ptr as i64
+                    ; mov rax, [rcx + (s.holder_slot as i32) * 8]
+                    ; mov r10, QWORD s.fn_bits as i64
+                    ; cmp rax, r10
+                    ; jne => fallback
+                );
+                // Sub-window: reg 0 = the SAME receiver, reg 1 = the value
+                // (the parent setter's one formal parameter).
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(win)]
+                    ; mov [rbx + dreg(s.win_off)], rax
+                    ; mov rax, [rbx + dreg(rg(val))]
+                    ; mov [rbx + dreg(s.win_off + 1)], rax
+                );
+                if s.callee_reg_count > 2 {
+                    dynasm!(ops ; mov rax, QWORD Value::UNDEFINED.bits() as i64);
+                    for r in 2..s.callee_reg_count {
+                        dynasm!(ops ; mov [rbx + dreg(s.win_off + r)], rax);
+                    }
+                }
+                // The setter's return value is ignored (an assignment's value
+                // is the RHS, which the caller already holds), so the body's
+                // ret_reg is discarded.
+                let no_supers: FxHashMap<usize, SuperInline> = FxHashMap::default();
+                let _ = emit_mi_body(
+                    ops, call_ip, epilogue, fallback, &s.body, &no_supers, &s.field_slots,
+                    &s.consts, vals_ptr, s.win_off,
+                );
             }
             // `this.<field> = val` (a trivial setter's store) — a baked in-place
             // store to the receiver's own data slot (no version bump, matching
