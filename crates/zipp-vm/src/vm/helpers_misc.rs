@@ -1026,8 +1026,11 @@ pub(crate) extern "win64" fn jit_concat(
 }
 
 /// `dst = a + b` for the OSR region's `StrAppendInPlace` op: appends into `a`'s
-/// buffer in place when uniquely owned (see `str_append_inplace`). Never deopts
-/// (string append doesn't throw); always returns the result bits.
+/// buffer in place when uniquely owned (see `str_append_inplace`). Deopts
+/// (SELF_CALL_DEOPT) when the appended value needs real ToPrimitive — a user
+/// `toString`/`valueOf`/`@@toPrimitive`, or a Symbol's TypeError — so the
+/// interpreter re-executes the op with full semantics. The purity gate runs
+/// BEFORE any mutation, so the re-execution is clean.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
@@ -1042,7 +1045,10 @@ pub(crate) extern "win64" fn jit_str_append(
     // SAFETY: exclusive view to mutate/allocate the string; the running region
     // holds no conflicting borrow (reg file / globals base only).
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    vm.str_append_inplace(a, b).bits()
+    match vm.str_append_inplace(a, b) {
+        Some(r) => r.bits(),
+        None => crate::codegen::SELF_CALL_DEOPT,
+    }
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

@@ -698,7 +698,13 @@ impl<'p> Vm<'p> {
                     Instr::StrAppendInPlace { dst, a, b } => {
                         let av = self.get(base, a);
                         let bv = self.get(base, b);
-                        let r = self.str_append_inplace(av, bv);
+                        // `None`: the appended value needs real ToPrimitive
+                        // (user hooks / a Symbol's TypeError) — run the full
+                        // generic `+`, exactly as the unfused op would.
+                        let r = match self.str_append_inplace(av, bv) {
+                            Some(r) => r,
+                            None => self.add(base, a, b)?,
+                        };
                         self.set(base, dst, r);
                         ip += 1;
                     }

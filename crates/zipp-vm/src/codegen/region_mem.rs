@@ -1717,15 +1717,22 @@ pub(crate) fn compile_region_mem(
             }
             Instr::StrAppendInPlace { dst, a, b } => {
                 // In-place `dst = a + b` via `jit_str_append` (mutates a's buffer
-                // when uniquely owned — the emitter proved linearity). Never
-                // deopts, but uses the same ABI; allocates/grows the heap, so
-                // (like StrConcat) re-derive r13 when the region reads it.
+                // when uniquely owned — the emitter proved linearity). DEOPTS
+                // when the appended value needs real ToPrimitive (user hooks /
+                // a Symbol's TypeError): the helper's purity gate runs BEFORE
+                // any mutation, so the interpreter re-executes the op cleanly
+                // with full semantics. Allocates/grows the heap on the pure
+                // path, so (like StrConcat) re-derive r13 when the region
+                // reads it.
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(a)]            // a (accumulator) bits
                     ; mov r8, [rbx + dreg(b)]             // b (appended) bits
                     ; mov rax, QWORD heap.str_append as i64
                     ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // needs ToPrimitive → interp
                     ; mov [rbx + dreg(dst)], rax
                 );
                 if refetch_pinned {
@@ -1734,6 +1741,7 @@ pub(crate) fn compile_region_mem(
                 if let Some((snap, plan)) = ta_refetch {
                     emit_refetch_ta(&mut ops, snap, plan);
                 }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 // Resume interpreting at this ip so the interpreter performs the

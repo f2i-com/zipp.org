@@ -681,7 +681,23 @@ impl<'p> Vm<'p> {
     /// it). Correctness rests on the emitter's linearity proof: the only reference
     /// to the mutated buffer is the accumulator itself, so the mutation is
     /// unobservable. Returns the (possibly unchanged) accumulator Value.
-    pub(crate) fn str_append_inplace(&mut self, acc: Value, val: Value) -> Value {
+    pub(crate) fn str_append_inplace(&mut self, acc: Value, val: Value) -> Option<Value> {
+        // ── purity gate, BEFORE any mutation ── this path materialises `val`
+        // via `display`, which takes `&self` and therefore CANNOT run user
+        // code. That is correct for primitives (numbers, bools, null,
+        // undefined — no hooks exist) and for strings (no coercion at all),
+        // and WRONG for every other heap value: an object's `+` coercion runs
+        // ToPrimitive (a user `toString`/`valueOf`/`@@toPrimitive`, observable
+        // side effects included), and a Symbol must THROW a TypeError.
+        // `display` was quietly stringifying those as "[object Object]" /
+        // "Symbol(x)" — a live wrong answer on any `s += obj` inside a
+        // top-level string-accumulator loop. `None` ⇒ the caller runs the
+        // full generic `+` (and the JIT helper deopts); returning it before
+        // touching the accumulator is what keeps the fallback re-execution
+        // clean.
+        if val.is_heap() && !self.heap.is_str_like(val.heap_index()) {
+            return None;
+        }
         let mutable = acc.is_heap()
             && acc.heap_index() > crate::heap::INTERN_EMPTY
             && matches!(self.heap.get(acc.heap_index()), HeapObj::Str(_));
@@ -692,7 +708,7 @@ impl<'p> Vm<'p> {
             if (0..=9).contains(&n) {
                 if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
                     js.push_ascii(b'0' + n as u8);
-                    return acc;
+                    return Some(acc);
                 }
             }
         }
@@ -704,7 +720,7 @@ impl<'p> Vm<'p> {
         if mutable {
             if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
                 js.push_wtf8(&add); // updates the cached unit length + ascii flag
-                return acc;
+                return Some(acc);
             }
         }
         // Fresh buffer (first append / interned / rope acc): flatten acc + add into
@@ -713,7 +729,7 @@ impl<'p> Vm<'p> {
         let mut s: Vec<u8> =
             self.heap.str_wtf8_cow(li).map(|c| c.into_owned()).unwrap_or_default();
         crate::heap::wtf8_push(&mut s, &add);
-        Value::heap(self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_wtf8(s))))
+        Some(Value::heap(self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_wtf8(s)))))
     }
 
     /// Heap index of a string-like object representing `v`: `v`'s own index when
