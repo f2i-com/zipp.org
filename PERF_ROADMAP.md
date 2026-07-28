@@ -1320,6 +1320,46 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B57 — `o["k" + i] = v` fuses soundly: polymorphic-objects −16%
+
+The F1 finding, landed on the second attempt. The first (B50's wrong-answer
+note) emitted `SetIndexConcat` directly, which performs the concatenation —
+and therefore the key's observable `ToPrimitive`/`ToString` — at the STORE,
+after the RHS has evaluated. The `+` sits BEFORE the RHS, so a user `toString`
+on the key ran in the wrong order. Ten lines of JS showed it, and it had
+passed an adversarial verifier; the probe is what caught it.
+
+The sound shape splits the `+` into its two halves: a new `ToConcatKey { dst,
+src }` runs at the `+`'s own position — identity for every primitive and for
+heap strings (their concat runs no user code, so deferring it is
+unobservable, and an Int key keeps the store's allocation-free scratch path),
+the real `ToPrimitive(default)` + Symbol-TypeError protocol for a non-string
+heap value — and `SetIndexConcat`'s concatenation is then PURE at the store.
+Emission order: receiver, key-rhs, ToConcatKey, RHS, store — the unfused
+sequence's order exactly. The read/delete/for-of-target fusions stay as they
+were: nothing evaluates between their key and their store, which is why they
+were always sound.
+
+Both ops are admitted to the region MEM path in the same commit — mandatory,
+or every loop that previously compiled its `Add`+`SetIndex` would now decline:
+`jit_to_concat_key` (pure identity, deopts a real coercion) and
+`jit_set_index_concat`, the write twin of `jit_get_index_concat` (own writable
+data-slot hit in place — scratch key, no alloc, no version bump, exactly the
+interpreter's hit arm; a NEW key / exotic / non-Int key deopts, which is the
+same set the old pair failed to compile).
+
+**Measured (quiet box, `tools/bench.py --ab`, paired medians of 9):
+polymorphic-objects 733 → 614ms, −16.2% [p10 604 p90 639]**, above the
+survey's verified ~13% — its two keyed-write phases are interpreted
+(blacklisted for other ops), and the interpreter arm saves the throwaway
+key-string alloc plus the map re-probe per write. json-large +1.1% (noise).
+Pinned by `set_index_concat_fusion_order`: the exact B50 ordering case, key
+valueOf/@@toPrimitive/Symbol-throw before the RHS, coercion mutating the
+receiver, `__proto__` (runs the inherited setter — node semantics),
+frozen/non-extensible, an inherited setter, new-key attributes/order, a hot
+JIT loop with a mid-loop new-key deopt, and double/negative/1e21 key
+formatting — all from node, byte-identical on JIT/NOJIT/GC-stress.
+
 ### B56 — Function-local string accumulators go in-place: markdown-render −30%
 
 The survey's M1, landed after its prerequisite (the `StrAppendInPlace`

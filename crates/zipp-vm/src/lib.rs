@@ -828,6 +828,61 @@ mod tests {
     }
 
     #[test]
+    fn set_index_concat_fusion_order() {
+        // `o["k" + e] = v` fuses to ToConcatKey + SetIndexConcat. Case 1 is
+        // the wrong answer a previous fusion shipped and reverted (B50): the
+        // key's observable coercion must run BEFORE the RHS, where the `+`
+        // sits. The rest: valueOf/@@toPrimitive on the key (default hint), a
+        // Symbol key throwing before the RHS runs, a throwing toString
+        // skipping the RHS, coercion mutating the receiver before the store,
+        // string-suffix keys, `__proto__` (runs the inherited setter — node
+        // semantics), frozen/non-extensible strict TypeErrors, an inherited
+        // setter, new-key attributes and key order, a hot JIT loop hitting
+        // existing keys with a mid-loop new-key deopt, and double/negative/
+        // huge numeric key formatting. Expectations from node.
+        assert_jit_matches(
+            "'use strict';var out=[];\
+             var log=[];var o1={};\
+             function k1(){log.push('key');return {toString:function(){log.push('keyToString');return 'X';}};}\
+             function v1(){log.push('val');return 7;}\
+             o1['p'+k1()]=v1();\
+             out.push(log.join(',')+'='+o1.pX);\
+             var o2={};o2['n'+{valueOf:function(){return 42;}}]='v';out.push(Object.keys(o2)[0]);\
+             var tp={};tp[Symbol.toPrimitive]=function(h){return 'H'+h;};\
+             var o3={};o3['x'+tp]=1;out.push(Object.keys(o3)[0]);\
+             var ran4=0,err4='';var o4={};\
+             try{o4['s'+Symbol('q')]=(ran4++,5);}catch(e){err4=e.constructor.name;}\
+             out.push(err4+'/'+ran4);\
+             var ran5=0,o5={};\
+             try{o5['t'+{toString:function(){throw new Error('boom');}}]=(ran5++,1);}catch(e){}\
+             out.push('ran='+ran5);\
+             var o6={};var mut={toString:function(){o6.kA='early';return 'A';}};\
+             o6['k'+mut]='late';out.push(o6.kA);\
+             var o7={};var suf='zz';for(var i=0;i<300;i++)o7['p'+suf]=i;out.push(o7.pzz);\
+             var o8={};o8['__pro'+'to__']={t:1};\
+             out.push((Object.getPrototypeOf(o8)===Object.prototype)+'/'+Object.keys(o8).length);\
+             var o9=Object.freeze({q1:1});var err9='';\
+             try{o9['q'+1]=5;}catch(e){err9=e.constructor.name;}out.push(err9+'/'+o9.q1);\
+             var got10=null;var proto10={};\
+             Object.defineProperty(proto10,'w3',{set:function(v){got10=v;}});\
+             var o10=Object.create(proto10);o10['w'+3]=99;\
+             out.push(got10+'/'+Object.prototype.hasOwnProperty.call(o10,'w3'));\
+             var o11={z:1};o11['a'+0]=2;var d11=Object.getOwnPropertyDescriptor(o11,'a0');\
+             out.push(d11.writable+d11.enumerable+d11.configurable+'/'+JSON.stringify(Object.keys(o11)));\
+             var o12={};for(var i=0;i<8;i++)o12['h'+i]=0;\
+             for(var i=0;i<300000;i++){o12['h'+(i&7)]=i;if(i===200000)o12['h9']=-1;}\
+             out.push(o12.h0+'/'+o12.h7+'/'+o12.h9);\
+             var o13=Object.preventExtensions({e0:1});var err13='';\
+             try{o13['e'+9]=5;}catch(e){err13=e.constructor.name;}\
+             out.push(err13+'/'+(o13.e9===undefined));\
+             var o14={};o14['d'+1.5]=1;o14['d'+(-3)]=2;o14['d'+1e21]=3;\
+             out.push(Object.keys(o14).join(';'));\
+             console.log(out.join('|'))",
+            &["key,keyToString,val=7|n42|xHdefault|TypeError/0|ran=0|late|299|false/0|TypeError/1|99/false|3/[\"z\",\"a0\"]|299992/299999/-1|TypeError/true|d1.5;d-3;d1e+21"],
+        );
+    }
+
+    #[test]
     fn local_accumulator_inplace_aliasing() {
         // `out += x` on a FUNCTION-LOCAL accumulator now rewrites to
         // StrAppendInPlace when the register provably never leaks a second

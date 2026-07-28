@@ -516,6 +516,8 @@ pub struct HeapHelperAddrs {
     pub typeof_str: usize,
     pub typeof_is: usize,
     pub static_fn: usize,
+    pub to_concat_key: usize,
+    pub set_index_concat: usize,
     /// Tier C `IsArray` — `Array.isArray(v)`; returns Bool bits, or the deopt
     /// sentinel for the rare throwing case (revoked Proxy).
     pub is_array: usize,
@@ -569,6 +571,8 @@ impl HeapHelperAddrs {
             typeof_str: self.typeof_str,
             typeof_is: self.typeof_is,
             static_fn: self.static_fn,
+            to_concat_key: self.to_concat_key,
+            set_index_concat: self.set_index_concat,
             is_array: self.is_array,
             len_of: self.len_of,
             forin_keys: self.forin_keys,

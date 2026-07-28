@@ -627,6 +627,17 @@ pub enum Instr {
     /// `obj[<string-const `name`> + key] = val` — the `SetIndex` twin of
     /// `GetIndexConcat` (same no-alloc fast path; falls back to concat + `SetIndex`).
     SetIndexConcat { obj: Reg, name: u32, key: Reg, val: Reg },
+    /// `dst = the key half of `"name" + src`, coerced to a PRIMITIVE` — the
+    /// evaluation-order shim that makes the fused WRITE (`SetIndexConcat` from
+    /// a plain `obj["name" + e] = v`) sound. The `+`'s observable coercion
+    /// (`ToPrimitive(src, default)`, and the Symbol TypeError of the ensuing
+    /// ToString) must run where the `+` sits — BEFORE the RHS evaluates — while
+    /// the concatenation itself is deferred to the store. Numbers, strings and
+    /// the other primitives pass through UNCHANGED (their concat runs no user
+    /// code, so deferring it is unobservable, and an Int key keeps
+    /// `set_index_concat`'s allocation-free scratch path); a non-string heap
+    /// value runs the real protocol here.
+    ToConcatKey { dst: Reg, src: Reg },
     /// `dst = delete obj[<string-const `name`> + key]` — the `DeleteIndex` twin of
     /// `GetIndexConcat`: an int key on a plain object deletes by `&str` (no concat
     /// alloc — these allocs dominate dictionary-churn delete loops via GC

@@ -1620,6 +1620,88 @@ pub(crate) extern "win64" fn jit_get_index_concat(
     }
 }
 
+/// Win64 helper for `ToConcatKey`: identity for every primitive and for heap
+/// strings (their deferred concat at the store runs no user code); the deopt
+/// sentinel for a non-string heap value, whose ToPrimitive protocol is user
+/// code the interpreter must run. PURE on the non-deopt path — no alloc, so no
+/// refetch.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `v_bits` is a valid Value rooted in the caller.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_to_concat_key(vm: *mut core::ffi::c_void, v_bits: u64) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    let v = Value::from_bits(v_bits);
+    if !v.is_heap() || vm.heap.is_str_like(v.heap_index()) {
+        v_bits
+    } else {
+        crate::codegen::SELF_CALL_DEOPT
+    }
+}
+
+/// Win64 helper for a region `SetIndexConcat`: the own writable DATA-slot HIT
+/// on a plain object with an Int key, mirroring `jit_get_index_concat` — the
+/// key is formatted into the reused scratch buffer (no allocation), the slot
+/// value is overwritten in place (no shape change, no version bump — exactly
+/// the interpreter's hit arm), and EVERYTHING else deopts: a NEW key (the
+/// append reallocs `vals` and bumps the version — let the interpreter do it),
+/// a non-writable/accessor slot, `__proto__`, an exotic receiver, a non-Int
+/// key. Runs no user code.
+///
+/// `packed = (func_id << 32) | name_idx`; `val` rides the stack as arg 5.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; all bits are valid rooted Values.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_set_index_concat(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    packed: u64,
+    key_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let obj = Value::from_bits(obj_bits);
+    let key = Value::from_bits(key_bits);
+    if !key.is_int() || !obj.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let oidx = obj.heap_index();
+    if (oidx == vm.global_this && vm.global_this != 0)
+        || oidx == vm.obj_proto
+        || !vm.realm_global_objs.is_empty()
+        || (!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
+        || (!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
+        || !matches!(vm.heap.get(oidx), HeapObj::Object(_))
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let func_id = (packed >> 32) as u32;
+    let name = packed as u32;
+    let mut scratch = std::mem::take(&mut vm.idx_key_scratch);
+    vm.build_concat_key(&mut scratch, name, key.as_int(), func_id);
+    let hit = match vm.heap.get(oidx) {
+        HeapObj::Object(m) if scratch != "__proto__" => match m.pos(&scratch) {
+            Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => Some(i),
+            _ => None,
+        },
+        _ => None,
+    };
+    let out = match hit {
+        Some(i) => {
+            if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
+                m.vals[i] = Value::from_bits(val_bits);
+                0
+            } else {
+                crate::codegen::SELF_CALL_DEOPT
+            }
+        }
+        None => crate::codegen::SELF_CALL_DEOPT,
+    };
+    vm.idx_key_scratch = scratch;
+    out
+}
+
 /// Win64 helper: write a captured cell (`CellSet`). A cell is one heap slot and
 /// the store is unconditional — no TDZ check (that is `CellSetChecked`), no
 /// allocation, no user code, no GC safe point — so it needs no pinned-pointer

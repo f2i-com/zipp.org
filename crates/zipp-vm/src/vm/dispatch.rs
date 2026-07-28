@@ -3621,6 +3621,32 @@ impl<'p> Vm<'p> {
                         self.set_index(o, k, v, strict)?;
                         ip += 1;
                     }
+                    Instr::ToConcatKey { dst, src } => {
+                        // The `+`'s observable half, hoisted out of a fused
+                        // `obj["k" + e] = v` so it runs BEFORE the RHS (where
+                        // the `+` sits). Primitives and strings pass through —
+                        // their deferred concat at the store runs no user
+                        // code. A non-string heap value runs exactly what
+                        // `add_values("k", v)` would: ToPrimitive(default),
+                        // then the Symbol TypeError of the ensuing ToString.
+                        let v = self.get(base, src);
+                        let out = if !v.is_heap() || self.heap.is_str_like(v.heap_index()) {
+                            v
+                        } else {
+                            let p = self.to_primitive_default(v)?;
+                            if p.is_heap()
+                                && matches!(self.heap.get(p.heap_index()), HeapObj::Symbol { .. })
+                            {
+                                return Err(Thrown(
+                                    "TypeError: Cannot convert a Symbol value to a string"
+                                        .into(),
+                                ));
+                            }
+                            p
+                        };
+                        self.set(base, dst, out);
+                        ip += 1;
+                    }
                     Instr::SetIndexConcat { obj, name, key, val } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
@@ -6364,6 +6390,8 @@ impl<'p> Vm<'p> {
             typeof_str: jit_typeof as usize,
             typeof_is: crate::vm::helpers_misc::jit_typeof_is as usize,
             static_fn: crate::vm::helpers_misc::jit_static_fn as usize,
+            to_concat_key: crate::vm::helpers_misc::jit_to_concat_key as usize,
+            set_index_concat: crate::vm::helpers_misc::jit_set_index_concat as usize,
             is_array: jit_is_array as usize,
             len_of: jit_len_of as usize,
             forin_keys: jit_forin_keys as usize,

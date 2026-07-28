@@ -922,6 +922,35 @@ impl<'a> FnCompiler<'a> {
                 }
                 MemberProp::Computed(key_expr) => {
                     let obj = self.expr(&m.object)?; // evaluate receiver + key once
+                    // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat,
+                    // like the READ (`exprs.rs`), the delete and `assign_target`
+                    // already do. Those three are sound as-is because nothing
+                    // evaluates between their key and their store; a plain `=`
+                    // evaluates the RHS in between, so the `+`'s OBSERVABLE
+                    // coercion is hoisted into `ToConcatKey` at the `+`'s own
+                    // position and only the (then-pure) concatenation is
+                    // deferred to the store. A previous version of this fusion
+                    // omitted the hoist and ran a user `toString` after the
+                    // RHS — see PERF_ROADMAP B50's wrong-answer note.
+                    //
+                    // Only the plain `=` arm fuses: compound (`+=`) and logical
+                    // (`||=`) assignments read and write through ONE
+                    // ToPropKey-coerced key so a user coercion runs exactly
+                    // once, and the fused op exposes no such key.
+                    if !is_logical && matches!(op, AssignOp::Assign) {
+                        if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
+                            let nidx = self.string_name(name);
+                            let key = self.expr(rhs)?;
+                            let keyk = self.temp();
+                            self.emit(Instr::ToConcatKey { dst: keyk, src: key });
+                            let val = self.expr_into(value, dst)?;
+                            if val != dst {
+                                self.emit(Instr::Move { dst, src: val });
+                            }
+                            self.emit(Instr::SetIndexConcat { obj, name: nidx, key: keyk, val: dst });
+                            return Ok(dst);
+                        }
+                    }
                     let key = self.expr(key_expr)?;
                     if is_logical {
                         // A read-modify-write reuses the SAME property key for the load

@@ -259,6 +259,7 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
         Instr::SetIndex { obj, key, val } => obj == r || key == r || val == r,
         Instr::GetIndexConcat { obj, key, .. } => obj == r || key == r,
         Instr::SetIndexConcat { obj, key, val, .. } => obj == r || key == r || val == r,
+        Instr::ToConcatKey { src, .. } => src == r,
         Instr::Call { callee, arg_base, argc, .. } => callee == r || in_args(arg_base, argc),
         Instr::TailCall { callee, arg_base, argc } => callee == r || in_args(arg_base, argc),
         Instr::CallMethod { obj, arg_base, argc, .. } => obj == r || in_args(arg_base, argc),
@@ -317,7 +318,8 @@ pub(crate) fn accum_touches(i: &Instr, r: Reg) -> bool {
         | Instr::Call { dst, .. }
         | Instr::CallMethod { dst, .. }
         | Instr::MathOp { dst, .. }
-        | Instr::StaticFn { dst, .. } => dst == r,
+        | Instr::StaticFn { dst, .. }
+        | Instr::ToConcatKey { dst, .. } => dst == r,
         Instr::StoreGlobal { .. }
         | Instr::StoreGlobalStrict { .. }
         | Instr::StoreGlobalResolved { .. }
@@ -383,7 +385,8 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
         | Instr::Call { dst, .. }
         | Instr::CallMethod { dst, .. }
         | Instr::MathOp { dst, .. }
-        | Instr::StaticFn { dst, .. } => dst == r,
+        | Instr::StaticFn { dst, .. }
+        | Instr::ToConcatKey { dst, .. } => dst == r,
         _ => false,
     }
 }

@@ -579,6 +579,44 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::ToConcatKey { dst, src } => {
+                // The fused write's evaluation-order shim: identity for
+                // primitives and heap strings (pure helper), deopt for a heap
+                // value whose ToPrimitive protocol is user code. No refetch.
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(src)]         // value bits
+                    ; mov rax, QWORD heap.to_concat_key as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // object key → interpreter
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::SetIndexConcat { obj, name, key, val } => {
+                // `obj["name" + i] = v` — own writable data-slot HIT in place
+                // (scratch key, no alloc, no version bump — the interpreter's
+                // hit arm exactly); a NEW key / exotic / non-Int key deopts.
+                // No alloc and no user code on the hit ⇒ no refetch. `val`
+                // rides the stack as the 5th arg (the set_prop_miss shape).
+                let packed: u64 = ((heap.func_id as u64) << 32) | (name as u64);
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(obj)]         // receiver bits
+                    ; mov r8, QWORD packed as i64        // (func_id << 32) | name
+                    ; mov r9, [rbx + dreg(key)]          // key bits
+                    ; mov rax, [rbx + dreg(val)]
+                    ; mov [rsp + 32], rax                // 5th arg: value bits
+                    ; mov rax, QWORD heap.set_index_concat as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // miss/new key → interpreter
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::ToNum { dst, a } => {
                 // `+x`. A number passes through UNCHANGED — note the raw `mov`
                 // rather than a round trip through xmm, which would re-tag an

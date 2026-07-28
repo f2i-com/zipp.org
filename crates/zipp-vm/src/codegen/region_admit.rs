@@ -208,6 +208,17 @@ pub(crate) fn region_can_compile(
             // `jit_get_index_concat`, which handles only the own-DATA hit (no
             // alloc, no user code) and deopts otherwise.
             Instr::GetIndexConcat { .. } => {}
+            // The fused computed-key WRITE and its evaluation-order shim.
+            // Both MUST be admitted together with the fusion in
+            // `compile/assign.rs`, or every loop that previously compiled its
+            // `o["k" + i] = v` as Add+SetIndex would now DECLINE. ToConcatKey
+            // is identity for primitives/strings (pure helper, deopts a real
+            // coercion to the interpreter); SetIndexConcat handles the own
+            // writable data-slot hit in place (scratch-formatted key, no
+            // alloc, no version bump) and deopts a NEW key / exotic / string
+            // key — exactly the cases the old Add+SetIndex pair also failed
+            // to compile.
+            Instr::ToConcatKey { .. } | Instr::SetIndexConcat { .. } => {}
             // `ForInLive` — the per-iteration for-in liveness check — MEM path via
             // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
             // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
@@ -681,6 +692,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) typeof_str: usize,
     pub(crate) typeof_is: usize,
     pub(crate) static_fn: usize,
+    pub(crate) to_concat_key: usize,
+    pub(crate) set_index_concat: usize,
     /// Tier C `IsArray` helper (v bits → Bool bits / deopt sentinel).
     pub(crate) is_array: usize,
     /// Tier C `LenOf` helper (obj bits → length Value bits).
