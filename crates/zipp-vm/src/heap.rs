@@ -463,6 +463,23 @@ impl ObjMap {
         m
     }
 
+    /// `new_side_table` with pre-sized vectors — for the regex match-result
+    /// entry, which appends exactly `index`/`input`/`groups` (+`indices` with
+    /// /d) per match. That site used `with_capacity`, whose shape starts at
+    /// the EMPTY root — so every match ran 3-4 REAL `shape::add` transitions
+    /// (a TLS table probe each) for a map that can never serve a shape guard.
+    /// Every other side table already starts DICT, where `push_data`'s shape
+    /// maintenance is one branch; this closes the accidental exception.
+    pub fn side_table_with_capacity(n: usize) -> ObjMap {
+        let mut m = ObjMap::new_side_table();
+        if n > 0 {
+            m.keys.reserve_exact(n);
+            m.vals.reserve_exact(n);
+            m.attrs.reserve_exact(n);
+        }
+        m
+    }
+
     pub fn new() -> ObjMap {
         ObjMap {
             keys: Vec::new(),

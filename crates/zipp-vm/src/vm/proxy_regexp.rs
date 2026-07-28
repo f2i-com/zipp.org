@@ -1112,7 +1112,10 @@ impl<'p> Vm<'p> {
         // The `is_empty` test keeps that an assertion rather than an assumption
         // — when it holds, append straight past `define`'s per-key hash probe.
         let n = 3 + has_indices as usize;
-        let m = self.arr_props.entry(arr_idx).or_insert_with(|| ObjMap::with_capacity(n));
+        let m = self
+            .arr_props
+            .entry(arr_idx)
+            .or_insert_with(|| ObjMap::side_table_with_capacity(n));
         if m.keys.is_empty() {
             m.push_data("index".to_string(), index_v);
             m.push_data("input".to_string(), input_sv);

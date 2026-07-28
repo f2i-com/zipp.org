@@ -1316,6 +1316,60 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B55 — The match-result side table: DICT-mode landed (neutral), the
+recycling pool REFUTED (+2.2% on its own target), and the design space mapped
+
+B33-C / RLS-1, attacked with a three-design workflow (lazy sidecar / cheap
+construction / pristine-path elision) plus an exhaustive territory map. What
+came out is mostly refutations, and they close the item's cheap ends:
+
+**Landed: the match-result entry now starts in DICT mode**
+(`ObjMap::side_table_with_capacity`). It was the ONE side table built with
+`with_capacity`, whose shape starts at the EMPTY root — so every match ran 3-4
+real `shape::add` transitions (a TLS table probe each) for a map that can never
+serve a shape guard. Predicted 15-25ms on regex-log-scan; measured **+0.9%,
+i.e. at the noise floor and indistinguishable**. Kept because it is correct by
+construction (it closes an accidental exception to `new_side_table`'s
+documented contract), not because it measured.
+
+**Refuted: the GC-harvested recycling pool** — B19's counterexample design,
+demand-trimmed (pool truncated each GC to the results created since the last
+one, so it decays to zero in non-regex workloads), content-verified (exact
+3-key check, attrs, no index, DICT), vals cleared so the pool holds no heap
+reference. Built, verified byte-identical vs node incl. GC stress and a
+mutation/defineProperty/delete probe — and **regex-log-scan measured +2.2%**,
+the bench it exists for. Reverted. That is the FOURTH recycling/caching
+refutation in this file (B19 ObjMap recycling, B29/B49 interning twice, now
+this), each killed by a different term: this one presumably the per-GC dead-
+entry scan plus cold pooled memory against mimalloc's fresh allocations.
+**Construction cost is real (~456ns/match) and caching does not recover it.
+Stop proposing caches for it.** What would recover it is not building the
+representation at all — which is Design A below.
+
+**Measured and closed: pristine-path elision (Design C) is worth ~0ms HERE.**
+Instrumented on the real corpus: 825k successful matches, of which the phases
+that don't need results already build none (`test` via build=false, replace via
+`regex_replace`) — and **100% of the 600k results that ARE built escape to
+user code**, so there is nothing left to elide on this bench. Two cheap grafts
+remain real for OTHER workloads and are specified in the workflow output
+(delegate a pristine `RegExp.prototype[Symbol.replace]` to the trusted
+`regex_replace` path; a no-build arm for `@@search`): ~10 lines each, no suite
+movement expected.
+
+**Deferred with a full map: the lazy sidecar (Design A)** — index/input/groups
+unboxed in a POD side map, arr_props materialised on first exotic touch.
+Predicted ~140ms of the ~190ms ceiling, effort XL, and the judge's verdict is
+the reason it waits: correctness rests on ~256 hand-bucketed `arr_props` uses
+(the workflow's territory map lists every one), and one wrong bucket is a
+silent wrong answer — e.g. `has_property_jit` answers `"index" in m` only
+because a match array HAS a side table today. The map, the three designs and
+the judge's synthesis live in the session workflow output; anyone attempting
+A starts from there, not from scratch.
+
+The honest bottom line for regex-log-scan: after this, its remaining gap is
+the matcher's execution model (B8b) and the boxed loops that surround it —
+representation tweaks are tapped out.
+
 ### B54 — `typeof x === "lit"` fuses to `TypeOfIs`: map-set-heavy −10%,
 json-large −4%
 
