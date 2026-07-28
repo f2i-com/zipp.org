@@ -448,7 +448,18 @@ impl<'p> Vm<'p> {
                 if self.is_object_value(regexp) {
                     // A real RegExp argument must be global (spec: IsRegExp +
                     // RequireObjectCoercible(flags) + 'g' check).
-                    if self.as_regexp(regexp).is_some() {
+                    //
+                    // IsRegExp is OBSERVABLE: it reads `@@match` and ToBoolean's
+                    // the result, and that read must happen BEFORE Get(flags).
+                    // `as_regexp(..).is_some()` answered the same question for a
+                    // plain RegExp while performing no property lookup at all, so
+                    // on the PRIMITIVE-receiver path (`"s".matchAll(re)`, which
+                    // lands here rather than in string_symbol_method) a user
+                    // `@@match` getter never fired — staging/sm/String/matchAll.js
+                    // counts those calls and requires exactly two. It was also
+                    // wrong for a non-RegExp object carrying a truthy `@@match`,
+                    // which the spec still requires to be global.
+                    if self.is_regexp(regexp)? {
                         let flags_v = self.get_prop(regexp, "flags")?;
                         let flags = self.to_js_string(flags_v)?;
                         if !flags.contains('g') {

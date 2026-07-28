@@ -825,6 +825,16 @@ pub struct Vm<'p> {
     /// Realm slots declared var/function by `$262.evalScript` scripts —
     /// HasVarDeclaration for later scripts' lexical-collision checks.
     eval_var_globals: std::collections::HashSet<u32>,
+    /// Set while a PRELUDE script runs (`run_with_prelude` — the test262 harness).
+    /// CreateGlobalVar/FunctionBinding then initializes the SLOT rather than
+    /// parking an own property and leaving the slot UNINITIALIZED. A prelude is a
+    /// realm-setup script, not observed code, and the own-property representation
+    /// is only correct for paths that carry the interpreter's own-prop fallback:
+    /// every JIT tier reads the slot directly, so an own-backed binding read from
+    /// compiled code yields `undefined` and the two tiers disagree. Ordinary
+    /// `$262.evalScript` keeps the own-property behaviour, which the
+    /// non-configurability and reflection tests depend on.
+    pub(crate) eval_prelude_mode: bool,
     /// `arguments` exotic objects (Array-backed): heap index → the live
     /// [[ParameterMap]] for a MAPPED one (sloppy + simple params), or `None`
     /// for an unmapped one (strict / non-simple). Presence alone drives the

@@ -35,11 +35,11 @@ are in B58.
 
 ## 1. Where the project actually is
 
-### Conformance — 99.97% test262, 96.9% intl402
+### Conformance — 99.995% test262, 96.9% intl402
 
 | slice | executions | pass | fail |
 |---|---|---|---|
-| ECMA-262 + `staging`, sloppy **and** strict | 95,846 | 95,816 (99.97%) | 30 |
+| ECMA-262 + `staging`, sloppy **and** strict | 95,846 | 95,841 (99.995%) | 5 |
 | `intl402` (opt-in) | 6,682 | 6,474 (96.9%) | 208 |
 
 Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
@@ -50,56 +50,96 @@ predated the `.zipptmp-` prefix the walk now skips, and being a harness+test
 concatenation it ran and scored as a pass — the exact phantom the prefix exists
 to prevent, still present from before the prefix existed.
 
-Of the 30, **only 6 are engine defects** (`matchAll` @@match lookups 2, `en`-only
-CLDR 2, Annex B `arguments` 2). 19 are this repo's runner making the *harness*
-strict — `INTERPRETING.md` puts the directive on the test file and evaluates
-`includes` as separate sloppy scripts. On a conformant assembly both engines
-pass all 19; on the bytes this runner emits zipp passes 0 and V8 passes 3. 3
-more are a Windows `core.autocrlf` checkout inflating `import-bytes` fixtures,
-and 2 are an upstream test that predates immutable `ArrayBuffer`. Fixing the
-runner and the checkout is worth 22 executions and no engine work.
-
-One genuine defect surfaced while proving that, and it is invisible to the
-current runner: inside a **strict** `$262.evalScript`, assigning to a `var`
-declared without an initializer throws `ReferenceError`, though the binding
-exists (`"x" in globalThis` is true), the sloppy form works, and an initialised
-`var x = 5` reads back fine. Not in the 30; worth fixing before the runner is
-corrected, since a conformant runner reaches it.
-
 The intl402 denominator changed because the runner was not parsing YAML
 list-form `flags:` — roughly half that suite silently never ran, so the old
 16.9% was measured against a half-skipped suite.
 
-What is left, and it is a different SHAPE from the long tail this section used
-to describe. Decorators — once the largest single item — are implemented. So
-are all fifteen Temporal calendars and the IANA time zone database. At 30
-executions the residue is small enough to classify exhaustively rather than
-estimate, so these are counts, not `~` figures, each reproduced against V8:
+**30 → 5.** What the 30 turned out to be, once each was diagnosed against the
+spec text and reproduced against V8 rather than assumed — and what closing them
+took:
 
-| cause | executions | note |
-|---|---|---|
-| runner makes the harness strict | 19 | runner's assembly: zipp 0/19, V8 3/19. `INTERPRETING.md` assembly: **both 19/19** |
-| Windows `core.autocrlf` checkout | 3 | `import-bytes` fixtures inflated LF→CRLF; normalise them and all 5 pass |
-| upstream test predates the feature | 2 | `TypedArray` slice species vs immutable `ArrayBuffer`; zipp passes the sibling test asserting the throw |
-| **fixable engine bugs** | **6** | `matchAll` @@match lookups 2, `en`-only CLDR 2, Annex B `arguments` 2 |
+| cause | was | now | how |
+|---|---|---|---|
+| runner made the *harness* strict | 19 | 0 | harness is a separate realm script; the directive goes on the test text alone |
+| Windows `core.autocrlf` checkout | 3 | 0 | `core.autocrlf=false` + renormalise; `import-bytes` fixtures were inflated LF→CRLF |
+| `matchAll` skipped `Get(@@match)` | 2 | 0 | observable `IsRegExp` on the primitive path; matcher-clone fast path bails when `@@match` is patched |
+| Annex B `arguments` | 2 | 0 | `"arguments"` blocks the var binding only, never the `SetMutableBinding` |
+| `en`-only CLDR | 2 | 2 | needs real CLDR data; refusing to hand-write one German pattern |
+| upstream test predates the feature | 2 | 2 | fixed upstream in `250f204f` (2026-07-08); vendored checkout is four weeks older |
+| ES2017 text the spec deleted | 0 | 1 | `block-decl-func-skip-arguments.js` is red *on purpose* now; V8 fails it too |
 
-The previous version of this table estimated ~45 fixable engine bugs and claimed
+None of the remaining 5 is a live engine defect. Three engine bugs were fixed
+along the way, and **two of them were tier divergences** — the JIT disagreeing
+with the interpreter, which is the failure mode this file has warned about since
+the first JIT landed. Both were latent long before this work and reachable from
+ordinary `$262.evalScript`; running the harness as a real separate script is what
+made them fire:
+
+* **A binding the JIT cannot see.** A script GDI parks `$262.evalScript`'s
+  var/function bindings as own properties of the global object and leaves the
+  slot `UNINITIALIZED` by design, so the interpreter's own-prop fallbacks govern
+  them. Every JIT tier compiles `LoadGlobal` to a bare `mov rax,[r12+idx*8]`.
+  A harness function called in a loop therefore worked for the interpreted
+  iterations and became `undefined is not a function` the instant the region
+  tiered up — at the *same iteration every time*, which reads like a scoping bug
+  and is not one. Fixed by giving a prelude ordinary slot bindings; the region
+  and leaf-inline planners now also decline any body reading an own-backed slot.
+* **`jit_get_prop_miss` indexed the wrong function table.** It read
+  `program.functions[func_id]`, but a compiled function can be an *eval*
+  function living past `main_func_count` in `eval_funcs`. It panicked —
+  `len is 3 but the index is 45` — as soon as such a function got hot and took a
+  property miss.
+
+Still open, same family, not currently reachable from the suite: the whole-
+function (Tier C) path still reads an own-backed slot directly, so
+`$262.evalScript("function f(){}")` called hot from the main program returns
+`undefined` at iteration 8. The region and leaf planners decline; Tier C does not.
+
+An earlier version of this table estimated ~45 fixable engine bugs and claimed
 ~10 executions where "zipp is right, node is wrong" — naming Annex B `arguments`
 first. That claim was **false**, and it survived because it was never re-checked
 against the spec text. `paramNames` has not been mutated to contain `"arguments"`
 since ES2018 (a separate `paramBindings` list carries it), so Annex B's guard
 does not fire, and the `SetMutableBinding` at block-declaration evaluation always
-runs. node is right; zipp is wrong. The test262 test zipp *passes* here quotes
+runs. node is right; zipp is wrong. The test262 test zipp *passed* here quotes
 the removed ES2017 step, which is why V8 fails it. This is the fourth time an
 entry in this file was refuted by re-measurement, and the first where the
-refuted entry was a claim of superiority.
+refuted entry was a claim of superiority. The engine now matches the current
+text, and that test is the baselined failure.
 
-The intl402 remainder is data, not logic: CLDR content (patterns, unit display
-names with plural selection, collation order, plural categories) and the
-Unicode algorithm data behind `Segmenter` (UAX #29) and `Collator` (UCA/DUCET).
+### intl402 — 208, and why the number has not moved
+
+It is data, not logic, and that is a statement about SIZE as much as kind. Of
+the 104 distinct failing files, **68 reference a non-`en` locale** — `de`, `ja`,
+`ar`, `th`, `sr` and friends — so they need CLDR content this engine does not
+ship: number patterns and grouping, currency display names, compact notation,
+date patterns, unit display names with plural selection, list patterns, plural
+categories, collation order. The remaining 36 are `en`-only or locale-agnostic,
+and they concentrate:
+
+| cluster | files | what it needs |
+|---|---|---|
+| `NumberFormat` (grouping, ranges, decimal strings) | 8 | `en-IN` 2,2,3 grouping; range patterns; algorithm, small data |
+| `DateTimeFormat` non-ISO calendar formatting | 15 | the formatter can only produce `gregory` — every `-u-ca-` request silently resolves to it |
+| Temporal `toLocaleString` (`calendar-mismatch`, `dateStyle`) | 11 | blocked on the same thing |
+| assorted (`Segmenter`, `PluralRules` order, `canonicalize-calendar`) | 2 | logic |
+
+The largest single lever is that **`Intl.DateTimeFormat` implements two
+calendars while Temporal implements fifteen**. `AVAILABLE_CALENDARS` is
+`["gregory", "iso8601"]`, and `Intl.supportedValuesOf("calendar")` reports it
+verbatim — which is *honest*, because ECMA-402 defines that list as the calendars
+for which the implementation provides `Intl.DateTimeFormat` functionality, and it
+does not. The calendar ARITHMETIC already exists in `vm/temporal`; what is
+missing is era/month display names and wiring the formatter to a non-ISO
+calendar. Doing that closes roughly 40 executions — and cannot be done by
+widening the constant, which would make the engine advertise formatting it
+cannot perform.
+
 Where a table IS carried it comes from the real upstream source with recorded
 provenance and is verified value-by-value against node's ICU — that is the
-standard, and approximating it would be worse than the honest failure.
+standard, and approximating it would be worse than the honest failure. Which is
+why `staging/sm/String/internalUsage.js` stays red over a single German date:
+one hand-written pattern would turn it green and quietly lower the bar.
 
 `tools/test262-expected-failures.txt` is the checked-in baseline; a regression
 is a `diff`, not a remembered number. It was stale for a long stretch (the
@@ -333,13 +373,15 @@ This track did not exist in the previous roadmap; test262 was only a gate. It is
 now the shorter of the two tracks and should go first — the work is bounded and
 the payoff is a headline number.
 
-**Status 2026-07-29: 938 → 30 failures (99.0% → 99.97%), and intl402 2,778 →
+**Status 2026-07-29: 938 → 5 failures (99.0% → 99.995%), and intl402 2,778 →
 208 (16.9% → 96.9%).** Every step gated against the checked-in baseline with
-zero regressions; the 2026-07-29 run reproduced the 30-failure baseline exactly,
-on both tiers. Of those 30, 24 are not engine defects at all (19 runner, 3
-checkout, 2 upstream test) — so the remaining engine work in this track is 6
-executions, and the largest single lever left is fixing the runner. What the
-work actually taught, beyond the number:
+zero regressions, both tiers byte-identical, `cargo test --workspace --release`
+green at 421. **None of the 5 is a live engine defect** — 2 are fixed upstream in
+a test262 commit four weeks newer than the vendored checkout, 2 need real CLDR
+data, and 1 is a test encoding spec text deleted in ES2018 that V8 fails too.
+Track A is effectively closed on ECMA-262; what is left of the track is intl402,
+and that is a data-vendoring project (see §1). What the work actually taught,
+beyond the number:
 
 * **Cluster, then fix.** The wins came from root causes, not assertions. One
   sentence — "nothing created inside a child realm carried that realm's

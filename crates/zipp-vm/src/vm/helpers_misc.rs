@@ -1068,8 +1068,15 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     let func_id = (packed >> 32) as u32;
     let name_idx = packed as u32;
     let idx = obj.heap_index();
-    let prog = vm.program; // &'p Program, independent of `vm`'s borrow
-    let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
+    // `vm.func` — NOT `vm.program.functions[..]`. A JIT-compiled function can be
+    // an EVAL function (`$262.evalScript`, and the test262 harness prelude), which
+    // lives in `vm.eval_funcs` past `main_func_count`, not in the main program's
+    // table. Indexing the program directly panicked with an out-of-bounds the
+    // moment such a function got hot enough to compile and took a property miss —
+    // "len is 3 but the index is 45", where 3 was the test's own function count.
+    // `func` resolves both halves and returns the same `'p` lifetime the key
+    // borrow below needs.
+    let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Exotic receivers whose slots have live semantics layered over the ObjMap
     // (the global object, %Array.prototype%, module namespaces, realm globals,
     // deferred-namespace state) — same exclusions as the interpreter IC. A

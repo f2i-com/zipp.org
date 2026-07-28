@@ -8,10 +8,39 @@ use super::*;
 impl<'p> Vm<'p> {
     /// Run the top-level function (id 0) to completion.
     pub fn run(&mut self) -> Result<Value, Thrown> {
+        self.run_with_prelude(None)
+    }
+
+    /// Run the program, optionally evaluating `prelude` as a SEPARATE realm
+    /// script first — the test262 harness shape, and the reason this is not just
+    /// `eval_script` on the other side.
+    ///
+    /// The program under test stays the MAIN program: its top-level `var`s
+    /// initialize real global slots, its direct/indirect `eval` sees a genuine
+    /// script context, and `this` at top level is the global object. Putting the
+    /// TEST through the eval-script path instead looks equivalent and is not —
+    /// script GlobalDeclarationInstantiation parks eval-script `var`s on the
+    /// global object with the slot left UNINITIALIZED, which is observably
+    /// different for global-code, identifier-resolution and direct-eval tests
+    /// (~250 test262 executions disagree, four of them by crashing).
+    ///
+    /// So the HARNESS takes the eval-script path: it only has to publish helper
+    /// functions into the realm, which that path does correctly. It runs after
+    /// `setup_globals` but BEFORE `hoist_functions`, matching real
+    /// script-after-script ordering — each harness file is its own complete
+    /// script, and the test's own GDI runs last, so a same-named declaration in
+    /// the test wins.
+    pub fn run_with_prelude(&mut self, prelude: Option<&str>) -> Result<Value, Thrown> {
         // Inject the built-in global objects (Object/Array/Function + their
         // prototypes) into their reserved slots BEFORE hoisting, so a user
         // declaration of the same name shadows the builtin.
         self.setup_globals();
+        if let Some(src) = prelude {
+            self.eval_prelude_mode = true;
+            let r = self.eval_script(src);
+            self.eval_prelude_mode = false;
+            r?;
+        }
         // Materialise function objects for every top-level function into the
         // globals that the compiler reserved for them. The compiler records,
         // per function, the global slot its name binds to (or u32::MAX if it is

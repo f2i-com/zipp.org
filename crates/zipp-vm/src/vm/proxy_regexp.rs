@@ -168,6 +168,12 @@ impl<'p> Vm<'p> {
                 || m.pos("constructor").is_some()
                 || m.pos("exec").is_some()
                 || m.pos("@@matchAll").is_some()
+                // `@@match` is observable from this path even though the clone
+                // never matches with it: the spec builds the matcher via
+                // Construct(C, «R, flags»), and the RegExp constructor's step 1
+                // is IsRegExp(pattern) — a Get of `@@match`. Cloning skips the
+                // construction and so skips that Get.
+                || m.pos("@@match").is_some()
         }) {
             return false;
         }
@@ -195,7 +201,17 @@ impl<'p> Vm<'p> {
                         && m.vals[i].is_heap()
                         && m.vals[i].heap_index() == self.regexp_ctor
                 });
-                flags_ok && exec_ok && ctor_ok
+                // `@@match` still the intrinsic data property. Replacing it with
+                // a GETTER makes the construction the fast path elides observable
+                // (see the own-prop check above), and a plain replacement value
+                // changes what IsRegExp answers inside the RegExp constructor.
+                let match_ok = m.pos("@@match").is_some_and(|i| {
+                    !m.attrs[i].accessor
+                        && m.vals[i].is_heap()
+                        && matches!(self.heap.get(m.vals[i].heap_index()),
+                                    HeapObj::Native(n) if *n == native::REGEXP_SYM_MATCH)
+                });
+                flags_ok && exec_ok && ctor_ok && match_ok
             }
             _ => false,
         };

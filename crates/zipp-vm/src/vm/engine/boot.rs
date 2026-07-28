@@ -226,6 +226,7 @@ impl<'p> Vm<'p> {
             eval_lexical_globals: std::collections::HashSet::new(),
             eval_const_globals: std::collections::HashSet::new(),
             eval_var_globals: std::collections::HashSet::new(),
+            eval_prelude_mode: false,
             arguments_objs: std::collections::HashMap::new(),
             gen_args_obj: std::collections::HashMap::new(),
             module_base_dir: None,

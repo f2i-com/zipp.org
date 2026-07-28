@@ -217,10 +217,23 @@ def run_one(args, get_harness, job):
     # Atomics.wait throws TypeError per AgentCanSuspend.
     cannot_block = "CanBlockIsFalse" in flags
     # Assemble.
+    #
+    # The harness is a SEPARATE SCRIPT from the test, never concatenated with it
+    # (INTERPRETING.md: `includes` "must be evaluated in the test realm's global
+    # scope PRIOR TO test execution", and the strict directive is "inserted as the
+    # initial character sequence of the file" -- the TEST file). Both `js` and
+    # `mjs` take the harness as a second argument and evaluate it as a realm
+    # script first.
+    #
+    # This used to be one concatenated source with `"use strict";` glued on top,
+    # which made the HARNESS strict too. A harness helper that runs code through a
+    # DIRECT eval -- sm/non262-strict-shell.js's testLenientAndStrict, and
+    # sm/non262-expressions-shell.js -- inherits its caller's strictness, so the
+    # sloppy half of those helpers ran strict and 19 executions failed. They are
+    # not engine failures: V8 fails the same 19 on the concatenated bytes and
+    # passes all 19 on this assembly.
     parts = []
     strict = mode == "strict"
-    if strict and "raw" not in flags:
-        parts.append('"use strict";')
     if "raw" not in flags:
         parts.append(get_harness("assert.js"))
         parts.append(get_harness("sta.js"))
@@ -231,17 +244,14 @@ def run_one(args, get_harness, job):
                 parts.append(get_harness(inc))
             except Exception:
                 return ("SKIP", f"missing-include {inc}", job)
+    # `raw` takes no harness and no directive: the file is run exactly as authored.
+    harness_src = "\n".join(parts) if parts else None
     if is_module:
-        # The harness runs as a realm SCRIPT (its vars become realm globals,
-        # visible to every module -- real-engine harness semantics); the TEST
-        # text alone is the module entry, so its decls stay module-scoped and
-        # a self-import of the on-disk file links cleanly.
-        harness_src = "\n".join(parts)
+        # A module is always strict; there is no directive to add.
         assembled = src
     else:
-        parts.append(src)
-        assembled = "\n".join(parts)
-        harness_src = None
+        # The directive goes on the TEST TEXT ONLY, as its own directive prologue.
+        assembled = ('"use strict";\n' + src) if (strict and "raw" not in flags) else src
     # Create the temp script IN THE TEST'S OWN DIRECTORY so a relative dynamic
     # `import('./x_FIXTURE.js')` resolves against the fixtures beside the test
     # (zipp resolves import() relative to the running script's directory).
@@ -256,7 +266,8 @@ def run_one(args, get_harness, job):
         os.close(fd)
         try:
             # A `flags:[module]` test runs as an ES module (top-level await,
-            # module scope); the assembled harness + test is one module.
+            # module scope); the test text alone is the module, with the harness
+            # supplied separately -- the same shape scripts now use.
             subcmd = "mjs" if is_module else "js"
             env = None
             if cannot_block:

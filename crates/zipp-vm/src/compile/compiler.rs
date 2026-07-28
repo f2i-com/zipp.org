@@ -568,13 +568,30 @@ impl Compiler {
                 blockers.insert(p.clone());
                 protect.insert(p.clone());
             }
-            // B.3.3.1: a block function named `arguments` is never promoted —
-            // the implicit arguments binding behaves like a formal parameter
-            // (block-decl-func-skip-arguments). Script top level has no
-            // `arguments` binding, so the skip applies to function bodies only.
+            // B.3.3.1 and `arguments`: a BLOCKER but deliberately NOT protected.
+            // The extension's outer guard is `paramNames does not contain F`, and
+            // since ES2018 `paramNames` is never mutated to hold "arguments" — the
+            // arguments object is appended to a SEPARATE `paramBindings` list — so
+            // the guard does not fire and the extension is NOT skipped. Only the
+            // inner step is suppressed (`... and F is not "arguments"`), which
+            // creates the var binding; the SetMutableBinding performed when the
+            // block declaration is evaluated sits outside that guard and always
+            // runs. So the arguments OBJECT is overwritten by the block function:
+            //   function f(){ { function arguments(){} } return typeof arguments }
+            // is "function", not "object".
+            //
+            // Protecting the name as well (what this used to do) implemented the
+            // ES2017 text, where step 22.f really did append "arguments" to
+            // parameterNames. test262 still carries a V8-authored 2017 test,
+            // annexB/language/function-code/block-decl-func-skip-arguments.js,
+            // that encodes the removed wording — V8 fails it, and passing it was
+            // mistaken here for being MORE conformant than V8. It is not.
+            //
+            // `arguments` as a genuine FORMAL PARAMETER is unaffected: the params
+            // loop above puts it in both sets, which is correct, because then
+            // paramNames really does contain it and the whole extension is skipped.
             if !is_script {
                 blockers.insert("arguments".to_string());
-                protect.insert("arguments".to_string());
             }
             for s in body {
                 match s {

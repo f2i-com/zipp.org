@@ -158,6 +158,46 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
     }
 }
 
+/// Run `harness` and then `src` as TWO SEPARATE SCRIPTS in one realm — the
+/// script-goal analogue of [`run_module_file`]'s harness prelude.
+///
+/// This exists because concatenating them is not equivalent. `INTERPRETING.md`
+/// evaluates each `includes:` file in the realm *prior to* the test, and applies
+/// the strict-mode directive as "the initial character sequence of the file" —
+/// the TEST file. Gluing harness and test into one source and putting
+/// `"use strict";` on top instead makes the HARNESS strict, and any harness
+/// helper that uses a **direct** `eval` inherits that strictness, so the mode
+/// under test leaks into code that is supposed to stay sloppy. That is not a
+/// hypothetical: it accounted for 19 of this engine's test262 failures, and V8
+/// fails the very same tests when handed the concatenated bytes.
+///
+/// The harness runs first as a realm script (its `var`/function declarations
+/// become realm globals the test can see), then the test runs as its own script
+/// through the same path `$262.evalScript` uses, so its directive prologue —
+/// and only its own — governs it. The event loop is drained afterwards, and
+/// drained even when the test threw, matching [`run_with_base`].
+pub fn run_with_harness(
+    src: &str,
+    harness: &str,
+    base_dir: Option<std::path::PathBuf>,
+) -> Result<Outcome, String> {
+    // `src` — the TEST — is compiled as the main program, so it keeps ordinary
+    // script semantics in full; the harness is the prelude. See
+    // `Vm::run_with_prelude` for why it is this way round and not the other.
+    let ast = front::parse_auto(src)?;
+    let program = compile::compile_program(&ast, src)?;
+    let mut vm = vm::Vm::new(&program);
+    vm.set_module_base_dir(base_dir);
+    match vm.run_with_prelude(Some(harness)) {
+        Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+        Err(thrown) => Ok(Outcome {
+            output: std::mem::take(&mut vm.output),
+            errput: std::mem::take(&mut vm.errput),
+            error: Some(thrown.0),
+        }),
+    }
+}
+
 /// Run `src` as an ES MODULE entry: the top level is an async context (top-level
 /// `await`), declarations are module-scoped, and the event loop drains to
 /// completion. `base_dir` resolves relative imports. Like [`run_with_base`] but

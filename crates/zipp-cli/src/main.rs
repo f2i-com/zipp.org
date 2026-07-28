@@ -85,9 +85,15 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                 }
             }
-            let path = &path.ok_or("usage: zipp js [--script-goal] <file.js>")?;
+            let path = &path.ok_or("usage: zipp js [--script-goal] <file.js> [harness.js]")?;
             let src =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            // An optional SECOND file is a harness prelude, exactly as `mjs`
+            // takes one: it is evaluated as its own realm script before the
+            // entry, which is what lets the entry's `"use strict"` directive
+            // apply to the entry ALONE. test262's runner needs that — see
+            // `run_with_harness`.
+            let harness = it.next();
             // The script's directory resolves relative `import(specifier)` loads.
             let base_dir = std::path::Path::new(path).parent().map(|p| {
                 if p.as_os_str().is_empty() {
@@ -96,7 +102,14 @@ fn run(args: &[String]) -> Result<(), String> {
                     p.to_path_buf()
                 }
             });
-            emit(zipp_vm::run_with_base(&src, base_dir)?)
+            match harness {
+                None => emit(zipp_vm::run_with_base(&src, base_dir)?),
+                Some(h) => {
+                    let hsrc = std::fs::read_to_string(h)
+                        .map_err(|e| format!("cannot read harness '{h}': {e}"))?;
+                    emit(zipp_vm::run_with_harness(&src, &hsrc, base_dir)?)
+                }
+            }
         }
         Some("mjs") => {
             // Run a file as an ES MODULE (top-level await; module-scoped

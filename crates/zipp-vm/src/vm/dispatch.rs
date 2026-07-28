@@ -783,6 +783,30 @@ impl<'p> Vm<'p> {
                                 )));
                             }
                             if self.global_by_name(&name).is_none() {
+                                // A slot a script GlobalDeclarationInstantiation
+                                // DECLARED (`$262.evalScript("var x;")`, or a
+                                // top-level function) is resolvable even though
+                                // its slot stays UNINITIALIZED: CreateGlobalVar-
+                                // Binding parks those on the global object and
+                                // routes access through the own prop. Without
+                                // this the declaration is invisible to a STRICT
+                                // write, so `"use strict"; var x; x = 1;` in one
+                                // evalScript threw "x is not defined" while the
+                                // sloppy form (StoreGlobal, which has the own-prop
+                                // fallback) worked and the read of the same name
+                                // resolved fine. Checked BEFORE the proto probe
+                                // and keyed on the DECLARATION registry, not on
+                                // own-property presence, so
+                                // `undeclared = (this.undeclared = 5)` — which
+                                // creates a property but declares nothing — still
+                                // throws.
+                                if self.eval_var_globals.contains(&idx) {
+                                    let v = self.get(base, src);
+                                    let gobj = Value::heap(self.global_this);
+                                    self.set_prop(gobj, &name, v, true)?;
+                                    ip += 1;
+                                    continue;
+                                }
                                 // The reference can still resolve through the
                                 // global object's PROTO CHAIN — an inherited
                                 // property, or a Proxy prototype's `has` trap
@@ -3407,6 +3431,49 @@ impl<'p> Vm<'p> {
                                 // SAFETY: program functions are immutable during run.
                                 let proto_ref = unsafe { &*proto };
                                 let heap_helper_addrs = self.jit_heap_helper_addrs();
+                                // ── globals that are NOT slot bindings ──
+                                // An UNINITIALIZED slot is not an empty binding:
+                                // a script GlobalDeclarationInstantiation
+                                // ($262.evalScript, and the test262 harness
+                                // prelude) parks its var/function bindings as OWN
+                                // PROPERTIES of the global object and leaves the
+                                // slot UNINITIALIZED on purpose, so the
+                                // interpreter's Load/StoreGlobal own-prop
+                                // fallbacks govern them. A region compiles
+                                // LoadGlobal to a bare `mov rax,[r12+idx*8]` with
+                                // no such fallback, so it would read the sentinel
+                                // and hand the region `undefined`.
+                                //
+                                // That is a TIER DIVERGENCE, the failure mode this
+                                // engine gates hardest against: a harness function
+                                // called in a loop worked for the interpreted
+                                // iterations and turned into "undefined is not a
+                                // function" the instant the region tiered up —
+                                // always at the same iteration, which reads like a
+                                // scoping bug and is not one. Decline the region;
+                                // the interpreter is already correct.
+                                let uninit_global = proto_ref.code[t..=region_end].iter().any(|ins| {
+                                    let g = match *ins {
+                                        Instr::LoadGlobal { idx, .. }
+                                        | Instr::LoadGlobalOrUndefined { idx, .. }
+                                        | Instr::StoreGlobal { idx, .. }
+                                        | Instr::StoreGlobalStrict { idx, .. }
+                                        | Instr::StoreGlobalResolved { idx, .. } => idx,
+                                        _ => return false,
+                                    };
+                                    self.globals
+                                        .get(g as usize)
+                                        .is_some_and(|v| v.is_uninitialized())
+                                });
+                                if uninit_global {
+                                    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                                        eprintln!(
+                                            "[region] fn{func_id}@{t} DECLINE (global slot is own-property-backed, not a slot binding)"
+                                        );
+                                    }
+                                    ip = t;
+                                    continue;
+                                }
                                 self.jit.compile_region(
                                     func_id,
                                     proto_ref,

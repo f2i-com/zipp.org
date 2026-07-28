@@ -252,6 +252,23 @@ impl<'p> Vm<'p> {
                 None => {}
             }
         }
+        // Bindings a LATER script introduced live in the eval slot map, not the
+        // main program's compile-time name table. A prelude's (`run_with_prelude`)
+        // are slot-backed, so without this lookup they are readable as bare
+        // identifiers yet invisible to property reflection — and
+        // `hasOwnProperty(globalThis, "$DONE")` is precisely the gate test262's
+        // asyncHelpers.js uses to decide a test was run with the `async` flag, so
+        // every async test failed with "asyncTest called without async flag".
+        // An ordinary `$262.evalScript` binding is unaffected: its slot stays
+        // UNINITIALIZED and is skipped here, because it is reflected by the real
+        // own property that CreateGlobalVarBinding put on the global object.
+        if let Some(&slot) = self.eval_global_map.get(name) {
+            match self.globals.get(slot as usize).copied() {
+                Some(v) if v.is_uninitialized() => {}
+                Some(v) => return Some(v),
+                None => {}
+            }
+        }
         // Standard built-in globals (Object, Array, Math, eval, parseInt, …) are
         // own properties of the global object even when the running program never
         // referenced them as a bare identifier (so no compiler slot was reserved).

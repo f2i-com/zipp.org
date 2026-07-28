@@ -370,6 +370,40 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            // ── globals that are NOT slot bindings ──
+            // An UNINITIALIZED slot is not an empty binding: a script
+            // GlobalDeclarationInstantiation ($262.evalScript, and the test262
+            // harness prelude) parks its var/function bindings as OWN PROPERTIES
+            // of the global object and leaves the slot UNINITIALIZED by design,
+            // so the interpreter's Load/StoreGlobal own-prop fallbacks govern
+            // them. The inlined body emits LoadGlobal as a bare
+            // `mov rax,[r12+idx*8]` (codegen/inline.rs) with no fallback, so it
+            // reads the sentinel and the inlined callee sees `undefined`.
+            //
+            // That is a TIER DIVERGENCE — the failure mode this engine gates
+            // hardest against. A harness function called from a loop worked for
+            // the interpreted iterations and became "undefined is not a function"
+            // the instant the leaf inline kicked in, always at the same
+            // iteration, which reads like a scoping bug and is not one.
+            if body.iter().any(|ins| {
+                let g = match *ins {
+                    Instr::LoadGlobal { idx, .. }
+                    | Instr::LoadGlobalOrUndefined { idx, .. }
+                    | Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. } => idx,
+                    _ => return false,
+                };
+                self.globals.get(g as usize).is_some_and(|v| v.is_uninitialized())
+            }) {
+                if log {
+                    eprintln!(
+                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                         (reads a global whose binding is an own property, not a slot)"
+                    );
+                }
+                continue;
+            }
             // Pre-resolve the numeric constants the body's `LoadConst` ops read
             // (callee_leaf_ok rejected any non-numeric constant).
             let mut consts = rustc_hash::FxHashMap::default();

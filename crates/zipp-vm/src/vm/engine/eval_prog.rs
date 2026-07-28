@@ -399,7 +399,10 @@ impl<'p> Vm<'p> {
             let rs = gmap[slot as usize] as usize;
             if self.globals[rs].bits() == Value::UNINITIALIZED.bits() {
                 let mut own_backed = false;
-                if var_env_global {
+                // A prelude keeps its bindings in SLOTS (see `eval_prelude_mode`):
+                // own-backed bindings are invisible to every JIT tier's direct
+                // slot read, which makes the tiers disagree.
+                if var_env_global && !self.eval_prelude_mode {
                     if let Some(name) = self.global_slot_name(rs as u32) {
                         // A builtin binding of this name already exists — leave it.
                         if self.global_by_name(&name).is_some() {
@@ -466,6 +469,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if var_env_global
+                    && !self.eval_prelude_mode
                     && self.globals[slot as usize].bits() == Value::UNINITIALIZED.bits()
                 {
                     if let Some(name) = self.global_slot_name(slot as u32) {
