@@ -1115,7 +1115,13 @@ impl<'p> Vm<'p> {
         // RangeError (options-read-before-algorithmic-validation).
         let (unit, digits, omit, mode, cal_suf, show_offset, tzn) =
             if options == Value::UNDEFINED {
-                (1, -1, false, "trunc".to_string(), String::new(), true, "auto".to_string())
+                // `showCalendar` still defaults to "auto", which annotates every
+                // NON-ISO calendar — hard-coding "" here dropped `[u-ca=gregory]`
+                // from `zdt.toString()` and `zdt.toString(undefined)` while
+                // `zdt.toString({})` (which takes the branch below) kept it
+                // (ZonedDateTime/prototype/toString/options-undefined.js).
+                let cal_suf = self.calendar_name_suffix(Value::UNDEFINED, self.cal_of(idx))?;
+                (1, -1, false, "trunc".to_string(), cal_suf, true, "auto".to_string())
             } else {
                 if !self.is_object_value(options) {
                     return Err(Thrown("TypeError: options must be an object or undefined".into()));

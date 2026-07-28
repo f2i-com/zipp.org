@@ -677,19 +677,34 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::UNDEFINED
                 };
+                // An ASYNC stack that fell back to @@dispose stores the spec's
+                // result-discarding wrapper, not the sync method — see
+                // `sync_dispose_shim`. A SYNC stack never wraps: its
+                // `dispose()` ignores the result anyway.
+                let mut sync_fallback = false;
                 if !self.is_callable(method) {
                     method = self.get_member(a0, "@@dispose", a0)?;
+                    sync_fallback = is_async;
                 }
                 if !self.is_callable(method) {
                     return Err(Thrown(
                         "TypeError: value is not disposable (its [Symbol.dispose] is not a function)".into(),
                     ));
                 }
-                let disposer = Value::heap(self.heap.alloc(HeapObj::Bound {
-                    target: method,
-                    this: a0,
-                    args: Vec::new(),
-                }));
+                let disposer = if sync_fallback {
+                    let shim = self.sync_dispose_shim()?;
+                    Value::heap(self.heap.alloc(HeapObj::Bound {
+                        target: shim,
+                        this: method,
+                        args: vec![a0],
+                    }))
+                } else {
+                    Value::heap(self.heap.alloc(HeapObj::Bound {
+                        target: method,
+                        this: a0,
+                        args: Vec::new(),
+                    }))
+                };
                 if let Some((d, _)) = self.dispose_stacks.get_mut(&ti) {
                     d.push(disposer);
                 }

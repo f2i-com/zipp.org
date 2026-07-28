@@ -575,130 +575,427 @@ pub(crate) fn date_to_utc_string(ms: f64) -> String {
     )
 }
 
-/// Parse the human/RFC date forms an engine emits via `toString`/`toUTCString`
-/// (e.g. `"Thu Jan 01 1970 00:00:00 GMT+0000"`, `"Thu, 01 Jan 1970 00:00:00 GMT"`):
-/// a leading weekday, a month name, a day, a 4+-digit (possibly negative) year, a
-/// `HH:MM[:SS]` time, and an optional `GMT±HHMM` / `GMT` / `UTC` zone. The day
-/// precedes the year in both forms. Treated as UTC when no offset is given.
-/// `Date.parse` must accept this engine's own output, so these must round-trip.
-fn parse_rfc_date(s: &str) -> f64 {
-    // Drop a trailing `(Zone Name)`; a `Wkd,` comma is just a separator.
-    let head = match s.find('(') {
-        Some(i) => &s[..i],
-        None => s,
-    };
-    let cleaned = head.replace(',', " ");
-    let mut month0: Option<i64> = None;
-    let mut time: Option<(i64, i64, i64)> = None;
-    let mut offset_min: i64 = 0;
-    let mut nums: Vec<i64> = Vec::new();
-    for tok in cleaned.split_whitespace() {
-        if let Some(m) = MONTH.iter().position(|x| x.eq_ignore_ascii_case(tok)) {
-            month0 = Some(m as i64);
-        } else if tok.contains(':') {
-            let parts: Vec<&str> = tok.split(':').collect();
-            let h = parts.first().and_then(|x| x.parse::<i64>().ok());
-            let mi = parts.get(1).and_then(|x| x.parse::<i64>().ok());
-            let se = parts.get(2).map_or(Some(0), |x| x.parse::<i64>().ok());
-            match (h, mi, se) {
-                (Some(h), Some(mi), Some(se)) => time = Some((h, mi, se)),
-                _ => return f64::NAN,
-            }
-        } else if let Some(rest) = tok.strip_prefix("GMT").or_else(|| tok.strip_prefix("UTC")) {
-            // An optional ±HHMM offset (empty rest = GMT/UTC = +0000).
-            let b = rest.as_bytes();
-            if rest.len() >= 5 && (b[0] == b'+' || b[0] == b'-') {
-                let sign = if b[0] == b'-' { -1 } else { 1 };
-                match (rest[1..3].parse::<i64>().ok(), rest[3..5].parse::<i64>().ok()) {
-                    (Some(oh), Some(om)) => offset_min = sign * (oh * 60 + om),
-                    _ => return f64::NAN,
-                }
-            } else if !rest.is_empty() {
-                return f64::NAN;
-            }
-        } else if WEEKDAY.iter().any(|w| w.eq_ignore_ascii_case(tok)) {
-            // The leading weekday name is ignored (not validated against the date).
-        } else if let Ok(n) = tok.parse::<i64>() {
-            nums.push(n);
-        } else {
-            return f64::NAN;
-        }
-    }
-    let (mo0, (h, mi, se)) = match (month0, time) {
-        (Some(m), Some(t)) => (m, t),
-        _ => return f64::NAN,
-    };
-    if nums.len() != 2 {
-        return f64::NAN;
-    }
-    // UTC = local-with-offset − offset (so GMT-0400 fields move +4h to UTC).
-    ms_from_utc(nums[1], mo0, nums[0], h, mi, se, 0) - offset_min as f64 * 60_000.0
-}
-
-/// Parse the ISO-8601 subset JS accepts (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`,
-/// optionally `THH:mm[:ss[.sss]]` and a trailing `Z`). Treated as UTC. Returns
-/// NaN if unrecognised.
+/// Date-string parsing, in the two layers every engine has.
+///
+/// 21.4.3.2 `Date.parse` first tries the **Date Time String Format** of
+/// 21.4.1.20 — the only shape the spec pins down — and, failing that, falls back
+/// to an implementation-defined heuristic. Folding the two into one permissive
+/// scan (what this used to be) makes the strict form accept things it must
+/// reject: `1997-3-8T11:19:20`, `1997-03-08T1:1`, `1997-03-08T` and
+/// `1997-03-08T11:19:10-07` are all NaN in V8 and SpiderMonkey precisely
+/// because a `T` selects the strict grammar, while the SAME fields after a
+/// SPACE reach the legacy parser and are accepted
+/// (staging/sm/Date/non-iso.js).
+///
+/// `parse_iso_date_time` is the strict layer; `parse_legacy_date` is the
+/// heuristic one, modelled on V8's `DateParser` (`src/date/dateparser*`) because
+/// that is the behaviour test262's staging tests were written against.
 pub(crate) fn parse_date(s: &str) -> f64 {
     let s = s.trim();
-    // The human/RFC forms (toString/toUTCString) start with a weekday name; the
-    // ISO forms start with a digit or a sign. Date.parse must round-trip both.
-    if s.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
-        return time_clip(parse_rfc_date(s));
+    if let Some(t) = parse_iso_date_time(s) {
+        return time_clip(t);
     }
-    let (date, time) = match s.split_once(['T', ' ']) {
-        Some((d, t)) => (d, Some(t)),
-        None => (s, None),
+    time_clip(parse_legacy_date(s))
+}
+
+// ---- strict: the Date Time String Format (21.4.1.20) -----------------------
+
+/// Read exactly `n` ASCII digits at `i`, advancing `i`.
+fn take_digits(b: &[u8], i: &mut usize, n: usize) -> Option<i64> {
+    if *i + n > b.len() {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for k in 0..n {
+        let c = b[*i + k];
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        v = v * 10 + (c - b'0') as i64;
+    }
+    *i += n;
+    Some(v)
+}
+
+/// `YYYY-MM-DDTHH:mm:ss.sssZ` and its documented subsets, with every field
+/// range-checked. Returns `None` (not NaN) when the string is not in this
+/// format at all, so the caller can try the legacy parser; a string that IS in
+/// this format but carries an out-of-range field returns `Some(NaN)` — it must
+/// not fall through and be re-read by the looser grammar.
+fn parse_iso_date_time(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    // `YYYY`, or an expanded `±YYYYYY`. A negative zero year is not a year.
+    let year = if b.first() == Some(&b'+') || b.first() == Some(&b'-') {
+        let neg = b[0] == b'-';
+        i = 1;
+        let y = take_digits(b, &mut i, 6)?;
+        if neg && y == 0 {
+            return Some(f64::NAN);
+        }
+        if neg {
+            -y
+        } else {
+            y
+        }
+    } else {
+        take_digits(b, &mut i, 4)?
     };
-    // An ISO extended year carries an explicit sign: `-000001-07-01` (year -1) or
-    // `+002014-03-23`. Strip the sign first so the `-` field split doesn't yield an
-    // empty leading field, then apply it to the parsed year.
-    let (year_sign, date_body) = match date.strip_prefix('-') {
-        Some(rest) => (-1i64, rest),
-        None => (1i64, date.strip_prefix('+').unwrap_or(date)),
-    };
-    let dp: Vec<&str> = date_body.split('-').collect();
-    if dp.is_empty() || dp[0].is_empty() {
+    let mut month = 1i64;
+    let mut day = 1i64;
+    if b.get(i) == Some(&b'-') {
+        i += 1;
+        month = take_digits(b, &mut i, 2)?;
+        if b.get(i) == Some(&b'-') {
+            i += 1;
+            day = take_digits(b, &mut i, 2)?;
+        }
+    }
+    let (mut h, mut mi, mut sec, mut ms) = (0i64, 0i64, 0i64, 0i64);
+    let mut has_time = false;
+    // A lowercase `t`/`z` is not in the grammar, but every engine accepts it and
+    // real-world data carries it, so the STRICT layer takes both spellings. The
+    // legacy layer still rejects `t` outright, which is what keeps
+    // `1997-3-8T11:19:20` (one-digit month, so not the strict format) NaN.
+    if b.get(i) == Some(&b'T') || b.get(i) == Some(&b't') {
+        has_time = true;
+        i += 1;
+        h = take_digits(b, &mut i, 2)?;
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        mi = take_digits(b, &mut i, 2)?;
+        if b.get(i) == Some(&b':') {
+            i += 1;
+            sec = take_digits(b, &mut i, 2)?;
+            if b.get(i) == Some(&b'.') {
+                i += 1;
+                // The grammar spells exactly three digits, but every engine
+                // accepts any number of them (and `toJSON` round-trips are not
+                // the only producers) — take the first three, ignore the rest.
+                let start = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+                let frac = &s[start..i];
+                let mut scaled = String::with_capacity(3);
+                scaled.push_str(&frac[..frac.len().min(3)]);
+                while scaled.len() < 3 {
+                    scaled.push('0');
+                }
+                ms = scaled.parse::<i64>().ok()?;
+            }
+        }
+    }
+    // `Z`, or `±HH:mm`. Absent: a date-only form is UTC and a date-time is local
+    // time — identical here, since this engine's local time zone IS UTC
+    // (`getTimezoneOffset` is 0 unconditionally).
+    let mut offset_min = 0i64;
+    let mut has_zone = false;
+    if i < b.len() {
+        has_zone = true;
+        match b[i] {
+            b'Z' | b'z' => {
+                i += 1;
+            }
+            b'+' | b'-' => {
+                let sign = if b[i] == b'-' { -1 } else { 1 };
+                i += 1;
+                let oh = take_digits(b, &mut i, 2)?;
+                // `±HH:mm`, or the colon-less `±HHmm` every engine also takes.
+                // An hours-ONLY `±HH` is not accepted here: `1997-03-08T11:19:10-07`
+                // must be NaN (staging/sm/Date/non-iso.js), and only the legacy
+                // layer — reached through a SPACE separator — reads that form.
+                let om = if b.get(i) == Some(&b':') {
+                    i += 1;
+                    take_digits(b, &mut i, 2)?
+                } else {
+                    take_digits(b, &mut i, 2)?
+                };
+                if oh > 23 || om > 59 {
+                    return Some(f64::NAN);
+                }
+                offset_min = sign * (oh * 60 + om);
+            }
+            _ => return None,
+        }
+    }
+    if i != b.len() {
+        return None;
+    }
+    // `DateTimeUTCOffset` only follows a `TimeSpec`, so a zone with no time
+    // (`1970-01-01Z`) is not in the format.
+    if has_zone && !has_time {
+        return None;
+    }
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || h > 24
+        || mi > 59
+        || sec > 59
+        || (h == 24 && (mi != 0 || sec != 0 || ms != 0))
+    {
+        return Some(f64::NAN);
+    }
+    Some(ms_from_utc(year, month - 1, day, h, mi, sec, ms) - offset_min as f64 * 60_000.0)
+}
+
+// ---- heuristic: the legacy forms (V8's DateParser) -------------------------
+
+fn is_day_num(n: i64) -> bool {
+    (1..=31).contains(&n)
+}
+
+/// Everything the Date Time String Format does not cover: `toString` /
+/// `toUTCString` output (`Thu Jan 01 1970 00:00:00 GMT+0000`), the
+/// space-separated relaxed ISO forms (`1997-3-8 11:19:20`), and the US
+/// `M/D/Y` + month-name orderings (`12/25/1995`, `may 1 1999`, `1 1999 may`).
+///
+/// Ordering and the two-digit-year window follow V8's `DayComposer::Write`:
+/// three bare numbers are `Y/M/D` when the first cannot be a day-of-month and
+/// `M/D/Y` otherwise; with a month NAME the first number is the day when it can
+/// be one and the year otherwise; and a year of 0–49 means 20xx, 50–99 means
+/// 19xx. staging/sm/Date/two-digit-years.js asserts exactly that, across
+/// 100 × 12 × 31 dates plus 1000 written-month ones.
+fn parse_legacy_date(s: &str) -> f64 {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    // Up to three bare numbers (a fourth is a parse failure, which is what makes
+    // `1997-03-08 11` — year, month, day, then a stray hour — NaN).
+    let mut nums: Vec<i64> = Vec::new();
+    let mut named_month: Option<i64> = None;
+    let mut time: Option<(i64, i64, i64, i64)> = None;
+    let mut pm: Option<bool> = None;
+    let mut tz_utc = false;
+    let mut offset_min: Option<i64> = None;
+
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() || c == b',' {
+            i += 1;
+            continue;
+        }
+        // `(…)` is a comment — the `(Australian Eastern Daylight Time)` tail of
+        // a `toString`. Nesting counts, as in V8.
+        if c == b'(' {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i] == b'(' {
+                    depth += 1;
+                } else if b[i] == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            let n: i64 = match s[start..i].parse() {
+                Ok(v) => v,
+                Err(_) => return f64::NAN, // absurdly long digit run
+            };
+            if b.get(i) == Some(&b':') {
+                // A time: HH:mm[:ss[.sss]].
+                if time.is_some() {
+                    return f64::NAN;
+                }
+                i += 1;
+                let m = match read_uint(b, &mut i) {
+                    Some(v) => v,
+                    None => return f64::NAN,
+                };
+                let mut sec = 0i64;
+                let mut ms = 0i64;
+                if b.get(i) == Some(&b':') {
+                    i += 1;
+                    sec = match read_uint(b, &mut i) {
+                        Some(v) => v,
+                        None => return f64::NAN,
+                    };
+                }
+                if b.get(i) == Some(&b'.') && b.get(i + 1).is_some_and(|d| d.is_ascii_digit()) {
+                    i += 1;
+                    let fs = i;
+                    while i < b.len() && b[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    let frac = &s[fs..i];
+                    let mut scaled = String::with_capacity(3);
+                    scaled.push_str(&frac[..frac.len().min(3)]);
+                    while scaled.len() < 3 {
+                        scaled.push('0');
+                    }
+                    ms = scaled.parse::<i64>().unwrap_or(0);
+                }
+                time = Some((n, m, sec, ms));
+            } else {
+                if nums.len() == 3 {
+                    return f64::NAN;
+                }
+                nums.push(n);
+                // `1997-3-8` / `5/1/1999`: the separator belongs to the date.
+                if b.get(i) == Some(&b'-') || b.get(i) == Some(&b'/') {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if c == b'+' || c == b'-' {
+            let sign = if c == b'-' { -1 } else { 1 };
+            // V8's rule: a sign is a time-zone offset once a time (or an
+            // explicit UTC marker) has been seen, and otherwise the sign of a
+            // date number — which is how `+001997-3-8 11:19:20` and this
+            // engine's own `Sat Jan 01 -0001 …` both parse.
+            if time.is_some() || tz_utc {
+                i += 1;
+                let oh = match read_uint(b, &mut i) {
+                    Some(v) => v,
+                    None => return f64::NAN,
+                };
+                if b.get(i) == Some(&b':') {
+                    i += 1;
+                    let om = match read_uint(b, &mut i) {
+                        Some(v) => v,
+                        None => return f64::NAN,
+                    };
+                    offset_min = Some(sign * (oh * 60 + om));
+                } else if oh >= 100 {
+                    // `-0700` — hours and minutes written without the colon.
+                    offset_min = Some(sign * ((oh / 100) * 60 + oh % 100));
+                } else {
+                    // `-07` — hours only.
+                    offset_min = Some(sign * oh * 60);
+                }
+                continue;
+            }
+            i += 1;
+            let n = match read_uint(b, &mut i) {
+                Some(v) => v,
+                None => return f64::NAN,
+            };
+            if nums.len() == 3 {
+                return f64::NAN;
+            }
+            nums.push(sign * n);
+            if b.get(i) == Some(&b'-') || b.get(i) == Some(&b'/') {
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let start = i;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            let word = &s[start..i];
+            // V8 keys its keyword table on the first three letters and ignores
+            // whatever follows, so `March` and `Mar` are the same token.
+            let key: String = word.chars().take(3).flat_map(|c| c.to_lowercase()).collect();
+            if let Some(m) = MONTH.iter().position(|x| x.eq_ignore_ascii_case(&key)) {
+                if named_month.is_some() {
+                    return f64::NAN;
+                }
+                named_month = Some(m as i64);
+            } else if WEEKDAY.iter().any(|w| w.eq_ignore_ascii_case(&key)) {
+                // Ignored — never validated against the date.
+            } else if word.eq_ignore_ascii_case("gmt")
+                || word.eq_ignore_ascii_case("ut")
+                || word.eq_ignore_ascii_case("utc")
+                || word.eq_ignore_ascii_case("z")
+            {
+                tz_utc = true;
+                if offset_min.is_none() {
+                    offset_min = Some(0);
+                }
+            } else if word.eq_ignore_ascii_case("am") {
+                pm = Some(false);
+            } else if word.eq_ignore_ascii_case("pm") {
+                pm = Some(true);
+            } else {
+                return f64::NAN;
+            }
+            continue;
+        }
+        // Anything else (including a bare `T`, which selects the STRICT grammar
+        // and so must not be readable here) is not a legacy date.
         return f64::NAN;
     }
-    let parse = |x: &str| x.parse::<i64>().ok();
-    let year = match parse(dp[0]) {
-        // `-000000` (negative-zero extended year) is invalid — year 0 must be
-        // written `+000000`.
-        Some(0) if year_sign < 0 => return f64::NAN,
-        Some(y) => year_sign * y,
-        None => return f64::NAN,
+
+    // DayComposer::Write.
+    if nums.is_empty() {
+        return f64::NAN;
+    }
+    while nums.len() < 3 {
+        nums.push(1);
+    }
+    let (year, month, day) = match named_month {
+        None => {
+            if !is_day_num(nums[0]) {
+                (nums[0], nums[1], nums[2]) // Y/M/D
+            } else {
+                (nums[2], nums[0], nums[1]) // M/D/Y
+            }
+        }
+        Some(m) => {
+            let (y, d) = if !is_day_num(nums[0]) { (nums[0], nums[1]) } else { (nums[1], nums[0]) };
+            (y, m + 1, d)
+        }
     };
-    let mo = if dp.len() > 1 { match parse(dp[1]) { Some(v) => v, None => return f64::NAN } } else { 1 };
-    let day = if dp.len() > 2 { match parse(dp[2]) { Some(v) => v, None => return f64::NAN } } else { 1 };
-    let (mut h, mut mi, mut sec, mut msec) = (0i64, 0i64, 0i64, 0i64);
-    if let Some(t) = time {
-        let t = t.trim_end_matches('Z');
-        // Drop a timezone offset (we treat everything as UTC).
-        let t = t.split(['+']).next().unwrap_or(t);
-        let (hms, frac) = match t.split_once('.') {
-            Some((a, b)) => (a, Some(b)),
-            None => (t, None),
-        };
-        let tp: Vec<&str> = hms.split(':').collect();
-        if !tp.is_empty() {
-            h = parse(tp[0]).unwrap_or(0);
+    let year = match year {
+        0..=49 => year + 2000,
+        50..=99 => year + 1900,
+        _ => year,
+    };
+    if !(1..=12).contains(&month) || !is_day_num(day) {
+        return f64::NAN;
+    }
+    let (mut h, mi, sec, ms) = time.unwrap_or((0, 0, 0, 0));
+    // A 12-hour clock, as V8's `TimeComposer::Write` spells it: the hour must be
+    // at most 12, 12 folds to 0, and `pm` then adds 12. So `12:30 am` is 00:30,
+    // `12:30 pm` is 12:30, `0:30 am` is 00:30 and `13:30 pm` is not a time.
+    if let Some(is_pm) = pm {
+        if h > 12 {
+            return f64::NAN;
         }
-        if tp.len() > 1 {
-            mi = parse(tp[1]).unwrap_or(0);
+        if h == 12 {
+            h = 0;
         }
-        if tp.len() > 2 {
-            sec = parse(tp[2]).unwrap_or(0);
-        }
-        if let Some(f) = frac {
-            // First 3 digits = milliseconds.
-            let f3: String = f.chars().take(3).chain(std::iter::repeat('0')).take(3).collect();
-            msec = f3.parse::<i64>().unwrap_or(0);
+        if is_pm {
+            h += 12;
         }
     }
-    // mo here is 1-based from the string; ms_from_utc wants 0-based. Date.parse
-    // returns a TIME VALUE: TimeClip bounds it to ±8.64e15 ms (±100M days) —
-    // one ms past either end is NaN, not a number.
-    time_clip(ms_from_utc(year, mo - 1, day, h, mi, sec, msec))
+    if h > 24 || mi > 59 || sec > 59 || (h == 24 && (mi != 0 || sec != 0 || ms != 0)) {
+        return f64::NAN;
+    }
+    ms_from_utc(year, month - 1, day, h, mi, sec, ms)
+        - offset_min.unwrap_or(0) as f64 * 60_000.0
+}
+
+/// Read a run of ASCII digits at `i` (at least one), advancing `i`.
+fn read_uint(b: &[u8], i: &mut usize) -> Option<i64> {
+    let start = *i;
+    let mut v: i64 = 0;
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        v = v.checked_mul(10)?.checked_add((b[*i] - b'0') as i64)?;
+        *i += 1;
+    }
+    if *i == start {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// `Number.prototype.toFixed(f)`. JS rounds half AWAY from zero — `(0.5).toFixed(0)`

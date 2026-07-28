@@ -622,6 +622,15 @@ pub const INTL_SEGMENT_ITER_NEXT: u16 = 935;
 /// BigInt.prototype; without it the Object.prototype one answered, ignoring
 /// both the locale and the options).
 pub const BIGINT_TO_LOCALE_STRING: u16 = 936;
+/// `resolvedOptions`, one id per Intl service kind (`INTL_RESOLVED_OPTIONS_BASE
+/// + kind`). Each service's method is its OWN function with its OWN brand check
+/// — `Intl.DisplayNames.prototype.resolvedOptions.call(new Intl.DateTimeFormat)`
+/// is a TypeError, which a single shared native (matching any `[[Initialized*]]`
+/// slot) could not express
+/// (DisplayNames/prototype/resolvedOptions/this-object-lacks-internal-throws.js).
+/// Ten slots cover kinds 0..9; `INTL_LOCALE` (7) has no resolvedOptions and its
+/// slot is simply never wired up.
+pub const INTL_RESOLVED_OPTIONS_BASE: u16 = 937;
 /// Intl service kinds (index into VM.intl_ctors / intl_protos).
 pub const INTL_NUMBERFORMAT: u8 = 0;
 pub const INTL_DATETIMEFORMAT: u8 = 1;
@@ -1192,6 +1201,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         INTL_GET_CANONICAL_LOCALES => ("getCanonicalLocales", 1),
         INTL_SUPPORTED_VALUES_OF => ("supportedValuesOf", 1),
         INTL_RESOLVED_OPTIONS => ("resolvedOptions", 0),
+        n if n >= INTL_RESOLVED_OPTIONS_BASE && n < INTL_RESOLVED_OPTIONS_BASE + 10 => {
+            ("resolvedOptions", 0)
+        }
         INTL_SUPPORTED_LOCALES_OF => ("supportedLocalesOf", 1),
         // The `format`/`compare` TARGETS are never exposed directly: the accessor
         // hands out a Bound wrapper whose name is "" (handled in

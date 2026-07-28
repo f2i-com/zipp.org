@@ -446,6 +446,22 @@ impl<'p> Vm<'p> {
                 }
                 let r = self.call_value(Value::heap(main), this, args);
                 self.active_realm = prev_realm;
+                // An error raised by the realm's OWN built-in is created with that
+                // realm's error constructors (the spec's "the current Realm Record"
+                // during the built-in's execution): `g.Function("'use strict'; var
+                // yield = 3;")` must throw `g.SyntaxError`, not the main realm's
+                // (staging/sm/syntax/yield-as-identifier.js line 22). Only an
+                // INTERNAL throw is re-homed — a `pending_throw` already carries a
+                // user-thrown object whose realm is whatever created it.
+                if cr != 0 {
+                    if let Err(ref t) = r {
+                        if self.pending_throw.is_none() {
+                            let e = self.alloc_error_from_message(&t.0);
+                            self.realm_adopt_error_to(e, cr);
+                            self.pending_throw = Some(e);
+                        }
+                    }
+                }
                 let r = r?;
                 if r.is_heap() && cr != 0 {
                     self.obj_realm.insert(r.heap_index(), cr);
@@ -948,4 +964,26 @@ impl<'p> Vm<'p> {
         Ok(f)
     }
 
+    /// GetDisposeMethod(V, ~async-dispose~) step 1.b.iii: when only `@@dispose`
+    /// exists, the method the spec stores is NOT the sync method itself but a
+    /// wrapper that calls it and resolves with **undefined** — the sync method's
+    /// return value is deliberately discarded. Handing the raw sync method to the
+    /// async disposal loop instead made `Dispose`'s `Await(result)` await whatever
+    /// it returned, so a `[Symbol.dispose]` returning a never-settling promise hung
+    /// `await using` and `AsyncDisposableStack.prototype.disposeAsync` forever
+    /// (staging/explicit-resource-management/async-disposal-from-sync-method-
+    /// returning-a-promise.js).
+    ///
+    /// Returns the shim BODY, to be used as
+    /// `Bound { target: shim, this: syncMethod, args: vec![resource] }`: calling
+    /// that thunk runs `syncMethod.call(resource)` and yields undefined.
+    pub(crate) fn sync_dispose_shim(&mut self) -> Result<Value, Thrown> {
+        if let Some(f) = self.sync_dispose_shim_fn {
+            return Ok(f);
+        }
+        const SRC: &str = r#"(function(O) { "use strict"; this.call(O); })"#;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)?;
+        self.sync_dispose_shim_fn = Some(f);
+        Ok(f)
+    }
 }

@@ -1060,9 +1060,10 @@ impl<'p> Vm<'p> {
             // genuine inherited DATA property and @@toStringTag returns undefined
             // rather than throwing, so both stay reachable.
             if receiver != obj && matches!(key, "length" | "byteLength" | "byteOffset" | "buffer") {
-                return Err(Thrown(format!(
+                let msg = format!(
                     "TypeError: get %TypedArray%.prototype.{key} called on a value that is not a TypedArray"
-                )));
+                );
+                return Err(self.realm_thrown_from_proto(obj.heap_index(), msg));
             }
             // KNOWN DEVIATION: these six names are answered from the instance
             // without consulting the prototype chain, so
@@ -1179,9 +1180,10 @@ impl<'p> Vm<'p> {
             // merely inherits from this view must get that TypeError, not the
             // view's own numbers (same rule as the TypedArray/ArrayBuffer arms).
             if receiver != obj && matches!(key, "byteLength" | "byteOffset" | "buffer") {
-                return Err(Thrown(format!(
+                let msg = format!(
                     "TypeError: get DataView.prototype.{key} called on a value that is not a DataView"
-                )));
+                );
+                return Err(self.realm_thrown_from_proto(obj.heap_index(), msg));
             }
             return Ok(match key {
                 "byteLength" | "byteOffset" if oob => {

@@ -232,6 +232,7 @@ impl<'p> Vm<'p> {
             closure_new_target: std::collections::HashMap::new(),
             from_async_fn: None,
             async_dispose_fn: None,
+            sync_dispose_shim_fn: None,
             using_resources: std::collections::HashMap::new(),
             using_next_id: 0,
             weakref_ctor: 0,

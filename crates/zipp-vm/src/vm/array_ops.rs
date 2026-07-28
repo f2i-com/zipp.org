@@ -256,7 +256,11 @@ impl<'p> Vm<'p> {
             EachMode::ForEach => Ok(Some(Value::UNDEFINED)),
             _ => Ok(Some(match species_target {
                 Some(a) => a,
-                None => Value::heap(self.heap.alloc(HeapObj::Array(out))),
+                // ArraySpeciesCreate's ArrayCreate fallback allocates in the
+                // CURRENT realm — for a built-in that is the built-in's OWN
+                // realm, so `otherRealm.a.map(f)` returns an array whose
+                // prototype is the other realm's (sm/Array/species.js line 156).
+                None => self.alloc_array_current_realm(out),
             })),
         }
     }
@@ -409,7 +413,8 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
         match self.array_species_create(original, species_len)? {
-            None => Ok(Value::heap(self.heap.alloc(HeapObj::Array(out)))),
+            // ArrayCreate in the CURRENT realm — see alloc_array_current_realm.
+            None => Ok(self.alloc_array_current_realm(out)),
             Some(target) => {
                 let n = out.len();
                 for (i, v) in out.into_iter().enumerate() {
@@ -1186,7 +1191,8 @@ impl<'p> Vm<'p> {
                             });
                             k += 1;
                         }
-                        Value::heap(self.heap.alloc(HeapObj::Array(deleted)))
+                        // ArrayCreate in the CURRENT realm — see alloc_array_current_realm.
+                        self.alloc_array_current_realm(deleted)
                     }
                 };
                 // Shift the tail to make room for the inserted items.
@@ -2001,7 +2007,8 @@ impl<'p> Vm<'p> {
                     }
                 }
                 match species_target {
-                    None => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out))))),
+                    // ArrayCreate in the CURRENT realm — see alloc_array_current_realm.
+                    None => Ok(Some(self.alloc_array_current_realm(out))),
                     Some(a) => {
                         // Step 6: Set(A, "length", n, true).
                         self.set_prop(a, "length", Value::num(n as f64), true)?;
@@ -2511,7 +2518,8 @@ impl<'p> Vm<'p> {
                 self.heap.bump_version(idx); // length/contents changed
                 let n = removed.len();
                 match species_target {
-                    None => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(removed))))),
+                    // ArrayCreate in the CURRENT realm — see alloc_array_current_realm.
+                    None => Ok(Some(self.alloc_array_current_realm(removed))),
                     Some(a) => {
                         for (i, v) in removed.into_iter().enumerate() {
                             // A HOLE marks an ABSENT source index: it stays absent

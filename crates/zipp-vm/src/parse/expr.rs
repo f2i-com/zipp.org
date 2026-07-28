@@ -202,7 +202,7 @@ impl<'s> Parser<'s> {
             return Err(SyntaxError::new("SyntaxError: invalid assignment target", start));
         }
         let value = self.parse_assign()?;
-        Ok(Expr::Assign { op, target, value: Box::new(value) })
+        Ok(Expr::Assign { op, target, value: Box::new(value), covered: false })
     }
 
     fn parse_yield(&mut self) -> PResult<Expr> {
@@ -586,6 +586,28 @@ impl<'s> Parser<'s> {
         // (staging/sm/Function/function-name-computed-01.js).
         if matches!(&e, Expr::Arrow(a) if a.span.start == lhs_start) {
             return Ok(e);
+        }
+        // A CoverInitializedName (`{a = 1}`) and a duplicate `__proto__` are legal
+        // only while the literal holding them may still be REFINED into a
+        // destructuring pattern; both are recorded as deferred pattern-only errors
+        // and discharged by the `=` that refines the literal. A `.`/`[`/`(`/
+        // template suffix ends that possibility — the literal becomes the base of
+        // a MemberExpression or CallExpression, which no refinement descends into
+        // — so the deferred error can never be discharged and fires here.
+        //
+        // Without it `[{a = 0}.x] = []` was accepted: the enclosing array literal
+        // IS refined, and its `=` dropped the inner object's error along with its
+        // own (staging/sm/destructuring/bug1396261.js).
+        if matches!(&e, Expr::Object(..) | Expr::Array(..))
+            && (self.at(Punct::Dot)
+                || self.at(Punct::QuestionDot)
+                || self.at(Punct::LBracket)
+                || self.at(Punct::LParen)
+                || matches!(self.cur().kind, TokenKind::Template { .. }))
+        {
+            if let Some(err) = self.cover.pattern_only.take() {
+                return Err(err);
+            }
         }
         let mut saw_optional = false;
         loop {

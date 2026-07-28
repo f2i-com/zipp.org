@@ -91,6 +91,30 @@ impl<'a> FnCompiler<'a> {
         self.store_binding_ex(b, src, false)
     }
 
+    /// A WRITE to a name still in its Temporal Dead Zone is a ReferenceError, the
+    /// same as a read: SetMutableBinding on an uninitialized binding throws
+    /// (9.1.1.1.5 step 2), and `PutValue` has no carve-out. The read half is
+    /// guarded in `expr_into`'s identifier arm; this is the write half, and
+    /// without it `let y = [y] = []` and `(a = (b &&= 0), b) => {}` stored into
+    /// the dead zone and completed normally
+    /// (staging/sm/expressions/destructuring-array-lexical.js,
+    /// staging/sm/expressions/short-circuit-compound-assignment-tdz.js).
+    ///
+    /// Emits nothing and returns false when `name` is not in a dead zone. When it
+    /// is, the caller must emit nothing further for this store — the throw is
+    /// unconditional. Call it AFTER whatever the spec evaluates first (a plain
+    /// `=` evaluates its RHS before PutValue; a compound/logical assignment's
+    /// GetValue throws before the RHS runs at all).
+    pub(crate) fn emit_tdz_store_throw(&mut self, name: &str) -> bool {
+        if !self.param_tdz.contains(name) {
+            return false;
+        }
+        let e = self.alloc_reg();
+        self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+        self.emit(Instr::Throw { src: e });
+        true
+    }
+
     /// `store_binding` for the write half of a read-modify-write (`x++`,
     /// `x += 1`, `x ||= v`): the caller has already emitted a `load_binding` of
     /// the SAME binding, so the reference is proven resolvable and the strict

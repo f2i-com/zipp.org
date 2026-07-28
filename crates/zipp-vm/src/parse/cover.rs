@@ -156,9 +156,12 @@ impl<'s> Parser<'s> {
         };
         // These parentheses block the AssignmentPattern refinement: `({}) = 1`
         // and `[({})] = []` are early errors where `({} = 1)` and `[a] = 1` are
-        // not. See [`LiteralFlags::parenthesized`].
+        // not. See [`LiteralFlags::parenthesized`]. Same rule for a whole
+        // assignment: `[(a = 5)] = []` is an early error where `[(a) = 5] = []`
+        // is not — see [`Expr::Assign::covered`].
         match &mut e {
             Expr::Array(_, f) | Expr::Object(_, f) => f.parenthesized = true,
+            Expr::Assign { covered, .. } => *covered = true,
             _ => {}
         }
         // Remember the parentheses, which is the whole reason the AST has a
@@ -229,6 +232,19 @@ impl<'s> Parser<'s> {
         allow_pattern: bool,
         pos: u32,
     ) -> PResult<Target> {
+        self.expr_to_target_at(e, allow_pattern, false, pos)
+    }
+
+    /// [`Self::expr_to_target`], plus `nested`: this target sits INSIDE a
+    /// destructuring pattern rather than being the whole left-hand side. The two
+    /// positions have different early-error rules — see the `Expr::Call` arm.
+    fn expr_to_target_at(
+        &mut self,
+        e: Expr,
+        allow_pattern: bool,
+        nested: bool,
+        pos: u32,
+    ) -> PResult<Target> {
         Ok(match e {
             Expr::Ident(name) => {
                 if self.ctx.strict && (&*name == "eval" || &*name == "arguments") {
@@ -244,8 +260,14 @@ impl<'s> Parser<'s> {
             // must PARSE and throw a ReferenceError at runtime — which is the
             // single case oxc's AST could not represent, and the reason the
             // engine used to rewrite source text and reparse.
+            //
+            // That allowance covers `LeftHandSideExpression = …` only. A
+            // DestructuringAssignmentTarget gets no such carve-out: 13.15.5.1
+            // requires AssignmentTargetType to be simple outright, so
+            // `[f()] = []` and `[f() = 1] = []` are early errors in BOTH modes
+            // (staging/sm/expressions/destructuring-pattern-parenthesized.js).
             Expr::Call(c) => {
-                if self.ctx.strict {
+                if self.ctx.strict || nested {
                     return Err(SyntaxError::new(
                         "SyntaxError: invalid assignment target",
                         pos,
@@ -275,7 +297,7 @@ impl<'s> Parser<'s> {
                                 ));
                             }
                             Some(TargetElem {
-                                target: self.expr_to_target(inner, true, pos)?,
+                                target: self.expr_to_target_at(inner, true, true, pos)?,
                                 default: None,
                                 rest: true,
                             })
@@ -307,14 +329,14 @@ impl<'s> Parser<'s> {
                                     pos,
                                 ));
                             }
-                            rest = Some(Box::new(self.expr_to_target(inner, false, pos)?));
+                            rest = Some(Box::new(self.expr_to_target_at(inner, false, true, pos)?));
                         }
                         ObjectMember::Prop { key, value, shorthand, init } => {
                             // A CoverInitializedName is legal here and only
                             // here — this is the conversion that makes
                             // `({a = 1} = {})` work.
                             let (target, default) = match init {
-                                Some(d) => (self.expr_to_target(value, true, pos)?, Some(d)),
+                                Some(d) => (self.expr_to_target_at(value, true, true, pos)?, Some(d)),
                                 None => self.split_default(value, pos)?,
                             };
                             props.push(TargetProp { key, target, default, shorthand });
@@ -334,11 +356,26 @@ impl<'s> Parser<'s> {
     }
 
     /// Split `a = 1` inside a destructuring position into target and default.
+    ///
+    /// `covered: false` is load-bearing: only an UNPARENTHESIZED assignment is an
+    /// `AssignmentElement : DestructuringAssignmentTarget Initializer`. A
+    /// parenthesized one (`[(a = 5)] = []`) falls through to `expr_to_target`,
+    /// whose `_` arm rejects it — 13.15.5.1 requires that early error because a
+    /// ParenthesizedExpression's AssignmentTargetType is its contents', and an
+    /// AssignmentExpression's is invalid.
     fn split_default(&mut self, e: Expr, pos: u32) -> PResult<(Target, Option<Expr>)> {
-        if let Expr::Assign { op: AssignOp::Assign, target, value } = e {
+        if let Expr::Assign { op: AssignOp::Assign, target, value, covered: false } = e {
+            // The inner assignment was converted by `parse_assign`, which applies
+            // the TOP-LEVEL rules — including Annex B's sloppy-mode allowance for
+            // a CallExpression target. Nested in a pattern that allowance is gone
+            // (see the `Expr::Call` arm), so re-check here: `[f() = 1] = []` is an
+            // early SyntaxError in both modes.
+            if matches!(target, Target::Call(_)) {
+                return Err(SyntaxError::new("SyntaxError: invalid assignment target", pos));
+            }
             return Ok((target, Some(*value)));
         }
-        Ok((self.expr_to_target(e, true, pos)?, None))
+        Ok((self.expr_to_target_at(e, true, true, pos)?, None))
     }
 
     /// Expression → BINDING pattern, for arrow parameters.
@@ -356,10 +393,16 @@ impl<'s> Parser<'s> {
                 }
                 Pattern::Ident(name)
             }
-            Expr::Assign { op: AssignOp::Assign, target, value } => Pattern::Assign {
-                left: Box::new(self.target_to_pattern(target)?),
-                right: value,
-            },
+            // `covered: false`: `SingleNameBinding : BindingIdentifier
+            // Initializer` and `BindingElement : BindingPattern Initializer` both
+            // take the initializer UNPARENTHESIZED, so `((a = 5)) => {}` and
+            // `([(a = 5)]) => {}` are SyntaxErrors — the `_` arm below.
+            Expr::Assign { op: AssignOp::Assign, target, value, covered: false } => {
+                Pattern::Assign {
+                    left: Box::new(self.target_to_pattern(target)?),
+                    right: value,
+                }
+            }
             // A BindingPattern is an ObjectLiteral/ArrayLiteral read directly;
             // `(({})) => 1` wraps one in parentheses, which no FormalParameter
             // production admits.

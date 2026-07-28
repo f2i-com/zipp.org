@@ -20,9 +20,13 @@
 //!   (GB6-GB8), regional-indicator pairs (GB12/13), and ZWJ emoji sequences
 //!   (GB11) — those need the break-property table.
 //! * **word** — a maximal run of alphanumerics-and-marks is one word-like
-//!   segment; every other scalar is its own segment. Correct for space- and
-//!   punctuation-delimited scripts. **Wrong** for WB6/WB7 (the apostrophe in
-//!   "can't", the full stop in "3.14") and for scripts that need a dictionary.
+//!   segment, plus the four INFIX rules WB6/WB7 (the apostrophe in "can't", the
+//!   colon in "10:30") and WB11/WB12 (the full stop in "3.14"), whose character
+//!   classes are the closed `MidLetter` / `MidNum` / `MidNumLet` sets below;
+//!   every other scalar is its own segment. Correct for space- and
+//!   punctuation-delimited scripts. **Wrong** for scripts that need a
+//!   dictionary, and for the rest of the Word_Break table (ExtendNumLet,
+//!   Regional_Indicator, WSegSpace).
 //! * **sentence** — the whole string is one segment. There is no data-free way
 //!   to tell a sentence-ending period from an abbreviation's, and a guess would
 //!   be worse than the honest "one sentence".
@@ -50,6 +54,59 @@ fn is_wordish(c: char) -> bool {
     c.is_alphanumeric() || is_mark(c)
 }
 
+/// Which of UAX #29's infix classes a scalar belongs to, if any:
+/// `Letter` = `MidLetter` (WB6/WB7), `Num` = `MidNum` (WB11/WB12),
+/// `Both` = `MidNumLetQ` = `MidNumLet` ∪ `Single_Quote`, which serves both.
+///
+/// Transcribed from `WordBreakProperty.txt` (Unicode 16.0.0,
+/// <https://www.unicode.org/Public/16.0.0/ucd/auxiliary/WordBreakProperty.txt>):
+/// MidLetter is 9 code points, MidNum 13, MidNumLet 7, Single_Quote 1. These
+/// four classes are the entire data the infix rules need — every other operand
+/// in WB6/7/11/12 is AHLetter or Numeric, which general category already gives.
+#[derive(Clone, Copy, PartialEq)]
+enum Mid {
+    Letter,
+    Num,
+    Both,
+}
+
+fn mid_class(c: char) -> Option<Mid> {
+    match c {
+        // MidLetter
+        '\u{3A}' | '\u{B7}' | '\u{387}' | '\u{55F}' | '\u{5F4}' | '\u{2027}' | '\u{FE13}'
+        | '\u{FE55}' | '\u{FF1A}' => Some(Mid::Letter),
+        // MidNum
+        '\u{2C}' | '\u{3B}' | '\u{37E}' | '\u{589}' | '\u{60C}' | '\u{60D}' | '\u{66C}'
+        | '\u{7F8}' | '\u{2044}' | '\u{FE50}' | '\u{FE54}' | '\u{FF0C}' | '\u{FF1B}' => {
+            Some(Mid::Num)
+        }
+        // MidNumLet ∪ Single_Quote
+        '\u{2E}' | '\u{2018}' | '\u{2019}' | '\u{2024}' | '\u{FE52}' | '\u{FF07}' | '\u{FF0E}'
+        | '\u{27}' => Some(Mid::Both),
+        _ => None,
+    }
+}
+
+/// Does `chars[j]` bridge its two neighbours under WB6/7 or WB11/12 — i.e. is
+/// it an infix character with a matching operand on each side? A bridged infix
+/// takes no boundary on either side, so "3.14" and "can't" stay one segment.
+fn bridges(chars: &[char], j: usize) -> bool {
+    let Some(kind) = chars.get(j).copied().and_then(mid_class) else { return false };
+    let (Some(&p), Some(&n)) = (chars.get(j.wrapping_sub(1)), chars.get(j + 1)) else {
+        return false;
+    };
+    if j == 0 {
+        return false;
+    }
+    let letters = p.is_alphabetic() && n.is_alphabetic();
+    let numbers = p.is_numeric() && n.is_numeric();
+    match kind {
+        Mid::Letter => letters,
+        Mid::Num => numbers,
+        Mid::Both => letters || numbers,
+    }
+}
+
 /// The segment starts, in UTF-16 code units, always beginning with 0 and
 /// followed (implicitly) by the string's length. Empty for the empty string.
 pub(crate) fn segment_starts(s: &str, granularity: &str) -> Vec<usize> {
@@ -60,14 +117,18 @@ pub(crate) fn segment_starts(s: &str, granularity: &str) -> Vec<usize> {
         return vec![0];
     }
     let word = granularity == "word";
+    // The infix rules need one scalar of lookahead on each side, so the word
+    // walk indexes a materialized slice rather than streaming.
+    let chars: Vec<char> = s.chars().collect();
     let mut out = vec![0usize];
     let mut pos = 0usize;
-    let mut prev: Option<char> = None;
-    for c in s.chars() {
-        if pos > 0 {
-            let p = prev.unwrap();
+    for (i, &c) in chars.iter().enumerate() {
+        if i > 0 {
+            let p = chars[i - 1];
             let joins = if word {
-                is_wordish(c) && is_wordish(p)
+                // WB6/WB11 keep the boundary BEFORE a bridging infix closed;
+                // WB7/WB12 keep the one after it closed.
+                (is_wordish(c) && is_wordish(p)) || bridges(&chars, i) || bridges(&chars, i - 1)
             } else {
                 is_mark(c) || (c == '\n' && p == '\r')
             };
@@ -76,7 +137,6 @@ pub(crate) fn segment_starts(s: &str, granularity: &str) -> Vec<usize> {
             }
         }
         pos += char_units(c);
-        prev = Some(c);
     }
     out
 }
@@ -135,6 +195,22 @@ mod tests {
         assert_eq!(segment_starts("", "grapheme"), Vec::<usize>::new());
         // "[object Object]" — the bracket is its own segment, the run is one word.
         assert_eq!(segment_starts("[object", "word"), vec![0, 1]);
+    }
+
+    #[test]
+    fn infix_rules_keep_one_word() {
+        // WB11/WB12: Numeric MidNumLet Numeric.
+        assert_eq!(segment_starts("1.23", "word"), vec![0]);
+        // WB6/WB7: AHLetter MidNumLetQ AHLetter.
+        assert_eq!(segment_starts("can't", "word"), vec![0]);
+        // WB6/WB7 with MidLetter.
+        assert_eq!(segment_starts("a:b", "word"), vec![0]);
+        // A trailing infix does NOT bridge — the sentence-final full stop is its
+        // own segment.
+        assert_eq!(segment_starts("hi.", "word"), vec![0, 2]);
+        // MidNum joins numbers only; between letters it stays a break.
+        assert_eq!(segment_starts("a,b", "word"), vec![0, 1, 2]);
+        assert_eq!(segment_starts("1,2", "word"), vec![0]);
     }
 
     #[test]

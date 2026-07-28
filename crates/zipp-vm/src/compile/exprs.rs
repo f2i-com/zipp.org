@@ -363,7 +363,7 @@ impl<'a> FnCompiler<'a> {
             E::Logical { op, left, right } => self.logical(*op, left, right, dst),
             E::Unary { op, arg } => self.unary(*op, arg, dst),
             E::Update { op, prefix, target } => self.update(*op, *prefix, target, dst),
-            E::Assign { op, target, value } => self.assign(*op, target, value, dst),
+            E::Assign { op, target, value, .. } => self.assign(*op, target, value, dst),
             E::Cond { test, cons, alt } => self.conditional(test, cons, alt, dst),
             E::Yield { arg, delegate } => self.yield_expr(arg.as_deref(), *delegate, dst),
             E::Await(a) => self.await_expr(a, dst),
@@ -1915,6 +1915,11 @@ impl<'a> FnCompiler<'a> {
         };
         // Strict mode: `eval++` / `--arguments` is an early SyntaxError.
         strict_name_err(self.cx.in_strict, &name)?;
+        // `x++` starts with GetValue(lref), so a name still in its Temporal Dead
+        // Zone throws before anything else runs — see `emit_tdz_store_throw`.
+        if self.emit_tdz_store_throw(&name) {
+            return Ok(dst);
+        }
         // Inside a `with`, the updated identifier may be a property of an active
         // with-object (innermost first): read → increment → write through it.
         let with_objs = self.with_obj_regs(&name);

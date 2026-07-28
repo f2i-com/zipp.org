@@ -817,7 +817,14 @@ impl<'p> Vm<'p> {
         }
         let drain = match self.heap.get(v.heap_index()) {
             HeapObj::Generator { .. } => true,
-            HeapObj::Object(_) => {
+            // `HeapObj::Intl` is here for %Segments% and %SegmentIterator%: both
+            // are branded exotic objects that carry a `@@iterator` method like an
+            // ordinary object, and without this arm they fell through to `_ =>
+            // false` and the positional walk read `segments[0]`, `segments[1]`, …
+            // off the Segments object — so `const [a, b] = seg.segment(s)` bound
+            // two undefineds instead of the first two Segment Data Objects
+            // (Segmenter/prototype/segment/segment-tostring.js).
+            HeapObj::Object(_) | HeapObj::Intl { .. } => {
                 let it = self.get_prop(v, "@@iterator")?;
                 self.is_callable(it)
             }
@@ -1192,8 +1199,12 @@ impl<'p> Vm<'p> {
             return Ok(out);
         }
         // A user iterator object (one with a `next()` method) or a built-in
-        // Iterator: drain it.
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
+        // Iterator: drain it. `HeapObj::Intl` is in the list for
+        // %SegmentIterator% — the same reason `IterNext` carries it — because
+        // without it `[...segmenter.segment(s)]` fell past this drain to the
+        // positional plan below and reported the iterator "not iterable", even
+        // though `for-of` over the same object worked.
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } | HeapObj::Intl { .. }) {
             let next = self.get_prop(v, "next")?;
             if self.is_callable(next) {
                 let mut out = Vec::new();

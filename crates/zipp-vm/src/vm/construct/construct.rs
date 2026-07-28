@@ -180,8 +180,26 @@ impl<'p> Vm<'p> {
                 // the common `new other.X()` case keeps the facade (cv) so the
                 // REALM's prototype applies.
                 let nt = if new_target == cv { cv } else { new_target };
+                // The delegated [[Construct]] runs ON BEHALF OF the child realm,
+                // so any intrinsic object it allocates internally belongs to that
+                // realm: `new g.AggregateError([e]).errors` must have
+                // `g.Array.prototype` (staging/sm/Error/AggregateError.js line 85).
+                // `native_callee_realm` is the existing "which realm's built-in is
+                // running" context that `alloc_array_current_realm` consults.
+                let prev_ncr = self.native_callee_realm;
+                self.native_callee_realm = Some(cr);
                 let res = self.construct_with_newtarget(Value::heap(main), args, nt);
+                self.native_callee_realm = prev_ncr;
                 self.active_realm = prev_realm;
+                // Same rule as the call route: an INTERNAL throw from the realm's
+                // own [[Construct]] carries that realm's error identity.
+                if let Err(ref t) = res {
+                    if self.pending_throw.is_none() {
+                        let e = self.alloc_error_from_message(&t.0);
+                        self.realm_adopt_error_to(e, cr);
+                        self.pending_throw = Some(e);
+                    }
+                }
                 let res = res?;
                 if res.is_heap() {
                     self.obj_realm.insert(res.heap_index(), cr);
@@ -415,11 +433,31 @@ impl<'p> Vm<'p> {
             return Ok(self.set_ctor_proto(r, over));
         }
         if let Some(k) = self.ta_ctors.iter().position(|&c| c == ci && ci != 0) {
+            // 23.2.5.1 steps 5 and 6.b.i: with NO arguments, or an OBJECT first
+            // argument, AllocateTypedArray runs FIRST — and its
+            // OrdinaryCreateFromConstructor does Get(NewTarget, "prototype"), so a
+            // throwing `prototype` accessor must win over the byteOffset/length
+            // ToIndex coercions and the detached-buffer check that
+            // InitializeTypedArrayFromArrayBuffer performs
+            // (staging/sm/TypedArray/constructor-buffer-sequence.js line 71).
+            // Step 6.c is the other way round for a PRIMITIVE first argument
+            // (ToIndex(firstArgument), THEN AllocateTypedArray), so that order is
+            // kept below.
+            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            let alloc_first = args.is_empty() || self.is_object_value(a0);
+            let early = if alloc_first {
+                Some(self.newtarget_proto_override(new_target, cv, self.ta_protos[k])?)
+            } else {
+                None
+            };
             let r = self.build_typed_array(k as u8, args)?;
             // OrdinaryCreateFromConstructor: a foreign/derived newTarget sets the
             // instance's [[Prototype]] (cross-realm intrinsic fallback when its
             // .prototype is not an object).
-            let over = self.newtarget_proto_override(new_target, cv, self.ta_protos[k])?;
+            let over = match early {
+                Some(o) => o,
+                None => self.newtarget_proto_override(new_target, cv, self.ta_protos[k])?,
+            };
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.ta_base_ctor && ci != 0 {
@@ -998,6 +1036,22 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<bool, Thrown> {
         let oidx = obj.heap_index();
+        // A `$262.createRealm()` FACADE constructor mirrors a main-realm built-in,
+        // so `class B extends g.ArrayBuffer` must brand exactly like `class B
+        // extends ArrayBuffer`. Every test below compares against a MAIN ctor /
+        // MAIN `.prototype` heap index, which a facade never matches — the
+        // instance stayed a plain Object and its `byteLength` getter then threw
+        // "incompatible receiver" (staging/sm/ArrayBuffer/slice-species.js line
+        // 131). Only the branding decision is re-homed: the instance keeps the
+        // subclass prototype captured below, so the realm identity survives.
+        let cval = match cval
+            .is_heap()
+            .then(|| self.realm_ctor_main.get(&cval.heap_index()).copied())
+            .flatten()
+        {
+            Some(main) => Value::heap(main),
+            None => cval,
+        };
         // `class S extends Symbol/BigInt`: super() must throw — neither is a
         // constructor ([[Construct]] is absent). Checked FIRST: these ctors have
         // no .prototype mapping, so the pidx lookup below would bail before it.

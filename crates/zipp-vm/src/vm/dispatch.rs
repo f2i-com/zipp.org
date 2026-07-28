@@ -524,6 +524,11 @@ impl<'p> Vm<'p> {
                                     ip += 1;
                                     continue;
                                 }
+                                // See StoreGlobal: re-creating a deleted binding
+                                // lifts DeleteGlobal's deletion record.
+                                if !self.deleted_globals.is_empty() {
+                                    self.deleted_globals.remove(&name);
+                                }
                             }
                         }
                         self.globals[idx as usize] = v;
@@ -556,6 +561,13 @@ impl<'p> Vm<'p> {
                                     self.set_prop(gobj, &name, v, false)?;
                                     ip += 1;
                                     continue;
+                                }
+                                // Re-CREATING a deleted binding (`delete Function;
+                                // Function = 1`) makes it a global-object property
+                                // again, so lift the deletion record DeleteGlobal
+                                // left behind. Empty until something is deleted.
+                                if !self.deleted_globals.is_empty() {
+                                    self.deleted_globals.remove(&name);
                                 }
                             }
                         }
@@ -3432,6 +3444,8 @@ impl<'p> Vm<'p> {
                             items.push(self.get(base, arg_base + i));
                         }
                         let v = Value::heap(self.heap.alloc(HeapObj::Array(items)));
+                        // ArrayCreate uses the CURRENT realm's %Array.prototype%.
+                        self.realm_born(v.heap_index(), self.arr_proto);
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -3439,6 +3453,8 @@ impl<'p> Vm<'p> {
                         let v = Value::heap(
                             self.heap.alloc(HeapObj::Object(Box::new(ObjMap::with_capacity(hint as usize)))),
                         );
+                        // OrdinaryObjectCreate uses the CURRENT realm's %Object.prototype%.
+                        self.realm_born(v.heap_index(), self.obj_proto);
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -4289,6 +4305,17 @@ impl<'p> Vm<'p> {
                         if ok {
                             if let Some(g) = self.globals.get_mut(slot as usize) {
                                 *g = Value::UNINITIALIZED;
+                            }
+                            // Clearing the SLOT is not enough for a BUILT-IN name:
+                            // `global_by_name` falls back to the builtin table, so
+                            // %Function% stayed visible to `"Function" in this` /
+                            // `globalThis.Function` after `delete Function`
+                            // (staging/sm/regress/regress-569306.js). Record the
+                            // removal the same way `delete globalThis.X` does.
+                            if let Some(name) = self.global_slot_name(slot) {
+                                if self.builtin_globals.contains_key(&name) {
+                                    self.deleted_globals.insert(name);
+                                }
                             }
                         }
                         self.set(base, dst, Value::bool(ok));
@@ -5234,8 +5261,12 @@ impl<'p> Vm<'p> {
                                 ));
                             }
                             let mut method = self.get_member(v, "@@asyncDispose", v)?;
+                            // Only the @@dispose FALLBACK gets the result-discarding
+                            // shim — see `sync_dispose_shim`.
+                            let mut sync_fallback = false;
                             if !self.is_callable(method) {
                                 method = self.get_member(v, "@@dispose", v)?;
+                                sync_fallback = true;
                             }
                             if !self.is_callable(method) {
                                 return Err(Thrown(
@@ -5243,11 +5274,20 @@ impl<'p> Vm<'p> {
                                         .into(),
                                 ));
                             }
-                            let disposer = Value::heap(self.heap.alloc(HeapObj::Bound {
-                                target: method,
-                                this: v,
-                                args: Vec::new(),
-                            }));
+                            let disposer = if sync_fallback {
+                                let shim = self.sync_dispose_shim()?;
+                                Value::heap(self.heap.alloc(HeapObj::Bound {
+                                    target: shim,
+                                    this: method,
+                                    args: vec![v],
+                                }))
+                            } else {
+                                Value::heap(self.heap.alloc(HeapObj::Bound {
+                                    target: method,
+                                    this: v,
+                                    args: Vec::new(),
+                                }))
+                            };
                             if let Some(d) = self.using_resources.get_mut(&id) {
                                 d.push(disposer);
                             }

@@ -804,6 +804,7 @@ impl<'s> Parser<'s> {
                     optional: false,
                 })),
                 value: Box::new(Expr::Ident(setter_param)),
+                covered: false,
             })]),
             is_async: false,
             is_generator: false,

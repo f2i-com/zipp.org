@@ -724,14 +724,34 @@ fn round_to_increment(int_s: &str, frac_s: &str, k: i64, inc: i64, mode: &str) -
     let rest_nonzero = rest.bytes().any(|b| b != b'0');
     let inc = inc as i128;
     let lo = (q / inc) * inc;
-    // Distance from the lower multiple, in units of 1/2 the increment, using the
-    // dropped tail only to break an exact tie.
+    // Where the value sits relative to the MIDPOINT of [lo, lo+inc]. The exact
+    // distance from `lo` is `off + 0.rest`, so the comparison is
+    // `2*(off + 0.rest)` against `inc` — and the `0.rest` term matters whenever
+    // the increment is ODD, because then the midpoint itself has a fractional
+    // digit. Comparing `2*off` alone (which is what this did) put 1.750 at
+    // `4 < 5` = below the midpoint of [1.5, 2.0] and rounded it DOWN to 1.5,
+    // where halfExpand must round the exact tie away from zero to 2.0
+    // (NumberFormat/prototype/format/format-rounding-increment-{5,25}.js).
     let off = q - lo;
-    let cmp = (off * 2).cmp(&inc);
-    let cmp = if cmp == std::cmp::Ordering::Equal && rest_nonzero {
+    // `d = inc - 2*off` is what `2*0.rest` (which lies in [0, 2)) must beat.
+    let d = inc - off * 2;
+    let cmp = if d < 0 {
         std::cmp::Ordering::Greater
+    } else if d > 1 {
+        std::cmp::Ordering::Less
+    } else if d == 0 {
+        // Midpoint is exactly at digit position k: any dropped tail is above it.
+        if rest_nonzero { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
     } else {
-        cmp
+        // d == 1: the midpoint is `off` + 0.5, so compare the dropped tail
+        // `0.rest` against one half.
+        let first = rest.bytes().next().unwrap_or(b'0');
+        match first.cmp(&b'5') {
+            std::cmp::Ordering::Equal if rest[1..].bytes().any(|b| b != b'0') => {
+                std::cmp::Ordering::Greater
+            }
+            other => other,
+        }
     };
     let nonzero = off != 0 || rest_nonzero;
     let last_odd = (lo / inc) % 2 == 1;

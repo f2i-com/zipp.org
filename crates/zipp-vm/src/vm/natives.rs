@@ -176,6 +176,7 @@ impl<'p> Vm<'p> {
             let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
             let mut fell_back = false;
             let mut ta_chain_node: Option<u32> = None;
+            let mut proxy_chain_node: Option<Value> = None;
             let mut cur = a0;
             loop {
                 match self.heap.get(cur.heap_index()) {
@@ -196,6 +197,16 @@ impl<'p> Vm<'p> {
                         ta_chain_node = Some(cur.heap_index());
                         break;
                     }
+                    // A PROXY on the prototype chain GOVERNS the write: OrdinarySet
+                    // recurses as parent.[[Set]](P, V, Receiver), so the `set` trap
+                    // runs with the ORIGINAL receiver. Falling through to the generic
+                    // arm below skipped the trap entirely, which is what
+                    // `super.prop = v` reaching a proxied prototype hit
+                    // (staging/sm/class/superPropProxies.js line 23).
+                    HeapObj::Proxy { .. } => {
+                        proxy_chain_node = Some(cur);
+                        break;
+                    }
                     _ => {
                         fell_back = true;
                         break;
@@ -206,6 +217,16 @@ impl<'p> Vm<'p> {
                     break;
                 }
                 cur = p;
+            }
+            if let Some(p) = proxy_chain_node {
+                // Same two steps the `a0`-is-a-Proxy case above takes: the trap's
+                // boolean, or (no trap) a receiver-aware forward to the target.
+                if let Some(b) = self.proxy_set_bool(p, &key, value, receiver)? {
+                    return Ok(b);
+                }
+                if let Some((t, _, _)) = self.proxy_parts(p.heap_index()) {
+                    return self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false);
+                }
             }
             if let Some(c) = ta_chain_node {
                 // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
@@ -376,8 +397,26 @@ impl<'p> Vm<'p> {
                 m.set("configurable", Value::TRUE);
             }
             let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
-            self.object_define_property(receiver, &key, desc)?;
-            return Ok(true);
+            return match self.object_define_property(receiver, &key, desc) {
+                Ok(()) => Ok(true),
+                // OrdinarySetWithOwnDescriptor steps 3.e.iv / 3.f RETURN the
+                // [[DefineOwnProperty]] boolean — a `defineProperty` trap that
+                // answers falsish makes the whole [[Set]] false (Reflect.set
+                // reports it; an assignment silently no-ops). Propagating the
+                // internal rejection as a throw made `Reflect.set(obj, k, v,
+                // proxyReceiver)` raise a TypeError instead
+                // (staging/sm/Reflect/set.js line 275). The trap's OWN abrupt
+                // completion still propagates — the same message discrimination
+                // Reflect.defineProperty uses.
+                Err(e)
+                    if e.0.starts_with(
+                        "TypeError: proxy 'defineProperty' trap returned falsish",
+                    ) =>
+                {
+                    Ok(false)
+                }
+                Err(e) => Err(e),
+            };
         }
         if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)
@@ -1108,6 +1147,35 @@ impl<'p> Vm<'p> {
         main_proto
     }
 
+    /// OrdinaryObjectCreate / ArrayCreate take their [[Prototype]] from the
+    /// CURRENT Realm Record's intrinsics (10.1.12, 10.4.2.2). zipp leaves an
+    /// ordinary object's [[Prototype]] IMPLICIT — no `proto_of` entry means
+    /// %Object.prototype% / %Array.prototype% — which silently bound EVERY
+    /// object born inside a `$262.createRealm()` child to the MAIN realm's
+    /// intrinsics: `g.eval("var a = [1,2,3]")` produced an array whose
+    /// `constructor` was the main `Array`, so ArraySpeciesCreate on it picked
+    /// the wrong realm's %Array% (staging/sm/Array/species.js line 156) and
+    /// `new g.AggregateError([x]).errors` had the main %Array.prototype%
+    /// (staging/sm/Error/AggregateError.js line 85).
+    ///
+    /// Write the link EXPLICITLY when a child realm's code is what created the
+    /// object. `realm_global_objs` is empty until `$262.createRealm()` is called,
+    /// so this is one `is_empty` branch for every ordinary program.
+    #[inline]
+    pub(crate) fn realm_born(&mut self, idx: u32, main_proto: u32) {
+        if self.realm_global_objs.is_empty() {
+            return;
+        }
+        let r = match self.current_realm_id() {
+            Some(r) => r,
+            None => return,
+        };
+        if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_proto)) {
+            self.proto_of.insert(idx, Value::heap(rp));
+        }
+        self.obj_realm.insert(idx, r);
+    }
+
     /// Tag a freshly-created function/class with the realm whose code created it
     /// (no-op in the main realm) — functions born inside a child realm's
     /// eval/Function code carry the child's realm for GetFunctionRealm,
@@ -1132,6 +1200,27 @@ impl<'p> Vm<'p> {
         }
         let Some(r) = self.current_realm_id() else { return };
         self.realm_adopt_error_to(err, r);
+    }
+
+    /// An internal built-in error raised where the built-in is EMULATED inline
+    /// instead of being invoked as a function value — the %DataView.prototype%
+    /// / %TypedArray%.prototype accessors that `proto_member_get` answers from
+    /// the instance. `call_value`'s realm plumbing never runs for those, so the
+    /// throw would carry the CALLER's error constructors; the spec creates it
+    /// with the realm of the accessor, which is the realm that owns the
+    /// prototype the walk reached (`Object.create(otherRealmView).buffer` must
+    /// throw `other.TypeError` — staging/sm/extensions/dataview.js line 1568).
+    pub(crate) fn realm_thrown_from_proto(&mut self, obj_idx: u32, msg: String) -> Thrown {
+        if !self.realm_global_objs.is_empty() && self.pending_throw.is_none() {
+            let proto = self.proto_of.get(&obj_idx).copied().unwrap_or(Value::UNDEFINED);
+            let r = self.get_function_realm(proto);
+            if r != 0 {
+                let e = self.alloc_error_from_message(&msg);
+                self.realm_adopt_error_to(e, r);
+                self.pending_throw = Some(e);
+            }
+        }
+        Thrown(msg)
     }
 
     /// `realm_adopt_error` with an explicit target realm (used where the FUNCTION
@@ -5333,30 +5422,41 @@ impl<'p> Vm<'p> {
                     self.to_object(a1)?
                 };
                 self.opt_string(options, "localeMatcher", "best fit", &["lookup", "best fit"])?;
+                // LookupSupportedLocales: keep a requested tag only when
+                // BestAvailableLocale finds a match for its no-extension form.
+                // Returning the whole list unfiltered claimed support for every
+                // well-formed tag on earth, `zxx` ("no linguistic content")
+                // included — which is what every service's
+                // `supportedLocalesOf/basic.js` checks.
+                let list: Vec<String> = list
+                    .into_iter()
+                    .filter(|tag| {
+                        crate::vm::intl::best_available_locale(&crate::vm::intl::strip_extensions(
+                            tag,
+                        ))
+                        .is_some()
+                    })
+                    .collect();
                 let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
                 Value::heap(self.heap.alloc(HeapObj::Array(items)))
             }
-            INTL_RESOLVED_OPTIONS => {
+            n if n >= native::INTL_RESOLVED_OPTIONS_BASE
+                && n < native::INTL_RESOLVED_OPTIONS_BASE + 10 =>
+            {
+                let want = (n - native::INTL_RESOLVED_OPTIONS_BASE) as u8;
                 // UnwrapNumberFormat / UnwrapDateTimeFormat run BEFORE the brand
                 // check: a receiver produced by the legacy
                 // `Intl.DateTimeFormat.call(obj)` chaining carries the real
-                // service under %Intl%.[[FallbackSymbol]].
+                // service under %Intl%.[[FallbackSymbol]]. Only those two
+                // services have the legacy chaining, and only their own
+                // resolvedOptions unwraps.
                 let mut this = this;
-                for kind in [INTL_NUMBERFORMAT, INTL_DATETIMEFORMAT] {
-                    let un = self.intl_unwrap_legacy(this, kind)?;
-                    if un != this {
-                        this = un;
-                        break;
-                    }
+                if want == INTL_NUMBERFORMAT || want == INTL_DATETIMEFORMAT {
+                    this = self.intl_unwrap_legacy(this, want)?;
                 }
-                let resolved = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::Intl { resolved, .. }) => *resolved,
-                    _ => {
-                        return Err(Thrown(
-                            "TypeError: resolvedOptions called on an incompatible receiver".into(),
-                        ))
-                    }
-                };
+                // RequireInternalSlot names ONE slot: the receiver must be an
+                // instance of THIS service, not of any Intl service.
+                let resolved = self.intl_this(this, want, "resolvedOptions")?;
                 self.clone_plain_object(resolved)
             }
             INTL_NF_FORMAT => {
@@ -5436,6 +5536,20 @@ impl<'p> Vm<'p> {
                 let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, name)?;
                 if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
                     return Err(Thrown(format!("TypeError: {name} requires two dates")));
+                }
+                // ToDateTimeFormattable on BOTH endpoints (steps 4-5) before
+                // PartitionDateTimeRangePattern's SameTemporalType check (step
+                // 5a): a non-Temporal argument's valueOf runs even when the
+                // pairing is going to be rejected, and it runs for the second
+                // argument too
+                // (formatRange/to-datetime-formattable-with-different-arg-kinds.js
+                // counts the calls). A Temporal object passes through untouched.
+                let mut a0 = a0;
+                let mut a1 = a1;
+                for v in [&mut a0, &mut a1] {
+                    if self.dt_arg_kind(*v).is_none() {
+                        *v = Value::num(self.to_number_coerce(*v)?);
+                    }
                 }
                 // The endpoints must be the same kind of value: a Date/number
                 // range or a range of the SAME Temporal type, never a mix.
@@ -5582,8 +5696,16 @@ impl<'p> Vm<'p> {
                 // would (`en-us-numbering-systems.js` compares it against
                 // `Intl.NumberFormat(locale).format(value)`).
                 let rtf_ns = self.display(self.intl_slot(rtf_resolved, "numberingSystem"));
+                let rtf_seps = crate::vm::intl::numbering_separators(&rtf_ns);
                 for (t, val) in grouped_decimal_parts(n) {
-                    let val = crate::vm::intl::translate_digits(&val, &rtf_ns);
+                    // Digits AND separators, or this would print "١,٢٣٤" where
+                    // NumberFormat — the oracle the test compares against —
+                    // prints "١٬٢٣٤" for `-u-nu-arab`.
+                    let val = match (t, rtf_seps) {
+                        ("group", Some((_, g))) => g.to_string(),
+                        ("decimal", Some((d, _))) => d.to_string(),
+                        _ => crate::vm::intl::translate_digits(&val, &rtf_ns),
+                    };
                     parts.push((t.to_string(), val, unit.as_str()));
                 }
                 if !suffix.is_empty() {

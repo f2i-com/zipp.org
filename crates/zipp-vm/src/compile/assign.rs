@@ -110,6 +110,11 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn assign_target(&mut self, target: &Target, src: Reg) -> R<()> {
         match target {
             Target::Ident { name, .. } => {
+                // `src` is already computed, so the TDZ throw lands exactly where
+                // PutValue would — see `emit_tdz_store_throw`.
+                if self.emit_tdz_store_throw(name) {
+                    return Ok(());
+                }
                 let b = self.resolve(name);
                 self.store_binding(&b, src);
                 Ok(())
@@ -346,6 +351,9 @@ impl<'a> FnCompiler<'a> {
         // this one never has, and the gate is byte-identical bytecode.
         match target {
             Target::Ident { name, .. } => {
+                if self.emit_tdz_store_throw(name) {
+                    return Ok(());
+                }
                 let b = self.resolve(name);
                 self.store_binding(&b, val);
                 Ok(())
@@ -615,8 +623,10 @@ impl<'a> FnCompiler<'a> {
                         if let Some(init) = &prop.default {
                             self.apply_default_in_place_named(val, init, Some(&**name))?;
                         }
-                        let b = self.resolve(name);
-                        self.store_binding(&b, val);
+                        if !self.emit_tdz_store_throw(name) {
+                            let b = self.resolve(name);
+                            self.store_binding(&b, val);
+                        }
                     }
                     _ => {
                         self.assign_maybe_default(&prop.target, prop.default.as_ref(), val)?;
@@ -646,8 +656,10 @@ impl<'a> FnCompiler<'a> {
                         // `({x = function(){}} = o)` ⇒ default takes the name "x".
                         self.apply_default_in_place_named(val, init, Some(&**name))?;
                     }
-                    let b = self.resolve(name);
-                    self.store_binding(&b, val);
+                    if !self.emit_tdz_store_throw(name) {
+                        let b = self.resolve(name);
+                        self.store_binding(&b, val);
+                    }
                 }
                 _ => {
                     // `({key: target} = o)`. For a MEMBER target the spec
@@ -982,6 +994,20 @@ impl<'a> FnCompiler<'a> {
         };
         // Strict mode: assignment to `eval`/`arguments` is an early SyntaxError.
         strict_name_err(self.cx.in_strict, &name)?;
+        // Assigning to a name still in its Temporal Dead Zone throws — see
+        // `emit_tdz_store_throw`. A compound/logical operator's GetValue throws
+        // BEFORE the RHS is evaluated; a plain `=` evaluates the RHS first and
+        // only then performs PutValue, so its throw is emitted after.
+        if self.param_tdz.contains(&name) {
+            if op == AssignOp::Assign {
+                let v = self.expr_into(value, dst)?;
+                if v != dst {
+                    self.emit(Instr::Move { dst, src: v });
+                }
+            }
+            self.emit_tdz_store_throw(&name);
+            return Ok(dst);
+        }
         // Inside a `with`, an assignment target may be a property of an active
         // with-object (innermost first), else the static binding.
         let with_objs = self.with_obj_regs(&name);

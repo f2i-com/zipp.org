@@ -1158,8 +1158,19 @@ impl Compiler {
                 }
             }
         }
-        for s in body {
-            fc.stmt(s)?;
+        // A class method / constructor / accessor / `static {}` body is a
+        // FunctionBody (resp. ClassStaticBlockBody) like any other, so a
+        // TOP-LEVEL `using` in it must dispose on exit — the same finally
+        // desugar `compile_function_body` applies. Without this the resource was
+        // registered and never disposed, so `class C { static { using x = r; } }`
+        // never ran r[Symbol.dispose]
+        // (staging/explicit-resource-management/call-dispose-methods.js).
+        if FnCompiler::block_has_using(body) {
+            fc.compile_using_block(body, false)?;
+        } else {
+            for s in body {
+                fc.stmt(s)?;
+            }
         }
         fc.cx.in_strict = parent_strict; // restore after the (strict) class body
         fc.cx.new_target_ok = parent_nt;

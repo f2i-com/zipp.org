@@ -225,11 +225,9 @@ impl<'p> Vm<'p> {
         Ok(out)
     }
 
-    /// Pick the resolved locale: the first requested tag (we "support" all), else
-    /// the default "en".
     pub(crate) fn resolve_locale(&mut self, locales: Value) -> Result<String, Thrown> {
         let list = self.canonicalize_locale_list(locales)?;
-        Ok(list.into_iter().next().unwrap_or_else(|| "en".to_string()))
+        Ok(lookup_matcher(&list))
     }
 
     /// Read + ToString-cast a string option (returns `default` if undefined),
@@ -756,7 +754,7 @@ impl<'p> Vm<'p> {
             None
         };
         self.opt_string(options, "localeMatcher", "best fit", &["lookup", "best fit"])?;
-        let locale = requested.into_iter().next().unwrap_or_else(|| "en".to_string());
+        let locale = lookup_matcher(&requested);
         let loc = self.alloc_str(locale.clone());
         let mut r = ObjMap::new();
         r.set("locale", loc);
@@ -819,8 +817,15 @@ impl<'p> Vm<'p> {
                 )?;
                 // The fraction-digit defaults depend on the style: a currency uses
                 // its minor-unit count, a percent 0, anything else 0..3.
+                // InitializeNumberFormat step 19 gates the currency case on
+                // `notation is "standard"` — under scientific/engineering the
+                // minor-unit count is NOT the default, so KWD reported 3..3 where
+                // the spec's step 20 says 0..3
+                // (NumberFormat/currency-digits-nonstandard-notation.js).
+                // `compact` reaches SetNumberFormatDigitOptions' morePrecision
+                // branch, which overrides both regardless.
                 let (mnfd_def, mxfd_def) = match style.as_str() {
-                    "currency" => {
+                    "currency" if notation == "standard" => {
                         let d = currency_digits(currency.as_deref().unwrap_or("USD"));
                         (d, d)
                     }
@@ -1070,29 +1075,33 @@ impl<'p> Vm<'p> {
                 // hourCycle/hour12 are reported only when the resolved pattern has
                 // an hour field — an explicit `hour` component or any timeStyle.
                 let has_hour = vals.iter().any(|(n, _)| *n == "hour") || time_style.is_some();
-                if has_hour {
-                    // An explicit `hour12` overrides both the `hourCycle` option
-                    // and `-u-hc-`, and (ECMA-402) drops the keyword from the
-                    // resolved locale; otherwise this is an ordinary
-                    // option-then-extension resolution.
-                    let hc = match (hour12, hour_cycle_opt.clone()) {
-                        // hour12:false is h23; hour12:true keeps the locale's
-                        // 12-hour cycle (h12 for the en-style default).
-                        (Some(false), _) => "h23".to_string(),
-                        (Some(true), _) => "h12".to_string(),
-                        (None, opt) => {
-                            let (v, keep) = resolve_ext_key(
-                                opt,
-                                ext("hc"),
-                                &["h11", "h12", "h23", "h24"],
-                                "h12",
-                            );
-                            if keep {
-                                ext_used.push(("hc", v.clone()));
-                            }
-                            v
+                // An explicit `hour12` overrides both the `hourCycle` option
+                // and `-u-hc-`, and (ECMA-402) drops the keyword from the
+                // resolved locale; otherwise this is an ordinary
+                // option-then-extension resolution.
+                //
+                // ResolveLocale runs over ["ca","nu","hc"] BEFORE the component
+                // options are read, so a `-u-hc-` the request carried stays in
+                // [[Locale]] whether or not the resolved pattern ends up with an
+                // hour field. Only the `hourCycle`/`hour12` entries of
+                // resolvedOptions are gated on the hour
+                // (`resolvedOptions/resolved-locale-with-hc-unicode.js` asserts
+                // exactly that split, "Without hour option").
+                let hc = match (hour12, hour_cycle_opt.clone()) {
+                    // hour12:false is h23; hour12:true keeps the locale's
+                    // 12-hour cycle (h12 for the en-style default).
+                    (Some(false), _) => "h23".to_string(),
+                    (Some(true), _) => "h12".to_string(),
+                    (None, opt) => {
+                        let (v, keep) =
+                            resolve_ext_key(opt, ext("hc"), &["h11", "h12", "h23", "h24"], "h12");
+                        if keep {
+                            ext_used.push(("hc", v.clone()));
                         }
-                    };
+                        v
+                    }
+                };
+                if has_hour {
                     let is12 = hc == "h11" || hc == "h12";
                     let hcv = self.alloc_str(hc);
                     r.set("hourCycle", hcv);
@@ -1571,36 +1580,64 @@ impl<'p> Vm<'p> {
 
     /// CompareStrings for a resolved `Intl.Collator`.
     ///
-    /// There is no DUCET/CLDR collation here — this is an NFC code-point
-    /// comparison. The two option-driven transforms that do NOT need collation
-    /// weights are applied: `ignorePunctuation` drops the characters CLDR treats
-    /// as variable (whitespace, punctuation and symbols), and
-    /// `sensitivity: "base"/"accent"` case-folds.
+    /// **There is still no DUCET/CLDR collation here.** What this DOES implement
+    /// is the part of ECMA-402 §10.3.2 that is not weight data at all: the
+    /// multi-level comparison the four `sensitivity` values name. A string is
+    /// decomposed (NFD) into three keys —
+    ///
+    /// * **primary** — the base characters (combining marks removed), lowercased
+    /// * **secondary** — the combining marks, in order
+    /// * **tertiary** — the case of each base character
+    ///
+    /// — and `sensitivity` chooses how many of them count: `"base"` primary
+    /// only, `"accent"` primary+secondary, `"case"` primary+tertiary, `"variant"`
+    /// all three. Ties at the tertiary level order lowercase before uppercase,
+    /// which is the DUCET tertiary weight ordering (0x0002 for small letters,
+    /// 0x0008 for capitals) and what `caseFirst: "upper"` exists to reverse.
+    ///
+    /// The primary level still orders base characters **by code point**, because
+    /// zipp ships no `allkeys_CLDR.txt`. That agrees with the root collation
+    /// across ASCII Latin and any script whose code points already run in
+    /// alphabetical order, and is not guaranteed to elsewhere — a real weight
+    /// table is the only fix for that, and
+    /// `Collator/prototype/compare/non-normative-*.js` are the tests that would
+    /// notice. Locale collation TAILORINGS (German `search` folding ä to "ae",
+    /// `-u-co-phonebk`) are likewise absent; `Collator/usage-de.js` is theirs.
     ///
     /// Shared with `String.prototype.localeCompare`, which ECMA-402 specifies as
     /// `Intl.Collator(locales, options).compare(this, that)` — so the two agree
     /// by construction rather than by two copies of the same approximation
     /// (`localeCompare/returns-same-results-as-Collator.js`).
     pub(crate) fn collator_compare(&self, resolved: u32, a: &str, b: &str) -> f64 {
-        use unicode_normalization::UnicodeNormalization;
         let ignore_punct = self.intl_slot(resolved, "ignorePunctuation") == Value::bool(true);
         let sens = self.display(self.intl_slot(resolved, "sensitivity"));
-        let prep = |s: &str| -> String {
-            let s: String = s.nfc().collect();
-            let s: String = if ignore_punct {
-                s.chars().filter(|c| !is_variable_collation_char(*c)).collect()
-            } else {
-                s
-            };
-            if sens == "base" || sens == "accent" { s.to_lowercase() } else { s }
+        let upper_first = self.display(self.intl_slot(resolved, "caseFirst")) == "upper";
+        let key = |s: &str| collation_key(s, ignore_punct);
+        let (ka, kb) = (key(a), key(b));
+        let ord = match ka.0.cmp(&kb.0) {
+            std::cmp::Ordering::Equal => {
+                // Secondary (accents) is skipped by "base" and "case"; tertiary
+                // (case) is skipped by "base" and "accent".
+                let sec = if sens == "accent" || sens == "variant" {
+                    ka.1.cmp(&kb.1)
+                } else {
+                    std::cmp::Ordering::Equal
+                };
+                if sec != std::cmp::Ordering::Equal {
+                    sec
+                } else if sens == "case" || sens == "variant" {
+                    let t = ka.2.cmp(&kb.2);
+                    if upper_first { t.reverse() } else { t }
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }
+            other => other,
         };
-        let (a, b) = (prep(a), prep(b));
-        if a < b {
-            -1.0
-        } else if a > b {
-            1.0
-        } else {
-            0.0
+        match ord {
+            std::cmp::Ordering::Less => -1.0,
+            std::cmp::Ordering::Greater => 1.0,
+            std::cmp::Ordering::Equal => 0.0,
         }
     }
 
@@ -2567,9 +2604,21 @@ impl<'p> Vm<'p> {
         // 'E'); the numbering system applies to the digit runs afterwards.
         let ns = self.display(self.intl_slot(resolved, "numberingSystem"));
         if ns != "latn" {
+            let seps = numbering_separators(&ns);
             for (ty, v) in parts.iter_mut() {
-                if matches!(ty.as_str(), "integer" | "fraction" | "exponentInteger") {
-                    *v = translate_digits(v, &ns);
+                match ty.as_str() {
+                    "integer" | "fraction" | "exponentInteger" => *v = translate_digits(v, &ns),
+                    "decimal" => {
+                        if let Some((d, _)) = seps {
+                            *v = d.to_string();
+                        }
+                    }
+                    "group" => {
+                        if let Some((_, g)) = seps {
+                            *v = g.to_string();
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2842,7 +2891,14 @@ impl<'p> Vm<'p> {
     /// date pattern `EEEE, MMMM d, y` with the weekday, the year, and their
     /// commas gone (`temporal-plainmonthday-formatting-datetime-style.js`).
     /// A removed field takes the literal AFTER it, or, when nothing follows,
-    /// the literal before it.
+    /// the literal before it — except the DAY PERIOD, which takes the literal
+    /// BEFORE it. CLDR writes `en`'s medium time pattern as `h:mm:ss\u{202f}a`:
+    /// the NARROW NO-BREAK SPACE is the separator that binds "PM" to the clock
+    /// time, so under `-u-hc-h23` (which drops `a`) it must go with it and the
+    /// ordinary space that followed is what survives — `h:mm:ss\u{202f}a zzzz`
+    /// becomes `14:12:47 Coordinated Universal Time`, not
+    /// `14:12:47\u{202f}Coordinated Universal Time`
+    /// (`format/timedatestyle-en.js`, which hard-codes the plain space).
     fn dtf_filter(items: Vec<dtf_pattern::Item>, keep: &dyn Fn(char) -> bool) -> Vec<dtf_pattern::Item> {
         let n = items.len();
         let mut drop = vec![false; n];
@@ -2852,6 +2908,14 @@ impl<'p> Vm<'p> {
                 continue;
             }
             drop[i] = true;
+            if matches!(c, 'a' | 'b' | 'B')
+                && i > 0
+                && matches!(items[i - 1], dtf_pattern::Item::Lit(_))
+                && !drop[i - 1]
+            {
+                drop[i - 1] = true;
+                continue;
+            }
             let later = items[i + 1..]
                 .iter()
                 .any(|x| matches!(x, dtf_pattern::Item::Field(c, _) if keep(*c)));
@@ -3125,6 +3189,17 @@ impl<'p> Vm<'p> {
             for (ty, v) in out.iter_mut() {
                 if *ty != "literal" && *ty != "timeZoneName" && *ty != "dayPeriod" {
                     *v = translate_digits(v, &ns);
+                }
+            }
+            // FormatDateTimePattern step 11 formats the fractional seconds with
+            // a NumberFormat carrying [[NumberingSystem]], so the separator in
+            // front of them is that system's decimal separator, not the
+            // pattern's ASCII "." — `en-US-u-nu-arab` prints ٠٦٫٧٨٩.
+            if let Some((dec, _)) = numbering_separators(&ns) {
+                for i in 1..out.len() {
+                    if out[i].0 == "fractionalSecond" && out[i - 1] == ("literal", ".".to_string()) {
+                        out[i - 1].1 = dec.to_string();
+                    }
                 }
             }
         }
@@ -3490,6 +3565,28 @@ pub(crate) const AVAILABLE_NUMBERING_SYSTEMS: &[&str] = &[
     "wcho"
 ];
 
+/// The `(decimal, group)` separators a numbering system overrides in the CLDR
+/// **root** locale, i.e. independently of which locale is formatting.
+///
+/// Source: CLDR 47 `common/main/root.xml`, `<numbers><symbols numberSystem=…>`.
+/// Of the 75 numbering systems root names, exactly TWO carry their own
+/// separators — `arab` and `arabext`, both U+066B ARABIC DECIMAL SEPARATOR and
+/// U+066C ARABIC THOUSANDS SEPARATOR; every other system inherits `latn`'s
+/// "." / ",". Verified value-by-value against node 24 (ICU 77.1, CLDR 47) over
+/// `latn, arab, arabext, deva, thai, hanidec, beng, fullwide` — all eight agree,
+/// and only the two Arabic ones differ from ASCII.
+///
+/// This is NOT locale content: it does not vary with the locale, which is why
+/// `en-u-nu-arab` gets `٫` even though CLDR `en` itself only ships `latn`
+/// symbols (`DateTimeFormat/prototype/format/numbering-system.js` requires
+/// exactly that).
+pub(crate) fn numbering_separators(ns: &str) -> Option<(&'static str, &'static str)> {
+    match ns {
+        "arab" | "arabext" => Some(("\u{66b}", "\u{66c}")),
+        _ => None,
+    }
+}
+
 /// Map the ASCII digits of an already-formatted number into `ns`. Everything
 /// else (signs, separators, currency symbols) is untouched — the separators are
 /// locale data this engine does not have, but the DIGITS are not.
@@ -3584,6 +3681,33 @@ pub(crate) fn is_variable_collation_char(c: char) -> bool {
     !c.is_alphanumeric() && !unicode_normalization::char::is_combining_mark(c)
 }
 
+/// The (primary, secondary, tertiary) sort key `collator_compare` documents:
+/// NFD, then split each scalar into its base-letter, accent and case
+/// contributions. `ignore_punct` drops the variable characters first, so they
+/// affect no level at all.
+///
+/// The case level records one flag per BASE character rather than per scalar of
+/// the lowercased primary, because a full case mapping can change length
+/// (U+0130 lowercases to two scalars) and the two levels must stay independent.
+fn collation_key(s: &str, ignore_punct: bool) -> (String, String, Vec<u8>) {
+    use unicode_normalization::UnicodeNormalization;
+    let mut primary = String::with_capacity(s.len());
+    let mut secondary = String::new();
+    let mut case = Vec::new();
+    for c in s.nfd() {
+        if ignore_punct && is_variable_collation_char(c) {
+            continue;
+        }
+        if unicode_normalization::char::is_combining_mark(c) {
+            secondary.push(c);
+            continue;
+        }
+        primary.extend(c.to_lowercase());
+        case.push(u8::from(c.is_uppercase()));
+    }
+    (primary, secondary, case)
+}
+
 /// IsValidDisplayNamesCode + CanonicalCodeForDisplayNames (ECMA-402 12.5.2):
 /// validate `Intl.DisplayNames.prototype.of`'s argument against the instance's
 /// `type` and return it in canonical case, or `None` for a RangeError. Pure
@@ -3661,6 +3785,103 @@ pub(crate) fn is_well_formed_type_code(s: &str) -> bool {
 /// Whether a canonical tag carries a `-u-<key>` keyword at all, with or without
 /// a value — `-u-kn` (the canonical form of `-u-kn-true`) has no value subtag,
 /// so `unicode_ext_value` alone cannot distinguish it from an absent key.
+/// `[[AvailableLocales]]` — the locales this engine actually has content for.
+///
+/// It is `["en", "en-US"]` because `vm/cldr_en.rs` is the whole of the locale
+/// data zipp ships (CLDR 47 `en`, V8's `small-icu` shape). This list must never
+/// grow past what is bundled: an engine that answers `supportedLocalesOf(["de"])`
+/// with `["de"]` and then formats German with English month names is lying about
+/// what it can do, and `Intl.NumberFormat("de").resolvedOptions().locale === "de"`
+/// is the same lie in the other direction.
+///
+/// Sorted, and every entry is a canonical tag — `best_available_locale` relies
+/// on both.
+pub(crate) const AVAILABLE_LOCALES: &[&str] = &["en", "en-US"];
+
+/// DefaultLocale(). Must itself be in [[AvailableLocales]].
+pub(crate) const DEFAULT_LOCALE: &str = "en";
+
+/// A tag with its `-u-`, `-t-` and `-x-` extension sequences removed — the
+/// "noExtensionsLocale" every matcher works on.
+pub(crate) fn strip_extensions(tag: &str) -> String {
+    let mut out: Vec<&str> = vec![];
+    let mut skipping = false;
+    for (i, sub) in tag.split('-').enumerate() {
+        // A singleton subtag (one alphanumeric) opens an extension sequence that
+        // runs to the next singleton or the end. Position 0 can never be one.
+        if i > 0 && sub.len() == 1 {
+            skipping = true;
+            continue;
+        }
+        if !skipping {
+            out.push(sub);
+        }
+    }
+    out.join("-")
+}
+
+/// The `-u-` extension subtags of a tag ("ca-buddhist-nu-arab"), or `None`.
+pub(crate) fn unicode_extension_of(tag: &str) -> Option<String> {
+    let rest = tag.split("-u-").nth(1)?;
+    // The `-u-` sequence ends at the next singleton subtag (`-t-`, `-x-`, …).
+    let mut out: Vec<&str> = vec![];
+    for sub in rest.split('-') {
+        if sub.len() == 1 {
+            break;
+        }
+        out.push(sub);
+    }
+    (!out.is_empty()).then(|| out.join("-"))
+}
+
+/// ResolveLocale's LookupMatcher (ECMA-402 9.2.3): the first requested tag
+/// whose no-extension form has a BestAvailableLocale match, carrying that tag's
+/// `-u-` extension forward so the callers' `unicode_ext_value` still sees the
+/// requested keywords.
+///
+/// No match anywhere falls back to DefaultLocale() and — per LookupMatcher
+/// step 5 — WITHOUT an extension: the keywords of a locale the engine does not
+/// have say nothing about the one it will actually use. That is why
+/// `new Intl.DateTimeFormat("de-u-hc-h11")` resolves to plain `en` here rather
+/// than to `en-u-hc-h11` (`resolvedOptions/hourCycle.js` wants the h11, and
+/// only a `de` in [[AvailableLocales]] would earn it).
+pub(crate) fn lookup_matcher(requested: &[String]) -> String {
+    requested
+        .iter()
+        .find_map(|tag| {
+            best_available_locale(&strip_extensions(tag)).map(|found| {
+                // Only the `-u-` travels; `-t-`/`-x-` carry no
+                // [[RelevantExtensionKeys]].
+                match unicode_extension_of(tag) {
+                    Some(ext) => format!("{found}-u-{ext}"),
+                    None => found,
+                }
+            })
+        })
+        .unwrap_or_else(|| DEFAULT_LOCALE.to_string())
+}
+
+/// BestAvailableLocale (ECMA-402 9.2.2): the longest prefix of `locale` that is
+/// in [[AvailableLocales]], truncating one subtag at a time and never leaving a
+/// trailing single-character subtag behind. `locale` must already have its
+/// extensions stripped.
+pub(crate) fn best_available_locale(locale: &str) -> Option<String> {
+    let mut candidate = locale.to_string();
+    loop {
+        if AVAILABLE_LOCALES.iter().any(|a| a.eq_ignore_ascii_case(&candidate)) {
+            return Some(candidate);
+        }
+        let Some(pos) = candidate.rfind('-') else { return None };
+        // Step 2c: if the truncation would leave a one-character subtag
+        // dangling ("en-a-bbb" → "en-a"), drop that too.
+        let cut = if pos >= 2 && candidate.as_bytes()[pos - 2] == b'-' { pos - 2 } else { pos };
+        candidate.truncate(cut);
+        if candidate.is_empty() {
+            return None;
+        }
+    }
+}
+
 pub(crate) fn unicode_ext_has_key(tag: &str, key: &str) -> bool {
     match tag.split("-u-").nth(1) {
         Some(ext) => ext.split('-').any(|t| t == key),
@@ -3853,4 +4074,40 @@ pub(crate) fn time_zone_offset_minutes_at(tz: &str, ms: i128) -> Option<i64> {
 /// sec-availablenamedtimezoneidentifiers step 5.c).
 pub(crate) fn available_time_zones() -> Vec<String> {
     crate::vm::temporal::tzdb::primary_ids().into_iter().map(str::to_string).collect()
+}
+
+#[cfg(test)]
+mod locale_matcher_tests {
+    use super::*;
+
+    #[test]
+    fn best_available_truncates_subtag_by_subtag() {
+        assert_eq!(best_available_locale("en").as_deref(), Some("en"));
+        assert_eq!(best_available_locale("en-US").as_deref(), Some("en-US"));
+        // Not bundled, so it falls back to the parent that is.
+        assert_eq!(best_available_locale("en-GB").as_deref(), Some("en"));
+        assert_eq!(best_available_locale("en-Latn-GB").as_deref(), Some("en"));
+        assert_eq!(best_available_locale("de").as_deref(), None);
+        assert_eq!(best_available_locale("zxx").as_deref(), None);
+    }
+
+    #[test]
+    fn extensions_are_split_off_and_re_attached() {
+        assert_eq!(strip_extensions("en-US-u-ca-gregory-nu-latn"), "en-US");
+        assert_eq!(strip_extensions("en-u-hc-h11-x-priv"), "en");
+        assert_eq!(strip_extensions("en-Latn-US"), "en-Latn-US");
+        assert_eq!(unicode_extension_of("en-u-ca-gregory-x-p").as_deref(), Some("ca-gregory"));
+        assert_eq!(unicode_extension_of("en-US").as_deref(), None);
+    }
+
+    #[test]
+    fn lookup_matcher_keeps_the_extension_only_on_a_real_match() {
+        assert_eq!(lookup_matcher(&["en-u-hc-h11".into()]), "en-u-hc-h11");
+        assert_eq!(lookup_matcher(&["en-GB-u-hc-h11".into()]), "en-u-hc-h11");
+        // LookupMatcher step 5: the default locale, and the extension is gone.
+        assert_eq!(lookup_matcher(&["de-u-hc-h11".into()]), "en");
+        // The FIRST tag that MATCHES wins, not simply the first tag.
+        assert_eq!(lookup_matcher(&["de".into(), "en-US".into()]), "en-US");
+        assert_eq!(lookup_matcher(&[]), "en");
+    }
 }

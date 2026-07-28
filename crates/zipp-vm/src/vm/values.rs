@@ -55,6 +55,18 @@ impl<'p> Vm<'p> {
                 if k == "length" && idx == self.arr_proto && self.arr_proto != 0 {
                     return true;
                 }
+                // The global object's SLOT-backed own properties (script `var`s
+                // and function declarations, and the built-ins that never got an
+                // ObjMap entry). `globalThis.assert` read fine while
+                // `"assert" in globalThis` was false, because only the member-get
+                // and descriptor paths consulted the slot table
+                // (staging/sm/Reflect/set.js line 126).
+                if idx == self.global_this
+                    && self.global_this != 0
+                    && self.global_by_name(&k).is_some()
+                {
+                    return true;
+                }
                 // Inherited method/getter/setter through the class chain.
                 let class = map.class;
                 let mut cur = class;
@@ -772,6 +784,14 @@ impl<'p> Vm<'p> {
             if k == "length" && idx == self.arr_proto && self.arr_proto != 0 {
                 return Ok(true);
             }
+            // The global object's slot-backed own properties — mirrors
+            // `has_property`'s Object arm (see the comment there).
+            if idx == self.global_this
+                && self.global_this != 0
+                && self.global_by_name(&k).is_some()
+            {
+                return Ok(true);
+            }
             let mut cur = match self.heap.get(idx) {
                 HeapObj::Object(m) => m.class,
                 _ => None,
@@ -1208,7 +1228,10 @@ impl<'p> Vm<'p> {
     /// argument's iterator (user code) under a GC lock, so `err` stays live across it.
     pub(crate) fn install_agg_errors(&mut self, err: Value, errors_arg: Value) -> Result<(), Thrown> {
         let list = self.iterate_to_vec(errors_arg)?;
-        let arr = Value::heap(self.heap.alloc(HeapObj::Array(list)));
+        // CreateArrayFromList allocates in the CONSTRUCTOR's realm — the errors
+        // array of `new otherRealm.AggregateError([e])` carries the other realm's
+        // %Array.prototype% (staging/sm/Error/AggregateError.js line 85).
+        let arr = self.alloc_array_current_realm(list);
         if let HeapObj::Object(m) = self.heap.get_mut(err.heap_index()) {
             m.define(
                 "errors",

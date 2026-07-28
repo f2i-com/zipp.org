@@ -189,7 +189,20 @@ impl<'p> Vm<'p> {
     pub(crate) fn alloc_array_buffer(&mut self, byte_len: usize) -> u32 {
         let idx = self.heap.alloc(HeapObj::ArrayBuffer { data: vec![0u8; byte_len].into(), detached: false });
         if self.arraybuffer_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.arraybuffer_proto));
+            // AllocateArrayBuffer does OrdinaryCreateFromConstructor(%ArrayBuffer%,
+            // "%ArrayBuffer.prototype%") against the CURRENT realm — so the buffer a
+            // child realm's TypedArray constructor allocates for itself belongs to
+            // that realm. `g.eval("new Uint8Array(16)").buffer.constructor` was the
+            // MAIN `ArrayBuffer`, which then made SpeciesConstructor on it pick the
+            // wrong realm (staging/sm/ArrayBuffer/slice-species.js line 162).
+            // `native_home` is identity outside a realm-copied built-in.
+            let p = self.native_home(self.arraybuffer_proto);
+            self.proto_of.insert(idx, Value::heap(p));
+            if p != self.arraybuffer_proto {
+                if let Some(r) = self.native_callee_realm {
+                    self.obj_realm.insert(idx, r);
+                }
+            }
         }
         idx
     }

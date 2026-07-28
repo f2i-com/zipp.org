@@ -1036,6 +1036,19 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("RangeError: month and monthCode must agree".into()));
                 }
                 if cal != Cal::Iso {
+                    // CalendarMergeFields drops the receiver's monthCode when the
+                    // bag supplies `month`, and an ORDINAL month cannot be
+                    // resolved in a non-ISO calendar without a year to count it
+                    // in (a lunisolar leap month shifts every later ordinal). So
+                    // `month` alone is a TypeError — the field set is
+                    // unresolvable, not out of range
+                    // (PlainMonthDay/prototype/with/fields-missing-properties.js).
+                    if matches!(nm_ref, MonthRef::Ordinal(_)) && mf.is_some() && yf.is_none() {
+                        return Err(Thrown(
+                            "TypeError: a non-ISO month-day needs monthCode, or month with a year"
+                                .into(),
+                        ));
+                    }
                     let code = match nm_ref {
                         MonthRef::Code(n, l) => (n, l),
                         MonthRef::Ordinal(n) => {
@@ -1065,9 +1078,22 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.make_plain_month_day(nm, nd, ry)?))
             }
             "toPlainDate" => {
-                let year = self.opt_int_field(a0, "year")?.ok_or_else(|| {
-                    Thrown("TypeError: toPlainDate requires a year".into())
-                })?;
+                // PrepareCalendarFields is called with « year », and
+                // CalendarExtraFields adds « era, eraYear » for any calendar
+                // that has eras — so an era pair is a legal stand-in for `year`
+                // here, and its value is range-checked like one (an infinite
+                // eraYear is a RangeError, not a "missing year" TypeError:
+                // toPlainDate/infinity-throws-rangeerror.js). Alphabetical read
+                // order: era, eraYear, year.
+                let (era, era_year) = self.read_era_fields(a0, cal)?;
+                let yf = self.opt_int_field(a0, "year")?;
+                if era.is_none() && era_year.is_none() && yf.is_none() {
+                    return Err(Thrown("TypeError: toPlainDate requires a year".into()));
+                }
+                if era.is_some() != era_year.is_some() {
+                    return Err(Thrown("TypeError: era and eraYear must be given together".into()));
+                }
+                let year = Self::resolve_cal_year(cal, era.as_deref(), era_year, yf)?;
                 // Default overflow is "constrain": clamp the day to the month (e.g.
                 // PlainMonthDay(2,29).toPlainDate({year:2023}) → 2023-02-28). The
                 // month travels as a CODE — the reference year's ordinal need not be

@@ -957,6 +957,9 @@ pub struct Vm<'p> {
     /// The lazily-compiled `%AsyncIteratorPrototype%[@@asyncDispose]` JS polyfill
     /// (an async function). Compiled on first call via `do_eval`, cached + GC-rooted.
     async_dispose_fn: Option<Value>,
+    /// The lazily-compiled body of GetDisposeMethod's async-hint fallback closure
+    /// (see `sync_dispose_shim`). Cached + GC-rooted like the polyfills above.
+    sync_dispose_shim_fn: Option<Value>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).
@@ -1258,6 +1261,7 @@ mod cldr_alias_data;
 mod cldr_en;
 mod dtf_pattern;
 mod segmenter;
+mod special_casing;
 mod iterhelpers;
 mod proxy_regexp;
 mod typedarray;

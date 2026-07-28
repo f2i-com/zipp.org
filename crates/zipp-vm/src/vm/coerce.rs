@@ -1253,12 +1253,14 @@ impl<'p> Vm<'p> {
         if let Some(p) = self.symbol_to_primitive(v, "default")? {
             return Ok(p);
         }
-        let order: [&str; 2] = if matches!(self.heap.get(v.heap_index()), HeapObj::Date(_)) {
-            ["toString", "valueOf"]
-        } else {
-            ["valueOf", "toString"]
-        };
-        for name in order {
+        // OrdinaryToPrimitive(O, "default") IS OrdinaryToPrimitive(O, "number") —
+        // there is no Date branch in 7.1.1. What makes `"" + new Date` stringify is
+        // `Date.prototype[@@toPrimitive]` (21.4.4.45), which the hook lookup above
+        // already found. A `["toString", "valueOf"]` order for Dates HERE is
+        // therefore dead code while the hook is installed, and wrong once it is
+        // not: `delete Date.prototype[Symbol.toPrimitive]; 0 + d` must be a NUMBER
+        // (staging/sm/object/toPrimitive.js).
+        for name in ["valueOf", "toString"] {
             let f = self.get_prop(v, name)?;
             if self.is_callable(f) {
                 let r = self.call_value(f, v, &[])?;

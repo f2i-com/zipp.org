@@ -802,18 +802,25 @@ impl<'p> Vm<'p> {
                 let r = self.string_replace_plain(&s, idx, arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED), true)?;
                 Ok(Some(r))
             }
-            // ECMA-402 step 1 of both is CanonicalizeLocaleList(locales), so a
-            // structurally invalid tag is a RangeError even though the mapping
-            // that follows is the locale-INDEPENDENT one (the Turkish/Azeri/
-            // Lithuanian conditional mappings of SpecialCasing.txt are not
-            // implemented, so no locale changes the result yet).
+            // TransformCase (ECMA-402): CanonicalizeLocaleList first (so a
+            // structurally invalid tag is a RangeError), then BestAvailableLocale
+            // over "the languages for which the UCD contains language sensitive
+            // case mappings" — az, lt, tr. Anything else, including no argument
+            // at all, is "und" and takes the locale-independent mapping.
             "toLocaleUpperCase" | "toLocaleLowerCase" => {
-                self.canonicalize_locale_list(arg0)?;
-                Ok(Some(self.alloc_str(if name == "toLocaleUpperCase" {
-                    s.to_uppercase()
-                } else {
-                    s.to_lowercase()
-                })))
+                let locales = self.canonicalize_locale_list(arg0)?;
+                let upper = name == "toLocaleUpperCase";
+                let lang = locales
+                    .first()
+                    .and_then(|t| crate::vm::special_casing::special_casing_language(t));
+                let out = match lang
+                    .and_then(|l| crate::vm::special_casing::transform_case(&s, l, upper))
+                {
+                    Some(mapped) => mapped,
+                    None if upper => s.to_uppercase(),
+                    None => s.to_lowercase(),
+                };
+                Ok(Some(self.alloc_str(out)))
             }
             "lastIndexOf" => {
                 // ToString(searchString) before the position coercion (spec order).

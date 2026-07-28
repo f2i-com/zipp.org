@@ -217,7 +217,16 @@ pub enum Expr {
     Update { op: UpdateOp, prefix: bool, target: Target },
     Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
     Logical { op: LogicalOp, left: Box<Expr>, right: Box<Expr> },
-    Assign { op: AssignOp, target: Target, value: Box<Expr> },
+    /// `covered`: the whole assignment was written inside parentheses — the third
+    /// place parenthesization has to be recorded (see [`LiteralFlags`]). An
+    /// AssignmentElement is `DestructuringAssignmentTarget Initializer_opt`, and
+    /// neither half may be parenthesized AS A UNIT: `[(a) = 5] = []` is fine
+    /// (target `(a)`, initializer `5`) while `[(a = 5)] = []` is an early error —
+    /// `(a = 5)` is a ParenthesizedExpression whose AssignmentTargetType is
+    /// invalid, so 13.15.5.1 rejects it. Without the bit both spell the same
+    /// `Expr::Assign` and the second was silently accepted
+    /// (staging/sm/expressions/destructuring-pattern-parenthesized.js).
+    Assign { op: AssignOp, target: Target, value: Box<Expr>, covered: bool },
     Cond { test: Box<Expr>, cons: Box<Expr>, alt: Box<Expr> },
     Call(Box<CallExpr>),
     New { callee: Box<Expr>, args: Vec<Arg> },
@@ -690,6 +699,7 @@ mod tests {
                 optional: false,
             })),
             value: Box::new(Expr::Num(1.0)),
+            covered: false,
         };
         assert!(matches!(annexb, Expr::Assign { target: Target::Call(_), .. }));
 

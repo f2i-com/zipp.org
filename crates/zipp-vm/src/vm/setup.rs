@@ -195,7 +195,22 @@ impl<'p> Vm<'p> {
         // Link the prototype chain to the parent's prototype (a parent class's
         // own prototype, or a built-in parent ctor's `.prototype`).
         if let Some(par) = parent {
-            if let Some(pp) = self.prototype_of(Value::heap(par)) {
+            let pp = match self.prototype_of(Value::heap(par)) {
+                Some(pp) => Some(pp),
+                // `class C extends someProxy`: ClassDefinitionEvaluation's
+                // protoParent is `Get(superclass, "prototype")`, which for a Proxy
+                // means its `get` trap (or the trap-less forward to the target).
+                // `prototype_of` only understands Func/Closure/Class/is_ctor
+                // objects, so the link was silently dropped and C.prototype chained
+                // to %Object.prototype% — instances inherited nothing from the
+                // proxied base, and `super.x` in a method resolved against the
+                // wrong object (staging/sm/class/superPropProxies.js line 23).
+                None if self.proxy_parts(par).is_some() => {
+                    self.get_prop(Value::heap(par), "prototype").ok()
+                }
+                None => None,
+            };
+            if let Some(pp) = pp {
                 if pp.is_heap() {
                     self.proto_of.insert(p, pp);
                 }
@@ -1992,6 +2007,19 @@ impl<'p> Vm<'p> {
             ];
             let mut intl_ns_map = ObjMap::new();
             for (kind, name, len, methods, slo) in intl_services {
+                // Each service gets its OWN resolvedOptions function, so its
+                // brand check can name one internal slot instead of accepting
+                // any Intl instance (see INTL_RESOLVED_OPTIONS_BASE).
+                let methods: Vec<(&str, u16)> = methods
+                    .into_iter()
+                    .map(|(m, id)| {
+                        if id == INTL_RESOLVED_OPTIONS {
+                            (m, native::INTL_RESOLVED_OPTIONS_BASE + kind as u16)
+                        } else {
+                            (m, id)
+                        }
+                    })
+                    .collect();
                 let proto = build(self, &methods, None);
                 self.proto_of.insert(proto, Value::heap(obj_proto));
                 self.intl_protos[kind as usize] = proto;

@@ -982,7 +982,18 @@ impl<'p> Vm<'p> {
                 json_skip_ws(b, i);
                 let (val, s) = self.json_parse_value_src(src, i)?;
                 pairs.push((key.clone(), val));
-                srcs.push((key, s));
+                // A DUPLICATE key OVERWRITES, exactly as the object build below
+                // does (`map.set`): the LAST member is what the property ends up
+                // holding, so that is the parse node `context.source` must report.
+                // Appending instead made the lookup find the FIRST member, whose
+                // snapshot no longer matched the property's value — so the
+                // correspondence check dropped `source` altogether
+                // (staging/sm/JSON/parse-with-source.js line 76,
+                // `{ "b": 2, "b": 1, "b": 4 }`).
+                match srcs.iter_mut().find(|(k, _)| *k == key) {
+                    Some(e) => e.1 = s,
+                    None => srcs.push((key, s)),
+                }
                 json_skip_ws(b, i);
                 match b.get(*i) {
                     Some(b',') => *i += 1,

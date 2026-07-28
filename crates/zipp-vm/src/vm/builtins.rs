@@ -47,7 +47,37 @@ impl<'p> Vm<'p> {
     /// slice. Shared by `try_builtin_method` (args gathered from registers) and
     /// the spread method-call path (args taken from an array). `Ok(None)` means
     /// no builtin matched the receiver kind.
+    ///
+    /// This inline dispatch resolves a built-in by NAME + receiver kind, skipping
+    /// the prototype walk that would otherwise reach a `$262.createRealm()`
+    /// child's %X.prototype% IMAGE and its realm-copied native. When the
+    /// receiver's [[Prototype]] belongs to a child realm the method found there
+    /// IS that realm's built-in, so the objects it allocates must come from that
+    /// realm's intrinsics (`g.a.map(f)` returns an array with `g.Array.prototype`
+    /// — staging/sm/Array/species.js line 156). Re-establish that context here;
+    /// `call_value` already does it for a realm native reached the slow way.
+    /// One `is_empty` check until `$262.createRealm()` is called.
     pub(crate) fn dispatch_builtin_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        if !self.realm_global_objs.is_empty() && recv.is_heap() {
+            let proto = self.proto_of.get(&recv.heap_index()).copied().unwrap_or(Value::UNDEFINED);
+            let r = self.get_function_realm(proto);
+            if r != 0 && r != self.native_callee_realm.unwrap_or(0) {
+                let prev = self.native_callee_realm;
+                self.native_callee_realm = Some(r);
+                let res = self.dispatch_builtin_method_inner(recv, name, args);
+                self.native_callee_realm = prev;
+                return res;
+            }
+        }
+        self.dispatch_builtin_method_inner(recv, name, args)
+    }
+
+    fn dispatch_builtin_method_inner(
         &mut self,
         recv: Value,
         name: &str,
