@@ -827,6 +827,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn topropkey_regalloc_key_semantics() {
+        // `x[i] *= v` emits ToPropKey, which the regalloc (f64) tier now
+        // compiles as a register copy — sound ONLY because a numeric key is
+        // ToPropertyKey's identity. These pin the cases where a copy and the
+        // real coercion diverge: a FRACTIONAL key must stay a miss (never
+        // truncate to an element), NaN likewise, and `-0` is element 0. The
+        // hot f64 read-modify-write is case 1. Expectations from node.
+        assert_jit_matches(
+            "var out=[];\
+             (function(){var x=new Float64Array(64); for(var i=0;i<64;i++) x[i]=i+0.5; var s=0;\
+              for(var r=0;r<20000;r++){ for(var i=0;i<64;i++){ x[i]*=1.000001; s+=x[i]; } }\
+              out.push(s.toFixed(2));})();\
+             (function(){var y=new Float64Array(4); y[1]=2;\
+              for(var r=0;r<200000;r++){ y[1.5]=(y[1.5]||0)+1; } out.push(y[1]+'/'+(y[1.5]===undefined));})();\
+             (function(){var w=new Float64Array(2); w[0]=5;\
+              for(var r=0;r<200000;r++){ w[NaN]=(w[NaN]||0)+1; } out.push(w[0]+'/'+(w[NaN]===undefined));})();\
+             (function(){var v=new Float64Array(2); v[0]=3;\
+              for(var r=0;r<200000;r++){ v[-0]+=1; } out.push(v[0]);})();\
+             console.log(out.join('|'))",
+            &["41372364.85|2/true|5/true|200003"],
+        );
+    }
+
     // ── INT live-in interval contract ─────────────────────────────────────────
     // `emit_int_entry_load` admits an Int-tagged value OR a double holding an
     // exact integer in [-2^53, 2^53], so `plan_region` must seed the interval

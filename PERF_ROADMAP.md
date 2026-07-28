@@ -1316,6 +1316,44 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B53 — `ToPropKey` is now visible to the regalloc planner: the normalize
+loop reaches the unboxed tier, typedarray-math −15% under load
+
+B32 open item 2, landed as specified there and verified by this session's
+survey. `x[i] *= v` emits `ToPropKey; GetIndex; Mul; SetIndex`, and `ToPropKey`
+was invisible to `writes_reg` and `instr_uses` — so its dst looked
+never-defined, landed in `ro_live_in`, and fired the ONE site in the whole
+suite where `read-only live-in used where a number isn't required` declines
+(typedarray-math's normalize region [104,124], to the boxed MEM tier).
+
+Five edits, all planner/emitter bookkeeping: `writes_reg` gets the def;
+`instr_uses` gets `[obj, src]`; `numeric_operand_uses` gets `[src]`, which is
+what makes a live-in key sound — the entry guard bails for anything that is not
+a genuine number, and a NUMBER key is exactly where ToPropertyKey is the
+identity; the pinned-receiver use-site scan exempts ToPropKey's `obj` (the
+nullish check is subsumed: the plan proved the receiver a live TypedArray,
+LoadConst admits no null/undefined, no calls run in a numeric region, and every
+pinned access re-checks identity); and the emitter compiles it as `Move`. One
+type rule carries the correctness: a **Bool-typed src declines** — the
+interpreter coerces `true` to the STRING key `"true"`, where a copy would index
+element 1. Fractional/NaN/-0 keys are covered by the entry/access guards and
+pinned against node in `topropkey_regalloc_key_semantics`.
+
+**Measured (focused A/B, paired medians of 11, heavy concurrent load):
+typedarray-math 1558 → 1324ms, −15.0%.** The verified prediction was ~39ms
+(~5%); −15% suggests the fix un-declined more than the one region, but the box
+was too loaded to decompose honestly — re-measure the phase split on a quiet
+machine before quoting a number finer than "the row moved, double digits". The
+full-suite A/B from the same window was thrash-contaminated (absolute times
+2-5× inflated, p10/p90 spanning 2×) and is recorded in `ab_topropkey.json` as
+unusable rather than averaged into a claim.
+
+The deterministic evidence, load-proof: the decline-reason line between
+[104,124]'s INT decline and its compile is GONE (it reads regalloc now), and
+`region [136,167]` (xorshift) still declines with `pinned receiver reg not
+cleanly excludable` — which is CORRECT, because B32 item 1 measured that tier
+1.65× slower for that loop. Do not "fix" that decline.
+
 ### B52 — `super.v = x` inside a class setter inlines too: another −28.8%, and
 the soundness probe found a process-killing engine bug that predates it
 

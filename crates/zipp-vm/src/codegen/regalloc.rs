@@ -165,7 +165,12 @@ pub(crate) fn compile_region_regalloc(
             // `movsd xmm, xmm`, it has no false dependency on the destination's
             // old value and is eliminated at rename — this keeps the loop's
             // carried dependency chains down to the actual addsd/mulsd.
-            Instr::Move { dst, src } => match home(&plan, dst) {
+            // ToPropKey compiles as Move on this tier: the plan proved (or
+            // entry-guarded) the key numeric, ToPropertyKey of a number is the
+            // identity, and the receiver's nullish check is subsumed by the pin
+            // (see the plan's idx_obj note). Same or-pattern homes, same copy
+            // elision.
+            Instr::Move { dst, src } | Instr::ToPropKey { dst, src, .. } => match home(&plan, dst) {
                 Home::Xmm(d) => {
                     let srx = xh(&plan, src);
                     if d != srx && !copy_is_noop(lc, d, srx) {

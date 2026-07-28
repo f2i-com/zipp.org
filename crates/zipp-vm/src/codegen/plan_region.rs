@@ -150,6 +150,16 @@ pub(crate) fn plan_region_cold(
                     {
                         Some(obj)
                     }
+                    // ToPropKey's receiver use is only the nullish check, which
+                    // the pin subsumes: a compiled region proves the receiver
+                    // was a live TypedArray at plan time, nothing in a numeric
+                    // region can write the slot non-numerically (LoadConst
+                    // admits no null/undefined and no calls run), and every
+                    // pinned access re-checks identity anyway. Without this
+                    // exemption the ToPropKey-site use marked the receiver
+                    // used_elsewhere and traded the ro_live_in decline for
+                    // "pinned receiver reg not cleanly excludable".
+                    Instr::ToPropKey { obj, .. } => Some(obj),
                     _ => None,
                 };
                 for u in instr_uses(instr) {
@@ -262,6 +272,19 @@ pub(crate) fn plan_region_cold(
             // fnv1a accumulator (written ONLY by Imul) is never typed → the
             // used-but-undefined scan declines the whole region.
             Instr::MathOp { dst, op: MathFn::Imul, argc: 2, .. } => (Some(dst), VTy::Num),
+            // ToPropertyKey of a NUMBER is the identity (no observable
+            // coercion), so on this tier the op is a register copy and its dst
+            // is a Num. The identity claim needs the src to actually BE a
+            // number: a live-in src is entry-guarded numeric (it is in
+            // `numeric_operand_uses`), an in-region Num def proves itself, and
+            // a Bool def must DECLINE — the interpreter coerces `true` to the
+            // STRING key "true", where a copy would index element 1.
+            Instr::ToPropKey { dst, src, .. } => {
+                if ty.get(&src) == Some(&VTy::Bool) {
+                    decline!("ToPropKey of a Bool-typed key");
+                }
+                (Some(dst), VTy::Num)
+            }
             Instr::Move { dst, .. } => (Some(dst), VTy::Num), // refined below
             _ => (None, VTy::Num),
         };
@@ -1022,6 +1045,13 @@ pub(crate) fn numeric_operand_uses(i: &Instr) -> Vec<u16> {
         | Instr::JumpIfNotLe { a, b, .. } => vec![a, b],
         Instr::AddInt { a, .. } | Instr::Neg { a, .. } => vec![a],
         Instr::MathOp { arg_base, argc, .. } => (0..argc).map(|k| arg_base + k).collect(),
+        // The KEY of a read-modify-write (`x[i] *= v`). Declaring it numeric is
+        // what makes a live-in key sound on this tier: the entry guard bails to
+        // the interpreter for anything that is not a genuine number, and a
+        // NUMBER key is exactly the case where ToPropertyKey is the identity.
+        // (A string key thereby DECLINES/bails rather than compiling — the same
+        // treatment the general heap-op key gets by exclusion from this list.)
+        Instr::ToPropKey { src, .. } => vec![src],
         _ => vec![],
     }
 }
@@ -1057,6 +1087,11 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::SetIndex { obj, key, val } => vec![obj, key, val],
         Instr::GetIndexConcat { obj, key, .. } => vec![obj, key],
         Instr::SetIndexConcat { obj, key, val, .. } => vec![obj, key, val],
+        // ToPropKey reads the receiver (nullish check) and the key. `src` MUST
+        // be listed or the dead-code pass drops the load that feeds it; `obj`
+        // follows the GetIndex/SetIndex pattern and is exempted at the pinned
+        // receiver's use-site scan like theirs.
+        Instr::ToPropKey { obj, src, .. } => vec![obj, src],
         Instr::DeleteIndexConcat { obj, key, .. } => vec![obj, key],
         Instr::Return { src } => vec![src],
         // MathOp / CallMethod read a CONTIGUOUS argument window starting at

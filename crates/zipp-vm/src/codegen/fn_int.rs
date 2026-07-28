@@ -175,6 +175,13 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         // the register had no home at all.
         | Instr::MathOp { dst, .. }
         | Instr::CallMethod { dst, .. } => Some(dst),
+        // ToPropKey DEFINES its dst (for a numeric key it is the identity — the
+        // regalloc tier emits it as a register copy). Absent from this list, the
+        // dst looked never-defined, landed in `ro_live_in`, and one `x[i] *= v`
+        // declined its whole loop to the boxed MEM tier — the only site in the
+        // suite where "read-only live-in used where a number isn't required"
+        // fired (typedarray-math's normalize phase).
+        | Instr::ToPropKey { dst, .. } => Some(dst),
         _ => None,
     }
 }
