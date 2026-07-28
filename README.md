@@ -92,22 +92,22 @@ node's ICU.
 regression is a diff rather than a remembered number. Run both tiers — a JIT
 change that only *appears* correct is the common failure mode here.
 
-**Performance — geomean 2.57× slower than node (V8)** on the ten real-world
+**Performance — geomean 2.29× slower than node (V8)** on the ten real-world
 benchmarks in `bench/real/`, paired medians of 7, every output byte-identical
 to node:
 
 | bench | node | zipp | ratio |
 |---|---|---|---|
-| map-set-heavy | 594ms | 723ms | 1.22× |
-| json-large | 230ms | 484ms | 2.10× |
-| async-promise-chain | 301ms | 693ms | 2.31× |
-| polymorphic-objects | 300ms | 708ms | 2.36× |
-| parse-large-js | 241ms | 583ms | 2.42× |
-| class-prototype-hot | 275ms | 741ms | 2.69× |
-| markdown-render | 238ms | 645ms | 2.71× |
-| sparse-array | 50ms | 151ms | 3.03× |
-| typedarray-math | 172ms | 674ms | 3.93× |
-| regex-log-scan | 411ms | 1741ms | 4.24× |
+| map-set-heavy | 779ms | 778ms | **1.00×** |
+| class-prototype-hot | 270ms | 380ms | 1.41× |
+| json-large | 258ms | 518ms | 2.01× |
+| async-promise-chain | 311ms | 630ms | 2.03× |
+| parse-large-js | 252ms | 602ms | 2.39× |
+| polymorphic-objects | 302ms | 731ms | 2.42× |
+| markdown-render | 254ms | 663ms | 2.61× |
+| sparse-array | 50ms | 155ms | 3.08× |
+| typedarray-math | 180ms | 645ms | 3.58× |
+| regex-log-scan | 440ms | 1868ms | 4.25× |
 
 Startup is ~4× faster than node (7ms vs 30ms — no snapshot to load).
 

@@ -65,7 +65,11 @@ exact bytes.
 **Run-to-run variance is ±10–17%** — node's own `map-set` time has ranged
 609–966ms on this machine. A single-row move under ~10% is noise; use
 `tools/bench.py --ab old.exe new.exe` for anything under a few percent. Track
-the geomean, which has moved 4.77× → 4.20× → 3.31× → 2.82× → 2.72× → **2.56×**.
+the geomean, which has moved 4.77× → 4.20× → 3.31× → 2.82× → 2.72× → 2.56× →
+**2.29×** (2026-07-28: B51-B54 — super-accessor inlining ×2, ToPropKey to the
+regalloc tier, the typeof fusion, and Promise.resolve region admission;
+`bench/final_2026-07-28.json`. map-set-heavy reached **1.00×** — parity — and
+class-prototype-hot 3.30× → 1.41×).
 
 **What it would take to reach 2×**, from the phase-level measurements in B31–B33
 — none of these is a tuning change:
