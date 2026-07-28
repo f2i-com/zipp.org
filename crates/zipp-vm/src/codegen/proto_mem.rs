@@ -104,7 +104,14 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             | Instr::LoadUndefined { .. }
             // `/` — `dbinop` handles it on the always-f64 path (JS `/` has no
             // integer form), the same call the region path makes.
-            | Instr::Div { .. } => {}
+            | Instr::Div { .. }
+            // In-place string append — B56's local-accumulator rewrite now
+            // plants these INSIDE function bodies (markdown's escapeHtml and
+            // renderInline), so Tier C rejecting the op un-compiled functions
+            // it previously compiled. Same helper protocol as the region arm;
+            // allocates (grows the heap) ⇒ the emitter refetches r13/r14 when
+            // the function pins them.
+            | Instr::StrAppendInPlace { .. } => {}
             // NOT admitted here, though the emitters exist below and the REGION
             // path (Tier B) has carried them since B10.3: `CellGet`/`UpvalGet`/
             // `CellSet`/`UpvalSet`. Admitting them MEASURED SLOWER — see B50.
@@ -136,10 +143,27 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             }
             // General plain call `f(args…)` — `this = undefined`.
             Instr::Call { .. } => {}
-            // v1 method calls: ONLY the 1-arg `charCodeAt` (dedicated helper).
+            // Method calls: the INTRINSIC set only — the builtins with
+            // dedicated pure win64 helpers, i.e. the region path's whitelist
+            // minus its pin-dependent fast paths. NOT the generic
+            // `jit_call_method_ic` route: that helper deopts on every NATIVE
+            // callee, so admitting an arbitrary method name would turn a
+            // `join`/`toUpperCase`-calling function into per-call
+            // native-entry + bail — strictly worse than staying interpreted
+            // (B50's Upval lesson: reaching a tier is not being faster in it).
             Instr::CallMethod { name, argc, .. } => {
                 let key = proto.string_constants.get(name as usize).map(|s| s.as_str());
-                if !(argc == 1 && key == Some("charCodeAt")) {
+                let ok = matches!(
+                    (key, argc),
+                    (Some("charCodeAt"), 1)
+                        | (Some("indexOf"), 1)
+                        | (Some("push"), 1)
+                        | (Some("get"), 1)
+                        | (Some("has"), 1)
+                        | (Some("substring"), 2)
+                        | (Some("slice"), 2)
+                );
+                if !ok {
                     reject!("[tierC-reject] CallMethod {key:?} argc={argc}");
                 }
             }
@@ -852,22 +876,90 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
-            Instr::CallMethod { dst, obj, arg_base, .. } => {
-                // v1: only `s.charCodeAt(i)` (mem_can_compile gated). Dedicated
-                // win64 helper: receiver + arg0 bits in, result bits out, deopt
-                // sentinel → bail. No alloc / no user code → no re-fetch.
-                dynasm!(ops
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, [rbx + dreg(obj)]          // receiver bits
-                    ; mov r8, [rbx + dreg(arg_base)]      // arg0 bits
-                    ; mov rax, QWORD heap.char_code_at as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
-                );
-                emit_region_bail(&mut ops, ip, bail, epilogue);
+            Instr::CallMethod { dst, obj, name, arg_base, argc } => {
+                // The intrinsic set (mem_can_compile gated) — the region path's
+                // dedicated pure win64 helpers, minus its pin fast paths (Tier C
+                // has no pins). Every helper here: receiver + arg bits in,
+                // result bits out, deopt sentinel → bail; none runs user code,
+                // and none moves the versions array (`push` grows the array's
+                // own Vec) → no re-fetch anywhere in this arm.
+                let key = proto.string_constants[name as usize].as_str();
+                if argc == 2 {
+                    // substring/slice: two args read from the contiguous window.
+                    let is_slice = (key == "slice") as i32;
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; lea r8, [rbx + dreg(arg_base)]      // &args[0..2]
+                        ; mov r9d, is_slice
+                        ; mov rax, QWORD heap.str_substring as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else if matches!(key, "get" | "has") {
+                    // Map.get / Map.has / Set.has — the region arm verbatim:
+                    // `has` retries as Set (op 2) before deopting; a wrong
+                    // receiver kind deopts, so a same-named user method is
+                    // unaffected (the interpreter runs it at this ip).
+                    let opsel: i32 = if key == "get" { 0 } else { 1 };
+                    let set_try = ops.new_dynamic_label();
+                    let coll_done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; mov r8, [rbx + dreg(arg_base)]      // key bits
+                        ; mov r9d, opsel
+                        ; mov rax, QWORD heap.coll_lookup as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; jne => coll_done
+                    );
+                    if opsel == 1 {
+                        dynasm!(ops
+                            ; => set_try
+                            ; mov rcx, rdi
+                            ; mov rdx, [rbx + dreg(obj)]
+                            ; mov r8, [rbx + dreg(arg_base)]
+                            ; mov r9d, 2
+                            ; mov rax, QWORD heap.coll_lookup as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                        );
+                    } else {
+                        dynasm!(ops ; => set_try ; jmp => bail);
+                    }
+                    dynasm!(ops
+                        ; => coll_done
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else {
+                    // charCodeAt / indexOf / push — one-arg dedicated helpers.
+                    let helper = match key {
+                        "indexOf" => heap.str_index_of,
+                        "push" => heap.array_push,
+                        _ => heap.char_code_at,
+                    };
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; mov r8, [rbx + dreg(arg_base)]      // arg0 bits
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                }
             }
             Instr::Call { dst, callee, arg_base, argc } => {
                 // General `f(args…)` (`this = undefined`) via the interpreter-IC
@@ -920,6 +1012,28 @@ pub(crate) fn compile_proto_mem(
                         None,
                     );
                 }
+            }
+            Instr::StrAppendInPlace { dst, a, b } => {
+                // In-place `dst = a + b` (the linearity-proved accumulator
+                // append). DEOPTS when the appended value needs real
+                // ToPrimitive — the helper's purity gate runs BEFORE any
+                // mutation, so the interpreter re-executes cleanly. Allocates
+                // on the pure path ⇒ refetch r13/r14 when pinned.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // accumulator bits
+                    ; mov r8, [rbx + dreg(b)]             // appended bits
+                    ; mov rax, QWORD heap.str_append as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // needs ToPrimitive → interp
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Return { src } => {
                 // Whole-function return: NO_BAIL + result Value (UNLIKE the region,
