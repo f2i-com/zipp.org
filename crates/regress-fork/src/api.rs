@@ -137,7 +137,38 @@ pub type Matches<'r, 't> = exec::Matches<backends::DefaultExecutor<'r, 't>>;
 
 /// An iterator type which yields `Match`es found in a string, supporting ASCII
 /// only.
+#[cfg(feature = "linear-ascii")]
+pub type AsciiMatches<'r, 't> = crate::linear::AsciiMatches<'r, 't>;
+#[cfg(not(feature = "linear-ascii"))]
 pub type AsciiMatches<'r, 't> = exec::Matches<backends::DefaultAsciiExecutor<'r, 't>>;
+
+/// An executor plan available for ASCII-only subjects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexPlan {
+    /// The complete ECMAScript backtracking executor.
+    Classical,
+    /// The bounded linear-time executor for the conservative regular subset.
+    LinearAscii,
+}
+
+/// Why a pattern was not admitted to the bounded ASCII executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegexFallbackReason {
+    BackendUnavailable,
+    NonAsciiPattern,
+    UnicodeSets,
+    PatternTooLarge,
+    Backreference,
+    Lookaround,
+    UnsupportedEscape,
+    UnsupportedClassSyntax,
+    UnsupportedGroup,
+    MultilineAnchor,
+    CaptureResetSemantics,
+    CaptureRepetitionSemantics,
+    BackendRejected,
+    CaptureLayoutMismatch,
+}
 
 /// A Match represents a portion of a string which was found to match a Regex.
 #[derive(Debug, Clone)]
@@ -158,6 +189,15 @@ pub struct Match {
     //   - A list of names with length `captures.len()`, corresponding to the
     //     capture group names in order. Groups without names have an empty string.
     pub(crate) group_names: Box<[Box<str>]>,
+}
+
+#[cfg(feature = "linear-ascii")]
+pub(crate) fn clone_group_names(group_names: &[Box<str>]) -> Box<[Box<str>]> {
+    if group_names.iter().all(|name| name.is_empty()) {
+        Box::default()
+    } else {
+        group_names.to_vec().into_boxed_slice()
+    }
 }
 
 impl Match {
@@ -383,11 +423,23 @@ impl<'m> FusedIterator for NamedGroups<'m> {}
 #[derive(Debug, Clone)]
 pub struct Regex {
     cr: CompiledRegex,
+    #[cfg(feature = "linear-ascii")]
+    linear_candidate: crate::linear::LinearCandidate,
+    #[cfg(feature = "linear-ascii")]
+    linear_ascii: crate::linear::LinearPlan,
 }
 
 impl From<CompiledRegex> for Regex {
     fn from(cr: CompiledRegex) -> Self {
-        Self { cr }
+        Self {
+            cr,
+            #[cfg(feature = "linear-ascii")]
+            linear_candidate: crate::linear::LinearCandidate::Fallback(
+                RegexFallbackReason::BackendUnavailable,
+            ),
+            #[cfg(feature = "linear-ascii")]
+            linear_ascii: Default::default(),
+        }
     }
 }
 
@@ -425,12 +477,20 @@ impl Regex {
         F: Into<Flags>,
     {
         let flags = flags.into();
+        #[cfg(feature = "linear-ascii")]
+        let linear_candidate = crate::linear::collect_candidate(pattern.clone(), flags);
         let mut ire = parse::try_parse(pattern, flags)?;
         if !flags.no_opt {
             optimizer::optimize(&mut ire);
         }
         let cr = emit::emit(&ire);
-        Ok(Regex { cr })
+        Ok(Regex {
+            cr,
+            #[cfg(feature = "linear-ascii")]
+            linear_candidate,
+            #[cfg(feature = "linear-ascii")]
+            linear_ascii: Default::default(),
+        })
     }
 
     /// PATCH (see VENDORED.md): like `from_unicode`, but additionally runs the
@@ -445,12 +505,62 @@ impl Regex {
         F: Into<Flags>,
     {
         let flags = flags.into();
+        #[cfg(feature = "linear-ascii")]
+        let linear_candidate = crate::linear::collect_candidate(pattern.clone(), flags);
         let mut ire = parse::try_parse(pattern, flags)?;
         if !flags.no_opt {
             optimizer::optimize_bytes(&mut ire);
         }
         let cr = emit::emit(&ire);
-        Ok(Regex { cr })
+        Ok(Regex {
+            cr,
+            #[cfg(feature = "linear-ascii")]
+            linear_candidate,
+            #[cfg(feature = "linear-ascii")]
+            linear_ascii: Default::default(),
+        })
+    }
+
+    /// Return the executor available for ASCII-only subjects.
+    ///
+    /// This reports availability, not the environment-selected executor.
+    #[inline]
+    pub fn ascii_plan(&self) -> RegexPlan {
+        #[cfg(feature = "linear-ascii")]
+        if crate::linear::resolve_candidate(&self.linear_candidate, &self.cr, &self.linear_ascii)
+            .is_ok()
+        {
+            return RegexPlan::LinearAscii;
+        }
+        RegexPlan::Classical
+    }
+
+    /// Return the stable classifier reason when the ASCII tier is unavailable.
+    #[inline]
+    pub fn ascii_fallback_reason(&self) -> Option<RegexFallbackReason> {
+        #[cfg(feature = "linear-ascii")]
+        {
+            crate::linear::resolve_candidate(&self.linear_candidate, &self.cr, &self.linear_ascii)
+                .err()
+        }
+        #[cfg(not(feature = "linear-ascii"))]
+        {
+            Some(RegexFallbackReason::BackendUnavailable)
+        }
+    }
+
+    /// Whether `ZIPP_REGEX_TIER=auto` selects the available ASCII plan.
+    #[inline]
+    pub fn ascii_auto_eligible(&self) -> bool {
+        #[cfg(feature = "linear-ascii")]
+        {
+            crate::linear::resolve_candidate(&self.linear_candidate, &self.cr, &self.linear_ascii)
+                .is_ok_and(crate::linear::auto_eligible)
+        }
+        #[cfg(not(feature = "linear-ascii"))]
+        {
+            false
+        }
     }
 
     /// Searches `text` to find the first match.
@@ -506,7 +616,42 @@ impl Regex {
     /// `start`.
     #[inline]
     pub fn find_from_ascii<'r, 't>(&'r self, text: &'t str, start: usize) -> AsciiMatches<'r, 't> {
-        backends::find(self, text, start)
+        #[cfg(feature = "linear-ascii")]
+        {
+            crate::linear::AsciiMatches::new(
+                &self.cr,
+                &self.linear_candidate,
+                &self.linear_ascii,
+                text,
+                start,
+            )
+        }
+        #[cfg(not(feature = "linear-ascii"))]
+        {
+            backends::find(self, text, start)
+        }
+    }
+
+    /// Search an ASCII-only subject with an explicit executor plan.
+    ///
+    /// This bypasses `ZIPP_REGEX_TIER` and is intended for differential
+    /// validation and controlled performance experiments.
+    #[cfg(feature = "linear-ascii")]
+    #[inline]
+    pub fn find_from_ascii_with_plan<'r, 't>(
+        &'r self,
+        text: &'t str,
+        start: usize,
+        plan: RegexPlan,
+    ) -> AsciiMatches<'r, 't> {
+        crate::linear::AsciiMatches::new_for_plan(
+            &self.cr,
+            &self.linear_candidate,
+            &self.linear_ascii,
+            text,
+            start,
+            plan,
+        )
     }
 
     /// Returns an iterator for matches found in 'text' starting at index `start`.

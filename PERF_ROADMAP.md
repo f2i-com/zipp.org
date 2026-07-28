@@ -6,7 +6,7 @@
 > per-call-site inline caches, a native x86-64 OSR JIT (dynasm), and a
 > whole-heap mark-sweep GC.
 >
-> Last re-measured **2026-07-26**. Every number below was measured on this repo;
+> Last re-measured **2026-07-28**. Every number below was measured on this repo;
 > nothing here is an estimate unless it says "inferred".
 >
 > **Sections 1 and 3 below were written at 3.31x and several of their
@@ -14,6 +14,22 @@
 > B8 (the regex engine is not the bottleneck — we beat V8 at scanning), B17 (key
 > interning and inline storage both measured slower), and B16 (which loops the
 > JIT never reaches). Read those before acting on anything here.
+
+## Current experiment registry — 2026-07-28
+
+This is the short, current view. Detailed measurements and retained raw results
+are in B58.
+
+| item | current disposition | measured result |
+|---|---|---|
+| M0.1 counterbalanced harness | **IMPLEMENTED; A/A DRIFT OPEN** | paired AB/BA observations, raw schedules, bootstrap intervals, metadata, timeouts, and schema-v1/v2 reading; an A/A regex rerun reversed from −0.4% to +1.1% with both nominal CIs excluding zero, so ~1% claims still require independent replication |
+| M1.1 compiler global lookup | **IMPLEMENTED IN WORKTREE** | 3k/6k/12k/24k generated-function sweep stays approximately linear; largest/middle ns-per-MB ratio 0.975 |
+| M1.2 expression-arrow analysis | **IMPLEMENTED IN WORKTREE** | analysis consumes the expression directly; capture/`this`/`arguments`/`super`/`await` tests pass |
+| M1.3 first-way shape `SetProp` | **IMPLEMENTED IN WORKTREE** | NOJIT own-store microbenchmark −46.66% (95% CI −47.80% to −45.51%); removing it was +0.52% on four affected suite rows (95% CI −0.66% to +1.53%) |
+| M2 regular-subset regex tier | **EXPERIMENTAL, OFF BY DEFAULT** | regex row −2.82% (95% CI −3.8% to −2.0%), far below the 25% promotion gate; feature binary +14.7% |
+| default regex capture-name clone removal | **REVERTED** | restoring the original code measured −0.51% (95% CI −1.05% to −0.24%), inside the independently observed ~1% A/A drift floor |
+| M4.0 TypedArray guard reduction | **REVERTED** | −0.11% (95% CI −1.10% to +0.55%): statistically neutral |
+| M3-M5 object metadata, CFG/SSA, arena/nursery | **OPEN** | these remain the required architectural path toward broad V8 parity |
 
 ---
 
@@ -57,50 +73,55 @@ is a `diff`, not a remembered number. It was stale for a long stretch (the
 2,194-line oxc-era list against a 938-failure run), which made that diff
 meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — geomean 2.17× slower than node (was 3.31×)
+### Performance — cold geomean 1.90×; historical adjusted geomean 2.15×
 
-`bench/real/*.js` via `tools/bench.py`, paired medians of 7, output compared as
-exact bytes.
+`bench/real/*.js` via the schema-v2 `tools/bench.py`, 15 counterbalanced paired
+observations, exact-byte output comparison. These are cold total medians and
+paired ratios from `bench/final_default_2026-07-28.json`.
+The cold suite-level 95% paired-bootstrap interval is 1.87×-1.92×.
 
-| bench | node | zipp | ratio |
+| bench | node | zipp | cold paired ratio |
 |---|---|---|---|
-| map-set-heavy | 579ms | 699ms | 1.21× |
-| json-large | 227ms | 468ms | 2.06× |
-| async-promise-chain | 299ms | 688ms | 2.30× |
-| parse-large-js | 241ms | 582ms | 2.42× |
-| polymorphic-objects | 293ms | 716ms | 2.44× |
-| markdown-render | 238ms | 633ms | 2.66× |
-| class-prototype-hot | 266ms | 740ms | 2.78× |
-| sparse-array | 50ms | 151ms | 3.02× |
-| typedarray-math | 171ms | 667ms | 3.89× |
-| regex-log-scan | 422ms | 1725ms | 4.09× |
+| map-set-heavy | 923ms | 818ms | 0.90× |
+| class-prototype-hot | 299ms | 381ms | 1.27× |
+| markdown-render | 287ms | 478ms | 1.65× |
+| json-large | 300ms | 534ms | 1.77× |
+| async-promise-chain | 351ms | 644ms | 1.85× |
+| polymorphic-objects | 331ms | 622ms | 1.88× |
+| sparse-array | 85ms | 162ms | 1.92× |
+| parse-large-js | 280ms | 601ms | 2.16× |
+| typedarray-math | 210ms | 650ms | 3.11× |
+| regex-log-scan | 467ms | 1890ms | 4.00× |
 
-**Run-to-run variance is ±10–17%** — node's own `map-set` time has ranged
-609–966ms on this machine. A single-row move under ~10% is noise; use
-`tools/bench.py --ab old.exe new.exe` for anything under a few percent. Track
-the geomean, which has moved 4.77× → 4.20× → 3.31× → 2.82× → 2.72× → 2.56× →
-2.29× → **2.17×** (both steps 2026-07-28: B51-B54 — super-accessor inlining
-×2, ToPropKey to the regalloc tier, the typeof fusion, Promise.resolve region
-admission — then B56-B57 — local accumulators in-place, the sound keyed-write
-fusion; `bench/final3_2026-07-28.json`. map-set-heavy is AHEAD of node at
-0.88×, class-prototype-hot went 3.30× → 1.41×, markdown-render 2.71× → 1.92×,
-polymorphic-objects 2.42× → 2.09×).
+The repaired harness treats total wall time as the primary cold metric. For
+continuity with the old table, subtracting the median empty-process launch gives
+a **2.15× historical-adjusted geomean** (Node startup 32.2ms, Zipp startup
+7.8ms), effectively confirming the former 2.17× headline from the same run.
 
-**What it would take to reach 2×**, from the phase-level measurements in B31–B33
-— none of these is a tuning change:
+Run-to-run variance remains material, so a raw percentage is no longer treated
+as evidence on its own: use the retained paired observations and paired-bootstrap
+95% interval. The historical adjusted geomean has moved 4.77× → 4.20× → 3.31×
+→ 2.82× → 2.72× → 2.56× → 2.29× → 2.17× → **2.15×**. On the current cold
+run, map-set-heavy is ahead of Node at 0.90×, while class-prototype-hot is
+1.27×, markdown-render 1.65×, and polymorphic-objects 1.88×.
+
+**What it would take to move the adjusted 2.15× result toward parity**, from
+the phase-level measurements in B31–B33 — none of these is a tuning change:
 
 1. **Hidden classes / shapes.** The property fast path is keyed to object
    IDENTITY, not shape, with a cliff at exactly `IC_WAYS = 8`: the same
    `{alpha,beta,gamma}` read costs 4.2ns at 8 distinct receivers and 18.9ns at
    16, where node is flat at 0.6ns. This is the only fix for that cliff and for
    the unconditional `pos()` the interpreter IC pays on every access.
-2. **A compiled regex backend.** `regress` is a backtracking interpreter at
-   6.9ns per failed match attempt against Irregexp's 0.37ns.
+2. **A profitable compiled regex backend.** `regress` is a backtracking
+   interpreter at 6.9ns per failed match attempt against Irregexp's 0.37ns,
+   but B58's conservative regular-subset tier moved the complete row only 2.82%
+   and therefore remains off by default.
 3. **An optimizing tier with SSA.** `typedarray-math`'s DataView phase and its
    prefix-sum phase are both op-count bound on a register machine with no such
    tier (B32, B7) — prefix-sum is already on the BEST tier and is still 3.4×.
 
-Startup is ~4× faster than node (7ms vs 30ms).
+Startup is ~4× faster than node (7.8ms vs 32.2ms).
 
 ### What the engine already wins
 
@@ -128,11 +149,10 @@ measuring something other than its name:
   that §3 blames it for. Any claim about megamorphic behaviour needs a 9th
   shape.
 
-Harness gaps that keep costing real time (±10% run-to-run variance has already
-produced at least two false readings this cycle): no raw samples retained, no
-engine interleaving, mean-of-best rather than median with an interval, and no
-separation of cold start / warm steady state / GC / RSS. A change under ~10% on
-one row currently cannot be distinguished from noise without hand-repeating it.
+M0.1 resolved the raw-sample, engine-order, paired-startup, median/interval, and
+metadata debts. Still open are persistent warm execution, compile/JIT/GC phase
+timing, RSS, and the coverage corrections above. A small change now needs its
+paired confidence interval rather than hand-repeated best-of-N timing.
 
 ## 2. The standing gate
 
@@ -142,8 +162,8 @@ Every engine change must pass, in full:
 2. **test262, BOTH tiers:** `tools/run_test262.py --dump-fails f.txt`, then
    `diff <(sort f.txt) <(sort tools/test262-expected-failures.txt)` — zero new
    entries. Repeat with `ZIPP_NOJIT=1`.
-3. **Unit tests:** `cargo test --release` = **287 passing, 0 failed**. Check the
-   SUMMED pass count; the suite count is invariant to deleting tests.
+3. **Unit tests:** `cargo test --workspace --release`. Check the summed pass
+   count and every ignored test; do not rely on one package's summary.
 4. **Bench correctness:** `bash bench/run_real.sh` → `ALL_CORRECT=1`, default
    **and** `ZIPP_NOJIT=1`.
 5. **GC stress:** add `ZIPP_GC_STRESS=1` when the change touches GC/heap —
@@ -153,10 +173,10 @@ Any change touching the JIT must produce identical output with and without it;
 `assert_jit_matches` in `crates/zipp-vm/src/lib.rs` pins that per case, and new
 JIT work is expected to add cases there.
 
-**Measurement protocol.** Baseline is the live `bench/results_real.txt`. Re-run
-with `bash bench/run_real.sh` (or `BENCHES=<row> bash bench/run_real.sh`). Given
-the variance above, an A/B needs best-of-7 on a quiet machine, and a claimed win
-under 10% on one row needs a second run before it goes in a commit message.
+**Measurement protocol.** Use `tools/bench.py --ab old.exe new.exe` and retain
+its schema-v2 JSON. A change expected under 10% needs at least 15
+counterbalanced pairs (21 for a marginal decision), a paired-bootstrap 95%
+interval, exact output, and the full-suite regression check.
 
 **Heavy-codegen discipline.** Develop behind an opt-in env flag, flip the default
 last, only after the full gate is green across several milestones.
@@ -1362,6 +1382,85 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B58 — The V8-parity plan audit: contained work is safe; the architectural gap remains
+
+The implementation plan was applied against exact baseline
+`1388621f86ac92188f66c8402a8a070428d01438`. Its definition of parity is the
+current ten-program suite, not general V8 parity.
+
+M0.1 is now implemented in `tools/bench.py`: each repetition retains paired
+full and empty launches, two-engine order is counterbalanced AB/BA, benchmark
+order and larger engine sets are shuffled deterministically, cold total is
+primary, startup-adjusted time is separate, paired medians and bootstrap
+intervals are reported, raw execution order is retained, and schema-v1 results
+remain readable. The harness also records
+timeouts, failures, stderr previews, output byte lengths/digests,
+engine/binary/host metadata, arguments, environment, seed, and digest, and
+refuses silent JSON overwrite. Its 22 Python
+tests cover scheduling, confidence intervals, old-schema reading, correctness
+failures, timeouts, and overwrite protection.
+
+The no-change validation found one remaining measurement debt. In the full
+15-pair A/A suite, the suite CI contained zero (−1.31% to +0.21%) and nine of
+ten row CIs contained zero, but `regex-log-scan` reported −1.2% to −0.1%. The
+required 21-pair marginal rerun then moved in the opposite direction, from +0.6%
+to +1.4%, despite both sides being the same executable. This is environmental
+drift, not a binary effect, and demonstrates that the nominal within-run
+bootstrap interval is too optimistic at roughly the 1% scale. Treat changes in
+that range as inconclusive without an independent run even when one interval
+excludes zero. Raw data:
+
+- `bench/harness_aa_final_2026-07-28.json`
+- `bench/harness_aa_regex_21_2026-07-28.json`
+
+The isolated implementation results are:
+
+| experiment | disposition | paired result |
+|---|---|---|
+| compiler hash lookups and direct expression-arrow analysis | **kept** | 3k/6k/12k/24k generated-function sweep: 6.62/16.43/43.81/86.91ms; largest/middle ns-per-MB ratio 0.975 |
+| first-way own-data shape probe in interpreter `SetProp` | **kept** | focused NOJIT store micro −46.66%, 95% CI −47.80% to −45.51%; removing it was +0.52% on the four affected suite rows, 95% CI −0.66% to +1.53% |
+| optional conservative ASCII regular-subset executor | **off by default** | regex row −2.82%, 95% CI −3.8% to −2.0%; feature binary +14.7%; misses the plan's 25% row promotion gate |
+| classical-path capture-name clone removal | **reverted** | restoring the original path measured −0.51%, 95% CI −1.05% to −0.24%; this is inside the independently observed ~1% A/A drift floor |
+| M4.0 TypedArray guard reduction | **reverted** | −0.11%, 95% CI −1.10% to +0.55%: neutral |
+
+The final default build, containing only the retained runtime/compiler changes,
+is neutral against the exact baseline over 15 counterbalanced pairs:
+**0.9974× (−0.26%) cold geomean**, with a suite-level 95% CI of −0.76% to +0.90%
+and exact output for every row. No unrelated row regressed more than 2% beyond
+its confidence interval; `json-large`
+improved 3.0% (95% CI 0.1% to 3.7%). Raw data:
+
+- `bench/final_default_2026-07-28.json`
+- `bench/final_default_nojit_smoke_2026-07-28.json`
+- `bench/final_default_vs_1388621_ab_2026-07-28.json`
+- `bench/setprop_suite_subset_ab_2026-07-28.json`
+- `bench/regex_linear_final_ab_2026-07-28.json`
+- `bench/group_name_clone_ab_2026-07-28.json`
+- `bench/typedarray_m4_guard_reduction_ab_2026-07-28.json`
+
+The same final binary against Node is **1.90× on primary cold total** and
+**2.15× in the historical startup-adjusted units**, with `ALL_CORRECT=1`.
+It wins `map-set-heavy` at 0.90×, but `regex-log-scan` (4.00× cold) and
+`typedarray-math` (3.11× cold) show why this cannot be described as parity. A
+one-repetition no-JIT smoke also produced exact output on all ten programs; it
+is a correctness check, not a performance estimate.
+
+Correctness checks passed for the workspace release suite, default and
+feature-gated regexp differential suites, compiler boundary and semantic tests,
+strict/sloppy/proxy/accessor/dictionary `SetProp`, GC stress, WASM, and
+no-default-feature compilation. Test262 was not rerun because no Test262 checkout
+was available locally; its baseline must therefore be checked before release.
+
+This is useful substrate, but it is not parity. Still open from the plan:
+
+1. M0.2-M0.4: persistent warm/compile separation, phase telemetry, RSS, and
+   materially broader benchmark coverage.
+2. M3: stable per-object metadata and shape-key native ICs.
+3. M4: a CFG/SSA tier with precise deoptimization, then typed-array/DataView
+   range and bounds specialization.
+4. M5: stable object arena, scalar replacement, and a handle-preserving nursery.
+5. Validation on real application bundles before any broad V8-parity claim.
 
 ### B57 — `o["k" + i] = v` fuses soundly: polymorphic-objects −16%
 

@@ -298,7 +298,7 @@ impl<'a> FnCompiler<'a> {
                 | Some(Binding::Upvalue(_))
                 | Some(Binding::ClassName(_)) => true,
                 Some(Binding::Global(slot)) => {
-                    self.cx.hoisted_globals.contains(&slot)
+                    self.cx.hoisted_set.contains(&slot)
                         || self.cx.lexical_globals.contains(&slot)
                         || self.cx.decl_globals.contains(&slot)
                 }

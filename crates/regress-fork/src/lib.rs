@@ -173,6 +173,8 @@ mod exec;
 mod indexing;
 mod insn;
 mod ir;
+#[cfg(feature = "linear-ascii")]
+mod linear;
 mod matchers;
 mod optimizer;
 mod parse;

@@ -21,11 +21,11 @@
 //! Proxies, non-`Object` receivers, deferred-namespace state) is excluded at
 //! fill time and re-excluded cheaply at hit time.
 //!
-//! * `OwnData`/`OwnAcc` entries cache only a SLOT index. Validation is
-//!   `keys[slot] == key` (keys are unique within a map, so a match proves the
-//!   slot is the own property) plus a re-read of `attrs[slot]` — so in-place
-//!   value writes, `freeze`, and data⇄accessor redefinition are all observed
-//!   fresh. Nothing cached can go stale.
+//! * `OwnData`/`OwnAcc` entries cache a SHAPE plus SLOT. A guardable first-way
+//!   shape match proves the key → slot mapping without a name lookup; other
+//!   ways validate `keys[slot] == key`. Every usable hit re-reads
+//!   `attrs[slot]` — so in-place value writes, `freeze`, and data⇄accessor
+//!   redefinition are all observed fresh. Nothing cached can go stale.
 //! * `Class*` entries rely on ClassData being IMMUTABLE after class
 //!   definition (methods/getters/setters/parent are only written by the
 //!   MakeClass / computed-member ops; `C.prototype.m = …` does not feed back
@@ -170,7 +170,8 @@ pub(crate) enum SetAct {
     None,
 }
 
-/// A validated `SetProp` action, produced borrow-free by `ic_validate_set`.
+/// A validated `SetProp` action, produced borrow-free by the shape probe or
+/// [`Vm::ic_validate_set`].
 enum SetPlan {
     WriteOwn { idx: u32, slot: u32 },
     Setter { fid: u32, closure: u32, setter: Value },
@@ -796,11 +797,39 @@ impl<'p> Vm<'p> {
             disabled = site.misses >= IC_MISS_LIMIT;
             if site.n > 0 {
                 if let Some((idx, m)) = self.ic_recv_map(recv) {
-                    let own = m.pos(key);
-                    for e in &site.entries[..site.n as usize] {
-                        if let Some(p) = self.ic_validate_set(e, idx, m, own) {
-                            plan = Some(p);
-                            break;
+                    // Probe ONLY the first way by hidden class before paying for
+                    // `pos(key)`. A shape match proves this site's constant key
+                    // still occupies the recorded slot, but not that the live
+                    // descriptor is safe to write: re-read it so freeze and
+                    // data<->accessor redefinitions cannot bypass ordinary Set
+                    // semantics. Keep only indices in the plan so the mutable
+                    // store happens after the map/site borrows end.
+                    //
+                    // Do not scan every way by shape here. GetProp tried that
+                    // policy already; failed compares on genuinely polymorphic
+                    // JSON sites made it materially slower.
+                    let shape = m.shape();
+                    if m.shape_guardable() {
+                        if let IcEntry::OwnData { shape: cached_shape, slot } = site.entries[0] {
+                            if cached_shape == shape {
+                                if let Some(attr) = m.attr_get(slot as usize) {
+                                    if !attr.accessor && attr.writable {
+                                        plan = Some(SetPlan::WriteOwn { idx, slot });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Dictionary receivers, unsafe/invalidated first ways, and
+                    // shape misses retain the complete old lookup and way scan.
+                    if plan.is_none() {
+                        let own = m.pos(key);
+                        for e in &site.entries[..site.n as usize] {
+                            if let Some(p) = self.ic_validate_set(e, idx, m, own) {
+                                plan = Some(p);
+                                break;
+                            }
                         }
                     }
                 }

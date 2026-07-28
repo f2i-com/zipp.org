@@ -14,7 +14,7 @@ use super::*;
 /// lets a self-recursive integer function (fib) be compiled — the `LoadGlobal`
 /// of the own slot is a no-op marker (its value is only the call target, which
 /// the helper resolves), and the `Call` becomes a depth-guarded native recurse.
-pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u16>) -> bool {
+pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
     if proto.code.is_empty() {
         return false;
     }
@@ -48,7 +48,7 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u16>) -> bool {
             | Instr::ReturnUndefined => {}
             // `LoadGlobal(self_slot)` is allowed only as the immediately-
             // preceding callee load of a self `Call` (checked at the Call).
-            Instr::LoadGlobal { idx, .. } if Some(*idx as u16) == self_slot => {}
+            Instr::LoadGlobal { idx, .. } if Some(*idx) == self_slot => {}
             // A self-call: callee must be loaded from self_slot by the prior op.
             Instr::Call { callee, .. } => {
                 if !is_self_call(code, ip, *callee, self_slot) {
@@ -64,7 +64,7 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u16>) -> bool {
 /// Is the `Call` at `ip` (with callee register `callee`) a self-call — i.e. was
 /// `callee` produced by a `LoadGlobal(self_slot)` earlier with no intervening
 /// write to that register? Conservative: scans backward for the nearest writer.
-pub(crate) fn is_self_call(code: &[Instr], ip: usize, callee: u16, self_slot: Option<u16>) -> bool {
+pub(crate) fn is_self_call(code: &[Instr], ip: usize, callee: u16, self_slot: Option<u32>) -> bool {
     let self_slot = match self_slot {
         Some(s) => s,
         None => return false,
@@ -72,7 +72,7 @@ pub(crate) fn is_self_call(code: &[Instr], ip: usize, callee: u16, self_slot: Op
     for j in (0..ip).rev() {
         if let Some(w) = writes_reg(&code[j]) {
             if w == callee {
-                return matches!(&code[j], Instr::LoadGlobal { idx, .. } if *idx as u16 == self_slot);
+                return matches!(&code[j], Instr::LoadGlobal { idx, .. } if *idx == self_slot);
             }
         }
     }

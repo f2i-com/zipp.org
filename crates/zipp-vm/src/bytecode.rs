@@ -1054,7 +1054,7 @@ pub struct FuncProto {
     pub wtf8_consts: Vec<u32>,
     /// If this function's name is hoisted to a global binding, the slot index;
     /// the VM materialises a function object into that global at startup.
-    pub name_global: Option<u16>,
+    pub name_global: Option<u32>,
     /// Upvalues this function captures, in order. Index `i` of a `UpvalGet`/
     /// `UpvalSet` refers to `upvalues[i]`. Each entry says where the DEFINING
     /// frame finds the cell to capture: a local register holding a cell, or one

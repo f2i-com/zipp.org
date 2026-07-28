@@ -51,24 +51,6 @@ fn drop_member(list: &mut Vec<(String, &ast::Function)>, name: &str) {
     list.retain(|(n, _)| n != name);
 }
 
-/// The statement list of an arrow body, for the `&[Stmt]`-shaped analyses
-/// (`hoisted_var_names`, `capture::captured_locals`, `stash_child_with_shadows`).
-///
-/// NOTE: an expression-bodied arrow no longer HAS a statement list — `x => e` is
-/// `ArrowBody::Expr`, where oxc synthesised a body of exactly one
-/// `ExpressionStatement` (and no directives, so `x => "use strict"` was never a
-/// prologue). Those analyses are written against statements, so the same
-/// one-element list is rebuilt here: identical input, identical bytecode. It
-/// costs one clone of the body expression per expression-bodied arrow; an
-/// expression-level entry point in `capture` would remove the clone, but adding
-/// one is a change to a module this port does not own.
-fn arrow_body_stmts(a: &ast::Arrow) -> std::borrow::Cow<'_, [ast::Stmt]> {
-    match &a.body {
-        ast::ArrowBody::Block(b) => std::borrow::Cow::Borrowed(&b.stmts),
-        ast::ArrowBody::Expr(e) => std::borrow::Cow::Owned(vec![ast::Stmt::Expr((**e).clone())]),
-    }
-}
-
 impl<'a> FnCompiler<'a> {
     pub(crate) fn func_decl(&mut self, f: &ast::Function) -> R<()> {
         self.func_decl_inner(f, true)
@@ -1759,8 +1741,22 @@ impl<'a> FnCompiler<'a> {
         if self.with_stack.is_empty() && self.inherited_with_shadows.is_empty() {
             return;
         }
+        self.stash_child_free_names(capture::free_vars(bound, body));
+    }
+
+    /// Arrow-body counterpart of `stash_child_with_shadows`. The capture walk
+    /// accepts both block and bare-expression bodies directly, so an expression
+    /// arrow never needs a cloned synthetic `ExpressionStatement`.
+    fn stash_arrow_child_with_shadows(&mut self, bound: &[String], body: &ast::ArrowBody) {
+        if self.with_stack.is_empty() && self.inherited_with_shadows.is_empty() {
+            return;
+        }
+        self.stash_child_free_names(capture::free_vars_arrow(bound, body));
+    }
+
+    fn stash_child_free_names(&mut self, free_names: HashSet<String>) {
         let mut map = std::collections::HashMap::new();
-        for name in capture::free_vars(bound, body) {
+        for name in free_names {
             let mut chain = self.with_names_for(&name);
             if !self.scopes.iter().flatten().any(|(n, _)| *n == name)
                 && self.self_name.as_ref().map_or(true, |(n, _)| *n != name)
@@ -1829,12 +1825,13 @@ impl<'a> FnCompiler<'a> {
         let rest = rest_name(&a.params)?;
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&a.params));
-        // See `arrow_body_stmts`: an expression body has no statement list of its
-        // own, so the one-statement list oxc used to synthesise is rebuilt.
-        let body = arrow_body_stmts(a);
-        names.extend(hoisted_var_names(&body)); // function-scoped `var`s (capture)
-        let captured = capture::captured_locals(&names, &body);
-        self.stash_child_with_shadows(&names, &body);
+        // A bare expression cannot contain this arrow's own `var` declaration;
+        // block bodies retain the ordinary hoisting analysis.
+        if let ast::ArrowBody::Block(b) = &a.body {
+            names.extend(hoisted_var_names(&b.stmts));
+        }
+        let captured = capture::captured_locals_arrow(&names, &a.body);
+        self.stash_arrow_child_with_shadows(&names, &a.body);
         let enclosing = self.child_enclosing();
         let mut proto =
             self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class, self.super_static, self.super_home_obj)?;

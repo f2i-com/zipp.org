@@ -216,7 +216,7 @@ impl<'p> Vm<'p> {
                 }
             }
             if let Some(s) = f.name_global {
-                f.name_global = Some(gmap[s as usize] as u16);
+                f.name_global = Some(gmap[s as usize]);
             }
             new_funcs.push(Box::leak(Box::new(f)));
         }

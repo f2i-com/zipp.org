@@ -33,6 +33,7 @@ dynasmrt = { workspace = true, optional = true }
 # build is a pure interpreter with no unsafe codegen.
 default = ["jit"]
 jit = ["dep:dynasm", "dep:dynasmrt"]
+regex-linear = ["regress/linear-ascii"]
 # Step budget, cooperative abort, and per-instruction execution tracing for
 # embedders running untrusted code (see vm/instrument.rs). Off by default: it
 # adds a branch to the inner dispatch loop, and enabling it on a VM turns the

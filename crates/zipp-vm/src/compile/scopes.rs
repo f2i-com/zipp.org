@@ -275,7 +275,7 @@ impl<'a> FnCompiler<'a> {
         match self.resolve(name) {
             Binding::Global(idx) => {
                 let i = idx as u32;
-                !self.cx.hoisted_globals.contains(&i)
+                !self.cx.hoisted_set.contains(&i)
                     && !self.cx.decl_globals.contains(&i)
                     && !self.cx.lexical_globals.contains(&i)
                     && !self.cx.const_globals.contains(&i)
@@ -368,7 +368,7 @@ impl<'a> FnCompiler<'a> {
         if let Some(idx) = self.resolve_upvalue(name) {
             return Binding::Upvalue(idx);
         }
-        if let Some(i) = self.cx.globals.iter().position(|g| g == name) {
+        if let Some(i) = self.cx.existing_global_slot(name) {
             return Binding::Global(i as u32);
         }
         // Unknown name → treat as a global (read yields undefined; matches JS
@@ -448,9 +448,7 @@ impl<'a> FnCompiler<'a> {
             }
         }
         self.cx
-            .globals
-            .iter()
-            .position(|g| g == name)
+            .existing_global_slot(name)
             .map(|i| Binding::Global(i as u32))
     }
 

@@ -11,6 +11,11 @@ use super::*;
 use crate::parse::ast;
 use crate::parse::token::StrVal;
 
+fn checked_global_slot_index(len: usize) -> Option<u32> {
+    let slot = u32::try_from(len).ok()?;
+    (slot < u32::MAX).then_some(slot)
+}
+
 impl Compiler {
     /// Whether `name` names a binding of the eval's VARIABLE ENVIRONMENT — the
     /// calling function's own activation. Such a name is re-used by a top-level
@@ -75,11 +80,12 @@ impl Compiler {
     /// the synthetic `*default*`) — remapped to per-module fresh slots by the
     /// loader. Meaningful only for module compiles; harmless (unused) for scripts.
     pub(crate) fn collect_module_decl_globals(&self) -> Vec<u32> {
+        self.debug_assert_global_indexes();
         let mut v: Vec<u32> = self.decl_globals.iter().copied().collect();
         v.extend(self.lexical_globals.iter().copied());
         v.extend(self.const_globals.iter().copied());
         v.extend(self.hoisted_globals.iter().copied());
-        if let Some(i) = self.globals.iter().position(|n| n == "*default*") {
+        if let Some(i) = self.existing_global_slot("*default*") {
             v.push(i as u32);
         }
         // An INLINE `export const x` / `export function f` is an
@@ -87,7 +93,7 @@ impl Compiler {
         // never registered its slot. Add every exported LOCAL's slot directly so a
         // module's exports always get fresh per-module slots (isolation).
         for (_, local) in &self.module_exports {
-            if let Some(i) = self.globals.iter().position(|n| n == local) {
+            if let Some(i) = self.existing_global_slot(local) {
                 v.push(i as u32);
             }
         }
@@ -108,14 +114,72 @@ impl Compiler {
             .unwrap_or_default()
     }
 
-    pub(crate) fn global_slot(&mut self, name: &str) -> u16 {
-        if let Some(&i) = self.global_index.get(name) {
+    /// Look up an already-reserved global without changing the deterministic
+    /// slot-to-name vector. All name-to-slot reads go through the reverse index;
+    /// the point assertion catches a stale/wrong map entry at its first use.
+    pub(crate) fn existing_global_slot(&self, name: &str) -> Option<u32> {
+        let slot = self.global_index.get(name).copied();
+        #[cfg(debug_assertions)]
+        if let Some(slot) = slot {
+            debug_assert_eq!(
+                self.globals.get(slot as usize).map(String::as_str),
+                Some(name),
+                "global_index slot disagrees with globals"
+            );
+        }
+        slot
+    }
+
+    pub(crate) fn global_slot(&mut self, name: &str) -> u32 {
+        if let Some(i) = self.existing_global_slot(name) {
             return i;
         }
-        let i = self.globals.len() as u16;
-        self.globals.push(name.to_string());
-        self.global_index.insert(name.to_string(), i);
+        let i = checked_global_slot_index(self.globals.len())
+            .expect("a program cannot contain more than u32::MAX globals");
+        let owned = name.to_string();
+        self.globals.push(owned.clone());
+        let old = self.global_index.insert(owned, i);
+        debug_assert!(old.is_none(), "global_index insertion replaced an entry");
+        debug_assert_eq!(self.globals.len(), self.global_index.len());
         i
+    }
+
+    /// Append a top-level `var` slot exactly once while keeping its ordered
+    /// replay vector and membership index in lockstep.
+    fn record_hoisted_global(&mut self, slot: u32) {
+        if self.hoisted_set.insert(slot) {
+            self.hoisted_globals.push(slot);
+        }
+        debug_assert_eq!(self.hoisted_globals.len(), self.hoisted_set.len());
+    }
+
+    /// Full debug-only consistency check for the ordered compiler tables and
+    /// their lookup indexes. This runs at compile/module boundaries, not per
+    /// lookup, so debug builds retain linear rather than quadratic compilation.
+    fn debug_assert_global_indexes(&self) {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert_eq!(self.globals.len(), self.global_index.len());
+            for (slot, name) in self.globals.iter().enumerate() {
+                debug_assert_eq!(
+                    self.global_index.get(name).copied(),
+                    Some(slot as u32),
+                    "globals entry disagrees with global_index"
+                );
+            }
+            debug_assert_eq!(self.hoisted_globals.len(), self.hoisted_set.len());
+            let ordered_set: rustc_hash::FxHashSet<u32> =
+                self.hoisted_globals.iter().copied().collect();
+            debug_assert_eq!(
+                ordered_set.len(),
+                self.hoisted_globals.len(),
+                "hoisted_globals contains a duplicate"
+            );
+            debug_assert_eq!(
+                ordered_set, self.hoisted_set,
+                "hoisted_globals disagrees with hoisted_set"
+            );
+        }
     }
 
     pub(crate) fn compile(&mut self, prog: &ast::Program) -> R<()> {
@@ -169,9 +233,7 @@ impl Compiler {
                     continue;
                 }
                 let slot = self.global_slot(&name) as u32;
-                if self.hoisted_set.insert(slot) {
-                    self.hoisted_globals.push(slot);
-                }
+                self.record_hoisted_global(slot);
             }
         }
 
@@ -197,6 +259,7 @@ impl Compiler {
             Vec::new(),
         )?;
         self.functions[0] = top;
+        self.debug_assert_global_indexes();
         Ok(())
     }
 
@@ -546,9 +609,7 @@ impl Compiler {
                     }
                     if !fn_names.contains(name) {
                         let slot = fc.cx.global_slot(name) as u32;
-                        if fc.cx.hoisted_set.insert(slot) {
-                            fc.cx.hoisted_globals.push(slot);
-                        }
+                        fc.cx.record_hoisted_global(slot);
                     }
                 }
             } else {
@@ -1273,27 +1334,10 @@ impl Compiler {
                 ast::ArrowBody::Block(b) => has_use_strict(&b.directives),
                 ast::ArrowBody::Expr(_) => false,
             };
-        // `capture::free_vars` scans a STATEMENT list, and an expression-bodied
-        // arrow no longer has one — the old AST spelled `x => e` as a body of a
-        // single ExpressionStatement, which is exactly what the scans below expect
-        // to see. Rebuild that one statement rather than give `capture` a second
-        // entry point.
-        // NOTE: this clones the body expression. `compile_arrow` (funcs.rs) needs
-        // the same list for `captured_locals` / `hoisted_var_names` /
-        // `stash_child_with_shadows`, so if a shared `ArrowBody` → `&[Stmt]` view
-        // lands, both sites should use it instead of cloning.
-        let expr_body_stmt: Vec<ast::Stmt>;
-        let body_stmts: &[ast::Stmt] = match &a.body {
-            ast::ArrowBody::Block(b) => &b.stmts,
-            ast::ArrowBody::Expr(e) => {
-                expr_body_stmt = vec![ast::Stmt::Expr((**e).clone())];
-                &expr_body_stmt
-            }
-        };
         // An arrow that references `eval` (incl. in its parameter defaults)
         // boxes its locals and records DirectEval sites like a function.
         let mut captured = captured;
-        let arrow_refs_eval = capture::free_vars(&[], body_stmts).contains("eval")
+        let arrow_refs_eval = capture::free_vars_arrow(&[], &a.body).contains("eval")
             || capture::params_reference("eval", &a.params);
         if arrow_refs_eval {
             let mut all: Vec<String> = params.to_vec();
@@ -1482,5 +1526,67 @@ fn add_str_val_const(fc: &mut FnCompiler<'_>, s: &StrVal) -> u32 {
     match s {
         StrVal::Utf8(t) => fc.add_string_const(t),
         StrVal::Utf16(_) => fc.add_string_const_wtf8(&str_val_text(s)),
+    }
+}
+
+#[cfg(test)]
+mod m1_tests {
+    use super::{checked_global_slot_index, Compiler};
+    use std::fmt::Write;
+    use std::time::Instant;
+
+    #[test]
+    fn global_index_does_not_wrap_at_the_u16_boundary() {
+        let mut compiler = Compiler::new(String::new());
+        for slot in 0..=(u16::MAX as u32 + 1) {
+            let name = format!("global_{slot}");
+            assert_eq!(compiler.global_slot(&name), slot);
+        }
+        assert_eq!(
+            compiler.existing_global_slot("global_65536"),
+            Some(65_536)
+        );
+        compiler.debug_assert_global_indexes();
+    }
+
+    #[test]
+    fn global_count_rejects_the_unrepresentable_next_slot() {
+        assert_eq!(checked_global_slot_index(u32::MAX as usize), None);
+    }
+
+    #[test]
+    #[ignore = "explicit compiler-only scalability sweep"]
+    fn generated_function_compile_sweep() {
+        let mut ns_per_mb = Vec::new();
+        for count in [3_000, 6_000, 12_000, 24_000] {
+            let mut source = String::with_capacity(count * 36);
+            for i in 0..count {
+                writeln!(
+                    source,
+                    "function generated_{i}() {{ return generated_{}; }}",
+                    i.saturating_sub(1)
+                )
+                .unwrap();
+            }
+            let ast = crate::front::parse_script(&source).expect("generated script parses");
+            let bytes = source.len();
+            let started = Instant::now();
+            drop(
+                crate::compile::compile_program(&ast, &source)
+                    .expect("generated script compiles"),
+            );
+            let elapsed = started.elapsed();
+            let rate = elapsed.as_nanos() as f64 * 1_000_000.0 / bytes as f64;
+            ns_per_mb.push(rate);
+            eprintln!(
+                "functions={count} bytes={bytes} elapsed={elapsed:?} ns_per_mb={:.0}",
+                rate
+            );
+        }
+        assert!(
+            ns_per_mb[3] / ns_per_mb[2] < 1.25,
+            "compiler throughput degraded by {:.3}x from 12k to 24k functions",
+            ns_per_mb[3] / ns_per_mb[2]
+        );
     }
 }

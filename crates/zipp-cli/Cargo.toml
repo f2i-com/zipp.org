@@ -12,3 +12,7 @@ path = "src/main.rs"
 [dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
 zipp-vm = { path = "../zipp-vm" }
+
+[features]
+default = []
+regex-linear = ["zipp-vm/regex-linear"]

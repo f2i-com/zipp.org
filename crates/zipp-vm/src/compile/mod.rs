@@ -148,7 +148,7 @@ struct Compiler {
     /// interning that PERF_ROADMAP records as a measured loss: that one sat on
     /// the runtime hot path, where the hash costs more than the small malloc it
     /// replaced. This is a compile-time lookup that was O(n).)
-    global_index: rustc_hash::FxHashMap<String, u16>,
+    global_index: rustc_hash::FxHashMap<String, u32>,
     /// Compiled class descriptors, indexed by the `MakeClass` class_id.
     classes: Vec<ClassDef>,
     /// Class name → class_id, for resolving `extends <Name>` and `super`.

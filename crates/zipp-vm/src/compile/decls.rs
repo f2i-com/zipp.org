@@ -449,7 +449,7 @@ impl<'a> FnCompiler<'a> {
                             let (id, has_up) =
                                 self.compile_func_expr(Some("default".to_string()), f)?;
                             if self.is_script && self.cx.script_binds_globals && !has_up {
-                                self.cx.functions[id as usize].name_global = Some(slot as u16);
+                                self.cx.functions[id as usize].name_global = Some(slot);
                                 self.cx.decl_globals.insert(slot);
                                 self.next_reg -= 1;
                                 self.cx

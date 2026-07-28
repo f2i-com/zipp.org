@@ -18,7 +18,7 @@ pub const STRING_CONST_BIT: u32 = 0x8000_0000;
 /// simple we encode it via a convention: a function whose name is hoisted to a
 /// global has that slot recorded in a side table. For v1 the compiler sets it
 /// through `FuncProto`-adjacent metadata; we read it here.
-pub(crate) fn function_global_slot(f: &crate::bytecode::FuncProto) -> Option<u16> {
+pub(crate) fn function_global_slot(f: &crate::bytecode::FuncProto) -> Option<u32> {
     f.name_global
 }
 

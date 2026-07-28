@@ -103,24 +103,26 @@ node's ICU.
 regression is a diff rather than a remembered number. Run both tiers — a JIT
 change that only *appears* correct is the common failure mode here.
 
-**Performance — geomean 2.17× slower than node (V8)** on the ten real-world
-benchmarks in `bench/real/`, paired medians of 7, every output byte-identical
-to node:
+**Performance — cold geomean 1.90× zipp/node (95% CI 1.87×–1.92×)** on the
+ten programs in `bench/real/`, 15 counterbalanced paired observations, every
+output byte-identical to Node:
 
-| bench | node | zipp | ratio |
+| bench | node | zipp | paired ratio (95% CI) |
 |---|---|---|---|
-| map-set-heavy | 956ms | 842ms | **0.88×** |
-| class-prototype-hot | 272ms | 384ms | 1.41× |
-| markdown-render | 261ms | 499ms | 1.92× |
-| json-large | 276ms | 536ms | 1.95× |
-| async-promise-chain | 323ms | 670ms | 2.07× |
-| polymorphic-objects | 305ms | 638ms | 2.09× |
-| parse-large-js | 252ms | 620ms | 2.46× |
-| sparse-array | 52ms | 160ms | 3.05× |
-| typedarray-math | 182ms | 652ms | 3.58× |
-| regex-log-scan | 446ms | 1934ms | 4.34× |
+| map-set-heavy | 923ms | 818ms | **0.90× [0.82, 0.99]** |
+| class-prototype-hot | 299ms | 381ms | 1.27× [1.24, 1.30] |
+| markdown-render | 287ms | 478ms | 1.65× [1.61, 1.72] |
+| json-large | 300ms | 534ms | 1.77× [1.68, 1.82] |
+| async-promise-chain | 351ms | 644ms | 1.85× [1.84, 1.85] |
+| polymorphic-objects | 331ms | 622ms | 1.88× [1.85, 1.90] |
+| sparse-array | 85ms | 162ms | 1.92× [1.91, 1.94] |
+| parse-large-js | 280ms | 601ms | 2.16× [2.13, 2.19] |
+| typedarray-math | 210ms | 650ms | 3.11× [3.09, 3.17] |
+| regex-log-scan | 467ms | 1890ms | 4.00× [3.99, 4.05] |
 
-Startup is ~4× faster than node (7ms vs 30ms — no snapshot to load).
+Cold total is now the primary metric. In the historical convention that
+subtracts median process startup, the same captured run is **2.15×**. Zipp
+starts about 4× faster than Node (7.8ms vs 32.2ms — no snapshot to load).
 
 zipp beats V8 on specific shapes: scalar-numeric kernels, self-recursive integer
 functions, `s += …` string accumulation, dense-integer `Array` loops
@@ -130,13 +132,17 @@ Those wins do not carry to the benches above, which are dominated by object
 construction, property access, and building result objects.
 
 Use `python tools/bench.py` — NOT `bench/run_real.sh`, which is kept only for
-its historical series. The Python harness runs engines paired (so machine drift
-lands on all of them), reports medians with p10/p90, keeps raw samples, and
-compares output as exact bytes. The shell script takes best-of-N and pipes both
-outputs through `tr -d '-ÿ'` before comparing, which silently deleted
-every non-ASCII byte — its "byte-identical" claim was not true. Back-to-back
-runs of the same binary drift 3–10%, so `--ab old.exe new.exe` is the only
-reliable way to judge a change under a few percent.
+its historical series. The Python harness counterbalances two-engine AB/BA
+order, deterministically shuffles benchmark order (and larger engine sets),
+pairs an empty launch with every full launch, reports paired medians and
+bootstrap 95% intervals, retains the complete schedule and raw observations,
+and compares output as exact bytes. The shell script takes best-of-N and pipes
+both outputs through `tr -d '-ÿ'` before comparing, which silently deleted
+every non-ASCII byte — its "byte-identical" claim was not true. Use at least 15
+pairs for a change expected under 10%, and 21 for a marginal decision. A
+same-binary A/A check reversed the regex row from −0.4% to +1.1% on an
+independent rerun while both nominal intervals excluded zero, so a result around
+1% still needs independent reproduction.
 
 One known blind spot in the suite: **all ten benchmarks open with
 `"use strict"`.** That is realistic for modern bundles and unrepresentative of
@@ -156,21 +162,16 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today | 2.17× |
-| `regex-log-scan` made *exactly* as fast as V8 | **1.88×** |
-| `typedarray-math` made *exactly* as fast as V8 | 1.91× |
-| **both of the two worst at V8 parity** | **1.65×** |
-| the uniform alternative | every bench 8.0% faster |
+| today (cold total) | 1.90× |
+| `regex-log-scan` at Node parity | **1.65×** |
+| `typedarray-math` at Node parity | **1.69×** |
+| **both of the two worst at Node parity** | **1.47×** |
 
-**This table used to say something stronger than it does now, and the change is
-the point.** At 2.57× it took *both* of the two worst benchmarks at V8 parity to
-reach 1.94×, so the conclusion was that no single fix could get under 2×. At
-2.29× that is no longer true: `regex-log-scan` alone, brought to parity, lands
-at 1.99×. The 2× goal now has a single named blocker rather than needing a
-broad campaign — which is why the regex matcher is first on the list below.
-
-The wider discipline still holds. 13.0% uniformly is a lot to find in an engine
-already carrying four JIT tiers, so a stack of 1–2% wins is still not a plan.
+The cold score being below 2× is not general parity: nine rows remain slower,
+the two worst are 4.00× and 3.11×, and the historical startup-adjusted score is
+2.15×. The contained fixes in `PERF_ROADMAP.md` are safe substrate, but moving
+toward 1× still requires stable shape metadata, an optimizing CFG/SSA tier, and
+arena/nursery allocation rather than a stack of unmeasured 1–2% tweaks.
 
 **One number explains most of the rest: the general (boxed) JIT tier costs
 ~3.5ns per op.** A property read measured at 21ns is not a 21ns read — it is a
@@ -446,12 +447,12 @@ The standing gate for any engine change — see `PERF_ROADMAP.md` §2:
 
 ```sh
 cargo build --release
-cargo test --release                                   # 337 tests, 0 failed
+cargo test --workspace --release
 python tools/run_test262.py --t262 <path> --dump-fails fails.txt
 diff <(sort fails.txt) <(sort tools/test262-expected-failures.txt)   # REG=0
 ZIPP_NOJIT=1 python tools/run_test262.py …             # and again, interpreter only
-python tools/bench.py --reps 7                         # ALL_CORRECT=1
-python tools/bench.py --reps 7 --readme                # + the two tables above
+python tools/bench.py --reps 15                        # ALL_CORRECT=1
+python tools/bench.py --reps 15 --readme               # + the tables above
 ```
 
 On Windows the test262 runner needs `PYTHONUTF8=1` — a failing test can print a
