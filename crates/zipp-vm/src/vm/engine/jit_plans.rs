@@ -70,7 +70,9 @@ impl<'p> Vm<'p> {
         }
         let mut stored_globals: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
         for ins in &proto.code[s..=e] {
-            if let Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } = *ins {
+            if let Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } = *ins {
                 stored_globals.insert(idx);
             }
         }
@@ -1030,6 +1032,7 @@ fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
         Instr::LoadGlobal { dst, idx } => Instr::LoadGlobal { dst: s(dst), idx },
         Instr::StoreGlobal { idx, src } => Instr::StoreGlobal { idx, src: s(src) },
         Instr::StoreGlobalStrict { idx, src } => Instr::StoreGlobalStrict { idx, src: s(src) },
+        Instr::StoreGlobalResolved { idx, src } => Instr::StoreGlobalResolved { idx, src: s(src) },
         Instr::Add { dst, a, b } => Instr::Add { dst: s(dst), a: s(a), b: s(b) },
         Instr::Sub { dst, a, b } => Instr::Sub { dst: s(dst), a: s(a), b: s(b) },
         Instr::Mul { dst, a, b } => Instr::Mul { dst: s(dst), a: s(a), b: s(b) },

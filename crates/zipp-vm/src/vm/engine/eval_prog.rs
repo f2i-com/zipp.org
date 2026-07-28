@@ -134,6 +134,7 @@ impl<'p> Vm<'p> {
                     | Instr::LoadGlobalOrUndefined { idx, .. }
                     | Instr::StoreGlobal { idx, .. }
                     | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. }
                     | Instr::LoadGlobalDyn { idx, .. }
                     | Instr::LoadGlobalOrUndefinedDyn { idx, .. }
                     | Instr::StoreGlobalDyn { idx, .. }

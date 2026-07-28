@@ -1269,6 +1269,10 @@ pub struct ClassData {
     pub getters: Vec<(String, Value)>,
     /// `set x(v)` accessors, invoked with `this` = instance on property write.
     pub setters: Vec<(String, Value)>,
+    /// Public instance prototype keys in SOURCE order (see `ClassDef::proto_order`)
+    /// — the order `C.prototype`'s property map is built in, which the three
+    /// kind-grouped lists above cannot express on their own.
+    pub proto_order: Vec<String>,
     /// Static members — own properties of the class value (`C.method`,
     /// `C.field`). Methods start here; static fields are added by SetProp.
     pub statics: ObjMap,

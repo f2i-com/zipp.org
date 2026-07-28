@@ -696,6 +696,22 @@ impl<'p> Vm<'p> {
 
     /// `new Intl.<service>(locales, options)` → build resolved options + instance.
     pub(crate) fn make_intl(&mut self, kind: u8, locales: Value, options: Value) -> Result<Value, Thrown> {
+        self.make_intl_dtf(kind, locales, options, DtfDefaults::Standard)
+    }
+
+    /// As `make_intl`, but with CreateDateTimeFormat's `required`/`defaults`
+    /// arguments chosen by the caller. `Intl.DateTimeFormat` itself is
+    /// (any, date); `Date.prototype.toLocale*String` and every
+    /// `Temporal.*.prototype.toLocaleString` each pass their own pair, which is
+    /// what decides both which options clear needDefaults and which components
+    /// get filled in when none did.
+    pub(crate) fn make_intl_dtf(
+        &mut self,
+        kind: u8,
+        locales: Value,
+        options: Value,
+        dtf_mode: DtfDefaults,
+    ) -> Result<Value, Thrown> {
         use native::*;
         if kind == INTL_LOCALE {
             if options != Value::UNDEFINED && !self.is_object_value(options) {
@@ -955,34 +971,74 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                // ToDateTimeOptions(options, "any", "date"): needDefaults is
-                // cleared only by weekday/year/month/day (the date half) or
-                // dayPeriod/hour/minute/second/fractionalSecondDigits (the time
-                // half), or by a style. `era` and `timeZoneName` are Table-7
-                // components that clear NEITHER — so `{timeZoneName: "long"}`
-                // and `{era: "short"}` both still resolve to year/month/day,
-                // which is what every `…-formatting-timezonename.js` test reads
-                // back out of formatToParts.
-                let clears = vals.iter().any(|(n, _)| {
-                    matches!(
-                        *n,
-                        "weekday" | "year" | "month" | "day" | "dayPeriod" | "hour" | "minute"
-                            | "second"
-                    )
-                }) || frac_digits.is_some();
+                // CreateDateTimeFormat steps "If required is date and timeStyle
+                // is not undefined, throw" / "If required is time and dateStyle
+                // is not undefined, throw". This is the ONLY place the required
+                // half is observable when the other half's style is asked for:
+                // a PlainDate given {dateStyle, timeStyle} still has a non-empty
+                // date pattern, so the empty-intersection TypeError below would
+                // never fire (`PlainDate/…/datestyle-and-timestyle.js`).
+                let (req_date, req_time) = dtf_mode.required();
+                if !req_time && time_style.is_some() {
+                    return Err(Thrown(
+                        "TypeError: timeStyle is not a valid option for this date-only formatter"
+                            .into(),
+                    ));
+                }
+                if !req_date && date_style.is_some() {
+                    return Err(Thrown(
+                        "TypeError: dateStyle is not a valid option for this time-only formatter"
+                            .into(),
+                    ));
+                }
+                // needDefaults is cleared only by weekday/year/month/day (the
+                // date half) or dayPeriod/hour/minute/second/
+                // fractionalSecondDigits (the time half) — and only by the
+                // half(ves) `required` names — or by a style. `era` and
+                // `timeZoneName` are Table-7 components that clear NEITHER, so
+                // `{timeZoneName: "long"}` and `{era: "short"}` both still
+                // resolve to the defaults, which is what every
+                // `…-formatting-timezonename.js` test reads back out of
+                // formatToParts.
+                let clears = vals.iter().any(|(n, _)| match *n {
+                    "weekday" | "year" | "month" | "day" => req_date,
+                    "dayPeriod" | "hour" | "minute" | "second" => req_time,
+                    _ => false,
+                }) || (frac_digits.is_some() && req_time);
                 if !clears && date_style.is_none() && time_style.is_none() {
-                    for (name, v) in
-                        [("year", "numeric"), ("month", "numeric"), ("day", "numeric")]
-                    {
-                        vals.push((name, v.to_string()));
+                    let (def_date, def_time, def_zone) = dtf_mode.defaults();
+                    if def_date {
+                        for (name, v) in
+                            [("year", "numeric"), ("month", "numeric"), ("day", "numeric")]
+                        {
+                            vals.push((name, v.to_string()));
+                        }
                     }
-                    // Remembered because each Temporal type re-runs
-                    // ToDateTimeOptions with ITS group as the defaults: a
-                    // year/month/day that the OPTIONS asked for pins a
-                    // PlainTime to a date-only pattern (TypeError), one that
-                    // ToDateTimeOptions filled in does not (the PlainTime
-                    // pattern becomes hour/minute/second instead).
-                    r.set("@@dtfDefaulted", Value::bool(true));
+                    if def_time {
+                        for (name, v) in
+                            [("hour", "numeric"), ("minute", "numeric"), ("second", "numeric")]
+                        {
+                            vals.push((name, v.to_string()));
+                        }
+                    }
+                    // ZonedDateTime's defaults group is the only one that names
+                    // a zone: `zdt.toLocaleString()` must print the zone name
+                    // (`default-includes-time-and-time-zone-name.js`) where the
+                    // otherwise identical Instant must not.
+                    if def_zone && !vals.iter().any(|(n, _)| *n == "timeZoneName") {
+                        vals.push(("timeZoneName", "short".to_string()));
+                    }
+                    if dtf_mode == DtfDefaults::Standard {
+                        // Remembered because each Temporal type re-runs
+                        // ToDateTimeOptions with ITS group as the defaults: a
+                        // year/month/day that the OPTIONS asked for pins a
+                        // PlainTime to a date-only pattern (TypeError), one that
+                        // ToDateTimeOptions filled in does not (the PlainTime
+                        // pattern becomes hour/minute/second instead). The
+                        // toLocaleString modes already filled in their own
+                        // type's group, so they must NOT be re-defaulted.
+                        r.set("@@dtfDefaulted", Value::bool(true));
+                    }
                     // resolvedOptions reports the components in Table-7 order, and
                     // `vals` was built by walking `comps` — restore that order
                     // after the appends (era must precede year, timeZoneName
@@ -1840,6 +1896,10 @@ impl<'p> Vm<'p> {
             1 => (Self::F_DATE, YMD),                     // PlainDate
             2 => (Self::F_TIME, HMS),                     // PlainTime
             3 => (Self::F_DATE | Self::F_TIME, YMD | HMS), // PlainDateTime (no zone)
+            // ZonedDateTime — reachable only from its own toLocaleString
+            // (Intl.DateTimeFormat rejects the type outright), where the zone
+            // name is part of the defaults group.
+            7 => (Self::F_DATE | Self::F_TIME | Self::F_ZONE, YMD | HMS | Self::F_ZONE),
             5 => (Self::F_ERA | Self::F_YEAR | Self::F_MONTH, Self::F_YEAR | Self::F_MONTH),
             6 => (Self::F_MONTH | Self::F_DAY, Self::F_MONTH | Self::F_DAY),
             _ => (Self::F_DATE | Self::F_TIME | Self::F_ZONE, YMD | HMS), // Instant
@@ -1903,6 +1963,19 @@ impl<'p> Vm<'p> {
         if matches!(kind, 0 | 7) {
             return Ok((requested, true)); // Duration/ZonedDateTime: dtf_time_value rejects
         }
+        self.dtf_fields_for_kind(resolved, kind, name)
+    }
+
+    /// `dtf_fields_for` with the Temporal kind supplied directly, so
+    /// `Temporal.ZonedDateTime.prototype.toLocaleString` — the one caller for
+    /// which a ZonedDateTime is a legal argument — can reach the same resolution.
+    pub(crate) fn dtf_fields_for_kind(
+        &mut self,
+        resolved: u32,
+        kind: u8,
+        name: &str,
+    ) -> Result<(u16, bool), Thrown> {
+        let requested = self.dtf_requested_fields(resolved);
         let (allowed, defaults) = Self::temporal_fields(kind);
         // ToDateTimeOptions' needDefaults: only a Table-7 date/time COMPONENT
         // clears it — `era` and `timeZoneName` do not (which is why
@@ -1929,7 +2002,9 @@ impl<'p> Vm<'p> {
                 "TypeError: {name} options do not include any field this Temporal value has"
             )));
         }
-        Ok((effective, kind == 4))
+        // Instant and ZonedDateTime are absolute times: they render THROUGH the
+        // formatter's zone. Every plain type carries its own wall clock instead.
+        Ok((effective, matches!(kind, 4 | 7)))
     }
 
     /// HandleDateTimeValue: ToNumber + TimeClip for an ordinary time value (an
@@ -2250,7 +2325,17 @@ impl<'p> Vm<'p> {
             };
             let mut time: Vec<(&'static str, String)> = vec![];
             if has(Self::F_HOUR) {
-                time.push(("hour", two("hour", hour_val)));
+                // CLDR's 24-hour time pattern is `HH:mm:ss` (root, and every
+                // locale this engine claims): a `hour: "numeric"` request on a
+                // 24-hour cycle still prints two digits, while the 12-hour
+                // pattern `h:mm:ss a` does not. `hour12: false` therefore has to
+                // read "00:00:00", not "0:00:00"
+                // (`PlainTime/…/toLocaleString/resolved-time-zone.js`).
+                let pad = !is12 || slot("hour").as_deref() == Some("2-digit");
+                time.push((
+                    "hour",
+                    if pad { format!("{hour_val:02}") } else { hour_val.to_string() },
+                ));
             }
             if has(Self::F_MINUTE) {
                 if !time.is_empty() {
@@ -2292,10 +2377,32 @@ impl<'p> Vm<'p> {
         // makes the *localized GMT format* the specified fallback for exactly
         // that case, so the name is rendered from the offset this formatter
         // actually used — self-consistent with the rendering above rather than
-        // an invented name. ICU spells the zero offset "GMT" in every style.
+        // an invented name.
+        //
+        // The ONE zone that does get its CLDR name is "UTC": `en.xml` gives
+        // Etc/UTC the short name "UTC" and the long name "Coordinated Universal
+        // Time", and that is not interchangeable with the GMT fallback — an
+        // OFFSET zone of `+00:00` still prints "GMT"
+        // (`ZonedDateTime/…/toLocaleString/offset-time-zones.js` asserts the GMT
+        // spelling, `…/default-includes-time-and-time-zone-name.js` the UTC one).
+        // The *Offset and *Generic styles stay on the GMT format for UTC too.
         if has(Self::F_ZONE) {
             let m = tz_minutes;
-            let name = if m == 0 {
+            // Under a dateStyle/timeStyle there is no `timeZoneName` option: the
+            // CLDR `full` time pattern carries `zzzz` (the long name) and `long`
+            // carries `z` (the short one).
+            let style = slot("timeZoneName").unwrap_or_else(|| {
+                if slot("timeStyle").as_deref() == Some("full") {
+                    "long".to_string()
+                } else {
+                    "short".to_string()
+                }
+            });
+            let utc_named = slot("timeZone").as_deref() == Some("UTC")
+                && matches!(style.as_str(), "short" | "long");
+            let name = if utc_named {
+                if style == "long" { "Coordinated Universal Time" } else { "UTC" }.to_string()
+            } else if m == 0 {
                 "GMT".to_string()
             } else {
                 let sign = if m < 0 { '-' } else { '+' };
@@ -2325,6 +2432,75 @@ impl<'p> Vm<'p> {
         self.dtf_parts(resolved, ms, fields, absolute).into_iter().map(|(_, v)| v).collect()
     }
 
+    /// `Temporal.<Type>.prototype.toLocaleString(locales, options)` for every
+    /// Temporal type (ECMA-402's Temporal integration). Each type builds an
+    /// `Intl.DateTimeFormat` with ITS OWN required/defaults pair and then runs
+    /// FormatDateTime over the receiver — which is why `pd.toLocaleString("en")`
+    /// prints a date, `pt.toLocaleString("en")` a time, and `zdt.toLocaleString`
+    /// both plus a zone name. Temporal.Duration goes to Intl.DurationFormat
+    /// instead (it is not a date-time at all).
+    pub(crate) fn temporal_to_locale_string(
+        &mut self,
+        this: Value,
+        kind: u8,
+        locales: Value,
+        options: Value,
+    ) -> Result<Value, Thrown> {
+        use crate::vm::helpers_datetime::format_duration_en;
+        if kind == 0 {
+            // sec-temporal.duration.prototype.tolocalestring: construct an
+            // Intl.DurationFormat (so the options are validated exactly as the
+            // constructor would) and format the receiver with it.
+            let df = self.make_intl(native::INTL_DURATIONFORMAT, locales, options)?;
+            let _ = self.intl_this(df, native::INTL_DURATIONFORMAT, "toLocaleString")?;
+            let dur = self.to_duration(this)?;
+            return Ok(self.alloc_str(format_duration_en(&dur)));
+        }
+        let mode = match kind {
+            1 | 5 | 6 => DtfDefaults::Date, // PlainDate / PlainYearMonth / PlainMonthDay
+            2 => DtfDefaults::Time,         // PlainTime
+            7 => DtfDefaults::Zoned,        // ZonedDateTime
+            _ => DtfDefaults::All,          // PlainDateTime / Instant
+        };
+        // ZonedDateTime formats in ITS OWN zone, so a `timeZone` option would be
+        // a second, conflicting answer to the same question: the spec rejects it
+        // outright, even when it agrees (`toLocaleString/options-timeZone.js`).
+        let zdt_zone = if kind == 7 {
+            if options != Value::UNDEFINED {
+                self.require_object_coercible(options)?;
+                let o = self.to_object(options)?;
+                if self.get_prop(o, "timeZone")? != Value::UNDEFINED {
+                    return Err(Thrown(
+                        "TypeError: ZonedDateTime.toLocaleString does not accept a timeZone option"
+                            .into(),
+                    ));
+                }
+            }
+            Some(self.zdt_tz_id(this.heap_index()).unwrap_or_else(|| "UTC".to_string()))
+        } else {
+            None
+        };
+        let dtf = self.make_intl_dtf(native::INTL_DATETIMEFORMAT, locales, options, mode)?;
+        let resolved = self.intl_this(dtf, native::INTL_DATETIMEFORMAT, "toLocaleString")?;
+        if let Some(tz) = zdt_zone {
+            // Step "CreateDataPropertyOrThrow(optionsCopy, "timeZone",
+            // zonedDateTime.[[TimeZone]])" — done on the resolved record, since
+            // the constructor above already validated everything else.
+            let v = self.alloc_str(tz);
+            if let HeapObj::Object(m) = self.heap.get_mut(resolved) {
+                m.set("timeZone", v);
+            }
+        }
+        self.dtf_check_calendar(resolved, this, "toLocaleString")?;
+        let (fields, absolute) = self.dtf_fields_for_kind(resolved, kind, "toLocaleString")?;
+        let ms = if kind == 7 {
+            (self.zdt_epoch_ns(this.heap_index()).unwrap_or(0) / 1_000_000) as f64
+        } else {
+            self.dtf_time_value(this)?
+        };
+        let s = self.dtf_format(resolved, ms, fields, absolute);
+        Ok(self.alloc_str(s))
+    }
 }
 
 /// The resolved digit slots of SetNumberFormatDigitOptions. A `None` pair means
@@ -2341,6 +2517,50 @@ pub(crate) struct DigitOptions {
     pub rounding_mode: String,
     pub rounding_priority: String,
     pub trailing_zero_display: String,
+}
+
+/// CreateDateTimeFormat's `required`/`defaults` pair. `required` decides which
+/// options clear needDefaults (and which style is outright rejected); `defaults`
+/// decides which components are filled in when none did.
+///
+/// Every entry point picks its own pair: `Intl.DateTimeFormat` is (any, date),
+/// `Date.prototype.toLocaleString` is (any, all), `toLocaleDateString` is
+/// (date, date), and each `Temporal.*.prototype.toLocaleString` uses the group
+/// its own type has.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DtfDefaults {
+    /// (any, date) — the `Intl.DateTimeFormat` constructor itself.
+    Standard,
+    /// (date, date) — toLocaleDateString, PlainDate, PlainYearMonth, PlainMonthDay.
+    Date,
+    /// (time, time) — toLocaleTimeString, PlainTime.
+    Time,
+    /// (any, all) — Date.prototype.toLocaleString, PlainDateTime, Instant.
+    All,
+    /// (any, all + timeZoneName "short") — ZonedDateTime.
+    Zoned,
+}
+
+impl DtfDefaults {
+    /// (date half required, time half required) — which component groups clear
+    /// needDefaults, and which style the formatter accepts at all.
+    fn required(self) -> (bool, bool) {
+        match self {
+            DtfDefaults::Date => (true, false),
+            DtfDefaults::Time => (false, true),
+            _ => (true, true),
+        }
+    }
+
+    /// (fill year/month/day, fill hour/minute/second, fill timeZoneName).
+    fn defaults(self) -> (bool, bool, bool) {
+        match self {
+            DtfDefaults::Standard | DtfDefaults::Date => (true, false, false),
+            DtfDefaults::Time => (false, true, false),
+            DtfDefaults::All => (true, true, false),
+            DtfDefaults::Zoned => (true, true, true),
+        }
+    }
 }
 
 /// `useGrouping` is the one option whose resolved value keeps a JS type: `true`

@@ -3112,6 +3112,18 @@ impl<'p> Vm<'p> {
                             if id != OBJ_PREVENT_EXT
                                 && self.ta_effective_len(idx).unwrap_or(0) > 0 =>
                         {
+                            // SetIntegrityLevel runs `? O.[[PreventExtensions]]()`
+                            // (step 3) BEFORE the per-key DefinePropertyOrThrow
+                            // walk that throws here, and that step SUCCEEDED — so
+                            // the array is left NON-EXTENSIBLE even though seal /
+                            // freeze threw. Throwing without it reported
+                            // `Object.isExtensible(ta) === true` after a failed
+                            // `Object.seal(ta)` (staging/sm/TypedArray/
+                            // test-integrity-level.js).
+                            self.arr_props
+                                .entry(idx)
+                                .or_insert_with(ObjMap::new_side_table)
+                                .extensible = false;
                             let m = if id == OBJ_FREEZE { "freeze" } else { "seal" };
                             return Err(Thrown(format!(
                                 "TypeError: Cannot {m} a TypedArray that has elements"
@@ -3176,10 +3188,35 @@ impl<'p> Vm<'p> {
                         | HeapObj::Symbol { .. }
                         | HeapObj::BigInt(_)
                         | HeapObj::BigIntBig(_) => (true, true, false),
-                        // An exotic object (Array / TypedArray / Map / Set / …) whose
-                        // elements live outside arr_props: the explicit seal/freeze
-                        // markers are authoritative (the vacuous attrs-based check
-                        // can't see the dense elements).
+                        // A TypedArray's integrity level is COMPUTED, not read off
+                        // the seal/freeze markers: 10.4.5.3 gives every valid
+                        // integer index a {writable, enumerable, configurable}
+                        // descriptor, so a non-empty one is never sealed or frozen,
+                        // while one with NO valid index (length 0, or DETACHED) has
+                        // only its named side-table properties left — making it
+                        // sealed AND frozen the moment it stops being extensible.
+                        // Reading `m.sealed`/`m.frozen` instead reported
+                        // `Object.isFrozen(new Int32Array(0))` as false right after
+                        // `Object.seal` of it, and both false after a bare
+                        // `Object.preventExtensions`
+                        // (staging/sm/TypedArray/test-integrity-level{,-detached}.js).
+                        HeapObj::TypedArray { .. } => {
+                            let has_elems = self.ta_effective_len(o.heap_index()).unwrap_or(0) > 0;
+                            self.arr_props.get(&o.heap_index()).map_or(
+                                (false, false, true),
+                                |m| {
+                                    if has_elems {
+                                        (false, false, m.extensible)
+                                    } else {
+                                        (m.is_frozen(), m.is_sealed(), m.extensible)
+                                    }
+                                },
+                            )
+                        }
+                        // An exotic object (Array / Map / Set / …) whose elements
+                        // live outside arr_props: the explicit seal/freeze markers
+                        // are authoritative (the vacuous attrs-based check can't see
+                        // the dense elements).
                         _ => self.arr_props.get(&o.heap_index()).map_or((false, false, true), |m| {
                             (m.frozen, m.sealed, m.extensible)
                         }),
@@ -5147,22 +5184,21 @@ impl<'p> Vm<'p> {
                 self.alloc_zdt(ns, offset, id)?
             }
             NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
-            // Shared Temporal toLocaleString: no Intl — same string as toString,
-            // with a brand check (a non-Temporal receiver is a TypeError).
+            // Shared Temporal toLocaleString. ECMA-402 replaces every one of
+            // these with `CreateDateTimeFormat(%Intl.DateTimeFormat%, locales,
+            // options, <required>, <defaults>)` followed by FormatDateTime — the
+            // receiver's own kind supplies the required/defaults pair, so ONE
+            // implementation covers all eight prototypes.
             TEMPORAL_TO_LOCALE_STRING => {
-                let r = if this.is_heap() {
-                    self.temporal_method(this.heap_index(), "toString", &[])?
-                } else {
-                    None
-                };
-                match r {
-                    Some(v) => v,
-                    None => {
+                let kind = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Temporal { kind, .. }) => *kind,
+                    _ => {
                         return Err(Thrown(
                             "TypeError: toLocaleString called on a non-Temporal object".into(),
                         ))
                     }
-                }
+                };
+                self.temporal_to_locale_string(this, kind, a0, a1)?
             }
             ZDT_GET_TZ_TRANSITION => {
                 if !this.is_heap()

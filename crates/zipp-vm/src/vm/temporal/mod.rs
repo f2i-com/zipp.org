@@ -340,11 +340,72 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
             return None;
         }
     }
+    // The `Etc/…` family, before the catch-all below: it is the one part of the
+    // IANA database that is a closed RULE rather than a table of political
+    // history, so its membership, canonical spelling and offset are all exactly
+    // derivable without shipping the database. Getting it here means
+    // `Etc/GMT-24` is rejected (it does not exist) and `Etc/GMT-5` carries its
+    // real +05:00 instead of silently pretending to be UTC.
+    // Matched on BYTES: a `&str[..4]` slice panics when a multi-byte character
+    // straddles index 4 ("abc\u{4e00}" is a legal — if invalid — time-zone
+    // argument, and must RangeError, not abort the engine).
+    if t.as_bytes().len() >= 4 && t.as_bytes()[..4].eq_ignore_ascii_case(b"Etc/") {
+        return parse_etc_zone(&t[4..]);
+    }
     // A named zone like "America/New_York" or "Europe/London": accept the id.
     if t.contains('/') || t.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
         return Some((t.to_string(), 0));
     }
     None
+}
+
+/// The `Etc/<rest>` zones of the IANA `etcetera` file, matched case-insensitively
+/// and returned in their canonical spelling (`eTc/gMt+1` -> `Etc/GMT+1`, which is
+/// what `timezone-case-insensitive.js` asks for). The identifier itself is NOT
+/// canonicalized onto its Link target — Temporal keeps the id it was given
+/// (`do-not-canonicalize-iana-identifiers.js`).
+///
+/// The file defines `Etc/GMT+1`…`Etc/GMT+12` and `Etc/GMT-1`…`Etc/GMT-14` with
+/// the POSIX sign inversion (`Etc/GMT+7` is 7 hours WEST of Greenwich), plus the
+/// zero-offset spellings `GMT`, `GMT0`, `GMT+0`, `GMT-0`, `UTC`, `UCT`,
+/// `Universal`, `Zulu` and `Greenwich`. Everything else under `Etc/` — including
+/// a leading-zero form like `Etc/GMT-05` — does not exist.
+fn parse_etc_zone(rest: &str) -> Option<(String, i64)> {
+    for zero in ["GMT", "GMT0", "UTC", "UCT", "Universal", "Zulu", "Greenwich"] {
+        if rest.eq_ignore_ascii_case(zero) {
+            return Some((format!("Etc/{zero}"), 0));
+        }
+    }
+    let b = rest.as_bytes();
+    if b.len() < 3 || !b[..3].eq_ignore_ascii_case(b"GMT") {
+        return None;
+    }
+    // Safe: the first three bytes were just confirmed ASCII, so 3 is a boundary.
+    let after = &rest[3..];
+    let (sign, digits) = match after.as_bytes().first() {
+        Some(b'+') => (-1i64, &after[1..]),
+        Some(b'-') => (1i64, &after[1..]),
+        _ => return None,
+    };
+    // No leading zero and at most two digits: the file has `Etc/GMT+1`, never
+    // `Etc/GMT+01` or `Etc/GMT+001`.
+    if digits.is_empty()
+        || digits.len() > 2
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+        || (digits.len() == 2 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    let n: i64 = digits.parse().ok()?;
+    if n == 0 {
+        // `Etc/GMT+0` and `Etc/GMT-0` are both Links to Etc/GMT.
+        return Some((format!("Etc/GMT{}0", if sign > 0 { '-' } else { '+' }), 0));
+    }
+    if n > if sign > 0 { 14 } else { 12 } {
+        return None;
+    }
+    let id = format!("Etc/GMT{}{n}", if sign > 0 { '-' } else { '+' });
+    Some((id, sign * n * 3_600_000_000_000))
 }
 
 /// Add a Duration `f` ([y,mo,w,d,h,mi,s,ms,us,ns]) to a date-time `start`

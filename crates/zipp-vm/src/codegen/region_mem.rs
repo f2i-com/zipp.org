@@ -223,7 +223,9 @@ pub(crate) fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
-            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src } => {
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(src)]
                     ; mov [r12 + (idx as i32) * 8], rax

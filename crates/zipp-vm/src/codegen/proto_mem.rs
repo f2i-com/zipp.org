@@ -35,6 +35,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             | Instr::LoadGlobal { .. }
             | Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. }
             | Instr::GetIndex { .. }
             | Instr::GetProp { .. }
             | Instr::AddInt { .. }
@@ -279,7 +280,9 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
-            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src } => {
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(src)]
                     ; mov [r12 + (idx as i32) * 8], rax

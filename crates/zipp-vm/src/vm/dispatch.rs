@@ -567,7 +567,10 @@ impl<'p> Vm<'p> {
                         // never declared/initialized) is a ReferenceError, not a global
                         // creation. (No own-prop fallback here: the reference's
                         // unresolvable-ness was fixed when the LHS was evaluated —
-                        // a property the RHS created meanwhile must not resolve it.)
+                        // a property the RHS created meanwhile must not resolve it,
+                        // `undeclared = (this.undeclared = 5)` still throws. The
+                        // read-modify-write forms, whose Get already PROVED the
+                        // reference resolvable, use StoreGlobalResolved instead.)
                         if self.globals[idx as usize].is_uninitialized() {
                             let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
                             // The reference IS resolvable when the name is a
@@ -587,6 +590,76 @@ impl<'p> Vm<'p> {
                             }
                         }
                         // A $262.evalScript `const` is immutable once initialized.
+                        if !self.eval_const_globals.is_empty()
+                            && self.eval_const_globals.contains(&idx)
+                        {
+                            return Err(Thrown(
+                                "TypeError: Assignment to constant variable.".into(),
+                            ));
+                        }
+                        let v = self.get(base, src);
+                        self.globals[idx as usize] = v;
+                        ip += 1;
+                    }
+                    Instr::StoreGlobalResolved { idx, src } => {
+                        // PutValue for a reference this same expression already
+                        // ran GetValue on (`x++`, `x += 1`, `x ||= v`): 6.2.5.6
+                        // step 1 cannot be reached — a Get that succeeded proves
+                        // the reference is resolvable — so this must never raise
+                        // the "is not defined" ReferenceError StoreGlobalStrict
+                        // raises. Emitted only where the compiler put a
+                        // load_binding of the SAME binding immediately before.
+                        if self.globals[idx as usize].is_uninitialized() {
+                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                            // undefined/NaN/Infinity are non-writable data
+                            // properties: a strict write is a TypeError.
+                            if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
+                                return Err(Thrown(format!(
+                                    "TypeError: Cannot assign to read only property '{name}'"
+                                )));
+                            }
+                            // An own property of the global OBJECT is a global
+                            // BINDING (9.1.1.4's object Environment Record), and
+                            // the write belongs on that property — not in a slot
+                            // that would shadow it. Without this,
+                            //     "use strict"; this.count = 0;
+                            //     ({ m(){ count++; } }).m();
+                            // threw "count is not defined" even though the `count`
+                            // READ one instruction earlier had just succeeded
+                            // through exactly this property
+                            // (language/types/object/S8.6.2_A5_T1, _T2).
+                            // Global LEXICALs are excluded: an uninitialized
+                            // `let x` slot is a TDZ, which a same-named
+                            // global-object property does not resolve.
+                            let own_backed = !self.global_name_is_lexical(&name)
+                                && self.global_this != 0
+                                && matches!(
+                                    self.heap.get(self.global_this),
+                                    HeapObj::Object(m) if m.pos(&name).is_some()
+                                );
+                            if own_backed {
+                                let v = self.get(base, src);
+                                let gobj = Value::heap(self.global_this);
+                                // strict = true: a non-writable own property is a
+                                // TypeError, as PutValue requires.
+                                self.set_prop(gobj, &name, v, true)?;
+                                ip += 1;
+                                continue;
+                            }
+                            // 9.1.1.2.5 SetMutableBinding step 2 re-checks
+                            // HasProperty: a binding that VANISHED between the Get
+                            // and the Put — `Object.defineProperty(this, "x", {get(){
+                            // delete this.x; return 2 }}); x ^= 3` — is a
+                            // ReferenceError in strict code even though the Get
+                            // succeeded (compound-assignment-operator-calls-putvalue-
+                            // lref--v--*.js). Dropping this let the store silently
+                            // create a slot value instead.
+                            if self.global_by_name(&name).is_none() {
+                                return Err(Thrown(format!(
+                                    "ReferenceError: {name} is not defined"
+                                )));
+                            }
+                        }
                         if !self.eval_const_globals.is_empty()
                             && self.eval_const_globals.contains(&idx)
                         {
@@ -1399,6 +1472,7 @@ impl<'p> Vm<'p> {
                             methods,
                             getters,
                             setters,
+                            proto_order: cd.proto_order,
                             statics,
                             static_getters,
                             static_setters,
@@ -1518,7 +1592,7 @@ impl<'p> Vm<'p> {
                                     // `accessor [k]` clobber a `get k` below it.
                                     (Some(d), Some(p)) if p < d => {
                                         let v = list[d].1;
-                                        list[p] = (kstr, v);
+                                        list[p] = (kstr.clone(), v);
                                         list.remove(d);
                                     }
                                     (Some(d), p) => {
@@ -1528,9 +1602,33 @@ impl<'p> Vm<'p> {
                                         }
                                     }
                                     (None, Some(p)) => {
-                                        list[p] = (kstr, fv);
+                                        list[p] = (kstr.clone(), fv);
                                     }
-                                    (None, None) => list.push((kstr, fv)),
+                                    (None, None) => list.push((kstr.clone(), fv)),
+                                }
+                                // Mirror the rename into the cross-kind source
+                                // order that builds `C.prototype` — the same
+                                // "first definition keeps the position" rule,
+                                // but measured across methods AND accessors
+                                // (each kind's own list can only order within
+                                // itself). Static members do not participate:
+                                // their order comes from the `statics` ObjMap.
+                                if matches!(kind, 0 | 1 | 2) {
+                                    let ord = &mut c.proto_order;
+                                    let dup = ord.iter().position(|n| *n == kstr);
+                                    let parked = ord.iter().position(|n| *n == ph);
+                                    match (dup, parked) {
+                                        (Some(d), Some(p)) if p < d => {
+                                            ord[p] = kstr;
+                                            ord.remove(d);
+                                        }
+                                        (Some(_), Some(p)) => {
+                                            ord.remove(p);
+                                        }
+                                        (None, Some(p)) => ord[p] = kstr,
+                                        (Some(_), None) => {}
+                                        (None, None) => ord.push(kstr),
+                                    }
                                 }
                             }
                         }
@@ -2735,6 +2833,7 @@ impl<'p> Vm<'p> {
                                             Instr::LoadGlobalOrUndefined { idx, .. } => Some(idx),
                                             Instr::StoreGlobal { idx, .. } => Some(idx),
                                             Instr::StoreGlobalStrict { idx, .. } => Some(idx),
+                                            Instr::StoreGlobalResolved { idx, .. } => Some(idx),
                                             _ => None,
                                         };
                                         slot.map_or(true, |i| !self.globals[i as usize].is_uninitialized())

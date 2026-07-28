@@ -14,11 +14,14 @@
 //! data. `hebrew` qualifies despite being lunisolar: since Hillel II its months
 //! have been fixed by the 19-year Metonic cycle plus the four dechiyot
 //! (postponement rules), so a Hebrew date is pure integer arithmetic on the
-//! mean molad — no observation and no tables. `chinese`/`dangi` do NOT qualify
-//! (true new moons and solar terms), nor do the observational islamic variants
-//! (islamic-umalqura and friends): they need month-length tables or new-moon
-//! computation we do not have, and a fake answer would be worse than the
-//! honest `RangeError`.
+//! mean molad — no observation and no tables. `islamic-umalqura` qualifies for
+//! a different reason: it is not computed at all but *published* as a fixed
+//! month-length table for 1300–1600 AH, with islamic-civil outside that window,
+//! so the whole calendar is 301 words of data plus the arithmetic already here.
+//! `chinese`/`dangi` do NOT qualify (true new moons and solar terms), nor do
+//! the genuinely observational islamic variants (`islamic`, `islamic-rgsa`):
+//! they need new-moon computation or sighting records we do not have, and a
+//! fake answer would be worse than the honest `RangeError`.
 //!
 //! Formulas are the standard fixed-date (R.D.) ones from Reingold &
 //! Dershowitz, *Calendrical Calculations*; `RD_AT_EPOCH` converts between R.D.
@@ -47,6 +50,7 @@ pub(crate) enum Cal {
     Persian = 10,
     Indian = 11,
     Hebrew = 12,
+    IslamicUmalqura = 13,
 }
 
 impl Cal {
@@ -64,6 +68,7 @@ impl Cal {
             10 => Cal::Persian,
             11 => Cal::Indian,
             12 => Cal::Hebrew,
+            13 => Cal::IslamicUmalqura,
             _ => Cal::Iso,
         }
     }
@@ -82,6 +87,7 @@ impl Cal {
             Cal::Ethioaa => "ethioaa",
             Cal::IslamicCivil => "islamic-civil",
             Cal::IslamicTbla => "islamic-tbla",
+            Cal::IslamicUmalqura => "islamic-umalqura",
             Cal::Persian => "persian",
             Cal::Indian => "indian",
             Cal::Hebrew => "hebrew",
@@ -120,12 +126,15 @@ impl Cal {
         }
     }
 
-    /// Tabular (arithmetic) Islamic calendars: the 30-year cycle, differing only
-    /// in whether the epoch is the civil (Friday) or astronomical (Thursday) one.
+    /// Islamic calendars built on the tabular 30-year cycle, differing only in
+    /// whether the epoch is the civil (Friday) or astronomical (Thursday) one.
+    /// `islamic-umalqura` is included because the tabular civil calendar is
+    /// exactly what it falls back to outside its tabulated window; inside the
+    /// window the table overrides every month length (see [`umalqura_row`]).
     fn islamic_epoch(self) -> Option<i64> {
         match self {
-            // R.D. 227015 / 227014, expressed in epoch days.
-            Cal::IslamicCivil => Some(227_015 - RD_AT_EPOCH),
+            Cal::IslamicCivil | Cal::IslamicUmalqura => Some(ISLAMIC_CIVIL_EPOCH),
+            // R.D. 227014: the astronomical epoch, one day before the civil one.
             Cal::IslamicTbla => Some(227_014 - RD_AT_EPOCH),
             _ => None,
         }
@@ -135,7 +144,7 @@ impl Cal {
 /// Resolve a calendar identifier (ASCII case-insensitive) to its calendar,
 /// applying the CLDR aliases that `CanonicalizeCalendar` must accept
 /// (`islamicc` → `islamic-civil`, `ethiopic-amete-alem` → `ethioaa`).
-/// Unsupported-but-real ids (`chinese`, `hebrew`, `islamic-umalqura`, …) return
+/// Unsupported-but-real ids (`chinese`, `dangi`, `islamic-rgsa`, …) return
 /// `None` and the caller reports them as unsupported, not as malformed.
 pub(crate) fn calendar_by_id(s: &str) -> Option<Cal> {
     let s = s.trim();
@@ -151,6 +160,7 @@ pub(crate) fn calendar_by_id(s: &str) -> Option<Cal> {
         "ethioaa" | "ethiopic-amete-alem" => Cal::Ethioaa,
         "islamic-civil" | "islamicc" => Cal::IslamicCivil,
         "islamic-tbla" => Cal::IslamicTbla,
+        "islamic-umalqura" => Cal::IslamicUmalqura,
         "persian" => Cal::Persian,
         "indian" => Cal::Indian,
         "hebrew" => Cal::Hebrew,
@@ -171,6 +181,10 @@ fn coptic_leap(y: i64) -> bool {
 
 // ── Tabular-Islamic helpers ─────────────────────────────────────────────────
 
+/// R.D. 227015 (Friday 16 July 622 Julian) in epoch days: the civil Hijri
+/// epoch, shared by `islamic-civil` and by `islamic-umalqura`'s fallback.
+const ISLAMIC_CIVIL_EPOCH: i64 = 227_015 - RD_AT_EPOCH;
+
 /// Whether tabular-Islamic year `y` is a leap year (the 11-in-30 cycle).
 fn islamic_leap(y: i64) -> bool {
     (14 + 11 * y).rem_euclid(30) < 11
@@ -180,6 +194,157 @@ fn islamic_leap(y: i64) -> bool {
 /// plus the 11 intercalary days the 30-year cycle has inserted so far.
 fn islamic_year_start(epoch: i64, y: i64) -> i64 {
     epoch + 354 * (y - 1) + (3 + 11 * y).div_euclid(30)
+}
+
+/// Length of tabular-Islamic month `m` of year `y`: 30/29 alternating, with a
+/// 30-day twelfth month in a leap year.
+fn islamic_tabular_month_len(y: i64, m: i64) -> i64 {
+    if m % 2 == 1 || (m == 12 && islamic_leap(y)) { 30 } else { 29 }
+}
+
+// ── Umm al-Qura (islamic-umalqura) ──────────────────────────────────────────
+//
+// Unlike every other calendar in this file, Umm al-Qura is not computed: the
+// Saudi authority PUBLISHES the length of each month, and 1300–1600 AH is the
+// span that has been tabulated. Outside that window the calendar is DEFINED to
+// be islamic-civil — which is why `Cal::IslamicUmalqura` carries the civil
+// epoch above and why `PlainDate/from/extreme-dates.js` expects umalqura and
+// islamic-civil to give the same answer at ±280804 AH.
+//
+// PROVENANCE of the table below: it is `UMALQURA_MONTHLENGTH` from ICU4C's
+// `i18n/islamcal.cpp`, verbatim, bit order included. It was verified two ways
+// before being committed: (a) every one of the 3612 tabulated month lengths and
+// all 301 year starts were re-derived date-by-date from node 24's own ICU 77.1
+// (`Intl.DateTimeFormat` with `-u-ca-islamic-umalqura`, walking every month
+// boundary from 1250 to 1650 AH) and agreed exactly; (b) the ICU source carries
+// each word twice, as hex and as a "1010 1010 1010" comment, and the two
+// readings agree. The independently-authored expectations in test262
+// (`inLeapYear/basic-islamic-umalqura.js`' 30 leap years in 1390–1469 and
+// `daysInMonth/basic-islamic-umalqura.js`' month lengths for 1390/1391) also
+// match the table.
+
+/// First tabulated Umm al-Qura year; `UMALQURA_MONTHS[0]` describes it.
+const UMALQURA_FIRST_YEAR: i64 = 1300;
+
+/// Number of tabulated years — 1300..=1600 AH.
+const UMALQURA_YEARS: usize = 301;
+
+/// Epoch day of Umm al-Qura 1300-01-01. It is exactly `islamic_year_start` of
+/// the civil epoch for 1300, and the tabulated months sum to exactly the civil
+/// 1601 start, so the fallback joins the table without a gap or an overlap at
+/// either edge (`umalqura_window_joins_islamic_civil` pins both).
+const UMALQURA_EPOCH: i32 = -31_826;
+
+/// Month lengths of 1300..=1600 AH, one word per year. Bit `12 - month` is set
+/// when that month runs 30 days rather than 29 — ICU's own bit order (month 1
+/// is the HIGH bit of the low 12), kept so these words can be diffed against
+/// the published table without transformation.
+#[rustfmt::skip]
+const UMALQURA_MONTHS: [u16; UMALQURA_YEARS] = [
+    // 1300
+    0x0AAA, 0x0D54, 0x0EC9, 0x06D4, 0x06EA, 0x036C, 0x0AAD, 0x0555, 0x06A9, 0x0792,
+    // 1310
+    0x0BA9, 0x05D4, 0x0ADA, 0x055C, 0x0D2D, 0x0695, 0x074A, 0x0B54, 0x0B6A, 0x05AD,
+    // 1320
+    0x04AE, 0x0A4F, 0x0517, 0x068B, 0x06A5, 0x0AD5, 0x02D6, 0x095B, 0x049D, 0x0A4D,
+    // 1330
+    0x0D26, 0x0D95, 0x05AC, 0x09B6, 0x02BA, 0x0A5B, 0x052B, 0x0A95, 0x06CA, 0x0AE9,
+    // 1340
+    0x02F4, 0x0976, 0x02B6, 0x0956, 0x0ACA, 0x0BA4, 0x0BD2, 0x05D9, 0x02DC, 0x096D,
+    // 1350
+    0x054D, 0x0AA5, 0x0B52, 0x0BA5, 0x05B4, 0x09B6, 0x0557, 0x0297, 0x054B, 0x06A3,
+    // 1360
+    0x0752, 0x0B65, 0x056A, 0x0AAB, 0x052B, 0x0C95, 0x0D4A, 0x0DA5, 0x05CA, 0x0AD6,
+    // 1370
+    0x0957, 0x04AB, 0x094B, 0x0AA5, 0x0B52, 0x0B6A, 0x0575, 0x0276, 0x08B7, 0x045B,
+    // 1380
+    0x0555, 0x05A9, 0x05B4, 0x09DA, 0x04DD, 0x026E, 0x0936, 0x0AAA, 0x0D54, 0x0DB2,
+    // 1390
+    0x05D5, 0x02DA, 0x095B, 0x04AB, 0x0A55, 0x0B49, 0x0B64, 0x0B71, 0x05B4, 0x0AB5,
+    // 1400
+    0x0A55, 0x0D25, 0x0E92, 0x0EC9, 0x06D4, 0x0AE9, 0x096B, 0x04AB, 0x0A93, 0x0D49,
+    // 1410
+    0x0DA4, 0x0DB2, 0x0AB9, 0x04BA, 0x0A5B, 0x052B, 0x0A95, 0x0B2A, 0x0B55, 0x055C,
+    // 1420
+    0x04BD, 0x023D, 0x091D, 0x0A95, 0x0B4A, 0x0B5A, 0x056D, 0x02B6, 0x093B, 0x049B,
+    // 1430
+    0x0655, 0x06A9, 0x0754, 0x0B6A, 0x056C, 0x0AAD, 0x0555, 0x0B29, 0x0B92, 0x0BA9,
+    // 1440
+    0x05D4, 0x0ADA, 0x055A, 0x0AAB, 0x0595, 0x0749, 0x0764, 0x0BAA, 0x05B5, 0x02B6,
+    // 1450
+    0x0A56, 0x0E4D, 0x0B25, 0x0B52, 0x0B6A, 0x05AD, 0x02AE, 0x092F, 0x0497, 0x064B,
+    // 1460
+    0x06A5, 0x06AC, 0x0AD6, 0x055D, 0x049D, 0x0A4D, 0x0D16, 0x0D95, 0x05AA, 0x05B5,
+    // 1470
+    0x02DA, 0x095B, 0x04AD, 0x0595, 0x06CA, 0x06E4, 0x0AEA, 0x04F5, 0x02B6, 0x0956,
+    // 1480
+    0x0AAA, 0x0B54, 0x0BD2, 0x05D9, 0x02EA, 0x096D, 0x04AD, 0x0A95, 0x0B4A, 0x0BA5,
+    // 1490
+    0x05B2, 0x09B5, 0x04D6, 0x0A97, 0x0547, 0x0693, 0x0749, 0x0B55, 0x056A, 0x0A6B,
+    // 1500
+    0x052B, 0x0A8B, 0x0D46, 0x0DA3, 0x05CA, 0x0AD6, 0x04DB, 0x026B, 0x094B, 0x0AA5,
+    // 1510
+    0x0B52, 0x0B69, 0x0575, 0x0176, 0x08B7, 0x025B, 0x052B, 0x0565, 0x05B4, 0x09DA,
+    // 1520
+    0x04ED, 0x016D, 0x08B6, 0x0AA6, 0x0D52, 0x0DA9, 0x05D4, 0x0ADA, 0x095B, 0x04AB,
+    // 1530
+    0x0653, 0x0729, 0x0762, 0x0BA9, 0x05B2, 0x0AB5, 0x0555, 0x0B25, 0x0D92, 0x0EC9,
+    // 1540
+    0x06D2, 0x0AE9, 0x056B, 0x04AB, 0x0A55, 0x0D29, 0x0D54, 0x0DAA, 0x09B5, 0x04BA,
+    // 1550
+    0x0A3B, 0x049B, 0x0A4D, 0x0AAA, 0x0AD5, 0x02DA, 0x095D, 0x045E, 0x0A2E, 0x0C9A,
+    // 1560
+    0x0D55, 0x06B2, 0x06B9, 0x04BA, 0x0A5D, 0x052D, 0x0A95, 0x0B52, 0x0BA8, 0x0BB4,
+    // 1570
+    0x05B9, 0x02DA, 0x095A, 0x0B4A, 0x0DA4, 0x0ED1, 0x06E8, 0x0B6A, 0x056D, 0x0535,
+    // 1580
+    0x0695, 0x0D4A, 0x0DA8, 0x0DD4, 0x06DA, 0x055B, 0x029D, 0x062B, 0x0B15, 0x0B4A,
+    // 1590
+    0x0B95, 0x05AA, 0x0AAE, 0x092E, 0x0C8F, 0x0527, 0x0695, 0x06AA, 0x0AD6, 0x055D,
+    // 1600
+    0x029D,
+];
+
+/// Epoch day of each tabulated year's 1 Muharram, plus a final entry for the
+/// day after the window ends — running sums of [`UMALQURA_MONTHS`], folded at
+/// compile time so a date conversion is an index rather than a 300-year walk.
+const UMALQURA_YEAR_STARTS: [i32; UMALQURA_YEARS + 1] = umalqura_year_starts();
+
+const fn umalqura_year_starts() -> [i32; UMALQURA_YEARS + 1] {
+    let mut out = [0i32; UMALQURA_YEARS + 1];
+    let mut ed = UMALQURA_EPOCH;
+    let mut i = 0;
+    while i < UMALQURA_YEARS {
+        out[i] = ed;
+        let w = UMALQURA_MONTHS[i];
+        let mut m = 1u32;
+        while m <= 12 {
+            ed += 29 + ((w >> (12 - m)) & 1) as i32;
+            m += 1;
+        }
+        i += 1;
+    }
+    out[UMALQURA_YEARS] = ed;
+    out
+}
+
+/// The row of [`UMALQURA_MONTHS`] describing year `y`, or `None` when `c` is not
+/// umalqura or `y` is outside the tabulated window (where islamic-civil applies).
+fn umalqura_row(c: Cal, y: i64) -> Option<usize> {
+    if c != Cal::IslamicUmalqura {
+        return None;
+    }
+    let i = y - UMALQURA_FIRST_YEAR;
+    (0..UMALQURA_YEARS as i64).contains(&i).then_some(i as usize)
+}
+
+/// Epoch day of umalqura `y`-01-01: tabulated inside the window, islamic-civil
+/// outside it.
+fn umalqura_year_start(y: i64) -> i64 {
+    match umalqura_row(Cal::IslamicUmalqura, y) {
+        Some(i) => UMALQURA_YEAR_STARTS[i] as i64,
+        None => islamic_year_start(ISLAMIC_CIVIL_EPOCH, y),
+    }
 }
 
 // ── Persian (Solar Hijri) helpers ───────────────────────────────────────────
@@ -530,8 +695,17 @@ pub(crate) fn cal_days_in_month(c: Cal, y: i64, m: i64) -> i64 {
         };
     }
     if c.islamic_epoch().is_some() {
-        // Alternating 30/29, with a 30-day twelfth month in leap years.
-        return if m % 2 == 1 || (m == 12 && islamic_leap(y)) { 30 } else { 29 };
+        if c == Cal::IslamicUmalqura {
+            // A month that has rolled out of its year (the `until`/`since`
+            // probes step past a year boundary) belongs to the neighbouring
+            // year, which is a DIFFERENT row of the table — normalise first.
+            let (uy, um) = cal_month_from_index(c, cal_month_index(c, y, m));
+            return match umalqura_row(c, uy) {
+                Some(i) => 29 + ((UMALQURA_MONTHS[i] >> (12 - um)) & 1) as i64,
+                None => islamic_tabular_month_len(uy, um),
+            };
+        }
+        return islamic_tabular_month_len(y, m);
     }
     if c == Cal::Persian {
         // Six 31-day months, five 30-day, then a 29-day (30 in a leap year) Esfand.
@@ -591,6 +765,13 @@ pub(crate) fn cal_in_leap_year(c: Cal, y: i64) -> bool {
     if let Some(off) = c.coptic_like() {
         return coptic_leap(y + off);
     }
+    if c == Cal::IslamicUmalqura {
+        // Umm al-Qura has no leap RULE inside the tabulated window — the
+        // published month lengths simply add up to 354 or 355 — so a "leap"
+        // year is just a long one. Outside the window `cal_days_in_year` falls
+        // through to the tabular 11-in-30 cycle, which agrees.
+        return cal_days_in_year(c, y) == 355;
+    }
     if c.islamic_epoch().is_some() {
         return islamic_leap(y);
     }
@@ -614,6 +795,9 @@ pub(crate) fn cal_days_in_year(c: Cal, y: i64) -> i64 {
     if c.coptic_like().is_some() {
         return if cal_in_leap_year(c, y) { 366 } else { 365 };
     }
+    if let Some(i) = umalqura_row(c, y) {
+        return (UMALQURA_YEAR_STARTS[i + 1] - UMALQURA_YEAR_STARTS[i]) as i64;
+    }
     if c.islamic_epoch().is_some() {
         return if islamic_leap(y) { 355 } else { 354 };
     }
@@ -635,6 +819,17 @@ pub(crate) fn cal_to_epoch_days(c: Cal, y: i64, m: i64, d: i64) -> i64 {
     }
     if let Some(off) = c.coptic_like() {
         return coptic_year_start(y + off) + 30 * (m - 1) + d - 1;
+    }
+    if c == Cal::IslamicUmalqura {
+        // No closed form inside the tabulated window: walk the published month
+        // lengths from the year start, after normalising a month that has
+        // rolled out of its year (which the difference probes do).
+        let (uy, um) = cal_month_from_index(c, cal_month_index(c, y, m));
+        let mut ed = umalqura_year_start(uy);
+        for k in 1..um {
+            ed += cal_days_in_month(c, uy, k);
+        }
+        return ed + d - 1;
     }
     if let Some(epoch) = c.islamic_epoch() {
         // 29*(m-1) + floor(m/2) days precede month m (the 30/29 alternation).
@@ -759,7 +954,7 @@ pub(crate) fn cal_era(c: Cal, y: i64, m: i64, d: i64) -> Option<(&'static str, i
             }
         }
         Cal::Ethioaa => ("aa", y),
-        Cal::IslamicCivil | Cal::IslamicTbla => {
+        Cal::IslamicCivil | Cal::IslamicTbla | Cal::IslamicUmalqura => {
             if y >= 1 {
                 ("ah", y)
             } else {
@@ -848,7 +1043,7 @@ pub(crate) fn cal_resolve_era(c: Cal, era: &str, era_year: i64) -> Option<i64> {
             _ => None,
         },
         Cal::Ethioaa => (era == "aa").then_some(era_year),
-        Cal::IslamicCivil | Cal::IslamicTbla => match era {
+        Cal::IslamicCivil | Cal::IslamicTbla | Cal::IslamicUmalqura => match era {
             "ah" => Some(era_year),
             "bh" => Some(1 - era_year),
             _ => None,
@@ -1030,4 +1225,67 @@ pub(crate) fn cal_difference_date(
     let (fy, fm, fd) = cal_add_year_month(c, ay, am, dd1, 0, months, false).unwrap();
     let days = e2 - cal_to_epoch_days(c, fy, fm, fd);
     [years, months, 0, days]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Umm al-Qura table must butt exactly against islamic-civil at BOTH
+    /// ends of the tabulated window, since that is what the spec's fallback
+    /// means: 1300-01-01 is the civil 1300-01-01, and the tabulated months run
+    /// out exactly on the civil 1601-01-01. If either failed, dates just
+    /// outside the window would be off by the gap and `cal_from_epoch_days`
+    /// could land on the wrong year.
+    #[test]
+    fn umalqura_window_joins_islamic_civil() {
+        let c = Cal::IslamicUmalqura;
+        let civil = ISLAMIC_CIVIL_EPOCH;
+        assert_eq!(UMALQURA_EPOCH as i64, islamic_year_start(civil, 1300));
+        assert_eq!(
+            UMALQURA_YEAR_STARTS[UMALQURA_YEARS] as i64,
+            islamic_year_start(civil, 1601)
+        );
+        assert_eq!(cal_to_epoch_days(c, 1300, 1, 1), islamic_year_start(civil, 1300));
+        assert_eq!(cal_to_epoch_days(c, 1601, 1, 1), islamic_year_start(civil, 1601));
+    }
+
+    /// Every tabulated year is 354 or 355 days of twelve 29/30-day months, and
+    /// the projection out of epoch days inverts the projection into them — the
+    /// property `until`/`since`/`with` all lean on.
+    #[test]
+    fn umalqura_roundtrips_every_tabulated_day() {
+        let c = Cal::IslamicUmalqura;
+        for y in UMALQURA_FIRST_YEAR..=(UMALQURA_FIRST_YEAR + UMALQURA_YEARS as i64 - 1) {
+            let len = cal_days_in_year(c, y);
+            assert!(len == 354 || len == 355, "year {y} is {len} days");
+            let mut sum = 0;
+            for m in 1..=12 {
+                let dim = cal_days_in_month(c, y, m);
+                assert!(dim == 29 || dim == 30, "{y}-{m} is {dim} days");
+                sum += dim;
+                for d in [1, dim] {
+                    let ed = cal_to_epoch_days(c, y, m, d);
+                    assert_eq!(cal_from_epoch_days(c, ed), (y, m, d));
+                }
+            }
+            assert_eq!(sum, len);
+            assert_eq!(cal_in_leap_year(c, y), len == 355);
+        }
+    }
+
+    /// Outside the window umalqura IS islamic-civil, day for day — the property
+    /// `PlainDate/from/extreme-dates.js` checks at ±280804 AH.
+    #[test]
+    fn umalqura_outside_window_is_islamic_civil() {
+        for y in [-280_804, -1, 0, 1, 1299, 1601, 1700, 283_583] {
+            for m in 1..=12 {
+                assert_eq!(
+                    cal_to_epoch_days(Cal::IslamicUmalqura, y, m, 1),
+                    cal_to_epoch_days(Cal::IslamicCivil, y, m, 1),
+                    "{y}-{m}"
+                );
+            }
+        }
+    }
 }

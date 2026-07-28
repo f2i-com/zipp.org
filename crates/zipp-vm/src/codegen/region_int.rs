@@ -71,6 +71,7 @@ pub(crate) fn int_unadmitted_ips(
             // `let`/`const` global write: inside a hot loop region the binding is
             // already initialized, so it's treated like StoreGlobal.
             | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. }
             | Instr::Add { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
@@ -431,7 +432,9 @@ pub(crate) fn compile_region_int_maybe_cold(
                     flag_cmp = prev_flag;
                 }
             }
-            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src } => {
                 let g = plan.glob_home[&idx];
                 let srx = xh(&plan, src);
                 if g != srx && !copy_is_noop(lc, g, srx) {

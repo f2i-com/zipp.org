@@ -295,7 +295,9 @@ pub(crate) fn plan_region_cold(
                     glob_order.push(idx);
                 }
             }
-            Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } => {
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } => {
                 glob_first_read.entry(idx).or_insert(false);
                 if !glob_order.contains(&idx) {
                     glob_order.push(idx);
@@ -564,7 +566,9 @@ pub(crate) fn plan_region_cold(
             continue;
         }
         let bool_glob = match *instr {
-            Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } => src,
+            Instr::StoreGlobal { src, .. }
+            | Instr::StoreGlobalStrict { src, .. }
+            | Instr::StoreGlobalResolved { src, .. } => src,
             Instr::LoadGlobal { dst, .. } => dst,
             _ => continue,
         };
@@ -1026,7 +1030,9 @@ pub(crate) fn numeric_operand_uses(i: &Instr) -> Vec<u16> {
 pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
     match *i {
         Instr::Move { src, .. } => vec![src],
-        Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } => vec![src],
+        Instr::StoreGlobal { src, .. }
+        | Instr::StoreGlobalStrict { src, .. }
+        | Instr::StoreGlobalResolved { src, .. } => vec![src],
         Instr::AddInt { a, .. } | Instr::Neg { a, .. } => vec![a],
         Instr::Add { a, b, .. }
         | Instr::Sub { a, b, .. }
@@ -1175,7 +1181,9 @@ pub(crate) fn plan_field_promotion(
     // The object ref must be stable (G not re-stored) and its ref reg must not
     // escape (used only as the GetProp/SetProp receiver, nowhere else).
     for instr in &code[s..=e] {
-        if let Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } = *instr {
+        if let Instr::StoreGlobal { idx, .. }
+        | Instr::StoreGlobalStrict { idx, .. }
+        | Instr::StoreGlobalResolved { idx, .. } = *instr {
             if idx == g {
                 return None;
             }

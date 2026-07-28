@@ -1069,7 +1069,9 @@ impl<'a> FnCompiler<'a> {
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
-                self.store_binding_snapped(&binding, dst, snap);
+                // read-first: `load_binding` ran above (the short-circuit test
+                // needs the current value), so the reference is resolved.
+                self.store_binding_snapped_ex(&binding, dst, snap, true);
                 let end = self.here();
                 self.patch_jump(j, end);
                 self.next_reg = save_p;
@@ -1102,7 +1104,9 @@ impl<'a> FnCompiler<'a> {
                 let instr = compound_assign_instr(other, dst, cur, rhs)
                     .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                 self.emit(instr);
-                self.store_binding_snapped(&binding, dst, snap);
+                // read-first: the `load_binding` above already resolved the
+                // reference, so the store may not raise "is not defined".
+                self.store_binding_snapped_ex(&binding, dst, snap, true);
                 self.next_reg = save_p;
                 Ok(dst)
             }

@@ -226,7 +226,9 @@ pub(crate) fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: A
                 out.regs.insert(dst, st.glob(idx));
                 out.alias.insert(dst, idx);
             }
-            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src } => {
                 out.globs.insert(idx, st.reg(src));
                 out.alias.retain(|_, g| *g != idx);
                 out.alias.insert(src, idx);

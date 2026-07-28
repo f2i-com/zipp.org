@@ -87,6 +87,13 @@ pub enum Instr {
     /// reference (a never-declared global slot, still UNINITIALIZED) throws a
     /// ReferenceError instead of creating the global (sloppy `StoreGlobal` creates).
     StoreGlobalStrict { idx: u32, src: Reg },
+    /// `globals[idx] = src` for a reference the SAME expression already read
+    /// (`x++`, `x += 1`, `x ||= v`). GetValue having succeeded proves the
+    /// reference is resolvable, so PutValue may not throw "is not defined";
+    /// an uninitialized slot whose name is an own property of the global object
+    /// writes through that property instead. Emitted only where a
+    /// `load_binding` of the same binding precedes the store.
+    StoreGlobalResolved { idx: u32, src: Reg },
 
     /// A clock read: `performance.now()` (`epoch = false`, fractional ms since
     /// VM start) or `Date.now()` (`epoch = true`, integer ms since the Unix
@@ -1289,6 +1296,14 @@ pub struct ClassDef {
     pub getters: Vec<(String, u32)>,
     /// `set name(v)` accessors: invoked (with `this` = instance) on property write.
     pub setters: Vec<(String, u32)>,
+    /// Public INSTANCE prototype keys in SOURCE order, first definition keeping
+    /// the position (OrdinaryDefineOwnProperty never moves an existing key).
+    /// The three lists above are grouped by kind, so they cannot express the
+    /// interleaving `class C { get g(){} m(){} }` requires — `getOwnPropertyNames`
+    /// must answer ["constructor","g","m"], not ["constructor","m","g"].
+    /// Computed keys park a "\u{1}cm{i}" placeholder here, renamed in place by
+    /// `ClassAddMember` once the key value is known.
+    pub proto_order: Vec<String>,
     /// `static name()` methods: own properties of the class value itself.
     pub statics: Vec<(String, u32)>,
     /// `static get name()` / `static set name(v)` accessors: invoked with

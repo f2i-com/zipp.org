@@ -137,11 +137,51 @@ impl<'p> Vm<'p> {
         false
     }
 
+    /// The class VALUE the constructor frame on top of the stack belongs to.
+    ///
+    /// `class_values[id]` holds only the LATEST evaluation of a class
+    /// expression, so a chain built by re-evaluating one expression —
+    ///     let chain = base;
+    ///     for (let i = 0; i < 100; i++)
+    ///         chain = class extends chain { constructor() { super(); } };
+    ///     new chain();                      // staging/sm/class/superPropChains.js
+    /// — made every level's `super()` resolve GetSuperConstructor against the
+    /// NEWEST class, whose parent is the level below it: an infinite recursion
+    /// that overflowed the native stack and ABORTED the process (not even a
+    /// catchable RangeError). 15.7.16 GetSuperConstructor reads the *running*
+    /// function object's [[GetPrototypeOf]], so recover that specific evaluation
+    /// here.
+    ///
+    /// The link is the private brand, which is already minted per class
+    /// EVALUATION: `method_brand[classValue] = [ownBrand, ...enclosing]` and
+    /// `brand_owner[ownBrand] = classValue`, and run_class_ctor/[[Construct]]
+    /// copy `method_brand` from the class value onto the freshly allocated ctor
+    /// callable it invokes — which is this frame's `callee`. The
+    /// `ctor == frame.func` check proves the recovered class really owns the
+    /// running frame (a recycled heap index cannot fake it), and `None` leaves
+    /// every caller on the previous `class_values` path.
+    pub(crate) fn running_class_value(&self) -> Option<Value> {
+        let f = self.frames.last()?;
+        let callee = f.callee;
+        if !callee.is_heap() {
+            return None;
+        }
+        let brand = *self.method_brand.get(&callee.heap_index())?.first()?;
+        let owner = *self.brand_owner.get(&brand)?;
+        match self.heap.get(owner) {
+            HeapObj::Class(c) if c.ctor == Some(f.func) => Some(Value::heap(owner)),
+            _ => None,
+        }
+    }
+
     /// The superclass value for a `super` reference inside a method of class
     /// `home_class_id`: that class's runtime `ClassData.parent` (linked by
     /// MakeClass from the evaluated `extends` expression), or None.
     pub(crate) fn super_parent(&self, home_class_id: u32) -> Option<Value> {
-        let home = (*self.class_values.get(home_class_id as usize)?)?;
+        let home = match self.running_class_value() {
+            Some(v) => v,
+            None => (*self.class_values.get(home_class_id as usize)?)?,
+        };
         match self.heap.get(home.heap_index()) {
             HeapObj::Class(c) => c.parent.map(Value::heap),
             _ => None,
@@ -155,7 +195,11 @@ impl<'p> Vm<'p> {
     /// the SuperCall site (after ArgumentListEvaluation; call-proto-not-ctor).
     pub(crate) fn super_ctor_func(&mut self, home_class_id: u32) -> Result<Value, Thrown> {
         let not_ctor = || Thrown("TypeError: superclass is not a constructor".into());
-        let home = self.class_values.get(home_class_id as usize).copied().flatten();
+        // The RUNNING ctor's own class evaluation, not merely the latest one
+        // bound to this class_id — see `running_class_value`.
+        let home = self
+            .running_class_value()
+            .or_else(|| self.class_values.get(home_class_id as usize).copied().flatten());
         if let Some(h) = home.filter(|h| h.is_heap()) {
             if let Some(&p) = self.proto_of.get(&h.heap_index()) {
                 if !self.is_constructor(p) {
@@ -324,7 +368,12 @@ impl<'p> Vm<'p> {
         }
         // InitializeInstanceElements: this class's field initializers run NOW
         // (not at ctor entry), on the produced instance, with no new.target.
-        let cls_v = self.class_values.get(home_class_id as usize).copied().flatten();
+        // Same evaluation the `super()` above resolved against, so a chain built
+        // by re-evaluating one class expression initializes each level's OWN
+        // fields rather than the newest evaluation's.
+        let cls_v = self
+            .running_class_value()
+            .or_else(|| self.class_values.get(home_class_id as usize).copied().flatten());
         if let Some(cv) = cls_v {
             // Checked PrivateBrandAdd: a return-override that already carries
             // this class's private elements, or a non-extensible instance,

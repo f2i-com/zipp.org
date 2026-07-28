@@ -1926,7 +1926,8 @@ impl<'a> FnCompiler<'a> {
         let cur = self.load_binding(&binding, dst); // == dst
         if prefix {
             self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta, upd: true });
-            self.store_binding(&binding, cur);
+            // read-first: `load_binding` above resolved the reference.
+            self.store_binding_read_first(&binding, cur);
             Ok(dst) // dst holds the new value
         } else {
             // Coerce the old value in place (cur == dst), compute the new value in a
@@ -1934,7 +1935,7 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::AddInt { dst: cur, a: cur, imm: 0, upd: true });
             let tmp = self.temp();
             self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta, upd: true });
-            self.store_binding(&binding, tmp);
+            self.store_binding_read_first(&binding, tmp);
             self.next_reg -= 1; // reclaim tmp
             Ok(dst) // dst still holds the (coerced) old value
         }

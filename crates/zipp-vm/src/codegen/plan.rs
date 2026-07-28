@@ -203,7 +203,9 @@ pub(crate) fn unify_homes_with_globals(
         if let Some(d) = writes_reg(&code[ip]) {
             defs.entry(d).or_default().push(ip);
         }
-        if let Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } = code[ip] {
+        if let Instr::StoreGlobal { idx, .. }
+        | Instr::StoreGlobalStrict { idx, .. }
+        | Instr::StoreGlobalResolved { idx, .. } = code[ip] {
             g_stores.entry(idx).or_default().push(ip);
         }
     }
@@ -235,6 +237,7 @@ pub(crate) fn unify_homes_with_globals(
                     match code.get(d + 1) {
                         Some(&Instr::StoreGlobal { idx, src })
                         | Some(&Instr::StoreGlobalStrict { idx, src })
+                        | Some(&Instr::StoreGlobalResolved { idx, src })
                             if src == r && d + 1 <= e && !jump_targets.contains(&(d + 1)) =>
                         {
                             adj_store_ips.insert(d + 1);

@@ -197,7 +197,9 @@ pub(crate) fn compile_region_regalloc(
                     flag_cmp = prev_flag;
                 }
             }
-            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src } => {
                 let g = plan.glob_home[&idx];
                 let srx = xh(&plan, src);
                 if g != srx && !copy_is_noop(lc, g, srx) {

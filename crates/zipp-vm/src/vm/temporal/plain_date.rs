@@ -202,10 +202,23 @@ impl<'p> Vm<'p> {
     /// option: "always" → "[u-ca=<id>]", "critical" → "[!u-ca=<id>]", "never" →
     /// "". "auto" (the default) emits the annotation for every calendar EXCEPT
     /// iso8601, which is the default calendar and stays implicit.
-    pub(crate) fn calendar_name_suffix(&mut self, options: Value, cal: Cal) -> Result<String, Thrown> {
+    ///
+    /// The second result is the EXPANDED flag TemporalYearMonthToString /
+    /// TemporalMonthDayToString need: "If showCalendar is always or critical, OR
+    /// calendarIdentifier is not iso8601, add the reference day/year". That
+    /// condition is NOT the same as "an annotation is printed" — with
+    /// `{calendarName: "never"}` on a non-ISO calendar the annotation is dropped
+    /// but the reference component stays (`toString/calendarname-never.js`).
+    pub(crate) fn calendar_name_suffix_expanded(
+        &mut self,
+        options: Value,
+        cal: Cal,
+    ) -> Result<(String, bool), Thrown> {
         let id = cal.id();
+        let non_iso = cal != Cal::Iso;
         if options == Value::UNDEFINED {
-            return Ok(if cal == Cal::Iso { String::new() } else { format!("[u-ca={id}]") });
+            let suf = if non_iso { format!("[u-ca={id}]") } else { String::new() };
+            return Ok((suf, non_iso));
         }
         if !self.is_object_value(options) {
             return Err(Thrown("TypeError: options must be an object or undefined".into()));
@@ -216,12 +229,21 @@ impl<'p> Vm<'p> {
             "auto",
             &["auto", "always", "never", "critical"],
         )?;
-        Ok(match cn.as_str() {
+        let suf = match cn.as_str() {
             "always" => format!("[u-ca={id}]"),
             "critical" => format!("[!u-ca={id}]"),
-            "auto" if cal != Cal::Iso => format!("[u-ca={id}]"),
+            "auto" if non_iso => format!("[u-ca={id}]"),
             _ => String::new(),
-        })
+        };
+        let expanded = non_iso || matches!(cn.as_str(), "always" | "critical");
+        Ok((suf, expanded))
+    }
+
+    /// `calendar_name_suffix_expanded` for the types whose serialization never
+    /// varies in shape (PlainDate/PlainDateTime/ZonedDateTime always print the
+    /// full ISO date).
+    pub(crate) fn calendar_name_suffix(&mut self, options: Value, cal: Cal) -> Result<String, Thrown> {
+        self.calendar_name_suffix_expanded(options, cal).map(|(s, _)| s)
     }
 
     pub(crate) fn to_plain_date(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {

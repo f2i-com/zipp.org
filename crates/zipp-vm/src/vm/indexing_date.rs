@@ -916,20 +916,48 @@ impl<'p> Vm<'p> {
                     self.alloc_str(date_to_iso(ms))
                 }
             }
+            // ECMA-402 sup-date.prototype.tolocalestring replaces all three
+            // toLocale* forms with an Intl.DateTimeFormat built from (locales,
+            // options) and the method's own required/defaults pair —
+            // toLocaleString is (any, all), toLocaleDateString (date, date),
+            // toLocaleTimeString (time, time). That is the whole of
+            // `intl402/Date/prototype/returns-same-results-as-DateTimeFormat.js`,
+            // and it is what makes a Temporal toLocaleString comparable to a
+            // legacy Date one (the `lone-options-accepted.js` family).
+            "toLocaleString" | "toLocaleDateString" | "toLocaleTimeString" => {
+                // Step 4 precedes the formatter: an invalid Date answers
+                // "Invalid Date" without ever validating locales/options.
+                if ms.is_nan() {
+                    self.alloc_str("Invalid Date".to_string())
+                } else {
+                    let mode = match name {
+                        "toLocaleDateString" => crate::vm::intl::DtfDefaults::Date,
+                        "toLocaleTimeString" => crate::vm::intl::DtfDefaults::Time,
+                        _ => crate::vm::intl::DtfDefaults::All,
+                    };
+                    let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                    let dtf =
+                        self.make_intl_dtf(native::INTL_DATETIMEFORMAT, locales, options, mode)?;
+                    let resolved =
+                        self.intl_this(dtf, native::INTL_DATETIMEFORMAT, "toLocaleString")?;
+                    let fields = self.dtf_requested_fields(resolved);
+                    let s = self.dtf_format(resolved, ms, fields, true);
+                    self.alloc_str(s)
+                }
+            }
             // The human/RFC date string forms (the engine is UTC-only, so the
             // local `toString`/`toTimeString` zone is always GMT+0000). toGMTString
-            // is a legacy (Annex B) alias of toUTCString; the toLocale* forms reuse
-            // the corresponding non-locale formatter (no Intl locale data).
-            "toString" | "toUTCString" | "toGMTString" | "toDateString" | "toTimeString"
-            | "toLocaleString" | "toLocaleDateString" | "toLocaleTimeString" => {
+            // is a legacy (Annex B) alias of toUTCString.
+            "toString" | "toUTCString" | "toGMTString" | "toDateString" | "toTimeString" => {
                 if ms.is_nan() {
                     self.alloc_str("Invalid Date".to_string())
                 } else {
                     let s = match name {
-                        "toDateString" | "toLocaleDateString" => date_to_date_string(ms),
-                        "toTimeString" | "toLocaleTimeString" => date_to_time_string(ms),
+                        "toDateString" => date_to_date_string(ms),
+                        "toTimeString" => date_to_time_string(ms),
                         "toUTCString" | "toGMTString" => date_to_utc_string(ms),
-                        _ => date_to_string(ms), // toString | toLocaleString
+                        _ => date_to_string(ms),
                     };
                     self.alloc_str(s)
                 }

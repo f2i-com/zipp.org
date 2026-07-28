@@ -42,6 +42,7 @@ pub(crate) fn region_can_compile(
             // A `let`/`const` global write (TDZ-checked); inside a hot loop region the
             // binding is already initialized, so the JIT treats it like StoreGlobal.
             | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. }
             | Instr::Add { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
@@ -462,7 +463,9 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             | Instr::LoadGlobal { .. } => {}
             // ── the one admitted effect ── a global write. Must be the only
             // kind of effect; after it, no deopt-capable op may follow.
-            Instr::StoreGlobal { .. } | Instr::StoreGlobalStrict { .. } => {
+            Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. } => {
                 seen_effect = true;
             }
             // Anything else (calls, heap props, branches, closures, throw, …)
@@ -554,7 +557,9 @@ pub(crate) fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Optio
                 }
                 g = Some(idx);
             }
-            Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } => {
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } => {
                 if Some(idx) == g {
                     return None; // g mutated in the loop
                 }

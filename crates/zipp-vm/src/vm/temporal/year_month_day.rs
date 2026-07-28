@@ -420,22 +420,24 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
             "toJSON" => {
-                let suf = self.calendar_name_suffix(Value::UNDEFINED, cal)?;
-                let s = if suf.is_empty() {
-                    year_month_string(y, m)
-                } else {
+                let (suf, expanded) =
+                    self.calendar_name_suffix_expanded(Value::UNDEFINED, cal)?;
+                let s = if expanded {
                     format!("{}{}", iso_date_string(y, m, rd), suf)
+                } else {
+                    year_month_string(y, m)
                 };
                 Ok(Some(self.alloc_str(s)))
             }
             "toString" => {
-                // A calendar annotation (always/critical, or any non-ISO calendar)
-                // makes the reference ISO day part of the serialization.
-                let suf = self.calendar_name_suffix(a0, cal)?;
-                let s = if suf.is_empty() {
-                    year_month_string(y, m)
-                } else {
+                // showCalendar always/critical, or ANY non-ISO calendar, makes the
+                // reference ISO day part of the serialization — including when
+                // `calendarName: "never"` suppresses the annotation itself.
+                let (suf, expanded) = self.calendar_name_suffix_expanded(a0, cal)?;
+                let s = if expanded {
                     format!("{}{}", iso_date_string(y, m, rd), suf)
+                } else {
+                    year_month_string(y, m)
                 };
                 Ok(Some(self.alloc_str(s)))
             }
@@ -952,22 +954,24 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
             "toJSON" => {
-                let suf = self.calendar_name_suffix(Value::UNDEFINED, cal)?;
-                let s = if suf.is_empty() {
-                    format!("{m:02}-{d:02}")
-                } else {
+                let (suf, expanded) =
+                    self.calendar_name_suffix_expanded(Value::UNDEFINED, cal)?;
+                let s = if expanded {
                     format!("{}{}", iso_date_string(ry, m, d), suf)
+                } else {
+                    format!("{m:02}-{d:02}")
                 };
                 Ok(Some(self.alloc_str(s)))
             }
             "toString" => {
-                // A calendar annotation (always/critical, or any non-ISO calendar)
-                // makes the reference ISO year part of the serialization.
-                let suf = self.calendar_name_suffix(a0, cal)?;
-                let s = if suf.is_empty() {
-                    format!("{m:02}-{d:02}")
-                } else {
+                // showCalendar always/critical, or ANY non-ISO calendar, makes the
+                // reference ISO year part of the serialization — including when
+                // `calendarName: "never"` suppresses the annotation itself.
+                let (suf, expanded) = self.calendar_name_suffix_expanded(a0, cal)?;
+                let s = if expanded {
                     format!("{}{}", iso_date_string(ry, m, d), suf)
+                } else {
+                    format!("{m:02}-{d:02}")
                 };
                 Ok(Some(self.alloc_str(s)))
             }

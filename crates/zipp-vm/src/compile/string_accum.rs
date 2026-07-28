@@ -55,7 +55,9 @@ pub(crate) fn instr_touches(i: &Instr, r: Reg) -> bool {
             dst == r
         }
         Instr::Move { dst, src } => dst == r || src == r,
-        Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } => src == r,
+        Instr::StoreGlobal { src, .. }
+        | Instr::StoreGlobalStrict { src, .. }
+        | Instr::StoreGlobalResolved { src, .. } => src == r,
         Instr::AddInt { dst, a, .. } | Instr::Neg { dst, a } => dst == r || a == r,
         Instr::Add { dst, a, b }
         | Instr::Sub { dst, a, b }
@@ -90,6 +92,7 @@ pub(crate) fn is_simple_loop_op(i: &Instr) -> bool {
             | Instr::LoadGlobal { .. }
             | Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. }
             | Instr::Add { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
@@ -153,7 +156,9 @@ pub(crate) fn loop_inplace_safe(
     let (mut ld_before, mut ld_in) = (0u32, 0u32);
     for (ip, instr) in code.iter().enumerate() {
         match *instr {
-            Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } if idx == g => {
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } if idx == g => {
                 if ip < start {
                     st_before += 1
                 } else if ip <= end {
@@ -210,11 +215,13 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
             };
             // result `dst` stored back to some global `g` in the body
             let store_ip = (start..=j).find(|&m| {
-                matches!(f.code[m], Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } if src == dst)
+                matches!(f.code[m], Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } | Instr::StoreGlobalResolved { src, .. } if src == dst)
             });
             let (g, store_ip) = match store_ip {
                 Some(m) => match f.code[m] {
-                    Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } => (idx, m),
+                    Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. } => (idx, m),
                     _ => continue,
                 },
                 None => continue,

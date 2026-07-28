@@ -43,17 +43,19 @@ impl<'p> Vm<'p> {
         // Collect own methods + accessors first (ends the immutable heap borrow
         // before alloc).
         #[allow(clippy::type_complexity)]
-        let (methods, getters, setters): (
+        let (methods, getters, setters, proto_order): (
             Vec<(String, Value)>,
             Vec<(String, Value)>,
             Vec<(String, Value)>,
+            Vec<String>,
         ) = match self.heap.get(idx) {
             HeapObj::Class(c) => (
                 c.methods.iter().map(|(k, v)| (k.clone(), *v)).collect(),
                 c.getters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
                 c.setters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                c.proto_order.clone(),
             ),
-            _ => (Vec::new(), Vec::new(), Vec::new()),
+            _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
         // A derived class's prototype chains to its parent's prototype (so a
         // subclass instance is `instanceof` the parent — including built-in
@@ -83,37 +85,58 @@ impl<'p> Vm<'p> {
         if !is_gen_fn {
             map.define("constructor", obj, nonenum);
         }
-        for (k, v) in &methods {
-            // Private methods are not prototype properties.
-            if k.starts_with('#') {
-                continue;
-            }
-            map.define(k, *v, nonenum);
-        }
         // Accessors become real accessor properties (getter in `vals`, setter in
         // `attr.setter`) so getOwnPropertyDescriptor / getOwnPropertyNames /
         // enumeration reflect them; non-enumerable + configurable per spec. A
         // get+set pair on one key merges into a single accessor property.
         let acc_attr =
             PropAttr { writable: false, enumerable: false, configurable: true, accessor: true, setter: Value::UNDEFINED };
-        for (k, g) in &getters {
+        // Walk the class body's SOURCE order (`proto_order`), not method-list
+        // then accessor-list: the three lists are grouped by kind, so replaying
+        // them in turn reported `class C { get g(){} m(){} }` as
+        // ["constructor","m","g"] where OrdinaryOwnPropertyKeys requires
+        // ["constructor","g","m"]. `proto_order` carries one entry per public
+        // instance key, at its FIRST definition's position; the compiler
+        // (`drop_member`) has already made a key belong to exactly one of
+        // methods / (getters ∪ setters), so the classification below is
+        // unambiguous.
+        // `done` (not `map.pos`) is what stops the safety net below re-running a
+        // key: `class C { ['constructor'](){} }` legally REDEFINES the
+        // constructor back-reference installed above, so "already in the map"
+        // must not mean "skip"
+        // (language/computed-property-names/class/method/constructor.js).
+        let mut done: Vec<&str> = Vec::new();
+        let define_key = |map: &mut ObjMap, k: &str| {
             if k.starts_with('#') {
-                continue;
+                return;
             }
-            map.define(k, *g, acc_attr);
+            if let Some((_, v)) = methods.iter().find(|(n, _)| n == k) {
+                map.define(k, *v, nonenum);
+                return;
+            }
+            let g = getters.iter().find(|(n, _)| n == k).map(|(_, v)| *v);
+            let s = setters.iter().find(|(n, _)| n == k).map(|(_, v)| *v);
+            if g.is_none() && s.is_none() {
+                return; // an unresolved computed-key placeholder
+            }
+            let mut a = acc_attr;
+            a.setter = s.unwrap_or(Value::UNDEFINED);
+            map.define(k, g.unwrap_or(Value::UNDEFINED), a);
+        };
+        for k in &proto_order {
+            done.push(k.as_str());
+            define_key(&mut map, k);
         }
-        for (k, s) in &setters {
-            if k.starts_with('#') {
+        // Safety net: anything the order list missed (a class value built by a
+        // path that never filled `proto_order`) still becomes a property, in the
+        // old kind-grouped order. Keys the loop above already handled are
+        // skipped, so this cannot reorder or duplicate them.
+        for (k, _) in methods.iter().chain(getters.iter()).chain(setters.iter()) {
+            if done.iter().any(|d| *d == k.as_str()) {
                 continue;
             }
-            if let Some(i) = map.pos(k) {
-                map.attrs[i].accessor = true;
-                map.attrs[i].setter = *s;
-            } else {
-                let mut a = acc_attr;
-                a.setter = *s;
-                map.define(k, Value::UNDEFINED, a);
-            }
+            done.push(k.as_str());
+            define_key(&mut map, k);
         }
         let p = self.heap.alloc(HeapObj::Object(Box::new(map)));
         self.prototypes.insert(idx, p);

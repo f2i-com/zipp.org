@@ -37,6 +37,20 @@ fn put_member<'x>(
     }
 }
 
+/// Drop `name` from a member list.
+///
+/// Each ClassElement is a DefinePropertyOrThrow onto ONE property map
+/// (15.7.14 ClassDefinitionEvaluation → MethodDefinitionEvaluation), so a data
+/// method and an accessor of the same key cannot coexist: whichever comes LAST
+/// replaces the other's kind entirely. zipp keeps methods and accessors in
+/// separate lists, so without this both survived and the earlier list won —
+/// `class C { method(){r+=1} get method(){r+=2} }` ran the METHOD
+/// (staging/sm/class/methodOverwrites.js). A get/set pair is the one case that
+/// merges rather than replaces, so a getter/setter only clears `methods`.
+fn drop_member(list: &mut Vec<(String, &ast::Function)>, name: &str) {
+    list.retain(|(n, _)| n != name);
+}
+
 /// The statement list of an arrow body, for the `&[Stmt]`-shaped analyses
 /// (`hoisted_var_names`, `capture::captured_locals`, `stash_child_with_shadows`).
 ///
@@ -631,6 +645,7 @@ impl<'a> FnCompiler<'a> {
             methods: Vec::new(),
             getters: Vec::new(),
             setters: Vec::new(),
+            proto_order: Vec::new(),
             statics: Vec::new(),
             static_getters: Vec::new(),
             static_setters: Vec::new(),
@@ -677,6 +692,9 @@ impl<'a> FnCompiler<'a> {
         let mut static_setters: Vec<(String, &ast::Function)> = Vec::new();
         let mut fields: Vec<(String, Option<&ast::Expr>)> = Vec::new();
         let mut static_fields: Vec<(String, Option<&'b ast::Expr>)> = Vec::new();
+        // Public INSTANCE prototype keys in SOURCE order — see `ClassDef::proto_order`.
+        // The kind-grouped lists above cannot express `get g(){} m(){}`'s interleaving.
+        let mut proto_order: Vec<String> = Vec::new();
         // `static { … }` initializer blocks, in source order. Each is compiled to a
         // thunk and run once at class definition time with `this` = the class.
         let mut static_blocks: Vec<&'b [ast::Stmt]> = Vec::new();
@@ -730,16 +748,47 @@ impl<'a> FnCompiler<'a> {
                         ast::MethodKind::Method => 0u8,
                     };
                     match class_key_name(&m.key) {
-                        Ok(name) => match (m.is_static, m.kind) {
-                            (true, ast::MethodKind::Method) => put_member(&mut statics, name, &*m.func),
-                            (true, ast::MethodKind::Get) => put_member(&mut static_getters, name, &*m.func),
-                            (true, ast::MethodKind::Set) => put_member(&mut static_setters, name, &*m.func),
+                        Ok(name) => {
+                            // A public INSTANCE member takes (or keeps) its
+                            // source position on the prototype; a later
+                            // same-key element redefines it in place.
+                            if !m.is_static
+                                && !name.starts_with('#')
+                                && !proto_order.iter().any(|n| *n == name)
+                            {
+                                proto_order.push(name.clone());
+                            }
+                            match (m.is_static, m.kind) {
+                            (true, ast::MethodKind::Method) => {
+                                drop_member(&mut static_getters, &name);
+                                drop_member(&mut static_setters, &name);
+                                put_member(&mut statics, name, &*m.func)
+                            }
+                            (true, ast::MethodKind::Get) => {
+                                drop_member(&mut statics, &name);
+                                put_member(&mut static_getters, name, &*m.func)
+                            }
+                            (true, ast::MethodKind::Set) => {
+                                drop_member(&mut statics, &name);
+                                put_member(&mut static_setters, name, &*m.func)
+                            }
                             (true, ast::MethodKind::Constructor) => unreachable!(),
-                            (false, ast::MethodKind::Method) => put_member(&mut methods, name, &*m.func),
-                            (false, ast::MethodKind::Get) => put_member(&mut getters, name, &*m.func),
-                            (false, ast::MethodKind::Set) => put_member(&mut setters, name, &*m.func),
+                            (false, ast::MethodKind::Method) => {
+                                drop_member(&mut getters, &name);
+                                drop_member(&mut setters, &name);
+                                put_member(&mut methods, name, &*m.func)
+                            }
+                            (false, ast::MethodKind::Get) => {
+                                drop_member(&mut methods, &name);
+                                put_member(&mut getters, name, &*m.func)
+                            }
+                            (false, ast::MethodKind::Set) => {
+                                drop_member(&mut methods, &name);
+                                put_member(&mut setters, name, &*m.func)
+                            }
                             (false, ast::MethodKind::Constructor) => unreachable!(),
-                        },
+                            }
+                        }
                         // Not statically nameable. A COMPUTED key is a
                         // runtime-keyed member; anything else is the error.
                         Err(e) => {
@@ -756,6 +805,9 @@ impl<'a> FnCompiler<'a> {
                             // already keeps insertion order.
                             if matches!(kind, 0 | 1 | 2 | 4 | 5) {
                                 let ph = format!("\u{1}cm{}", computed.len());
+                                if matches!(kind, 0 | 1 | 2) {
+                                    proto_order.push(ph.clone());
+                                }
                                 let list = match kind {
                                     1 => &mut getters,
                                     2 => &mut setters,
@@ -788,11 +840,20 @@ impl<'a> FnCompiler<'a> {
                     }
                     match class_key_name(&p.key) {
                         Ok(name) => {
-                            let (gl, sl) = if p.is_static {
-                                (&mut static_getters, &mut static_setters)
+                            if !p.is_static
+                                && !name.starts_with('#')
+                                && !proto_order.iter().any(|n| *n == name)
+                            {
+                                proto_order.push(name.clone());
+                            }
+                            let (ml, gl, sl) = if p.is_static {
+                                (&mut statics, &mut static_getters, &mut static_setters)
                             } else {
-                                (&mut getters, &mut setters)
+                                (&mut methods, &mut getters, &mut setters)
                             };
+                            // An auto-accessor is a get/set PAIR: like any
+                            // accessor it replaces a same-key data method.
+                            drop_member(ml, &name);
                             put_member(gl, name.clone(), &*acc.getter);
                             put_member(sl, name, &*acc.setter);
                         }
@@ -806,6 +867,9 @@ impl<'a> FnCompiler<'a> {
                             } else {
                                 (&mut getters, &mut setters)
                             };
+                            if !p.is_static {
+                                proto_order.push(format!("\u{1}cm{i}"));
+                            }
                             gl.push((format!("\u{1}cm{i}"), &*acc.getter));
                             sl.push((format!("\u{1}cs{i}"), &*acc.setter));
                             let kind = if p.is_static { 4u8 } else { 1u8 };
@@ -1176,6 +1240,11 @@ impl<'a> FnCompiler<'a> {
             if let Some(slot) = list.iter_mut().find(|(n, _)| *n == old) {
                 slot.0 = format!("\u{1}cm{fid}");
             }
+            // …and the same rename in the source-order list the prototype's
+            // property map is built from.
+            if let Some(slot) = proto_order.iter_mut().find(|n| **n == old) {
+                *slot = format!("\u{1}cm{fid}");
+            }
             if let Some(sf) = pair_fid {
                 let old = format!("\u{1}cs{i}");
                 let list =
@@ -1226,6 +1295,7 @@ impl<'a> FnCompiler<'a> {
             methods: method_defs,
             getters: getter_defs,
             setters: setter_defs,
+            proto_order,
             statics: static_defs,
             static_getters: static_getter_defs,
             static_setters: static_setter_defs,

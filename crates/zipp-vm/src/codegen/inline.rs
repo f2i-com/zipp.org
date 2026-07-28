@@ -233,7 +233,9 @@ pub(crate) fn emit_inline_leaf_call(
                     ; mov [rbx + dreg(rg(d))], rax
                 );
             }
-            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src } => {
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(rg(src))]
                     ; mov [r12 + (idx as i32) * 8], rax

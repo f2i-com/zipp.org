@@ -88,6 +88,19 @@ impl<'a> FnCompiler<'a> {
     }
 
     pub(crate) fn store_binding(&mut self, b: &Binding, src: Reg) {
+        self.store_binding_ex(b, src, false)
+    }
+
+    /// `store_binding` for the write half of a read-modify-write (`x++`,
+    /// `x += 1`, `x ||= v`): the caller has already emitted a `load_binding` of
+    /// the SAME binding, so the reference is proven resolvable and the strict
+    /// global store must not raise "x is not defined" (see
+    /// `Instr::StoreGlobalResolved`).
+    pub(crate) fn store_binding_read_first(&mut self, b: &Binding, src: Reg) {
+        self.store_binding_ex(b, src, true)
+    }
+
+    pub(crate) fn store_binding_ex(&mut self, b: &Binding, src: Reg, read_first: bool) {
         // A named function expression's own name is an immutable binding: assigning
         // to it inside the body throws a TypeError in strict mode and is a silent
         // no-op in sloppy mode (the RHS in `src` was already evaluated for its side
@@ -153,7 +166,16 @@ impl<'a> FnCompiler<'a> {
                 // lexical (`let`) binding is likewise checked even in sloppy mode: a
                 // store while it is still in its TDZ (UNINITIALIZED) is a ReferenceError.
                 if self.cx.in_strict || self.cx.lexical_globals.contains(idx) {
-                    self.emit(Instr::StoreGlobalStrict { idx: *idx, src });
+                    // A read-modify-write's Get already resolved the reference,
+                    // so its Put may not throw ReferenceError — but a global
+                    // LEXICAL keeps the checked store: its TDZ is about
+                    // INITIALIZATION, and `let x; ... x += 1` in the TDZ must
+                    // still throw (the read would have thrown first anyway).
+                    if read_first && !self.cx.lexical_globals.contains(idx) {
+                        self.emit(Instr::StoreGlobalResolved { idx: *idx, src });
+                    } else {
+                        self.emit(Instr::StoreGlobalStrict { idx: *idx, src });
+                    }
                 } else if self.box_all_locals || self.cx.dyn_global_zone {
                     self.emit(Instr::StoreGlobalDyn { idx: *idx, src });
                 } else {
@@ -454,6 +476,16 @@ impl<'a> FnCompiler<'a> {
     /// Store through a reference snapshotted by `eval_snap_probe`: the probed
     /// state (not the store-time state) picks EvalScope vs the static target.
     pub(crate) fn store_binding_snapped(&mut self, b: &Binding, src: Reg, snap: Option<Reg>) {
+        self.store_binding_snapped_ex(b, src, snap, false)
+    }
+
+    pub(crate) fn store_binding_snapped_ex(
+        &mut self,
+        b: &Binding,
+        src: Reg,
+        snap: Option<Reg>,
+        read_first: bool,
+    ) {
         let (p, name_slot, static_store): (Reg, u32, Instr) = match (snap, b) {
             (Some(p), Binding::Global(idx)) => {
                 (p, *idx, Instr::StoreGlobal { idx: *idx, src })
@@ -464,7 +496,7 @@ impl<'a> FnCompiler<'a> {
                 (p, slot, Instr::UpvalSet { idx: *uidx, src })
             }
             _ => {
-                self.store_binding(b, src);
+                self.store_binding_ex(b, src, read_first);
                 return;
             }
         };
