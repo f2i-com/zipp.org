@@ -66,7 +66,7 @@ wraps a `.js` file in a function and real packages rely on both. Pass
 
 **intl402** was mostly a Temporal calendar suite in disguise: before non-ISO
 calendars existed, 79% of its failures were one defect — every calendar but
-`iso8601` was rejected. Thirteen calendars now exist. Twelve are closed-form
+`iso8601` was rejected. Fifteen calendars now exist. Twelve are closed-form
 and need no data at all (gregory, buddhist, roc, japanese, coptic, ethiopic,
 ethioaa, islamic-civil, islamic-tbla, persian, indian, and hebrew — lunisolar
 but purely computational, being the Metonic cycle plus the four dechiyot).
@@ -150,15 +150,21 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today | 2.57× |
-| `regex-log-scan` made *exactly* as fast as V8 | 2.22× |
-| `typedarray-math` made *exactly* as fast as V8 | 2.24× |
-| **both of the two worst at V8 parity** | **1.94×** |
-| the uniform alternative | every bench 22.1% faster |
+| today | 2.29× |
+| `regex-log-scan` made *exactly* as fast as V8 | **1.99×** |
+| `typedarray-math` made *exactly* as fast as V8 | 2.02× |
+| **both of the two worst at V8 parity** | **1.75×** |
+| the uniform alternative | every bench 13.0% faster |
 
-So beating the worst benchmark outright is not enough, and no stack of 1–2%
-wins closes the gap. A plan that neither matches V8 on two benchmarks nor moves
-every operation is not a plan for 2×, whatever else it is worth.
+**This table used to say something stronger than it does now, and the change is
+the point.** At 2.57× it took *both* of the two worst benchmarks at V8 parity to
+reach 1.94×, so the conclusion was that no single fix could get under 2×. At
+2.29× that is no longer true: `regex-log-scan` alone, brought to parity, lands
+at 1.99×. The 2× goal now has a single named blocker rather than needing a
+broad campaign — which is why the regex matcher is first on the list below.
+
+The wider discipline still holds. 13.0% uniformly is a lot to find in an engine
+already carrying four JIT tiers, so a stack of 1–2% wins is still not a plan.
 
 **One number explains most of the rest: the general (boxed) JIT tier costs
 ~3.5ns per op.** A property read measured at 21ns is not a 21ns read — it is a
