@@ -19,32 +19,45 @@
 
 ## 1. Where the project actually is
 
-### Conformance — 99.0%
+### Conformance — 99.91% test262, 96.9% intl402
 
 | slice | executions | pass | fail |
 |---|---|---|---|
-| ECMA-262 + `staging`, sloppy **and** strict | 96,029 | 95,091 (99.0%) | 938 |
-| `intl402` (opt-in) | 3,341 | 563 (16.9%) | 2,778 |
+| ECMA-262 + `staging`, sloppy **and** strict | 95,848 | 95,766 (99.91%) | 82 |
+| `intl402` (opt-in) | 6,682 | 6,474 (96.9%) | 208 |
 
 Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
 
-The static-semantics cluster that was 76% of everything is gone: parse-phase
-negatives are now **80 files** of the 552 that fail, down from 607. What is left
-is a long tail plus two deliberate items:
+The intl402 denominator changed because the runner was not parsing YAML
+list-form `flags:` — roughly half that suite silently never ran, so the old
+16.9% was measured against a half-skipped suite.
+
+What is left, and it is a different SHAPE from the long tail this section used
+to describe. Decorators — once the largest single item — are implemented. So
+are all fifteen Temporal calendars and the IANA time zone database. A
+meaningful share of the residue is now zipp being deliberately MORE conformant
+than node:
 
 | cause | executions | note |
 |---|---|---|
-| positive tests failing at runtime | 774 | the long tail — no cluster over ~30 |
-| parse-phase negatives not raised | 135 | incl. 20 for top-level `return` (deliberate) |
-| decorators | 26 | not implemented |
-| wrong error TYPE / runtime negatives | 29 | |
+| fixable engine bugs | ~45 | no cluster over ~6; re-classified from scratch |
+| unimplemented features | ~13 | Float16Array, RegExp legacy statics, import-source |
+| harness / test262 artifacts | ~14 | node fails identically on the same source |
+| **zipp is right, node is wrong** | ~10 | Annex B `arguments`, ICU4C hebrew, chinese, a V8 2^53 bound |
+
+The intl402 remainder is data, not logic: CLDR content (patterns, unit display
+names with plural selection, collation order, plural categories) and the
+Unicode algorithm data behind `Segmenter` (UAX #29) and `Collator` (UCA/DUCET).
+Where a table IS carried it comes from the real upstream source with recorded
+provenance and is verified value-by-value against node's ICU — that is the
+standard, and approximating it would be worse than the honest failure.
 
 `tools/test262-expected-failures.txt` is the checked-in baseline; a regression
 is a `diff`, not a remembered number. It was stale for a long stretch (the
 2,194-line oxc-era list against a 938-failure run), which made that diff
 meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — geomean 2.56× slower than node (was 3.31×)
+### Performance — geomean 2.17× slower than node (was 3.31×)
 
 `bench/real/*.js` via `tools/bench.py`, paired medians of 7, output compared as
 exact bytes.
@@ -266,6 +279,34 @@ with a definitive A/B, before building anything large.
 This track did not exist in the previous roadmap; test262 was only a gate. It is
 now the shorter of the two tracks and should go first — the work is bounded and
 the payoff is a headline number.
+
+**Status 2026-07-28: 938 → 82 failures (99.0% → 99.91%), and intl402 2,778 →
+208 (16.9% → 96.9%).** Every step gated against the checked-in baseline with
+zero regressions. What the work actually taught, beyond the number:
+
+* **Cluster, then fix.** The wins came from root causes, not assertions. One
+  sentence — "nothing created inside a child realm carried that realm's
+  intrinsics" — explained ten files. 79% of intl402 was a single defect:
+  Temporal rejecting every non-ISO calendar.
+* **Re-diagnose rather than trust a stale list.** Roughly one diagnosis in four
+  turned out wrong or already fixed. Two recorded blockers were simply false —
+  `Intl.DateTimeFormat` was never unconstructable — and a cluster estimated at
+  10 executions delivered 0. Re-classify at each new failure count; a list
+  written at 396 failures is worthless at 151.
+* **node is a good oracle, not an authority.** Four divergences are deliberate
+  and proved: Annex B `arguments`, the ICU4C hebrew calendar, a V8
+  `DurationFormat` 2^53 bound, and the chinese calendar (where test262's own
+  expectations back zipp against ICU). 100.0% is therefore not the target —
+  matching node on these would mean becoming LESS conformant.
+* **Ship the semantics or ship the honest error.** Decorators sat at a flat
+  SyntaxError for a long time, and that was correct: a parser that accepts
+  `@dec` and drops the semantics turns a missing feature into silently wrong
+  user code. They landed only once the runtime existed.
+* **The prerequisite was the real cost.** Decorators looked expensive because
+  they needed stateful native callables and every stateful native was its own
+  `HeapObj` variant. Building `HeapObj::NativeClosure` as a GENERAL mechanism
+  cost one audit of 42 match sites — 39 of them `_` catch-alls the compiler
+  would never have flagged — and now any stateful builtin is one match arm.
 
 - [x] **A1 — Static-semantics early errors. DONE: 2,214 → 135.** Not by adding
   `oxc_semantic` as this entry proposed, but by the engine growing its own front

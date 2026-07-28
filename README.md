@@ -30,34 +30,40 @@ wasm32 are built and tested.
 Both figures are measured on this repo, not estimated. Neither is finished —
 they are the current state.
 
-**Conformance — 99.88% of test262**, 95,732 of 95,848 required executions
+**Conformance — 99.91% of test262**, 95,766 of 95,848 required executions
 (ECMA-262 + `staging`, run in both sloppy and strict mode as `INTERPRETING.md`
 requires). Both tiers produce a **byte-identical** failure set, which is the
 cheapest evidence that a JIT change has not quietly diverged:
 
 | slice | executions | pass |
 |---|---|---|
-| ECMA-262 + staging, both modes | 95,848 | 95,732 (99.88%) |
+| ECMA-262 + staging, both modes | 95,848 | 95,766 (99.91%) |
 | intl402 (opt-in, `--include-intl402`) | 6,682 | 6,474 (96.9%) |
 
 That is up from 96.97% under `oxc_parser`, and the increase is the whole reason
 the engine grew its own front end.
 
-116 executions still fail. The two largest items are known and bounded:
+82 executions still fail — and a meaningful share of them are cases where zipp
+is deliberately MORE conformant than node, not less:
 
-* **Decorators (~34).** Not implemented, and `@dec` is an honest SyntaxError
-  rather than a parser that accepts the syntax and silently ignores it. The
-  runtime is the blocker, not the grammar: a decorator context object needs
-  `addInitializer` and `access.{has,get,set}` as callable values carrying
-  state, and this engine has no generic native-closure — every stateful native
-  is its own `HeapObj` variant, with ~18 touch points where omitting one is a
-  wrong answer rather than a compile error. Auto-accessors (`accessor x = v`),
-  which share the cluster, *are* implemented.
-* **Annex B block functions named `arguments` (2).** Left failing on purpose.
-  B.3.2.4 step 1.a.ii's `parameterNames does not contain F` condition gates the
-  whole step and FunctionDeclarationInstantiation puts `"arguments"` in
-  parameterNames, so zipp is correct here and node is not. Matching node would
-  mean becoming non-conformant.
+* **Annex B block functions named `arguments` (2).** B.3.2.4 step 1.a.ii's
+  `parameterNames does not contain F` condition gates the whole step, and
+  FunctionDeclarationInstantiation puts `"arguments"` in parameterNames. zipp is
+  right; matching node would mean becoming non-conformant.
+* **The `chinese` calendar (22 disagreeing date-runs).** test262's own
+  expectations back zipp against ICU — see the calendar note below.
+* **The ICU4C `hebrew` calendar (6 dates)** and **a V8 `DurationFormat` 2^53
+  bound**, both with the divergence proved rather than assumed.
+
+Decorators — for a long time the single largest gap, at ~34 executions — are
+now implemented end to end: the parser, the decoration runtime, and the
+prerequisite that had actually been blocking them. A decorator context object
+needs `addInitializer` and `access.{has,get,set}` as callable values that carry
+state, and every stateful native here used to be its own `HeapObj` variant.
+`HeapObj::NativeClosure` makes that a general mechanism, so a stateful builtin
+now costs one match arm rather than ~18 touch points. All eight kinds work
+(class, method, getter, setter, field, auto-accessor, static, private),
+including on computed keys.
 
 `zipp js` parses the CommonJS-shaped script by default — top-level `return` is
 legal, and an ESM-shaped `.js` falls back to the Module goal — because node
@@ -150,11 +156,11 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today | 2.29× |
-| `regex-log-scan` made *exactly* as fast as V8 | **1.99×** |
-| `typedarray-math` made *exactly* as fast as V8 | 2.02× |
-| **both of the two worst at V8 parity** | **1.75×** |
-| the uniform alternative | every bench 13.0% faster |
+| today | 2.17× |
+| `regex-log-scan` made *exactly* as fast as V8 | **1.88×** |
+| `typedarray-math` made *exactly* as fast as V8 | 1.91× |
+| **both of the two worst at V8 parity** | **1.65×** |
+| the uniform alternative | every bench 8.0% faster |
 
 **This table used to say something stronger than it does now, and the change is
 the point.** At 2.57× it took *both* of the two worst benchmarks at V8 parity to
