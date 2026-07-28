@@ -415,7 +415,16 @@ impl<'p> Vm<'p> {
                     kind as u8,
                     native::INTL_NUMBERFORMAT | native::INTL_DATETIMEFORMAT | native::INTL_COLLATOR
                 ) {
-                    return self.construct(callee, args);
+                    let built = self.construct(callee, args)?;
+                    // ChainNumberFormat / ChainDateTimeFormat (normative
+                    // optional, and only these two have it — Collator does not):
+                    // `Intl.DateTimeFormat.call(obj)` returns `obj` carrying the
+                    // service under %Intl%.[[FallbackSymbol]].
+                    if matches!(kind as u8, native::INTL_NUMBERFORMAT | native::INTL_DATETIMEFORMAT)
+                    {
+                        return self.intl_chain_legacy(callee, built, this);
+                    }
+                    return Ok(built);
                 }
                 return Err(Thrown(
                     "TypeError: Constructor Intl service requires 'new'".into(),

@@ -224,8 +224,12 @@ impl<'p> Vm<'p> {
         // ArrayBuffer / DataView / TypedArray constructors used as values.
         let ci = cv.heap_index();
         if ci == self.function_ctor && ci != 0 {
-            let over = self.newtarget_proto_override(new_target, cv, self.fn_proto)?;
+            // CreateDynamicFunction PARSES (step 16) before
+            // GetPrototypeFromConstructor(newTarget, …) (step 21): a SyntaxError
+            // in the body must leave `newTarget.prototype` unread
+            // (sm/*/create-function-parse-before-getprototype.js).
             let r = self.build_function(args)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.fn_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         // The dynamic-function intrinsics: GetPrototypeFromConstructor with the
@@ -234,18 +238,18 @@ impl<'p> Vm<'p> {
         // NEWTARGET REALM's image of that intrinsic (realms map entries built by
         // create_realm).
         if ci == self.gen_fn_ctor && ci != 0 {
-            let over = self.newtarget_proto_override(new_target, cv, self.gen_fn_proto)?;
             let r = self.build_function_kind(args, 1)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.gen_fn_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.async_fn_ctor && ci != 0 {
-            let over = self.newtarget_proto_override(new_target, cv, self.async_fn_proto)?;
             let r = self.build_function_kind(args, 2)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.async_fn_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.asyncgen_fn_ctor && ci != 0 {
-            let over = self.newtarget_proto_override(new_target, cv, self.asyncgen_fn_proto)?;
             let r = self.build_function_kind(args, 3)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.asyncgen_fn_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.arraybuffer_ctor && ci != 0 {
@@ -507,13 +511,15 @@ impl<'p> Vm<'p> {
             if let Some(kind) = self.intl_ctors.iter().position(|&c| c == ci) {
                 let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let r = self.make_intl(kind as u8, locales, options)?;
                 // OrdinaryCreateFromConstructor(newTarget, "%Intl.<svc>.prototype%"):
                 // a subclass / Reflect.construct newTarget supplies the instance's
                 // [[Prototype]] (`class M extends Intl.Collator {}` must produce an
-                // M, not a bare Collator).
+                // M, not a bare Collator). It is step 2 of every Intl constructor,
+                // BEFORE Initialize<Service> — so a newTarget whose "prototype"
+                // getter throws wins over any options/locale error.
                 let default_proto = self.intl_protos[kind];
                 let over = self.newtarget_proto_override(new_target, cv, default_proto)?;
+                let r = self.make_intl(kind as u8, locales, options)?;
                 return Ok(self.set_ctor_proto(r, over));
             }
         }
@@ -899,7 +905,17 @@ impl<'p> Vm<'p> {
                 ));
             }
             if let Some(pidx) = parent {
-                let r = self.run_class_ctor(Value::heap(pidx), inst, args, new_target);
+                // A default derived constructor is
+                // `constructor(...args){ super(...args) }`, whose `super` resolves
+                // through GetSuperConstructor() — the class object's LIVE
+                // [[GetPrototypeOf]]. Using the `parent` recorded at class-
+                // definition time made `Object.setPrototypeOf(D, Other)` a no-op
+                // for a ctor-less class, while the explicit-ctor form (which goes
+                // through `super_ctor_func`) already retargeted
+                // (staging/sm/class/superCallProperBase.js).
+                let live = self.object_get_prototype_of(cv);
+                let sup = if live.is_heap() { live } else { Value::heap(pidx) };
+                let r = self.run_class_ctor(sup, inst, args, new_target);
                 // An explicit DERIVED parent in the chain may have left a this-TDZ
                 // mark (it threw pre-super) or a banked return-override (it
                 // object-returned past it) on the threaded instance — clear both.

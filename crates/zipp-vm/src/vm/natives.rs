@@ -74,7 +74,273 @@ impl<'p> Vm<'p> {
     /// writes the coerced element; anything else refuses without coercing);
     /// an accessor / non-writable / non-extensible-and-absent receiver own
     /// descriptor refuses.
-    fn reflect_set_on_receiver(
+    /// `target.[[Set]](P, V, Receiver)` — OrdinarySet with a Receiver that
+    /// may differ from the target (9.1.9.1 OrdinarySetWithOwnDescriptor),
+    /// Proxy-trap-aware on both sides. Returns the [[Set]] BOOLEAN; the caller
+    /// decides whether a false is silent (sloppy assignment) or a TypeError.
+    ///
+    /// This is `Reflect.set`'s whole body, lifted so `super.x = v` — which is
+    /// literally `GetSuperBase().[[Set]](x, v, this)` — can share it instead of
+    /// approximating it with `Set(this, …)`. `kv` is the ALREADY-coerced
+    /// property key (ToPropertyKey runs once, at the call site).
+    pub(crate) fn ordinary_set_with_receiver(
+        &mut self,
+        a0: Value,
+        kv: Value,
+        value: Value,
+        receiver: Value,
+    ) -> Result<bool, Thrown> {
+            let key = self.key_of(kv);
+            // Module Namespace exotic [[Set]]: always false.
+            if self.module_namespaces.contains_key(&a0.heap_index()) {
+                return Ok(false);
+            }
+            // A Proxy's [[Set]] is its `set` trap: Reflect.set reports the trap's
+            // boolean (an assignment swallows a falsish result). With NO trap,
+            // [[Set]] forwards to the target with the SAME receiver — the
+            // receiver-aware forward also reports the [[Set]] boolean (a
+            // rejected exotic write — RegExp flags, fn length, a frozen
+            // target — must read false, not true).
+            if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
+                return Ok(b);
+            }
+            if let Some((t, _, _)) = self.proxy_parts(a0.heap_index()) {
+                let b = self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false)?;
+                return Ok(b);
+            }
+            // TypedArray [[Set]] (10.4.5.5) step 1, for any canonical numeric
+            // key: SameValue(O, Receiver) runs TypedArraySetElement (coerce the
+            // value — observable — then bounds-checked write or silent drop) and
+            // returns true; an altered Receiver with an INVALID index returns
+            // true with NO coercion; a valid index continues OrdinarySet on the
+            // RECEIVER with the RAW value (the element is a writable data prop).
+            if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
+                && self.is_canonical_numeric_index(&key)
+            {
+                if self.same_value(a0, receiver) {
+                    match self.ta_valid_index(a0.heap_index(), &key) {
+                        Some(i) => self.ta_element_set(a0.heap_index(), i, value)?,
+                        None => self.ta_coerce_for_set(a0.heap_index(), value)?,
+                    }
+                    return Ok(true);
+                }
+                if self.ta_valid_index(a0.heap_index(), &key).is_none() {
+                    return Ok(true);
+                }
+                let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+                return Ok(b);
+            }
+            // ArraySetLength via Reflect.set: ToUint32 + ToNumber BOTH run
+            // (valueOf twice), non-uint32 is a RangeError, and a non-writable
+            // `length` (made so even DURING the coercion) reports FALSE — the
+            // ordinary assignment path can only no-op or throw.
+            //
+            // ONLY when the receiver is the array itself. `length` is an ordinary
+            // (writable) own data property as far as OrdinarySet is concerned, so
+            // a DIFFERENT receiver takes the generic path: the value is defined on
+            // the RECEIVER and the array is untouched. Running ArraySetLength
+            // regardless truncated the array and skipped the receiver's
+            // [[GetOwnProperty]]/[[DefineOwnProperty]] — which is exactly the pair
+            // of trap calls sm/Array/{pop,shift}-no-has-trap.js counts, since
+            // Array.prototype.pop's `Set(O,"length",…)` goes through the proxy.
+            if key == "length"
+                && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_))
+                && self.same_value(a0, receiver)
+            {
+                let nu = self.to_number_coerce(value)?;
+                let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
+                let number_len = self.to_number_coerce(value)?;
+                if u != number_len {
+                    return Err(Thrown("RangeError: Invalid array length".into()));
+                }
+                let aidx = a0.heap_index();
+                if self.array_length_nonwritable.contains(&aidx)
+                    || self.arr_props.get(&aidx).is_some_and(|m| m.frozen)
+                {
+                    return Ok(false);
+                }
+                // Mirror the ordinary `arr.length = n` path: stop the shrink
+                // at a non-configurable index, sweep the doomed arr_props
+                // entries, and keep the virtual (sparse) length consistent.
+                let mut final_len = u as usize;
+                if let Some(ki) = self.array_shrink_blocker(aidx, final_len) {
+                    final_len = ki + 1;
+                }
+                self.array_apply_length(aidx, final_len);
+                return Ok(true);
+            }
+            // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
+            // (target's own, then up the prototype chain). Only ordinary Object
+            // links carry inline descriptors here; a class-instance/exotic link
+            // falls back to the simpler target-write below.
+            let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
+            let mut fell_back = false;
+            let mut ta_chain_node: Option<u32> = None;
+            let mut cur = a0;
+            loop {
+                match self.heap.get(cur.heap_index()) {
+                    HeapObj::Object(m) => {
+                        if let Some(i) = m.pos(&key) {
+                            governing =
+                                Some((m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter));
+                            break;
+                        }
+                        if m.class.is_some() {
+                            fell_back = true; // class-chain members aren't inline attrs
+                            break;
+                        }
+                    }
+                    // A TypedArray on the prototype chain ABSORBS canonical
+                    // numeric keys (its [[Set]] governs); handled below.
+                    HeapObj::TypedArray { .. } if self.is_canonical_numeric_index(&key) => {
+                        ta_chain_node = Some(cur.heap_index());
+                        break;
+                    }
+                    _ => {
+                        fell_back = true;
+                        break;
+                    }
+                }
+                let p = self.object_get_prototype_of(cur);
+                if !p.is_heap() {
+                    break;
+                }
+                cur = p;
+            }
+            if let Some(c) = ta_chain_node {
+                // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
+                // TA [[Set]] step 1 as above, with the ORIGINAL receiver.
+                if self.same_value(Value::heap(c), receiver) {
+                    match self.ta_valid_index(c, &key) {
+                        Some(i) => self.ta_element_set(c, i, value)?,
+                        None => self.ta_coerce_for_set(c, value)?,
+                    }
+                    return Ok(true);
+                }
+                if self.ta_valid_index(c, &key).is_none() {
+                    return Ok(true);
+                }
+                let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+                return Ok(b);
+            }
+            // A String exotic object's `length` and in-range char indices are
+            // NON-WRITABLE own data properties, so [[Set]] rejects them. They
+            // live in neither the ObjMap nor `arr_props`, so the fell-back
+            // descriptor probe below saw "absent + extensible" and reported TRUE
+            // for `Reflect.set(new String("hello"), "0", "y")` — the write
+            // no-opped, but the boolean was wrong (sm/Reflect/set.js).
+            if let Some((_, len)) = self.string_exotic_chars(a0) {
+                if key == "length" || canonical_index_str(&key).is_some_and(|i| i < len) {
+                    return Ok(false);
+                }
+            }
+            // Does the target's OWN descriptor for `key` (the one the fell-back
+            // arm consults) name an accessor? An accessor's setter runs against
+            // the target here; anything else is a data/absent case whose write
+            // belongs on the RECEIVER when the two differ.
+            let target_own_accessor = match self.heap.get(a0.heap_index()) {
+                HeapObj::Object(m) => m.pos(&key).is_some_and(|i| m.attrs[i].accessor),
+                _ => {
+                    let h = a0.heap_index();
+                    let side = match self.heap.get(h) {
+                        HeapObj::Func(_)
+                        | HeapObj::Closure { .. }
+                        | HeapObj::Bound { .. }
+                        | HeapObj::Native(_) => self.fn_props.get(&h),
+                        _ => self.arr_props.get(&h),
+                    };
+                    side.and_then(|m| m.pos(&key).map(|i| m.attrs[i].accessor)).unwrap_or(false)
+                }
+            };
+            let result = if fell_back {
+                let ok = match self.heap.get(a0.heap_index()) {
+                    HeapObj::Object(m) => match m.pos(&key) {
+                        Some(i) => {
+                            if m.attrs[i].accessor {
+                                m.attrs[i].setter != Value::UNDEFINED
+                            } else {
+                                m.attrs[i].writable
+                            }
+                        }
+                        None => m.extensible,
+                    },
+                    // Exotic/callable targets keep defineProperty'd descriptors
+                    // in the arr_props/fn_props side tables — honour them:
+                    // accessor-without-setter and non-writable data reject, a
+                    // NEW named prop on a non-extensible target rejects.
+                    _ => {
+                        let h = a0.heap_index();
+                        let side = match self.heap.get(h) {
+                            HeapObj::Func(_)
+                            | HeapObj::Closure { .. }
+                            | HeapObj::Bound { .. }
+                            | HeapObj::Native(_) => self.fn_props.get(&h),
+                            _ => self.arr_props.get(&h),
+                        };
+                        match side.and_then(|m| {
+                            m.pos(&key).map(|i| {
+                                (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter)
+                            })
+                        }) {
+                            Some((true, _, setter)) => setter != Value::UNDEFINED,
+                            Some((_, w, _)) => w,
+                            None => {
+                                if canonical_index_str(&key).is_some() {
+                                    true
+                                } else {
+                                    side.map_or(true, |m| m.extensible)
+                                }
+                            }
+                        }
+                    }
+                };
+                if ok {
+                    // OrdinarySetWithOwnDescriptor: only an ACCESSOR ownDesc
+                    // writes through the target. A data (or absent) ownDesc with
+                    // a DIFFERENT Receiver defines on the receiver and leaves the
+                    // target untouched — `Reflect.set([1,2,3], "length", 0, {})`
+                    // must give the plain object a `length` of 0 and keep the
+                    // array at 3, which is the [[GetOwnProperty]]/
+                    // [[DefineOwnProperty]] pair `Array.prototype.pop`'s
+                    // `Set(O,"length",…)` shows on a proxy receiver
+                    // (sm/Array/{pop,shift}-no-has-trap.js).
+                    if target_own_accessor || self.same_value(a0, receiver) {
+                        self.set_index(a0, kv, value, false)?;
+                    } else {
+                        return self.reflect_set_on_receiver(receiver, kv, value);
+                    }
+                }
+                ok
+            } else {
+                match governing {
+                    // Accessor: invoke its setter with the RECEIVER as `this`.
+                    Some((true, _, setter)) => {
+                        if setter == Value::UNDEFINED {
+                            false
+                        } else {
+                            self.call_value(setter, receiver, &[value])?;
+                            true
+                        }
+                    }
+                    // Non-writable data property: rejected.
+                    Some((false, false, _)) => false,
+                    // Writable data property, or a new property: write to the
+                    // RECEIVER (CreateDataProperty / overwrite its data prop),
+                    // rejecting a non-object receiver or a conflicting own prop.
+                    // Receiver.[[GetOwnProperty]] → reject an own accessor or
+                    // non-writable data prop, else DefineOwnProperty. (Inlining
+                    // only the plain-Object case here reported TRUE for every
+                    // rejected write on an exotic receiver — a frozen array's
+                    // element, a frozen function's new prop — and for a NEW prop
+                    // on ANY non-extensible receiver, where CreateDataProperty
+                    // returns false.)
+                    _ => self.reflect_set_on_receiver(receiver, kv, value)?,
+                }
+            };
+            Ok(result)
+    }
+
+    pub(crate) fn reflect_set_on_receiver(
         &mut self,
         receiver: Value,
         kv: Value,
@@ -85,6 +351,34 @@ impl<'p> Vm<'p> {
         }
         let key = self.key_of(kv);
         let ridx = receiver.heap_index();
+        // OrdinarySetWithOwnDescriptor on a Proxy receiver: read its own
+        // descriptor ([[GetOwnProperty]] → the gopd trap), then define
+        // ([[DefineOwnProperty]] → the defineProperty trap) — NEVER its `set`
+        // trap. A trap that calls `Reflect.set(target, k, v, proxy)` (the
+        // forwarding shape every logging proxy uses) would otherwise re-enter
+        // itself forever.
+        if self.proxy_parts(ridx).is_some() {
+            let existing = self.proxy_gopd(receiver, &key)?.unwrap_or(Value::UNDEFINED);
+            let mut m = crate::heap::ObjMap::new();
+            m.set("value", value);
+            if self.is_object_value(existing) {
+                let g = self.get_prop(existing, "get")?;
+                let s = self.get_prop(existing, "set")?;
+                let w = self.get_prop(existing, "writable")?;
+                if g != Value::UNDEFINED || s != Value::UNDEFINED || !self.truthy(w) {
+                    return Ok(false);
+                }
+                // valueDesc = { [[Value]]: V } only.
+            } else {
+                // CreateDataProperty(Receiver, P, V).
+                m.set("writable", Value::TRUE);
+                m.set("enumerable", Value::TRUE);
+                m.set("configurable", Value::TRUE);
+            }
+            let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+            self.object_define_property(receiver, &key, desc)?;
+            return Ok(true);
+        }
         if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)
         {
@@ -109,6 +403,24 @@ impl<'p> Vm<'p> {
                 .arr_props
                 .get(&ridx)
                 .and_then(|m| m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))),
+        };
+        // An Array's dense elements are not in `arr_props`, so an in-range index
+        // looks "absent" above and would then be rejected by the extensibility
+        // test below. It IS an own data property; its writability follows the
+        // array's integrity level (frozen ⇒ non-writable, sealed ⇒ still
+        // writable), which is exactly what separates
+        // `Reflect.set({}, "0", 9, Object.freeze([1]))` → false from
+        // `Reflect.set({}, "0", 9, Object.seal([1]))` → true.
+        let own = match own {
+            Some(o) => Some(o),
+            None => match self.heap.get(ridx) {
+                HeapObj::Array(items) => canonical_index_str(&key)
+                    .filter(|i| items.get(*i).is_some_and(|v| !v.is_hole()))
+                    .map(|_| {
+                        (false, !self.arr_props.get(&ridx).is_some_and(|m| m.frozen))
+                    }),
+                _ => None,
+            },
         };
         match own {
             Some((true, _)) => Ok(false),
@@ -1433,6 +1745,25 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("RangeError: toString() radix must be between 2 and 36".into()));
                 }
                 self.alloc_str(n.to_radix_string(radix as u32))
+            }
+            BIGINT_TO_LOCALE_STRING => {
+                // ECMA-402 BigInt.prototype.toLocaleString: brand-check `this`,
+                // then Construct an Intl.NumberFormat from (locales, options)
+                // and format through it — so a bad locale/option throws exactly
+                // what the constructor would.
+                let Some(n) = self.this_bigint_val(this) else {
+                    return Err(Thrown(
+                        "TypeError: BigInt.prototype.toLocaleString requires that 'this' be a BigInt"
+                            .into(),
+                    ));
+                };
+                let nf = self.make_intl(native::INTL_NUMBERFORMAT, a0, a1)?;
+                let resolved = match self.heap.get(nf.heap_index()) {
+                    HeapObj::Intl { resolved, .. } => *resolved,
+                    _ => return Err(Thrown("TypeError: NumberFormat expected".into())),
+                };
+                let prim = self.make_bigint_val(n);
+                self.intl_number_format(resolved, prim)?
             }
             BIGINT_VALUE_OF => {
                 match self.this_bigint_val(this) {
@@ -3066,247 +3397,7 @@ impl<'p> Vm<'p> {
                 // coerced a second time.
                 let receiver = args.get(3).copied().unwrap_or(a0);
                 let kv = self.coerce_index_key(a1)?;
-                let key = self.key_of(kv);
-                // Module Namespace exotic [[Set]]: always false.
-                if self.module_namespaces.contains_key(&a0.heap_index()) {
-                    return Ok(Value::bool(false));
-                }
-                // A Proxy's [[Set]] is its `set` trap: Reflect.set reports the trap's
-                // boolean (an assignment swallows a falsish result). With NO trap,
-                // [[Set]] forwards to the target with the SAME receiver — the
-                // receiver-aware forward also reports the [[Set]] boolean (a
-                // rejected exotic write — RegExp flags, fn length, a frozen
-                // target — must read false, not true).
-                if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
-                    return Ok(Value::bool(b));
-                }
-                if let Some((t, _, _)) = self.proxy_parts(a0.heap_index()) {
-                    let b = self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false)?;
-                    return Ok(Value::bool(b));
-                }
-                // TypedArray [[Set]] (10.4.5.5) step 1, for any canonical numeric
-                // key: SameValue(O, Receiver) runs TypedArraySetElement (coerce the
-                // value — observable — then bounds-checked write or silent drop) and
-                // returns true; an altered Receiver with an INVALID index returns
-                // true with NO coercion; a valid index continues OrdinarySet on the
-                // RECEIVER with the RAW value (the element is a writable data prop).
-                if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
-                    && self.is_canonical_numeric_index(&key)
-                {
-                    if self.same_value(a0, receiver) {
-                        match self.ta_valid_index(a0.heap_index(), &key) {
-                            Some(i) => self.ta_element_set(a0.heap_index(), i, value)?,
-                            None => self.ta_coerce_for_set(a0.heap_index(), value)?,
-                        }
-                        return Ok(Value::bool(true));
-                    }
-                    if self.ta_valid_index(a0.heap_index(), &key).is_none() {
-                        return Ok(Value::bool(true));
-                    }
-                    let b = self.reflect_set_on_receiver(receiver, kv, value)?;
-                    return Ok(Value::bool(b));
-                }
-                // ArraySetLength via Reflect.set: ToUint32 + ToNumber BOTH run
-                // (valueOf twice), non-uint32 is a RangeError, and a non-writable
-                // `length` (made so even DURING the coercion) reports FALSE — the
-                // ordinary assignment path can only no-op or throw.
-                if key == "length" && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_)) {
-                    let nu = self.to_number_coerce(value)?;
-                    let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
-                    let number_len = self.to_number_coerce(value)?;
-                    if u != number_len {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
-                    }
-                    let aidx = a0.heap_index();
-                    if self.array_length_nonwritable.contains(&aidx)
-                        || self.arr_props.get(&aidx).is_some_and(|m| m.frozen)
-                    {
-                        return Ok(Value::bool(false));
-                    }
-                    // Mirror the ordinary `arr.length = n` path: stop the shrink
-                    // at a non-configurable index, sweep the doomed arr_props
-                    // entries, and keep the virtual (sparse) length consistent.
-                    let mut final_len = u as usize;
-                    if let Some(ki) = self.array_shrink_blocker(aidx, final_len) {
-                        final_len = ki + 1;
-                    }
-                    self.array_apply_length(aidx, final_len);
-                    return Ok(Value::bool(true));
-                }
-                // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
-                // (target's own, then up the prototype chain). Only ordinary Object
-                // links carry inline descriptors here; a class-instance/exotic link
-                // falls back to the simpler target-write below.
-                let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
-                let mut fell_back = false;
-                let mut ta_chain_node: Option<u32> = None;
-                let mut cur = a0;
-                loop {
-                    match self.heap.get(cur.heap_index()) {
-                        HeapObj::Object(m) => {
-                            if let Some(i) = m.pos(&key) {
-                                governing =
-                                    Some((m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter));
-                                break;
-                            }
-                            if m.class.is_some() {
-                                fell_back = true; // class-chain members aren't inline attrs
-                                break;
-                            }
-                        }
-                        // A TypedArray on the prototype chain ABSORBS canonical
-                        // numeric keys (its [[Set]] governs); handled below.
-                        HeapObj::TypedArray { .. } if self.is_canonical_numeric_index(&key) => {
-                            ta_chain_node = Some(cur.heap_index());
-                            break;
-                        }
-                        _ => {
-                            fell_back = true;
-                            break;
-                        }
-                    }
-                    let p = self.object_get_prototype_of(cur);
-                    if !p.is_heap() {
-                        break;
-                    }
-                    cur = p;
-                }
-                if let Some(c) = ta_chain_node {
-                    // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
-                    // TA [[Set]] step 1 as above, with the ORIGINAL receiver.
-                    if self.same_value(Value::heap(c), receiver) {
-                        match self.ta_valid_index(c, &key) {
-                            Some(i) => self.ta_element_set(c, i, value)?,
-                            None => self.ta_coerce_for_set(c, value)?,
-                        }
-                        return Ok(Value::bool(true));
-                    }
-                    if self.ta_valid_index(c, &key).is_none() {
-                        return Ok(Value::bool(true));
-                    }
-                    let b = self.reflect_set_on_receiver(receiver, kv, value)?;
-                    return Ok(Value::bool(b));
-                }
-                let result = if fell_back {
-                    let ok = match self.heap.get(a0.heap_index()) {
-                        HeapObj::Object(m) => match m.pos(&key) {
-                            Some(i) => {
-                                if m.attrs[i].accessor {
-                                    m.attrs[i].setter != Value::UNDEFINED
-                                } else {
-                                    m.attrs[i].writable
-                                }
-                            }
-                            None => m.extensible,
-                        },
-                        // Exotic/callable targets keep defineProperty'd descriptors
-                        // in the arr_props/fn_props side tables — honour them:
-                        // accessor-without-setter and non-writable data reject, a
-                        // NEW named prop on a non-extensible target rejects.
-                        _ => {
-                            let h = a0.heap_index();
-                            let side = match self.heap.get(h) {
-                                HeapObj::Func(_)
-                                | HeapObj::Closure { .. }
-                                | HeapObj::Bound { .. }
-                                | HeapObj::Native(_) => self.fn_props.get(&h),
-                                _ => self.arr_props.get(&h),
-                            };
-                            match side.and_then(|m| {
-                                m.pos(&key).map(|i| {
-                                    (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter)
-                                })
-                            }) {
-                                Some((true, _, setter)) => setter != Value::UNDEFINED,
-                                Some((_, w, _)) => w,
-                                None => {
-                                    if canonical_index_str(&key).is_some() {
-                                        true
-                                    } else {
-                                        side.map_or(true, |m| m.extensible)
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    if ok {
-                        self.set_index(a0, kv, value, false)?;
-                    }
-                    ok
-                } else {
-                    match governing {
-                        // Accessor: invoke its setter with the RECEIVER as `this`.
-                        Some((true, _, setter)) => {
-                            if setter == Value::UNDEFINED {
-                                false
-                            } else {
-                                self.call_value(setter, receiver, &[value])?;
-                                true
-                            }
-                        }
-                        // Non-writable data property: rejected.
-                        Some((false, false, _)) => false,
-                        // Writable data property, or a new property: write to the
-                        // RECEIVER (CreateDataProperty / overwrite its data prop),
-                        // rejecting a non-object receiver or a conflicting own prop.
-                        _ => {
-                            if !self.is_object_value(receiver) {
-                                false
-                            } else if self.proxy_parts(receiver.heap_index()).is_some() {
-                                // OrdinarySetWithOwnDescriptor on a Proxy receiver:
-                                // read its own descriptor ([[GetOwnProperty]] → GOPD
-                                // trap), then define ([[DefineOwnProperty]] →
-                                // defineProperty trap) — NEVER its set trap (a trap
-                                // calling Reflect.set(t,k,v,proxy) would recurse).
-                                let existing =
-                                    self.proxy_gopd(receiver, &key)?.unwrap_or(Value::UNDEFINED);
-                                if self.is_object_value(existing) {
-                                    let g = self.get_prop(existing, "get")?;
-                                    let s = self.get_prop(existing, "set")?;
-                                    let w = self.get_prop(existing, "writable")?;
-                                    if g != Value::UNDEFINED || s != Value::UNDEFINED || !self.truthy(w)
-                                    {
-                                        false
-                                    } else {
-                                        // valueDesc = { [[Value]]: V } only.
-                                        let mut m = crate::heap::ObjMap::new();
-                                        m.set("value", value);
-                                        let desc =
-                                            Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
-                                        self.object_define_property(receiver, &key, desc)?;
-                                        true
-                                    }
-                                } else {
-                                    // CreateDataProperty(Receiver, P, V).
-                                    let mut m = crate::heap::ObjMap::new();
-                                    m.set("value", value);
-                                    m.set("writable", Value::TRUE);
-                                    m.set("enumerable", Value::TRUE);
-                                    m.set("configurable", Value::TRUE);
-                                    let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
-                                    self.object_define_property(receiver, &key, desc)?;
-                                    true
-                                }
-                            } else {
-                                let rown = match self.heap.get(receiver.heap_index()) {
-                                    HeapObj::Object(m) => {
-                                        m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
-                                    }
-                                    _ => None,
-                                };
-                                match rown {
-                                    Some((true, _)) => false,      // accessor own prop on receiver
-                                    Some((false, false)) => false, // non-writable data on receiver
-                                    _ => {
-                                        self.set_index(receiver, kv, value, false)?;
-                                        true
-                                    }
-                                }
-                            }
-                        }
-                    }
-                };
-                Value::bool(result)
+                Value::bool(self.ordinary_set_with_receiver(a0, kv, value, receiver)?)
             }
             REFLECT_HAS => {
                 if !self.is_object_value(a0) {
@@ -5104,23 +5195,43 @@ impl<'p> Vm<'p> {
             }
             INTL_SUPPORTED_VALUES_OF => {
                 let key = self.to_js_string(a0)?;
+                let mut zones: Vec<String> = Vec::new();
                 let vals: &[&str] = match key.as_str() {
                     // Shared with the DateTimeFormat/NumberFormat option
                     // resolution so the two agree: a value listed here is
                     // exactly one that resolvedOptions will echo back.
                     "calendar" => crate::vm::intl::AVAILABLE_CALENDARS,
                     "collation" => &["default"],
-                    "currency" => &["USD", "EUR", "GBP", "JPY"],
+                    // AvailableCurrencies is the codes for which the engine
+                    // provides BOTH Intl.NumberFormat and Intl.DisplayNames
+                    // functionality. There are no currency display names here
+                    // (no CLDR), so the intersection is empty — listing codes
+                    // NumberFormat alone handles would claim display names that
+                    // do not exist.
+                    "currency" => &[],
                     "numberingSystem" => crate::vm::intl::AVAILABLE_NUMBERING_SYSTEMS,
-                    "timeZone" => &["UTC"],
-                    "unit" => &["meter", "second", "byte"],
+                    "timeZone" => {
+                        zones = crate::vm::intl::available_time_zones();
+                        &[]
+                    }
+                    // AvailableUnits is every simple sanctioned identifier of
+                    // ECMA-402 Table 2 — exactly the set `style: "unit"` accepts
+                    // and echoes back — not the three that happen to have a
+                    // hand-written label.
+                    "unit" => crate::vm::intl::SANCTIONED_UNITS,
                     _ => {
                         return Err(Thrown(format!(
                             "RangeError: invalid key for supportedValuesOf: {key}"
                         )))
                     }
                 };
-                let items: Vec<Value> = vals.iter().map(|s| self.alloc_str(s.to_string())).collect();
+                // Every AvailableX list is specified as sorted (as %Array.prototype.sort%
+                // with no comparefn would leave it), and the enumeration tests compare
+                // the result against its own `.sort()`.
+                let mut sorted: Vec<String> =
+                    vals.iter().map(|s| s.to_string()).chain(zones).collect();
+                sorted.sort_unstable();
+                let items: Vec<Value> = sorted.into_iter().map(|s| self.alloc_str(s)).collect();
                 Value::heap(self.heap.alloc(HeapObj::Array(items)))
             }
             INTL_SUPPORTED_LOCALES_OF => {
@@ -5140,6 +5251,18 @@ impl<'p> Vm<'p> {
                 Value::heap(self.heap.alloc(HeapObj::Array(items)))
             }
             INTL_RESOLVED_OPTIONS => {
+                // UnwrapNumberFormat / UnwrapDateTimeFormat run BEFORE the brand
+                // check: a receiver produced by the legacy
+                // `Intl.DateTimeFormat.call(obj)` chaining carries the real
+                // service under %Intl%.[[FallbackSymbol]].
+                let mut this = this;
+                for kind in [INTL_NUMBERFORMAT, INTL_DATETIMEFORMAT] {
+                    let un = self.intl_unwrap_legacy(this, kind)?;
+                    if un != this {
+                        this = un;
+                        break;
+                    }
+                }
                 let resolved = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::Intl { resolved, .. }) => *resolved,
                     _ => {
@@ -5156,7 +5279,9 @@ impl<'p> Vm<'p> {
             }
             INTL_NF_FORMAT_TO_PARTS => {
                 let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "formatToParts")?;
-                let n = self.to_number(a0)?;
+                // ? ToNumber(value) — the coercing one, so an object argument's
+                // valueOf/@@toPrimitive runs (see `intl_number_format`).
+                let n = self.to_number_coerce(a0)?;
                 let parts = self.nf_parts(resolved, n)?;
                 let parts: Vec<(String, String, &str)> =
                     parts.into_iter().map(|(t, v)| (t, v, "")).collect();
@@ -5170,8 +5295,8 @@ impl<'p> Vm<'p> {
                 if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
                     return Err(Thrown(format!("TypeError: {name} requires two values")));
                 }
-                let x = self.to_number(a0)?;
-                let y = self.to_number(a1)?;
+                let x = self.to_number_coerce(a0)?;
+                let y = self.to_number_coerce(a1)?;
                 if x.is_nan() || y.is_nan() {
                     return Err(Thrown(format!("RangeError: {name} values must not be NaN")));
                 }
@@ -5185,25 +5310,35 @@ impl<'p> Vm<'p> {
             }
             INTL_DTF_FORMAT => {
                 let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "format")?;
+                let mut fields = self.dtf_requested_fields(resolved);
+                let mut absolute = true;
                 let ms = if a0 == Value::UNDEFINED {
                     (Self::now_epoch_ns() / 1_000_000) as f64
                 } else {
                     self.dtf_check_calendar(resolved, a0, "format")?;
+                    let (f, abs) = self.dtf_fields_for(resolved, a0, "format")?;
+                    fields = f;
+                    absolute = abs;
                     self.dtf_time_value(a0)?
                 };
-                let s = self.dtf_format(resolved, ms);
+                let s = self.dtf_format(resolved, ms, fields, absolute);
                 self.alloc_str(s)
             }
             INTL_DTF_FORMAT_TO_PARTS => {
                 let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "formatToParts")?;
+                let mut fields = self.dtf_requested_fields(resolved);
+                let mut absolute = true;
                 let ms = if a0 == Value::UNDEFINED {
                     (Self::now_epoch_ns() / 1_000_000) as f64
                 } else {
                     self.dtf_check_calendar(resolved, a0, "formatToParts")?;
+                    let (f, abs) = self.dtf_fields_for(resolved, a0, "formatToParts")?;
+                    fields = f;
+                    absolute = abs;
                     self.dtf_time_value(a0)?
                 };
                 let parts: Vec<(String, String, &str)> = self
-                    .dtf_parts(resolved, ms)
+                    .dtf_parts(resolved, ms, fields, absolute)
                     .into_iter()
                     .map(|(t, v)| (t.to_string(), v, ""))
                     .collect();
@@ -5225,9 +5360,10 @@ impl<'p> Vm<'p> {
                 }
                 self.dtf_check_calendar(resolved, a0, name)?;
                 self.dtf_check_calendar(resolved, a1, name)?;
+                let (fields, absolute) = self.dtf_fields_for(resolved, a0, name)?;
                 let x = self.dtf_time_value(a0)?;
                 let y = self.dtf_time_value(a1)?;
-                let parts = self.dtf_range_parts(resolved, x, y);
+                let parts = self.dtf_range_parts(resolved, x, y, fields, absolute);
                 if id == INTL_DTF_FORMAT_RANGE {
                     let s: String = parts.iter().map(|(_, v, _)| v.as_str()).collect();
                     self.alloc_str(s)
@@ -5264,7 +5400,7 @@ impl<'p> Vm<'p> {
             }
             INTL_PLURAL_SELECT => {
                 let _ = self.intl_this(this, INTL_PLURALRULES, "select")?;
-                let n = self.to_number(a0)?;
+                let n = self.to_number_coerce(a0)?;
                 let cat = if n == 1.0 { "one" } else { "other" };
                 self.alloc_str(cat.to_string())
             }
@@ -5278,8 +5414,8 @@ impl<'p> Vm<'p> {
                         "TypeError: selectRange requires both a start and an end".into(),
                     ));
                 }
-                let x = self.to_number(a0)?;
-                let y = self.to_number(a1)?;
+                let x = self.to_number_coerce(a0)?;
+                let y = self.to_number_coerce(a1)?;
                 if x.is_nan() || y.is_nan() {
                     return Err(Thrown("RangeError: selectRange endpoints must not be NaN".into()));
                 }
@@ -5307,8 +5443,8 @@ impl<'p> Vm<'p> {
             INTL_RTF_FORMAT | INTL_RTF_FORMAT_TO_PARTS => {
                 let to_parts = id == INTL_RTF_FORMAT_TO_PARTS;
                 let name = if to_parts { "formatToParts" } else { "format" };
-                let _ = self.intl_this(this, INTL_RELATIVETIMEFORMAT, name)?;
-                let v = self.to_number(a0)?;
+                let rtf_resolved = self.intl_this(this, INTL_RELATIVETIMEFORMAT, name)?;
+                let v = self.to_number_coerce(a0)?;
                 // PartitionRelativeTimePattern step 2: a non-finite value is a
                 // RangeError (it was formatted as "in NaN days" before).
                 if !v.is_finite() {
@@ -5336,15 +5472,25 @@ impl<'p> Vm<'p> {
                 // every one of ITS parts (but none of the surrounding literals)
                 // carries the singular `unit` field.
                 let mut parts: Vec<(String, String, &str)> = vec![];
-                if v >= 0.0 {
+                // PartitionRelativeTimePattern step 5 selects "past" when
+                // value < 0 **or value is -0** — the sign bit, not the ordering,
+                // so `format(-0, "second")` is "0 seconds ago", not "in 0 seconds".
+                let past = v.is_sign_negative();
+                if !past {
                     parts.push(("literal".into(), "in ".into(), ""));
                 }
+                // The interpolated number goes through the service's resolved
+                // numbering system, exactly as PartitionNumberPattern would
+                // (`en-us-numbering-systems.js` compares it against
+                // `Intl.NumberFormat(locale).format(value)`).
+                let rtf_ns = self.display(self.intl_slot(rtf_resolved, "numberingSystem"));
                 for (t, val) in grouped_decimal_parts(n) {
+                    let val = crate::vm::intl::translate_digits(&val, &rtf_ns);
                     parts.push((t.to_string(), val, unit.as_str()));
                 }
                 parts.push((
                     "literal".into(),
-                    if v < 0.0 { format!(" {unit_str} ago") } else { format!(" {unit_str}") },
+                    if past { format!(" {unit_str} ago") } else { format!(" {unit_str}") },
                     "",
                 ));
                 if to_parts {

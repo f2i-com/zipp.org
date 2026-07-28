@@ -139,21 +139,24 @@ impl<'p> Vm<'p> {
                     false
                 };
                 let y = Self::resolve_cal_year(cal, era.as_deref(), era_year, y_opt)?;
-                if m_conflict {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
-                }
                 if !m_valid {
                     return Err(Thrown(format!(
                         "RangeError: monthCode is not valid for the {} calendar",
                         cal.id()
                     )));
                 }
+                if !cal_month_fields_agree(cal, y, m_val, m_conflict) {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
                 // month < 1 always rejects; the upper bound is constrained/rejected
                 // by CalendarDateToISO below.
-                if m_val < 1 {
+                if m_val.floor() < 1 {
                     return Err(Thrown("RangeError: month out of range".into()));
                 }
-                let (iy, im, id) = cal_date_to_iso(cal, y, m_val, 1, reject)
+                let m_ord = m_val
+                    .ordinal(cal, y, reject)
+                    .ok_or_else(|| Thrown("RangeError: month out of range".into()))?;
+                let (iy, im, id) = cal_date_to_iso(cal, y, m_ord, 1, reject)
                     .ok_or_else(|| Thrown("RangeError: month out of range".into()))?;
                 if !iso_year_month_in_range(iy, im) {
                     return Err(Thrown(
@@ -167,19 +170,22 @@ impl<'p> Vm<'p> {
     }
 
     /// Read the `month`/`monthCode` fields, returning
-    /// `(month, calendar_valid, conflict)`. `calendar_valid` is false only for a
-    /// *well-formed* monthCode that this calendar does not have (a leap month, or
-    /// an ordinal past monthsInYear) — a numeric `month` is always reported valid
-    /// (its upper bound is constrained/rejected later; its lower bound is a
-    /// field-prep floor enforced by the caller). `conflict` records a month vs
-    /// monthCode disagreement. Malformed monthCode SYNTAX still throws eagerly;
-    /// the other two are deferred so the caller can raise the required-field
-    /// TypeErrors and read its options bag first, per CalendarResolveFields.
+    /// `(month, calendar_valid, other)`. `calendar_valid` is false only for a
+    /// *well-formed* monthCode that this calendar NEVER has (a leap month it does
+    /// not define, or an ordinal past its month count) — a numeric `month` is
+    /// always reported valid (its upper bound is constrained/rejected later; its
+    /// lower bound is a field-prep floor enforced by the caller). `other` carries
+    /// the numeric `month` when a monthCode was ALSO given, so the caller can run
+    /// the agreement check once it has resolved the calendar year (the two only
+    /// line up per-year in a leap-month calendar). Malformed monthCode SYNTAX
+    /// still throws eagerly; the rest is deferred so the caller can raise the
+    /// required-field TypeErrors and read its options bag first, per
+    /// CalendarResolveFields.
     pub(crate) fn read_month_field_raw(
         &mut self,
         obj: Value,
         cal: Cal,
-    ) -> Result<Option<(i64, bool, bool)>, Thrown> {
+    ) -> Result<Option<(MonthRef, bool, Option<i64>)>, Thrown> {
         // Read both `month` and `monthCode` (alphabetical field order puts `month`
         // first). When both are present they must agree.
         let month_opt = self.opt_int_field(obj, "month")?;
@@ -196,14 +202,10 @@ impl<'p> Vm<'p> {
             let s = self.heap.str_cow(prim.heap_index()).unwrap().into_owned();
             let (code_month, is_leap) = parse_month_code_syntax(&s)
                 .ok_or_else(|| Thrown(format!("RangeError: invalid monthCode '{s}'")))?;
-            let conflict = month_opt.is_some_and(|m| m != code_month);
-            // No calendar implemented here has leap months, so an "L" code is
-            // never valid; the ordinal bound is the calendar's month count.
-            let calendar_valid =
-                !is_leap && (1..=cal_months_in_year(cal, 0)).contains(&code_month);
-            return Ok(Some((code_month, calendar_valid, conflict)));
+            let calendar_valid = cal_month_code_valid(cal, code_month, is_leap);
+            return Ok(Some((MonthRef::Code(code_month, is_leap), calendar_valid, month_opt)));
         }
-        Ok(month_opt.map(|m| (m, true, false)))
+        Ok(month_opt.map(|m| (MonthRef::Ordinal(m), true, None)))
     }
 
     /// Read the `era`/`eraYear` fields. Calendars without eras (only `iso8601`
@@ -347,9 +349,10 @@ impl<'p> Vm<'p> {
             "year" => Value::num(y as f64),
             "month" => Value::num(m as f64),
             "day" => Value::num(d as f64),
-            // No calendar implemented here has leap months, so the month code is
-            // always the plain ordinal (a lunisolar calendar would need "M05L").
-            "monthCode" => self.alloc_str(format!("M{m:02}")),
+            "monthCode" => {
+                let s = month_code_string(cal, y, m);
+                self.alloc_str(s)
+            }
             "era" => match cal_era(cal, y, m, d) {
                 Some((e, _)) => self.alloc_str(e.to_string()),
                 None => Value::UNDEFINED,
@@ -467,32 +470,38 @@ impl<'p> Vm<'p> {
                     cy
                 };
                 let month_valid = mf.map(|(_, v, _)| v).unwrap_or(true);
-                let month_conflict = mf.map(|(_, _, c)| c).unwrap_or(false);
-                let nm = mf.map(|(mm, _, _)| mm).unwrap_or(cm);
+                let month_conflict = mf.and_then(|(_, _, c)| c);
+                // A bag with no month keeps the receiver's MONTH CODE, not its
+                // ordinal: `hebrew.with({ year })` from a leap year into a common
+                // one must stay on the same named month.
+                let nm = mf.map(|(mm, _, _)| mm).unwrap_or(MonthRef::of(cal, cy, cm));
                 // month uses ToPositiveIntegerWithTruncation: a value below 1 is rejected
                 // during field preparation, BEFORE the options bag is read.
-                if nm < 1 {
+                if nm.floor() < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
-                if month_conflict {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
-                }
                 if !month_valid {
                     return Err(Thrown(format!(
                         "RangeError: monthCode is not valid for the {} calendar",
                         cal.id()
                     )));
                 }
+                if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
+                let nm = nm
+                    .ordinal(cal, ny, reject)
+                    .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
                 Ok(Some(self.make_plain_year_month_cal(cal, ny, nm, reject)?))
             }
             "add" | "subtract" => {
                 let dur = self.to_duration(a0)?;
                 // The overflow option is still validated (constrain/reject/RangeError
                 // on bad values) and read before the algorithmic range check below.
-                let _ = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign = if name == "add" { 1 } else { -1 };
                 let op_sign = sign * Self::duration_sign(&dur);
                 // A PlainYearMonth carries no day, so any unit smaller than a month
@@ -518,6 +527,18 @@ impl<'p> Vm<'p> {
                 let ref_day = if op_sign < 0 { cal_days_in_month(cal, cy, cm) } else { 1 };
                 let anchor = cal_date_to_iso(cal, cy, cm, ref_day, false)
                     .ok_or_else(|| Thrown("RangeError: invalid year-month value".into()))?;
+                // A PlainYearMonth has no day, so `overflow: reject` can only bite on
+                // the MONTH — a leap month the destination year does not have (hebrew
+                // Adar I + 1 year, add/leap-months-hebrew.js). Probed with day 1 so the
+                // day clamp, which is not an overflow here, cannot fire.
+                if reject
+                    && cal_add_year_month(cal, cy, cm, 1, dur[0] * sign, dur[1] * sign, true)
+                        .is_none()
+                {
+                    return Err(Thrown(
+                        "RangeError: the month does not exist in the resulting year".into(),
+                    ));
+                }
                 let (ay, am, ad) = self.date_add(cal, anchor.0, anchor.1, anchor.2, &dur, sign);
                 let (ry, rm, _) = cal_from_iso(cal, ay, am, ad);
                 Ok(Some(self.make_plain_year_month_cal(cal, ry, rm, false)?))
@@ -553,12 +574,12 @@ impl<'p> Vm<'p> {
                         "RangeError: smallestUnit is larger than largestUnit".into(),
                     ));
                 }
-                // Difference in CALENDAR months (every calendar implemented here has
-                // a fixed month count, so a month index is year*monthsInYear + month).
+                // Difference in CALENDAR months, via the global month index so that
+                // years of 12 and 13 months (hebrew) both count for their real length.
                 let miy = cal_months_in_year(cal, cy);
                 let (oy, om, _) = cal_from_iso(cal, o.0, o.1, o.2);
-                let from = cy * miy + (cm - 1);
-                let to = oy * miy + (om - 1);
+                let from = cal_month_index(cal, cy, cm);
+                let to = cal_month_index(cal, oy, om);
                 let total_months = if name == "until" { to - from } else { from - to };
                 // DifferenceTemporalPlainYearMonth sets each operand's reference Day=1
                 // and range-checks that date; the very-minimum YM (-271821-04) has a
@@ -585,17 +606,17 @@ impl<'p> Vm<'p> {
                     let inc_i = inc as i64;
                     let cand_idx = if smallest == "year" {
                         let r2y = (d_months / miy / inc_i + s) * inc_i;
-                        (cy + r2y) * miy + (cm - 1)
+                        cal_month_index(cal, cy + r2y, cm)
                     } else if largest == "year" {
                         // Years split out first; only the months remainder is rounded.
                         let years = d_months / miy;
                         let r2m = (d_months % miy / inc_i + s) * inc_i;
-                        cy * miy + (cm - 1) + years * miy + r2m
+                        from + years * miy + r2m
                     } else {
                         let r2m = (d_months / inc_i + s) * inc_i;
-                        cy * miy + (cm - 1) + r2m
+                        from + r2m
                     };
-                    let (ky, km) = (cand_idx.div_euclid(miy), cand_idx.rem_euclid(miy) + 1);
+                    let (ky, km) = cal_month_from_index(cal, cand_idx);
                     let kiso = cal_date_to_iso(cal, ky, km, 1, false);
                     if kiso.is_none_or(|(a, b, c)| !iso_date_in_range(a, b, c)) {
                         return Err(Thrown(
@@ -606,21 +627,37 @@ impl<'p> Vm<'p> {
                 }
                 let mut f = [0i64; 10];
                 if largest == "year" {
+                    // Split the years out by MONTH CODE, exactly as the date
+                    // difference does — `total / monthsInYear` would be wrong in a
+                    // calendar whose years hold 12 or 13 months, and even in a
+                    // 12-month Hebrew year 12 months need not make a year
+                    // (until/leap-months-hebrew.js).
+                    // Always split the RECEIVER → other direction and negate for
+                    // `since`; swapping the operands would anchor the year step on the
+                    // wrong date, and the split is deliberately not antisymmetric.
+                    let (years, ay, am, span) =
+                        cal_until_year_split(cal, (cy, cm, 1), (oy, om, 1));
+                    let months = cal_month_index(cal, oy, om) - cal_month_index(cal, ay, am);
+                    let (years, months) =
+                        if name == "until" { (years, months) } else { (-years, -months) };
                     if smallest == "year" {
-                        // Round the whole-year count to the increment.
-                        f[0] = round_increment(total_months as i128, miy as i128 * inc, &mode)
-                            as i64
-                            / miy;
+                        // Round years + (months / span), scaled so `span` months are
+                        // one year; `span` is the real length of the year the leftover
+                        // months are eating into.
+                        f[0] = round_increment(
+                            (years * span + months) as i128,
+                            span as i128 * inc,
+                            &mode,
+                        ) as i64
+                            / span;
                     } else {
-                        // Split years out FIRST, then round ONLY the months remainder
-                        // to the increment (years aren't rounded); carry across a year
-                        // if the rounded remainder overflows. (Trunc division keeps the
-                        // sign for `since`'s negative difference.)
-                        let years = total_months / miy;
-                        let rem = total_months % miy;
-                        let rm = round_increment(rem as i128, inc, &mode) as i64;
-                        f[0] = years + rm / miy;
-                        f[1] = rm % miy;
+                        // Years aren't rounded; only the months remainder is. It can
+                        // carry into a year only if ROUNDING grew it — the exact
+                        // remainder never does, however close to `span` it is.
+                        let rm = round_increment(months as i128, inc, &mode) as i64;
+                        let carry = if rm.abs() > months.abs() { rm / span } else { 0 };
+                        f[0] = years + carry;
+                        f[1] = rm - carry * span;
                     }
                 } else {
                     f[1] = round_increment(total_months as i128, inc, &mode) as i64;
@@ -677,21 +714,25 @@ impl<'p> Vm<'p> {
     pub(crate) fn make_plain_month_day_fields(
         &mut self,
         cal: Cal,
-        cm: i64,
+        code: (i64, bool),
         cd: i64,
     ) -> Result<Value, Thrown> {
         if cal == Cal::Iso {
-            return self.make_plain_month_day(cm, cd, 1972);
+            return self.make_plain_month_day(code.0, cd, 1972);
         }
         let limit = iso_to_epoch_days(1972, 12, 31);
         let mut cy = cal_from_epoch_days(cal, limit).0;
         for _ in 0..40 {
-            if cd <= cal_days_in_month(cal, cy, cm) {
-                let ed = cal_to_epoch_days(cal, cy, cm, cd);
-                if ed <= limit {
-                    let (iy, im, id) = epoch_days_to_iso(ed);
-                    let r = self.make_plain_month_day(im, id, iy)?;
-                    return Ok(self.tag_cal(r, cal));
+            // A leap-month calendar skips years that do not HAVE this month at
+            // all: hebrew "M05L" anchors on the last leap year before 1973.
+            if let Some(cm) = cal_month_of_code(cal, cy, code.0, code.1) {
+                if cd <= cal_days_in_month(cal, cy, cm) {
+                    let ed = cal_to_epoch_days(cal, cy, cm, cd);
+                    if ed <= limit {
+                        let (iy, im, id) = epoch_days_to_iso(ed);
+                        let r = self.make_plain_month_day(im, id, iy)?;
+                        return Ok(self.tag_cal(r, cal));
+                    }
                 }
             }
             cy -= 1;
@@ -705,8 +746,8 @@ impl<'p> Vm<'p> {
         cal: Cal,
         iso: (i64, i64, i64),
     ) -> Result<Value, Thrown> {
-        let (_, cm, cd) = cal_from_iso(cal, iso.0, iso.1, iso.2);
-        self.make_plain_month_day_fields(cal, cm, cd)
+        let (cy, cm, cd) = cal_from_iso(cal, iso.0, iso.1, iso.2);
+        self.make_plain_month_day_fields(cal, cal_month_code(cal, cy, cm), cd)
     }
 
     pub(crate) fn pmd_fields(&self, idx: u32) -> Option<(i64, i64, i64)> {
@@ -778,6 +819,17 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: era and eraYear must be given together".into()));
                 }
                 let (m_val, m_valid, m_conflict) = m_raw.unwrap();
+                // In a non-ISO calendar an ORDINAL month names nothing on its own —
+                // which month it is depends on the year (a leap-month calendar can
+                // even shift it) — so `month` without `year` is a TypeError, not a
+                // RangeError (PlainMonthDay/from/fields-object.js).
+                let numeric_month = matches!(m_val, MonthRef::Ordinal(_)) || m_conflict.is_some();
+                if cal != Cal::Iso && numeric_month && year_field.is_none() && era.is_none() {
+                    return Err(Thrown(
+                        "TypeError: a non-ISO PlainMonthDay needs monthCode, or month with year"
+                            .into(),
+                    ));
+                }
                 // GetTemporalOverflowOption: read + validate options.overflow AFTER the
                 // field GETs + year coercion (order-of-operations) but BEFORE the
                 // calendar-invalid monthCode RangeError; absent options → constrain.
@@ -786,9 +838,6 @@ impl<'p> Vm<'p> {
                 } else {
                     false
                 };
-                if m_conflict {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
-                }
                 if !m_valid {
                     return Err(Thrown(format!(
                         "RangeError: monthCode is not valid for the {} calendar",
@@ -797,7 +846,7 @@ impl<'p> Vm<'p> {
                 }
                 let mut m = m_val;
                 let mut d = d_opt.unwrap();
-                if m < 1 || d < 1 {
+                if m.floor() < 1 || d < 1 {
                     return Err(Thrown("RangeError: month-day out of range".into()));
                 }
                 if cal != Cal::Iso {
@@ -812,20 +861,39 @@ impl<'p> Vm<'p> {
                             None
                         };
                     if let Some(y) = stated {
-                        let iso = cal_date_to_iso(cal, y, m, d, reject)
+                        if !cal_month_fields_agree(cal, y, m, m_conflict) {
+                            return Err(Thrown(
+                                "RangeError: month and monthCode must agree".into(),
+                            ));
+                        }
+                        let iso = m
+                            .ordinal(cal, y, reject)
+                            .and_then(|mo| cal_date_to_iso(cal, y, mo, d, reject))
                             .filter(|&(iy, im, id)| iso_date_in_range(iy, im, id));
                         if iso.is_none() {
                             return Err(Thrown("RangeError: month-day out of range".into()));
                         }
+                        // With a year in hand the ordinal is meaningful; carry the
+                        // month on as the CODE it names there, so the reference-year
+                        // search below looks for the right month.
+                        let mo = m.ordinal(cal, y, false).unwrap();
+                        m = MonthRef::of(cal, y, mo);
                     }
                     // Anchor on the calendar's own reference year; the day is
                     // regulated against that month's length there.
-                    let miy = cal_months_in_year(cal, 0);
-                    if reject && !(1..=miy).contains(&m) {
-                        return Err(Thrown("RangeError: month-day out of range".into()));
-                    }
-                    m = m.min(miy);
-                    let anchor = self.make_plain_month_day_fields(cal, m, d);
+                    let code = match m {
+                        MonthRef::Code(n, l) => (n, l),
+                        MonthRef::Ordinal(n) => {
+                            // Unreachable for non-ISO (a bare ordinal was rejected
+                            // above), but keep the bound rather than panicking.
+                            let last = cal_max_months(cal);
+                            if reject && !(1..=last).contains(&n) {
+                                return Err(Thrown("RangeError: month-day out of range".into()));
+                            }
+                            (n.min(last), false)
+                        }
+                    };
+                    let anchor = self.make_plain_month_day_fields(cal, code, d);
                     let v = match anchor {
                         Ok(v) => v,
                         Err(e) => {
@@ -836,13 +904,19 @@ impl<'p> Vm<'p> {
                             // the reference date is free to be a leap year, so
                             // Coptic M13 day 7 constrains to 6, not to 5.
                             let cy = cal_from_epoch_days(cal, iso_to_epoch_days(1972, 12, 31)).0;
-                            let cd = d.min(cal_month_max_days(cal, cy, m));
-                            self.make_plain_month_day_fields(cal, m, cd)?
+                            let cd = d.min(cal_month_code_max_days(cal, cy, code.0, code.1));
+                            self.make_plain_month_day_fields(cal, code, cd)?
                         }
                     };
                     let t = self.pmd_fields(v.heap_index()).unwrap();
                     return Ok((t, cal));
                 }
+                // iso8601: month and monthCode are interchangeable (no leap months),
+                // so the agreement check needs no year.
+                if !cal_month_fields_agree(cal, 1972, m, m_conflict) {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
+                let mut m = m.ordinal(cal, 1972, false).unwrap();
                 // The supplied `year` (if any) decides whether the day overflows
                 // (e.g. Feb-29 is valid only in a leap year); absent → 1972 (leap),
                 // so a bare {month:2,day:29} stays valid. The stored reference year
@@ -874,7 +948,7 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         let cal = self.cal_of(idx);
-        let (_, ccm, ccd) = cal_from_iso(cal, ry, m, d);
+        let (ccy, ccm, ccd) = cal_from_iso(cal, ry, m, d);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
             "toJSON" => {
@@ -917,34 +991,48 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let month_valid = mf.map(|(_, v, _)| v).unwrap_or(true);
-                let month_conflict = mf.map(|(_, _, c)| c).unwrap_or(false);
-                let mut nm = mf.map(|(mm, _, _)| mm).unwrap_or(if cal == Cal::Iso { m } else { ccm });
+                let month_conflict = mf.and_then(|(_, _, c)| c);
+                // No month field keeps the receiver's — as a CODE for a non-ISO
+                // calendar, since its reference year is re-chosen below.
+                let nm_ref = mf.map(|(mm, _, _)| mm).unwrap_or(if cal == Cal::Iso {
+                    MonthRef::Ordinal(m)
+                } else {
+                    MonthRef::of(cal, ccy, ccm)
+                });
                 let mut nd = df.unwrap_or(if cal == Cal::Iso { d } else { ccd });
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
-                if nm < 1 || nd < 1 {
+                if nm_ref.floor() < 1 || nd < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
-                if month_conflict {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
-                }
                 if !month_valid {
                     return Err(Thrown(format!(
                         "RangeError: monthCode is not valid for the {} calendar",
                         cal.id()
                     )));
                 }
-                if cal != Cal::Iso {
-                    let miy = cal_months_in_year(cal, 0);
-                    if reject && !(1..=miy).contains(&nm) {
-                        return Err(Thrown("RangeError: month-day out of range".into()));
-                    }
-                    nm = nm.min(miy);
-                    return Ok(Some(self.make_plain_month_day_fields(cal, nm, nd)?));
+                // `with` has no year field to resolve against, so the agreement check
+                // uses the receiver's own calendar year.
+                if !cal_month_fields_agree(cal, ccy, nm_ref, month_conflict) {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
                 }
+                if cal != Cal::Iso {
+                    let code = match nm_ref {
+                        MonthRef::Code(n, l) => (n, l),
+                        MonthRef::Ordinal(n) => {
+                            let last = cal_max_months(cal);
+                            if reject && !(1..=last).contains(&n) {
+                                return Err(Thrown("RangeError: month-day out of range".into()));
+                            }
+                            cal_month_code(cal, ccy, n.min(last))
+                        }
+                    };
+                    return Ok(Some(self.make_plain_month_day_fields(cal, code, nd)?));
+                }
+                let mut nm = nm_ref.ordinal(cal, ry, false).unwrap();
                 // The (optional) `year` field is used ONLY to apply the overflow option
                 // to the day (e.g. whether Feb 29 fits) — it is never range-checked. The
                 // result keeps the instance's canonical ISO reference year.
@@ -965,8 +1053,12 @@ impl<'p> Vm<'p> {
                     Thrown("TypeError: toPlainDate requires a year".into())
                 })?;
                 // Default overflow is "constrain": clamp the day to the month (e.g.
-                // PlainMonthDay(2,29).toPlainDate({year:2023}) → 2023-02-28).
-                let (iy, im, id) = cal_date_to_iso(cal, year, ccm, ccd, false)
+                // PlainMonthDay(2,29).toPlainDate({year:2023}) → 2023-02-28). The
+                // month travels as a CODE — the reference year's ordinal need not be
+                // the target year's (hebrew M05L is ordinal 6 only in a leap year).
+                let (num, leap) = cal_month_code(cal, ccy, ccm);
+                let mo = MonthRef::Code(num, leap).ordinal(cal, year, false).unwrap();
+                let (iy, im, id) = cal_date_to_iso(cal, year, mo, ccd, false)
                     .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
                 let r = self.make_plain_date(iy, im, id)?;
                 Ok(Some(self.tag_cal(r, cal)))

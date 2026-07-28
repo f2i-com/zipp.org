@@ -581,6 +581,12 @@ pub(crate) struct NumFmtParams<'a> {
     pub trailing_zero_display: &'a str,
     pub sign_display: &'a str,
     pub grouping: bool,
+    /// `useGrouping: "min2"` — CLDR's `minimumGroupingDigits` raised to 2, i.e.
+    /// the group separators appear only once the integer part reaches
+    /// `groupingSize + 2` = 5 digits (1000 → "1000", 10000 → "10,000"). It is a
+    /// property of the WHOLE integer part, not of the leading group: 1000000
+    /// still groups fully even though its leading group is one digit.
+    pub group_min2: bool,
 }
 
 /// The decimal digits a non-negative finite f64 rounds from, as (integer,
@@ -871,7 +877,8 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
     }
     let is_zero = ip.bytes().all(|b| b == b'0') && fp.bytes().all(|b| b == b'0');
     // The scientific/engineering pattern has no grouping separators.
-    let grouped = if p.grouping && exponent.is_none() && ip.len() > 3 {
+    let min_group_len = if p.group_min2 { 5 } else { 4 };
+    let grouped = if p.grouping && exponent.is_none() && ip.len() >= min_group_len {
         let len = ip.len();
         let first = match len % 3 {
             0 => 3,

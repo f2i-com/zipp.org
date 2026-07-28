@@ -246,16 +246,29 @@ impl<'p> Vm<'p> {
     ) -> Result<(), Thrown> {
         // MakeSuperPropertyReference: RequireObjectCoercible(GetSuperBase()).
         self.require_object_coercible(proto)?;
-        let setter = self.lookup_accessor(proto, key, true);
-        if self.is_callable(setter) {
-            self.call_value(setter, this, &[v])?;
-        } else {
-            // OrdinarySetWithOwnDescriptor consults Receiver.[[GetOwnProperty]]
-            // FIRST: a deferred-namespace receiver triggers evaluation, and a
-            // namespace receiver's uninit export throws ReferenceError.
-            self.defer_check(this, key)?;
-            self.ns_tdz_check(this, key)?;
-            self.set_prop(this, key, v, strict)?;
+        // OrdinarySetWithOwnDescriptor consults Receiver.[[GetOwnProperty]]
+        // FIRST: a deferred-namespace receiver triggers evaluation, and a
+        // namespace receiver's uninit export throws ReferenceError.
+        self.defer_check(this, key)?;
+        self.ns_tdz_check(this, key)?;
+        // `super.x = v` IS `GetSuperBase().[[Set]](x, v, Receiver = this)`, so it
+        // must run the full OrdinarySetWithOwnDescriptor. Approximating it with
+        // `Set(this, …)` after a chain setter probe got three cases wrong, all of
+        // them silently (staging/sm/class/superProp{NoOverwriting,StrictAssign}):
+        //   * an own ACCESSOR on the receiver rejects the write — it must NOT run
+        //     the receiver's own setter (`super.p = 1` where `this.p` is an
+        //     accessor is a TypeError, not a setter call);
+        //   * an own non-writable data prop on the receiver rejects it;
+        //   * a NON-WRITABLE data property found on the SUPER chain rejects it
+        //     (the old code only looked for a setter, so it fell through and
+        //     created an own prop on the receiver instead).
+        // A rejected [[Set]] is a TypeError at a strict reference site and a
+        // silent no-op at a sloppy one (an object-literal method in sloppy code).
+        let kv = self.key_to_value(key);
+        if !self.ordinary_set_with_receiver(proto, kv, v, this)? && strict {
+            return Err(Thrown(format!(
+                "TypeError: Cannot assign to read only property '{key}' of object"
+            )));
         }
         Ok(())
     }
@@ -413,6 +426,23 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                // `class X extends someProxy`: SuperCall is
+                // `Construct(parent, args, newTarget)`, so the PROXY's
+                // [[Construct]] runs — its `construct` trap, or (trap-less) the
+                // forward to its target. The result IS the instance: with
+                // newTarget still the derived class, OrdinaryCreateFromConstructor
+                // gives it the derived prototype, and `super_ctor_complete`
+                // rebinds `this` to it. Without this arm the parent constructor
+                // never ran at all and `this` kept the pre-made empty object
+                // (staging/sm/class/superCall{BaseInvoked,ProperBase}.js).
+                if self.proxy_parts(cval.heap_index()).is_some() {
+                    if !self.is_constructor(cval) {
+                        return Err(Thrown(
+                            "TypeError: the superclass is not a constructor".into(),
+                        ));
+                    }
+                    return self.construct_with_newtarget(cval, args, new_target);
+                }
                 // `class X extends f` where f is a PLAIN user function: super(...)
                 // must actually INVOKE the parent with this = the instance and the
                 // subclass new.target (a non-constructor parent is a TypeError; an
@@ -478,9 +508,19 @@ impl<'p> Vm<'p> {
         } else {
             // Implicit ctor: run the parent chain (threading its produced `this`),
             // then this class's field initializers on it.
+            //
+            // A default derived constructor is `constructor(...args){ super(...args) }`,
+            // and its `super` resolves through GetSuperConstructor() — the class
+            // object's LIVE [[GetPrototypeOf]]. Using the `parent` recorded at
+            // class-definition time made `Object.setPrototypeOf(D, Other)` a no-op
+            // for a class with no explicit ctor, while the explicit-ctor form
+            // (which goes through `super_ctor_func`) already retargeted
+            // (staging/sm/class/superCallProperBase.js).
             let mut eff = obj;
-            if let Some(pidx) = parent {
-                eff = self.run_class_ctor(Value::heap(pidx), eff, args, new_target)?;
+            if parent.is_some() {
+                let live = self.object_get_prototype_of(cval);
+                let target = if live.is_heap() { live } else { Value::heap(parent.unwrap()) };
+                eff = self.run_class_ctor(target, eff, args, new_target)?;
             }
             // PrivateBrandAdd before this class's field initializers run.
             self.brand_instance(eff, cval);

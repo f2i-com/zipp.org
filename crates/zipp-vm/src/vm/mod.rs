@@ -1087,6 +1087,9 @@ pub struct Vm<'p> {
     intl_ns: u32,
     intl_ctors: [u32; 10],
     intl_protos: [u32; 10],
+    /// realm id (0 = main) → that realm's `%Intl%.[[FallbackSymbol]]`. Rooted
+    /// indirectly: every entry is also in `symbol_keys`.
+    intl_fallback_syms: std::collections::HashMap<u32, Value>,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,

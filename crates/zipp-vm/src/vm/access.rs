@@ -195,15 +195,19 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // A String wrapper's `length` and in-range char indices are non-configurable
-        // exotic own props — `delete` fails (false). A named own prop (`s.foo`) falls
+        // A String's `length` and in-range char indices are non-configurable exotic
+        // own props — `delete` fails (false). A named own prop (`s.foo`) falls
         // through to the generic deletion below.
-        if matches!(self.heap.get(idx), HeapObj::Boxed { kind: 0, .. }) {
-            let blocked = key == "length"
-                || self
-                    .string_exotic_chars(obj)
-                    .and_then(|(_, len)| canonical_index_str(key).map(|i| i < len))
-                    .unwrap_or(false);
+        //
+        // This covers a PRIMITIVE string base too: `delete "foo".length` is
+        // 13.5.1.2 step 5 — ToObject(base) then [[Delete]] on the resulting String
+        // exotic object — so it yields false in sloppy code and throws TypeError in
+        // strict, exactly as for `new String("foo")`. Restricting the check to the
+        // boxed form made `delete "foo".length` / `delete "foo"[0]` answer true
+        // (staging/sm/strict/15.5.5.{1,2}.js).
+        if let Some((_, len)) = self.string_exotic_chars(obj) {
+            let blocked =
+                key == "length" || canonical_index_str(key).is_some_and(|i| i < len);
             if blocked {
                 return Value::bool(false);
             }
@@ -1083,13 +1087,21 @@ impl<'p> Vm<'p> {
             // order, stopping at the first NON-CONFIGURABLE one: it survives
             // and the final length becomes thatIndex + 1 (ArraySetLength).
             let mut final_len = n as usize;
-            if let Some(ki) = self.array_shrink_blocker(idx, final_len) {
+            let blocked = self.array_shrink_blocker(idx, final_len);
+            if let Some(ki) = blocked {
                 final_len = ki + 1;
             }
             // Sweeps the doomed arr_props index entries, truncates/extends the
             // dense store (extending adds HOLES — absent elements), and keeps
             // the virtual length (a sparse `n` past the dense cap) consistent.
             self.array_apply_length(idx, final_len);
+            // ArraySetLength step 17.b.iii: a blocked shrink applies the partial
+            // truncation AND returns FALSE, so a strict-mode `a.length = n`
+            // throws (staging/sm/strict/15.4.5.1.js). Reporting true here made
+            // the strict assignment silently succeed.
+            if blocked.is_some() {
+                return self.reject_write("length", strict);
+            }
             return Ok(true);
         }
         // A callable's `name`/`length` are non-writable: assignment is a sloppy
@@ -1472,7 +1484,7 @@ impl<'p> Vm<'p> {
     /// primitive as the receiver. An inherited setter/proxy-set fires; anything
     /// that bottoms out in a data write fails — CreateDataProperty on a
     /// non-object receiver returns false (sloppy no-op, strict TypeError).
-    fn primitive_base_set(
+    pub(crate) fn primitive_base_set(
         &mut self,
         obj: Value,
         key: &str,

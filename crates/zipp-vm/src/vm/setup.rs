@@ -1171,7 +1171,11 @@ impl<'p> Vm<'p> {
         {
             let bigint_proto = build(
                 self,
-                &[("toString", BIGINT_TO_STRING), ("valueOf", BIGINT_VALUE_OF)],
+                &[
+                    ("toString", BIGINT_TO_STRING),
+                    ("toLocaleString", BIGINT_TO_LOCALE_STRING),
+                    ("valueOf", BIGINT_VALUE_OF),
+                ],
                 None,
             );
             self.proto_of.insert(bigint_proto, Value::heap(obj_proto));

@@ -835,7 +835,23 @@ impl Compiler {
             // Sorted: this loop calls alloc_reg(), so raw HashSet order would
             // hand out CELL REGISTERS in a different order per compile.
             for name in &crate::compile::helpers::sorted_name_vec(&lex) {
-                if fc.captured.contains(name) && !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                // `box_all_locals` here means "this body references `eval`". A
+                // direct eval may name any of these lexicals, but
+                // `capture::captured_locals` cannot see inside the eval STRING, so
+                // `fc.captured` does not list them. Without the cell at entry, the
+                // function declarations materialised just below — they compile
+                // BEFORE the body's textual statements — snapshot an environment
+                // with no such binding, and the eval inside one resolved the name
+                // as a global:
+                //   (function(){ let a=1; function f(){ return eval("a"); }
+                //                return f(); })()   // ReferenceError
+                // while the same code with a function EXPRESSION worked. That is
+                // what killed every sm/expressions/destructuring-array-default-*
+                // (their harness evals `class D extends C` from a nested function
+                // declaration, with `C` a lexical of the enclosing IIFE).
+                if (fc.captured.contains(name) || fc.box_all_locals)
+                    && !fc.scopes[0].iter().any(|(n, _)| n == name)
+                {
                     // Box a TDZ cell: a read before the textual declaration runs
                     // (e.g. via a forward-materialised function) throws a
                     // ReferenceError rather than reading undefined.

@@ -138,8 +138,9 @@ impl<'p> Vm<'p> {
         let cal = self.validate_iso_calendar_field(v)?;
         let mut f = [0i64; 9];
         let mut have_date = [false; 3];
+        let mut month = MonthRef::Ordinal(1);
         let mut month_code_invalid = false;
-        let mut month_conflict = false;
+        let mut month_conflict = None;
         if let Some(x) = self.opt_int_field(v, "day")? {
             f[2] = x;
             have_date[2] = true;
@@ -160,8 +161,10 @@ impl<'p> Vm<'p> {
         if let Some((x, valid, conflict)) = self.read_month_field_raw(v, cal)? {
             // month then monthCode (alphabetical, inside read_month_field_raw);
             // a calendar-invalid monthCode's RangeError is deferred to
-            // finish_pdt_fields.
-            f[1] = x;
+            // finish_pdt_fields, as is resolving a code to an ordinal (that needs
+            // the year, which is read further down).
+            month = x;
+            f[1] = x.floor();
             have_date[1] = true;
             month_code_invalid = !valid;
             month_conflict = conflict;
@@ -188,7 +191,18 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: era and eraYear must be given together".into()));
         }
         let year = if have_date[0] { Some(f[0]) } else { None };
-        Ok(PdtBag { f, month_code_invalid, month_conflict, bag_off, tz, cal, era, era_year, year })
+        Ok(PdtBag {
+            f,
+            month,
+            month_code_invalid,
+            month_conflict,
+            bag_off,
+            tz,
+            cal,
+            era,
+            era_year,
+            year,
+        })
     }
 
     /// InterpretTemporalDateTimeFields: the deferred calendar-invalid monthCode
@@ -198,14 +212,14 @@ impl<'p> Vm<'p> {
         let mut f = bag.f;
         let cal = bag.cal;
         let y = Self::resolve_cal_year(cal, bag.era.as_deref(), bag.era_year, bag.year)?;
-        if bag.month_conflict {
-            return Err(Thrown("RangeError: month and monthCode must agree".into()));
-        }
         if bag.month_code_invalid {
             return Err(Thrown(format!(
                 "RangeError: monthCode is not valid for the {} calendar",
                 cal.id()
             )));
+        }
+        if !cal_month_fields_agree(cal, y, bag.month, bag.month_conflict) {
+            return Err(Thrown("RangeError: month and monthCode must agree".into()));
         }
         // date: month/day; time: hour..nanosecond (maxes 23/59/59/999/999/999).
         let maxes = [23, 59, 59, 999, 999, 999];
@@ -214,7 +228,10 @@ impl<'p> Vm<'p> {
         if f[1] < 1 || f[2] < 1 {
             return Err(Thrown("RangeError: invalid date fields".into()));
         }
-        let (iy, im, id) = cal_date_to_iso(cal, y, f[1], f[2], reject)
+        let (iy, im, id) = bag
+            .month
+            .ordinal(cal, y, reject)
+            .and_then(|m| cal_date_to_iso(cal, y, m, f[2], reject))
             .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
         f[0] = iy;
         f[1] = im;
@@ -374,8 +391,9 @@ impl<'p> Vm<'p> {
                     ("year", 0),
                 ];
                 let mut raw: [Option<i64>; 9] = [None; 9];
+                let mut month_ref: Option<MonthRef> = None;
                 let mut month_valid = true;
-                let mut month_conflict = false;
+                let mut month_conflict = None;
                 let mut any = false;
                 // era/eraYear sit between `day` and `hour` alphabetically.
                 let mut era: Option<String> = None;
@@ -391,7 +409,8 @@ impl<'p> Vm<'p> {
                         self.read_month_field_raw(a0, cal)?.map(|(mm, valid, conflict)| {
                             month_valid = valid;
                             month_conflict = conflict;
-                            mm
+                            month_ref = Some(mm);
+                            mm.floor()
                         })
                     } else {
                         self.opt_int_field(a0, key)?
@@ -421,26 +440,30 @@ impl<'p> Vm<'p> {
                 } else {
                     cy
                 };
-                let nm = raw[1].unwrap_or(cm);
+                // No month field keeps the receiver's MONTH CODE, not its ordinal
+                // (they differ across a leap-month calendar's year boundary).
+                let nm = month_ref.unwrap_or(MonthRef::of(cal, cy, cm));
                 let nd = raw[2].unwrap_or(cd);
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
-                if nm < 1 || nd < 1 {
+                if nm.floor() < 1 || nd < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
-                if month_conflict {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
-                }
                 if !month_valid {
                     return Err(Thrown(format!(
                         "RangeError: monthCode is not valid for the {} calendar",
                         cal.id()
                     )));
                 }
-                let (iy, im, id) = cal_date_to_iso(cal, ny, nm, nd, reject)
+                if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
+                let (iy, im, id) = nm
+                    .ordinal(cal, ny, reject)
+                    .and_then(|m| cal_date_to_iso(cal, ny, m, nd, reject))
                     .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
                 nf[0] = iy;
                 nf[1] = im;

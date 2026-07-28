@@ -114,6 +114,12 @@ impl<'a> FnCompiler<'a> {
                 self.store_binding(&b, src);
                 Ok(())
             }
+            // `for (super.x of it)` / `[...super.x] = it` — a super target that no
+            // caller pre-resolved. `m.object` is `Expr::Super`, which has no value
+            // form, so this must not reach the generic `self.expr(&m.object)` arms.
+            Target::Member(m) if matches!(&m.object, Expr::Super) => {
+                self.assign_super_target(target, None, src)
+            }
             Target::Member(m) => match &m.prop {
                 MemberProp::Ident(prop) => {
                     let save = self.next_reg;
@@ -196,6 +202,32 @@ impl<'a> FnCompiler<'a> {
     /// into one.
     pub(crate) fn pre_member_ref(&mut self, t: &Target) -> R<Option<(Reg, PreKey)>> {
         match t {
+            // `[super.x] = it` / `({k: super[e]} = o)`. MakeSuperPropertyReference
+            // runs GetThisBinding() (a derived ctor before `super()` throws HERE)
+            // and evaluates the computed key when the REFERENCE is taken — i.e.
+            // before the iterator step / GetV, which is what sm/destructuring/
+            // order-super.js logs. The base object is not materialised: the
+            // Super* opcodes read [[HomeObject]] themselves.
+            Target::Member(m) if matches!(&m.object, Expr::Super) => {
+                if !self.super_prop_ok() {
+                    return Err("`super.x = …` is only valid in a method".into());
+                }
+                self.this_check();
+                match &m.prop {
+                    MemberProp::Ident(prop) => {
+                        let name = self.string_name(prop);
+                        Ok(Some((0, PreKey::Super(name))))
+                    }
+                    MemberProp::Computed(key_expr) => {
+                        let k = self.pin_expr(key_expr)?;
+                        Ok(Some((0, PreKey::SuperComputed(k))))
+                    }
+                    // `super.#x` is not in the grammar.
+                    MemberProp::Private(_) => {
+                        Err("`super.#x` is not a valid assignment target".into())
+                    }
+                }
+            }
             Target::Member(m) => match &m.prop {
                 MemberProp::Ident(prop) => {
                     let r = self.pin_expr(&m.object)?;
@@ -250,7 +282,46 @@ impl<'a> FnCompiler<'a> {
             PreKey::Static(name) => self.emit(Instr::SetProp { obj, name, val }),
             PreKey::Computed(k) => self.emit(Instr::SetIndex { obj, key: k, val }),
             PreKey::Private(name) => self.emit(Instr::SetPrivate { obj, name, val }),
+            // `obj` is the dummy from pre_member_ref — a SuperProperty store
+            // routes through the class op (home_class_id) or the object-method
+            // op ([[HomeObject]]) exactly as `super.x = v` does in `assign`.
+            PreKey::Super(name) => match self.super_class {
+                Some(p) => self.emit(Instr::SuperSet { home_class_id: p, name, val }),
+                None => self.emit(Instr::SuperSetObj { name, val }),
+            },
+            PreKey::SuperComputed(k) => match self.super_class {
+                Some(p) => {
+                    self.emit(Instr::SuperSetComputed { home_class_id: p, key: k, val })
+                }
+                None => self.emit(Instr::SuperSetObjComputed { key: k, val }),
+            },
         }
+        Ok(())
+    }
+
+    /// True when a SuperProperty reference is legal here: inside a class method
+    /// (`super_class` names the home class) or an object method with a
+    /// [[HomeObject]].
+    pub(crate) fn super_prop_ok(&self) -> bool {
+        self.super_class.is_some() || self.super_home_obj
+    }
+
+    /// Take a `super.x` / `super[k]` reference and store `src` through it right
+    /// away — the shape every destructuring position that does NOT pre-take the
+    /// reference needs (`for (super.x of it)`, `[...super.x] = it`, a rest
+    /// target). Kept next to `store_pre_ref` because it is the same store.
+    pub(crate) fn assign_super_target(
+        &mut self,
+        target: &Target,
+        default: Option<&Expr>,
+        src: Reg,
+    ) -> R<()> {
+        let save = self.next_reg;
+        let (obj, key) = self
+            .pre_member_ref(target)?
+            .ok_or("`super` assignment target lost its reference")?;
+        self.store_pre_ref(default, obj, &key, src)?;
+        self.next_reg = save;
         Ok(())
     }
 
@@ -278,6 +349,10 @@ impl<'a> FnCompiler<'a> {
                 let b = self.resolve(name);
                 self.store_binding(&b, val);
                 Ok(())
+            }
+            // See `assign_target`: `Expr::Super` has no value form.
+            Target::Member(m) if matches!(&m.object, Expr::Super) => {
+                self.assign_super_target(target, None, val)
             }
             Target::Member(m) => match &m.prop {
                 MemberProp::Ident(prop) => {
@@ -339,8 +414,18 @@ impl<'a> FnCompiler<'a> {
             if rest.is_some() { &els[..els.len() - 1] } else { els };
         let save_top = self.next_reg;
         let iter_reg = self.alloc_reg();
-        self.emit(Instr::CheckIterable { src: src_in });
+        // GetIterator alone: it now raises the "not iterable" TypeError itself, so
+        // the old `CheckIterable` prefix is gone — it did a SECOND observable
+        // `Get(@@iterator)` on the RHS (sm/destructuring/order.js asserts exactly
+        // one, and sm/destructuring/order-super.js depends on the same log).
         self.emit(Instr::GetIterator { dst: iter_reg, src: src_in });
+        // GetIteratorFromMethod step 3 reads `next` ONCE, as part of building the
+        // iterator record — i.e. BEFORE the first element's target reference is
+        // evaluated. Priming it here (as for-of already does) both fixes that
+        // order and stops a mid-pattern redefinition of `iterator.next` from
+        // being observed.
+        let next_reg = self.alloc_reg();
+        self.emit(Instr::IterPrime { dst: next_reg, iter: iter_reg });
         let idx_reg = self.alloc_reg();
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
         let done = self.alloc_reg();
@@ -371,7 +456,7 @@ impl<'a> FnCompiler<'a> {
             let jdone = self.here();
             self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
             self.emit(Instr::LoadBool { dst: done, val: true });
-            self.emit(Instr::IterNext { value_dst: val, done_dst: dflag, iter: iter_reg, idx: idx_reg, next: Reg::MAX });
+            self.emit(Instr::IterNext { value_dst: val, done_dst: dflag, iter: iter_reg, idx: idx_reg, next: next_reg });
             let jexh = self.here();
             self.emit(Instr::JumpIfTrue { cond: dflag, target: 0 });
             self.emit(Instr::LoadBool { dst: done, val: false });
@@ -404,7 +489,7 @@ impl<'a> FnCompiler<'a> {
             let jrest_done = self.here();
             self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
             self.emit(Instr::LoadBool { dst: done, val: true });
-            self.emit(Instr::IterNext { value_dst: v, done_dst: dflag, iter: iter_reg, idx: idx_reg, next: Reg::MAX });
+            self.emit(Instr::IterNext { value_dst: v, done_dst: dflag, iter: iter_reg, idx: idx_reg, next: next_reg });
             let jout = self.here();
             self.emit(Instr::JumpIfTrue { cond: dflag, target: 0 });
             self.emit(Instr::LoadBool { dst: done, val: false });
@@ -414,13 +499,10 @@ impl<'a> FnCompiler<'a> {
             self.patch_jump(jrest_done, rest_done);
             self.patch_jump(jout, rest_done);
             match pre {
-                Some((obj, key)) => {
-                    match key {
-                        PreKey::Static(name) => self.emit(Instr::SetProp { obj, name, val: out }),
-                        PreKey::Computed(k) => self.emit(Instr::SetIndex { obj, key: k, val: out }),
-                        PreKey::Private(name) => self.emit(Instr::SetPrivate { obj, name, val: out }),
-                    }
-                }
+                // A rest target never carries a `= default` (the grammar forbids
+                // it), so `store_pre_ref(None, …)` is exactly the store the three
+                // inline arms used to be — and it also covers `[...super.x] = it`.
+                Some((obj, key)) => self.store_pre_ref(None, obj, &key, out)?,
                 None => self.assign_target(&rest.target, out)?,
             }
             self.next_reg = save;

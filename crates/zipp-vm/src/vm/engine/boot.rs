@@ -284,6 +284,7 @@ impl<'p> Vm<'p> {
             intl_ns: 0,
             intl_ctors: [0; 10],
             intl_protos: [0; 10],
+            intl_fallback_syms: std::collections::HashMap::new(),
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),

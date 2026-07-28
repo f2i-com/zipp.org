@@ -81,6 +81,9 @@ impl<'s> Parser<'s> {
     ) -> PResult<(Params, FnBody)> {
         let saved = self.ctx;
         let saved_labels = std::mem::take(&mut self.labels);
+        // Parameters AND body are function code, hidden from any enclosing
+        // cover region — see `Parser::enter_fn_code`.
+        let fn_code = self.enter_fn_code();
         // A function body resets these from its OWN flags — unlike an arrow,
         // which inherits them.
         self.ctx.yield_ = is_generator;
@@ -97,6 +100,7 @@ impl<'s> Parser<'s> {
         self.check_unique_params(&params, unique, params_at)?;
         let body = self.parse_fn_body_with_params(Some(&params))?;
 
+        self.leave_fn_code(fn_code);
         self.ctx = saved;
         self.labels = saved_labels;
         self.check_use_strict_with_non_simple_params(&params, &body, params_at)?;
@@ -409,7 +413,19 @@ impl<'s> Parser<'s> {
 
         let name = if self.is_binding_ident() { Some(self.binding_ident()?.0) } else { None };
         let superclass = if self.eat_kw(Keyword::Extends, true)? {
-            Some(Box::new(self.parse_lhs_public()?))
+            let sup = self.parse_lhs_public()?;
+            // `ClassHeritage : extends LeftHandSideExpression`. An ArrowFunction
+            // is an AssignmentExpression and no LHS, so `class extends () => {}
+            // {}` has no parse at all — but the LHS parser reaches one anyway,
+            // because the `(` that starts it is a CoverParenthesizedExpression
+            // until the `=>` arrives. Parenthesized (`extends (() => {})`) IS a
+            // PrimaryExpression and stays legal (a runtime TypeError).
+            if matches!(sup, Expr::Arrow(_)) && !self.take_parenthesized() {
+                return Err(self.err_here(
+                    "SyntaxError: an arrow function is not a valid class heritage expression",
+                ));
+            }
+            Some(Box::new(sup))
         } else {
             None
         };

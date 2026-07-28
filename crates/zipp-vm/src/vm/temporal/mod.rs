@@ -13,8 +13,13 @@ use crate::value::Value;
 /// validated `offset` (ns) and the raw `timeZone` value.
 pub(crate) struct PdtBag {
     pub(crate) f: [i64; 9],
+    /// The month as read — an ordinal `month` or a `monthCode`; which ordinal a
+    /// code names is only decidable once `finish_pdt_fields` has the year.
+    month: MonthRef,
     month_code_invalid: bool,
-    month_conflict: bool,
+    /// The numeric `month` when a `monthCode` was ALSO given (the agreement check
+    /// is year-dependent in a leap-month calendar).
+    month_conflict: Option<i64>,
     pub(crate) bag_off: Option<i64>,
     pub(crate) tz: Value,
     /// The calendar the bag's `calendar` field selected, plus the calendar-space

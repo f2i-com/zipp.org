@@ -194,7 +194,18 @@ impl<'a> FnCompiler<'a> {
                 let slot = self.cx.global_slot(n) as u32;
                 let tmp = self.temp();
                 self.emit(Instr::MakeClosure { dst: tmp, func_id: id });
-                self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                // Dyn store in an eval program (the same gate `emit_b33_sync`
+                // uses): the eval's own var/function names live in the caller
+                // activation's EvalScope, and READS of them compile to
+                // LoadGlobalDyn, so a plain StoreGlobal wrote the closure to a
+                // realm slot the reader never consults —
+                // `eval("function f(){ return outerLet; } typeof f")` answered
+                // "undefined" whenever f captured ANYTHING.
+                if self.box_all_locals || self.cx.dyn_global_zone {
+                    self.emit(Instr::StoreGlobalDyn { idx: slot, src: tmp });
+                } else {
+                    self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                }
                 self.next_reg -= 1;
             }
         } else {
@@ -896,7 +907,7 @@ impl<'a> FnCompiler<'a> {
             // A method's `.name` is the bare property key (`"m"` / `"#m"`), NOT
             // class-qualified — `toString` uses `proto.source`, set below.
             let mut proto = self.cx.compile_class_fn(
-                mname,
+                &fn_name_for_key(mname),
                 &params,
                 rest.as_deref(),
                 Some(&func.params),
@@ -922,7 +933,7 @@ impl<'a> FnCompiler<'a> {
             }
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("get {gname}"),
+                &format!("get {}", fn_name_for_key(gname)),
                 &params,
                 rest.as_deref(),
                 Some(&func.params),
@@ -948,7 +959,7 @@ impl<'a> FnCompiler<'a> {
             }
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("set {sname}"),
+                &format!("set {}", fn_name_for_key(sname)),
                 &params,
                 rest.as_deref(),
                 Some(&func.params),
@@ -970,7 +981,7 @@ impl<'a> FnCompiler<'a> {
         for (sname, func) in &statics {
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                sname,
+                &fn_name_for_key(sname),
                 &params,
                 rest.as_deref(),
                 Some(&func.params),
@@ -997,7 +1008,7 @@ impl<'a> FnCompiler<'a> {
             }
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("get {gname}"),
+                &format!("get {}", fn_name_for_key(gname)),
                 &params,
                 rest.as_deref(),
                 Some(&func.params),
@@ -1023,7 +1034,7 @@ impl<'a> FnCompiler<'a> {
             }
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("set {sname}"),
+                &format!("set {}", fn_name_for_key(sname)),
                 &params,
                 rest.as_deref(),
                 Some(&func.params),

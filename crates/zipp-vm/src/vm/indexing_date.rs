@@ -150,6 +150,13 @@ impl<'p> Vm<'p> {
                 | HeapObj::AsyncGenerator(_)
                 | HeapObj::Date(_)
                 | HeapObj::Temporal { .. }
+                // An Intl service instance has no integer-index meaning either.
+                // Omitting it dropped `nf["formatRange"]` (and every other
+                // COMPUTED read on an Intl object) into the `_ => undefined`
+                // arm below, so the prototype method resolved to undefined
+                // while `nf.formatRange` worked — what the `invoked-as-func`
+                // tests observe as `typeof f === "undefined"`.
+                | HeapObj::Intl { .. }
                 | HeapObj::Promise { .. }
                 | HeapObj::WeakMap { .. }
                 | HeapObj::WeakSet(_)
@@ -342,7 +349,20 @@ impl<'p> Vm<'p> {
         strict: bool,
     ) -> Result<(), Thrown> {
         if !obj.is_heap() {
-            return Err(Thrown("TypeError: cannot set property of non-object".into()));
+            if obj.is_nullish() {
+                return Err(Thrown("TypeError: cannot set property of non-object".into()));
+            }
+            // PutValue 6: a non-nullish PRIMITIVE base (a number or a boolean —
+            // the heap primitives are heap values and fall through) is ToObject'd
+            // and the write runs OrdinarySet against the wrapper, so it is a
+            // silent no-op in sloppy code and a TypeError in strict.
+            // `set_prop` has always done this; only the COMPUTED spelling landed
+            // here, so `n.x = 5` was a no-op while `n[k] = 5` threw in SLOPPY
+            // code (staging/sm/strict/primitive-assignment.js).
+            let k = self.coerce_index_key(key)?;
+            let ks = self.key_of(k);
+            self.primitive_base_set(obj, &ks, val, strict)?;
+            return Ok(());
         }
         let key = self.coerce_index_key(key)?;
         let idx = obj.heap_index();

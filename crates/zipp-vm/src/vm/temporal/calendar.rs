@@ -11,10 +11,14 @@
 //!
 //! Only the *arithmetic* calendars live here — those whose year/month lengths
 //! are a closed-form function of the year, needing no astronomical or CLDR
-//! data. The lunisolar ones (chinese/dangi/hebrew) and the observational
-//! islamic variants (islamic-umalqura and friends) are deliberately absent:
-//! they need month-length tables or new-moon computation we do not have, and a
-//! fake answer would be worse than the honest `RangeError`.
+//! data. `hebrew` qualifies despite being lunisolar: since Hillel II its months
+//! have been fixed by the 19-year Metonic cycle plus the four dechiyot
+//! (postponement rules), so a Hebrew date is pure integer arithmetic on the
+//! mean molad — no observation and no tables. `chinese`/`dangi` do NOT qualify
+//! (true new moons and solar terms), nor do the observational islamic variants
+//! (islamic-umalqura and friends): they need month-length tables or new-moon
+//! computation we do not have, and a fake answer would be worse than the
+//! honest `RangeError`.
 //!
 //! Formulas are the standard fixed-date (R.D.) ones from Reingold &
 //! Dershowitz, *Calendrical Calculations*; `RD_AT_EPOCH` converts between R.D.
@@ -40,6 +44,9 @@ pub(crate) enum Cal {
     Ethioaa = 7,
     IslamicCivil = 8,
     IslamicTbla = 9,
+    Persian = 10,
+    Indian = 11,
+    Hebrew = 12,
 }
 
 impl Cal {
@@ -54,6 +61,9 @@ impl Cal {
             7 => Cal::Ethioaa,
             8 => Cal::IslamicCivil,
             9 => Cal::IslamicTbla,
+            10 => Cal::Persian,
+            11 => Cal::Indian,
+            12 => Cal::Hebrew,
             _ => Cal::Iso,
         }
     }
@@ -72,6 +82,9 @@ impl Cal {
             Cal::Ethioaa => "ethioaa",
             Cal::IslamicCivil => "islamic-civil",
             Cal::IslamicTbla => "islamic-tbla",
+            Cal::Persian => "persian",
+            Cal::Indian => "indian",
+            Cal::Hebrew => "hebrew",
         }
     }
 
@@ -138,6 +151,9 @@ pub(crate) fn calendar_by_id(s: &str) -> Option<Cal> {
         "ethioaa" | "ethiopic-amete-alem" => Cal::Ethioaa,
         "islamic-civil" | "islamicc" => Cal::IslamicCivil,
         "islamic-tbla" => Cal::IslamicTbla,
+        "persian" => Cal::Persian,
+        "indian" => Cal::Indian,
+        "hebrew" => Cal::Hebrew,
         _ => return None,
     })
 }
@@ -166,16 +182,334 @@ fn islamic_year_start(epoch: i64, y: i64) -> i64 {
     epoch + 354 * (y - 1) + (3 + 11 * y).div_euclid(30)
 }
 
+// ── Persian (Solar Hijri) helpers ───────────────────────────────────────────
+//
+// The 33-year ARITHMETIC cycle ICU4C uses, not an astronomical vernal-equinox
+// computation. That is not an approximation of the civil Iranian calendar over
+// the range anyone checks: the leap years and Nowruz dates it produces agree
+// exactly with the Iranian calendar authority's published table for 1206–1498
+// AP, which is what `inLeapYear/persian-calendar-authority.js` and
+// `PlainDate/from/persian-new-year-dates.js` pin.
+
+/// Epoch day of Persian 1-01-01 (R.D. 226895 = 622-03-22 proleptic Gregorian).
+const PERSIAN_EPOCH: i64 = 226_895 - RD_AT_EPOCH;
+
+/// Whether Persian year `y` is a leap year. Eight leap years per 33: seven
+/// 4-year gaps then one of 5.
+fn persian_leap(y: i64) -> bool {
+    (25 * y + 11).rem_euclid(33) < 8
+}
+
+/// Epoch day of Persian `y`-01-01 (Nowruz). 365 days a year plus the 8
+/// intercalary days the 33-year cycle has inserted so far — the same cycle
+/// `persian_leap` reads, since `floor((8y+29)/33) - floor((8y+21)/33)` is 1
+/// exactly when `(25y+11) mod 33 < 8`.
+fn persian_year_start(y: i64) -> i64 {
+    PERSIAN_EPOCH + 365 * (y - 1) + (8 * y + 21).div_euclid(33)
+}
+
+// ── Indian national (Saka) helpers ──────────────────────────────────────────
+
+/// Whether Indian year `y` is a leap year. The 1957 reform defined the calendar
+/// to keep step with the Gregorian one, so a year is leap exactly when the
+/// Gregorian year its Chaitra 1 falls in is.
+fn indian_leap(y: i64) -> bool {
+    super::super::helpers_datetime::is_leap_year(y + 78)
+}
+
+/// Epoch day of Indian `y`-01-01 (1 Chaitra): 22 March of Gregorian y+78,
+/// pulled back to 21 March when that Gregorian year is a leap year (so the
+/// year always ends on the Gregorian 21 March that precedes the next Chaitra 1).
+fn indian_year_start(y: i64) -> i64 {
+    iso_to_epoch_days(y + 78, 3, if indian_leap(y) { 21 } else { 22 })
+}
+
+// ── Hebrew helpers ──────────────────────────────────────────────────────────
+//
+// The Hebrew calendar has been PURELY ARITHMETIC since Hillel II: a year is
+// leap (13 months) on the 19-year Metonic cycle, and Rosh Hashanah is the mean
+// molad of Tishri moved by the four dechiyot (postponements). Nothing here is
+// observational and nothing needs CLDR, so it belongs in this file — unlike
+// chinese/dangi, which need true new moons.
+//
+// Formulas are Reingold & Dershowitz's `hebrew-calendar-elapsed-days` /
+// `hebrew-year-length-correction` / `hebrew-new-year`.
+
+/// Epoch day of 1 Tishri 1 A.M. (R.D. -1373427 = -3760-09-07 proleptic Julian).
+const HEBREW_EPOCH: i64 = -1_373_427 - RD_AT_EPOCH;
+
+/// 19 Hebrew years hold 235 lunar months, 7 of which are the intercalary Adar I;
+/// the leap years of a cycle are 3, 6, 8, 11, 14, 17 and 19.
+fn hebrew_leap(y: i64) -> bool {
+    (7 * y + 1).rem_euclid(19) < 7
+}
+
+/// Lunar months from the epoch to 1 Tishri of year `y` — 12 per common year plus
+/// one per leap year, which `(7n+1)/19` counts exactly. Doubles as the global
+/// month index, so month arithmetic across years of different length is a
+/// subtraction rather than a walk.
+fn hebrew_months_before(y: i64) -> i64 {
+    (235 * y - 234).div_euclid(19)
+}
+
+/// Days from the epoch to the MEAN molad of Tishri of year `y`, already moved by
+/// dechiya #1 (lo ADU rosh: Rosh Hashanah may not fall on Sun/Wed/Fri) and #2
+/// (molad zaken, folded into the 25920-part division below).
+fn hebrew_elapsed_days(y: i64) -> i64 {
+    let months = hebrew_months_before(y);
+    // One mean lunation is 29d 12h 793p; 12h 793p = 13753 parts of 25920 per day.
+    let parts = 12084 + 13753 * months;
+    let day = 29 * months + parts.div_euclid(25920);
+    if (3 * (day + 1)).rem_euclid(7) < 3 { day + 1 } else { day }
+}
+
+/// Epoch day of 1 Tishri of Hebrew year `y`, with dechiyot #3 and #4: a year
+/// that would otherwise run 356 days (GaTaRaD) or follow a 382-day one (BeTUTaKPaT)
+/// has its start pushed out, which is what keeps every year length in
+/// {353, 354, 355, 383, 384, 385}.
+fn hebrew_year_start(y: i64) -> i64 {
+    let e = hebrew_elapsed_days(y);
+    let delay = if hebrew_elapsed_days(y + 1) - e == 356 {
+        2
+    } else if e - hebrew_elapsed_days(y - 1) == 382 {
+        1
+    } else {
+        0
+    };
+    HEBREW_EPOCH + e + delay
+}
+
+/// Days in Hebrew year `y`: 353/354/355 (common) or 383/384/385 (leap).
+fn hebrew_year_len(y: i64) -> i64 {
+    hebrew_year_start(y + 1) - hebrew_year_start(y)
+}
+
+/// Days in ordinal month `m` (1 = Tishri) of Hebrew year `y`.
+fn hebrew_days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 => 30, // Tishri
+        // Heshvan gains its 30th day only in a "complete" year (355/385), and
+        // Kislev loses its 30th only in a "deficient" one (353/383) — which is
+        // exactly what the last digit of the year length records.
+        2 => {
+            if hebrew_year_len(y) % 10 == 5 {
+                30
+            } else {
+                29
+            }
+        }
+        3 => {
+            if hebrew_year_len(y) % 10 == 3 {
+                29
+            } else {
+                30
+            }
+        }
+        // From Tevet on the months simply alternate 29/30 …
+        _ if !hebrew_leap(y) => {
+            if m % 2 == 0 {
+                29
+            } else {
+                30
+            }
+        }
+        // … except that a leap year splits Adar into a 30-day Adar I (ordinal 6)
+        // and a 29-day Adar II (ordinal 7), which flips the parity after it.
+        4 => 29,
+        5 | 6 => 30,
+        _ => {
+            if m % 2 == 1 {
+                29
+            } else {
+                30
+            }
+        }
+    }
+}
+
 // ── The calendar interface ──────────────────────────────────────────────────
 
-/// `CalendarDateMonthsInYear`: 13 for the Coptic-structured calendars, 12 for
-/// everything else here (no lunisolar calendar is implemented).
-pub(crate) fn cal_months_in_year(c: Cal, _y: i64) -> i64 {
+/// `CalendarDateMonthsInYear`. Year-dependent for `hebrew` (a leap year inserts
+/// Adar I); 13 for the Coptic-structured calendars, 12 for everything else.
+pub(crate) fn cal_months_in_year(c: Cal, y: i64) -> i64 {
+    if c == Cal::Hebrew {
+        return if hebrew_leap(y) { 13 } else { 12 };
+    }
     if c.coptic_like().is_some() {
         13
     } else {
         12
     }
+}
+
+/// The greatest `monthsInYear` this calendar ever has — the year-independent
+/// bound a field check can use before a year is known.
+pub(crate) fn cal_max_months(c: Cal) -> i64 {
+    if c == Cal::Hebrew || c.coptic_like().is_some() {
+        13
+    } else {
+        12
+    }
+}
+
+/// Months from a fixed origin to the start of calendar year `y`. Subtracting two
+/// of these gives the exact month distance even when the years in between differ
+/// in length, so month arithmetic never has to walk year by year.
+pub(crate) fn cal_months_before_year(c: Cal, y: i64) -> i64 {
+    if c == Cal::Hebrew {
+        return hebrew_months_before(y);
+    }
+    y * cal_months_in_year(c, y)
+}
+
+/// The global (0-based) index of calendar month `y`-`m`. `m` need not be inside
+/// `1..=monthsInYear`; the index simply rolls, which is what lets the difference
+/// and addition algorithms probe past a year boundary.
+pub(crate) fn cal_month_index(c: Cal, y: i64, m: i64) -> i64 {
+    cal_months_before_year(c, y) + m - 1
+}
+
+/// The inverse of [`cal_month_index`].
+pub(crate) fn cal_month_from_index(c: Cal, idx: i64) -> (i64, i64) {
+    if c == Cal::Hebrew {
+        // months_before(y) = floor((235y-234)/19) <= idx  ⟺  y <= (19·idx+252)/235.
+        let mut y = (19 * idx + 252).div_euclid(235);
+        while hebrew_months_before(y) > idx {
+            y -= 1;
+        }
+        while hebrew_months_before(y + 1) <= idx {
+            y += 1;
+        }
+        return (y, idx - hebrew_months_before(y) + 1);
+    }
+    let miy = cal_max_months(c);
+    (idx.div_euclid(miy), idx.rem_euclid(miy) + 1)
+}
+
+/// `CalendarISOToDate`'s `[[MonthCode]]`, as (number, is-leap-month). Only
+/// `hebrew` ever returns a leap code: its Adar I is `M05L`, sitting between
+/// Shevat (`M05`) and the Adar that a common year keeps (`M06`), so every month
+/// AFTER it has an ordinal one higher than its code.
+pub(crate) fn cal_month_code(c: Cal, y: i64, m: i64) -> (i64, bool) {
+    if c == Cal::Hebrew && hebrew_leap(y) {
+        return match m {
+            6 => (5, true),
+            _ if m > 6 => (m - 1, false),
+            _ => (m, false),
+        };
+    }
+    (m, false)
+}
+
+/// Whether a well-formed month code is one this calendar has in SOME year — the
+/// year-independent half of `CalendarResolveFields`' monthCode check. A code that
+/// fails here is a RangeError under either overflow mode ("M13", "M02L"); one
+/// that passes here but is missing from the requested year (hebrew "M05L" in a
+/// common year) is subject to `overflow` instead.
+pub(crate) fn cal_month_code_valid(c: Cal, num: i64, leap: bool) -> bool {
+    if leap {
+        // Adar I is the only leap month any implemented calendar has.
+        return c == Cal::Hebrew && num == 5;
+    }
+    // A 13th ORDINARY month exists only in the coptic-structured calendars;
+    // hebrew's 13th month is Adar I, which is the leap code M05L, not "M13".
+    let last = if c.coptic_like().is_some() { 13 } else { 12 };
+    (1..=last).contains(&num)
+}
+
+/// The ordinal month a month code names in calendar year `y`, or `None` when
+/// that year does not have it (hebrew "M05L" in a common year).
+pub(crate) fn cal_month_of_code(c: Cal, y: i64, num: i64, leap: bool) -> Option<i64> {
+    if c == Cal::Hebrew {
+        return if hebrew_leap(y) {
+            if leap {
+                (num == 5).then_some(6)
+            } else if num <= 5 {
+                Some(num)
+            } else {
+                Some(num + 1)
+            }
+        } else if leap {
+            None
+        } else {
+            Some(num)
+        };
+    }
+    (!leap && num <= cal_months_in_year(c, y)).then_some(num)
+}
+
+/// The `monthCode` string of an ordinal month: "M05" for an ordinary month,
+/// "M05L" for a leap one.
+pub(crate) fn month_code_string(c: Cal, y: i64, m: i64) -> String {
+    let (num, leap) = cal_month_code(c, y, m);
+    format!("M{num:02}{}", if leap { "L" } else { "" })
+}
+
+/// A month as `CalendarResolveFields` sees it BEFORE the calendar year is
+/// resolved: either the ordinal `month` field or a `monthCode`. The two mean the
+/// same thing in every fixed-month calendar, but not in a leap-month one — the
+/// distinction has to survive until the year is known, because `M06` is ordinal
+/// 6 in a common Hebrew year and ordinal 7 in a leap one.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum MonthRef {
+    Ordinal(i64),
+    Code(i64, bool),
+}
+
+impl MonthRef {
+    /// The month code of an ordinal month — what a `with`/`add` carries forward
+    /// when the caller did not supply a month of its own.
+    pub(crate) fn of(c: Cal, y: i64, m: i64) -> MonthRef {
+        let (num, leap) = cal_month_code(c, y, m);
+        MonthRef::Code(num, leap)
+    }
+
+    /// The ordinal month this names in calendar year `y`. `None` only when
+    /// `reject` and the year has no such month (hebrew "M05L" in a common year);
+    /// `constrain` collapses that onto the neighbouring month instead. An
+    /// ordinal is passed through unregulated — `cal_date_to_iso` bounds it.
+    pub(crate) fn ordinal(self, c: Cal, y: i64, reject: bool) -> Option<i64> {
+        match self {
+            MonthRef::Ordinal(n) => Some(n),
+            MonthRef::Code(num, leap) => match cal_month_of_code(c, y, num, leap) {
+                Some(m) => Some(m),
+                None if reject => None,
+                None => Some(cal_month_of_code_constrain(c, y, num, leap)),
+            },
+        }
+    }
+
+    /// The value the `< 1` field-preparation floor applies to. A month code is
+    /// well-formed by construction, so only a numeric `month` can be below 1.
+    pub(crate) fn floor(self) -> i64 {
+        match self {
+            MonthRef::Ordinal(n) => n,
+            MonthRef::Code(..) => 1,
+        }
+    }
+}
+
+/// `CalendarResolveFields`: a bag giving BOTH `month` and `monthCode` must have
+/// them name the same month OF THAT YEAR — which is not "the same number" in a
+/// leap-month calendar (`{ year: 5784, monthCode: "M06", month: 7 }` agrees,
+/// per `PlainMonthDay/from/calendarresolvefields-error-ordering-hebrew.js`).
+pub(crate) fn cal_month_fields_agree(c: Cal, y: i64, m: MonthRef, num: Option<i64>) -> bool {
+    match (m, num) {
+        (MonthRef::Code(n, leap), Some(k)) => cal_month_of_code(c, y, n, leap) == Some(k),
+        _ => true,
+    }
+}
+
+/// `overflow: "constrain"` for a month code the year does not have: the leap
+/// month `M{n}L` sits immediately after `M{n}`, so it collapses onto whatever
+/// month occupies that slot — for hebrew, Adar I becomes the common year's Adar
+/// (`M05L` → `M06`), which `PlainYearMonth/from/reference-day-hebrew.js` pins.
+pub(crate) fn cal_month_of_code_constrain(c: Cal, y: i64, num: i64, leap: bool) -> i64 {
+    if let Some(m) = cal_month_of_code(c, y, num, leap) {
+        return m;
+    }
+    let miy = cal_months_in_year(c, y);
+    cal_month_of_code(c, y, num, false).map_or(miy, |m| m + 1).clamp(1, miy)
 }
 
 /// `CalendarDateDaysInMonth` for a calendar year/ordinal month.
@@ -199,16 +533,54 @@ pub(crate) fn cal_days_in_month(c: Cal, y: i64, m: i64) -> i64 {
         // Alternating 30/29, with a 30-day twelfth month in leap years.
         return if m % 2 == 1 || (m == 12 && islamic_leap(y)) { 30 } else { 29 };
     }
+    if c == Cal::Persian {
+        // Six 31-day months, five 30-day, then a 29-day (30 in a leap year) Esfand.
+        return if m <= 6 {
+            31
+        } else if m <= 11 {
+            30
+        } else if persian_leap(y) {
+            30
+        } else {
+            29
+        };
+    }
+    if c == Cal::Hebrew {
+        return hebrew_days_in_month(y, m);
+    }
+    if c == Cal::Indian {
+        // Chaitra is 30 days (31 in a leap year), then five 31-day months and
+        // six 30-day ones.
+        return if m == 1 {
+            if indian_leap(y) {
+                31
+            } else {
+                30
+            }
+        } else if m <= 6 {
+            31
+        } else {
+            30
+        };
+    }
     super::super::helpers_datetime::days_in_month(y, m)
 }
 
-/// The greatest length calendar month `m` ever has, searching back over a full
-/// leap cycle from `y` — what `overflow: "constrain"` clamps a PlainMonthDay day
-/// to, since its reference year is chosen afterwards.
-pub(crate) fn cal_month_max_days(c: Cal, y: i64, m: i64) -> i64 {
-    // 40 years covers both the 4-year Coptic/Gregorian cycle and the 30-year
-    // tabular-Islamic one.
-    (0..40).map(|k| cal_days_in_month(c, y - k, m)).max().unwrap_or(0)
+/// The greatest length the month with this CODE ever has, searching back over a
+/// full leap cycle from `y` — what `overflow: "constrain"` clamps a PlainMonthDay
+/// day to, since its reference year is chosen afterwards. Keyed on the code, not
+/// the ordinal, because in a leap-month calendar one ordinal names two different
+/// months depending on the year.
+pub(crate) fn cal_month_code_max_days(c: Cal, y: i64, num: i64, leap: bool) -> i64 {
+    // 40 years covers the 4-year Coptic/Gregorian/Indian cycle, the 30-year
+    // tabular-Islamic one, the 33-year Persian one (whose longest gap between
+    // leap years is 5) and the 19-year Hebrew Metonic cycle.
+    (0..40)
+        .filter_map(|k| {
+            cal_month_of_code(c, y - k, num, leap).map(|m| cal_days_in_month(c, y - k, m))
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// `CalendarDateInLeapYear`.
@@ -221,6 +593,15 @@ pub(crate) fn cal_in_leap_year(c: Cal, y: i64) -> bool {
     }
     if c.islamic_epoch().is_some() {
         return islamic_leap(y);
+    }
+    if c == Cal::Persian {
+        return persian_leap(y);
+    }
+    if c == Cal::Indian {
+        return indian_leap(y);
+    }
+    if c == Cal::Hebrew {
+        return hebrew_leap(y);
     }
     super::super::helpers_datetime::is_leap_year(y)
 }
@@ -235,6 +616,12 @@ pub(crate) fn cal_days_in_year(c: Cal, y: i64) -> i64 {
     }
     if c.islamic_epoch().is_some() {
         return if islamic_leap(y) { 355 } else { 354 };
+    }
+    if c == Cal::Persian || c == Cal::Indian {
+        return if cal_in_leap_year(c, y) { 366 } else { 365 };
+    }
+    if c == Cal::Hebrew {
+        return hebrew_year_len(y);
     }
     365
 }
@@ -252,6 +639,31 @@ pub(crate) fn cal_to_epoch_days(c: Cal, y: i64, m: i64, d: i64) -> i64 {
     if let Some(epoch) = c.islamic_epoch() {
         // 29*(m-1) + floor(m/2) days precede month m (the 30/29 alternation).
         return islamic_year_start(epoch, y) + 29 * (m - 1) + m.div_euclid(2) + d - 1;
+    }
+    if c == Cal::Persian {
+        // 31 days each precede months 2..=7, then 30 each.
+        let before = if m <= 7 { 31 * (m - 1) } else { 186 + 30 * (m - 7) };
+        return persian_year_start(y) + before + d - 1;
+    }
+    if c == Cal::Indian {
+        // Chaitra's own (year-dependent) length, then five 31s and up to six 30s.
+        let before = if m <= 1 {
+            31 * (m - 1)
+        } else {
+            cal_days_in_month(c, y, 1) + 31 * (m - 2).min(5) + 30 * (m - 7).max(0)
+        };
+        return indian_year_start(y) + before + d - 1;
+    }
+    if c == Cal::Hebrew {
+        // No closed form for the month offsets (the first three month lengths
+        // depend on the year's kevi'ah), so sum them — after normalising a month
+        // that has rolled out of the year, which the difference probes rely on.
+        let (ry, rm) = cal_month_from_index(c, cal_month_index(c, y, m));
+        let mut ed = hebrew_year_start(ry);
+        for k in 1..rm {
+            ed += hebrew_days_in_month(ry, k);
+        }
+        return ed + d - 1;
     }
     iso_to_epoch_days(y, m, d)
 }
@@ -275,6 +687,16 @@ pub(crate) fn cal_from_epoch_days(c: Cal, ed: i64) -> (i64, i64, i64) {
         (4 * (ed + RD_AT_EPOCH - 103_605) + 1463).div_euclid(1461) - off
     } else if let Some(epoch) = c.islamic_epoch() {
         (30 * (ed - epoch) + 10646).div_euclid(10631)
+    } else if c == Cal::Persian {
+        // 33 Persian years are exactly 12053 days.
+        (33 * (ed - PERSIAN_EPOCH) - 29).div_euclid(12053) + 1
+    } else if c == Cal::Indian {
+        // The Indian year `y` opens in ISO year y+78 (late March), so the ISO
+        // year is the estimate and the loop below steps back a Jan–Mar date.
+        epoch_days_to_iso(ed).0 - 78
+    } else if c == Cal::Hebrew {
+        // Mean Hebrew year = (235/19)·(29d 12h 793p) = 179876755/492480 days.
+        ((ed - HEBREW_EPOCH) * 492_480).div_euclid(179_876_755) + 1
     } else {
         let (iy, m, d) = epoch_days_to_iso(ed);
         return (iy, m, d);
@@ -344,6 +766,11 @@ pub(crate) fn cal_era(c: Cal, y: i64, m: i64, d: i64) -> Option<(&'static str, i
                 ("bh", 1 - y)
             }
         }
+        // Single proleptic eras: the era year IS the arithmetic year, negative
+        // values included (`from/non-positive-single-era-year.js`).
+        Cal::Persian => ("ap", y),
+        Cal::Indian => ("shaka", y),
+        Cal::Hebrew => ("am", y),
     })
 }
 
@@ -426,6 +853,9 @@ pub(crate) fn cal_resolve_era(c: Cal, era: &str, era_year: i64) -> Option<i64> {
             "bh" => Some(1 - era_year),
             _ => None,
         },
+        Cal::Persian => (era == "ap").then_some(era_year),
+        Cal::Indian => (era == "shaka").then_some(era_year),
+        Cal::Hebrew => (era == "am").then_some(era_year),
     }
 }
 
@@ -452,9 +882,34 @@ pub(crate) fn cal_date_to_iso(
     Some(epoch_days_to_iso(cal_to_epoch_days(c, y, m, d)))
 }
 
+/// `CalendarDateAdd`'s YEAR step alone: shift the year keeping the MONTH CODE,
+/// not the ordinal. For every fixed-month calendar the two are the same thing,
+/// but in a leap-month calendar they part company — Adar II is `M06`, ordinal 7
+/// in a leap year and ordinal 6 in a common one, and `add(1 year)` must land on
+/// the Adar, not on Nisan (`PlainDate/prototype/add/leap-months-hebrew.js`).
+///
+/// `None` under `reject` when the destination year has no such month, e.g.
+/// Adar I (`M05L`) + 1 year into a common year. The third component records
+/// whether the month HAD to be constrained, which the difference algorithm needs.
+fn cal_add_years(c: Cal, y: i64, m: i64, add_y: i64, reject: bool) -> Option<(i64, i64, bool)> {
+    let (num, leap) = cal_month_code(c, y, m);
+    let ny = y + add_y;
+    match cal_month_of_code(c, ny, num, leap) {
+        Some(nm) => Some((ny, nm, false)),
+        None if reject => None,
+        None => Some((ny, cal_month_of_code_constrain(c, ny, num, leap), true)),
+    }
+}
+
 /// `CalendarDateAdd`'s year+month step in calendar space, with the day clamped
 /// (or rejected) into the destination month. Weeks/days are left to the caller,
 /// which adds them as exact epoch days.
+///
+/// Years go first (by month code), then months as ordinal steps through years
+/// that may hold 12 or 13 of them — `cal_month_index` makes that a single add.
+/// `m` must already be a real month of `y`: the year step reads its month CODE,
+/// which an out-of-range ordinal does not have. (Every caller takes it from
+/// `cal_from_iso`/`cal_from_epoch_days`, so it always is.)
 pub(crate) fn cal_add_year_month(
     c: Cal,
     y: i64,
@@ -464,17 +919,59 @@ pub(crate) fn cal_add_year_month(
     add_m: i64,
     reject: bool,
 ) -> Option<(i64, i64, i64)> {
-    let miy = cal_months_in_year(c, y);
-    // Every calendar here has a fixed month count, so month overflow rolls
-    // through the year with plain division (no lunisolar leap-month walk).
-    let total = (y + add_y) * miy + (m - 1) + add_m;
-    let ny = total.div_euclid(miy);
-    let nm = total.rem_euclid(miy) + 1;
+    let (iy, im, _) = cal_add_years(c, y, m, add_y, reject)?;
+    let (ny, nm) = cal_month_from_index(c, cal_month_index(c, iy, im) + add_m);
     let dim = cal_days_in_month(c, ny, nm);
     if reject && d > dim {
         return None;
     }
     Some((ny, nm, d.min(dim)))
+}
+
+/// `CalendarDateUntil`'s whole-YEAR step, shared by the date difference and
+/// PlainYearMonth's (which has no day, so it passes 1 for both). Returns
+/// `(years, anchor year, anchor month, months spanned by the NEXT year)` — the
+/// last is the denominator a fractional-year rounding needs, and is NOT simply
+/// `monthsInYear` in a calendar whose years differ in length.
+pub(crate) fn cal_until_year_split(
+    c: Cal,
+    one: (i64, i64, i64),
+    two: (i64, i64, i64),
+) -> (i64, i64, i64, i64) {
+    let (y1, m1, dd1) = one;
+    let (y2, m2, dd2) = two;
+    // Position of a probe for the surpass test: (month index, UNCLAMPED day, and
+    // a final tie-break for a CONSTRAINED month). "M05L in a year that has none"
+    // is not quite Adar — it is the gap just before it — so on an exact tie it
+    // ranks earlier, and that is what decides whether the year counts: Hebrew
+    // Adar I + 1 year onto Adar IS a whole year, while −1 year onto the same
+    // Adar is not (`since/leap-months-hebrew.js`, "M05L-M06 backwards is -1y"
+    // against "M05L-M06 is 12mo not 1y"). The tie-break is LAST so it cannot
+    // mask an unclamped day that really has run past the month
+    // (`wrapping-at-end-of-month-hebrew.js`: 30 Adar I to 29 Adar is not a year).
+    let key = |y: i64, m: i64, constrained: bool, d: i64| {
+        (cal_month_index(c, y, m), d, -(constrained as i64))
+    };
+    let e1 = cal_to_epoch_days(c, y1, m1, dd1);
+    let e2 = cal_to_epoch_days(c, y2, m2, dd2);
+    let sign = (e2 > e1) as i64 - (e2 < e1) as i64;
+    let mut years = if sign == 0 { 0 } else { y2 - y1 };
+    if years != 0 {
+        // At most one step back is ever needed: the probe's year is exactly
+        // y1+years, so years-sign already lands strictly before d2's year.
+        let (py, pm, pc) = cal_add_years(c, y1, m1, years, false).unwrap();
+        let (pk, tk) = (key(py, pm, pc, dd1), key(y2, m2, false, dd2));
+        if (sign > 0 && pk > tk) || (sign < 0 && pk < tk) {
+            years -= sign;
+        }
+    }
+    let (ay, am, _) = cal_add_years(c, y1, m1, years, false).unwrap();
+    // One more year in the direction of travel: the months it spans are what a
+    // fractional year is measured against.
+    let step = if sign == 0 { 1 } else { sign };
+    let (ny, nm, _) = cal_add_years(c, y1, m1, years + step, false).unwrap();
+    let span = cal_month_index(c, ny, nm) - cal_month_index(c, ay, am);
+    (years, ay, am, if span == 0 { cal_months_in_year(c, ay) } else { span.abs() })
 }
 
 /// `CalendarDateUntil`: the years/months/weeks/days from `d1` to `d2`, both
@@ -512,17 +1009,25 @@ pub(crate) fn cal_difference_date(
     }
     let (y1, m1, dd1) = cal_from_epoch_days(c, e1);
     let (y2, m2, dd2) = cal_from_epoch_days(c, e2);
-    let miy = cal_months_in_year(c, y1);
-    // Whole months from (y1,m1) to (y2,m2), then one step back if the day of
-    // month already puts the probe past d2.
-    let mut total = (y2 - y1) * miy + (m2 - m1);
-    let surpasses = if sign > 0 { dd1 > dd2 } else { dd1 < dd2 };
-    if surpasses {
-        total -= sign;
+    // Whole YEARS first (largestUnit "year" only): the most that can be added by
+    // month code without passing d2. The probe keeps d1's UNCLAMPED day for the
+    // same reason the month probe does — a 30 Kislev that lands in a 29-day
+    // Kislev has NOT completed the year.
+    let (mut years, mut ay, mut am) = (0, y1, m1);
+    if largest == "year" {
+        let s = cal_until_year_split(c, (y1, m1, dd1), (y2, m2, dd2));
+        years = s.0;
+        ay = s.1;
+        am = s.2;
     }
-    let years = if largest == "year" { total / miy } else { 0 };
-    let months = total - years * miy;
-    let (ay, am, ad) = cal_add_year_month(c, y1, m1, dd1, 0, total, false).unwrap();
-    let days = e2 - cal_to_epoch_days(c, ay, am, ad);
+    // Then whole MONTHS from that anchor, as ordinal steps (a month index
+    // difference, so years of 12 and 13 months both count correctly), stepping
+    // back once if the day of month already puts the probe past d2.
+    let mut months = cal_month_index(c, y2, m2) - cal_month_index(c, ay, am);
+    if if sign > 0 { dd1 > dd2 } else { dd1 < dd2 } {
+        months -= sign;
+    }
+    let (fy, fm, fd) = cal_add_year_month(c, ay, am, dd1, 0, months, false).unwrap();
+    let days = e2 - cal_to_epoch_days(c, fy, fm, fd);
     [years, months, 0, days]
 }

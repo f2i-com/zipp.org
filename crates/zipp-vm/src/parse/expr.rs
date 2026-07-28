@@ -266,6 +266,16 @@ impl<'s> Parser<'s> {
                         start,
                     ));
                 }
+                // `AsyncArrowBindingIdentifier[Yield] : BindingIdentifier
+                // [?Yield, +Await]` — `await` is reserved there whatever the
+                // enclosing context, and by STRING VALUE, so the escaped
+                // spelling `async await => 1` is the same error.
+                if name == "await" {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: 'await' is not a valid name in async function parameters",
+                        start,
+                    ));
+                }
                 self.bump_before_operand()?;
                 let params =
                     Params { items: vec![Pattern::Ident(name.into_boxed_str())], simple: true };
@@ -556,11 +566,27 @@ impl<'s> Parser<'s> {
     /// `LeftHandSideExpression`: member accesses, calls, `new`, and optional
     /// chains.
     pub(crate) fn parse_lhs(&mut self) -> PResult<Expr> {
+        let lhs_start = self.cur().span.start;
         let mut e = if self.at_kw(Keyword::New) {
             self.parse_new()?
         } else {
             self.parse_primary()?
         };
+        // `AssignmentExpression : ArrowFunction` — an ArrowFunction is NOT a
+        // LeftHandSideExpression, so no `.`/`[`/`(`/template suffix may follow
+        // one. Parentheses leave no trace in the AST, so the arrow's own span
+        // start is what separates the legal `(() => {})['x']` (arrow starts
+        // after the `(`) from the illegal `() => {} ['x']`.
+        //
+        // Accepting the suffix silently mis-parsed a class body: the two fields
+        //     ["p"] = () => {}
+        //     ["q"] = async () => {};
+        // became `["p"] = (() => {})["q"] = async () => {}` — one field named
+        // "p" holding the WRONG function and no "q" at all
+        // (staging/sm/Function/function-name-computed-01.js).
+        if matches!(&e, Expr::Arrow(a) if a.span.start == lhs_start) {
+            return Ok(e);
+        }
         let mut saw_optional = false;
         loop {
             if self.at(Punct::Dot) {
@@ -1061,6 +1087,16 @@ impl<'s> Parser<'s> {
             ));
         }
         let pos = self.cur().span.start;
+        // Legal HERE (a sloppy Script's `await` is an ordinary name), but the
+        // region may still turn out to be an async arrow's parameters, which
+        // carry [+Await] — record and let the `=>` decide. See `Cover::
+        // await_ident`.
+        if kw == Keyword::Await {
+            self.cover.await_ident.push(SyntaxError::new(
+                "SyntaxError: 'await' is not a valid name in async function parameters",
+                pos,
+            ));
+        }
         let tok = self.bump_after_operand()?;
         let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
         Ok((name.into_boxed_str(), pos))
@@ -1143,7 +1179,7 @@ impl<'s> Parser<'s> {
         }
         self.ctx.in_ = saved_in;
         self.expect(Punct::RBracket, false)?;
-        Ok(Expr::Array(items, rest_comma))
+        Ok(Expr::Array(items, LiteralFlags { rest_comma, parenthesized: false }))
     }
 
     fn parse_object_literal(&mut self) -> PResult<Expr> {
@@ -1191,7 +1227,7 @@ impl<'s> Parser<'s> {
                 proto_pos,
             ));
         }
-        Ok(Expr::Object(members, rest_comma))
+        Ok(Expr::Object(members, LiteralFlags { rest_comma, parenthesized: false }))
     }
 
     /// Returns the member, whether it is a plain `__proto__: v`, and its position.
@@ -1275,6 +1311,16 @@ impl<'s> Parser<'s> {
             ));
         }
         let name = name.clone();
+        // Shorthand re-reads the key as an IdentifierReference without going
+        // through `binding_ident_or_reference`, so record `{await}` here too —
+        // `async({await}) => {}` is the same early error as `async(await) =>
+        // {}`.
+        if &*name == "await" {
+            self.cover.await_ident.push(SyntaxError::new(
+                "SyntaxError: 'await' is not a valid name in async function parameters",
+                key_pos,
+            ));
+        }
         let mut init = None;
         if self.at(Punct::Eq) {
             self.bump_before_operand()?;

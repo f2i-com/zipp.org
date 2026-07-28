@@ -314,22 +314,24 @@ impl<'p> Vm<'p> {
                 };
                 let y = Self::resolve_cal_year(cal, era.as_deref(), era_year, y_opt)?;
                 let (m_val, m_valid, m_conflict) = m_raw.unwrap();
-                if m_conflict {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
-                }
                 if !m_valid {
                     return Err(Thrown(format!(
                         "RangeError: monthCode is not valid for the {} calendar",
                         cal.id()
                     )));
                 }
-                let (m, d) = (m_val, d_opt.unwrap());
+                if !cal_month_fields_agree(cal, y, m_val, m_conflict) {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
+                let d = d_opt.unwrap();
                 // A month/day below 1 is a hard floor that always rejects
                 // (RegulateISODate is reached only after the fields are >= 1).
-                if m < 1 || d < 1 {
+                if m_val.floor() < 1 || d < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
-                let (iy, im, id) = cal_date_to_iso(cal, y, m, d, reject)
+                let (iy, im, id) = m_val
+                    .ordinal(cal, y, reject)
+                    .and_then(|m| cal_date_to_iso(cal, y, m, d, reject))
                     .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
                 if !iso_date_in_range(iy, im, id) {
                     return Err(Thrown("RangeError: date is outside the representable range".into()));
@@ -585,27 +587,34 @@ impl<'p> Vm<'p> {
                     cy
                 };
                 let month_valid = mf.map(|(_, v, _)| v).unwrap_or(true);
-                let month_conflict = mf.map(|(_, _, c)| c).unwrap_or(false);
-                let nm = mf.map(|(mm, _, _)| mm).unwrap_or(cm);
+                let month_conflict = mf.and_then(|(_, _, c)| c);
+                // A bag with no month keeps the receiver's MONTH CODE, not its
+                // ordinal: `with({ year })` across a Hebrew leap-year boundary must
+                // stay on the same named month (with/leap-months-hebrew.js).
+                let nm = mf
+                    .map(|(mm, _, _)| mm)
+                    .unwrap_or(MonthRef::of(cal, cy, cm));
                 let nd = df.unwrap_or(cd);
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
-                if nm < 1 || nd < 1 {
+                if nm.floor() < 1 || nd < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
-                if month_conflict {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
-                }
                 if !month_valid {
                     return Err(Thrown(format!(
                         "RangeError: monthCode is not valid for the {} calendar",
                         cal.id()
                     )));
                 }
-                let (iy, im, id) = cal_date_to_iso(cal, ny, nm, nd, reject)
+                if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
+                let (iy, im, id) = nm
+                    .ordinal(cal, ny, reject)
+                    .and_then(|m| cal_date_to_iso(cal, ny, m, nd, reject))
                     .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
                 let r = self.make_plain_date(iy, im, id)?;
                 Ok(Some(self.tag_cal(r, cal)))

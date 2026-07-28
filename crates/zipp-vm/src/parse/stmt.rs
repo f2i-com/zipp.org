@@ -1121,9 +1121,26 @@ impl<'s> Parser<'s> {
                         self.declare_pattern(&id, kind, p2)?;
                         let init = if self.eat(Punct::Eq, true)? {
                             Some(self.parse_assign()?)
+                        } else if kind == VarKind::Const {
+                            // 14.3.1.1: the initializer requirement is per
+                            // LexicalBinding, not per declaration — the FIRST
+                            // declarator's check above missed
+                            // `for (const x = 5, y;;)` (sm/lexical-environment/
+                            // for-loop.js).
+                            return Err(SyntaxError::new(
+                                "SyntaxError: missing initializer in const declaration",
+                                p2,
+                            ));
                         } else {
                             None
                         };
+                        // A destructuring LexicalBinding must be initialized too.
+                        if init.is_none() && !matches!(id, Pattern::Ident(_)) {
+                            return Err(SyntaxError::new(
+                                "SyntaxError: missing initializer in destructuring declaration",
+                                p2,
+                            ));
+                        }
                         decls.push(Declarator { id, init });
                     }
                     self.ctx.in_ = saved_in;

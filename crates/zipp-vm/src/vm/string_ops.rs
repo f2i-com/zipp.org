@@ -789,9 +789,19 @@ impl<'p> Vm<'p> {
                 let r = self.string_replace_plain(&s, idx, arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED), true)?;
                 Ok(Some(r))
             }
-            // toLocale* default to the locale-independent case mappings.
-            "toLocaleUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
-            "toLocaleLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
+            // ECMA-402 step 1 of both is CanonicalizeLocaleList(locales), so a
+            // structurally invalid tag is a RangeError even though the mapping
+            // that follows is the locale-INDEPENDENT one (the Turkish/Azeri/
+            // Lithuanian conditional mappings of SpecialCasing.txt are not
+            // implemented, so no locale changes the result yet).
+            "toLocaleUpperCase" | "toLocaleLowerCase" => {
+                self.canonicalize_locale_list(arg0)?;
+                Ok(Some(self.alloc_str(if name == "toLocaleUpperCase" {
+                    s.to_uppercase()
+                } else {
+                    s.to_lowercase()
+                })))
+            }
             "lastIndexOf" => {
                 // ToString(searchString) before the position coercion (spec order).
                 let needle = self.to_js_string(arg0)?;

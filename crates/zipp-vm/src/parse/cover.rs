@@ -97,6 +97,20 @@ impl<'s> Parser<'s> {
             if let Some(e) = inner.yield_await.into_iter().next() {
                 return Err(e);
             }
+            // `AsyncArrowFunction : async AsyncArrowBindingIdentifier => …` and
+            // `CoverCallExpressionAndAsyncArrowHead` both parse their head with
+            // [+Await], so `await` may not be a name anywhere in it. A PLAIN
+            // arrow's parameters inherit [?Await] from where they stand — where
+            // `await` was already legal — but they may themselves be nested in
+            // an async arrow's head (`async(a = (await) => {}) => {}`), so the
+            // records propagate outward rather than being dropped.
+            if is_async {
+                if let Some(e) = inner.await_ident.into_iter().next() {
+                    return Err(e);
+                }
+            } else {
+                self.cover.await_ident.extend(inner.await_ident);
+            }
             let mut params = Vec::with_capacity(items.len() + 1);
             for it in items {
                 params.push(self.expr_to_pattern(it)?);
@@ -125,13 +139,14 @@ impl<'s> Parser<'s> {
         for e in inner.yield_await {
             self.cover.yield_await.push(e);
         }
+        self.cover.await_ident.extend(inner.await_ident);
 
         if items.is_empty() {
             return Err(self.err_here("SyntaxError: unexpected token ')'"));
         }
         let mut it = items.into_iter();
         let first = it.next().unwrap();
-        let e = match it.len() {
+        let mut e = match it.len() {
             0 => first,
             _ => {
                 let mut v = vec![first];
@@ -139,6 +154,13 @@ impl<'s> Parser<'s> {
                 Expr::Seq(v)
             }
         };
+        // These parentheses block the AssignmentPattern refinement: `({}) = 1`
+        // and `[({})] = []` are early errors where `({} = 1)` and `[a] = 1` are
+        // not. See [`LiteralFlags::parenthesized`].
+        match &mut e {
+            Expr::Array(_, f) | Expr::Object(_, f) => f.parenthesized = true,
+            _ => {}
+        }
         // Remember the parentheses, which is the whole reason the AST has a
         // `covered` bit rather than a wrapper node: `(x) = f` is a valid
         // assignment but suppresses NamedEvaluation.
@@ -166,6 +188,9 @@ impl<'s> Parser<'s> {
         self.ctx.return_ = true;
         self.ctx.in_loop = false;
         self.ctx.in_switch = false;
+        // The BODY is function code: an enclosing cover region's `Contains`
+        // never reaches into it — see `Parser::enter_fn_code`.
+        let fn_code = self.enter_fn_code();
         let body = if self.at(Punct::LBrace) {
             // `ConciseBody : { FunctionBody }` — a fresh statement region, so
             // `[In]` is on inside it however the arrow was reached.
@@ -178,6 +203,7 @@ impl<'s> Parser<'s> {
             // arrow — it is a SyntaxError, not an `in` test on a function.
             ArrowBody::Expr(Box::new(self.parse_assign_full()?))
         };
+        self.leave_fn_code(fn_code);
         self.ctx = saved;
         self.labels = saved_labels;
         // An arrow's ConciseBody carries the same restriction as a FunctionBody:
@@ -227,8 +253,10 @@ impl<'s> Parser<'s> {
                 }
                 Target::Call(c)
             }
-            Expr::Array(items, rest_comma) if allow_pattern => {
-                if rest_comma {
+            // `!f.parenthesized`: only a BARE ArrayLiteral is refined into an
+            // ArrayAssignmentPattern — `([]) = x` falls through to the `_` arm.
+            Expr::Array(items, f) if allow_pattern && !f.parenthesized => {
+                if f.rest_comma {
                     return Err(SyntaxError::new(
                         "SyntaxError: rest element may not be followed by a comma",
                         pos,
@@ -260,8 +288,8 @@ impl<'s> Parser<'s> {
                 }
                 Target::Array(out)
             }
-            Expr::Object(members, rest_comma) if allow_pattern => {
-                if rest_comma {
+            Expr::Object(members, f) if allow_pattern && !f.parenthesized => {
+                if f.rest_comma {
                     return Err(SyntaxError::new(
                         "SyntaxError: rest property may not be followed by a comma",
                         pos,
@@ -332,8 +360,14 @@ impl<'s> Parser<'s> {
                 left: Box::new(self.target_to_pattern(target)?),
                 right: value,
             },
-            Expr::Array(items, rest_comma) => {
-                if rest_comma {
+            // A BindingPattern is an ObjectLiteral/ArrayLiteral read directly;
+            // `(({})) => 1` wraps one in parentheses, which no FormalParameter
+            // production admits.
+            Expr::Array(items, f) => {
+                if f.parenthesized {
+                    return Err(self.err_here("SyntaxError: invalid parameter"));
+                }
+                if f.rest_comma {
                     return Err(
                         self.err_here("SyntaxError: rest element may not be followed by a comma")
                     );
@@ -370,8 +404,11 @@ impl<'s> Parser<'s> {
                 }
                 Pattern::Array(out)
             }
-            Expr::Object(members, rest_comma) => {
-                if rest_comma {
+            Expr::Object(members, f) => {
+                if f.parenthesized {
+                    return Err(self.err_here("SyntaxError: invalid parameter"));
+                }
+                if f.rest_comma {
                     return Err(self
                         .err_here("SyntaxError: rest property may not be followed by a comma"));
                 }

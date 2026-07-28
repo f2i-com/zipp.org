@@ -173,6 +173,28 @@ pub enum ForTarget {
 // Expressions
 // ============================================================================
 
+/// The two facts about an ObjectLiteral / ArrayLiteral that the tree cannot
+/// otherwise recover, both of which decide an early error when the literal is
+/// reinterpreted as a destructuring pattern in `cover.rs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LiteralFlags {
+    /// A comma followed the final spread/rest element — `[...x,]`, `{...x,}`.
+    /// Legal in a LITERAL, an early error in a PATTERN (neither
+    /// ArrayAssignmentPattern nor ObjectAssignmentPattern admits a comma after
+    /// the rest), and the comma leaves no other trace: `[...x,]` and `[...x]`
+    /// produce identical `items`.
+    pub rest_comma: bool,
+    /// The literal was written inside parentheses. `AssignmentPattern` refines a
+    /// BARE ObjectLiteral/ArrayLiteral only; through parentheses the rule that
+    /// applies is 13.2.9.2, "AssignmentTargetType of a ParenthesizedExpression
+    /// is that of its contents" — which for a literal is `invalid`. So
+    /// `({}) = 1`, `[({})] = []` and `for (({}) of [])` are early errors while
+    /// `({} = 1)` and `[a] = 1` are fine. Parenthesization leaves no other trace
+    /// in the tree (there is deliberately no paren node), so it is recorded here
+    /// for the two literals where it changes the answer.
+    pub parenthesized: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Ident(Name),
@@ -187,16 +209,8 @@ pub enum Expr {
     Str(StrVal),
     Regex { pattern: StrVal, flags: Box<str> },
     /// A hole in `[1, , 3]` is `None`; a spread element is `Spread`.
-    ///
-    /// The `bool` is "a comma followed the final spread element" — `[...x,]`.
-    /// It is legal in a LITERAL and an early error in a PATTERN
-    /// (`ArrayAssignmentPattern` puts no comma after AssignmentRestElement), and
-    /// the comma leaves no other trace: `[...x,]` and `[...x]` yield identical
-    /// `items`, so the conversion in `cover.rs` cannot otherwise see it.
-    Array(Vec<Option<ArrayElem>>, bool),
-    /// The `bool` is "a comma followed the final rest property" — `{...x,}`.
-    /// Legal in a literal, an early error in a pattern; see [`Expr::Array`].
-    Object(Vec<ObjectMember>, bool),
+    Array(Vec<Option<ArrayElem>>, LiteralFlags),
+    Object(Vec<ObjectMember>, LiteralFlags),
     Template(Box<TemplateLit>),
     TaggedTemplate { tag: Box<Expr>, quasi: Box<TemplateLit> },
     Unary { op: UnaryOp, arg: Box<Expr> },
@@ -702,7 +716,7 @@ mod tests {
             Some(ArrayElem::Expr(Expr::Num(1.0))),
             None,
             Some(ArrayElem::Spread(Expr::Ident("r".into()))),
-        ], false);
+        ], LiteralFlags::default());
         match a {
             Expr::Array(items, _) => {
                 assert!(matches!(items[0], Some(ArrayElem::Expr(_))));

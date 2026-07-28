@@ -618,6 +618,10 @@ pub const LOCALE_INFO_METHODS: &[&str] = &[
 pub const INTL_SEGMENTS_CONTAINING: u16 = 933;
 pub const INTL_SEGMENTS_ITERATOR: u16 = 934;
 pub const INTL_SEGMENT_ITER_NEXT: u16 = 935;
+/// `BigInt.prototype.toLocaleString` (ECMA-402 adds it as an OWN method of
+/// BigInt.prototype; without it the Object.prototype one answered, ignoring
+/// both the locale and the options).
+pub const BIGINT_TO_LOCALE_STRING: u16 = 936;
 /// Intl service kinds (index into VM.intl_ctors / intl_protos).
 pub const INTL_NUMBERFORMAT: u8 = 0;
 pub const INTL_DATETIMEFORMAT: u8 = 1;
@@ -975,6 +979,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         SYMBOL_DESCRIPTION_GET => ("get description", 0),
         STR_ITERATOR => ("[Symbol.iterator]", 0),
         BIGINT_TO_STRING => ("toString", 0),
+        BIGINT_TO_LOCALE_STRING => ("toLocaleString", 0),
         BIGINT_VALUE_OF => ("valueOf", 0),
         BIGINT_AS_INTN => ("asIntN", 2),
         BIGINT_AS_UINTN => ("asUintN", 2),

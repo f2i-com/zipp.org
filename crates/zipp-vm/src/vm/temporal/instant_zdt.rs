@@ -417,8 +417,9 @@ impl<'p> Vm<'p> {
                 // The month slot goes through read_month_field_raw so monthCode is
                 // honoured, month/monthCode agreement is enforced, and a calendar-
                 // invalid code is deferred until after the options bag is read.
+                let mut month_ref: Option<MonthRef> = None;
                 let mut month_valid = true;
-                let mut month_conflict = false;
+                let mut month_conflict = None;
                 let mut any = false;
                 // Which date slots the bag actually supplied — the date part must
                 // merge in CALENDAR space, so the raw values cannot just overwrite
@@ -429,7 +430,8 @@ impl<'p> Vm<'p> {
                         vm.read_month_field_raw(bag, cal)?.map(|(mm, valid, conflict)| {
                             month_valid = valid;
                             month_conflict = conflict;
-                            mm
+                            month_ref = Some(mm);
+                            mm.floor()
                         })
                     } else {
                         vm.opt_int_field(bag, nm)?
@@ -476,11 +478,13 @@ impl<'p> Vm<'p> {
                 } else {
                     ccy
                 };
-                let nm = date_raw[1].unwrap_or(ccm);
+                // No month field keeps the receiver's MONTH CODE, not its ordinal
+                // (they differ across a leap-month calendar's year boundary).
+                let nm = month_ref.unwrap_or(MonthRef::of(cal, ccy, ccm));
                 let nd = date_raw[2].unwrap_or(ccd);
                 // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
                 // rejected during field preparation, BEFORE the options bag is read.
-                if nm < 1 || nd < 1 {
+                if nm.floor() < 1 || nd < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
                 // Validate the resolution options. ZonedDateTime.with defaults the offset
@@ -489,19 +493,21 @@ impl<'p> Vm<'p> {
                 let (off_opt, reject) = self.read_zdt_options(options, "prefer")?;
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
-                if month_conflict {
-                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
-                }
                 if !month_valid {
                     return Err(Thrown(format!(
                         "RangeError: monthCode is not valid for the {} calendar",
                         cal.id()
                     )));
                 }
+                if !cal_month_fields_agree(cal, ny, nm, month_conflict) {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
                 // InterpretTemporalDateTimeFields: apply overflow to the upper bounds of
                 // the merged date/time fields ("reject" throws, "constrain" clamps).
                 let maxes = [23, 59, 59, 999, 999, 999];
-                let (iy, im, id2) = cal_date_to_iso(cal, ny, nm, nd, reject)
+                let (iy, im, id2) = nm
+                    .ordinal(cal, ny, reject)
+                    .and_then(|m| cal_date_to_iso(cal, ny, m, nd, reject))
                     .ok_or_else(|| Thrown("RangeError: invalid date fields".into()))?;
                 f[0] = iy;
                 f[1] = im;

@@ -68,6 +68,76 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
     }
 
+    /// `%Intl%.[[FallbackSymbol]]` — one per realm, described
+    /// "IntlLegacyConstructedSymbol" (ECMA-402 "The Intl Object"). Created
+    /// lazily; `make_symbol` registers it in `symbol_keys`, which the collector
+    /// already roots, so no extra root is needed.
+    ///
+    /// Per-REALM because intl402/FallbackSymbol/per-realm.js asserts a
+    /// `$262.createRealm()` child's fallback symbol is a different symbol from
+    /// the main realm's.
+    pub(crate) fn intl_fallback_symbol(&mut self) -> Value {
+        let realm = self.current_realm_id().unwrap_or(0);
+        if let Some(&v) = self.intl_fallback_syms.get(&realm) {
+            return v;
+        }
+        let desc = self.alloc_str("IntlLegacyConstructedSymbol".to_string());
+        let v = self.make_symbol(desc);
+        self.intl_fallback_syms.insert(realm, v);
+        v
+    }
+
+    /// ChainDateTimeFormat / ChainNumberFormat (ECMA-402 normative optional):
+    /// `Intl.DateTimeFormat.call(obj)` — the constructor invoked WITHOUT `new`
+    /// on a `this` that already inherits from it — stores the freshly built
+    /// service on `this` under %Intl%.[[FallbackSymbol]] (non-writable,
+    /// non-enumerable, non-configurable) and returns `this`. This is the legacy
+    /// `Object.create(Intl.DateTimeFormat.prototype)` subclassing idiom; without
+    /// it the call simply discarded `this`.
+    pub(crate) fn intl_chain_legacy(
+        &mut self,
+        ctor: Value,
+        built: Value,
+        this: Value,
+    ) -> Result<Value, Thrown> {
+        if !self.is_object_value(this) || !self.ordinary_has_instance(ctor, this)? {
+            return Ok(built);
+        }
+        let sym = self.intl_fallback_symbol();
+        let key = self.key_of(sym);
+        let mut d = ObjMap::new();
+        d.set("value", built);
+        d.set("writable", Value::FALSE);
+        d.set("enumerable", Value::FALSE);
+        d.set("configurable", Value::FALSE);
+        let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(d))));
+        self.object_define_property(this, &key, desc)?;
+        Ok(this)
+    }
+
+    /// UnwrapDateTimeFormat / UnwrapNumberFormat: a receiver that is not itself
+    /// an initialized service but DOES inherit from the constructor yields the
+    /// service stashed by `intl_chain_legacy`. The read is a real [[Get]] with
+    /// the symbol key, which is what
+    /// intl-legacy-constructed-symbol-on-unwrap.js observes through a Proxy.
+    pub(crate) fn intl_unwrap_legacy(&mut self, this: Value, kind: u8) -> Result<Value, Thrown> {
+        if !self.is_object_value(this) {
+            return Ok(this);
+        }
+        if let HeapObj::Intl { kind: k, .. } = self.heap.get(this.heap_index()) {
+            if *k == kind {
+                return Ok(this);
+            }
+        }
+        let ctor = self.intl_ctors[kind as usize];
+        if ctor == 0 || !self.ordinary_has_instance(Value::heap(ctor), this)? {
+            return Ok(this);
+        }
+        let sym = self.intl_fallback_symbol();
+        let key = self.key_of(sym);
+        self.get_member(this, &key, this)
+    }
+
     /// The `[[Locale]]` slot of an Intl.Locale instance, if `v` is one.
     /// CanonicalizeLocaleList and the Locale constructor both take the FULL
     /// canonical tag from a Locale argument, extensions included — not its
@@ -282,7 +352,12 @@ impl<'p> Vm<'p> {
         if v == Value::UNDEFINED {
             return Ok(None);
         }
-        let n = self.to_number(v)?;
+        // ToNumber, not the infallible `to_number`: an OBJECT option value must
+        // run its own valueOf/toString/@@toPrimitive (`{roundingIncrement:
+        // {valueOf(){return 5}}}`), and an abrupt from it must propagate. The
+        // infallible form cannot call back into JS, so every object option read
+        // as NaN and became a bogus RangeError.
+        let n = self.to_number_coerce(v)?;
         if n.is_nan() || n < min as f64 || n > max as f64 {
             return Err(Thrown(format!("RangeError: {key} value is out of range")));
         }
@@ -305,7 +380,8 @@ impl<'p> Vm<'p> {
         if v == Value::UNDEFINED {
             return Ok(default);
         }
-        let n = self.to_number(v)?;
+        // ToNumber (see `default_number_option`): an object value's valueOf runs.
+        let n = self.to_number_coerce(v)?;
         if n.is_nan() || n < min as f64 || n > max as f64 {
             return Err(Thrown(format!("RangeError: {key} value is out of range")));
         }
@@ -551,11 +627,16 @@ impl<'p> Vm<'p> {
             out.max_significant = Some(2);
             out.rounding_increment = 1;
         } else if rounding_increment != 1 {
-            // Step 28: a rounding increment only makes sense against a fixed
-            // fraction-digit count.
-            if out.min_significant.is_some() && has_sd {
+            // Steps 26-27: a rounding increment is only meaningful against
+            // [[RoundingType]] "fractionDigits" — that is, the DEFAULT priority
+            // with no significant-digit options in play. An explicit
+            // morePrecision/lessPrecision (whose roundingType is that priority,
+            // regardless of which options were supplied) is a TypeError too, and
+            // it must be a TypeError rather than the min/max RangeError below.
+            let rounding_type_is_fraction = out.rounding_priority == "auto" && !has_sd;
+            if !rounding_type_is_fraction {
                 return Err(Thrown(
-                    "TypeError: roundingIncrement cannot be mixed with significant digits".into(),
+                    "TypeError: roundingIncrement requires the fractionDigits rounding type".into(),
                 ));
             }
             if out.min_fraction != out.max_fraction {
@@ -581,10 +662,14 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// GetBooleanOrStringNumberFormatOption(options, "useGrouping", …): `true`
-    /// stays the boolean `true`, anything falsy becomes `false`, and a string must
-    /// be one of the three grouping strategies. resolvedOptions echoes it as-is,
-    /// so the boolean/string distinction has to survive.
+    /// GetBooleanOrStringNumberFormatOption(options, "useGrouping",
+    /// « "min2", "auto", "always" », "always", fallback) — ECMA-402 15.1.2.
+    ///
+    /// Two steps that a plain "boolean or one-of-three-strings" reading misses:
+    /// the boolean `true` resolves to `trueValue` ("always"), NOT to itself, and
+    /// the STRINGS "true"/"false" resolve to the fallback instead of throwing
+    /// (step 6). Only `false`/falsy stays the boolean `false`, which is why
+    /// resolvedOptions still has to keep the two JS types apart.
     fn read_use_grouping(&mut self, options: Value, fallback: &str) -> Result<UseGrouping, Thrown> {
         if options == Value::UNDEFINED {
             return Ok(UseGrouping::Str(fallback.to_string()));
@@ -594,12 +679,15 @@ impl<'p> Vm<'p> {
             return Ok(UseGrouping::Str(fallback.to_string()));
         }
         if v == Value::bool(true) {
-            return Ok(UseGrouping::Bool(true));
+            return Ok(UseGrouping::Str("always".to_string()));
         }
         if !self.truthy(v) {
             return Ok(UseGrouping::Bool(false));
         }
         let s = self.to_js_string(v)?;
+        if s == "true" || s == "false" {
+            return Ok(UseGrouping::Str(fallback.to_string()));
+        }
         if !["min2", "auto", "always"].contains(&s.as_str()) {
             return Err(Thrown(format!("RangeError: invalid useGrouping value: {s}")));
         }
@@ -655,6 +743,9 @@ impl<'p> Vm<'p> {
         let loc = self.alloc_str(locale.clone());
         let mut r = ObjMap::new();
         r.set("locale", loc);
+        // The `-u-` keywords ResolveLocale kept, filled in by each service for
+        // its own [[RelevantExtensionKeys]] and written back over "locale" below.
+        let mut ext_used: Vec<(&str, String)> = vec![];
         match kind {
             INTL_NUMBERFORMAT => {
                 // SetNumberFormatUnitOptions, then notation, then
@@ -733,11 +824,16 @@ impl<'p> Vm<'p> {
                 )?;
                 // resolvedOptions key order is fixed by the ECMA-402 table, and is
                 // NOT the read order above.
-                let nsv = self.alloc_str(resolve_available(
-                    ns.or_else(|| unicode_ext_value(&locale, "nu")),
+                let (nsr, keep) = resolve_ext_key(
+                    ns,
+                    unicode_ext_value(&locale, "nu"),
                     AVAILABLE_NUMBERING_SYSTEMS,
                     "latn",
-                ));
+                );
+                if keep {
+                    ext_used.push(("nu", nsr.clone()));
+                }
+                let nsv = self.alloc_str(nsr);
                 r.set("numberingSystem", nsv);
                 let sv = self.alloc_str(style.clone());
                 r.set("style", sv);
@@ -859,30 +955,58 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                // No components and no style at all → the "any date, all" default
-                // pattern (year/month/day).
-                if vals.is_empty() && frac_digits.is_none() && date_style.is_none()
-                    && time_style.is_none()
-                {
-                    vals = vec![
-                        ("year", "numeric".to_string()),
-                        ("month", "numeric".to_string()),
-                        ("day", "numeric".to_string()),
-                    ];
+                // ToDateTimeOptions(options, "any", "date"): needDefaults is
+                // cleared only by weekday/year/month/day (the date half) or
+                // dayPeriod/hour/minute/second/fractionalSecondDigits (the time
+                // half), or by a style. `era` and `timeZoneName` are Table-7
+                // components that clear NEITHER — so `{timeZoneName: "long"}`
+                // and `{era: "short"}` both still resolve to year/month/day,
+                // which is what every `…-formatting-timezonename.js` test reads
+                // back out of formatToParts.
+                let clears = vals.iter().any(|(n, _)| {
+                    matches!(
+                        *n,
+                        "weekday" | "year" | "month" | "day" | "dayPeriod" | "hour" | "minute"
+                            | "second"
+                    )
+                }) || frac_digits.is_some();
+                if !clears && date_style.is_none() && time_style.is_none() {
+                    for (name, v) in
+                        [("year", "numeric"), ("month", "numeric"), ("day", "numeric")]
+                    {
+                        vals.push((name, v.to_string()));
+                    }
+                    // Remembered because each Temporal type re-runs
+                    // ToDateTimeOptions with ITS group as the defaults: a
+                    // year/month/day that the OPTIONS asked for pins a
+                    // PlainTime to a date-only pattern (TypeError), one that
+                    // ToDateTimeOptions filled in does not (the PlainTime
+                    // pattern becomes hour/minute/second instead).
+                    r.set("@@dtfDefaulted", Value::bool(true));
+                    // resolvedOptions reports the components in Table-7 order, and
+                    // `vals` was built by walking `comps` — restore that order
+                    // after the appends (era must precede year, timeZoneName
+                    // follow day).
+                    let order = |n: &str| {
+                        comps.iter().position(|(c, _)| *c == n).unwrap_or(usize::MAX)
+                    };
+                    vals.sort_by_key(|(n, _)| order(n));
                 }
                 // The -u-ca / -u-nu extension keywords lose to an explicit option.
                 let ext = |k: &str| unicode_ext_value(&locale, k);
-                let calv = self.alloc_str(resolve_available(
-                    cal_opt.or_else(|| ext("ca")),
-                    AVAILABLE_CALENDARS,
-                    "gregory",
-                ));
+                let (calr, keep_ca) =
+                    resolve_ext_key(cal_opt, ext("ca"), AVAILABLE_CALENDARS, "gregory");
+                if keep_ca {
+                    ext_used.push(("ca", calr.clone()));
+                }
+                let calv = self.alloc_str(calr);
                 r.set("calendar", calv);
-                let nsv = self.alloc_str(resolve_available(
-                    ns_opt.or_else(|| ext("nu")),
-                    AVAILABLE_NUMBERING_SYSTEMS,
-                    "latn",
-                ));
+                let (nsr, keep_nu) =
+                    resolve_ext_key(ns_opt, ext("nu"), AVAILABLE_NUMBERING_SYSTEMS, "latn");
+                if keep_nu {
+                    ext_used.push(("nu", nsr.clone()));
+                }
+                let nsv = self.alloc_str(nsr);
                 r.set("numberingSystem", nsv);
                 let tzv = self.alloc_str(tz);
                 r.set("timeZone", tzv);
@@ -890,13 +1014,27 @@ impl<'p> Vm<'p> {
                 // an hour field — an explicit `hour` component or any timeStyle.
                 let has_hour = vals.iter().any(|(n, _)| *n == "hour") || time_style.is_some();
                 if has_hour {
+                    // An explicit `hour12` overrides both the `hourCycle` option
+                    // and `-u-hc-`, and (ECMA-402) drops the keyword from the
+                    // resolved locale; otherwise this is an ordinary
+                    // option-then-extension resolution.
                     let hc = match (hour12, hour_cycle_opt.clone()) {
                         // hour12:false is h23; hour12:true keeps the locale's
                         // 12-hour cycle (h12 for the en-style default).
                         (Some(false), _) => "h23".to_string(),
                         (Some(true), _) => "h12".to_string(),
-                        (None, Some(h)) => h,
-                        (None, None) => ext("hc").unwrap_or_else(|| "h12".to_string()),
+                        (None, opt) => {
+                            let (v, keep) = resolve_ext_key(
+                                opt,
+                                ext("hc"),
+                                &["h11", "h12", "h23", "h24"],
+                                "h12",
+                            );
+                            if keep {
+                                ext_used.push(("hc", v.clone()));
+                            }
+                            v
+                        }
                     };
                     let is12 = hc == "h11" || hc == "h12";
                     let hcv = self.alloc_str(hc);
@@ -965,24 +1103,40 @@ impl<'p> Vm<'p> {
                 // Only the root collation is implemented, so a requested `-u-co-`
                 // / `collation` value that is not it resolves to "default"
                 // rather than being echoed back as if it were honoured.
-                let requested = collation.or_else(|| unicode_ext_value(&locale, "co"));
-                let col = self.alloc_str(match requested.as_deref() {
-                    // "standard"/"search" are never valid as a resolved collation.
-                    Some("standard") | Some("search") | None => "default".to_string(),
-                    Some(_) => "default".to_string(),
-                });
+                // "standard"/"search" are never valid as a `-u-co-` value, and
+                // only the root collation exists here, so every request resolves
+                // to "default" and the keyword is never reflected.
+                let _ = collation.or_else(|| unicode_ext_value(&locale, "co"));
+                let col = self.alloc_str("default".to_string());
                 r.set("collation", col);
                 // `-u-kn` with no value IS the canonical spelling of `-u-kn-true`,
                 // so key presence (not a "true" value) is what turns it on.
-                let kn = numeric.unwrap_or_else(|| {
-                    unicode_ext_has_key(&locale, "kn")
-                        && unicode_ext_value(&locale, "kn").as_deref() != Some("false")
+                let ext_kn = unicode_ext_has_key(&locale, "kn").then(|| {
+                    match unicode_ext_value(&locale, "kn").as_deref() {
+                        Some("false") => "false".to_string(),
+                        _ => "true".to_string(),
+                    }
                 });
-                r.set("numeric", Value::bool(kn));
-                let kf = case_first
-                    .or_else(|| unicode_ext_value(&locale, "kf"))
-                    .filter(|s| ["upper", "lower", "false"].contains(&s.as_str()))
-                    .unwrap_or_else(|| "false".to_string());
+                let (kn_s, keep_kn) = resolve_ext_key(
+                    numeric.map(|b| b.to_string()),
+                    ext_kn,
+                    &["true", "false"],
+                    "false",
+                );
+                if keep_kn {
+                    // The canonical spelling of `-u-kn-true` is the bare key.
+                    ext_used.push(("kn", if kn_s == "true" { String::new() } else { kn_s.clone() }));
+                }
+                r.set("numeric", Value::bool(kn_s == "true"));
+                let (kf, keep_kf) = resolve_ext_key(
+                    case_first,
+                    unicode_ext_value(&locale, "kf"),
+                    &["upper", "lower", "false"],
+                    "false",
+                );
+                if keep_kf {
+                    ext_used.push(("kf", kf.clone()));
+                }
                 let cfv = self.alloc_str(kf);
                 r.set("caseFirst", cfv);
             }
@@ -1052,11 +1206,16 @@ impl<'p> Vm<'p> {
                 let nm = self.opt_string(options, "numeric", "always", &["always", "auto"])?;
                 let nmv = self.alloc_str(nm);
                 r.set("numeric", nmv);
-                let ns = self.alloc_str(resolve_available(
-                    ns_opt.or_else(|| unicode_ext_value(&locale, "nu")),
+                let (nsr, keep) = resolve_ext_key(
+                    ns_opt,
+                    unicode_ext_value(&locale, "nu"),
                     AVAILABLE_NUMBERING_SYSTEMS,
                     "latn",
-                ));
+                );
+                if keep {
+                    ext_used.push(("nu", nsr.clone()));
+                }
+                let ns = self.alloc_str(nsr);
                 r.set("numberingSystem", ns);
             }
             INTL_SEGMENTER => {
@@ -1196,11 +1355,16 @@ impl<'p> Vm<'p> {
                 let frac = self.opt_int_opt(options, "fractionalDigits", 0, 9)?;
                 // resolvedOptions table order: locale, numberingSystem, style,
                 // then each unit followed by its display, then fractionalDigits.
-                let nsv = self.alloc_str(resolve_available(
-                    ns_opt.or_else(|| unicode_ext_value(&locale, "nu")),
+                let (nsr, keep) = resolve_ext_key(
+                    ns_opt,
+                    unicode_ext_value(&locale, "nu"),
                     AVAILABLE_NUMBERING_SYSTEMS,
                     "latn",
-                ));
+                );
+                if keep {
+                    ext_used.push(("nu", nsr.clone()));
+                }
+                let nsv = self.alloc_str(nsr);
                 r.set("numberingSystem", nsv);
                 let sv = self.alloc_str(st);
                 r.set("style", sv);
@@ -1216,6 +1380,12 @@ impl<'p> Vm<'p> {
             }
             _ => {}
         }
+        // ResolveLocale step: [[locale]] is the base tag plus the kept keywords.
+        // A service with no relevant extension keys (ListFormat, Segmenter,
+        // DisplayNames) therefore reports the tag with NO `-u-` at all.
+        let tag = resolved_locale_tag(&locale, &ext_used);
+        let lv = self.alloc_str(tag);
+        r.set("locale", lv);
         let resolved = self.heap.alloc(HeapObj::Object(Box::new(r)));
         let idx = self.heap.alloc(HeapObj::Intl { kind, resolved });
         if self.intl_protos[kind as usize] != 0 {
@@ -1532,8 +1702,15 @@ impl<'p> Vm<'p> {
 
     /// Intl.NumberFormat.prototype.format(value).
     pub(crate) fn intl_number_format(&mut self, resolved: u32, value: Value) -> Result<Value, Thrown> {
-        let n = self.to_number(value)?;
+        // Number Format Functions step 4 is ? ToNumber(value) — the FULL one, so
+        // an object argument's @@toPrimitive/valueOf runs exactly once and its
+        // exception propagates (`format({[Symbol.toPrimitive](){…}})`).
+        let n = self.to_number_coerce(value)?;
         let s = self.intl_number_format_str(resolved, n)?;
+        // The digits — and only the digits — follow the resolved numbering
+        // system; the separators around them are locale data this engine lacks.
+        let ns = self.display(self.intl_slot(resolved, "numberingSystem"));
+        let s = translate_digits(&s, &ns);
         Ok(self.alloc_str(s))
     }
 
@@ -1550,6 +1727,7 @@ impl<'p> Vm<'p> {
         };
         let ug = self.intl_slot(resolved, "useGrouping");
         let grouping = ug != Value::bool(false) && self.display(ug) != "false";
+        let group_min2 = grouping && self.display(ug) == "min2";
         let notation = self.display(self.intl_slot(resolved, "notation"));
         let params = NumFmtParams {
             style: &style,
@@ -1565,6 +1743,7 @@ impl<'p> Vm<'p> {
             trailing_zero_display: &self.display(self.intl_slot(resolved, "trailingZeroDisplay")),
             sign_display: &self.display(self.intl_slot(resolved, "signDisplay")),
             grouping,
+            group_min2,
         };
         let s = format_number_intl(n, &params);
         Ok(if style == "currency" {
@@ -1628,6 +1807,131 @@ impl<'p> Vm<'p> {
         )))
     }
 
+    /// One bit per DateTimeFormat component (ECMA-402 Table 7 order).
+    ///
+    /// ECMA-402's Temporal integration gives one DateTimeFormat a *separate*
+    /// resolved pattern per Temporal type ([[TemporalPlainDateFormat]] and
+    /// friends): each is ToDateTimeOptions(originalOptions, ANY, <that type's
+    /// group>) intersected with the fields that type actually has, and an empty
+    /// result makes HandleDateTimeValue throw a TypeError. Masks express both
+    /// halves — which parts print, and whether anything prints at all.
+    pub(crate) const F_ERA: u16 = 1;
+    pub(crate) const F_YEAR: u16 = 2;
+    pub(crate) const F_MONTH: u16 = 4;
+    pub(crate) const F_DAY: u16 = 8;
+    pub(crate) const F_WEEKDAY: u16 = 16;
+    pub(crate) const F_DAYPERIOD: u16 = 32;
+    pub(crate) const F_HOUR: u16 = 64;
+    pub(crate) const F_MINUTE: u16 = 128;
+    pub(crate) const F_SECOND: u16 = 256;
+    pub(crate) const F_FRAC: u16 = 512;
+    pub(crate) const F_ZONE: u16 = 1024;
+    const F_DATE: u16 = Self::F_ERA | Self::F_YEAR | Self::F_MONTH | Self::F_DAY | Self::F_WEEKDAY;
+    const F_TIME: u16 =
+        Self::F_DAYPERIOD | Self::F_HOUR | Self::F_MINUTE | Self::F_SECOND | Self::F_FRAC;
+
+    /// (allowed, defaults) for a `dt_arg_kind` — the fields a value of that type
+    /// can contribute, and the group ToDateTimeOptions fills in when the options
+    /// named no component at all.
+    fn temporal_fields(kind: u8) -> (u16, u16) {
+        const YMD: u16 = Vm::F_YEAR | Vm::F_MONTH | Vm::F_DAY;
+        const HMS: u16 = Vm::F_HOUR | Vm::F_MINUTE | Vm::F_SECOND;
+        match kind {
+            1 => (Self::F_DATE, YMD),                     // PlainDate
+            2 => (Self::F_TIME, HMS),                     // PlainTime
+            3 => (Self::F_DATE | Self::F_TIME, YMD | HMS), // PlainDateTime (no zone)
+            5 => (Self::F_ERA | Self::F_YEAR | Self::F_MONTH, Self::F_YEAR | Self::F_MONTH),
+            6 => (Self::F_MONTH | Self::F_DAY, Self::F_MONTH | Self::F_DAY),
+            _ => (Self::F_DATE | Self::F_TIME | Self::F_ZONE, YMD | HMS), // Instant
+        }
+    }
+
+    /// The components `resolved` names. `dateStyle`/`timeStyle` stand for whole
+    /// groups; `full`/`long` time styles also carry the zone name, which is why
+    /// a PlainDateTime formatted with `timeStyle: "long"` must print less than an
+    /// Instant does.
+    pub(crate) fn dtf_requested_fields(&self, resolved: u32) -> u16 {
+        let has = |k: &str| self.intl_slot(resolved, k) != Value::UNDEFINED;
+        let mut m = 0u16;
+        for (name, bit) in [
+            ("era", Self::F_ERA),
+            ("year", Self::F_YEAR),
+            ("month", Self::F_MONTH),
+            ("day", Self::F_DAY),
+            ("weekday", Self::F_WEEKDAY),
+            ("dayPeriod", Self::F_DAYPERIOD),
+            ("hour", Self::F_HOUR),
+            ("minute", Self::F_MINUTE),
+            ("second", Self::F_SECOND),
+            ("fractionalSecondDigits", Self::F_FRAC),
+            ("timeZoneName", Self::F_ZONE),
+        ] {
+            if has(name) {
+                m |= bit;
+            }
+        }
+        if has("dateStyle") {
+            m |= Self::F_YEAR | Self::F_MONTH | Self::F_DAY;
+        }
+        if has("timeStyle") {
+            m |= Self::F_HOUR | Self::F_MINUTE | Self::F_SECOND;
+            let ts = self.display(self.intl_slot(resolved, "timeStyle"));
+            if ts == "full" || ts == "long" {
+                m |= Self::F_ZONE;
+            }
+        }
+        m
+    }
+
+    /// HandleDateTimeValue's field resolution for one argument. Returns the
+    /// components to print and whether the value is an ABSOLUTE time (a legacy
+    /// Date/number or a Temporal.Instant, which renders in the formatter's time
+    /// zone; a plain Temporal value renders its own wall clock, because the
+    /// spec's local -> epoch -> local round trip through the same zone cancels).
+    ///
+    /// A `Temporal.*` value whose fields do not intersect the pattern at all is
+    /// a TypeError (`temporal-objects-not-overlapping-options.js`): the per-type
+    /// format record would be null.
+    pub(crate) fn dtf_fields_for(
+        &mut self,
+        resolved: u32,
+        v: Value,
+        name: &str,
+    ) -> Result<(u16, bool), Thrown> {
+        let requested = self.dtf_requested_fields(resolved);
+        let Some(kind) = self.dt_arg_kind(v) else { return Ok((requested, true)) };
+        if matches!(kind, 0 | 7) {
+            return Ok((requested, true)); // Duration/ZonedDateTime: dtf_time_value rejects
+        }
+        let (allowed, defaults) = Self::temporal_fields(kind);
+        // ToDateTimeOptions' needDefaults: only a Table-7 date/time COMPONENT
+        // clears it — `era` and `timeZoneName` do not (which is why
+        // `{timeZoneName: "long"}` still resolves to year/month/day), but a
+        // dateStyle/timeStyle does.
+        let clears = Self::F_YEAR
+            | Self::F_MONTH
+            | Self::F_DAY
+            | Self::F_WEEKDAY
+            | Self::F_DAYPERIOD
+            | Self::F_HOUR
+            | Self::F_MINUTE
+            | Self::F_SECOND
+            | Self::F_FRAC;
+        let styled = self.intl_slot(resolved, "dateStyle") != Value::UNDEFINED
+            || self.intl_slot(resolved, "timeStyle") != Value::UNDEFINED;
+        // `@@dtfDefaulted` marks a year/month/day that ToDateTimeOptions supplied
+        // rather than the caller — those must not clear needDefaults here.
+        let defaulted = self.intl_slot(resolved, "@@dtfDefaulted") == Value::bool(true);
+        let need_defaults = defaulted || (requested & clears == 0 && !styled);
+        let effective = if need_defaults { defaults } else { requested } & allowed;
+        if effective == 0 {
+            return Err(Thrown(format!(
+                "TypeError: {name} options do not include any field this Temporal value has"
+            )));
+        }
+        Ok((effective, kind == 4))
+    }
+
     /// HandleDateTimeValue: ToNumber + TimeClip for an ordinary time value (an
     /// out-of-range or non-finite one is a RangeError, and the result is an
     /// integer so `format(-0.9)` and `format(0)` agree), or the epoch time of a
@@ -1676,7 +1980,10 @@ impl<'p> Vm<'p> {
                 },
             };
         }
-        let n = self.to_number(v)?;
+        // ToNumber then TimeClip. The full ToNumber: a plain object argument
+        // ToPrimitive's first, so a throwing `valueOf` wins over the RangeError
+        // that a NaN would otherwise produce (`argument-tonumber-throws`).
+        let n = self.to_number_coerce(v)?;
         if !n.is_finite() || n.abs() > 8.64e15 {
             return Err(Thrown("RangeError: date value is not finite".into()));
         }
@@ -1723,9 +2030,11 @@ impl<'p> Vm<'p> {
         resolved: u32,
         x: f64,
         y: f64,
+        fields: u16,
+        absolute: bool,
     ) -> Vec<(String, String, &'static str)> {
-        let a = self.dtf_parts(resolved, x);
-        let b = self.dtf_parts(resolved, y);
+        let a = self.dtf_parts(resolved, x, fields, absolute);
+        let b = self.dtf_parts(resolved, y, fields, absolute);
         if a == b {
             return a.into_iter().map(|(t, v)| (t.to_string(), v, "shared")).collect();
         }
@@ -1843,52 +2152,75 @@ impl<'p> Vm<'p> {
             parts.push(("literal".into(), " ".into()));
             parts.push(("unit".into(), u));
         }
+        // The split above works on the ASCII form (it looks for '-', ',', '.',
+        // 'E'); the numbering system applies to the digit runs afterwards.
+        let ns = self.display(self.intl_slot(resolved, "numberingSystem"));
+        if ns != "latn" {
+            for (ty, v) in parts.iter_mut() {
+                if matches!(ty.as_str(), "integer" | "fraction" | "exponentInteger") {
+                    *v = translate_digits(v, &ns);
+                }
+            }
+        }
         Ok(parts)
     }
 
     /// FormatDateTimePattern for the en-US patterns this engine implements, as a
     /// typed part list. `format` is this joined; `formatToParts` is this wrapped.
     /// (The pattern is date-then-time, both fixed: no locale data behind it.)
-    pub(crate) fn dtf_parts(&self, resolved: u32, ms: f64) -> Vec<(&'static str, String)> {
-        let total_ms = ms as i128;
-        let days = total_ms.div_euclid(86_400_000) as i64;
-        let (y, mo, d) = epoch_days_to_iso(days);
-        let rem_ns = total_ms.rem_euclid(86_400_000) * 1_000_000;
-        let t = ns_to_time(rem_ns); // [h, mi, s, ms, us, ns]
+    pub(crate) fn dtf_parts(
+        &self,
+        resolved: u32,
+        ms: f64,
+        fields: u16,
+        absolute: bool,
+    ) -> Vec<(&'static str, String)> {
         let slot = |k: &str| -> Option<String> {
             match self.heap.get(resolved) {
                 HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
                 _ => None,
             }
         };
-        let has = |k: &str| slot(k).is_some();
-        // Only the components the resolved options actually carry are emitted:
-        // `{minute, second}` must format as "02:03", not as a whole date-time.
-        // (A `dateStyle`/`timeStyle` selects the full date / full time, since the
-        // per-style skeletons are CLDR data this engine does not have.)
-        let date_style = has("dateStyle");
-        let time_style = has("timeStyle");
-        let has_date = has("year") || has("month") || has("day") || has("weekday") || date_style;
-        let has_time = has("hour") || has("minute") || has("second") || time_style;
+        // GetNamedTimeZoneEpochNanoseconds for an OFFSET time zone is a plain
+        // shift of the epoch instant: no tz database is involved, so `+03:01`
+        // renders a real local wall clock instead of silently formatting UTC.
+        // (A named IANA zone still formats as UTC — that one needs the database.)
+        //
+        // A PLAIN Temporal value is not an instant: the spec converts its wall
+        // clock to an epoch through the formatter's zone and straight back, so
+        // the offset cancels and its own fields print unchanged
+        // (`temporal-objects-resolved-time-zone.js`).
+        let tz_minutes = slot("timeZone").as_deref().and_then(time_zone_offset_minutes).unwrap_or(0);
+        let offset_ms = if absolute { tz_minutes as i128 * 60_000 } else { 0 };
+        let total_ms = ms as i128 + offset_ms;
+        let days = total_ms.div_euclid(86_400_000) as i64;
+        let (y, mo, d) = epoch_days_to_iso(days);
+        let rem_ns = total_ms.rem_euclid(86_400_000) * 1_000_000;
+        let t = ns_to_time(rem_ns); // [h, mi, s, ms, us, ns]
+        // `fields` is the resolved component set for THIS argument (see
+        // `dtf_fields_for`); the width of each component still comes from the
+        // options, defaulting to numeric when the field was filled in by
+        // ToDateTimeOptions rather than requested.
+        let has = |bit: u16| fields & bit != 0;
+        let has_date = has(Self::F_YEAR | Self::F_MONTH | Self::F_DAY | Self::F_WEEKDAY);
+        let has_time = has(Self::F_HOUR | Self::F_MINUTE | Self::F_SECOND);
         // A two-digit request pads; a numeric one does not.
         let two = |k: &str, v: i64| -> String {
             if slot(k).as_deref() == Some("2-digit") { format!("{v:02}") } else { v.to_string() }
         };
         let mut out: Vec<(&'static str, String)> = vec![];
-        // Neither a date nor a time component resolved (a dayPeriod- or
-        // timeZoneName-only request): the date fields carry nothing to print.
         if has_date {
             let mut date: Vec<(&'static str, String)> = vec![];
-            if has("month") || date_style {
+            if has(Self::F_MONTH) {
                 date.push(("month", two("month", mo)));
             }
-            if has("day") || date_style {
+            if has(Self::F_DAY) {
                 if !date.is_empty() {
                     date.push(("literal", "/".to_string()));
                 }
                 date.push(("day", two("day", d)));
             }
-            if has("year") || date_style {
+            if has(Self::F_YEAR) {
                 if !date.is_empty() {
                     date.push(("literal", "/".to_string()));
                 }
@@ -1917,16 +2249,16 @@ impl<'p> Vm<'p> {
                 _ => h12,
             };
             let mut time: Vec<(&'static str, String)> = vec![];
-            if has("hour") || time_style {
+            if has(Self::F_HOUR) {
                 time.push(("hour", two("hour", hour_val)));
             }
-            if has("minute") || time_style {
+            if has(Self::F_MINUTE) {
                 if !time.is_empty() {
                     time.push(("literal", ":".to_string()));
                 }
                 time.push(("minute", format!("{:02}", t[1])));
             }
-            if has("second") || time_style {
+            if has(Self::F_SECOND) {
                 if !time.is_empty() {
                     time.push(("literal", ":".to_string()));
                 }
@@ -1934,18 +2266,20 @@ impl<'p> Vm<'p> {
             }
             // fractionalSecondDigits attaches to the second as a `.`-separated
             // `fractionalSecond` part, truncated (never rounded) to its width.
-            if let Some(f) = slot("fractionalSecondDigits") {
-                if let Ok(n) = f.parse::<usize>() {
-                    if n >= 1 && n <= 3 {
-                        let ms_str = format!("{:03}", t[3]);
-                        time.push(("literal", ".".to_string()));
-                        time.push(("fractionalSecond", ms_str[..n].to_string()));
+            if has(Self::F_FRAC) {
+                if let Some(f) = slot("fractionalSecondDigits") {
+                    if let Ok(n) = f.parse::<usize>() {
+                        if n >= 1 && n <= 3 {
+                            let ms_str = format!("{:03}", t[3]);
+                            time.push(("literal", ".".to_string()));
+                            time.push(("fractionalSecond", ms_str[..n].to_string()));
+                        }
                     }
                 }
             }
             // The day period belongs to the HOUR field: `{minute, second}` is
             // "02:03", not "02:03 PM".
-            if is12 && (has("hour") || time_style) {
+            if is12 && has(Self::F_HOUR) {
                 time.push(("literal", "\u{202f}".to_string()));
                 time.push(("dayPeriod", ap.to_string()));
             }
@@ -1954,12 +2288,41 @@ impl<'p> Vm<'p> {
             }
             out.extend(time);
         }
+        // timeZoneName. There is no CLDR zone-name data here, and UTS-35 §4.5
+        // makes the *localized GMT format* the specified fallback for exactly
+        // that case, so the name is rendered from the offset this formatter
+        // actually used — self-consistent with the rendering above rather than
+        // an invented name. ICU spells the zero offset "GMT" in every style.
+        if has(Self::F_ZONE) {
+            let m = tz_minutes;
+            let name = if m == 0 {
+                "GMT".to_string()
+            } else {
+                let sign = if m < 0 { '-' } else { '+' };
+                let (h, mi) = (m.abs() / 60, m.abs() % 60);
+                if mi != 0 { format!("GMT{sign}{h}:{mi:02}") } else { format!("GMT{sign}{h}") }
+            };
+            if !out.is_empty() {
+                out.push(("literal", ", ".to_string()));
+            }
+            out.push(("timeZoneName", name));
+        }
+        // The date-time NUMBERS follow the resolved numbering system too
+        // (`format/numbering-system.js`); the literals between them do not.
+        let ns = slot("numberingSystem").unwrap_or_else(|| "latn".to_string());
+        if ns != "latn" {
+            for (ty, v) in out.iter_mut() {
+                if *ty != "literal" && *ty != "timeZoneName" && *ty != "dayPeriod" {
+                    *v = translate_digits(v, &ns);
+                }
+            }
+        }
         out
     }
 
     /// Intl.DateTimeFormat.prototype.format(date) — UTC, en-US conventions.
-    pub(crate) fn dtf_format(&self, resolved: u32, ms: f64) -> String {
-        self.dtf_parts(resolved, ms).into_iter().map(|(_, v)| v).collect()
+    pub(crate) fn dtf_format(&self, resolved: u32, ms: f64, fields: u16, absolute: bool) -> String {
+        self.dtf_parts(resolved, ms, fields, absolute).into_iter().map(|(_, v)| v).collect()
     }
 
 }
@@ -1994,7 +2357,250 @@ pub(crate) enum UseGrouping {
 /// than being echoed back, which is what the supportedValuesOf round-trip tests
 /// and the future-calendar fallback tests require.
 pub(crate) const AVAILABLE_CALENDARS: &[&str] = &["gregory", "iso8601"];
-pub(crate) const AVAILABLE_NUMBERING_SYSTEMS: &[&str] = &["latn"];
+/// ECMA-402 Table 10, "Numbering systems with simple digit mappings": the code
+/// point of DIGIT ZERO in each system whose ten digits are consecutive. This is
+/// a **normative table of the specification**, not CLDR locale data — every
+/// implementation must format in all of these, and
+/// `Intl.supportedValuesOf("numberingSystem")` must list them all
+/// (`numberingSystems-with-simple-digit-mappings.js`). Sorted by name, which is
+/// also the order supportedValuesOf must report.
+pub(crate) const NUMBERING_SYSTEM_ZERO: &[(&str, u32)] = &[
+    ("adlm", 0x1E950),
+    ("ahom", 0x11730),
+    ("arab", 0x660),
+    ("arabext", 0x6F0),
+    ("bali", 0x1B50),
+    ("beng", 0x9E6),
+    ("bhks", 0x11C50),
+    ("brah", 0x11066),
+    ("cakm", 0x11136),
+    ("cham", 0xAA50),
+    ("deva", 0x966),
+    ("diak", 0x11950),
+    ("fullwide", 0xFF10),
+    ("gara", 0x10D40),
+    ("gong", 0x11DA0),
+    ("gonm", 0x11D50),
+    ("gujr", 0xAE6),
+    ("gukh", 0x16130),
+    ("guru", 0xA66),
+    ("hanidec", 0x3007),
+    ("hmng", 0x16B50),
+    ("hmnp", 0x1E140),
+    ("java", 0xA9D0),
+    ("kali", 0xA900),
+    ("kawi", 0x11F50),
+    ("khmr", 0x17E0),
+    ("knda", 0xCE6),
+    ("krai", 0x16D70),
+    ("lana", 0x1A80),
+    ("lanatham", 0x1A90),
+    ("laoo", 0xED0),
+    ("latn", 0x30),
+    ("lepc", 0x1C40),
+    ("limb", 0x1946),
+    ("mathbold", 0x1D7CE),
+    ("mathdbl", 0x1D7D8),
+    ("mathmono", 0x1D7F6),
+    ("mathsanb", 0x1D7EC),
+    ("mathsans", 0x1D7E2),
+    ("mlym", 0xD66),
+    ("modi", 0x11650),
+    ("mong", 0x1810),
+    ("mroo", 0x16A60),
+    ("mtei", 0xABF0),
+    ("mymr", 0x1040),
+    ("mymrepka", 0x116DA),
+    ("mymrpao", 0x116D0),
+    ("mymrshan", 0x1090),
+    ("mymrtlng", 0xA9F0),
+    ("nagm", 0x1E4F0),
+    ("newa", 0x11450),
+    ("nkoo", 0x7C0),
+    ("olck", 0x1C50),
+    ("onao", 0x1E5F1),
+    ("orya", 0xB66),
+    ("osma", 0x104A0),
+    ("outlined", 0x1CCF0),
+    ("rohg", 0x10D30),
+    ("saur", 0xA8D0),
+    ("segment", 0x1FBF0),
+    ("shrd", 0x111D0),
+    ("sind", 0x112F0),
+    ("sinh", 0xDE6),
+    ("sora", 0x110F0),
+    ("sund", 0x1BB0),
+    ("sunu", 0x11BF0),
+    ("takr", 0x116C0),
+    ("talu", 0x19D0),
+    ("tamldec", 0xBE6),
+    ("telu", 0xC66),
+    ("thai", 0xE50),
+    ("tibt", 0xF20),
+    ("tirh", 0x114D0),
+    ("tnsa", 0x16AC0),
+    ("tols", 0x11DE0),
+    ("vaii", 0xA620),
+    ("wara", 0x118E0),
+    ("wcho", 0x1E2F0),
+];
+
+/// `hanidec` is the one Table 10 system whose digits are NOT consecutive.
+const HANIDEC_DIGITS: [char; 10] =
+    ['\u{3007}', '\u{4e00}', '\u{4e8c}', '\u{4e09}', '\u{56db}', '\u{4e94}', '\u{516d}',
+     '\u{4e03}', '\u{516b}', '\u{4e5d}'];
+
+pub(crate) const AVAILABLE_NUMBERING_SYSTEMS: &[&str] = &[
+    "adlm",
+    "ahom",
+    "arab",
+    "arabext",
+    "bali",
+    "beng",
+    "bhks",
+    "brah",
+    "cakm",
+    "cham",
+    "deva",
+    "diak",
+    "fullwide",
+    "gara",
+    "gong",
+    "gonm",
+    "gujr",
+    "gukh",
+    "guru",
+    "hanidec",
+    "hmng",
+    "hmnp",
+    "java",
+    "kali",
+    "kawi",
+    "khmr",
+    "knda",
+    "krai",
+    "lana",
+    "lanatham",
+    "laoo",
+    "latn",
+    "lepc",
+    "limb",
+    "mathbold",
+    "mathdbl",
+    "mathmono",
+    "mathsanb",
+    "mathsans",
+    "mlym",
+    "modi",
+    "mong",
+    "mroo",
+    "mtei",
+    "mymr",
+    "mymrepka",
+    "mymrpao",
+    "mymrshan",
+    "mymrtlng",
+    "nagm",
+    "newa",
+    "nkoo",
+    "olck",
+    "onao",
+    "orya",
+    "osma",
+    "outlined",
+    "rohg",
+    "saur",
+    "segment",
+    "shrd",
+    "sind",
+    "sinh",
+    "sora",
+    "sund",
+    "sunu",
+    "takr",
+    "talu",
+    "tamldec",
+    "telu",
+    "thai",
+    "tibt",
+    "tirh",
+    "tnsa",
+    "tols",
+    "vaii",
+    "wara",
+    "wcho"
+];
+
+/// Map the ASCII digits of an already-formatted number into `ns`. Everything
+/// else (signs, separators, currency symbols) is untouched — the separators are
+/// locale data this engine does not have, but the DIGITS are not.
+pub(crate) fn translate_digits(s: &str, ns: &str) -> String {
+    if ns == "latn" {
+        return s.to_string();
+    }
+    if ns == "hanidec" {
+        return s
+            .chars()
+            .map(|c| {
+                if c.is_ascii_digit() { HANIDEC_DIGITS[(c as u8 - b'0') as usize] } else { c }
+            })
+            .collect();
+    }
+    let Some(&(_, zero)) = NUMBERING_SYSTEM_ZERO.iter().find(|(n, _)| *n == ns) else {
+        return s.to_string();
+    };
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_digit() {
+                char::from_u32(zero + (c as u32 - '0' as u32)).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// ResolveLocale for ONE [[RelevantExtensionKeys]] entry. The *option* wins
+/// only when the implementation supports its value; otherwise the `-u-` value
+/// wins if IT is supported; otherwise the default. The second result says
+/// whether the resolved locale must carry the keyword, which it must exactly
+/// when the extension is what supplied the winning value — so `en-u-nu-arab`
+/// with `{numberingSystem: "invalid"}` resolves to arab and keeps `-u-nu-arab`,
+/// while `en-u-nu-latn` with `{numberingSystem: "arab"}` resolves to arab and
+/// reports plain "en" (resolved-*-unicode-extensions-and-options.js).
+///
+/// An empty `available` means "every well-formed value is supported".
+pub(crate) fn resolve_ext_key(
+    option: Option<String>,
+    ext: Option<String>,
+    available: &[&str],
+    default: &str,
+) -> (String, bool) {
+    let ok = |v: &String| available.is_empty() || available.contains(&v.as_str());
+    let opt = option.map(|s| s.to_ascii_lowercase()).filter(&ok);
+    let ext_ok = ext.map(|s| s.to_ascii_lowercase()).filter(&ok);
+    let value = opt.or_else(|| ext_ok.clone()).unwrap_or_else(|| default.to_string());
+    let reflect = ext_ok.as_deref() == Some(value.as_str());
+    (value, reflect)
+}
+
+/// ResolveLocale's [[locale]]: the requested tag reduced to its language id plus
+/// `-u-` keywords for exactly the relevant extension keys the extension
+/// supplied. Every other keyword — and every attribute — is dropped, which is
+/// what `unicode-ext-seq-with-attribute.js` ("de-u-attrval-co-phonebk" resolves
+/// to "de-u-co-phonebk") and `ignore-invalid-unicode-ext-values.js` require.
+pub(crate) fn resolved_locale_tag(tag: &str, keys: &[(&str, String)]) -> String {
+    let Some(mut t) = crate::vm::locale_tag::parse_lang_tag(tag) else {
+        return tag.to_string();
+    };
+    t.u_attributes.clear();
+    t.u_keywords.clear();
+    t.has_u = false;
+    for (k, v) in keys {
+        t.set_u(k, Some(v.clone()));
+    }
+    t.canonical()
+}
 
 /// Resolve a requested calendar/numberingSystem: ASCII-lowercased (the Unicode
 /// extension keys are case-insensitive), accepted only if supported.
@@ -2025,7 +2631,20 @@ pub(crate) fn is_variable_collation_char(c: char) -> bool {
 /// grammar — no display-name data is involved.
 pub(crate) fn canonical_display_names_code(ty: &str, code: &str) -> Option<String> {
     match ty {
-        "language" => crate::vm::locale_tag::canonicalize_tag(code),
+        // Step 1a: the code must match `unicode_language_id` — the language /
+        // script / region / variant prefix ONLY. A tag carrying any extension
+        // ("en-u-hebrew", "en-x-priv") parses fine as a `unicode_locale_id` but
+        // is a RangeError here, so reject anything whose canonical form grows an
+        // extension singleton.
+        "language" => crate::vm::locale_tag::parse_lang_tag(code)
+            .filter(|t| {
+                !t.has_u
+                    && t.transform.is_empty()
+                    && t.other.is_empty()
+                    && t.private.is_empty()
+                    && t.u_keywords.is_empty()
+            })
+            .map(|t| t.canonical()),
         "region" => {
             let ok = (code.len() == 2 && code.bytes().all(|b| b.is_ascii_alphabetic()))
                 || (code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()));
@@ -2109,7 +2728,7 @@ pub(crate) fn unicode_ext_value(tag: &str, key: &str) -> Option<String> {
 
 /// The sanctioned single-unit identifiers of ECMA-402 Table 2. `unit` may name
 /// one of these or a `<numerator>-per-<denominator>` pair of them.
-const SANCTIONED_UNITS: &[&str] = &[
+pub(crate) const SANCTIONED_UNITS: &[&str] = &[
     "acre", "bit", "byte", "celsius", "centimeter", "day", "degree", "fluid-ounce", "foot",
     "gallon", "gigabit", "gigabyte", "gram", "hectare", "hour", "inch", "kilobit", "kilobyte",
     "kilogram", "kilometer", "liter", "megabit", "megabyte", "meter", "microsecond", "mile",
@@ -2149,6 +2768,21 @@ pub(crate) fn canonicalize_time_zone(s: &str) -> Option<String> {
     if s.eq_ignore_ascii_case("UTC") {
         return Some("UTC".to_string());
     }
+    // An offset time zone identifier, checked BEFORE the name grammar so a
+    // malformed one ("+3", "-2400") is rejected instead of falling through.
+    if s.starts_with('+') || s.starts_with('-') {
+        return offset_time_zone_minutes(s).map(format_offset_time_zone);
+    }
+    if let Some(z) = canonicalize_etc_zone(s) {
+        return Some(z);
+    }
+    // `Etc/GMT…` is a CLOSED family (see `canonicalize_etc_zone`), so a spelling
+    // it rejected — "Etc/GMT+13", "Etc/GMT+00" — is definitively not a zone and
+    // must RangeError, rather than being waved through by the name grammar the
+    // way an unknown `Area/Location` still is.
+    if s.starts_with("Etc/GMT") {
+        return None;
+    }
     // "Area/Location", and the single-token legacy ids ("GMT", "EST5EDT") —
     // ECMA-402 keeps those verbatim rather than folding them onto "UTC".
     let ok = s.split('/').all(|p| {
@@ -2158,14 +2792,109 @@ pub(crate) fn canonicalize_time_zone(s: &str) -> Option<String> {
     if ok {
         return Some(s.to_string());
     }
-    // A numeric UTC offset (`+05:30`) is also a valid identifier.
-    let b = s.as_bytes();
-    if !b.is_empty() && (b[0] == b'+' || b[0] == b'-') {
-        let body = &s[1..];
-        let digits: String = body.chars().filter(|c| *c != ':').collect();
-        if matches!(digits.len(), 2 | 4 | 6) && digits.chars().all(|c| c.is_ascii_digit()) {
-            return Some(s.to_string());
-        }
-    }
     None
+}
+
+/// Parse an offset time zone identifier to signed minutes, or `None` if it is
+/// not one. The grammar is `UTCOffset[~SubMinutePrecision]` (ECMA-402
+/// IsOffsetTimeZoneIdentifier): a sign, then `HH`, `HHMM` or `HH:MM` — nothing
+/// else. Seconds, a lone-digit hour, a 3-digit run and an out-of-range field are
+/// all rejected, which is the whole point of `constructor-invalid-offset-timezone`
+/// ("+3", "-014", "-2400", "+15:59:00" … must each be a RangeError).
+pub(crate) fn offset_time_zone_minutes(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.is_empty() || !(b[0] == b'+' || b[0] == b'-') {
+        return None;
+    }
+    let sign: i64 = if b[0] == b'-' { -1 } else { 1 };
+    let body = &s[1..];
+    let (hh, mm) = match body.len() {
+        2 => (body, "00"),
+        4 => (&body[..2], &body[2..]),
+        5 if body.as_bytes()[2] == b':' => (&body[..2], &body[3..]),
+        _ => return None,
+    };
+    if !hh.bytes().chain(mm.bytes()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m): (i64, i64) = (hh.parse().ok()?, mm.parse().ok()?);
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(sign * (h * 60 + m))
+}
+
+/// FormatOffsetTimeZoneIdentifier: always `±HH:MM`, and always `+` for zero —
+/// `-00` and `-00:00` both canonicalize to `+00:00`.
+fn format_offset_time_zone(minutes: i64) -> String {
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let a = minutes.abs();
+    format!("{sign}{:02}:{:02}", a / 60, a % 60)
+}
+
+/// The `Etc/…` family of the IANA database's `etcetera` file — the ONE part of
+/// the tz database that is a closed rule rather than a table of political
+/// history: every `Etc/GMT±N` is a fixed whole-hour offset with no DST and no
+/// transitions, so it can be implemented exactly without shipping the database.
+/// The sign is POSIX-inverted (`Etc/GMT+7` is UTC−7), the file defines `+1..+12`
+/// and `-1..-14`, and every zero-offset spelling in it Links to `Etc/UTC`,
+/// whose canonical identifier is "UTC".
+///
+/// Returns the canonical identifier, or `None` when `s` is not one of them (a
+/// named zone that needs the real database, or `Etc/GMT+13`, which does not
+/// exist). Named IANA zones outside this family still format as UTC — see
+/// `dtf_parts`.
+fn canonicalize_etc_zone(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("Etc/")?;
+    if matches!(rest, "GMT" | "GMT0" | "UTC" | "UCT" | "Universal" | "Zulu" | "Greenwich") {
+        return Some("UTC".to_string());
+    }
+    let (sign, digits) = match rest.strip_prefix("GMT") {
+        Some(r) if r.starts_with('+') => (1i64, &r[1..]),
+        Some(r) if r.starts_with('-') => (-1i64, &r[1..]),
+        _ => return None,
+    };
+    // No leading zero: the file has `Etc/GMT+1`, never `Etc/GMT+01`.
+    if digits.is_empty() || digits.len() > 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() == 2 && digits.starts_with('0') {
+        return None;
+    }
+    let n: i64 = digits.parse().ok()?;
+    if n == 0 {
+        return Some("UTC".to_string());
+    }
+    let limit = if sign > 0 { 12 } else { 14 };
+    (n <= limit).then(|| s.to_string())
+}
+
+/// The UTC offset a time zone identifier denotes, in minutes, when that is
+/// knowable without the tz database: an offset identifier, "UTC", or an
+/// `Etc/GMT±N`. `None` for a named zone (which this engine formats as UTC).
+pub(crate) fn time_zone_offset_minutes(tz: &str) -> Option<i64> {
+    if let Some(m) = offset_time_zone_minutes(tz) {
+        return Some(m);
+    }
+    let rest = tz.strip_prefix("Etc/GMT")?;
+    let (sign, digits) = match rest.as_bytes().first() {
+        // POSIX sign inversion: `Etc/GMT+7` is 7 hours WEST of Greenwich.
+        Some(b'+') => (-1i64, &rest[1..]),
+        Some(b'-') => (1i64, &rest[1..]),
+        _ => return None,
+    };
+    digits.parse::<i64>().ok().map(|n| sign * n * 60)
+}
+
+/// AvailableTimeZones: "UTC" plus the closed `Etc/GMT±N` family above. Everything
+/// else in the IANA database needs the database itself.
+pub(crate) fn available_time_zones() -> Vec<String> {
+    let mut out = vec!["UTC".to_string()];
+    for n in 1..=12 {
+        out.push(format!("Etc/GMT+{n}"));
+    }
+    for n in 1..=14 {
+        out.push(format!("Etc/GMT-{n}"));
+    }
+    out
 }

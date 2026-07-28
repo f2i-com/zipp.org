@@ -616,6 +616,23 @@ pub(crate) fn well_known_symbol_key(name: &str) -> Option<&'static str> {
     })
 }
 
+/// SetFunctionName's rendering of a property KEY as a function `.name`.
+///
+/// A well-known symbol is stored internally as the reserved string key
+/// `@@iterator`; its name is `[Symbol.iterator]` (SetFunctionName step 2:
+/// `[` + description + `]`, and `Symbol.iterator.description` is
+/// "Symbol.iterator"). The object-literal path already does this at runtime via
+/// `set_fn_name_from_key`; a CLASS member's key is folded at compile time, so
+/// `class C { [Symbol.iterator](){} }` was naming the method "@@iterator"
+/// (staging/sm/Function/function-name-method.js). Only keys this compiler
+/// itself minted are rewritten — a literal `"@@foo"` string key keeps its text.
+pub(crate) fn fn_name_for_key(key: &str) -> String {
+    match key.strip_prefix("@@") {
+        Some(rest) if well_known_symbol_key(rest) == Some(key) => format!("[Symbol.{rest}]"),
+        _ => key.to_string(),
+    }
+}
+
 /// The canonical index of an error constructor name (parallel to the VM's
 /// `ERROR_NAMES` / `error_protos`). Unknown → 0 (`Error`).
 pub(crate) fn error_kind_index(name: &str) -> u8 {

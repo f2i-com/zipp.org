@@ -616,6 +616,14 @@ enum PreKey {
     Static(u32),
     Computed(Reg),
     Private(u32),
+    /// `super.x` as a destructuring target. A SuperProperty reference has no
+    /// object register — its base is `[[HomeObject]].[[Prototype]]`, resolved by
+    /// the Super* opcodes at store time — so `pre_member_ref` pairs this with a
+    /// dummy `obj` reg that `store_pre_ref` ignores.
+    Super(u32),
+    /// `super[k]`: the key expression is evaluated (and pinned) when the
+    /// reference is taken, ahead of the source read.
+    SuperComputed(Reg),
 }
 
 /// One active `with` scope (see `FnCompiler::with_stack`).

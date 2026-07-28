@@ -130,6 +130,14 @@ pub(crate) struct Cover {
     /// stand, illegal in the arrow parameters the region may become — so this
     /// cannot be decided until the `=>` is seen.
     pub yield_await: Vec<SyntaxError>,
+    /// `await` used as an IDENTIFIER inside the region — a perfectly ordinary
+    /// name in a sloppy Script, so it parses. But an AsyncArrowFunction's
+    /// `ArrowFormalParameters[~Yield, +Await]` reserve it, so `async(await) =>
+    /// {}`, `async(a = await) => {}` and `async(...await) => {}` are all early
+    /// errors, and which reading applies is not known until the `=>` (and the
+    /// leading `async`) are both in hand. Separate from `yield_await`: that one
+    /// fires for a plain arrow too, this one ONLY for an async arrow.
+    pub await_ident: Vec<SyntaxError>,
 }
 
 impl Cover {
@@ -664,6 +672,29 @@ impl<'s> Parser<'s> {
         if self.cover.pattern_only.is_none() {
             self.cover.pattern_only = Some(e);
         }
+    }
+
+    /// Step across a nested FUNCTION-CODE boundary, hiding the enclosing cover
+    /// region's deferred `yield`/`await` records from it and dropping whatever
+    /// the nested code files.
+    ///
+    /// Static Semantics `Contains` does not descend into a FunctionBody, a
+    /// method, or an arrow's ConciseBody, and the [Await] grammar parameter is
+    /// re-supplied at each of them. So `async(a = async function(){ await 1 })
+    /// => {}` and `async(a = async () => { await 1 }) => {}` are both legal:
+    /// the inner `await` belongs to the inner function, not to the arrow
+    /// parameters it happens to sit inside. Without this the record leaked out
+    /// and the whole arrow was rejected.
+    pub(crate) fn enter_fn_code(&mut self) -> (Vec<SyntaxError>, Vec<SyntaxError>) {
+        (
+            std::mem::take(&mut self.cover.yield_await),
+            std::mem::take(&mut self.cover.await_ident),
+        )
+    }
+
+    pub(crate) fn leave_fn_code(&mut self, saved: (Vec<SyntaxError>, Vec<SyntaxError>)) {
+        self.cover.yield_await = saved.0;
+        self.cover.await_ident = saved.1;
     }
 
     pub(crate) fn cover_expr_only(&mut self, e: SyntaxError) {

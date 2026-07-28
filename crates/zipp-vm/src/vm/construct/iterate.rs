@@ -662,20 +662,14 @@ impl<'p> Vm<'p> {
         Ok(it)
     }
 
+    /// GetIterator(obj, sync): `method = GetMethod(obj, @@iterator)`, then
+    /// `Call(method, obj)`. A missing / non-callable `@@iterator` is a TypeError
+    /// HERE, not later — the callers used to precede this with a separate
+    /// `CheckIterable` opcode, which performed a SECOND observable
+    /// `Get(@@iterator)` (sm/destructuring/order.js counts them).
     pub(crate) fn get_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
-                HeapObj::Object(_) | HeapObj::Proxy { .. } => {
-                    let m = self.get_prop(v, "@@iterator")?;
-                    if self.is_callable(m) {
-                        let it = self.call_value(m, v, &[])?;
-                        // GetIterator step 5: a non-object iterator is a TypeError.
-                        if !self.is_object_value(it) {
-                            return Err(Thrown("TypeError: iterator is not an object".into()));
-                        }
-                        return Ok(it);
-                    }
-                }
                 // A plain array: fast-path the default iterator (IterNext walks the
                 // array directly), but honour a replaced Array.prototype[@@iterator]
                 // by invoking it (so for-of uses the overridden iterator).
@@ -699,11 +693,43 @@ impl<'p> Vm<'p> {
                         // positional walk.
                         return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
                     }
+                    return Ok(v);
                 }
-                _ => {}
+                // Kinds whose default iteration is driven positionally by IterNext,
+                // with no observable @@iterator get. (A replaced @@iterator on these
+                // is not honoured — unchanged, pre-existing behaviour.)
+                HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::TypedArray { .. }
+                | HeapObj::Map { .. }
+                | HeapObj::Set(_)
+                | HeapObj::Generator { .. }
+                | HeapObj::AsyncGenerator(_)
+                | HeapObj::Iterator { .. }
+                | HeapObj::IterHelper { .. } => return Ok(v),
+                // Everything else that is an object — a plain object, a Proxy, but
+                // also a Date / RegExp / Error / function / boxed primitive — goes
+                // through the real protocol. Restricting this to Object|Proxy left
+                // `for (c of new String("ab"))` reporting "not iterable" even though
+                // %String.prototype%[@@iterator] is right there.
+                _ => {
+                    if self.is_object_value(v) {
+                        let m = self.get_prop(v, "@@iterator")?;
+                        if self.is_callable(m) {
+                            let it = self.call_value(m, v, &[])?;
+                            // GetIterator step 5: a non-object iterator is a TypeError.
+                            if !self.is_object_value(it) {
+                                return Err(Thrown(
+                                    "TypeError: iterator is not an object".into(),
+                                ));
+                            }
+                            return Ok(it);
+                        }
+                    }
+                }
             }
         }
-        Ok(v)
+        Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))))
     }
 
     /// `for await`: resolve the ASYNC iterator. An async generator is its own

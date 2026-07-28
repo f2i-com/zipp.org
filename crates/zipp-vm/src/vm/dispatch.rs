@@ -977,17 +977,22 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
-                            // A generator or a custom iterable (object) is drained
-                            // via the iterator protocol (iterate_to_vec also errors
-                            // for a plain, non-iterable object, as a spread should).
+                            // Everything that is NOT one of the four inline fast
+                            // paths below (Array / Set / Str|Cons / Map) is drained
+                            // through the iterator protocol; iterate_to_vec →
+                            // get_iterator raises the TypeError when the value has
+                            // genuinely no @@iterator. Naming the kinds explicitly
+                            // instead left `[...new Proxy([1,2],{})]`,
+                            // `[...new String("ab")]` and any object with a
+                            // user-installed @@iterator reporting "not iterable".
                             if vv.is_heap()
-                                && matches!(
+                                && !matches!(
                                     self.heap.get(vv.heap_index()),
-                                    HeapObj::Generator { .. }
-                                        | HeapObj::Object(_)
-                                        | HeapObj::Iterator { .. }
-                                        | HeapObj::IterHelper { .. }
-                                        | HeapObj::TypedArray { .. }
+                                    HeapObj::Array(_)
+                                        | HeapObj::Set(_)
+                                        | HeapObj::Str(_)
+                                        | HeapObj::Cons { .. }
+                                        | HeapObj::Map { .. }
                                 )
                             {
                                 let elems = self.iterate_to_vec(vv)?;
