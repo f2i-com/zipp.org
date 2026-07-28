@@ -828,6 +828,58 @@ mod tests {
     }
 
     #[test]
+    fn local_accumulator_inplace_aliasing() {
+        // `out += x` on a FUNCTION-LOCAL accumulator now rewrites to
+        // StrAppendInPlace when the register provably never leaks a second
+        // live reference while appends can still run. Every case here is an
+        // ALIASING ATTACK on that proof — a false positive mutates a string
+        // the user holds:
+        //   1. mid-loop escape (each snapshot a distinct prefix), 2. snapshot
+        //   read later, 3. `out += out`, 4. closure capture, 5. eval reading
+        //   the accumulator, 6. mid-loop reset, 7. two sibling loops,
+        //   8. per-outer-iteration re-init, 9. accumulator LIVE ACROSS outer
+        //   iterations (enclosed loop must decline), 10. try/catch in body,
+        //   11. the hot escapeHtml shape itself run twice, 12. append via a
+        //   helper-call result, 13. a generator yielding the accumulator.
+        // Expectations from node.
+        assert_jit_matches(
+            "var out_=[];\
+             function esc(n){var snaps=[];var out='';for(var i=0;i<n;i++){out+='x';snaps.push(out);}return snaps;}\
+             out_.push(esc(5).join(',')==='x,xx,xxx,xxxx,xxxxx');\
+             function snapread(n){var out='';var first=null;for(var i=0;i<n;i++){out+='a';if(i===0)first=out;}return first+'/'+out;}\
+             out_.push(snapread(4));\
+             function selfapp(n){var out='ab';for(var i=0;i<n;i++){out+=out;}return out.length+':'+out.slice(0,8);}\
+             out_.push(selfapp(4));\
+             function cap(n){var out='';var f=function(){return out;};for(var i=0;i<n;i++){out+='c';}return f()+'/'+out;}\
+             out_.push(cap(3));\
+             function ev(n){var out='';var seen='';for(var i=0;i<n;i++){out+='e';seen=eval('out');}return seen+'/'+out;}\
+             out_.push(ev(3));\
+             function reset(n){var out='';for(var i=0;i<n;i++){out+='r';if(i===2)out='R';}return out;}\
+             out_.push(reset(5));\
+             function sib(n){var out='';for(var i=0;i<n;i++)out+='1';var mid=out;for(var j=0;j<n;j++)out+='2';return mid+'/'+out;}\
+             out_.push(sib(3));\
+             function nest(n){var keep=[];for(var o=0;o<n;o++){var out='';for(var i=0;i<=o;i++)out+='n';keep.push(out);}return keep.join(',');}\
+             out_.push(nest(3));\
+             function nest2(n){var keep=[];var out='';for(var o=0;o<n;o++){for(var i=0;i<2;i++)out+=o;keep.push(out);}return keep.join(',');}\
+             out_.push(nest2(3));\
+             function tc(n){var out='';for(var i=0;i<n;i++){try{out+='t';}catch(e){}}return out;}\
+             out_.push(tc(4));\
+             function render(s){var out='';for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);if(c===60)out+='&lt;';else if(c===62)out+='&gt;';else if(c===38)out+='&amp;';else out+=s[i];}return out;}\
+             var big='';for(var i=0;i<50000;i++)big+=String.fromCharCode(97+(i%26),i%7===0?60:98);\
+             var r1=render(big);var r2=render(big);\
+             out_.push(r1.length+'/'+(r1===r2)+'/'+r1.slice(0,12));\
+             function up(c){return c.toUpperCase();}\
+             function callin(s){var out='';for(var i=0;i<s.length;i++){out+=up(s[i]);}return out;}\
+             out_.push(callin('abc'));\
+             function* gen(n){var out='';for(var i=0;i<n;i++){out+='g';yield out;}}\
+             var g=[];for(var v of gen(3))g.push(v);\
+             out_.push(g.join(','));\
+             console.log(out_.join('|'))",
+            &["true|a/aaaa|32:abababab|ccc/ccc|eee/eee|Rrr|111/111222|n,nn,nnn|00,0011,001122|tttt|121429/true/a&lt;bbcbdbe|ABC|g,gg,ggg"],
+        );
+    }
+
+    #[test]
     fn static_fn_region_promise_resolve() {
         // `a[j] = Promise.resolve(j)` in a hot loop now compiles (StaticFn was
         // the region's only blocker). The helper's fast path is non-heap

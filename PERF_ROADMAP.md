@@ -1320,6 +1320,53 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B56 — Function-local string accumulators go in-place: markdown-render −30%
+
+The survey's M1, landed after its prerequisite (the `StrAppendInPlace`
+ToPrimitive fix) shipped. `rewrite_string_accumulators` proved in-place safety
+only for a TOP-LEVEL GLOBAL accumulator with a call-free body — because a call
+can read a global by NAME. A function-local register cannot be named by any
+other code, so `rewrite_local_accumulators` admits calls in the body and moves
+the whole burden onto proving the REGISTER never leaks a second live reference
+while appends can still run:
+
+* `r` is not a parameter (sloppy `arguments` aliases parameter registers
+  invisibly), no `arguments`/rest object, not a generator/async;
+* the loop is not enclosed by another back-edge and no outside jump targets
+  its interior — once it exits, no append runs again in this activation;
+* before/inside the loop `r` is touched only by one pre-loop `LoadConst` of a
+  string literal, the `Add{dst:r, a:r}` appends themselves, and the discarded
+  statement value of `out += x` — a `Move` whose destination no read can
+  observe.
+
+That last clause is where the first attempt died, and the fix is the
+interesting part: the register allocator REUSES statement-value slots as
+scratch in other branches (renderInline's reg 30 is written by a `LoadInt` at
+ip 16 and read at ip 17, in a different branch from the discarded `Move` at
+ip 27), so "never read anywhere" declines the exact function this exists for.
+`move_dst_unobservable` instead proves every read of the slot has a DOMINATING
+WRITE, by scanning straight-line code backwards from the read and failing
+conservatively at any jump target, any unconditional transfer, or ANY op
+outside the enumerated set — which is also what keeps `PushHandler`-style ops
+with hidden control targets from being scanned across.
+
+The register-field enumeration (`accum_may_read` / `accum_touches` /
+`accum_writes`) is the hazard M1's verifier named: one missed READ field is a
+silently published alias. Every arm was written against the variant's
+declaration in bytecode.rs, `arg_base`/`argc` pairs are treated as windows,
+and everything not enumerated is conservative in the safe direction (reads:
+assume yes; writes: assume no).
+
+**Measured (quiet box, `tools/bench.py --ab`, paired medians of 9):
+markdown-render 677 → 476ms, −29.7% [p10 473 p90 479]** — M1's predicted band
+(5.05M appends × ~35ns saved). parse-large-js +0.9%: its accumulators do not
+match the proof, honestly declined. Verified by a 13-case aliasing probe
+(mid-loop escape, later-read snapshot, `out += out`, closure capture, eval,
+mid-loop reset, sibling loops, enclosed loops both with and without re-init,
+try/catch, helper-call appends, a generator, and the hot shape run twice) —
+byte-identical to node on JIT, NOJIT and GC-stress, and pinned as
+`local_accumulator_inplace_aliasing`.
+
 ### B55 — The match-result side table: DICT-mode landed (neutral), the
 recycling pool REFUTED (+2.2% on its own target), and the design space mapped
 

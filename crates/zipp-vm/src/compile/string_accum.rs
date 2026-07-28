@@ -193,6 +193,386 @@ pub(crate) fn loop_inplace_safe(
     true
 }
 
+/// Does instruction `i` READ register `r` — consume its VALUE through any
+/// operand field? CONSERVATIVE: any variant not enumerated returns `true`.
+/// Write-only `dst` fields deliberately do NOT count: a write to `r` is
+/// handled by the callers' own rules, and counting it here would make the
+/// dead-statement-value check below reject its own `Move` destination.
+///
+/// Every arm below was written against the variant's declaration in
+/// `bytecode.rs` — the register fields, the whole register fields (an
+/// `arg_base`/`argc` pair is a WINDOW of registers), and nothing but the
+/// register fields (`name`/`idx` in `u32` positions are constant-pool or slot
+/// indices, not registers). A missed READ field here would let a buffer alias
+/// escape unnoticed, which is a wrong answer, so extend this list only with
+/// the declaration in front of you.
+pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
+    let in_args = |base: Reg, argc: u16| r >= base && (r as u32) < base as u32 + argc as u32;
+    match *i {
+        Instr::LoadInt { .. }
+        | Instr::LoadConst { .. }
+        | Instr::LoadGlobal { .. }
+        | Instr::LoadGlobalOrUndefined { .. }
+        | Instr::LoadGlobalOrUndefinedDyn { .. }
+        | Instr::LoadBool { .. }
+        | Instr::LoadUndefined { .. }
+        | Instr::LoadNull { .. }
+        | Instr::UpvalGet { .. }
+        | Instr::Jump { .. }
+        | Instr::ReturnUndefined => false,
+        Instr::Move { src, .. } => src == r,
+        Instr::StoreGlobal { src, .. }
+        | Instr::StoreGlobalStrict { src, .. }
+        | Instr::StoreGlobalResolved { src, .. }
+        | Instr::UpvalSet { src, .. } => src == r,
+        Instr::AddInt { a, .. }
+        | Instr::Neg { a, .. }
+        | Instr::Not { a, .. }
+        | Instr::ToNum { a, .. }
+        | Instr::ToStr { a, .. }
+        | Instr::TypeOf { a, .. }
+        | Instr::TypeOfIs { a, .. }
+        | Instr::BitNot { a, .. } => a == r,
+        Instr::Add { a, b, .. }
+        | Instr::Sub { a, b, .. }
+        | Instr::Mul { a, b, .. }
+        | Instr::Div { a, b, .. }
+        | Instr::Mod { a, b, .. }
+        | Instr::StrConcat { a, b, .. }
+        | Instr::StrAppendInPlace { a, b, .. }
+        | Instr::Bitwise { a, b, .. }
+        | Instr::Lt { a, b, .. }
+        | Instr::Le { a, b, .. }
+        | Instr::Gt { a, b, .. }
+        | Instr::Ge { a, b, .. }
+        | Instr::Eq { a, b, .. }
+        | Instr::Ne { a, b, .. }
+        | Instr::JumpIfNotLt { a, b, .. }
+        | Instr::JumpIfNotLe { a, b, .. } => a == r || b == r,
+        Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => cond == r,
+        Instr::Return { src } | Instr::CheckCoercible { src } => src == r,
+        Instr::CellGet { cell, .. } => cell == r,
+        Instr::CellSet { cell, src } => cell == r || src == r,
+        Instr::GetProp { obj, .. } => obj == r,
+        Instr::SetProp { obj, val, .. } => obj == r || val == r,
+        Instr::GetIndex { obj, key, .. } => obj == r || key == r,
+        Instr::SetIndex { obj, key, val } => obj == r || key == r || val == r,
+        Instr::GetIndexConcat { obj, key, .. } => obj == r || key == r,
+        Instr::SetIndexConcat { obj, key, val, .. } => obj == r || key == r || val == r,
+        Instr::Call { callee, arg_base, argc, .. } => callee == r || in_args(arg_base, argc),
+        Instr::TailCall { callee, arg_base, argc } => callee == r || in_args(arg_base, argc),
+        Instr::CallMethod { obj, arg_base, argc, .. } => obj == r || in_args(arg_base, argc),
+        Instr::MathOp { arg_base, argc, .. } | Instr::StaticFn { arg_base, argc, .. } => {
+            in_args(arg_base, argc)
+        }
+        _ => true, // unrecognised op → assume it reads `r`
+    }
+}
+
+/// `instr_touches` over the WIDER op set the local-accumulator proof scans —
+/// reads OR writes, conservative `true` for anything not enumerated. (The
+/// original `instr_touches` stays as-is for the global proof's narrow body.)
+pub(crate) fn accum_touches(i: &Instr, r: Reg) -> bool {
+    if accum_may_read(i, r) {
+        return true;
+    }
+    // Writes. Every enumerated variant's dst field, verified like the reads.
+    match *i {
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::LoadGlobalOrUndefined { dst, .. }
+        | Instr::LoadGlobalOrUndefinedDyn { dst, .. }
+        | Instr::LoadBool { dst, .. }
+        | Instr::LoadUndefined { dst }
+        | Instr::LoadNull { dst }
+        | Instr::Move { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Neg { dst, .. }
+        | Instr::Not { dst, .. }
+        | Instr::ToNum { dst, .. }
+        | Instr::ToStr { dst, .. }
+        | Instr::TypeOf { dst, .. }
+        | Instr::TypeOfIs { dst, .. }
+        | Instr::BitNot { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Div { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::StrConcat { dst, .. }
+        | Instr::StrAppendInPlace { dst, .. }
+        | Instr::Bitwise { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::CellGet { dst, .. }
+        | Instr::UpvalGet { dst, .. }
+        | Instr::GetProp { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetIndexConcat { dst, .. }
+        | Instr::Call { dst, .. }
+        | Instr::CallMethod { dst, .. }
+        | Instr::MathOp { dst, .. }
+        | Instr::StaticFn { dst, .. } => dst == r,
+        Instr::StoreGlobal { .. }
+        | Instr::StoreGlobalStrict { .. }
+        | Instr::StoreGlobalResolved { .. }
+        | Instr::UpvalSet { .. }
+        | Instr::CellSet { .. }
+        | Instr::SetProp { .. }
+        | Instr::SetIndex { .. }
+        | Instr::SetIndexConcat { .. }
+        | Instr::TailCall { .. }
+        | Instr::Return { .. }
+        | Instr::ReturnUndefined
+        | Instr::Jump { .. }
+        | Instr::JumpIfFalse { .. }
+        | Instr::JumpIfTrue { .. }
+        | Instr::JumpIfNotLt { .. }
+        | Instr::JumpIfNotLe { .. }
+        | Instr::CheckCoercible { .. } => false,
+        _ => true, // unrecognised op → assume it touches `r`
+    }
+}
+
+/// Does instruction `i` WRITE register `r` — the write half of
+/// `accum_touches`, `false` conservatively for anything not enumerated (a
+/// missed WRITE here only under-covers a read and declines, never admits).
+pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
+    match *i {
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::LoadGlobalOrUndefined { dst, .. }
+        | Instr::LoadGlobalOrUndefinedDyn { dst, .. }
+        | Instr::LoadBool { dst, .. }
+        | Instr::LoadUndefined { dst }
+        | Instr::LoadNull { dst }
+        | Instr::Move { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Neg { dst, .. }
+        | Instr::Not { dst, .. }
+        | Instr::ToNum { dst, .. }
+        | Instr::ToStr { dst, .. }
+        | Instr::TypeOf { dst, .. }
+        | Instr::TypeOfIs { dst, .. }
+        | Instr::BitNot { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Div { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::StrConcat { dst, .. }
+        | Instr::StrAppendInPlace { dst, .. }
+        | Instr::Bitwise { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::CellGet { dst, .. }
+        | Instr::UpvalGet { dst, .. }
+        | Instr::GetProp { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetIndexConcat { dst, .. }
+        | Instr::Call { dst, .. }
+        | Instr::CallMethod { dst, .. }
+        | Instr::MathOp { dst, .. }
+        | Instr::StaticFn { dst, .. } => dst == r,
+        _ => false,
+    }
+}
+
+/// Is `code[move_ip]`'s destination `t` UNOBSERVABLE — i.e. can no read of
+/// `t` anywhere in the function see the value this `Move` stored? True when
+/// every read of `t` is covered by a DOMINATING write found by scanning
+/// straight-line code backwards from the read: the scan fails (conservatively)
+/// at a jump target (control can enter with `t` from elsewhere), at our own
+/// `move_ip`, or at ANY op outside the enumerated set — which includes every
+/// `PushHandler`/`PushFinally`-style op carrying a hidden control target.
+///
+/// This exists because the register allocator REUSES statement-value slots:
+/// the discarded value of one `out += x` may live in a register that a
+/// different branch uses as a genuine scratch, so "never read anywhere" is
+/// too blunt — the reuse always re-writes the register first, and this scan
+/// proves exactly that.
+fn move_dst_unobservable(code: &[Instr], targets: &[bool], t: Reg, move_ip: usize) -> bool {
+    'reads: for (rp, instr) in code.iter().enumerate() {
+        if rp == move_ip || !accum_may_read(instr, t) {
+            continue;
+        }
+        let mut ip = rp;
+        while ip > 0 {
+            ip -= 1;
+            if ip == move_ip {
+                return false; // reached our Move with no covering write
+            }
+            if accum_writes(&code[ip], t) {
+                continue 'reads; // covered on the only fall-through path
+            }
+            if targets[ip] {
+                return false; // block boundary — another path can reach the read
+            }
+            match code[ip] {
+                // An unconditional transfer means the read is only reachable
+                // via a jump target we would have crossed — decline.
+                Instr::Jump { .. } | Instr::Return { .. } | Instr::ReturnUndefined => {
+                    return false;
+                }
+                _ => {}
+            }
+            if accum_touches(&code[ip], Reg::MAX) {
+                // `Reg::MAX` is never a real register: `accum_touches` returns
+                // true for it ONLY via the unrecognised-op arm, i.e. this op is
+                // outside the enumerated set (it may carry a hidden control
+                // target, e.g. PushHandler) — decline.
+                return false;
+            }
+        }
+        return false; // ran off the top of the function
+    }
+    true
+}
+
+/// Rewrite `out = out + b` inside a loop to `StrAppendInPlace` for a
+/// FUNCTION-LOCAL accumulator register. The global proof
+/// (`loop_inplace_safe`) restricts the body to call-free simple ops because a
+/// call could read the accumulator GLOBAL by name; a local register cannot be
+/// named by any other code, so calls in the body are admissible and the whole
+/// burden moves to proving the REGISTER never leaks a second live reference
+/// to the buffer while appends can still happen:
+///
+///  - `r` is not a parameter (sloppy `arguments` aliases parameter
+///    registers invisibly), the function builds no `arguments`/rest object,
+///    and is not a generator/async (caution, mirrors the inliner);
+///  - the loop is not enclosed by another back-edge, and no jump from outside
+///    the loop targets its interior — so once it exits, no append runs again
+///    in this activation (a fresh call gets fresh registers);
+///  - before/inside the loop, `r` is touched ONLY by: one `LoadConst` of a
+///    string literal before the loop (the init — the first append copies off
+///    the interned literal, so earlier escapes of the INIT value are safe),
+///    the self-append `Add{dst:r, a:r}` sites themselves, and `Move`s of `r`
+///    into a register that is NEVER READ anywhere in the function (the
+///    discarded statement value of `out += x` — dead by construction);
+///  - AFTER the loop anything goes: appends are unreachable, the buffer is
+///    complete and behaves as an ordinary immutable string from then on.
+///
+/// A function whose accumulator is captured by a closure (or in a
+/// direct-eval/`with` scope) never matches structurally: those locals compile
+/// to cell operations, not a plain-register `Add{dst:r, a:r}` fed by a
+/// `LoadConst` init.
+pub(crate) fn rewrite_local_accumulators(f: &mut FuncProto) {
+    if f.is_generator || f.is_async || f.arguments_reg.is_some() || f.rest_reg.is_some() {
+        return;
+    }
+    let n = f.code.len();
+    let param_top: Reg = f.param_count;
+    let mut rewrites: Vec<usize> = Vec::new();
+    for j in 0..n {
+        let start = match f.code[j] {
+            Instr::Jump { target } if (target as usize) < j => target as usize,
+            _ => continue,
+        };
+        let end = j;
+        // Not enclosed by another back-edge, and no OUTSIDE jump into the
+        // interior (falling in at `start`, or a pre-loop jump TO `start`, is
+        // the canonical entry and fine).
+        let mut enclosed = false;
+        for (jp, instr) in f.code.iter().enumerate() {
+            let target = match *instr {
+                Instr::Jump { target }
+                | Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::JumpIfNotLt { target, .. }
+                | Instr::JumpIfNotLe { target, .. } => target as usize,
+                _ => continue,
+            };
+            if target < jp && (target, jp) != (start, end) && target <= start && jp >= end {
+                enclosed = true; // an enclosing back-edge
+                break;
+            }
+            if (jp < start || jp > end) && target > start && target <= end {
+                enclosed = true; // a jump into the interior from outside
+                break;
+            }
+        }
+        if enclosed {
+            continue;
+        }
+        // Candidate accumulators: self-append `Add { dst: r, a: r }` in the
+        // body, r above the parameter registers (reg 0 is `this`).
+        let mut accs: Vec<Reg> = Vec::new();
+        for k in start..=end {
+            if let Instr::Add { dst, a, .. } = f.code[k] {
+                if dst == a && dst > param_top && !accs.contains(&dst) {
+                    accs.push(dst);
+                }
+            }
+        }
+        'acc: for r in accs {
+            let appends: Vec<usize> = (start..=end)
+                .filter(|&k| matches!(f.code[k], Instr::Add { dst, a, .. } if dst == r && a == r))
+                .collect();
+            // The init: the LAST pre-loop LoadConst of a string literal into
+            // `r`. Any OTHER pre-loop touch of `r` (including an earlier init)
+            // fails the scan below, so "last" is also "only".
+            let init_ip = (0..start).rev().find(|&ip| {
+                matches!(f.code[ip], Instr::LoadConst { dst, idx } if dst == r
+                    && f.constants.get(idx as usize).copied().map(is_string_const).unwrap_or(false))
+            });
+            let Some(init_ip) = init_ip else { continue };
+            // Jump targets of the whole function — block boundaries for the
+            // dead-Move dominating-write scan. Ops outside the enumerated set
+            // (PushHandler etc.) are handled by the scan's own barrier.
+            let mut targets = vec![false; n];
+            for instr in f.code.iter() {
+                let t = match *instr {
+                    Instr::Jump { target }
+                    | Instr::JumpIfFalse { target, .. }
+                    | Instr::JumpIfTrue { target, .. }
+                    | Instr::JumpIfNotLt { target, .. }
+                    | Instr::JumpIfNotLe { target, .. } => target as usize,
+                    _ => continue,
+                };
+                if t < n {
+                    targets[t] = true;
+                }
+            }
+            for (ip, instr) in f.code.iter().enumerate() {
+                if ip == init_ip || appends.contains(&ip) || ip > end {
+                    continue; // the exempt sites; post-loop is unrestricted
+                }
+                // The discarded statement value of `out += x`: a Move of `r`
+                // into a register no read can ever observe (the allocator
+                // reuses these slots as scratch, so this is a dominating-write
+                // proof, not a "never read" one).
+                if ip >= start {
+                    if let Instr::Move { dst, src } = f.code[ip] {
+                        if src == r && dst != r && move_dst_unobservable(&f.code, &targets, dst, ip)
+                        {
+                            continue;
+                        }
+                    }
+                }
+                if accum_touches(&f.code[ip], r) {
+                    continue 'acc;
+                }
+            }
+            rewrites.extend(appends);
+        }
+    }
+    for k in rewrites {
+        if let Instr::Add { dst, a, b } = f.code[k] {
+            f.code[k] = Instr::StrAppendInPlace { dst, a, b };
+        }
+    }
+}
+
 /// Rewrite a string-accumulator loop's `g = g + b` so it JITs. Always emits
 /// `StrConcat` (a JIT routing hint, semantically identical to `Add`) when `g` is
 /// initialised to a string literal; UPGRADES to `StrAppendInPlace` (mutates the

@@ -27,6 +27,7 @@ pub(crate) fn compile_program_inner(prog: &ast::Program, source: &str, module_mo
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
+        rewrite_local_accumulators(f);
     }
     let module_decl_globals = c.collect_module_decl_globals();
     Ok(Program {
@@ -320,6 +321,7 @@ pub fn compile_eval(
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
+        rewrite_local_accumulators(f);
     }
     let module_decl_globals = c.collect_module_decl_globals();
     Ok(Program {
