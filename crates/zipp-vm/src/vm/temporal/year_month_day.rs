@@ -208,9 +208,10 @@ impl<'p> Vm<'p> {
         Ok(month_opt.map(|m| (MonthRef::Ordinal(m), true, None)))
     }
 
-    /// Read the `era`/`eraYear` fields. Calendars without eras (only `iso8601`
-    /// here) do not list them in their field set, so they are not even Get —
-    /// `{ era: "foobar", year: 1970, … }` must be accepted, era simply ignored.
+    /// Read the `era`/`eraYear` fields. Calendars without eras (`iso8601` and
+    /// the two lunisolar ones) do not list them in their field set, so they are
+    /// not even Get — `{ era: "foobar", year: 1970, … }` must be accepted, era
+    /// simply ignored (`PlainDate/from/calendar-not-supporting-eras.js`).
     pub(crate) fn read_era_fields(
         &mut self,
         obj: Value,
@@ -712,7 +713,8 @@ impl<'p> Vm<'p> {
     /// CalendarMonthDayToISOReferenceDate: the reference ISO date of a
     /// calendar month/day is the LATEST one not after 1972-12-31 that has those
     /// calendar fields — so a leap-only day (Coptic M13/6, ISO 02-29) still gets
-    /// a real anchor. Walks back at most a leap cycle.
+    /// a real anchor. `cal_month_day_reference` owns the search window, which is
+    /// not the same for the lunisolar calendars.
     pub(crate) fn make_plain_month_day_fields(
         &mut self,
         cal: Cal,
@@ -722,24 +724,12 @@ impl<'p> Vm<'p> {
         if cal == Cal::Iso {
             return self.make_plain_month_day(code.0, cd, 1972);
         }
-        let limit = iso_to_epoch_days(1972, 12, 31);
-        let mut cy = cal_from_epoch_days(cal, limit).0;
-        for _ in 0..40 {
-            // A leap-month calendar skips years that do not HAVE this month at
-            // all: hebrew "M05L" anchors on the last leap year before 1973.
-            if let Some(cm) = cal_month_of_code(cal, cy, code.0, code.1) {
-                if cd <= cal_days_in_month(cal, cy, cm) {
-                    let ed = cal_to_epoch_days(cal, cy, cm, cd);
-                    if ed <= limit {
-                        let (iy, im, id) = epoch_days_to_iso(ed);
-                        let r = self.make_plain_month_day(im, id, iy)?;
-                        return Ok(self.tag_cal(r, cal));
-                    }
-                }
-            }
-            cy -= 1;
-        }
-        Err(Thrown("RangeError: month-day is not valid in this calendar".into()))
+        let Some(ed) = cal_month_day_reference(cal, code.0, code.1, cd) else {
+            return Err(Thrown("RangeError: month-day is not valid in this calendar".into()));
+        };
+        let (iy, im, id) = epoch_days_to_iso(ed);
+        let r = self.make_plain_month_day(im, id, iy)?;
+        Ok(self.tag_cal(r, cal))
     }
 
     /// CreateTemporalMonthDay from an ISO date reinterpreted in `cal`.
@@ -749,7 +739,17 @@ impl<'p> Vm<'p> {
         iso: (i64, i64, i64),
     ) -> Result<Value, Thrown> {
         let (cy, cm, cd) = cal_from_iso(cal, iso.0, iso.1, iso.2);
-        self.make_plain_month_day_fields(cal, cal_month_code(cal, cy, cm), cd)
+        let code = cal_month_code(cal, cy, cm);
+        if let Ok(v) = self.make_plain_month_day_fields(cal, code, cd) {
+            return Ok(v);
+        }
+        // `toPlainMonthDay` runs the reference search with overflow "constrain",
+        // and a real date CAN have a month/day pair with no reference date: a
+        // chinese leap month that never recurs in the window the calendar is
+        // computable over (`chinese-dangi-leap-month-with-year-from-options-bag.js`
+        // builds exactly those and then asks for the month-day).
+        let (code, cd) = cal_month_day_constrain(cal, code, cd);
+        self.make_plain_month_day_fields(cal, code, cd)
     }
 
     pub(crate) fn pmd_fields(&self, idx: u32) -> Option<(i64, i64, i64)> {
@@ -868,17 +868,31 @@ impl<'p> Vm<'p> {
                                 "RangeError: month and monthCode must agree".into(),
                             ));
                         }
-                        let iso = m
-                            .ordinal(cal, y, reject)
-                            .and_then(|mo| cal_date_to_iso(cal, y, mo, d, reject))
-                            .filter(|&(iy, im, id)| iso_date_in_range(iy, im, id));
-                        if iso.is_none() {
+                        // With a year in hand the month and day are regulated
+                        // against THAT year before the reference-year search runs,
+                        // and the search then looks for the regulated pair: the
+                        // stated year decides whether the day exists, but never
+                        // becomes the reference year (`reference-year-1972.js`:
+                        // gregory {2021, M02, 29} is M02-28 anchored on 1972).
+                        let Some(mo) = m.ordinal(cal, y, reject) else {
+                            return Err(Thrown("RangeError: month-day out of range".into()));
+                        };
+                        let miy = cal_months_in_year(cal, y);
+                        if reject && !(1..=miy).contains(&mo) {
                             return Err(Thrown("RangeError: month-day out of range".into()));
                         }
-                        // With a year in hand the ordinal is meaningful; carry the
-                        // month on as the CODE it names there, so the reference-year
-                        // search below looks for the right month.
-                        let mo = m.ordinal(cal, y, false).unwrap();
+                        let mo = mo.clamp(1, miy);
+                        let dim = cal_days_in_month(cal, y, mo);
+                        if reject && d > dim {
+                            return Err(Thrown("RangeError: month-day out of range".into()));
+                        }
+                        d = d.min(dim);
+                        let (iy, im, id) = epoch_days_to_iso(cal_to_epoch_days(cal, y, mo, d));
+                        if !iso_date_in_range(iy, im, id) {
+                            return Err(Thrown("RangeError: month-day out of range".into()));
+                        }
+                        // Carry the month on as the CODE it names in that year, so
+                        // the search below looks for the right month.
                         m = MonthRef::of(cal, y, mo);
                     }
                     // Anchor on the calendar's own reference year; the day is
@@ -902,11 +916,9 @@ impl<'p> Vm<'p> {
                             if reject {
                                 return Err(e);
                             }
-                            // constrain: clamp to the LONGEST this month ever is —
-                            // the reference date is free to be a leap year, so
-                            // Coptic M13 day 7 constrains to 6, not to 5.
-                            let cy = cal_from_epoch_days(cal, iso_to_epoch_days(1972, 12, 31)).0;
-                            let cd = d.min(cal_month_code_max_days(cal, cy, code.0, code.1));
+                            // constrain: retry on whatever this calendar
+                            // relaxes the pair to.
+                            let (code, cd) = cal_month_day_constrain(cal, code, d);
                             self.make_plain_month_day_fields(cal, code, cd)?
                         }
                     };

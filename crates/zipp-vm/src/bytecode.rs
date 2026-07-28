@@ -670,6 +670,14 @@ pub enum Instr {
     /// fresh object — CreateDataProperty, NOT [[Set]]: used for object-literal data
     /// properties, which must ignore any inherited accessor / non-writable property.
     InitDataProp { obj: Reg, name: u32, val: Reg },
+    /// `{ __proto__: v }` — the object-literal proto SPECIAL FORM (B.3.1): a direct
+    /// `object.[[SetPrototypeOf]](v)` for an Object/null `v`, a no-op otherwise.
+    /// Deliberately NOT a [[Set]] of the key: the literal form is "not influenced
+    /// by Object.prototype" — it still works after `delete
+    /// Object.prototype.__proto__` and ignores a replacement `set __proto__`
+    /// accessor (staging/sm/extensions/mutable-proto-special-form.js). The target
+    /// is the freshly built literal, so the change can never be rejected.
+    SetLiteralProto { obj: Reg, val: Reg },
     /// `InitDataProp` for a key the COMPILER has proven is new: the Nth distinct
     /// static key of a literal with no spread, computed key, accessor or
     /// `__proto__:` before it. Appends without the existence probe that

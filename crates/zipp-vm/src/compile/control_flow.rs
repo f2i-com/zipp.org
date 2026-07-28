@@ -135,15 +135,23 @@ impl<'a> FnCompiler<'a> {
         None
     }
 
-    /// The registers of a declaration's simple-identifier bindings that are
-    /// cell-boxed (captured by a nested closure) — the ones needing per-iteration
-    /// freshening in a loop head.
+    /// The registers of a declaration's bindings that are cell-boxed (captured by
+    /// a nested closure) — the ones needing per-iteration freshening in a loop head.
+    ///
+    /// 14.7.4.1 perIterationBindings is `BoundNames of LexicalDeclaration`, which
+    /// includes every name a DESTRUCTURING pattern introduces. Only the
+    /// `Pattern::Ident` arm was walked, so `for (let [i] = [0]; i < 4; i++)
+    /// fns.push(() => i)` shared a single cell and every closure observed the final
+    /// value (4,4,4,4 instead of 0,1,2,3).
     pub(crate) fn captured_decl_regs(&self, d: &ast::VarDecl) -> Vec<Reg> {
         let mut regs = Vec::new();
+        let mut names = Vec::new();
         for decl in &d.decls {
-            if let ast::Pattern::Ident(id) = &decl.id {
+            names.clear();
+            crate::parse::stmt::collect_pattern_names(&decl.id, &mut names);
+            for id in &names {
                 if let Some(reg) = self.local_reg(id) {
-                    if self.cell_regs.contains(&reg) {
+                    if self.cell_regs.contains(&reg) && !regs.contains(&reg) {
                         regs.push(reg);
                     }
                 }

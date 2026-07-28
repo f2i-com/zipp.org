@@ -7,6 +7,14 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Everything the RegExp constructor reads out of `pattern` BEFORE RegExpAlloc.
+/// See [`Vm::regexp_pattern_snapshot`].
+pub(crate) struct RegExpPre {
+    pattern_is_regexp: bool,
+    real_regexp: Option<(String, String)>,
+    exact_bytes: Option<Vec<u8>>,
+}
+
 impl<'p> Vm<'p> {
     /// `key in obj` — does `obj` have the property `key`? Own object keys, a
     /// class instance's inherited methods/getters, array indices / `length`,
@@ -481,16 +489,38 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// The EvalScopes visible to a frame, INNERMOST FIRST: its own (or, failing
+    /// that, the one stamped on its callee), then each enclosing scope reached
+    /// through `eval_scope_parent`. These are nested variable environments, so a
+    /// name must be resolved against all of them — a closure that runs its own
+    /// direct eval has a scope of its own AND still sees the one it was created
+    /// under.
+    pub(crate) fn eval_scope_chain(&self, frame_idx: usize) -> impl Iterator<Item = u32> + '_ {
+        let mut cur = self.frame_eval_scope(frame_idx);
+        // Bounded: the parent links form a chain of activations, never a cycle,
+        // but a corrupt one must not hang the engine.
+        let mut budget = 64;
+        std::iter::from_fn(move || {
+            let sc = cur?;
+            budget -= 1;
+            cur = if budget > 0 { self.eval_scope_parent.get(&sc).copied() } else { None };
+            Some(sc)
+        })
+    }
+
     /// Dynamic-first lookup for the LoadGlobalDyn family: the current
     /// activation's EvalScope binding for the slot's NAME, if any.
     pub(crate) fn eval_scope_lookup(&self, idx: u32) -> Option<Value> {
         let fi = self.frames.len().checked_sub(1)?;
-        let sc = self.frame_eval_scope(fi)?;
         let name = self.global_slot_name(idx)?;
-        match self.heap.get(sc) {
-            HeapObj::EvalScope(m) => m.get(&name).copied(),
-            _ => None,
+        for sc in self.eval_scope_chain(fi) {
+            if let HeapObj::EvalScope(m) = self.heap.get(sc) {
+                if let Some(v) = m.get(&name) {
+                    return Some(*v);
+                }
+            }
         }
+        None
     }
 
     /// Dynamic-first store: write an EXISTING EvalScope binding; false = fall
@@ -499,13 +529,16 @@ impl<'p> Vm<'p> {
         let Some(fi) = self.frames.len().checked_sub(1) else {
             return false;
         };
-        let Some(sc) = self.frame_eval_scope(fi) else {
-            return false;
-        };
         let Some(name) = self.global_slot_name(idx) else {
             return false;
         };
-        if let HeapObj::EvalScope(m) = self.heap.get_mut(sc) {
+        // Innermost binding of the name wins, exactly as the read does.
+        let Some(target) = self.eval_scope_chain(fi).find(|&sc| {
+            matches!(self.heap.get(sc), HeapObj::EvalScope(m) if m.contains_key(&name))
+        }) else {
+            return false;
+        };
+        if let HeapObj::EvalScope(m) = self.heap.get_mut(target) {
             if let Some(slot) = m.get_mut(&name) {
                 *slot = v;
                 return true;
@@ -1545,10 +1578,23 @@ impl<'p> Vm<'p> {
     /// A RegExp pattern contributes its source (+ its flags when none are given);
     /// else ToString. Validates flags + compiles via `regress` (bad → SyntaxError).
     pub(crate) fn build_regexp(&mut self, p: Value, f: Value) -> Result<Value, Thrown> {
-        // Step 1: IsRegExp(pattern) — an OBSERVABLE Get(pattern, @@match) which
-        // may MUTATE the pattern (e.g. a getter calling pattern.compile(..)), so
-        // it must run BEFORE the [[OriginalSource]]/[[OriginalFlags]] snapshot.
-        // (Non-objects return false with no Get.)
+        let pre = self.regexp_pattern_snapshot(p)?;
+        self.build_regexp_snapshot(p, f, pre)
+    }
+
+    /// The RegExp constructor's steps 1-4a: every OBSERVABLE read of `pattern`
+    /// that PRECEDES RegExpAlloc — `IsRegExp(pattern)` plus, for a real RegExp
+    /// exotic, its [[OriginalSource]]/[[OriginalFlags]]. Split out so
+    /// `Reflect.construct(RegExp, [re], nt)` can run RegExpAlloc's `Get(nt,
+    /// "prototype")` between this and RegExpInitialize: a `prototype` getter that
+    /// calls `re.compile("b")` must not change the source the new RegExp is built
+    /// from (staging/sm/RegExp/constructor-ordering.js), while `ToString(flags)`
+    /// stays in RegExpInitialize, i.e. AFTER the lookup
+    /// (staging/sm/RegExp/constructor-ordering-2.js).
+    pub(crate) fn regexp_pattern_snapshot(&mut self, p: Value) -> Result<RegExpPre, Thrown> {
+        // IsRegExp is an observable Get(pattern, @@match) which may itself MUTATE
+        // the pattern, so it runs before the slot snapshot. (Non-objects return
+        // false with no Get.)
         let pattern_is_regexp = self.is_regexp(p)?;
         // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when
         // none are given) via its slots, regardless of a falsy @@match override.
@@ -1569,6 +1615,17 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
+        Ok(RegExpPre { pattern_is_regexp, real_regexp, exact_bytes })
+    }
+
+    /// RegExpInitialize against an already-taken pattern snapshot.
+    pub(crate) fn build_regexp_snapshot(
+        &mut self,
+        p: Value,
+        f: Value,
+        pre: RegExpPre,
+    ) -> Result<Value, Thrown> {
+        let RegExpPre { pattern_is_regexp, real_regexp, exact_bytes } = pre;
         let (source, inherited) = if let Some((src, fl)) = real_regexp {
             (src, Some(fl))
         } else if p.is_undefined() {

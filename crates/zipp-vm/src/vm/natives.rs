@@ -457,6 +457,18 @@ impl<'p> Vm<'p> {
             HeapObj::Native(nid) => native::static_name_length(*nid)
                 .map(|(n, _)| n.to_string())
                 .or_else(|| native::proto_method(*nid).map(|(n, _, _)| n.to_string()))
+                // The Math namespace methods live in their own table, so
+                // `Math.asin.toString()` rendered the anonymous
+                // `function () { [native code] }`
+                // (staging/sm/Function/function-toString-builtin-name.js).
+                .or_else(|| native::math_method(*nid).map(|(n, _, _)| n.to_string()))
+                .unwrap_or_default(),
+            // A constructor global (Array, Date, …) is modelled as an is_ctor
+            // Object whose `name` is a real own property — same omission as above.
+            HeapObj::Object(m) if m.is_ctor => m
+                .get("name")
+                .filter(|v| v.is_heap() && self.heap.is_str_like(v.heap_index()))
+                .map(|v| self.display(v))
                 .unwrap_or_default(),
             _ => String::new(),
         };
@@ -4085,9 +4097,13 @@ impl<'p> Vm<'p> {
                 self.lookup_accessor_checked(this, &key, id == OBJPROTO_LOOKUP_SETTER)?
             }
             OBJPROTO_PROTO_GET => {
-                // `get __proto__`: RequireObjectCoercible(this) before ToObject.
+                // `get __proto__` (B.2.2.1.1) is `? ToObject(this).[[GetPrototypeOf]]()`.
+                // Passing a PRIMITIVE straight to [[GetPrototypeOf]] answered null
+                // (`(42).__proto__`, `"s".__proto__` — and so `{__proto__: t} = 42`,
+                // which is an ordinary Get of that key, not the literal's proto-setter).
                 self.require_object_coercible(this)?;
-                self.get_prototype_of_checked(this)?
+                let o = self.to_object(this)?;
+                self.get_prototype_of_checked(o)?
             }
             OBJPROTO_PROTO_SET => {
                 // `set __proto__`: RequireObjectCoercible(this) first; a non-object/
@@ -5491,38 +5507,69 @@ impl<'p> Vm<'p> {
                 {
                     return Err(Thrown(format!("RangeError: invalid unit: {unit_raw}")));
                 }
-                // The value is rendered by the service's own number formatting
-                // (so 1000 groups as "1,000"); the surrounding pattern is the
-                // en "always" pattern — the CLDR dateFields for other locales,
-                // widths and the numeric:"auto" literals are data zipp lacks.
-                let n = v.abs();
-                let plural = (n - 1.0).abs() > f64::EPSILON;
-                let unit_str = if plural { format!("{unit}s") } else { unit.clone() };
-                // The interpolated number is decomposed like NumberFormat's, and
-                // every one of ITS parts (but none of the surrounding literals)
-                // carries the singular `unit` field.
-                let mut parts: Vec<(String, String, &str)> = vec![];
+                let style = self.display(self.intl_slot(rtf_resolved, "style"));
+                let numeric = self.display(self.intl_slot(rtf_resolved, "numeric"));
                 // PartitionRelativeTimePattern step 5 selects "past" when
                 // value < 0 **or value is -0** — the sign bit, not the ordering,
                 // so `format(-0, "second")` is "0 seconds ago", not "in 0 seconds".
                 let past = v.is_sign_negative();
-                if !past {
-                    parts.push(("literal".into(), "in ".into(), ""));
+                let n = v.abs();
+                let mut parts: Vec<(String, String, &str)> = vec![];
+                // Step 4: with numeric "auto", an exact integer that CLDR gives an
+                // idiomatic name ("yesterday", "now", "next quarter") replaces the
+                // whole pattern with one literal part. `-0` and `+0` share the
+                // key "0", which is why `format(-0, "day")` is "today".
+                let auto_lit = if numeric == "auto" && v.fract() == 0.0 && v.abs() < 2.0e9 {
+                    let key = v as i32;
+                    crate::vm::cldr_en::RELATIVE_LITERALS
+                        .iter()
+                        .find(|(u, s, o, _)| *u == unit && *s == style && *o == key)
+                        .map(|(.., t)| (*t).to_string())
+                } else {
+                    None
+                };
+                if let Some(lit) = auto_lit {
+                    parts.push(("literal".into(), lit, ""));
+                    if to_parts {
+                        return Ok(self.intl_parts_array_keyed(&parts, "unit"));
+                    }
+                    let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+                    return Ok(self.alloc_str(s));
                 }
-                // The interpolated number goes through the service's resolved
-                // numbering system, exactly as PartitionNumberPattern would
-                // (`en-us-numbering-systems.js` compares it against
+                // Otherwise the CLDR `relativeTimePattern` for (unit, style,
+                // tense, plural category) wraps the number. `en`'s cardinal rule
+                // is `i = 1 and v = 0`, so only an integral 1 takes "one"
+                // ("in 1 second" vs "in 1.5 seconds").
+                let one = n == 1.0;
+                let row = crate::vm::cldr_en::RELATIVE_PATTERNS
+                    .iter()
+                    .find(|(u, s, ..)| *u == unit && *s == style);
+                let pattern = match (row, past, one) {
+                    (Some((.., f1, _, _, _)), false, true) => *f1,
+                    (Some((.., _, fo, _, _)), false, false) => *fo,
+                    (Some((.., _, _, p1, _)), true, true) => *p1,
+                    (Some((.., _, _, _, po)), true, false) => *po,
+                    (None, false, _) => "in {0}",
+                    (None, true, _) => "{0} ago",
+                };
+                let (prefix, suffix) = pattern.split_once("{0}").unwrap_or((pattern, ""));
+                if !prefix.is_empty() {
+                    parts.push(("literal".into(), prefix.to_string(), ""));
+                }
+                // The interpolated number is decomposed like NumberFormat's, and
+                // every one of ITS parts (but none of the surrounding literals)
+                // carries the singular `unit` field. It goes through the service's
+                // resolved numbering system, exactly as PartitionNumberPattern
+                // would (`en-us-numbering-systems.js` compares it against
                 // `Intl.NumberFormat(locale).format(value)`).
                 let rtf_ns = self.display(self.intl_slot(rtf_resolved, "numberingSystem"));
                 for (t, val) in grouped_decimal_parts(n) {
                     let val = crate::vm::intl::translate_digits(&val, &rtf_ns);
                     parts.push((t.to_string(), val, unit.as_str()));
                 }
-                parts.push((
-                    "literal".into(),
-                    if past { format!(" {unit_str} ago") } else { format!(" {unit_str}") },
-                    "",
-                ));
+                if !suffix.is_empty() {
+                    parts.push(("literal".into(), suffix.to_string(), ""));
+                }
                 if to_parts {
                     self.intl_parts_array_keyed(&parts, "unit")
                 } else {
@@ -5539,13 +5586,27 @@ impl<'p> Vm<'p> {
                 // `of("00")`/`of("seconds")` silently echoed the code back.
                 let code = crate::vm::intl::canonical_display_names_code(&ty, &code)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid {ty} code: {code}")))?;
-                // The display names themselves are CLDR data this engine does
-                // not ship, so every code takes the [[Fallback]] path.
-                let fb = self.display(self.intl_slot(resolved, "fallback"));
-                if fb == "none" {
-                    Value::UNDEFINED
-                } else {
-                    self.alloc_str(code)
+                // The `en` calendar names are real CLDR (`localeDisplayNames`);
+                // every other display-name type is data this engine does not
+                // ship, so those codes still take the [[Fallback]] path.
+                let named = (ty == "calendar")
+                    .then(|| {
+                        crate::vm::cldr_en::CALENDAR_NAMES
+                            .iter()
+                            .find(|(k, _)| *k == code)
+                            .map(|(_, v)| (*v).to_string())
+                    })
+                    .flatten();
+                match named {
+                    Some(name) => self.alloc_str(name),
+                    None => {
+                        let fb = self.display(self.intl_slot(resolved, "fallback"));
+                        if fb == "none" {
+                            Value::UNDEFINED
+                        } else {
+                            self.alloc_str(code)
+                        }
+                    }
                 }
             }
             INTL_LOCALE_TOSTRING => {

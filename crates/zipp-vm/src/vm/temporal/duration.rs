@@ -265,8 +265,18 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                if let Some((start, zoned, off, cal)) = anchor {
-                    check_relative_target(cal, start, &f, zoned, off, true)?;
+                if let Some((start, tz, off, cal)) = anchor {
+                    // A ZONED anchor makes every date unit irregular — a day is
+                    // 23/24/25 hours — so the whole total goes through
+                    // AddZonedDateTime + DifferenceZonedDateTimeWithTotal, even
+                    // for a time unit (1 day totalled in hours is 25 across a
+                    // fall-back).
+                    if let Some(id) = tz {
+                        let ns1 = dt_epoch_ns(start) - off as i128;
+                        let ns2 = add_zoned(cal, &id, ns1, &f)?;
+                        return Ok(Some(Value::num(diff_zoned_total(cal, &id, ns1, ns2, &unit)?)));
+                    }
+                    check_relative_target(cal, start, &f, false, off, true)?;
                     if needs_cal {
                         // Calendar-relative totals stay on the i64 record (the
                         // calendar fields are small; exactness lives in the
@@ -277,23 +287,6 @@ impl<'p> Vm<'p> {
                             start,
                             &unit,
                         )?)));
-                    }
-                    // TotalRelativeDuration with a zoned anchor and unit "day":
-                    // NudgeToCalendarUnit materializes the NEXT day boundary
-                    // (truncated days + sign) as an instant, which must be
-                    // representable even when the result itself is exact.
-                    if zoned && unit == "day" {
-                        let diff_ns = dur_end_epoch_ns(cal, start, &f) - dt_epoch_ns(start);
-                        let s: i128 = if diff_ns < 0 { -1 } else { 1 };
-                        let mut upper = [0i64; 10];
-                        upper[3] = (diff_ns / DAY_NS + s) as i64;
-                        let upper_wall = dt_add_dur(cal, start, upper);
-                        if (dt_epoch_ns(upper_wall) - off as i128).abs() > NS_MAX_INSTANT {
-                            return Err(Thrown(
-                                "RangeError: Temporal result is outside the representable range"
-                                    .into(),
-                            ));
-                        }
                     }
                 }
                 let total_ns = dur_day_time_ns(&f);
@@ -423,8 +416,19 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                if let Some((start, zoned, off, cal)) = anchor {
-                    check_relative_target(cal, start, &f, zoned, off, true)?;
+                if let Some((start, tz, off, cal)) = anchor {
+                    // A ZONED anchor: round the span anchor → anchor+duration in
+                    // the real zone (DifferenceZonedDateTimeWithRounding), so a
+                    // 25-hour day balances as P1D and half a 23-hour day is 11:30.
+                    if let Some(id) = tz {
+                        let ns1 = dt_epoch_ns(start) - off as i128;
+                        let ns2 = add_zoned(cal, &id, ns1, &f)?;
+                        let r = diff_zoned_rounded(
+                            cal, &id, ns1, ns2, &largest, inc, &smallest, &mode,
+                        )?;
+                        return Ok(Some(self.make_duration(r)));
+                    }
+                    check_relative_target(cal, start, &f, false, off, true)?;
                     // Calendar-relative rounding stays on the i64 record; the
                     // exact range check above already ran on the f64 record.
                     let r = self.round_duration_relative(
@@ -435,8 +439,6 @@ impl<'p> Vm<'p> {
                         &largest,
                         inc,
                         &mode,
-                        zoned,
-                        off,
                     )?;
                     return Ok(Some(self.make_duration(r.map(|x| x as f64))));
                 }

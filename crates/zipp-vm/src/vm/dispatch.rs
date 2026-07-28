@@ -4137,6 +4137,14 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    Instr::SetLiteralProto { obj, val } => {
+                        let o = self.get(base, obj);
+                        let v = self.get(base, val);
+                        if o.is_heap() && (self.is_object_value(v) || v == Value::NULL) {
+                            let _ = self.ordinary_set_prototype_of(o, v)?;
+                        }
+                        ip += 1;
+                    }
                     Instr::InitDataProp { obj, name, val } => {
                         // CreateDataProperty on a fresh object-literal object: a plain
                         // own w/e/c data property, ignoring the prototype chain.
@@ -4201,7 +4209,11 @@ impl<'p> Vm<'p> {
                         // inside a function the eval itself declared).
                         if let Some(name) = self.global_slot_name(slot) {
                             if let Some(fi) = self.frames.len().checked_sub(1) {
-                                if let Some(sc) = self.frame_eval_scope(fi) {
+                                // Innermost binding of the name, as the read does.
+                                let owner = self.eval_scope_chain(fi).find(|&sc| {
+                                    matches!(self.heap.get(sc), HeapObj::EvalScope(m) if m.contains_key(&name))
+                                });
+                                if let Some(sc) = owner {
                                     let removed = match self.heap.get_mut(sc) {
                                         HeapObj::EvalScope(m) => m.remove(&name).is_some(),
                                         _ => false,
@@ -4411,10 +4423,18 @@ impl<'p> Vm<'p> {
                             let eval_scope_idx = if !var_env_is_global && !strict_caller {
                                 let fi = self.frames.len() - 1;
                                 if self.frames[fi].eval_scope == u32::MAX {
+                                    // A closure stamped with its CREATOR's eval
+                                    // scope keeps seeing it: the fresh scope this
+                                    // activation's own eval declares into is
+                                    // NESTED inside it, not a replacement.
+                                    let outer = self.frame_eval_scope(fi);
                                     let s = self.heap.alloc(HeapObj::EvalScope(
                                         std::collections::HashMap::new(),
                                     ));
                                     self.frames[fi].eval_scope = s;
+                                    if let Some(p) = outer {
+                                        self.eval_scope_parent.insert(s, p);
+                                    }
                                 }
                                 Some(self.frames[fi].eval_scope)
                             } else {

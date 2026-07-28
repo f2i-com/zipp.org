@@ -35,11 +35,7 @@ impl<'p> Vm<'p> {
             }
             // GetFunctionRealm(newTarget) throws on a REVOKED proxy — the
             // `prototype` Get's trap may have just revoked it.
-            if let Some((_, _, true)) = self.proxy_parts(new_target.heap_index()) {
-                return Err(Thrown(
-                    "TypeError: Cannot construct: newTarget is a revoked proxy".into(),
-                ));
-            }
+            self.check_function_realm_reachable(new_target)?;
             // Non-object prototype: GetPrototypeFromConstructor falls back to
             // GetFunctionRealm(newTarget)'s intrinsic prototype — the realm's
             // image of `default` when it IS an intrinsic (Iterator), else the
@@ -55,6 +51,39 @@ impl<'p> Vm<'p> {
             }
         }
         Ok(default)
+    }
+
+    /// GetFunctionRealm (10.2.5) reduced to its only OBSERVABLE effect: a REVOKED
+    /// Proxy anywhere in the bound-target / proxy-target unwrap chain throws a
+    /// TypeError (step 3.a). GetPrototypeFromConstructor reaches it exactly when
+    /// `Get(newTarget, "prototype")` did NOT return an object — which is the case
+    /// a `get` trap that revokes its own proxy and returns undefined produces, for
+    /// every built-in constructor
+    /// (staging/sm/Proxy/revoked-get-function-realm-typeerror.js).
+    pub(crate) fn check_function_realm_reachable(&self, f: Value) -> Result<(), Thrown> {
+        let mut cur = f;
+        // Bounded: a proxy/bound chain is acyclic by construction, but a corrupt
+        // one must not hang the engine.
+        for _ in 0..1000 {
+            if !cur.is_heap() {
+                return Ok(());
+            }
+            let idx = cur.heap_index();
+            if let Some((target, _, revoked)) = self.proxy_parts(idx) {
+                if revoked {
+                    return Err(Thrown(
+                        "TypeError: Cannot get the function realm of a revoked proxy".into(),
+                    ));
+                }
+                cur = target;
+                continue;
+            }
+            match self.heap.get(idx) {
+                HeapObj::Bound { target, .. } => cur = *target,
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     /// For a cross-realm `new_target` whose `prototype` is not an object, the
@@ -84,6 +113,10 @@ impl<'p> Vm<'p> {
             if self.is_object_value(p) {
                 return Ok(Some(p));
             }
+            // GetPrototypeFromConstructor step 3.a: a non-object `prototype`
+            // falls back to GetFunctionRealm(newTarget), which THROWS when the
+            // constructor is a revoked Proxy.
+            self.check_function_realm_reachable(new_target)?;
             if let Some(rp) = self.realm_proto_fallback(new_target, default_proto) {
                 return Ok(Some(Value::heap(rp)));
             }
@@ -574,6 +607,19 @@ impl<'p> Vm<'p> {
                     self.display(a0)
                 )));
             }
+            // RegExp(pattern, flags) snapshots the pattern's [[OriginalSource]] /
+            // [[OriginalFlags]] in steps 4-6, BEFORE RegExpAlloc (step 7) reads
+            // newTarget.prototype. Building it after the shared override below
+            // let a `prototype` getter that calls `pattern.compile(…)` change the
+            // source the new RegExp is built from
+            // (staging/sm/RegExp/constructor-ordering.js: source became "b").
+            if p == self.regexp_proto && self.regexp_proto != 0 {
+                let pre = self.regexp_pattern_snapshot(a0)?;
+                let over = self.newtarget_proto_override(new_target, cv, p)?;
+                let f = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let r = self.build_regexp_snapshot(a0, f, pre)?;
+                return Ok(self.set_ctor_proto(r, over));
+            }
             // OrdinaryCreateFromConstructor: a foreign newTarget (Reflect.construct /
             // cross-realm / derived super) sets the instance's [[Prototype]] to
             // newTarget.prototype rather than the built-in's default `p`.
@@ -638,10 +684,6 @@ impl<'p> Vm<'p> {
                     self.to_str_value(a0)?
                 };
                 let r = Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 0, value: sv }));
-                return Ok(self.set_ctor_proto(r, over));
-            }
-            if p == self.regexp_proto && self.regexp_proto != 0 {
-                let r = self.build_regexp(a0, args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.map_proto && self.map_proto != 0 {

@@ -1368,11 +1368,13 @@ impl<'a> FnCompiler<'a> {
             let fid = self.cx.functions.len() - 1;
             self.cx.functions[fid].non_constructable = true; // concise method
         }
-        // `{ __proto__: v }` sets the prototype — a real [[Set]]/proto-setter;
-        // every other key is CreateDataProperty, which must ignore an
-        // inherited accessor / non-writable prop.
+        // `{ __proto__: v }` sets the prototype through the B.3.1 SPECIAL FORM —
+        // a direct [[SetPrototypeOf]], NOT a [[Set]] of the key, so it is
+        // unaffected by `delete Object.prototype.__proto__` or a replacement
+        // `set __proto__` accessor. Every other key is CreateDataProperty, which
+        // must ignore an inherited accessor / non-writable prop.
         if is_proto {
-            self.emit(Instr::SetProp { obj, name, val: v });
+            self.emit(Instr::SetLiteralProto { obj, val: v });
         } else if all_appendable {
             self.emit(Instr::AppendDataProp { obj, name, val: v });
         } else {

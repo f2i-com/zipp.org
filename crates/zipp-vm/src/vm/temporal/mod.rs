@@ -540,6 +540,437 @@ pub(crate) fn tz_local_to_instant(
     }
 }
 
+// ── the zoned duration machinery ───────────────────────────────────────────
+//
+// A day in a real time zone is 23, 24 or 25 hours long (23.5 in Lord Howe, and
+// 23.5 again in 1919 Toronto, which sprang forward at 23:30). So a duration's
+// DATE part has to move on the WALL CLOCK and be re-zoned, while its TIME part
+// stays exact elapsed nanoseconds — and every "how far between here and there"
+// question has to measure the bracket on the timeline rather than assume 86400
+// seconds. Everything below follows the specification's zoned algorithms
+// (AddZonedDateTime, DifferenceZonedDateTime, NudgeTo*, BubbleRelativeDuration,
+// RoundRelativeDuration, TotalRelativeDuration) literally. `tz` may be an
+// offset zone, which simply makes every day exactly 24 hours again.
+
+/// GetISODateTimeFor: the wall clock `tz` shows at an instant.
+fn zoned_wall(tz: &str, ns: i128) -> [i64; 9] {
+    let local = ns + tz_offset_ns_at(tz, ns) as i128;
+    let (y, mo, d) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
+    let t = ns_to_time(local.rem_euclid(DAY_NS));
+    [y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]]
+}
+
+/// GetEpochNanosecondsFor(tz, dt, COMPATIBLE), with the CheckISODaysRange and
+/// IsValidEpochNanoseconds guards that plain `tz_local_to_instant` leaves to its
+/// callers: the bracket endpoints this machinery materializes are exactly where
+/// an out-of-range instant surfaces, and each must be a RangeError.
+fn zoned_epoch(tz: &str, dt: [i64; 9]) -> Result<i128, Thrown> {
+    let oor =
+        || Thrown("RangeError: Temporal result is outside the representable range".to_string());
+    if iso_to_epoch_days(dt[0], dt[1], dt[2]).abs() > 100_000_000 {
+        return Err(oor());
+    }
+    let ns = tz_local_to_instant(tz, dt_epoch_ns(dt), "compatible")?;
+    if ns.abs() > NS_MAX_INSTANT {
+        return Err(oor());
+    }
+    Ok(ns)
+}
+
+/// The hours-and-below part of a duration in nanoseconds, exactly. DAYS are
+/// excluded on purpose — in a zone a day is not 24 hours.
+fn dur_time_only_ns(f: &[f64; 10]) -> i128 {
+    (f[4] as i128) * 3_600_000_000_000
+        + (f[5] as i128) * 60_000_000_000
+        + (f[6] as i128) * 1_000_000_000
+        + (f[7] as i128) * 1_000_000
+        + (f[8] as i128) * 1_000
+        + (f[9] as i128)
+}
+
+/// AddZonedDateTime: the y/mo/w/d part moves on the wall clock and is re-zoned
+/// with "compatible" disambiguation; the h..ns part is then exact elapsed time.
+/// "+1 day" across a spring-forward is 23 real hours; "+24 hours" is 24.
+pub(crate) fn add_zoned(cal: Cal, tz: &str, ns: i128, f: &[f64; 10]) -> Result<i128, Thrown> {
+    let oor =
+        || Thrown("RangeError: Temporal result is outside the representable range".to_string());
+    let time_ns = dur_time_only_ns(f);
+    let out = if f[..4].iter().all(|&x| x == 0.0) {
+        ns + time_ns
+    } else {
+        let moved = dt_add_dur(
+            cal,
+            zoned_wall(tz, ns),
+            [f[0] as i64, f[1] as i64, f[2] as i64, f[3] as i64, 0, 0, 0, 0, 0, 0],
+        );
+        if !iso_datetime_ns_in_range(moved) {
+            return Err(oor());
+        }
+        zoned_epoch(tz, moved)? + time_ns
+    };
+    if out.abs() > NS_MAX_INSTANT {
+        return Err(oor());
+    }
+    Ok(out)
+}
+
+/// The instant a DATE-only duration reaches from `origin`, via AddZonedDateTime.
+///
+/// Every bracket and intermediate point in this machinery goes through here
+/// rather than re-materializing a wall clock, because AddZonedDateTime is the
+/// IDENTITY for a zero date duration. An origin inside the SECOND occurrence of
+/// a repeated hour has a wall clock whose "compatible" disambiguation is the
+/// FIRST occurrence, so re-materializing it silently moves the anchor an hour
+/// and measures a 25-hour bracket where the real one is 24
+/// (tc39/proposal-temporal#3148, and #3141 for the same effect in
+/// DifferenceZonedDateTime).
+fn zoned_step(cal: Cal, tz: &str, origin: i128, d: [i64; 4]) -> Result<i128, Thrown> {
+    let mut f = [0f64; 10];
+    for i in 0..4 {
+        f[i] = d[i] as f64;
+    }
+    add_zoned(cal, tz, origin, &f)
+}
+
+/// DifferenceZonedDateTime: the date part is measured on the wall clock in `tz`,
+/// the remainder is exact elapsed time. The day-correction loop is the
+/// specification's — a DST shift can leave that remainder pointing backwards
+/// (2000-04-02T01:30 → 04:30 in Vancouver is 2 hours, not 1 day minus 22), and
+/// the intermediate date then steps one day back toward the start until it does
+/// not. Whatever it settles on is exact by construction: the intermediate
+/// instant plus the remainder IS ns2. Returns
+/// ([years, months, weeks, days], remaining nanoseconds).
+fn difference_zoned(
+    cal: Cal,
+    tz: &str,
+    ns1: i128,
+    ns2: i128,
+    largest: &str,
+) -> Result<([i64; 4], i128), Thrown> {
+    if ns1 == ns2 {
+        return Ok(([0; 4], 0));
+    }
+    let s = zoned_wall(tz, ns1);
+    let e = zoned_wall(tz, ns2);
+    let sign: i64 = if ns2 > ns1 { 1 } else { -1 };
+    // Going forward a spring-forward can need two days of correction; going
+    // back, one.
+    let max_corr = if sign > 0 { 2 } else { 1 };
+    let s_days = iso_to_epoch_days(s[0], s[1], s[2]);
+    let e_days = iso_to_epoch_days(e[0], e[1], e[2]);
+    let st = time_to_ns(&[s[3], s[4], s[5], s[6], s[7], s[8]]);
+    let et = time_to_ns(&[e[3], e[4], e[5], e[6], e[7], e[8]]);
+    // An end wall TIME on the far side of the start's, relative to the direction
+    // of travel, means the whole-day part has overshot: 2000-05-02T02:00 back to
+    // 2000-04-02T03:00 in Vancouver is −29 days −23 hours, not −1 month (the
+    // uncorrected −30 days lands on 02:00, an hour that does not exist, and
+    // disambiguating it forward hides the overshoot).
+    let mut first = if (et - st).signum() as i64 == -sign { 1 } else { 0 };
+    // …unless correcting would push the DATE part backwards, which happens when
+    // the start's own wall clock is the SECOND occurrence of a repeated hour: the
+    // clocks run backwards there while the instants run forwards, and the
+    // uncorrected step — which AddZonedDateTime resolves as the identity, keeping
+    // the anchor on its own side of the fold — is the right one (#3141).
+    if first == 1 && (e_days - sign - s_days).signum() as i64 == -sign {
+        first = 0;
+    }
+    let mut fallback = None;
+    let mut chosen = None;
+    for corr in first..=max_corr {
+        let idays = e_days - corr * sign;
+        let inter = epoch_days_to_iso(idays);
+        // A candidate that leaves the representable instant range is skipped,
+        // not raised: both endpoints ARE representable, so such a candidate lies
+        // beyond ns2 and the sign test below would reject it anyway. Letting it
+        // throw turned `instance.until(limit, {largestUnit:"years"})` — an
+        // ordinary difference — into a RangeError.
+        let Ok(ins) = zoned_step(cal, tz, ns1, [0, 0, 0, idays - s_days]) else { continue };
+        let t = ns2 - ins;
+        fallback = Some((inter, t));
+        if t.signum() as i64 != -sign {
+            chosen = Some((inter, t));
+            break;
+        }
+    }
+    let (inter, time_ns) = chosen.or(fallback).unwrap_or(((e[0], e[1], e[2]), 0));
+    let date_largest = if matches!(largest, "year" | "month" | "week") { largest } else { "day" };
+    Ok((cal_difference_date(cal, (s[0], s[1], s[2]), inter, date_largest), time_ns))
+}
+
+/// The outcome of a nudge: the rounded date part, the rounded time remainder,
+/// the instant the rounded duration lands on, and whether it expanded to the
+/// away-from-zero bracket (which is what BubbleRelativeDuration keys on).
+struct Nudge {
+    date: [i64; 4],
+    time_ns: i128,
+    nudged_ns: i128,
+    expanded: bool,
+}
+
+/// round_fraction with the fraction given EXACTLY as `num`/`den` (both
+/// magnitudes, `num` ≤ `den`) rather than as an f64. The half of a 25-hour day
+/// is 45000000000000 out of 90000000000000 nanoseconds; an f64 quotient cannot
+/// be trusted to land on the right side of a tie at that magnitude.
+pub(crate) fn round_fraction_exact(
+    lower: i64,
+    sign: i64,
+    num: i128,
+    den: i128,
+    mode: &str,
+) -> i64 {
+    if num == 0 {
+        return lower;
+    }
+    let upper = lower + sign;
+    let pick_upper = match mode {
+        "ceil" => sign > 0,
+        "floor" => sign < 0,
+        "trunc" => false,
+        "expand" => true,
+        _ => {
+            let twice = 2 * num;
+            if twice > den {
+                true
+            } else if twice < den {
+                false
+            } else {
+                match mode {
+                    "halfCeil" => sign > 0,
+                    "halfFloor" => sign < 0,
+                    "halfTrunc" => false,
+                    "halfEven" => upper.rem_euclid(2) == 0,
+                    _ => true, // halfExpand (default)
+                }
+            }
+        }
+    };
+    if pick_upper { upper } else { lower }
+}
+
+/// NudgeToCalendarUnit: bracket the duration between the two whole multiples of
+/// `unit` around it (r1 toward zero, r2 away), materialize both brackets as
+/// instants in the zone, and choose per `mode` from the exact fraction between
+/// them. That fraction is what makes a 25-hour day count as 25 hours. Returns
+/// the nudge plus [[Total]] — r1 plus the fraction, which is what
+/// `Duration.prototype.total` reports for a calendar unit (and for "day" in a
+/// zone).
+fn nudge_calendar(
+    cal: Cal,
+    tz: &str,
+    origin: i128,
+    date: [i64; 4],
+    dest_ns: i128,
+    sign: i64,
+    inc: i64,
+    unit: &str,
+    mode: &str,
+) -> Result<(Nudge, f64), Thrown> {
+    let start = zoned_wall(tz, origin);
+    let step = inc * sign;
+    let (r1, sd, ed): (i64, [i64; 4], [i64; 4]) = match unit {
+        "year" => {
+            let k = (date[0] / inc) * inc;
+            (k, [k, 0, 0, 0], [k + step, 0, 0, 0])
+        }
+        "month" => {
+            let k = (date[1] / inc) * inc;
+            (k, [date[0], k, 0, 0], [date[0], k + step, 0, 0])
+        }
+        "week" => {
+            // Weeks are counted from the years+months anchor, so the days part
+            // of the duration has to be re-expressed as whole weeks first.
+            let ym = dt_add_dur(cal, start, [date[0], date[1], 0, 0, 0, 0, 0, 0, 0, 0]);
+            let we = epoch_days_to_iso(iso_to_epoch_days(ym[0], ym[1], ym[2]) + date[3]);
+            let u = cal_difference_date(cal, (ym[0], ym[1], ym[2]), we, "week");
+            let k = ((date[2] + u[2]) / inc) * inc;
+            (k, [date[0], date[1], k, 0], [date[0], date[1], k + step, 0])
+        }
+        _ => {
+            let k = (date[3] / inc) * inc;
+            (k, [date[0], date[1], date[2], k], [date[0], date[1], date[2], k + step])
+        }
+    };
+    let s_ns = zoned_step(cal, tz, origin, sd)?;
+    let e_ns = zoned_step(cal, tz, origin, ed)?;
+    let den = e_ns - s_ns;
+    let num = dest_ns - s_ns;
+    // total = r1 + (num/den)·inc·sign, as ONE correctly-rounded rational — the
+    // separate multiply-then-add would round twice.
+    let total = if den == 0 {
+        r1 as f64
+    } else {
+        rational_to_f64(r1 as i128 * den + num * inc as i128 * sign as i128, den)
+    };
+    let expanded = den != 0
+        && round_fraction_exact(r1 / inc, sign, num.abs(), den.abs(), mode) != r1 / inc;
+    let (date, nudged_ns) = if expanded { (ed, e_ns) } else { (sd, s_ns) };
+    Ok((Nudge { date, time_ns: 0, nudged_ns, expanded }, total))
+}
+
+/// NudgeToZonedTime: round only the TIME part, against the length of the real
+/// zoned day it sits in — halfway through a 25-hour day is 12:30, not 12:00 —
+/// and carry a whole day when the rounded time reaches the far boundary.
+fn nudge_zoned_time(
+    cal: Cal,
+    tz: &str,
+    origin: i128,
+    date: [i64; 4],
+    time_ns: i128,
+    sign: i64,
+    inc: i128,
+    unit: &str,
+    mode: &str,
+) -> Result<Nudge, Thrown> {
+    let s_ns = zoned_step(cal, tz, origin, date)?;
+    let e_ns = zoned_step(cal, tz, origin, [date[0], date[1], date[2], date[3] + sign])?;
+    let step = unit_ns(unit) * inc;
+    let rounded = round_increment(time_ns, step, mode);
+    let beyond = rounded - (e_ns - s_ns);
+    // The rounded time reached (or passed) the far day boundary: carry the day
+    // and keep what is left over past it.
+    if beyond.signum() as i64 != -sign {
+        let r = round_increment(beyond, step, mode);
+        return Ok(Nudge {
+            date: [date[0], date[1], date[2], date[3] + sign],
+            time_ns: r,
+            nudged_ns: e_ns + r,
+            expanded: true,
+        });
+    }
+    Ok(Nudge {
+        date,
+        time_ns: rounded,
+        nudged_ns: s_ns + rounded,
+        expanded: false,
+    })
+}
+
+/// BubbleRelativeDuration: a smallest unit that rounded up to a whole larger one
+/// folds into it — 31 days from 1 January is 1 month, not 1 month 0 days — with
+/// each larger unit's endpoint materialized as a real zoned instant.
+fn bubble_relative(
+    cal: Cal,
+    tz: &str,
+    origin: i128,
+    mut date: [i64; 4],
+    nudged_ns: i128,
+    sign: i64,
+    largest: &str,
+    smallest: &str,
+) -> Result<[i64; 4], Thrown> {
+    const ORDER: [&str; 4] = ["year", "month", "week", "day"];
+    let rank = |u: &str| ORDER.iter().position(|&x| x == u).unwrap_or(3);
+    let (li, si) = (rank(largest), rank(smallest));
+    let mut i = si as i64 - 1;
+    while i >= li as i64 {
+        let unit = ORDER[i as usize];
+        // Days never bubble into weeks unless weeks are what was asked for:
+        // P1M4W is not a duration Temporal produces.
+        if unit != "week" || largest == "week" {
+            let end: [i64; 4] = match unit {
+                "year" => [date[0] + sign, 0, 0, 0],
+                "month" => [date[0], date[1] + sign, 0, 0],
+                _ => [date[0], date[1], date[2] + sign, 0],
+            };
+            if (nudged_ns - zoned_step(cal, tz, origin, end)?).signum() as i64 == -sign {
+                break;
+            }
+            date = end;
+        }
+        i -= 1;
+    }
+    Ok(date)
+}
+
+/// RoundRelativeDuration for a ZONED anchor: a calendar smallestUnit — or "day",
+/// which in a zone is just as irregular — nudges against calendar brackets;
+/// a time smallestUnit rounds within the real zoned day.
+fn round_relative_zoned(
+    cal: Cal,
+    tz: &str,
+    origin: i128,
+    date: [i64; 4],
+    time_ns: i128,
+    dest_ns: i128,
+    largest: &str,
+    inc: i128,
+    smallest: &str,
+    mode: &str,
+) -> Result<([i64; 4], i128), Thrown> {
+    let dsign = date.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0);
+    let sign = if (if dsign != 0 { dsign } else { time_ns.signum() as i64 }) < 0 { -1 } else { 1 };
+    let n = if matches!(smallest, "year" | "month" | "week" | "day") {
+        nudge_calendar(cal, tz, origin, date, dest_ns, sign, inc as i64, smallest, mode)?.0
+    } else {
+        nudge_zoned_time(cal, tz, origin, date, time_ns, sign, inc, smallest, mode)?
+    };
+    let mut out = n.date;
+    if n.expanded && smallest != "week" {
+        let from = if matches!(smallest, "year" | "month") { smallest } else { "day" };
+        out = bubble_relative(cal, tz, origin, out, n.nudged_ns, sign, largest, from)?;
+    }
+    Ok((out, n.time_ns))
+}
+
+/// TemporalDurationFromInternal for a zoned result: with a DATE largestUnit the
+/// time remainder balances into UNCAPPED hours (a 25-hour day differencing to
+/// "day" is P1DT1H) and the days come from the date part, not from the clock.
+fn zoned_duration_record(date: [i64; 4], time_ns: i128, largest: &str) -> Result<[f64; 10], Thrown> {
+    if !matches!(largest, "year" | "month" | "week" | "day") {
+        return balance_duration_ns(time_ns, largest);
+    }
+    let mut out = balance_duration_ns(time_ns, "hour")?;
+    for i in 0..4 {
+        out[i] = date[i] as f64;
+    }
+    Ok(out)
+}
+
+/// DifferenceZonedDateTimeWithRounding, as a Duration record.
+pub(crate) fn diff_zoned_rounded(
+    cal: Cal,
+    tz: &str,
+    ns1: i128,
+    ns2: i128,
+    largest: &str,
+    inc: i128,
+    smallest: &str,
+    mode: &str,
+) -> Result<[f64; 10], Thrown> {
+    // A time largestUnit never consults the calendar or the zone: the answer is
+    // the exact elapsed nanoseconds, rounded (DifferenceInstant).
+    if !matches!(largest, "year" | "month" | "week" | "day") {
+        return balance_duration_ns(round_increment(ns2 - ns1, unit_ns(smallest) * inc, mode), largest);
+    }
+    let (date, time_ns) = difference_zoned(cal, tz, ns1, ns2, largest)?;
+    let (date, time_ns) = if inc == 1 && smallest == "nanosecond" {
+        (date, time_ns)
+    } else {
+        round_relative_zoned(cal, tz, ns1, date, time_ns, ns2, largest, inc, smallest, mode)?
+    };
+    zoned_duration_record(date, time_ns, largest)
+}
+
+/// DifferenceZonedDateTimeWithTotal: the (fractional) total of the span ns1→ns2
+/// in `unit`. For a calendar unit or "day" the fraction is measured between the
+/// two zoned brackets, which is how 25 hours across a fall-back comes out as
+/// exactly 1 day and 12 hours as 12/25 of one.
+pub(crate) fn diff_zoned_total(
+    cal: Cal,
+    tz: &str,
+    ns1: i128,
+    ns2: i128,
+    unit: &str,
+) -> Result<f64, Thrown> {
+    if !matches!(unit, "year" | "month" | "week" | "day") {
+        return Ok(rational_to_f64(ns2 - ns1, unit_ns(unit)));
+    }
+    let (date, time_ns) = difference_zoned(cal, tz, ns1, ns2, unit)?;
+    let dsign = date.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0);
+    let sign = if (if dsign != 0 { dsign } else { time_ns.signum() as i64 }) < 0 { -1 } else { 1 };
+    Ok(nudge_calendar(cal, tz, ns1, date, ns2, sign, 1, unit, "trunc")?.1)
+}
+
 /// Add a Duration `f` ([y,mo,w,d,h,mi,s,ms,us,ns]) to a date-time `start`
 /// ([y,mo,d,h,mi,s,ms,us,ns]) with calendar constrain — the shared add path.
 fn dt_add_dur(cal: Cal, start: [i64; 9], f: [i64; 10]) -> [i64; 9] {
@@ -968,6 +1399,10 @@ fn format_offset_rounded(ns: i64) -> String {
 // submodules (split out of the former monolithic temporal.rs)
 mod calendar;
 pub(crate) use calendar::*;
+// The one calendar family that is not arithmetic: chinese/dangi need true new
+// moons and solar terms, so they get their own astronomy.
+mod astro;
+mod chinese;
 // The IANA time zone database: a generated table and the reader over it.
 #[rustfmt::skip]
 mod tzdata;

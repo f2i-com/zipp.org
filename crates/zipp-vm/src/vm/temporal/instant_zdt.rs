@@ -280,11 +280,7 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.tag_cal(r, cal)))
             }
             "until" | "since" => {
-                // DifferenceZonedDateTime works in the RECEIVER's zone: re-express
-                // the other operand's exact time at the receiver's offset before
-                // differencing wall-clocks, so cross-zone operands diff by exact
-                // time (diffing each side's own wall-clock made any pair with the
-                // same local time spuriously equal). Default largestUnit is "hour".
+                // DifferenceTemporalZonedDateTime. Default largestUnit is "hour".
                 let other = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let oz = self.zoned_date_time_from(other, Value::UNDEFINED)?;
                 if self.cal_of(oz.heap_index()) != cal {
@@ -293,14 +289,6 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                let of = {
-                    let o_ns = self.zdt_epoch_ns(oz.heap_index()).unwrap_or(0);
-                    let my_off = self.zdt_offset_ns(idx);
-                    let local = o_ns + my_off as i128;
-                    let (oy, om, od) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
-                    let t = ns_to_time(local.rem_euclid(DAY_NS));
-                    [oy, om, od, t[0], t[1], t[2], t[3], t[4], t[5]]
-                };
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 // GetOptionsObject: a defined non-object options bag is a TypeError
                 // (a primitive must not be read for properties / silently ignored).
@@ -346,44 +334,35 @@ impl<'p> Vm<'p> {
                         ));
                     }
                 }
-                let f = self.zdt_local(idx);
                 // since = negate(until): forward (this → other) difference with a
                 // sign-negated rounding mode, then negate the result.
-                let (dt1, dt2) = (f, of);
                 let eff = if name == "since" { negate_mode(&mode) } else { mode.clone() };
-                let df = difference_datetime_cal(cal, dt1, dt2, &largest);
-                let mut out = if rank(&largest) >= rank("day") {
-                    let total_ns = (df[3] as i128) * DAY_NS
-                        + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
-                    let inc_ns = unit_ns(&smallest) * inc;
-                    // NudgeToCalendarUnit (smallestUnit "day"): the away-from-zero
-                    // candidate r2 = (trunc(total/inc)+sign)·inc days is materialized
-                    // against the receiver via GetEpochNanosecondsFor and must be a
-                    // representable instant, regardless of which way rounding goes.
-                    // Equal instants short-circuit before any nudge (total == 0).
-                    if smallest == "day" && total_ns != 0 {
-                        let s: i128 = if total_ns < 0 { -1 } else { 1 };
-                        let r2_days = (total_ns / inc_ns + s) * inc;
-                        let off = self.zdt_offset_ns(idx);
-                        let end_ns = (iso_to_epoch_days(f[0], f[1], f[2]) as i128 + r2_days)
-                            * DAY_NS
-                            + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]])
-                            - off as i128;
-                        if end_ns.abs() > NS_MAX_INSTANT {
-                            return Err(Thrown(
-                                "RangeError: rounding bound is outside the representable range"
-                                    .into(),
-                            ));
-                        }
-                    }
-                    let rounded = round_increment(total_ns, inc_ns, &eff);
-                    balance_duration_ns(rounded, &largest)?
-                } else if matches!(smallest.as_str(), "year" | "month" | "week") {
-                    round_relative_datetime_diff(cal, dt1, dt2, &smallest, &largest, inc, &eff)?
-                        .map(|x| x as f64)
+                let ns1 = self.zdt_epoch_ns(idx).unwrap_or(0);
+                let ns2 = self.zdt_epoch_ns(oz.heap_index()).unwrap_or(0);
+                let mut out = if rank(&largest) > rank("day") {
+                    // A time largestUnit is DifferenceInstant: exact elapsed
+                    // nanoseconds, so the two operands may sit in different zones.
+                    balance_duration_ns(
+                        round_increment(ns2 - ns1, unit_ns(&smallest) * inc, &eff),
+                        &largest,
+                    )?
                 } else {
-                    round_datetime_diff_daytime(cal, dt1, df, &smallest, &largest, inc, &eff)
-                        .map(|x| x as f64)
+                    // A DATE largestUnit measures calendar days, which only means
+                    // something if both operands keep the same clock: differencing
+                    // across zones is a RangeError, and Asia/Calcutta vs
+                    // Asia/Kolkata is the SAME zone (TimeZoneEquals compares
+                    // primary identifiers).
+                    if self.tz_canon(idx) != self.tz_canon(oz.heap_index()) {
+                        return Err(Thrown(
+                            "RangeError: cannot compute a calendar difference between ZonedDateTimes in different time zones"
+                                .into(),
+                        ));
+                    }
+                    if ns1 == ns2 {
+                        return Ok(Some(self.make_duration([0.0; 10])));
+                    }
+                    let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                    diff_zoned_rounded(cal, &id, ns1, ns2, &largest, inc, &smallest, &eff)?
                 };
                 if name == "since" {
                     out.iter_mut().for_each(|x| *x = -*x);
@@ -402,29 +381,46 @@ impl<'p> Vm<'p> {
                 )?;
                 let f = self.zdt_local(idx);
                 let off = self.zdt_offset_ns(idx);
-                // RoundISODateTime to "day" measures against the REAL day boundaries:
-                // GetStartOfDay(today) and GetStartOfDay(tomorrow) must both be
-                // representable instants even when the rounded result itself is.
-                if su == "day" {
-                    let start_ns =
-                        (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS - off as i128;
-                    let end_ns = start_ns + DAY_NS;
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                let day0 = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS;
+                let ns = if su == "day" {
+                    // Rounding to "day" measures against the REAL day boundaries
+                    // (GetStartOfDay both ends, each of which must be a
+                    // representable instant). Halfway through 2000-10-29 in
+                    // Vancouver is 11:30, not 12:00, because that day is 25 hours
+                    // long — and 1919-03-30 in Toronto does not even start at
+                    // midnight, it starts at 00:30.
+                    let start_ns = tz_start_of_day(&id, day0)?;
+                    let end_ns = tz_start_of_day(&id, day0 + DAY_NS)?;
                     if start_ns.abs() > NS_MAX_INSTANT || end_ns.abs() > NS_MAX_INSTANT {
                         return Err(Thrown(
                             "RangeError: ZonedDateTime day boundary is outside the representable range"
                                 .into(),
                         ));
                     }
-                }
-                let time_ns = time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
-                let inc_ns = unit_ns(&su) * inc;
-                let rounded = round_increment(time_ns, inc_ns, &mode);
-                let day_carry = rounded.div_euclid(DAY_NS) as i64;
-                let nt = ns_to_time(rounded.rem_euclid(DAY_NS));
-                let ed = iso_to_epoch_days(f[0], f[1], f[2]) + day_carry;
-                let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
-                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                let ns = tz_local_to_instant(&id, local, "compatible")?;
+                    // The answer is one of the two boundaries, never a multiple of
+                    // the day length: in Antarctica/Casey on 2010-03-04 the clock
+                    // went back three hours, so 23:10 on the SECOND 4 March is
+                    // 26h10m into a 24-hour day — flooring that as an increment
+                    // would step forward a whole day instead of down to the day's
+                    // own start.
+                    let epoch = self.zdt_epoch_ns(idx).unwrap_or(0);
+                    if round_fraction_exact(0, 1, epoch - start_ns, end_ns - start_ns, &mode) == 0 {
+                        start_ns
+                    } else {
+                        end_ns
+                    }
+                } else {
+                    // RoundISODateTime on the wall clock, then
+                    // InterpretISODateTimeOffset with the receiver's own offset and
+                    // offset:"prefer" — inside a repeated hour that keeps the
+                    // rounded time on the same side of the fold, and inside a gap
+                    // (nothing carries that offset) it falls back to "compatible".
+                    let time_ns = time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
+                    let rounded = round_increment(time_ns, unit_ns(&su) * inc, &mode);
+                    let local = day0 + rounded;
+                    interpret_iso_offset(&id, local, 2, off, "compatible", "prefer", false)?
+                };
                 let r = self.alloc_zdt(ns, tz_offset_ns_at(&id, ns), id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
@@ -793,24 +789,28 @@ impl<'p> Vm<'p> {
         Ok(s)
     }
 
-    /// Resolve a `relativeTo` option to its anchor: the wall-clock fields, a flag
-    /// for whether it is ZonedDateTime-like (a ZDT instance, a `[tz]`-annotated
-    /// string, or a bag carrying a `timeZone`), and the zone OFFSET pairing with
-    /// those wall fields (epoch = wall − offset; 0 for plain anchors). A PLAIN
-    /// anchor is a PlainDate per GetTemporalRelativeToOption — the time-of-day of
-    /// a datetime string / PlainDateTime / non-zoned bag is dropped (midnight).
+    /// Resolve a `relativeTo` option to its anchor: the wall-clock fields, the
+    /// ZONE IDENTIFIER when it is ZonedDateTime-like (a ZDT instance, a
+    /// `[tz]`-annotated string, or a bag carrying a `timeZone`) and `None` when
+    /// it is plain, and the zone OFFSET pairing with those wall fields
+    /// (epoch = wall − offset; 0 for plain anchors). The identifier — not just
+    /// the offset — is what the zoned duration machinery needs: the offset at
+    /// the anchor says nothing about the offset a month later. A PLAIN anchor is
+    /// a PlainDate per GetTemporalRelativeToOption, so the time-of-day of a
+    /// datetime string / PlainDateTime / non-zoned bag is dropped (midnight).
     /// Zoned string anchors are validated here: the epoch must be a representable
     /// instant, and an explicit-offset string is additionally subject to
     /// CheckISODaysRange on its wall date.
     pub(crate) fn relative_to_dt(
         &mut self,
         rel: Value,
-    ) -> Result<([i64; 9], bool, i64, Cal), Thrown> {
+    ) -> Result<([i64; 9], Option<String>, i64, Cal), Thrown> {
         if rel.is_heap() {
             if matches!(self.heap.get(rel.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
                 let idx = rel.heap_index();
                 let cal = self.cal_of(idx);
-                return Ok((self.zdt_local(idx), true, self.zdt_offset_ns(idx), cal));
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                return Ok((self.zdt_local(idx), Some(id), self.zdt_offset_ns(idx), cal));
             }
             // A property bag is read in ONE PrepareCalendarFields pass (calendar,
             // then the fields alphabetically with offset and timeZone at their
@@ -846,7 +846,7 @@ impl<'p> Vm<'p> {
                     };
                     off = (local - ns) as i64;
                 }
-                return Ok((f, zoned, off, cal));
+                return Ok((f, zoned.then_some(id), off, cal));
             }
         }
         // A plain STRING relativeTo (ToRelativeTemporalObject) uses a LOOSER grammar
@@ -910,7 +910,7 @@ impl<'p> Vm<'p> {
                         "RangeError: relativeTo '{s}' is outside the representable range"
                     )));
                 }
-                return Ok((f, true, eff, self.calendar_from_annotation(st)?));
+                return Ok((f, Some(id), eff, self.calendar_from_annotation(st)?));
             }
             let mut f = parse_iso_datetime(main)
                 .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")))?;
@@ -922,13 +922,13 @@ impl<'p> Vm<'p> {
                     "RangeError: relativeTo '{s}' is outside the representable range"
                 )));
             }
-            return Ok((f, false, 0, self.calendar_from_annotation(st)?));
+            return Ok((f, None, 0, self.calendar_from_annotation(st)?));
         }
         // Temporal instances (PlainDate/PlainDateTime) and other coercibles:
         // a plain anchor is a PlainDate, so any time-of-day is dropped.
         let (mut f, cal) = self.to_plain_date_time_cal(rel)?;
         f[3..9].fill(0);
-        Ok((f, false, 0, cal))
+        Ok((f, None, 0, cal))
     }
 
     /// Validate a ZonedDateTime-like property bag's `offset` field: if present it
@@ -992,11 +992,20 @@ impl<'p> Vm<'p> {
         if fa[..4].iter().all(|&x| x == 0.0) && fb[..4].iter().all(|&x| x == 0.0) {
             return Ok(order(dur_day_time_ns(&fa), dur_day_time_ns(&fb)));
         }
-        if let Some((start, zoned, off, cal)) = start {
+        if let Some((start, tz, off, cal)) = start {
+            // A ZONED anchor moves each duration through the real zone: 1 day
+            // and 24 hours from the same instant land an hour apart across a
+            // DST change, so comparing them in wall-clock space calls them equal.
+            if let Some(id) = tz {
+                let ns = dt_epoch_ns(start) - off as i128;
+                let e1 = add_zoned(cal, &id, ns, &fa)?;
+                let e2 = add_zoned(cal, &id, ns, &fb)?;
+                return Ok(order(e1, e2));
+            }
             // Both anchored end-points must be representable (lenient on the
             // plain start: compare uses day-granular date arithmetic).
-            check_relative_target(cal, start, &fa, zoned, off, false)?;
-            check_relative_target(cal, start, &fb, zoned, off, false)?;
+            check_relative_target(cal, start, &fa, false, off, false)?;
+            check_relative_target(cal, start, &fb, false, off, false)?;
             let e1 = dur_end_epoch_ns(cal, start, &fa);
             let e2 = dur_end_epoch_ns(cal, start, &fb);
             return Ok(order(e1, e2));
@@ -1009,10 +1018,12 @@ impl<'p> Vm<'p> {
         Ok(order(dur_day_time_ns(&fa), dur_day_time_ns(&fb)))
     }
 
-    /// `Duration.round` with a relativeTo anchor: round the span `start →
+    /// `Duration.round` with a PLAIN relativeTo anchor: round the span `start →
     /// start+duration` exactly like `PlainDateTime.prototype.until`, so the
     /// calendar-unit nudging, the day/time remainder rounding (time-of-day included
     /// via epoch nanoseconds), and the re-balance to largestUnit are all shared.
+    /// (A ZONED anchor goes through `diff_zoned_rounded` instead — none of the
+    /// day lengths here would be right.)
     pub(crate) fn round_duration_relative(
         &mut self,
         cal: Cal,
@@ -1022,8 +1033,6 @@ impl<'p> Vm<'p> {
         largest: &str,
         inc: i128,
         mode: &str,
-        zoned: bool,
-        off: i64,
     ) -> Result<[i64; 10], Thrown> {
         let end = dt_add_dur(cal, start, f);
         let order = [
@@ -1031,41 +1040,6 @@ impl<'p> Vm<'p> {
             "microsecond", "nanosecond",
         ];
         let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(9);
-        // NudgeToZonedTime: a ZONED anchor with largestUnit "day" and a time
-        // smallestUnit rounds ONLY the time portion against the real zoned day
-        // (lumping days+time into one span shifts the rounding increments and
-        // breaks half-even ties). Both day boundaries are materialized as
-        // instants and must be representable — even for a zero duration.
-        if zoned && largest == "day" && rank(smallest) > rank("day") {
-            // The whole span first balances into days+time against the anchor
-            // (largestUnit "day" collapses any calendar units into days); only
-            // the TIME remainder is then rounded against the real zoned day.
-            let df = difference_datetime(start, end, "day");
-            let s: i128 = if Self::duration_sign(&df) < 0 { -1 } else { 1 };
-            let start_dt = dt_add_dur(cal, start, [0, 0, 0, df[3], 0, 0, 0, 0, 0, 0]);
-            let start_epoch = dt_epoch_ns(start_dt) - off as i128;
-            let end_epoch = start_epoch + s * DAY_NS;
-            if start_epoch.abs() > NS_MAX_INSTANT || end_epoch.abs() > NS_MAX_INSTANT {
-                return Err(Thrown(
-                    "RangeError: ZonedDateTime day boundary is outside the representable range"
-                        .into(),
-                ));
-            }
-            let day_span = s * DAY_NS;
-            let time_ns = time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
-            let mut rounded = round_increment(time_ns, unit_ns(smallest) * inc, mode);
-            let mut day_delta = 0i64;
-            let beyond = rounded - day_span;
-            // The rounded time reached (or crossed) the day boundary in the
-            // duration's own direction: carry one day and keep the remainder.
-            if beyond == 0 || (beyond < 0) == (s < 0) {
-                day_delta = s as i64;
-                rounded = beyond;
-            }
-            let mut out = balance_duration_ns(rounded, "hour")?.map(Self::dur_to_i64);
-            out[3] = df[3] + day_delta;
-            return Ok(out);
-        }
         if rank(largest) >= rank("day") {
             // A day-or-time largestUnit is a pure nanosecond span: round it, balance.
             let total_ns = dt_epoch_ns(end) - dt_epoch_ns(start);
@@ -1160,18 +1134,27 @@ impl<'p> Vm<'p> {
                 let (unit, digits, omit) = Self::tostring_precision(su.as_deref(), fsd)?;
                 (unit, digits, omit, mode, cal_suf, off_opt != "never", tzn)
             };
-        let off = self.zdt_offset_ns(idx);
         // Round the instant to the requested unit, then express in the offset.
         // Rounding is on the ABSOLUTE timeline (epoch ns), so it rounds as-if the
         // value were positive (like Instant.toString) — NOT sign-relative, which
         // would round a negative epoch the wrong way for expand/ceil/floor.
         let epoch = self.zdt_epoch_ns(idx).unwrap_or(0);
         let rounded = round_increment_as_if_positive(epoch, unit, &mode);
+        // The wall clock and offset belong to the ROUNDED instant, not the
+        // original: rounding 2000-04-02T01:59:59.999999999-08 up to eight
+        // fractional digits in America/Vancouver crosses the spring-forward, so
+        // the answer is 03:00:00.00-07:00, not 02:00:00.00-08:00.
+        let (tz, off) = match self.zdt_tz_id(idx) {
+            Some(id) => {
+                let o = tz_offset_ns_at(&id, rounded);
+                (id, o)
+            }
+            None => ("UTC".to_string(), self.zdt_offset_ns(idx)),
+        };
         let local = rounded + off as i128;
         let t = ns_to_time(local.rem_euclid(DAY_NS));
         let (ny, nm, nd) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
         let offset_s = if show_offset { format_offset_rounded(off) } else { String::new() };
-        let tz = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
         let tz_suf = match tzn.as_str() {
             "never" => String::new(),
             "critical" => format!("[!{tz}]"),

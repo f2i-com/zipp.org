@@ -6,6 +6,7 @@ use crate::heap::{
     PropAttr, PromiseState, Reaction,
 };
 use crate::value::Value;
+use crate::vm::{cldr_en, dtf_pattern};
 
 impl<'p> Vm<'p> {
     /// Read an internal slot stored on an Intl instance's `resolved` object.
@@ -1908,9 +1909,11 @@ impl<'p> Vm<'p> {
         let grouping = ug != Value::bool(false) && self.display(ug) != "false";
         let group_min2 = grouping && self.display(ug) == "min2";
         let notation = self.display(self.intl_slot(resolved, "notation"));
+        let compact_display = self.display(self.intl_slot(resolved, "compactDisplay"));
         let params = NumFmtParams {
             style: &style,
             notation: &notation,
+            compact_display: &compact_display,
             min_int: slot_int(self, "minimumIntegerDigits").unwrap_or(1),
             min_frac: slot_int(self, "minimumFractionDigits"),
             max_frac: slot_int(self, "maximumFractionDigits"),
@@ -1927,11 +1930,26 @@ impl<'p> Vm<'p> {
         let s = format_number_intl(n, &params);
         Ok(if style == "currency" {
             let cur = self.display(self.intl_slot(resolved, "currency"));
-            // The minus sign leads the currency symbol ("-$5.00"), so splice the
-            // symbol in after any sign rather than prefixing the whole string.
+            let sym = currency_symbol(&cur);
+            // `currencySign: "accounting"` swaps CLDR's *negative subpattern* in
+            // for the minus sign — for `en` that is `(¤#,##0.00)`, so -987 USD
+            // reads "($987.00)". Which values take it is decided upstream: the
+            // parentheses appear exactly when signDisplay left a minus behind
+            // (so `signDisplay:"never"` and `exceptZero`'s -0 keep "$0.00").
+            let accounting = self.display(self.intl_slot(resolved, "currencySign")) == "accounting";
             match s.strip_prefix('-') {
-                Some(rest) => format!("-{}{}", currency_symbol(&cur), rest),
-                None => format!("{}{}", currency_symbol(&cur), s),
+                Some(rest) if accounting => {
+                    let (pre, post) = accounting_affixes();
+                    format!("{pre}{sym}{rest}{post}")
+                }
+                // The sign leads the currency symbol ("-$5.00", "+$5.00"), so
+                // splice the symbol in after it rather than prefixing the whole
+                // string.
+                Some(rest) => format!("-{sym}{rest}"),
+                None => match s.strip_prefix('+') {
+                    Some(rest) => format!("+{sym}{rest}"),
+                    None => format!("{sym}{s}"),
+                },
             }
         } else {
             s
@@ -2055,6 +2073,13 @@ impl<'p> Vm<'p> {
         }
         if has("dateStyle") {
             m |= Self::F_YEAR | Self::F_MONTH | Self::F_DAY;
+            // CLDR's `en` full date pattern is `EEEE, MMMM d, y` — the only one
+            // of the four that carries a weekday, so `dateStyle: "full"` is the
+            // only style whose component set includes one ("Saturday, May 1,
+            // 1886" against "May 1, 1886").
+            if self.display(self.intl_slot(resolved, "dateStyle")) == "full" {
+                m |= Self::F_WEEKDAY;
+            }
         }
         if has("timeStyle") {
             m |= Self::F_HOUR | Self::F_MINUTE | Self::F_SECOND;
@@ -2119,7 +2144,12 @@ impl<'p> Vm<'p> {
         // rather than the caller — those must not clear needDefaults here.
         let defaulted = self.intl_slot(resolved, "@@dtfDefaulted") == Value::bool(true);
         let need_defaults = defaulted || (requested & clears == 0 && !styled);
-        let effective = if need_defaults { defaults } else { requested } & allowed;
+        // ToDateTimeOptions ADDS the defaults group to the options; it does not
+        // replace them. `{era: "narrow"}` therefore resolves to era + the date
+        // defaults, so an Instant formatted by that formatter still prints its
+        // era — which is what makes it agree with `Date.prototype.toLocaleString`
+        // under the same options (`format/temporal-objects-format-with-era.js`).
+        let effective = if need_defaults { requested | defaults } else { requested } & allowed;
         if effective == 0 {
             return Err(Thrown(format!(
                 "TypeError: {name} options do not include any field this Temporal value has"
@@ -2236,11 +2266,112 @@ impl<'p> Vm<'p> {
         if a == b {
             return a.into_iter().map(|(t, v)| (t.to_string(), v, "shared")).collect();
         }
-        let mut out: Vec<(String, String, &'static str)> =
-            a.into_iter().map(|(t, v)| (t.to_string(), v, "startRange")).collect();
-        out.push(("literal".to_string(), " \u{2013} ".to_string(), "shared"));
+        // PartitionDateTimeRangePattern: CLDR's `intervalFormats` give a pattern
+        // per (skeleton, greatest differing field) that names each field twice,
+        // so the parts the endpoints SHARE are printed once — "Jan 3 – 5, 2019",
+        // and "8/4/2021, 12:30:45 AM – 11:30:45 PM" when only the time moves.
+        if let Some(parts) = self.dtf_interval_parts(resolved, x, y, fields, absolute) {
+            return parts;
+        }
+        // `intervalFormatFallback` — format both endpoints whole and join.
+        let (pre, post) =
+            cldr_en::INTERVAL_FALLBACK.split_once("{0}").unwrap_or(("", cldr_en::INTERVAL_FALLBACK));
+        let sep = post.split_once("{1}").map(|(s, _)| s).unwrap_or(" \u{2013} ");
+        let mut out: Vec<(String, String, &'static str)> = vec![];
+        if !pre.is_empty() {
+            out.push(("literal".to_string(), pre.to_string(), "shared"));
+        }
+        out.extend(a.into_iter().map(|(t, v)| (t.to_string(), v, "startRange")));
+        out.push(("literal".to_string(), sep.to_string(), "shared"));
         out.extend(b.into_iter().map(|(t, v)| (t.to_string(), v, "endRange")));
         out
+    }
+
+    /// The `intervalFormats` rendering of a range, or None when CLDR has no
+    /// pattern for this skeleton and difference (the caller then falls back).
+    fn dtf_interval_parts(
+        &self,
+        resolved: u32,
+        x: f64,
+        y: f64,
+        fields: u16,
+        absolute: bool,
+    ) -> Option<Vec<(String, String, &'static str)>> {
+        let (d_items, t_items, glue) = self.dtf_pattern_halves(resolved, fields);
+        let (_, hour12) = self.dtf_request(resolved, fields);
+        // Which half moved decides the shape: a date difference ranges the whole
+        // value, a time-only difference keeps the date as a shared prefix.
+        let d_diff = self.dtf_greatest_diff(resolved, &d_items, x, y, absolute);
+        let t_diff = self.dtf_greatest_diff(resolved, &t_items, x, y, absolute);
+        if d_diff.is_some() && !t_items.is_empty() {
+            // Both halves in play: CLDR has no combined interval skeleton, and
+            // splicing two independent ranges would print the date twice inside
+            // one range. The fallback pattern is the specified answer.
+            return None;
+        }
+        let (half, greatest) = match (d_diff, t_diff) {
+            (Some(g), _) => (&d_items, g),
+            (None, Some(g)) => (&t_items, g),
+            (None, None) => return None,
+        };
+        let pattern = dtf_pattern::interval_pattern(half, hour12, greatest)?;
+        let items = dtf_pattern::parse_pattern(&pattern);
+        let (sep, first, last) = dtf_pattern::interval_layout(&items)?;
+        // Items outside the two ranged runs are common to both endpoints.
+        let mut ranged: Vec<(String, String, &'static str)> = vec![];
+        let mut push = |vm: &Self, slice: &[dtf_pattern::Item], at: f64, src: &'static str| {
+            ranged.extend(
+                vm.dtf_render(resolved, at, absolute, slice)
+                    .into_iter()
+                    .map(|(t, v)| (t.to_string(), v, src)),
+            );
+        };
+        push(self, &items[..first], x, "shared");
+        push(self, &items[first..sep], x, "startRange");
+        push(self, &items[sep..sep + 1], x, "shared");
+        push(self, &items[sep + 1..last + 1], y, "endRange");
+        push(self, &items[last + 1..], y, "shared");
+        if d_diff.is_some() || d_items.is_empty() {
+            return Some(ranged);
+        }
+        // Time-only difference with a date half: the date is shared, and so is
+        // the glue between them.
+        let shared: Vec<(String, String, &'static str)> = self
+            .dtf_render(resolved, x, absolute, &d_items)
+            .into_iter()
+            .map(|(t, v)| (t.to_string(), v, "shared"))
+            .collect();
+        Some(dtf_pattern::splice_glue_parts(cldr_en::DATETIME_GLUE_AT[glue], &shared, &ranged))
+    }
+
+    /// The most significant field in `items` whose rendering differs between the
+    /// two instants — the `intervalFormats` key.
+    fn dtf_greatest_diff(
+        &self,
+        resolved: u32,
+        items: &[dtf_pattern::Item],
+        x: f64,
+        y: f64,
+        absolute: bool,
+    ) -> Option<char> {
+        if items.is_empty() {
+            return None;
+        }
+        let a = self.dtf_render(resolved, x, absolute, items);
+        let b = self.dtf_render(resolved, y, absolute, items);
+        // `dtf_render` emits exactly one part per item, so the three align.
+        let mut best: Option<(u8, char)> = None;
+        for (i, item) in items.iter().enumerate() {
+            let dtf_pattern::Item::Field(c, _) = item else { continue };
+            if a.get(i).map(|p| &p.1) == b.get(i).map(|p| &p.1) {
+                continue;
+            }
+            let Some(k) = dtf_pattern::class_of_pub(*c) else { continue };
+            if best.is_none_or(|(bk, _)| k < bk) {
+                best = Some((k, *c));
+            }
+        }
+        best.map(|(_, c)| c)
     }
 
     /// PartitionNumberRangePattern, same shape as the date-time one.
@@ -2255,14 +2386,23 @@ impl<'p> Vm<'p> {
         if a == b {
             // Both endpoints format identically: the range collapses to the
             // "approximately" pattern (~x), every part shared.
-            let mut out: Vec<(String, String, &'static str)> =
-                vec![("approximatelySign".to_string(), "~".to_string(), "shared")];
+            let mut out: Vec<(String, String, &'static str)> = vec![(
+                "approximatelySign".to_string(),
+                cldr_en::SYM_APPROX_SIGN.to_string(),
+                "shared",
+            )];
             out.extend(a.into_iter().map(|(t, v)| (t, v, "shared")));
             return Ok(out);
         }
+        // CLDR `miscPatterns.range` — `en`'s is the tight "{0}–{1}".
+        let sep = cldr_en::PATTERN_RANGE
+            .split_once("{0}")
+            .and_then(|(_, r)| r.split_once("{1}"))
+            .map(|(s, _)| s)
+            .unwrap_or("\u{2013}");
         let mut out: Vec<(String, String, &'static str)> =
             a.into_iter().map(|(t, v)| (t, v, "startRange")).collect();
-        out.push(("literal".to_string(), "\u{2013}".to_string(), "shared"));
+        out.push(("literal".to_string(), sep.to_string(), "shared"));
         out.extend(b.into_iter().map(|(t, v)| (t, v, "endRange")));
         Ok(out)
     }
@@ -2285,6 +2425,21 @@ impl<'p> Vm<'p> {
         };
         let mut parts: Vec<(String, String)> = vec![];
         let mut rest = formatted.as_str();
+        // The accounting subpattern's affixes are `literal` parts and REPLACE the
+        // minusSign part, so they are peeled before the sign check below
+        // (`formatToParts/signDisplay-currency-en-US.js` expects
+        // [literal "(", currency "$", …, literal ")"] with no minusSign).
+        let mut acct_close = "";
+        if style == "currency"
+            && self.display(self.intl_slot(resolved, "currencySign")) == "accounting"
+        {
+            let (pre, post) = accounting_affixes();
+            if !pre.is_empty() && rest.starts_with(pre) && rest.ends_with(post) {
+                rest = &rest[pre.len()..rest.len() - post.len()];
+                parts.push(("literal".into(), pre.to_string()));
+                acct_close = post;
+            }
+        }
         if let Some(r) = rest.strip_prefix('-') {
             parts.push(("minusSign".into(), "-".into()));
             rest = r;
@@ -2302,6 +2457,17 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
+        // The compact affix ("K", " million") is a `compact` part, with any
+        // space before it a `literal` — the same split the unit affix gets.
+        let mut compact: Option<(String, String)> = None;
+        if self.display(self.intl_slot(resolved, "notation")) == "compact" {
+            let disp = self.display(self.intl_slot(resolved, "compactDisplay"));
+            if let Some(aff) = compact_affix_of(rest, &disp) {
+                rest = &rest[..rest.len() - aff.len()];
+                let core = aff.trim_start();
+                compact = Some((aff[..aff.len() - core.len()].to_string(), core.to_string()));
+            }
+        }
         // Split off a scientific/engineering exponent before the mantissa is
         // decomposed: it becomes its own exponentSeparator / exponentMinusSign /
         // exponentInteger run at the very end of the part list.
@@ -2342,13 +2508,60 @@ impl<'p> Vm<'p> {
                 None => parts.push(("exponentInteger".into(), e)),
             }
         }
+        if let Some((space, core)) = compact {
+            if !space.is_empty() {
+                parts.push(("literal".into(), space));
+            }
+            parts.push(("compact".into(), core));
+        }
         if let Some(s) = suffix {
             parts.push(s);
         }
+        if !acct_close.is_empty() {
+            parts.push(("literal".into(), acct_close.to_string()));
+        }
         if style == "unit" {
             let u = self.display(self.intl_slot(resolved, "unit"));
-            parts.push(("literal".into(), " ".into()));
-            parts.push(("unit".into(), u));
+            let disp = self.display(self.intl_slot(resolved, "unitDisplay"));
+            // `en`'s cardinal rule is `i = 1 and v = 0`: exactly one integer run
+            // reading "1" and no fraction. The operands come from the FORMATTED
+            // number, so `{minimumFractionDigits: 1}` on 1 selects "other".
+            let ints: Vec<&String> =
+                parts.iter().filter(|(t, _)| t == "integer").map(|(_, v)| v).collect();
+            let one = ints.len() == 1 && ints[0] == "1"
+                && !parts.iter().any(|(t, _)| t == "fraction");
+            let pattern = cldr_unit_pattern(&u, &disp, one);
+            let (prefix, suffix) = match pattern.as_deref().and_then(|p| p.split_once("{0}")) {
+                Some((p, s)) => (p.to_string(), s.to_string()),
+                // No CLDR row: echo the identifier, as before this table existed.
+                None => (String::new(), format!(" {u}")),
+            };
+            // Inside an affix the spacing is a `literal` part and the name itself
+            // a `unit` part — "{0} km/h" is [literal " ", unit "km/h"] while
+            // "{0}%" is just [unit "%"] (`formatToParts/percent-en-US.js`).
+            let is_sp = |c: char| c.is_whitespace() || c == '\u{a0}' || c == '\u{202f}';
+            if !prefix.is_empty() {
+                let core = prefix.trim_end_matches(is_sp);
+                let mut head: Vec<(String, String)> = vec![];
+                if !core.is_empty() {
+                    head.push(("unit".into(), core.to_string()));
+                }
+                if core.len() < prefix.len() {
+                    head.push(("literal".into(), prefix[core.len()..].to_string()));
+                }
+                head.extend(parts);
+                parts = head;
+            }
+            if !suffix.is_empty() {
+                let core = suffix.trim_start_matches(is_sp);
+                let lead = &suffix[..suffix.len() - core.len()];
+                if !lead.is_empty() {
+                    parts.push(("literal".into(), lead.to_string()));
+                }
+                if !core.is_empty() {
+                    parts.push(("unit".into(), core.to_string()));
+                }
+            }
         }
         // The split above works on the ASCII form (it looks for '-', ',', '.',
         // 'E'); the numbering system applies to the digit runs afterwards.
@@ -2530,15 +2743,239 @@ impl<'p> Vm<'p> {
         Ok(out)
     }
 
-    /// FormatDateTimePattern for the en-US patterns this engine implements, as a
-    /// typed part list. `format` is this joined; `formatToParts` is this wrapped.
-    /// (The pattern is date-then-time, both fixed: no locale data behind it.)
+    /// The resolved components as CLDR pattern letters, plus the hour cycle.
+    /// This is the request `dtf_pattern::best_pattern` matches against
+    /// `availableFormats`; `mask` restricts it to the fields this argument has
+    /// (a Temporal.PlainDate contributes no hour, so no hour is requested).
+    fn dtf_request(&self, resolved: u32, mask: u16) -> (dtf_pattern::Request, bool) {
+        let slot = |k: &str| -> Option<String> {
+            match self.heap.get(resolved) {
+                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
+                _ => None,
+            }
+        };
+        let hc = slot("hourCycle").unwrap_or_else(|| "h12".to_string());
+        let hour12 = hc == "h11" || hc == "h12";
+        let mut req = dtf_pattern::Request::default();
+        let has = |bit: u16| mask & bit != 0;
+        // Table 7's widths, spelled as UTS #35 field counts: `MMMM` is a wide
+        // month, `MMM` an abbreviated one, `MM` two digits, `M` numeric.
+        if has(Self::F_ERA) {
+            req.push('G', match slot("era").as_deref() {
+                Some("long") => 4,
+                Some("narrow") => 5,
+                _ => 1,
+            });
+        }
+        if has(Self::F_YEAR) {
+            req.push('y', if slot("year").as_deref() == Some("2-digit") { 2 } else { 1 });
+        }
+        if has(Self::F_MONTH) {
+            req.push('M', match slot("month").as_deref() {
+                Some("2-digit") => 2,
+                Some("short") => 3,
+                Some("long") => 4,
+                Some("narrow") => 5,
+                _ => 1,
+            });
+        }
+        if has(Self::F_DAY) {
+            req.push('d', if slot("day").as_deref() == Some("2-digit") { 2 } else { 1 });
+        }
+        if has(Self::F_WEEKDAY) {
+            req.push('E', match slot("weekday").as_deref() {
+                Some("long") => 4,
+                Some("narrow") => 5,
+                _ => 3,
+            });
+        }
+        if has(Self::F_DAYPERIOD) {
+            req.push('B', match slot("dayPeriod").as_deref() {
+                Some("long") => 4,
+                Some("narrow") => 5,
+                _ => 1,
+            });
+        }
+        if has(Self::F_HOUR) {
+            let letter = match hc.as_str() {
+                "h11" => 'K',
+                "h23" => 'H',
+                "h24" => 'k',
+                _ => 'h',
+            };
+            req.push(letter, if slot("hour").as_deref() == Some("2-digit") { 2 } else { 1 });
+        }
+        if has(Self::F_MINUTE) {
+            req.push('m', if slot("minute").as_deref() == Some("2-digit") { 2 } else { 1 });
+        }
+        if has(Self::F_SECOND) {
+            req.push('s', if slot("second").as_deref() == Some("2-digit") { 2 } else { 1 });
+        }
+        if has(Self::F_FRAC) {
+            let n = slot("fractionalSecondDigits").and_then(|s| s.parse::<usize>().ok());
+            req.push('S', n.unwrap_or(3).clamp(1, 3));
+        }
+        if has(Self::F_ZONE) {
+            let (c, n) = match slot("timeZoneName").as_deref() {
+                Some("long") => ('z', 4),
+                Some("shortOffset") => ('O', 1),
+                Some("longOffset") => ('O', 4),
+                Some("shortGeneric") => ('v', 1),
+                Some("longGeneric") => ('v', 4),
+                // `timeStyle: "full"` carries `zzzz`, `"long"` carries `z`; with
+                // no timeZoneName option at all those are the only two shapes.
+                _ if slot("timeZoneName").is_none()
+                    && slot("timeStyle").as_deref() == Some("full") => ('z', 4),
+                _ => ('z', 1),
+            };
+            req.push(c, n);
+        }
+        (req, hour12)
+    }
+
+    /// Keep only the pattern items whose field this argument actually has, and
+    /// drop the separators the removed fields owned.
+    ///
+    /// ECMA-402's Temporal integration builds a SEPARATE pattern per Temporal
+    /// type by intersecting the resolved components with that type's fields, so
+    /// a `dateStyle: "full"` PlainMonthDay must print "March 4" — the CLDR full
+    /// date pattern `EEEE, MMMM d, y` with the weekday, the year, and their
+    /// commas gone (`temporal-plainmonthday-formatting-datetime-style.js`).
+    /// A removed field takes the literal AFTER it, or, when nothing follows,
+    /// the literal before it.
+    fn dtf_filter(items: Vec<dtf_pattern::Item>, keep: &dyn Fn(char) -> bool) -> Vec<dtf_pattern::Item> {
+        let n = items.len();
+        let mut drop = vec![false; n];
+        for (i, it) in items.iter().enumerate() {
+            let dtf_pattern::Item::Field(c, _) = it else { continue };
+            if keep(*c) {
+                continue;
+            }
+            drop[i] = true;
+            let later = items[i + 1..]
+                .iter()
+                .any(|x| matches!(x, dtf_pattern::Item::Field(c, _) if keep(*c)));
+            if later {
+                if let Some(j) = (i + 1..n)
+                    .find(|j| matches!(items[*j], dtf_pattern::Item::Lit(_)) && !drop[*j])
+                {
+                    if j == i + 1 {
+                        drop[j] = true;
+                    }
+                }
+            } else if i > 0 && matches!(items[i - 1], dtf_pattern::Item::Lit(_)) {
+                drop[i - 1] = true;
+            }
+        }
+        items.into_iter().zip(drop).filter(|(_, d)| !d).map(|(it, _)| it).collect()
+    }
+
+    /// FormatDateTimePattern (ECMA-402 §11.5.6) over the CLDR `en` patterns in
+    /// `cldr_en`, as a typed part list. `format` is this joined; `formatToParts`
+    /// is this wrapped.
+    ///
+    /// The pattern is chosen first — from `dateStyle`/`timeStyle` when they are
+    /// present, otherwise by matching the requested components against CLDR's
+    /// `availableFormats` — and then interpreted field by field. Before this
+    /// engine had the `en` tables it emitted a fixed `M/D/Y, HH:MM:SS`, which no
+    /// month name, weekday name, era or `dateStyle` could ever come out of.
     pub(crate) fn dtf_parts(
         &self,
         resolved: u32,
         ms: f64,
         fields: u16,
         absolute: bool,
+    ) -> Vec<(&'static str, String)> {
+        let (d, t, glue) = self.dtf_pattern_halves(resolved, fields);
+        let items = match (d.is_empty(), t.is_empty()) {
+            (false, false) => dtf_pattern::splice_glue(cldr_en::DATETIME_GLUE_AT[glue], &d, &t),
+            (false, true) => d,
+            _ => t,
+        };
+        self.dtf_render(resolved, ms, absolute, &items)
+    }
+
+    /// The pattern for `fields`, split into literals and fields — and kept as
+    /// two HALVES, because `formatRange` needs them apart: when only the time
+    /// differs, CLDR prints the date once and ranges the time inside it
+    /// ("8/4/2021, 12:30:45 AM – 11:30:45 PM").
+    fn dtf_pattern_halves(
+        &self,
+        resolved: u32,
+        fields: u16,
+    ) -> (Vec<dtf_pattern::Item>, Vec<dtf_pattern::Item>, usize) {
+        let slot = |k: &str| -> Option<String> {
+            match self.heap.get(resolved) {
+                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
+                _ => None,
+            }
+        };
+        let (req, hour12) = self.dtf_request(resolved, fields);
+        // Which CLASSES survive: a field the pattern carries but this argument
+        // does not have is dropped by `dtf_filter`.
+        let has = |bit: u16| fields & bit != 0;
+        let keep = move |c: char| match c {
+            'G' => has(Self::F_ERA),
+            'y' | 'Y' | 'u' => has(Self::F_YEAR),
+            'M' | 'L' => has(Self::F_MONTH),
+            'd' => has(Self::F_DAY),
+            'E' | 'e' | 'c' => has(Self::F_WEEKDAY),
+            // The day period rides with the hour: `h:mm a` keeps its "a" as long
+            // as the hour is printed on a 12-hour cycle, and `{minute, second}`
+            // never gains one. On h23/h24 it goes, with its separator.
+            'a' | 'b' | 'B' => (hour12 && has(Self::F_HOUR)) || has(Self::F_DAYPERIOD),
+            'h' | 'H' | 'K' | 'k' => has(Self::F_HOUR),
+            'm' => has(Self::F_MINUTE),
+            's' => has(Self::F_SECOND),
+            'S' => has(Self::F_FRAC),
+            'z' | 'Z' | 'O' | 'v' | 'V' | 'X' | 'x' => has(Self::F_ZONE),
+            _ => true,
+        };
+        // dateStyle/timeStyle name CLDR's four stored patterns directly; there
+        // is no skeleton matching for them (ECMA-402 DateTimeStylePattern).
+        let ds = slot("dateStyle").and_then(|s| dtf_pattern::style_index(&s));
+        let ts = slot("timeStyle").and_then(|s| dtf_pattern::style_index(&s));
+        if ds.is_some() || ts.is_some() {
+            let dpat = ds.map(|i| cldr_en::DATE_FORMATS[i].to_string());
+            let tpat = ts.map(|i| cldr_en::TIME_FORMATS[i].to_string());
+            let d_items = dpat.map(|p| Self::dtf_filter(dtf_pattern::parse_pattern(&p), &keep));
+            let t_items = tpat.map(|p| {
+                // `en`'s four stored time patterns are 12-hour (`h:mm:ss a …`).
+                // An h23/h24 request rewrites the hour field to the padded
+                // 24-hour form CLDR uses for it; the day period is then dropped
+                // by `keep` above, taking its separator with it.
+                let items = dtf_pattern::parse_pattern(&p)
+                    .into_iter()
+                    .map(|it| match it {
+                        dtf_pattern::Item::Field('h', _) if !hour12 => {
+                            let hc = slot("hourCycle").unwrap_or_default();
+                            dtf_pattern::Item::Field(if hc == "h24" { 'k' } else { 'H' }, 2)
+                        }
+                        other => other,
+                    })
+                    .collect();
+                Self::dtf_filter(items, &keep)
+            });
+            // CLDR 42+ keeps a second "at time" glue for exactly this
+            // combination; ICU uses it, so `dateStyle: "long"` +
+            // `timeStyle: "short"` reads "May 1, 1886 at 2:12 PM".
+            return (d_items.unwrap_or_default(), t_items.unwrap_or_default(), ds.unwrap_or(3));
+        }
+        let (dpat, tpat, glue) = dtf_pattern::best_pattern_halves(&req, hour12);
+        (
+            Self::dtf_filter(dtf_pattern::parse_pattern(&dpat), &keep),
+            Self::dtf_filter(dtf_pattern::parse_pattern(&tpat), &keep),
+            glue,
+        )
+    }
+
+    /// Interpret a parsed pattern against one instant.
+    fn dtf_render(
+        &self,
+        resolved: u32,
+        ms: f64,
+        absolute: bool,
+        items: &[dtf_pattern::Item],
     ) -> Vec<(&'static str, String)> {
         let slot = |k: &str| -> Option<String> {
             match self.heap.get(resolved) {
@@ -2564,147 +3001,122 @@ impl<'p> Vm<'p> {
         let (y, mo, d) = epoch_days_to_iso(days);
         let rem_ns = total_ms.rem_euclid(86_400_000) * 1_000_000;
         let t = ns_to_time(rem_ns); // [h, mi, s, ms, us, ns]
-        // `fields` is the resolved component set for THIS argument (see
-        // `dtf_fields_for`); the width of each component still comes from the
-        // options, defaulting to numeric when the field was filled in by
-        // ToDateTimeOptions rather than requested.
-        let has = |bit: u16| fields & bit != 0;
-        let has_date = has(Self::F_YEAR | Self::F_MONTH | Self::F_DAY | Self::F_WEEKDAY);
-        let has_time = has(Self::F_HOUR | Self::F_MINUTE | Self::F_SECOND);
-        // A two-digit request pads; a numeric one does not.
-        let two = |k: &str, v: i64| -> String {
-            if slot(k).as_deref() == Some("2-digit") { format!("{v:02}") } else { v.to_string() }
-        };
+        // 1970-01-01 was a Thursday, index 4 in CLDR's Sunday-first week.
+        let weekday = (days.rem_euclid(7) + 4) as usize % 7;
+        // Proleptic Gregorian has no year 0: CLDR year 1 BC is ISO year 0, so the
+        // ERA YEAR is 1 - y below the epoch (`proleptic-gregorian-calendar.js`).
+        let (era_idx, era_year) = if y <= 0 { (0usize, 1 - y) } else { (1usize, y) };
+        let minutes_of_day = (t[0] * 60 + t[1]) as i32;
         let mut out: Vec<(&'static str, String)> = vec![];
-        if has_date {
-            let mut date: Vec<(&'static str, String)> = vec![];
-            if has(Self::F_MONTH) {
-                date.push(("month", two("month", mo)));
-            }
-            if has(Self::F_DAY) {
-                if !date.is_empty() {
-                    date.push(("literal", "/".to_string()));
-                }
-                date.push(("day", two("day", d)));
-            }
-            if has(Self::F_YEAR) {
-                if !date.is_empty() {
-                    date.push(("literal", "/".to_string()));
-                }
-                date.push(("year", y.to_string()));
-            }
-            out.extend(date);
-        }
-        if has_time {
-            let h24 = t[0];
-            let (h12, ap) = if h24 == 0 {
-                (12, "AM")
-            } else if h24 <= 12 {
-                (h24, if h24 == 12 { "PM" } else { "AM" })
-            } else {
-                (h24 - 12, "PM")
-            };
-            // hourCycle h23/h24 print the 24-hour clock and no day period.
-            let hc = slot("hourCycle").unwrap_or_else(|| "h12".to_string());
-            let is12 = hc == "h11" || hc == "h12";
-            let hour_val = match hc.as_str() {
-                "h11" => h24 % 12,
-                "h23" => h24,
-                "h24" => {
-                    if h24 == 0 { 24 } else { h24 }
-                }
-                _ => h12,
-            };
-            let mut time: Vec<(&'static str, String)> = vec![];
-            if has(Self::F_HOUR) {
-                // CLDR's 24-hour time pattern is `HH:mm:ss` (root, and every
-                // locale this engine claims): a `hour: "numeric"` request on a
-                // 24-hour cycle still prints two digits, while the 12-hour
-                // pattern `h:mm:ss a` does not. `hour12: false` therefore has to
-                // read "00:00:00", not "0:00:00"
-                // (`PlainTime/…/toLocaleString/resolved-time-zone.js`).
-                let pad = !is12 || slot("hour").as_deref() == Some("2-digit");
-                time.push((
-                    "hour",
-                    if pad { format!("{hour_val:02}") } else { hour_val.to_string() },
-                ));
-            }
-            if has(Self::F_MINUTE) {
-                if !time.is_empty() {
-                    time.push(("literal", ":".to_string()));
-                }
-                time.push(("minute", format!("{:02}", t[1])));
-            }
-            if has(Self::F_SECOND) {
-                if !time.is_empty() {
-                    time.push(("literal", ":".to_string()));
-                }
-                time.push(("second", format!("{:02}", t[2])));
-            }
-            // fractionalSecondDigits attaches to the second as a `.`-separated
-            // `fractionalSecond` part, truncated (never rounded) to its width.
-            if has(Self::F_FRAC) {
-                if let Some(f) = slot("fractionalSecondDigits") {
-                    if let Ok(n) = f.parse::<usize>() {
-                        if n >= 1 && n <= 3 {
-                            let ms_str = format!("{:03}", t[3]);
-                            time.push(("literal", ".".to_string()));
-                            time.push(("fractionalSecond", ms_str[..n].to_string()));
+        for item in items {
+            match item {
+                dtf_pattern::Item::Lit(s) => out.push(("literal", s.clone())),
+                dtf_pattern::Item::Field(c, n) => {
+                    let n = *n;
+                    // CLDR width index: 0 = wide, 1 = abbreviated, 2 = narrow.
+                    let text_width = |n: usize| match n {
+                        4 => 0,
+                        5 => 2,
+                        _ => 1,
+                    };
+                    match c {
+                        'G' => out.push((
+                            "era",
+                            match text_width(n) {
+                                0 => cldr_en::ERAS_WIDE[era_idx],
+                                2 => cldr_en::ERAS_NARROW[era_idx],
+                                _ => cldr_en::ERAS_ABBR[era_idx],
+                            }
+                            .to_string(),
+                        )),
+                        'y' | 'Y' | 'u' => {
+                            let v = if *c == 'u' { y } else { era_year };
+                            // `yy` is the last two digits, zero-padded; any other
+                            // count is a minimum width.
+                            let s = if n == 2 {
+                                format!("{:02}", v.rem_euclid(100))
+                            } else {
+                                format!("{:0width$}", v, width = n)
+                            };
+                            out.push(("year", s));
                         }
+                        'M' | 'L' => {
+                            let i = (mo - 1) as usize;
+                            let s = match n {
+                                1 => mo.to_string(),
+                                2 => format!("{mo:02}"),
+                                3 => cldr_en::MONTHS_ABBR[i].to_string(),
+                                5 => cldr_en::MONTHS_NARROW[i].to_string(),
+                                _ => cldr_en::MONTHS_WIDE[i].to_string(),
+                            };
+                            out.push(("month", s));
+                        }
+                        'd' => out.push(("day", format!("{:0width$}", d, width = n))),
+                        'E' | 'e' | 'c' => {
+                            let s = match n {
+                                4 => cldr_en::DAYS_WIDE[weekday],
+                                5 => cldr_en::DAYS_NARROW[weekday],
+                                6 => cldr_en::DAYS_SHORT[weekday],
+                                _ => cldr_en::DAYS_ABBR[weekday],
+                            };
+                            out.push(("weekday", s.to_string()));
+                        }
+                        'a' | 'b' => {
+                            let key = if t[0] < 12 { "am" } else { "pm" };
+                            out.push((
+                                "dayPeriod",
+                                dtf_pattern::day_period_name(key, text_width(n)).to_string(),
+                            ));
+                        }
+                        'B' => {
+                            let key = dtf_pattern::day_period_key(minutes_of_day);
+                            out.push((
+                                "dayPeriod",
+                                dtf_pattern::day_period_name(key, text_width(n)).to_string(),
+                            ));
+                        }
+                        'h' | 'H' | 'K' | 'k' => {
+                            let h24 = t[0];
+                            let v = match c {
+                                'h' => {
+                                    if h24 % 12 == 0 {
+                                        12
+                                    } else {
+                                        h24 % 12
+                                    }
+                                }
+                                'K' => h24 % 12,
+                                'k' => {
+                                    if h24 == 0 {
+                                        24
+                                    } else {
+                                        h24
+                                    }
+                                }
+                                _ => h24,
+                            };
+                            out.push(("hour", format!("{:0width$}", v, width = n)));
+                        }
+                        'm' => out.push(("minute", format!("{:0width$}", t[1], width = n))),
+                        's' => out.push(("second", format!("{:0width$}", t[2], width = n))),
+                        'S' => {
+                            // fractionalSecond is truncated, never rounded.
+                            let ms_str = format!("{:03}", t[3]);
+                            let mut s: String = ms_str.chars().take(n).collect();
+                            while s.len() < n {
+                                s.push('0');
+                            }
+                            out.push(("fractionalSecond", s));
+                        }
+                        'z' | 'Z' | 'O' | 'v' | 'V' | 'X' | 'x' => {
+                            out.push(("timeZoneName", self.dtf_zone_name(resolved, *c, n, tz_minutes)));
+                        }
+                        // A field this engine does not implement (quarter, week
+                        // of year, …) is unreachable from ECMA-402's Table 7.
+                        _ => {}
                     }
                 }
             }
-            // The day period belongs to the HOUR field: `{minute, second}` is
-            // "02:03", not "02:03 PM".
-            if is12 && has(Self::F_HOUR) {
-                time.push(("literal", "\u{202f}".to_string()));
-                time.push(("dayPeriod", ap.to_string()));
-            }
-            if !out.is_empty() && !time.is_empty() {
-                out.push(("literal", ", ".to_string()));
-            }
-            out.extend(time);
-        }
-        // timeZoneName. There is no CLDR zone-name data here, and UTS-35 §4.5
-        // makes the *localized GMT format* the specified fallback for exactly
-        // that case, so the name is rendered from the offset this formatter
-        // actually used — self-consistent with the rendering above rather than
-        // an invented name.
-        //
-        // The ONE zone that does get its CLDR name is "UTC": `en.xml` gives
-        // Etc/UTC the short name "UTC" and the long name "Coordinated Universal
-        // Time", and that is not interchangeable with the GMT fallback — an
-        // OFFSET zone of `+00:00` still prints "GMT"
-        // (`ZonedDateTime/…/toLocaleString/offset-time-zones.js` asserts the GMT
-        // spelling, `…/default-includes-time-and-time-zone-name.js` the UTC one).
-        // The *Offset and *Generic styles stay on the GMT format for UTC too.
-        if has(Self::F_ZONE) {
-            let m = tz_minutes;
-            // Under a dateStyle/timeStyle there is no `timeZoneName` option: the
-            // CLDR `full` time pattern carries `zzzz` (the long name) and `long`
-            // carries `z` (the short one).
-            let style = slot("timeZoneName").unwrap_or_else(|| {
-                if slot("timeStyle").as_deref() == Some("full") {
-                    "long".to_string()
-                } else {
-                    "short".to_string()
-                }
-            });
-            let utc_named = slot("timeZone").as_deref() == Some("UTC")
-                && matches!(style.as_str(), "short" | "long");
-            let name = if utc_named {
-                if style == "long" { "Coordinated Universal Time" } else { "UTC" }.to_string()
-            } else if m == 0 {
-                "GMT".to_string()
-            } else {
-                let sign = if m < 0 { '-' } else { '+' };
-                let (h, mi) = (m.abs() / 60, m.abs() % 60);
-                if mi != 0 { format!("GMT{sign}{h}:{mi:02}") } else { format!("GMT{sign}{h}") }
-            };
-            if !out.is_empty() {
-                out.push(("literal", ", ".to_string()));
-            }
-            out.push(("timeZoneName", name));
         }
         // The date-time NUMBERS follow the resolved numbering system too
         // (`format/numbering-system.js`); the literals between them do not.
@@ -2717,6 +3129,40 @@ impl<'p> Vm<'p> {
             }
         }
         out
+    }
+
+    /// The zone name a `z`/`v`/`O` field prints.
+    ///
+    /// There is no CLDR zone-name data here, and UTS #35 §4.5 makes the
+    /// *localized GMT format* the specified fallback for exactly that case, so
+    /// the name is rendered from the offset this formatter actually used —
+    /// self-consistent with the rest of the pattern rather than an invented name.
+    ///
+    /// The ONE zone that does get its CLDR name is "UTC": `en` gives Etc/UTC the
+    /// short name "UTC" and the long name "Coordinated Universal Time", and that
+    /// is not interchangeable with the GMT fallback — an OFFSET zone of `+00:00`
+    /// still prints "GMT" (`ZonedDateTime/…/toLocaleString/offset-time-zones.js`
+    /// asserts the GMT spelling, `…/default-includes-time-and-time-zone-name.js`
+    /// the UTC one). The *Offset and *Generic styles stay on the GMT format for
+    /// UTC too.
+    fn dtf_zone_name(&self, resolved: u32, c: char, n: usize, tz_minutes: i64) -> String {
+        let slot = |k: &str| -> Option<String> {
+            match self.heap.get(resolved) {
+                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
+                _ => None,
+            }
+        };
+        let m = tz_minutes;
+        let utc_named = slot("timeZone").as_deref() == Some("UTC") && c == 'z';
+        if utc_named {
+            return if n >= 4 { "Coordinated Universal Time" } else { "UTC" }.to_string();
+        }
+        if m == 0 {
+            return "GMT".to_string();
+        }
+        let sign = if m < 0 { '-' } else { '+' };
+        let (h, mi) = (m.abs() / 60, m.abs() % 60);
+        if mi != 0 { format!("GMT{sign}{h}:{mi:02}") } else { format!("GMT{sign}{h}") }
     }
 
     /// Intl.DateTimeFormat.prototype.format(date) — UTC, en-US conventions.
@@ -3249,6 +3695,68 @@ pub(crate) const SANCTIONED_UNITS: &[&str] = &[
     "nanosecond", "ounce", "percent", "petabyte", "pound", "second", "stone", "terabit",
     "terabyte", "week", "yard", "year", "fahrenheit",
 ];
+
+/// The compact affix `s` ends with, if any. The affixes are a closed set (the
+/// literal halves of the locale's compact-decimal rows), so recognising one is
+/// exact rather than a guess — the longest match wins so " million" is not read
+/// as "n".
+fn compact_affix_of(s: &str, display: &str) -> Option<&'static str> {
+    let table = if display == "long" {
+        crate::vm::cldr_en::COMPACT_DECIMAL_LONG
+    } else {
+        crate::vm::cldr_en::COMPACT_DECIMAL_SHORT
+    };
+    table
+        .iter()
+        .map(|(.., pat)| pat.trim_start_matches('0'))
+        .filter(|aff| !aff.is_empty() && s.ends_with(aff))
+        .max_by_key(|aff| aff.len())
+}
+
+/// The prefix and suffix of the NEGATIVE subpattern of CLDR's accounting
+/// currency format (`en`: `¤#,##0.00;(¤#,##0.00)` → `("(", ")")`). Everything
+/// before the first and after the last of the pattern's own symbols (`¤`, `#`,
+/// `0`, and the grouping/decimal separators) is affix.
+fn accounting_affixes() -> (&'static str, &'static str) {
+    let neg = crate::vm::cldr_en::PATTERN_ACCOUNTING.split(';').nth(1).unwrap_or("");
+    let body = |c: char| matches!(c, '¤' | '#' | '0' | ',' | '.');
+    let start = neg.find(body).unwrap_or(neg.len());
+    let end = neg.rfind(body).map_or(neg.len(), |i| i + neg[i..].chars().next().unwrap().len_utf8());
+    (&neg[..start], &neg[end..])
+}
+
+/// The CLDR `en` pattern that renders `unit` at `width` for the given plural
+/// category — `"{0} km/h"`, `"{0}%"`, `"{0} kilometers per hour"` — or None when
+/// CLDR has no row for it (the caller then echoes the identifier rather than
+/// inventing a name).
+///
+/// A `<num>-per-<den>` compound follows UTS #35 "Compound Units" in order:
+/// CLDR's own idiomatic row first (so `kilometer-per-hour` is "km/h", never
+/// "km/hour"), then the DENOMINATOR's `perUnitPattern` wrapped around the
+/// numerator, and only then the generic `compoundUnitPattern`.
+fn cldr_unit_pattern(unit: &str, width: &str, one: bool) -> Option<String> {
+    use crate::vm::cldr_en as d;
+    let pick = |row: &(&str, &str, &'static str, &'static str)| {
+        if one { row.2.to_string() } else { row.3.to_string() }
+    };
+    if let Some(r) = d::UNIT_PER_PATTERNS.iter().find(|(u, w, ..)| *u == unit && *w == width) {
+        return Some(pick(r));
+    }
+    if let Some(r) = d::UNIT_PATTERNS.iter().find(|(u, w, ..)| *u == unit && *w == width) {
+        return Some(pick(r));
+    }
+    let (num, den) = unit.split_once("-per-")?;
+    let num_pat = d::UNIT_PATTERNS.iter().find(|(u, w, ..)| *u == num && *w == width).map(pick)?;
+    if let Some((.., p)) = d::UNIT_PER_UNIT.iter().find(|(u, w, _)| *u == den && *w == width) {
+        return Some(p.replace("{0}", &num_pat));
+    }
+    // The denominator contributes its NAME only: its own pattern minus the
+    // `{0}` placeholder and the spacing that separated them.
+    let den_pat = d::UNIT_PATTERNS.iter().find(|(u, w, ..)| *u == den && *w == width)?;
+    let den_name = den_pat.2.replace("{0}", "");
+    let idx = ["long", "short", "narrow"].iter().position(|w| *w == width)?;
+    Some(d::UNIT_COMPOUND_PER[idx].replace("{0}", &num_pat).replace("{1}", den_name.trim()))
+}
 
 pub(crate) fn is_well_formed_unit(u: &str) -> bool {
     if SANCTIONED_UNITS.contains(&u) {

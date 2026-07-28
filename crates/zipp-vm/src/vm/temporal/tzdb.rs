@@ -226,7 +226,15 @@ pub(crate) fn next_transition(zone: u16, t: i64) -> Option<i64> {
     // The annual rules repeat, so a transition after `t` is in this civil year
     // or the next one; scan three to be safe against the offset shifting the
     // year boundary.
-    let y = civil_year(t);
+    //
+    // The rules need not start the year after the explicit list ends: Egypt
+    // dropped DST in 2015 and reintroduced it with a `max` rule in 2023, so
+    // Africa/Cairo's last explicit transition is 2014-09-25 and `fin_year` is
+    // 2023. Scanning only around `t` found nothing in that eight-year gap and
+    // reported that the zone never changes offset again, which made
+    // `getTimeZoneTransition("next")` null from 2014 on. Start no earlier than
+    // the year before the rules take over.
+    let y = civil_year(t).max(z.fin_year as i64 - 1);
     let mut buf = Vec::with_capacity(4);
     for yy in (y - 1)..=(y + 2) {
         final_transitions(zone, yy, &mut buf);

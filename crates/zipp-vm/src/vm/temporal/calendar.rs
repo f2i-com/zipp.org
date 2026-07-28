@@ -18,10 +18,14 @@
 //! a different reason: it is not computed at all but *published* as a fixed
 //! month-length table for 1300–1600 AH, with islamic-civil outside that window,
 //! so the whole calendar is 301 words of data plus the arithmetic already here.
-//! `chinese`/`dangi` do NOT qualify (true new moons and solar terms), nor do
-//! the genuinely observational islamic variants (`islamic`, `islamic-rgsa`):
-//! they need new-moon computation or sighting records we do not have, and a
-//! fake answer would be worse than the honest `RangeError`.
+//! `chinese`/`dangi` do NOT qualify — they need true new moons and major solar
+//! terms — so their year structure lives in [`super::chinese`], on top of the
+//! astronomical series in [`super::astro`]; only the interface below is shared,
+//! and it needed no widening: months-in-year was already year-dependent and the
+//! `M05L` code layer already existed, both for `hebrew`. The genuinely
+//! observational islamic variants (`islamic`, `islamic-rgsa`) still do not
+//! qualify at all: they need sighting records we do not have, and a fake answer
+//! would be worse than the honest `RangeError`.
 //!
 //! Formulas are the standard fixed-date (R.D.) ones from Reingold &
 //! Dershowitz, *Calendrical Calculations*; `RD_AT_EPOCH` converts between R.D.
@@ -29,6 +33,7 @@
 //! (day 0 = 1970-01-01).
 
 use super::super::helpers_datetime::{epoch_days_to_iso, iso_to_epoch_days};
+use super::chinese;
 
 /// R.D. of 1970-01-01, the origin of this engine's `epoch_days`.
 const RD_AT_EPOCH: i64 = 719_163;
@@ -51,6 +56,8 @@ pub(crate) enum Cal {
     Indian = 11,
     Hebrew = 12,
     IslamicUmalqura = 13,
+    Chinese = 14,
+    Dangi = 15,
 }
 
 impl Cal {
@@ -69,6 +76,8 @@ impl Cal {
             11 => Cal::Indian,
             12 => Cal::Hebrew,
             13 => Cal::IslamicUmalqura,
+            14 => Cal::Chinese,
+            15 => Cal::Dangi,
             _ => Cal::Iso,
         }
     }
@@ -91,13 +100,28 @@ impl Cal {
             Cal::Persian => "persian",
             Cal::Indian => "indian",
             Cal::Hebrew => "hebrew",
+            Cal::Chinese => "chinese",
+            Cal::Dangi => "dangi",
         }
     }
 
     /// Whether the calendar reports `era`/`eraYear` (and therefore accepts them
-    /// as input fields). `iso8601` does not; every calendar here otherwise does.
+    /// as input fields). `iso8601` does not, and neither do `chinese`/`dangi` —
+    /// their sexagenary cycle is a year NAME, not an era, so Temporal gives them
+    /// a bare arithmetic year and an `era`/`eraYear` in the bag is ignored
+    /// (`PlainDate/from/calendar-not-supporting-eras.js`).
     pub(crate) fn has_eras(self) -> bool {
-        self != Cal::Iso
+        !matches!(self, Cal::Iso | Cal::Chinese | Cal::Dangi)
+    }
+
+    /// The lunisolar pair, as the `dangi` flag [`super::chinese`] takes: the two
+    /// calendars are one algorithm on two meridians.
+    fn lunisolar(self) -> Option<bool> {
+        match self {
+            Cal::Chinese => Some(false),
+            Cal::Dangi => Some(true),
+            _ => None,
+        }
     }
 
     /// Gregorian-structured calendars share the ISO month/day layout and differ
@@ -144,8 +168,8 @@ impl Cal {
 /// Resolve a calendar identifier (ASCII case-insensitive) to its calendar,
 /// applying the CLDR aliases that `CanonicalizeCalendar` must accept
 /// (`islamicc` → `islamic-civil`, `ethiopic-amete-alem` → `ethioaa`).
-/// Unsupported-but-real ids (`chinese`, `dangi`, `islamic-rgsa`, …) return
-/// `None` and the caller reports them as unsupported, not as malformed.
+/// Unsupported-but-real ids (`islamic`, `islamic-rgsa`, …) return `None` and
+/// the caller reports them as unsupported, not as malformed.
 pub(crate) fn calendar_by_id(s: &str) -> Option<Cal> {
     let s = s.trim();
     let lower = s.to_ascii_lowercase();
@@ -164,6 +188,8 @@ pub(crate) fn calendar_by_id(s: &str) -> Option<Cal> {
         "persian" => Cal::Persian,
         "indian" => Cal::Indian,
         "hebrew" => Cal::Hebrew,
+        "chinese" => Cal::Chinese,
+        "dangi" => Cal::Dangi,
         _ => return None,
     })
 }
@@ -497,6 +523,9 @@ fn hebrew_days_in_month(y: i64, m: i64) -> i64 {
 /// `CalendarDateMonthsInYear`. Year-dependent for `hebrew` (a leap year inserts
 /// Adar I); 13 for the Coptic-structured calendars, 12 for everything else.
 pub(crate) fn cal_months_in_year(c: Cal, y: i64) -> i64 {
+    if let Some(k) = c.lunisolar() {
+        return chinese::year(k, y).n_months as i64;
+    }
     if c == Cal::Hebrew {
         return if hebrew_leap(y) { 13 } else { 12 };
     }
@@ -510,7 +539,7 @@ pub(crate) fn cal_months_in_year(c: Cal, y: i64) -> i64 {
 /// The greatest `monthsInYear` this calendar ever has — the year-independent
 /// bound a field check can use before a year is known.
 pub(crate) fn cal_max_months(c: Cal) -> i64 {
-    if c == Cal::Hebrew || c.coptic_like().is_some() {
+    if c == Cal::Hebrew || c.lunisolar().is_some() || c.coptic_like().is_some() {
         13
     } else {
         12
@@ -521,6 +550,12 @@ pub(crate) fn cal_max_months(c: Cal) -> i64 {
 /// of these gives the exact month distance even when the years in between differ
 /// in length, so month arithmetic never has to walk year by year.
 pub(crate) fn cal_months_before_year(c: Cal, y: i64) -> i64 {
+    if let Some(k) = c.lunisolar() {
+        // The LUNATION number of the new year: months ARE new moons, so the
+        // index of the new moon opening month 1 is already the global,
+        // strictly-consecutive month index, with no year walk anywhere.
+        return chinese::year(k, y).first_nm;
+    }
     if c == Cal::Hebrew {
         return hebrew_months_before(y);
     }
@@ -536,6 +571,9 @@ pub(crate) fn cal_month_index(c: Cal, y: i64, m: i64) -> i64 {
 
 /// The inverse of [`cal_month_index`].
 pub(crate) fn cal_month_from_index(c: Cal, idx: i64) -> (i64, i64) {
+    if let Some(k) = c.lunisolar() {
+        return chinese::month_from_index(k, idx);
+    }
     if c == Cal::Hebrew {
         // months_before(y) = floor((235y-234)/19) <= idx  ⟺  y <= (19·idx+252)/235.
         let mut y = (19 * idx + 252).div_euclid(235);
@@ -556,6 +594,17 @@ pub(crate) fn cal_month_from_index(c: Cal, idx: i64) -> (i64, i64) {
 /// Shevat (`M05`) and the Adar that a common year keeps (`M06`), so every month
 /// AFTER it has an ordinal one higher than its code.
 pub(crate) fn cal_month_code(c: Cal, y: i64, m: i64) -> (i64, bool) {
+    if let Some(k) = c.lunisolar() {
+        // A lunisolar leap month repeats the number of the month BEFORE it, so
+        // ordinal `leap_ord` is `M{leap_ord-1}L` and every month after it has a
+        // code one lower than its ordinal.
+        let leap = chinese::year(k, y).leap_ord as i64;
+        return match m {
+            _ if leap == 0 || m < leap => (m, false),
+            _ if m == leap => (m - 1, true),
+            _ => (m - 1, false),
+        };
+    }
     if c == Cal::Hebrew && hebrew_leap(y) {
         return match m {
             6 => (5, true),
@@ -573,7 +622,15 @@ pub(crate) fn cal_month_code(c: Cal, y: i64, m: i64) -> (i64, bool) {
 /// common year) is subject to `overflow` instead.
 pub(crate) fn cal_month_code_valid(c: Cal, num: i64, leap: bool) -> bool {
     if leap {
-        // Adar I is the only leap month any implemented calendar has.
+        // A lunisolar leap month can follow ANY of the twelve months, so every
+        // M01L..M12L is well formed even though several never occur in the range
+        // these calendars can be computed over — that is an `overflow` matter,
+        // not a malformed code. M13L is malformed, which is what
+        // `with/chinese-calendar-leap-dates.js` asserts in a 13-month year.
+        if c.lunisolar().is_some() {
+            return (1..=12).contains(&num);
+        }
+        // Adar I is the only leap month the arithmetic calendars have.
         return c == Cal::Hebrew && num == 5;
     }
     // A 13th ORDINARY month exists only in the coptic-structured calendars;
@@ -585,6 +642,13 @@ pub(crate) fn cal_month_code_valid(c: Cal, num: i64, leap: bool) -> bool {
 /// The ordinal month a month code names in calendar year `y`, or `None` when
 /// that year does not have it (hebrew "M05L" in a common year).
 pub(crate) fn cal_month_of_code(c: Cal, y: i64, num: i64, leap: bool) -> Option<i64> {
+    if let Some(k) = c.lunisolar() {
+        let l = chinese::year(k, y).leap_ord as i64;
+        if leap {
+            return (l != 0 && num == l - 1).then_some(l);
+        }
+        return Some(if l != 0 && num >= l { num + 1 } else { num });
+    }
     if c == Cal::Hebrew {
         return if hebrew_leap(y) {
             if leap {
@@ -674,11 +738,26 @@ pub(crate) fn cal_month_of_code_constrain(c: Cal, y: i64, num: i64, leap: bool) 
         return m;
     }
     let miy = cal_months_in_year(c, y);
+    // The lunisolar calendars collapse the other way: their leap month REPEATS
+    // the month before it rather than splitting one in two, so a missing M05L
+    // falls back onto M05 (`PlainYearMonth/from/reference-day-chinese.js`:
+    // "M05L is constrained to M05 in year 2022"), where hebrew's Adar I becomes
+    // the following Adar.
+    if c.lunisolar().is_some() {
+        return cal_month_of_code(c, y, num, false).unwrap_or(miy).clamp(1, miy);
+    }
     cal_month_of_code(c, y, num, false).map_or(miy, |m| m + 1).clamp(1, miy)
 }
 
 /// `CalendarDateDaysInMonth` for a calendar year/ordinal month.
 pub(crate) fn cal_days_in_month(c: Cal, y: i64, m: i64) -> i64 {
+    if let Some(k) = c.lunisolar() {
+        // A month that has rolled out of its year (the difference probes step
+        // past a year boundary) belongs to a neighbouring year, which may have a
+        // different month count — normalise through the global index first.
+        let (_, nm, cy) = chinese::normalize(k, y, m);
+        return cy.days_in_month(nm);
+    }
     if let Some(off) = c.gregorian_like() {
         return super::super::helpers_datetime::days_in_month(y - off, m);
     }
@@ -740,6 +819,66 @@ pub(crate) fn cal_days_in_month(c: Cal, y: i64, m: i64) -> i64 {
     super::super::helpers_datetime::days_in_month(y, m)
 }
 
+/// `CalendarMonthDayToISOReferenceDate`'s search: the epoch day of the LATEST
+/// occurrence of this month code and day that is not after 1972-12-31, or `None`
+/// when the calendar has no such date at all.
+///
+/// The lunisolar calendars need their own window, because several of their leap
+/// months are rarer than the arithmetic calendars' leap cycles: `M09L`, `M10L`
+/// and `M11L` do not occur between 1900 and 1972 at all, so the search runs
+/// FORWARD when the backward one comes up empty — which is how the spec's
+/// tabulated reference years 2014, 1984 and 2033 arise. The window ends where
+/// `PlainDate/from/extreme-dates.js` says each calendar stops being exact, and
+/// that bound is load-bearing: over a wider one `dangi`'s `M08L` would find a
+/// 30-day instance in 2052 that the spec's table says does not exist.
+pub(crate) fn cal_month_day_reference(c: Cal, num: i64, leap: bool, d: i64) -> Option<i64> {
+    let limit = iso_to_epoch_days(1972, 12, 31);
+    let anchor = cal_from_epoch_days(c, limit).0;
+    let at = |cy: i64| -> Option<i64> {
+        let m = cal_month_of_code(c, cy, num, leap)?;
+        (d <= cal_days_in_month(c, cy, m)).then(|| cal_to_epoch_days(c, cy, m, d))
+    };
+    if c.lunisolar().is_some() {
+        let hi = if c == Cal::Chinese {
+            chinese::REF_YEAR_HI_CHINESE
+        } else {
+            chinese::REF_YEAR_HI_DANGI
+        };
+        for cy in (chinese::REF_YEAR_LO..=anchor).rev() {
+            if let Some(ed) = at(cy).filter(|&ed| ed <= limit) {
+                return Some(ed);
+            }
+        }
+        return (anchor + 1..=hi).find_map(at);
+    }
+    // 40 years covers the 4-year Coptic/Gregorian/Indian cycle, the 30-year
+    // tabular-Islamic one, the 33-year Persian one and the 19-year Hebrew
+    // Metonic cycle, so an arithmetic calendar never needs to look forward.
+    (0..40).find_map(|k| at(anchor - k).filter(|&ed| ed <= limit))
+}
+
+/// `overflow: "constrain"` for a month/day pair that has no reference date at
+/// all: what to try instead. Every calendar clamps the day, but the lunisolar
+/// ones ALSO drop the leap marker, because a leap month that never occurs is not
+/// "a shorter M02L" — there is no M02L (spec 4.1.21 step g, pinned by
+/// `PlainMonthDay/from/chinese-dangi-constrain-rare-leap-months.js`, where
+/// `M02L`-30 must come out equal to `M02`-30 with reference year 1972).
+pub(crate) fn cal_month_day_constrain(c: Cal, code: (i64, bool), d: i64) -> ((i64, bool), i64) {
+    if c.lunisolar().is_some() {
+        // No lunar month is longer than 30 days anywhere in the window the
+        // reference search covers (`chinese::every_day_round_trips` pins that).
+        let d = d.min(30);
+        if cal_month_day_reference(c, code.0, code.1, d).is_some() {
+            return (code, d);
+        }
+        return ((code.0, false), d);
+    }
+    // Clamp to the LONGEST this month ever is — the reference date is free to
+    // be a leap year, so Coptic M13 day 7 constrains to 6, not to 5.
+    let cy = cal_from_epoch_days(c, iso_to_epoch_days(1972, 12, 31)).0;
+    (code, d.min(cal_month_code_max_days(c, cy, code.0, code.1)))
+}
+
 /// The greatest length the month with this CODE ever has, searching back over a
 /// full leap cycle from `y` — what `overflow: "constrain"` clamps a PlainMonthDay
 /// day to, since its reference year is chosen afterwards. Keyed on the code, not
@@ -759,6 +898,10 @@ pub(crate) fn cal_month_code_max_days(c: Cal, y: i64, num: i64, leap: bool) -> i
 
 /// `CalendarDateInLeapYear`.
 pub(crate) fn cal_in_leap_year(c: Cal, y: i64) -> bool {
+    if c.lunisolar().is_some() {
+        // "Leap" for a lunisolar year means it holds an intercalary month.
+        return cal_months_in_year(c, y) == 13;
+    }
     if let Some(off) = c.gregorian_like() {
         return super::super::helpers_datetime::is_leap_year(y - off);
     }
@@ -789,6 +932,10 @@ pub(crate) fn cal_in_leap_year(c: Cal, y: i64) -> bool {
 
 /// `CalendarDateDaysInYear`.
 pub(crate) fn cal_days_in_year(c: Cal, y: i64) -> i64 {
+    if let Some(k) = c.lunisolar() {
+        let cy = chinese::year(k, y);
+        return (cy.starts[cy.n_months as usize] - cy.starts[0]) as i64;
+    }
     if c.gregorian_like().is_some() || c == Cal::Iso {
         return if cal_in_leap_year(c, y) { 366 } else { 365 };
     }
@@ -814,6 +961,10 @@ pub(crate) fn cal_days_in_year(c: Cal, y: i64) -> i64 {
 /// outside 1..monthsInYear still produces a well-defined (rolled) day so the
 /// probing loops in the difference algorithms cannot trap.
 pub(crate) fn cal_to_epoch_days(c: Cal, y: i64, m: i64, d: i64) -> i64 {
+    if let Some(k) = c.lunisolar() {
+        let (_, nm, cy) = chinese::normalize(k, y, m);
+        return cy.month_start(nm) + d - 1;
+    }
     if let Some(off) = c.gregorian_like() {
         return iso_to_epoch_days(y - off, m, d);
     }
@@ -871,6 +1022,9 @@ fn cal_year_start(c: Cal, y: i64) -> i64 {
 
 /// `CalendarISOToDate`'s year/month/day: project an epoch day into the calendar.
 pub(crate) fn cal_from_epoch_days(c: Cal, ed: i64) -> (i64, i64, i64) {
+    if let Some(k) = c.lunisolar() {
+        return chinese::from_epoch_days(k, ed);
+    }
     if let Some(off) = c.gregorian_like() {
         let (y, m, d) = epoch_days_to_iso(ed);
         return (y + off, m, d);
@@ -926,7 +1080,8 @@ pub(crate) fn cal_from_iso(c: Cal, y: i64, m: i64, d: i64) -> (i64, i64, i64) {
 /// The Japanese eras need the whole date because an era boundary falls mid-year.
 pub(crate) fn cal_era(c: Cal, y: i64, m: i64, d: i64) -> Option<(&'static str, i64)> {
     Some(match c {
-        Cal::Iso => return None,
+        // No eras: the sexagenary cycle NAMES a year, it does not count from one.
+        Cal::Iso | Cal::Chinese | Cal::Dangi => return None,
         Cal::Gregory => {
             if y >= 1 {
                 ("ce", y)
@@ -1051,6 +1206,7 @@ pub(crate) fn cal_resolve_era(c: Cal, era: &str, era_year: i64) -> Option<i64> {
         Cal::Persian => (era == "ap").then_some(era_year),
         Cal::Indian => (era == "shaka").then_some(era_year),
         Cal::Hebrew => (era == "am").then_some(era_year),
+        Cal::Chinese | Cal::Dangi => None,
     }
 }
 
@@ -1136,16 +1292,20 @@ pub(crate) fn cal_until_year_split(
     let (y1, m1, dd1) = one;
     let (y2, m2, dd2) = two;
     // Position of a probe for the surpass test: (month index, UNCLAMPED day, and
-    // a final tie-break for a CONSTRAINED month). "M05L in a year that has none"
-    // is not quite Adar — it is the gap just before it — so on an exact tie it
-    // ranks earlier, and that is what decides whether the year counts: Hebrew
-    // Adar I + 1 year onto Adar IS a whole year, while −1 year onto the same
-    // Adar is not (`since/leap-months-hebrew.js`, "M05L-M06 backwards is -1y"
-    // against "M05L-M06 is 12mo not 1y"). The tie-break is LAST so it cannot
-    // mask an unclamped day that really has run past the month
+    // a final tie-break for a CONSTRAINED month). A constrained leap month did
+    // not land on its own slot, so on an exact tie it ranks on whichever side of
+    // the month it was moved OFF — and the two leap-month calendars constrain in
+    // opposite directions. Hebrew's Adar I becomes the FOLLOWING Adar, so the
+    // gap it came from is earlier (`since/leap-months-hebrew.js`: "M05L-M06
+    // backwards is -1y" against "M05L-M06 is 12mo not 1y"); a lunisolar leap
+    // month becomes the PRECEDING ordinary month, so its gap is later
+    // (`until/leap-months-chinese.js`: "M04L-M04 is 12mo not 1y" against
+    // "M04L-M04 backwards is -1y"). The tie-break is LAST so it cannot mask an
+    // unclamped day that really has run past the month
     // (`wrapping-at-end-of-month-hebrew.js`: 30 Adar I to 29 Adar is not a year).
+    let bias = if c.lunisolar().is_some() { 1 } else { -1 };
     let key = |y: i64, m: i64, constrained: bool, d: i64| {
-        (cal_month_index(c, y, m), d, -(constrained as i64))
+        (cal_month_index(c, y, m), d, bias * constrained as i64)
     };
     let e1 = cal_to_epoch_days(c, y1, m1, dd1);
     let e2 = cal_to_epoch_days(c, y2, m2, dd2);

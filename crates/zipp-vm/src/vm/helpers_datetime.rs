@@ -566,10 +566,12 @@ pub(crate) fn canonicalize_locale(tag: &str) -> Option<String> {
 /// digit target, a fraction-digit target, or both under morePrecision).
 pub(crate) struct NumFmtParams<'a> {
     pub style: &'a str,
-    /// "standard" | "scientific" | "engineering" | "compact". `compact` needs
-    /// the CLDR compact-decimal patterns, which this engine does not ship, so it
-    /// formats as `standard`.
+    /// "standard" | "scientific" | "engineering" | "compact".
     pub notation: &'a str,
+    /// `compactDisplay`: "short" (988M) or "long" (988 million). Read only when
+    /// `notation` is "compact"; it selects which CLDR compact-decimal table
+    /// supplies the exponent and the affix.
+    pub compact_display: &'a str,
     pub min_int: i64,
     pub min_frac: Option<i64>,
     pub max_frac: Option<i64>,
@@ -742,6 +744,63 @@ fn round_to_increment(int_s: &str, frac_s: &str, k: i64, inc: i64, mode: &str) -
     Some((i.to_string(), fr.to_string()))
 }
 
+/// The CLDR compact-decimal table for a `compactDisplay` value.
+fn compact_table(display: &str) -> &'static [(u32, &'static str, &'static str)] {
+    if display == "long" {
+        crate::vm::cldr_en::COMPACT_DECIMAL_LONG
+    } else {
+        crate::vm::cldr_en::COMPACT_DECIMAL_SHORT
+    }
+}
+
+/// The compact-decimal row covering 10^magnitude — the highest row at or below
+/// it. Below the table's floor (10^3 for `en`) there is no row and no
+/// compaction, which is why 159 prints as "159".
+fn compact_row(magnitude: i64, display: &str) -> Option<(u32, &'static str)> {
+    if magnitude < 0 {
+        return None;
+    }
+    let m = magnitude as u32;
+    compact_table(display)
+        .iter()
+        .filter(|(p, ..)| *p <= m)
+        .max_by_key(|(p, ..)| *p)
+        .map(|(p, _, pat)| (*p, *pat))
+}
+
+/// ComputeExponentForMagnitude for compact notation: the row's pattern shows a
+/// fixed number of integer digits ("000M" shows three), and the exponent is the
+/// magnitude less those digits minus one.
+fn compact_exponent(magnitude: i64, display: &str) -> i64 {
+    match compact_row(magnitude, display) {
+        Some((power, pat)) => {
+            let zeros = pat.bytes().filter(|b| *b == b'0').count() as i64;
+            // A row of bare "0" means the locale does not compact at that
+            // magnitude at all.
+            if zeros == 0 { 0 } else { power as i64 - (zeros - 1) }
+        }
+        None => 0,
+    }
+}
+
+/// The literal part of the compact row's pattern — "K", " million" — for the
+/// magnitude the ROUNDED mantissa lands on, in the plural category that
+/// mantissa selects (`en`'s cardinal rule is `i = 1 and v = 0`).
+fn compact_affix(exponent: i64, int_s: &str, frac_s: &str, display: &str) -> &'static str {
+    let magnitude = exponent + decimal_exponent(int_s, frac_s) - 1;
+    let Some((power, _)) = compact_row(magnitude, display) else { return "" };
+    let one = int_s.trim_start_matches('0') == "1" && frac_s.is_empty();
+    let want = if one { "one" } else { "other" };
+    let row = compact_table(display)
+        .iter()
+        .find(|(p, c, _)| *p == power && *c == want)
+        .or_else(|| compact_table(display).iter().find(|(p, ..)| *p == power));
+    match row {
+        Some((.., pat)) => pat.trim_start_matches('0'),
+        None => "",
+    }
+}
+
 /// Format a number for Intl.NumberFormat: ECMA-402 rounding (fraction digits,
 /// significant digits, rounding mode + increment, trailing-zero display) and
 /// sign display, then en-US decoration ("," grouping, "." decimal; percent
@@ -793,13 +852,22 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
     // mantissa is produced by SHIFTING the decimal string, not by dividing —
     // `x / 1e-6` would re-introduce binary error into an exact decimal.
     let magnitude: Option<i64> = match p.notation {
-        "scientific" | "engineering" => {
+        "scientific" | "engineering" | "compact" => {
             let is_zero_in = int_s.bytes().all(|b| b == b'0') && frac_s.bytes().all(|b| b == b'0');
             Some(if is_zero_in { 0 } else { decimal_exponent(&int_s, &frac_s) - 1 })
         }
         _ => None,
     };
-    let exp_for = |m: i64| if p.notation == "engineering" { m.div_euclid(3) * 3 } else { m };
+    let compact = p.notation == "compact";
+    let exp_for = |m: i64| match p.notation {
+        "engineering" => m.div_euclid(3) * 3,
+        // ComputeExponentForMagnitude: the locale's compact-decimal row for
+        // 10^m says how many integer digits it keeps, and the exponent is the
+        // rest — `en`'s 10^8 row is "000M", three digits, so 987654321 scales
+        // by 10^6 to 987.654321 and prints "988M".
+        "compact" => compact_exponent(m, p.compact_display),
+        _ => m,
+    };
     let exponent = magnitude.map(exp_for);
     let (orig_int, orig_frac) = (int_s.clone(), frac_s.clone());
     let (int_s, frac_s) = match exponent {
@@ -886,9 +954,16 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
         }
     }
     let is_zero = ip.bytes().all(|b| b == b'0') && fp.bytes().all(|b| b == b'0');
-    // The scientific/engineering pattern has no grouping separators.
+    // The compact affix depends on the ROUNDED mantissa (9.99 thousand rounds to
+    // "10" and stays thousand, but 999.9 thousand rounds to "1000" and the
+    // exponent recomputation above has already moved it), so capture it before
+    // the integer part is consumed by grouping.
+    let compact_aff =
+        if compact { exponent.map(|e| compact_affix(e, &ip, &fp, p.compact_display)) } else { None };
+    // The scientific/engineering pattern has no grouping separators; the compact
+    // one keeps them (its mantissa is an ordinary number).
     let min_group_len = if p.group_min2 { 5 } else { 4 };
-    let grouped = if p.grouping && exponent.is_none() && ip.len() >= min_group_len {
+    let grouped = if p.grouping && (exponent.is_none() || compact) && ip.len() >= min_group_len {
         let len = ip.len();
         let first = match len % 3 {
             0 => 3,
@@ -911,13 +986,19 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
         res.push_str(&fp);
     }
     if let Some(e) = exponent {
-        // The en scientific pattern's exponent separator is "E"; the exponent
-        // itself carries a minus but never a plus.
-        res.push('E');
-        if e < 0 {
-            res.push('-');
+        if compact {
+            // The compact affix ("K", " million") replaces the exponent — the
+            // magnitude is spelled, not written as a power.
+            res.push_str(compact_aff.unwrap_or(""));
+        } else {
+            // The en scientific pattern's exponent separator is "E"; the
+            // exponent itself carries a minus but never a plus.
+            res.push('E');
+            if e < 0 {
+                res.push('-');
+            }
+            res.push_str(&e.abs().to_string());
         }
-        res.push_str(&e.abs().to_string());
     }
     if p.style == "percent" {
         res.push('%');
@@ -960,37 +1041,52 @@ pub(crate) fn currency_symbol(code: &str) -> String {
     }
 }
 
-/// CreatePartsFromList for the list patterns this engine has. `format` joins
+/// The literal between `{0}` and `{1}` in a CLDR two-placeholder pattern.
+///
+/// Every `en` list pattern has the shape `{0}<literal>{1}` — no prefix, no
+/// suffix — so the join is fully described by that one literal. A pattern that
+/// ever gained an affix would need CreatePartsFromList's nested substitution
+/// instead, and `debug_assert` says so rather than silently dropping it.
+fn pattern_infix(p: &str) -> &str {
+    let (pre, rest) = p.split_once("{0}").unwrap_or(("", p));
+    let (mid, post) = rest.split_once("{1}").unwrap_or((rest, ""));
+    debug_assert!(pre.is_empty() && post.is_empty(), "list pattern with affixes: {p}");
+    mid
+}
+
+/// CreatePartsFromList over the CLDR `en` list patterns (`cldr_en::LIST_PATTERNS`,
+/// generated from `cldr-misc-full/main/en/listPatterns.json`). `format` joins
 /// these; `formatToParts` wraps them; `Intl.DurationFormat` joins its units
 /// through the same function, so the two services can never disagree.
 ///
-/// Three pattern sets are real CLDR, the rest are the `long` fallbacks:
-///   * conjunction/disjunction `long` — CLDR `en.xml` `listPattern` (standard)
-///     and `listPattern type="or"`.
-///   * `unit` at long/short — CLDR ROOT `listPattern type="unit"` /
-///     `"unit-short"`, `{0}, {1}` in every part, which `en` inherits unchanged.
-///   * `unit` at narrow — CLDR ROOT `listPattern type="unit-narrow"`,
-///     `{0} {1}`. Also inherited unchanged by `en` AND by `es`, which is why
-///     `ListFormat/prototype/format/es-es-narrow.js` passes on it too.
-/// The `unit` rows are what `Intl.DurationFormat` needs to render
-/// "1 day, 01:02" rather than "1 day and 01:02" (see
-/// DurationFormat/prototype/format/digital-style-with-hours-display-auto-with-zero-hour.js).
-/// The conjunction/disjunction SHORT and NARROW widths are genuinely
-/// locale-specific (`en` short is "&", `es` unit-long is "y") and still need
-/// CLDR data zipp does not ship, so they fall back to `long` here.
+/// The widths were previously all collapsed onto `long` for want of data, which
+/// is why `en-US` `short` printed "foo and bar" where CLDR says "foo & bar"
+/// (`ListFormat/prototype/{format,formatToParts}/en-us-short.js`).
 pub(crate) fn list_parts_en(items: &[String], ty: &str, style: &str) -> Vec<(&'static str, String)> {
-    let (two, middle, end) = match (ty, style) {
-        ("unit", "narrow") => (" ", " ", " "),
-        ("unit", _) => (", ", ", ", ", "),
-        ("disjunction", _) => (" or ", ", ", ", or "),
-        _ => (" and ", ", ", ", and "),
+    let row = crate::vm::cldr_en::LIST_PATTERNS
+        .iter()
+        .find(|(t, s, ..)| *t == ty && *s == style)
+        .or_else(|| crate::vm::cldr_en::LIST_PATTERNS.iter().find(|(t, s, ..)| *t == ty && *s == "long"));
+    let (two, start, middle, end) = match row {
+        Some((_, _, two, start, middle, end)) => (
+            pattern_infix(two),
+            pattern_infix(start),
+            pattern_infix(middle),
+            pattern_infix(end),
+        ),
+        None => (" and ", ", ", ", ", ", and "),
     };
     let mut out: Vec<(&'static str, String)> = vec![];
     let n = items.len();
     for (i, it) in items.iter().enumerate() {
         if i > 0 {
+            // `start` joins the FIRST element to the rest, `end` the last two,
+            // `middle` everything between — the flattening of the recursive
+            // substitution in CreatePartsFromList.
             let lit = if n == 2 {
                 two
+            } else if i == 1 {
+                start
             } else if i == n - 1 {
                 end
             } else {

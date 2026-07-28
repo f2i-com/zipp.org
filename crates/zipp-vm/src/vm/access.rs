@@ -947,13 +947,24 @@ impl<'p> Vm<'p> {
             // via parent.[[Set]]("__proto__", v, Receiver) — its set trap fires
             // with the ORIGINAL receiver — before the inherited accessor is
             // ever reached (Proxy/set/call-parameters-prototype-dunder-proto).
-            let mut cur = self.object_get_prototype_of(obj);
-            for _ in 0..1000 {
-                if !cur.is_heap() || cur.heap_index() == self.obj_proto {
+            //
+            // The walk also decides WHETHER this is the proto-setter at all.
+            // B.2.2.1's `__proto__` is an ordinary (configurable) accessor
+            // property of %Object.prototype%, not a magic key: when the chain
+            // never reaches it (`Object.create(null).__proto__ = 5`) or the
+            // program deleted it (`delete Object.prototype.__proto__`), the
+            // assignment must create an ORDINARY own data property. Intercepting
+            // unconditionally silently dropped both writes.
+            let mut cur = obj;
+            let mut is_proto_accessor = false;
+            for step in 0..1000usize {
+                if !cur.is_heap() {
                     break;
                 }
                 let cidx = cur.heap_index();
-                if self.proxy_parts(cidx).is_some() {
+                // The receiver itself is not re-entered through its own set trap
+                // (this path is reached only for a non-Proxy receiver).
+                if step > 0 && self.proxy_parts(cidx).is_some() {
                     match self.proxy_set_bool(cur, key, val, obj)? {
                         Some(true) => return Ok(true),
                         Some(false) => return self.reject_write(key, strict),
@@ -964,21 +975,28 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                // An own "__proto__" prop on a chain object shadows the
-                // accessor — fall through to the ordinary handling below.
-                if matches!(self.heap.get(cidx), HeapObj::Object(m) if m.pos(key).is_some()) {
-                    break;
+                // The FIRST own "__proto__" on the chain decides: the
+                // %Object.prototype% accessor runs [[SetPrototypeOf]]; a plain
+                // data property (an earlier ordinary write, or a user-defined
+                // one) is written ordinarily.
+                if let HeapObj::Object(m) = self.heap.get(cidx) {
+                    if let Some(p) = m.pos(key) {
+                        is_proto_accessor = m.attrs[p].accessor;
+                        break;
+                    }
                 }
                 cur = self.object_get_prototype_of(cur);
             }
-            if (self.is_object_value(val) || val == Value::NULL)
-                && !self.ordinary_set_prototype_of(obj, val)?
-            {
-                return Err(Thrown(
-                    "TypeError: cannot set prototype (target is non-extensible, the change is cyclic, or it has an immutable prototype)".into(),
-                ));
+            if is_proto_accessor {
+                if (self.is_object_value(val) || val == Value::NULL)
+                    && !self.ordinary_set_prototype_of(obj, val)?
+                {
+                    return Err(Thrown(
+                        "TypeError: cannot set prototype (target is non-extensible, the change is cyclic, or it has an immutable prototype)".into(),
+                    ));
+                }
+                return Ok(true);
             }
-            return Ok(true);
         }
         // `re.lastIndex = n` — a RegExp's one writable data property by default.
         if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {

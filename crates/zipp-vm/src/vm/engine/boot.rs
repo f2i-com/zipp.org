@@ -134,6 +134,7 @@ impl<'p> Vm<'p> {
             private_fields: std::collections::HashMap::new(),
             eval_fn_idx: 0,
             closure_eval_scope: std::collections::HashMap::new(),
+            eval_scope_parent: std::collections::HashMap::new(),
             module_ambiguous: std::collections::HashMap::new(),
             module_ns_slots: std::collections::HashMap::new(),
             module_source_slots: std::collections::HashMap::new(),

@@ -1113,7 +1113,12 @@ impl<'p> Vm<'p> {
                     },
                 };
                 if !ext {
-                    let target_proto = self.object_get_prototype_of(target);
+                    // Step 11 is `? target.[[GetPrototypeOf]]()` — ABRUPT. The
+                    // infallible walker swallows a throwing getPrototypeOf trap on
+                    // the target (it returns null), so a nested proxy target whose
+                    // own trap throws reported "no exception" and, worse, compared
+                    // against a bogus null (staging/sm/Proxy/getPrototypeOf.js).
+                    let target_proto = self.get_prototype_of_checked(target)?;
                     if !self.same_value(handler_proto, target_proto) {
                         return Err(Thrown(
                             "TypeError: proxy 'getPrototypeOf' must return the target's prototype when the target is not extensible"

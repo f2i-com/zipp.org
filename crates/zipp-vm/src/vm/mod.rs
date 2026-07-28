@@ -598,6 +598,13 @@ pub struct Vm<'p> {
     /// arrows/functions made during or after the eval still see its
     /// bindings). Keyed by the closure value's heap index; pruned at GC.
     closure_eval_scope: std::collections::HashMap<u32, u32>,
+    /// EvalScope → the ENCLOSING EvalScope it was created under (child → parent).
+    /// A closure stamped with its creator's scope that then runs a direct eval of
+    /// its own gets a fresh scope of its own — which used to REPLACE the stamp,
+    /// hiding the creator's eval `var`s from the rest of the closure body
+    /// (staging/sm/regress/regress-554955-{2,3}.js: `b` read the global 1, not
+    /// the 2 the creator's `eval("var b = 2")` had bound). Pruned at GC.
+    eval_scope_parent: std::collections::HashMap<u32, u32>,
     /// Memo per func id: 0 unknown, 1 no, 2 yes — "code contains a sloppy
     /// function-context DirectEval". Drives EAGER EvalScope creation at
     /// closure-stamp time, so closures made before the eval call share the
@@ -1248,6 +1255,8 @@ mod intl;
 mod locale_tag;
 mod cldr_alias;
 mod cldr_alias_data;
+mod cldr_en;
+mod dtf_pattern;
 mod segmenter;
 mod iterhelpers;
 mod proxy_regexp;

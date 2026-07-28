@@ -233,6 +233,11 @@ impl Vm<'_> {
         for &s in self.closure_eval_scope.values() {
             root_idx!(s);
         }
+        // An EvalScope's enclosing EvalScope: still reachable through the chain
+        // walk (`frame_eval_scope_chain`), so it has to be rooted from the child.
+        for &s in self.eval_scope_parent.values() {
+            root_idx!(s);
+        }
         // Realm registry ($262.createRealm): keep every realm constructor /
         // prototype / object reachable so the `obj_realm` and `realms` heap-index
         // mappings never go stale (a freed-then-reused slot would misattribute a
@@ -423,6 +428,7 @@ impl Vm<'_> {
         self.instance_brand.retain(|&k, _| marks[k as usize]);
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
         self.closure_eval_scope.retain(|&k, _| marks[k as usize]);
+        self.eval_scope_parent.retain(|&k, _| marks[k as usize]);
         self.shadow_fn_realm.retain(|&k, _| marks[k as usize]);
         self.private_fields.retain(|&k, _| marks[k as usize]);
         // Keep declared-name records only for brands still referenced by a live
