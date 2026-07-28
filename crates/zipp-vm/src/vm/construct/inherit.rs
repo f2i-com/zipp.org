@@ -381,23 +381,36 @@ impl<'p> Vm<'p> {
             let inst = if produced.is_heap() { produced } else { this };
             let is_override = produced.is_heap() && produced != this;
             self.private_init_checked(inst, cv, is_override)?;
-            let (tfid, tups) = match self.heap.get(cv.heap_index()) {
-                HeapObj::Class(c) => (c.field_thunk, c.field_thunk_upvalues.clone()),
-                _ => (None, Vec::new()),
-            };
-            if let Some(fid) = tfid {
-                let f = self.ctor_value(fid, &tups);
-                // The thunk runs in the class body's private scope (same brand
-                // chain handed to the ctor in `construct`).
-                if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
-                    if f.is_heap() {
-                        self.method_brand.insert(f.heap_index(), brands);
-                    }
-                }
-                let inst = if produced.is_heap() { produced } else { this };
-                self.call_value(f, inst, &[])?;
+            self.run_field_thunk(inst, cv)?;
+        }
+        Ok(())
+    }
+
+    /// The instance-field half of InitializeInstanceElements for a class whose
+    /// ctor is EXPLICIT: its initializers live in a separate thunk (see
+    /// `defer_fields` in compile/funcs.rs) so they run at the spec's point —
+    /// after super() for a derived class, before the ctor body for a base one —
+    /// and in the class scope rather than the ctor's parameter scope. No-op for a
+    /// class that declares no instance fields. `new.target` is deliberately left
+    /// alone: it is undefined inside a field initializer.
+    pub(crate) fn run_field_thunk(&mut self, inst: Value, cv: Value) -> Result<(), Thrown> {
+        if !cv.is_heap() {
+            return Ok(());
+        }
+        let (tfid, tups) = match self.heap.get(cv.heap_index()) {
+            HeapObj::Class(c) => (c.field_thunk, c.field_thunk_upvalues.clone()),
+            _ => (None, Vec::new()),
+        };
+        let Some(fid) = tfid else { return Ok(()) };
+        let f = self.ctor_value(fid, &tups);
+        // The thunk runs in the class body's private scope (same brand chain
+        // handed to the ctor in `construct`).
+        if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
+            if f.is_heap() {
+                self.method_brand.insert(f.heap_index(), brands);
             }
         }
+        self.call_value(f, inst, &[])?;
         Ok(())
     }
 
@@ -524,9 +537,12 @@ impl<'p> Vm<'p> {
                         self.method_brand.insert(f.heap_index(), brands);
                     }
                 }
-                // A BASE parent's InitializeInstanceElements runs at entry.
+                // A BASE parent's InitializeInstanceElements runs at entry —
+                // brand, then fields, both before the parent ctor's parameter
+                // prologue.
                 if parent.is_none() && !extends_null {
                     self.brand_instance(obj, cval);
+                    self.run_field_thunk(obj, cval)?;
                 }
                 // A derived parent ctor begins with `this` back in TDZ (until
                 // ITS OWN super() completes). No removal here: if the parent

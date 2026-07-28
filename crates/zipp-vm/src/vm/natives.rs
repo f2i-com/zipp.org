@@ -500,6 +500,7 @@ impl<'p> Vm<'p> {
     /// cross-realm test shape); they are not yet independently functional.
     pub(crate) fn create_realm(&mut self) -> Value {
         let ne = PropAttr { writable: false, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
+        let ctor_attr = PropAttr { writable: true, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
         let proto_attr = PropAttr { writable: false, enumerable: false, configurable: false, accessor: false, setter: Value::UNDEFINED };
         let data = PropAttr::data();
         // A fresh realm id; realms[r] maps each MAIN-realm intrinsic prototype to
@@ -541,7 +542,13 @@ impl<'p> Vm<'p> {
             cmap.define("length", Value::int(1), ne);
             let ctor_idx = self.heap.alloc(HeapObj::Object(Box::new(cmap)));
             if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
-                pm.define("constructor", Value::heap(ctor_idx), ne);
+                // `X.prototype.constructor` is { [[Writable]]: true,
+                // [[Enumerable]]: false, [[Configurable]]: true } — NOT the
+                // read-only `ne` the ctor's own name/length use. Sharing `ne`
+                // here made a plain `otherRealmInstance.constructor = C` a strict
+                // TypeError once the receiver's [[Set]] began consulting the
+                // prototype chain (staging/sm/TypedArray/slice-bitwise-same.js).
+                pm.define("constructor", Value::heap(ctor_idx), ctor_attr);
             }
             // Copy the MAIN ctor's own STATIC props (skip prototype/name/length) so
             // the realm ctor is functional (`OSymbol.for`, `OArray.from`, well-known
@@ -5208,9 +5215,17 @@ impl<'p> Vm<'p> {
                         "TypeError: getTimeZoneTransition called on a non-ZonedDateTime".into(),
                     ));
                 }
-                let _ = self.read_direction_option(a0)?;
-                // Offset / single-offset (UTC) time zones have no transitions.
-                Value::NULL
+                let dir = self.read_direction_option(a0)?;
+                let idx = this.heap_index();
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                let ns = self.zdt_epoch_ns(idx).unwrap_or(0);
+                // An offset zone has no transitions at all; a named one is asked
+                // the database. The search is in whole seconds, so "next" from a
+                // sub-second instant must not re-find the transition it is in.
+                match crate::vm::temporal::tz_transition(&id, ns, dir == "next") {
+                    Some(t) => self.make_zoned_date_time_raw(t, 0, idx)?,
+                    None => Value::NULL,
+                }
             }
             PDT_WITH_PLAIN_TIME => {
                 if !this.is_heap()
@@ -5463,10 +5478,10 @@ impl<'p> Vm<'p> {
                 let resolved = self.intl_this(this, INTL_LISTFORMAT, name)?;
                 let strs = self.string_list_from_iterable(a0)?;
                 let t = self.display(self.intl_slot(resolved, "type"));
-                let conj = if t == "disjunction" { "or" } else { "and" };
+                let st = self.display(self.intl_slot(resolved, "style"));
                 // CreatePartsFromList: the element/literal decomposition IS the
                 // format string, so both entry points derive from one splitter.
-                let parts = list_parts_en(&strs, conj);
+                let parts = list_parts_en(&strs, &t, &st);
                 if to_parts {
                     let ps: Vec<(String, String, &str)> =
                         parts.into_iter().map(|(t, v)| (t.to_string(), v, "")).collect();
@@ -5595,55 +5610,23 @@ impl<'p> Vm<'p> {
                 o.set("@@seginput", sv);
                 Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
             }
-            INTL_DURATION_FORMAT => {
-                let _ = self.intl_this(this, INTL_DURATIONFORMAT, "format")?;
-                let dur = self.to_duration(a0)?;
-                let s = format_duration_en(&dur);
-                self.alloc_str(s)
-            }
-            INTL_DURATION_FORMAT_TO_PARTS => {
-                let _ = self.intl_this(this, INTL_DURATIONFORMAT, "formatToParts")?;
-                let dur = self.to_duration(a0)?;
-                // PartitionDurationFormatPattern: each non-zero unit contributes an
-                // `integer` + `literal` + `unit` run, joined by ", " literals. Every
-                // part inside a run also carries the SINGULAR unit name it belongs
-                // to (the `unit` field), which the range/parts tests read.
-                let mut parts: Vec<(String, String, &str)> = vec![];
-                for (i, field) in native::DURATION_FIELDS.iter().enumerate() {
-                    if dur[i] == 0 {
-                        continue;
-                    }
-                    if !parts.is_empty() {
-                        parts.push(("literal".into(), ", ".into(), ""));
-                    }
-                    let unit = field.strip_suffix('s').unwrap_or(field);
-                    parts.push(("integer".into(), dur[i].to_string(), unit));
-                    parts.push(("literal".into(), " ".into(), unit));
-                    parts.push(("unit".into(), duration_unit_label(i).into(), unit));
+            INTL_DURATION_FORMAT | INTL_DURATION_FORMAT_TO_PARTS => {
+                let to_parts = id == INTL_DURATION_FORMAT_TO_PARTS;
+                let name = if to_parts { "formatToParts" } else { "format" };
+                let resolved = self.intl_this(this, INTL_DURATIONFORMAT, name)?;
+                // The record is read as f64 rather than the i64 view: a duration
+                // may legally hold 4503599627370495000000 microseconds, which
+                // saturates i64, and PartitionDurationFormatPattern sums the
+                // sub-second fields exactly.
+                let dur = self.to_duration_f64(a0)?;
+                let parts = self.duration_format_parts(resolved, &dur)?;
+                if to_parts {
+                    // The third tuple slot is the `unit` field here, not `source`.
+                    self.intl_parts_array_keyed(&parts, "unit")
+                } else {
+                    let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+                    self.alloc_str(s)
                 }
-                if parts.is_empty() {
-                    parts.push(("integer".into(), "0".into(), "second"));
-                    parts.push(("literal".into(), " ".into(), "second"));
-                    parts.push(("unit".into(), "sec".into(), "second"));
-                }
-                // The third tuple slot is the `unit` field here, not `source`.
-                let arr = self.intl_parts_array(
-                    &parts.iter().map(|(t, v, _)| (t.clone(), v.clone(), "")).collect::<Vec<_>>(),
-                );
-                let items = match self.heap.get(arr.heap_index()) {
-                    HeapObj::Array(v) => v.clone(),
-                    _ => vec![],
-                };
-                for (o, (_, _, unit)) in items.iter().zip(parts.iter()) {
-                    if unit.is_empty() {
-                        continue;
-                    }
-                    let uv = self.alloc_str(unit.to_string());
-                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
-                        m.set("unit", uv);
-                    }
-                }
-                arr
             }
             _ if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16)
                 .contains(&id) =>

@@ -101,11 +101,18 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// The UTC offset (nanoseconds) of a ZonedDateTime instance.
+    /// The UTC offset (nanoseconds) of a ZonedDateTime instance — for a NAMED
+    /// zone that is a function of the instant, so it is recomputed from the tz
+    /// database rather than read back from the slot the constructor filled in
+    /// (which only ever holds an offset zone's fixed value).
     pub(crate) fn zdt_offset_ns(&self, idx: u32) -> i64 {
-        match self.heap.get(idx) {
+        let stored = match self.heap.get(idx) {
             HeapObj::Temporal { kind: 7, fields } => fields.get(2).copied().unwrap_or(0),
-            _ => 0,
+            _ => return 0,
+        };
+        match self.zdt_tz_id(idx) {
+            Some(id) => tz_offset_ns_at(&id, self.zdt_epoch_ns(idx).unwrap_or(0)),
+            None => stored,
         }
     }
 
@@ -161,10 +168,15 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.make_plain_time([f[3], f[4], f[5], f[6], f[7], f[8]])?))
             }
             "startOfDay" => {
+                // GetStartOfDay: local midnight resolved through the zone with
+                // "compatible" disambiguation — in a zone that springs forward
+                // AT midnight (America/Sao_Paulo used to) the day starts at
+                // 01:00, not at an instant that never happened.
                 let off = self.zdt_offset_ns(idx) as i128;
                 let local = self.zdt_epoch_ns(idx).unwrap_or(0) + off;
                 let midnight_local = local.div_euclid(DAY_NS) * DAY_NS;
-                let new_ns = midnight_local - off;
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                let new_ns = tz_start_of_day(&id, midnight_local)?;
                 Ok(Some(self.make_zoned_date_time_raw(new_ns, self.zdt_offset_ns(idx), idx)?))
             }
             "equals" => {
@@ -203,50 +215,59 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.tag_cal(r, ncal)))
             }
             "withPlainTime" => {
+                // No argument is GetStartOfDay, NOT midnight-disambiguated: in
+                // America/Toronto on 1919-03-31 those differ by 30 minutes.
                 let tv = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let time = if tv == Value::UNDEFINED {
-                    [0i64; 6]
-                } else {
-                    self.to_plain_time(tv)?
-                };
+                let time =
+                    if tv == Value::UNDEFINED { None } else { Some(self.to_plain_time(tv)?) };
                 let f = self.zdt_local(idx);
-                let off = self.zdt_offset_ns(idx);
-                let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS + time_to_ns(&time);
+                let midnight = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS;
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                let r = self.alloc_zdt(local - off as i128, off, id)?;
+                let ns = match time {
+                    None => tz_start_of_day(&id, midnight)?,
+                    Some(t) => tz_local_to_instant(&id, midnight + time_to_ns(&t), "compatible")?,
+                };
+                let off = tz_offset_ns_at(&id, ns);
+                let r = self.alloc_zdt(ns, off, id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
             "add" | "subtract" => {
-                // Fixed-offset zones: apply the same calendar/clock arithmetic as
-                // PlainDateTime to the local wall-clock, then re-zone. (Named-zone
-                // DST disambiguation is not modelled.)
+                // AddZonedDateTime: the calendar (year/month/week/day) part moves
+                // in WALL-CLOCK space and is re-zoned, so adding a day across a
+                // DST boundary keeps the clock time; the time part is then added
+                // as exact duration on the timeline.
                 let dur = self.to_duration(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign: i64 = if name == "add" { 1 } else { -1 };
                 let lf = self.zdt_local(idx);
-                let time = [lf[3], lf[4], lf[5], lf[6], lf[7], lf[8]];
-                let tns = time_to_ns(&time)
-                    + ((dur[4] as i128) * 3_600_000_000_000
-                        + (dur[5] as i128) * 60_000_000_000
-                        + (dur[6] as i128) * 1_000_000_000
-                        + (dur[7] as i128) * 1_000_000
-                        + (dur[8] as i128) * 1_000
-                        + (dur[9] as i128))
-                        * sign as i128;
-                let carry = tns.div_euclid(DAY_NS) as i64;
-                let nt = ns_to_time(tns.rem_euclid(DAY_NS));
-                // The years/months step happens in CALENDAR space.
-                let (cy, cm, cd) = cal_from_iso(cal, lf[0], lf[1], lf[2]);
-                let (ay, am, ad) =
-                    cal_add_year_month(cal, cy, cm, cd, dur[0] * sign, dur[1] * sign, reject)
-                        .ok_or_else(|| {
-                            Thrown("RangeError: date arithmetic overflows the month".into())
-                        })?;
-                let ed = cal_to_epoch_days(cal, ay, am, ad) + (dur[2] * 7 + dur[3]) * sign + carry;
-                let off = self.zdt_offset_ns(idx);
-                let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                let result_ns = local - off as i128;
+                let time_ns = ((dur[4] as i128) * 3_600_000_000_000
+                    + (dur[5] as i128) * 60_000_000_000
+                    + (dur[6] as i128) * 1_000_000_000
+                    + (dur[7] as i128) * 1_000_000
+                    + (dur[8] as i128) * 1_000
+                    + (dur[9] as i128))
+                    * sign as i128;
+                let no_date_units = dur[..4].iter().all(|&x| x == 0);
+                let result_ns = if no_date_units {
+                    // Pure time: exact nanoseconds on the timeline, never re-zoned.
+                    self.zdt_epoch_ns(idx).unwrap_or(0) + time_ns
+                } else {
+                    // The years/months step happens in CALENDAR space; the whole
+                    // date part then lands back on the timeline through the zone
+                    // (so "+1 day" over a spring-forward is 23 real hours), and
+                    // the time part is added to THAT instant.
+                    let (cy, cm, cd) = cal_from_iso(cal, lf[0], lf[1], lf[2]);
+                    let (ay, am, ad) =
+                        cal_add_year_month(cal, cy, cm, cd, dur[0] * sign, dur[1] * sign, reject)
+                            .ok_or_else(|| {
+                                Thrown("RangeError: date arithmetic overflows the month".into())
+                            })?;
+                    let ed = cal_to_epoch_days(cal, ay, am, ad) + (dur[2] * 7 + dur[3]) * sign;
+                    let local = (ed as i128) * DAY_NS
+                        + time_to_ns(&[lf[3], lf[4], lf[5], lf[6], lf[7], lf[8]]);
+                    tz_local_to_instant(&id, local, "compatible")? + time_ns
+                };
                 // IsValidEpochNanoseconds: the result must lie within the supported
                 // instant range (matches the ZonedDateTime/Instant constructors).
                 if result_ns.abs() > NS_MAX_INSTANT {
@@ -254,6 +275,7 @@ impl<'p> Vm<'p> {
                         "RangeError: ZonedDateTime result is outside the supported range".into(),
                     ));
                 }
+                let off = tz_offset_ns_at(&id, result_ns);
                 let r = self.alloc_zdt(result_ns, off, id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
@@ -402,7 +424,8 @@ impl<'p> Vm<'p> {
                 let ed = iso_to_epoch_days(f[0], f[1], f[2]) + day_carry;
                 let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                let r = self.alloc_zdt(local - off as i128, off, id)?;
+                let ns = tz_local_to_instant(&id, local, "compatible")?;
+                let r = self.alloc_zdt(ns, tz_offset_ns_at(&id, ns), id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
             "with" => {
@@ -490,7 +513,7 @@ impl<'p> Vm<'p> {
                 // Validate the resolution options. ZonedDateTime.with defaults the offset
                 // option to "prefer" (unlike `from`, which defaults to "reject").
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let (off_opt, reject) = self.read_zdt_options(options, "prefer")?;
+                let (off_opt, disamb, reject) = self.read_zdt_options(options, "prefer")?;
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
                 if !month_valid {
@@ -523,36 +546,24 @@ impl<'p> Vm<'p> {
                         f[3 + i] = f[3 + i].clamp(0, mx);
                     }
                 }
-                // Offset agreement (InterpretISODateTimeOffset): the merged offset is the
-                // bag's (when given) else the receiver's, which for zipp's fixed-offset
-                // zones equals the zone offset. "use" keeps the merged offset; "ignore"/
-                // "prefer" use the zone offset; "reject" requires the two to match.
-                let zone_off = self.zdt_offset_ns(idx);
-                let merged_off = bag_off.unwrap_or(zone_off);
-                let eff = match off_opt.as_str() {
-                    "use" => merged_off,
-                    "ignore" | "prefer" => zone_off,
-                    _ => {
-                        if merged_off == zone_off {
-                            zone_off
-                        } else {
-                            return Err(Thrown(
-                                "RangeError: the offset does not match the time zone".into(),
-                            ));
-                        }
-                    }
-                };
+                // Offset agreement (InterpretISODateTimeOffset). `with` carries the
+                // RECEIVER's offset forward when the bag did not supply one, which
+                // is what makes the default "prefer" keep the same side of a
+                // fall-back repeat instead of silently jumping to the earlier one.
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                let merged_off = bag_off.unwrap_or_else(|| self.zdt_offset_ns(idx));
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
+                let instant =
+                    interpret_iso_offset(&id, local, 2, merged_off, &disamb, &off_opt, false)?;
                 // The resulting instant must be representable (the ±nsMaxInstant bound).
-                let instant = local - eff as i128;
                 if instant.abs() > NS_MAX_INSTANT {
                     return Err(Thrown(
                         "RangeError: ZonedDateTime outside the supported range".into(),
                     ));
                 }
-                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                let r = self.alloc_zdt(instant, zone_off, id)?;
+                let off = tz_offset_ns_at(&id, instant);
+                let r = self.alloc_zdt(instant, off, id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
             _ => Ok(None),
@@ -614,32 +625,28 @@ impl<'p> Vm<'p> {
                 }
                 // ToTemporalTimeZoneIdentifier: a string is parsed, a wrong type
                 // (null/boolean/number/bigint/symbol) is a TypeError — not coerced.
-                let (id, offset) = self.parse_tz_arg(bag.tz)?;
-                let (off_opt, reject) = self.read_zdt_options(options, "reject")?;
+                let (id, _) = self.parse_tz_arg(bag.tz)?;
+                let (off_opt, disamb, reject) = self.read_zdt_options(options, "reject")?;
                 let cal = bag.cal;
                 let f = self.finish_pdt_fields(&bag, reject)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
-                // Offset agreement: a bag `offset` is reconciled with the zone's offset
-                // per the `offset` option. zipp's zones carry a single fixed offset, so:
-                // reject → must equal it (else RangeError); use → use the bag offset for
-                // the instant; ignore/prefer → use the zone offset.
-                let eff = match bag.bag_off {
-                    None => offset,
-                    Some(b) => match off_opt.as_str() {
-                        "use" => b,
-                        "ignore" | "prefer" => offset,
-                        _ => {
-                            if b != offset {
-                                return Err(Thrown(
-                                    "RangeError: offset does not match the time zone".into(),
-                                ));
-                            }
-                            offset
-                        }
-                    },
-                };
-                let r = self.alloc_zdt(local - eff as i128, offset, id)?;
+                // A bag with no `offset` is WALL (the zone decides, disambiguation
+                // resolves gaps/repeats); with one it is OPTION and must be
+                // reconciled. A BAG offset must match to the nanosecond — only a
+                // parsed STRING gets the MATCH-MINUTES latitude.
+                let behaviour = if bag.bag_off.is_some() { 2 } else { 0 };
+                let ns = interpret_iso_offset(
+                    &id,
+                    local,
+                    behaviour,
+                    bag.bag_off.unwrap_or(0),
+                    &disamb,
+                    &off_opt,
+                    false,
+                )?;
+                let off = tz_offset_ns_at(&id, ns);
+                let r = self.alloc_zdt(ns, off, id)?;
                 return Ok(self.tag_cal(r, cal));
             }
         }
@@ -660,15 +667,15 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")));
         }
         let cal = self.calendar_from_annotation(&s)?;
-        let (f, str_offset, id, zone_offset, behaviour) = parse_zdt_string(&s)
+        let (f, str_offset, id, _zone_offset, behaviour) = parse_zdt_string(&s)
             .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
-        let (off_opt, _reject) = self.read_zdt_options(options, "reject")?;
+        let (off_opt, disamb, _reject) = self.read_zdt_options(options, "reject")?;
         // InterpretISODateTimeOffset step 6 (OPTION behaviour, offset prefer/
         // reject): CheckISODaysRange rejects a WALL date beyond ±10^8 epoch days
         // even when the resulting instant is exactly representable (e.g.
         // '-271821-04-19T23:00-01:00[-01:00]' has epoch == nsMin but wall date
         // -271821-04-19). Never applies to Z/wall behaviours or use/ignore.
-        if behaviour == 2
+        if behaviour >= 2
             && matches!(off_opt.as_str(), "prefer" | "reject")
             && iso_to_epoch_days(f[0], f[1], f[2]).abs() > 100_000_000
         {
@@ -678,27 +685,24 @@ impl<'p> Vm<'p> {
         }
         let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
             + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
-        // Offset agreement (InterpretISODateTimeOffset): a `Z` designator (EXACT) fixes
-        // the instant as UTC and is never reconciled; no explicit offset (WALL) uses the
-        // zone; an explicit offset (OPTION) that differs from the zone's is reconciled
-        // per the `offset` option (reject=default → RangeError; use → the string offset
-        // sets the instant; ignore/prefer → the zone offset).
-        let eff = if behaviour == 1 {
-            str_offset
-        } else if str_offset == zone_offset {
-            zone_offset
-        } else {
-            match off_opt.as_str() {
-                "use" => str_offset,
-                "ignore" | "prefer" => zone_offset,
-                _ => {
-                    return Err(Thrown(
-                        "RangeError: the offset does not match the time zone".into(),
-                    ))
-                }
-            }
-        };
-        let r = self.alloc_zdt(local - eff as i128, zone_offset, id)?;
+        // A DATE-ONLY string is GetStartOfDay, not midnight: "1919-03-31
+        // [America/Toronto]" is 00:30, the instant the skipped hour ended, while
+        // "1919-03-31T00[America/Toronto]" disambiguates to 01:00.
+        let head = s.trim().split('[').next().unwrap_or("");
+        if behaviour == 0 && !head.contains(['T', 't', ' ']) {
+            let r = tz_start_of_day(&id, local)?;
+            let v = self.alloc_zdt(r, tz_offset_ns_at(&id, r), id)?;
+            return Ok(self.tag_cal(v, cal));
+        }
+        // Offset agreement (InterpretISODateTimeOffset). A parsed string gets the
+        // MATCH-MINUTES rule: `…-04:56[America/New_York]` written against the
+        // 1883 LMT offset of −04:56:02 still matches, because the ISO grammar
+        // cannot spell the seconds.
+        let ns =
+            // MATCH-MINUTES only for a minute-precision offset (behaviour 2).
+            interpret_iso_offset(&id, local, behaviour.min(2) as u8, str_offset, &disamb,
+                                 &off_opt, behaviour == 2)?;
+        let r = self.alloc_zdt(ns, tz_offset_ns_at(&id, ns), id)?;
         Ok(self.tag_cal(r, cal))
     }
 
@@ -820,15 +824,27 @@ impl<'p> Vm<'p> {
             {
                 let bag = self.read_pdt_bag(rel, true)?;
                 let zoned = bag.tz != Value::UNDEFINED;
-                let mut off = 0i64;
-                if zoned {
-                    let (_id, o) = self.parse_tz_arg(bag.tz)?;
-                    off = o;
-                }
+                let id = if zoned { self.parse_tz_arg(bag.tz)?.0 } else { String::new() };
                 let cal = bag.cal;
                 let mut f = self.finish_pdt_fields(&bag, false)?;
                 if !zoned {
                     f[3..9].fill(0);
+                }
+                // The anchor's offset is the zone's offset AT the anchor instant,
+                // not a per-zone constant — a relativeTo in July and one in
+                // January differ by an hour in half the world. A bag `offset`
+                // resolves with offset "reject" and NO fuzzy minute matching
+                // (that latitude is only for parsed strings).
+                let mut off = 0i64;
+                if zoned {
+                    let local = dt_epoch_ns(f);
+                    let ns = match bag.bag_off {
+                        Some(b) => {
+                            interpret_iso_offset(&id, local, 2, b, "compatible", "reject", false)?
+                        }
+                        None => tz_local_to_instant(&id, local, "compatible")?,
+                    };
+                    off = (local - ns) as i64;
                 }
                 return Ok((f, zoned, off, cal));
             }
@@ -862,27 +878,33 @@ impl<'p> Vm<'p> {
             // exact UTC instant and is accepted, and no offset (WALL) uses the zone. The
             // wall-clock fields are the anchor.
             if has_tz_ann {
-                let (f, str_offset, _id, zone_offset, behaviour) = parse_zdt_string(st)
+                let (f, str_offset, id, _zone_offset, behaviour) = parse_zdt_string(st)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")))?;
-                if behaviour == 2 && str_offset != zone_offset {
-                    return Err(Thrown(format!(
-                        "RangeError: the relativeTo offset does not match the time zone in '{s}'"
-                    )));
-                }
-                // The wall fields pair with the offset they were written against:
-                // Z (EXACT) is UTC, no offset (WALL) is the zone, explicit OPTION
-                // is the string's own offset.
-                let eff = match behaviour {
-                    1 => 0,
-                    2 => str_offset,
-                    _ => zone_offset,
-                };
+                // ToRelativeTemporalObject resolves with offset "reject": an
+                // explicit offset that no instant in the zone actually has is a
+                // RangeError. The wall fields then pair with the offset the
+                // resolved instant really carries.
+                let eff = (dt_epoch_ns(f)
+                    - interpret_iso_offset(
+                        &id,
+                        dt_epoch_ns(f),
+                        behaviour.min(2) as u8,
+                        str_offset,
+                        "compatible",
+                        "reject",
+                        behaviour == 2,
+                    )
+                    .map_err(|_| {
+                        Thrown(format!(
+                            "RangeError: the relativeTo offset does not match the time zone in '{s}'"
+                        ))
+                    })?) as i64;
                 // The anchor must be a representable instant, and an explicit-
                 // offset string is subject to CheckISODaysRange on its WALL date
                 // (relativeTo resolves with offset "reject") even when the epoch
                 // is exactly at the bound.
                 if (dt_epoch_ns(f) - eff as i128).abs() > NS_MAX_INSTANT
-                    || (behaviour == 2 && iso_to_epoch_days(f[0], f[1], f[2]).abs() > 100_000_000)
+                    || (behaviour >= 2 && iso_to_epoch_days(f[0], f[1], f[2]).abs() > 100_000_000)
                 {
                     return Err(Thrown(format!(
                         "RangeError: relativeTo '{s}' is outside the representable range"
@@ -1067,15 +1089,18 @@ impl<'p> Vm<'p> {
             .and_then(|v| self.heap.str_cow(v.heap_index()).map(|s| s.into_owned()))
     }
 
-    /// A canonical time-zone key for equality: an offset zone collapses to its
-    /// formatted offset (so "+00"/"+0000"/"+00:00" all match), a named zone keeps
-    /// its id. Calendars are always iso8601 here, so no calendar term is needed.
+    /// TimeZoneEquals: an offset zone collapses to its formatted offset (so
+    /// "+00"/"+0000"/"+00:00" all match), a named zone to its PRIMARY
+    /// identifier — which is why `Asia/Calcutta` equals `Asia/Kolkata` and
+    /// `Etc/GMT` equals `UTC`.
     pub(crate) fn tz_canon(&self, idx: u32) -> String {
         let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
         if id.starts_with(['+', '-']) {
-            format_offset(self.zdt_offset_ns(idx))
-        } else {
-            id
+            return format_offset(self.zdt_offset_ns(idx));
+        }
+        match tzdb::lookup(&id) {
+            Some(z) => tzdb::primary(z.zone).to_string(),
+            None => id,
         }
     }
 
@@ -1083,7 +1108,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn zdt_to_string(&self, idx: u32) -> String {
         let f = self.zdt_local(idx);
         let off = self.zdt_offset_ns(idx);
-        let offset = format_offset(off);
+        let offset = format_offset_rounded(off);
         let tz = self
             .zdt_tz
             .get(&idx)
@@ -1145,7 +1170,7 @@ impl<'p> Vm<'p> {
         let local = rounded + off as i128;
         let t = ns_to_time(local.rem_euclid(DAY_NS));
         let (ny, nm, nd) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
-        let offset_s = if show_offset { format_offset(off) } else { String::new() };
+        let offset_s = if show_offset { format_offset_rounded(off) } else { String::new() };
         let tz = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
         let tz_suf = match tzn.as_str() {
             "never" => String::new(),
@@ -1238,8 +1263,10 @@ impl<'p> Vm<'p> {
                 let (offset, tz_str) = if tz_v == Value::UNDEFINED {
                     (0i64, "Z".to_string())
                 } else {
-                    let (_, off) = self.parse_tz_arg(tz_v)?;
-                    (off, format_offset(off))
+                    // A named zone's offset is the one it has AT this instant.
+                    let (id, _) = self.parse_tz_arg(tz_v)?;
+                    let off = tz_offset_ns_at(&id, ns);
+                    (off, format_offset_rounded(off))
                 };
                 let rounded = round_increment_as_if_positive(ns, unit, &mode);
                 let local = rounded + offset as i128;

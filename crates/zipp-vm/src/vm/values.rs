@@ -228,7 +228,16 @@ impl<'p> Vm<'p> {
                         _ => None,
                     };
                     if let Some(n) = clen {
-                        if let Some(i) = array_index(key) {
+                        // The index may arrive as a NUMBER (`4 in str`) or as its
+                        // canonical STRING form (`"4" in str`, and every
+                        // `Reflect.has`, which passes ToPropertyKey's result).
+                        // Only `array_index` was consulted, so the string form
+                        // reported absent (staging/sm/Reflect/has.js).
+                        let i = array_index(key).or_else(|| match k.parse::<u32>() {
+                            Ok(u) if u != u32::MAX && u.to_string() == k => Some(u as usize),
+                            _ => None,
+                        });
+                        if let Some(i) = i {
                             if i < n {
                                 return true;
                             }

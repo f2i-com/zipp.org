@@ -647,30 +647,23 @@ impl<'p> Vm<'p> {
             if p == self.map_proto && self.map_proto != 0 {
                 // Per spec the entries are added via the `set` adder resolved off the
                 // new map — so an overridden `set` (or a subclass's) is honoured.
+                // AddEntriesFromIterable (shared with WeakMap) steps the iterator
+                // LAZILY, requires every entry to be an Object, and closes the
+                // iterator on any abrupt completion. The eager `iterate_to_vec`
+                // drain this replaced did none of the three: a non-object entry was
+                // silently indexed instead of throwing TypeError, and a throwing
+                // `[0]`/`[1]` getter or adder left the iterator open
+                // (staging/sm/Map/constructor-iterator-close.js).
                 let map_v = Value::heap(self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() }));
                 if !a0.is_nullish() {
-                    let adder = self.get_member(map_v, "set", map_v)?;
-                    if !self.is_callable(adder) {
-                        return Err(Thrown("TypeError: Map.prototype.set is not callable".into()));
-                    }
-                    for e in self.iterate_to_vec(a0)? {
-                        let k = self.get_index(e, Value::int(0))?;
-                        let v = self.get_index(e, Value::int(1))?;
-                        self.call_value(adder, map_v, &[k, v])?;
-                    }
+                    self.add_entries_via_adder(map_v, a0, true)?;
                 }
                 return Ok(self.set_ctor_proto(map_v, over));
             }
             if p == self.set_proto && self.set_proto != 0 {
                 let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
                 if !a0.is_nullish() {
-                    let adder = self.get_member(set_v, "add", set_v)?;
-                    if !self.is_callable(adder) {
-                        return Err(Thrown("TypeError: Set.prototype.add is not callable".into()));
-                    }
-                    for e in self.iterate_to_vec(a0)? {
-                        self.call_value(adder, set_v, &[e])?;
-                    }
+                    self.add_entries_via_adder(set_v, a0, false)?;
                 }
                 return Ok(self.set_ctor_proto(set_v, over));
             }
@@ -844,9 +837,13 @@ impl<'p> Vm<'p> {
                     }
                 }
                 // A BASE class's InitializeInstanceElements runs at
-                // [[Construct]] entry (a DERIVED class's at super() completion).
+                // [[Construct]] entry (a DERIVED class's at super() completion) —
+                // brand first, then the field initializers, and BOTH before the
+                // ctor's own FunctionDeclarationInstantiation, so a parameter
+                // default sees the fields already installed.
                 if parent.is_none() && !extends_null {
                     self.brand_instance(obj, cv);
+                    self.run_field_thunk(obj, cv)?;
                 }
                 // A DERIVED ctor's `this` is in TDZ until its `super(...)`
                 // completes (the SuperCtor ops remove the mark).
@@ -1137,15 +1134,7 @@ impl<'p> Vm<'p> {
             }
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !a0.is_nullish() {
-                let adder = self.get_member(obj, "set", obj)?;
-                if !self.is_callable(adder) {
-                    return Err(Thrown("TypeError: WeakMap.prototype.set is not callable".into()));
-                }
-                for e in self.iterate_to_vec(a0)? {
-                    let k = self.get_index(e, Value::int(0))?;
-                    let v = self.get_index(e, Value::int(1))?;
-                    self.call_value(adder, obj, &[k, v])?;
-                }
+                self.add_entries_via_adder(obj, a0, true)?;
             }
             return Ok(true);
         }
@@ -1158,39 +1147,28 @@ impl<'p> Vm<'p> {
             }
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !a0.is_nullish() {
-                let adder = self.get_member(obj, "add", obj)?;
-                if !self.is_callable(adder) {
-                    return Err(Thrown("TypeError: WeakSet.prototype.add is not callable".into()));
-                }
-                for e in self.iterate_to_vec(a0)? {
-                    self.call_value(adder, obj, &[e])?;
-                }
+                self.add_entries_via_adder(obj, a0, false)?;
             }
             return Ok(true);
         }
         if pidx == self.set_proto && self.set_proto != 0 {
-            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
-            let mut items: Vec<Value> = Vec::new();
-            if !a0.is_nullish() {
-                // SameValueZero dedup via the incremental finder (linear for a
-                // small source, hash-indexed past the threshold).
-                let mut finder = super::collections::LocalFinder::new();
-                for e in self.iterate_to_vec(a0)? {
-                    if e.is_heap() {
-                        self.heap.flatten(e.heap_index()); // flat keys hash/compare cheaply
-                    }
-                    if finder.find(&self.heap, &items, e).is_none() {
-                        finder.record_push(&self.heap, &items, e);
-                        items.push(e);
-                    }
-                }
-            }
-            *self.heap.get_mut(oidx) = HeapObj::Set(items);
+            // Brand to an EMPTY Set first, then add through the adder resolved off
+            // the instance. Building the element list directly (what this used to
+            // do) skipped `add` entirely, so `class S extends Set { add() { … } }`
+            // never saw its own override run — and a throwing override could not
+            // close the iterator either
+            // (staging/sm/Map/constructor-iterator-close.js). The builtin `add`
+            // still does the SameValueZero dedup.
+            *self.heap.get_mut(oidx) = HeapObj::Set(Vec::new());
             // The instance slot is re-branded in place: make sure no stale
             // collection index can be keyed by it.
             self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
+            }
+            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !a0.is_nullish() {
+                self.add_entries_via_adder(obj, a0, false)?;
             }
             return Ok(true);
         }
@@ -1218,15 +1196,7 @@ impl<'p> Vm<'p> {
             }
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !a0.is_nullish() {
-                let adder = self.get_member(obj, "set", obj)?;
-                if !self.is_callable(adder) {
-                    return Err(Thrown("TypeError: Map.prototype.set is not callable".into()));
-                }
-                for e in self.iterate_to_vec(a0)? {
-                    let k = self.get_index(e, Value::int(0))?;
-                    let v = self.get_index(e, Value::int(1))?;
-                    self.call_value(adder, obj, &[k, v])?;
-                }
+                self.add_entries_via_adder(obj, a0, true)?;
             }
             return Ok(true);
         }

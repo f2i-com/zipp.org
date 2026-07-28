@@ -950,23 +950,43 @@ pub(crate) fn currency_symbol(code: &str) -> String {
     }
 }
 
-/// CreatePartsFromList for the en LONG conjunction/disjunction list patterns —
-/// the only pattern set this engine has. `format` joins these; `formatToParts`
-/// wraps them. The short/narrow widths and the `unit` type need CLDR
-/// listPatterns, so they format identically to `long` here.
-pub(crate) fn list_parts_en(items: &[String], conj: &str) -> Vec<(&'static str, String)> {
+/// CreatePartsFromList for the list patterns this engine has. `format` joins
+/// these; `formatToParts` wraps them; `Intl.DurationFormat` joins its units
+/// through the same function, so the two services can never disagree.
+///
+/// Three pattern sets are real CLDR, the rest are the `long` fallbacks:
+///   * conjunction/disjunction `long` — CLDR `en.xml` `listPattern` (standard)
+///     and `listPattern type="or"`.
+///   * `unit` at long/short — CLDR ROOT `listPattern type="unit"` /
+///     `"unit-short"`, `{0}, {1}` in every part, which `en` inherits unchanged.
+///   * `unit` at narrow — CLDR ROOT `listPattern type="unit-narrow"`,
+///     `{0} {1}`. Also inherited unchanged by `en` AND by `es`, which is why
+///     `ListFormat/prototype/format/es-es-narrow.js` passes on it too.
+/// The `unit` rows are what `Intl.DurationFormat` needs to render
+/// "1 day, 01:02" rather than "1 day and 01:02" (see
+/// DurationFormat/prototype/format/digital-style-with-hours-display-auto-with-zero-hour.js).
+/// The conjunction/disjunction SHORT and NARROW widths are genuinely
+/// locale-specific (`en` short is "&", `es` unit-long is "y") and still need
+/// CLDR data zipp does not ship, so they fall back to `long` here.
+pub(crate) fn list_parts_en(items: &[String], ty: &str, style: &str) -> Vec<(&'static str, String)> {
+    let (two, middle, end) = match (ty, style) {
+        ("unit", "narrow") => (" ", " ", " "),
+        ("unit", _) => (", ", ", ", ", "),
+        ("disjunction", _) => (" or ", ", ", ", or "),
+        _ => (" and ", ", ", ", and "),
+    };
     let mut out: Vec<(&'static str, String)> = vec![];
     let n = items.len();
     for (i, it) in items.iter().enumerate() {
         if i > 0 {
             let lit = if n == 2 {
-                format!(" {conj} ")
+                two
             } else if i == n - 1 {
-                format!(", {conj} ")
+                end
             } else {
-                ", ".to_string()
+                middle
             };
-            out.push(("literal", lit));
+            out.push(("literal", lit.to_string()));
         }
         out.push(("element", it.clone()));
     }
@@ -1009,26 +1029,41 @@ pub(crate) fn grouped_decimal_parts(n: f64) -> Vec<(&'static str, String)> {
     out
 }
 
-/// Minimal en duration formatting: non-zero fields joined as "N unit, …".
-pub(crate) fn format_duration_en(d: &[i64; 10]) -> String {
-    let parts: Vec<String> = d
-        .iter()
-        .enumerate()
-        .filter(|(_, &v)| v != 0)
-        .map(|(i, &v)| format!("{v} {}", duration_unit_label(i)))
-        .collect();
-    if parts.is_empty() {
-        "0 sec".to_string()
-    } else {
-        parts.join(", ")
+/// AddFractionalDigits (ECMA-402, Intl.DurationFormat): the value of the
+/// sub-second-bearing unit at `exponent` (9 = seconds, 6 = milliseconds,
+/// 3 = microseconds) PLUS every finer field, as an exact decimal.
+///
+/// Exactness is the point: `precision-exact-mathematical-values.js` feeds
+/// `milliseconds: 4503599627370497000`, whose f64 really holds
+/// 4503599627370497024, and asserts the digits survive the sum. f64 addition
+/// would lose them, so the total is accumulated in i128 nanoseconds. `None`
+/// means no finer field is set and the unit's own integral value is already
+/// exact.
+pub(crate) fn duration_fractional_decimal(d: &[f64; 10], exponent: u32) -> Option<String> {
+    let finer_zero = match exponent {
+        9 => d[7] == 0.0 && d[8] == 0.0 && d[9] == 0.0,
+        6 => d[8] == 0.0 && d[9] == 0.0,
+        _ => d[9] == 0.0,
+    };
+    if finer_zero {
+        return None;
     }
-}
-
-/// The en "short"-style label of a Duration field, by DURATION_FIELDS index —
-/// shared by `format` and `formatToParts` so the two never drift apart.
-pub(crate) fn duration_unit_label(i: usize) -> &'static str {
-    const NAMES: [&str; 10] = ["yr", "mth", "wk", "day", "hr", "min", "sec", "ms", "μs", "ns"];
-    NAMES[i.min(9)]
+    let mut ns = d[9] as i128 + (d[8] as i128) * 1_000;
+    if exponent >= 6 {
+        ns += (d[7] as i128) * 1_000_000;
+    }
+    if exponent >= 9 {
+        ns += (d[6] as i128) * 1_000_000_000;
+    }
+    let e = 10i128.pow(exponent);
+    let q = ns / e;
+    let r = (ns % e).unsigned_abs();
+    let w = exponent as usize;
+    // Truncating division loses the sign of a value in (-1, 0) — the quotient is
+    // a plain 0 — so re-attach it; the spec's value is the signed mathematical
+    // sum, and it is what decides whether "-" is printed.
+    let sign = if ns < 0 && q == 0 { "-" } else { "" };
+    Some(format!("{sign}{q}.{r:0w$}"))
 }
 
 /// Normalize a Temporal unit option: strip a trailing plural "s"; "auto"→`auto_to`.

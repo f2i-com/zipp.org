@@ -1321,15 +1321,26 @@ impl<'p> Vm<'p> {
                     break;
                 }
                 let k_value = self.get_prop(result, "value")?;
+                // IteratorClose(iteratorRecord, throwCompletion) discards ANY
+                // completion the close produces — including the one from
+                // GetMethod(iterator, "return") — and rethrows the original. The
+                // thrown VALUE lives in `pending_throw`, so it has to be banked
+                // across the close: without that, a `return` accessor that itself
+                // throws overwrote it and `Array.from` reported "return getter
+                // throws" instead of the defineProperty failure that actually
+                // aborted the loop (staging/sm/Array/from-iterator-close.js).
+                macro_rules! close_and_throw {
+                    ($e:expr) => {{
+                        let saved = self.pending_throw;
+                        let _ = self.iterator_close(iter);
+                        self.pending_throw = saved;
+                        return Err($e);
+                    }};
+                }
                 let mapped = if mapping {
                     match self.call_value(mapfn, this_arg, &[k_value, Value::num(k as f64)]) {
                         Ok(v) => v,
-                        Err(e) => {
-                            // IteratorClose(iteratorRecord, error): the original
-                            // throw wins; a throwing return() is ignored.
-                            let _ = self.iterator_close(iter);
-                            return Err(e);
-                        }
+                        Err(e) => close_and_throw!(e),
                     }
                 } else {
                     k_value
@@ -1337,8 +1348,7 @@ impl<'p> Vm<'p> {
                 match dest {
                     Some(a) => {
                         if let Err(e) = self.create_data_property_or_throw(a, k, mapped) {
-                            let _ = self.iterator_close(iter);
-                            return Err(e);
+                            close_and_throw!(e);
                         }
                     }
                     None => {
@@ -1364,39 +1374,18 @@ impl<'p> Vm<'p> {
                 None => Ok(self.alloc_array_current_realm(out)),
             };
         }
-        // Natively-iterable kinds whose prototype carries no VISIBLE @@iterator
-        // in this engine keep the internal positional drain.
-        if src.is_heap()
-            && matches!(
-                self.heap.get(src.heap_index()),
-                HeapObj::Str(_)
-                    | HeapObj::Cons { .. }
-                    | HeapObj::Set(_)
-                    | HeapObj::Map { .. }
-                    | HeapObj::TypedArray { .. }
-                    | HeapObj::Generator { .. }
-                    | HeapObj::Iterator { .. }
-                    | HeapObj::IterHelper { .. }
-            )
-        {
-            let mut elems = self.iterate_to_vec(src)?;
-            if mapping {
-                for (i, slot) in elems.iter_mut().enumerate() {
-                    let args = [*slot, Value::int(i as i32)];
-                    *slot = self.call_value(mapfn, this_arg, &args)?;
-                }
-            }
-            if custom_ctor {
-                let len = elems.len();
-                let a = self.construct(this_ctor, &[Value::num(len as f64)])?;
-                for (i, v) in elems.iter().enumerate() {
-                    self.create_data_property_or_throw(a, i, *v)?;
-                }
-                self.set_prop(a, "length", Value::num(len as f64), true)?;
-                return Ok(a);
-            }
-            return Ok(self.alloc_array_current_realm(elems));
-        }
+        // NOTE: reaching here means GetMethod(items, @@iterator) was UNDEFINED, so
+        // the array-like path below is the only one the spec allows — even for a
+        // String/Set/Map/TypedArray/generator. There used to be an internal
+        // positional drain here for those kinds, from a time when their prototypes
+        // carried no visible @@iterator; they all expose a real one now, so the
+        // drain could only ever fire once a test had DELETED @@iterator, which is
+        // precisely when it must not:
+        //   delete String.prototype[Symbol.iterator];
+        //   Array.from("𝄞")   // ["\uD834","\uDD1E"], not ["\u{1D11E}"]
+        //   Array.from(new Set([1,2]))   // [] — a Set has no `length`
+        // (staging/sm/Array/from_string.js).
+        //
         // Array-like path: arrayLike = ToObject(items); len = ToLength(Get(O,
         // 'length')); elements are read live and DEFINED on the result
         // (CreateDataPropertyOrThrow — a non-extensible receiver or a

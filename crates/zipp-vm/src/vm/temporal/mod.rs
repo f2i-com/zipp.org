@@ -340,72 +340,204 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
             return None;
         }
     }
-    // The `Etc/…` family, before the catch-all below: it is the one part of the
-    // IANA database that is a closed RULE rather than a table of political
-    // history, so its membership, canonical spelling and offset are all exactly
-    // derivable without shipping the database. Getting it here means
-    // `Etc/GMT-24` is rejected (it does not exist) and `Etc/GMT-5` carries its
-    // real +05:00 instead of silently pretending to be UTC.
-    // Matched on BYTES: a `&str[..4]` slice panics when a multi-byte character
-    // straddles index 4 ("abc\u{4e00}" is a legal — if invalid — time-zone
-    // argument, and must RangeError, not abort the engine).
-    if t.as_bytes().len() >= 4 && t.as_bytes()[..4].eq_ignore_ascii_case(b"Etc/") {
-        return parse_etc_zone(&t[4..]);
-    }
-    // A named zone like "America/New_York" or "Europe/London": accept the id.
-    if t.contains('/') || t.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
-        return Some((t.to_string(), 0));
-    }
-    None
+    // A named zone: GetAvailableNamedTimeZoneIdentifier against the bundled
+    // IANA table (see `tzdb.rs`). The match is ASCII-case-insensitive and the
+    // CANONICAL spelling is what comes back, so "africa/cairo" becomes
+    // "Africa/Cairo"; a name the database does not have returns None, which
+    // every caller turns into a RangeError. The offset is 0 here because a
+    // named zone does not have one — it has a function of the instant, which
+    // is `tz_offset_ns_at`.
+    tzdb::lookup(t).map(|z| (z.canonical.to_string(), 0))
 }
 
-/// The `Etc/<rest>` zones of the IANA `etcetera` file, matched case-insensitively
-/// and returned in their canonical spelling (`eTc/gMt+1` -> `Etc/GMT+1`, which is
-/// what `timezone-case-insensitive.js` asks for). The identifier itself is NOT
-/// canonicalized onto its Link target — Temporal keeps the id it was given
-/// (`do-not-canonicalize-iana-identifiers.js`).
+/// The UTC offset (nanoseconds) a time-zone IDENTIFIER has at an instant:
+/// fixed for an offset zone, and GetNamedTimeZoneOffsetNanoseconds against the
+/// IANA table for a named one. An unrecognised id yields 0 — identifiers are
+/// validated where they enter (`parse_time_zone`), so this is unreachable for
+/// a stored zone.
+pub(crate) fn tz_offset_ns_at(id: &str, epoch_ns: i128) -> i64 {
+    if id.starts_with(['+', '-']) {
+        return parse_offset_ns(id).unwrap_or(0) as i64;
+    }
+    match tzdb::lookup(id) {
+        // FLOOR to seconds: transitions land on whole seconds, so the offset
+        // for a negative sub-second instant is the one of the second it is in.
+        Some(z) => {
+            tzdb::offset_seconds(z.zone, epoch_ns.div_euclid(1_000_000_000) as i64) as i64
+                * 1_000_000_000
+        }
+        None => 0,
+    }
+}
+
+/// GetStartOfDay: the first instant of a local calendar day. Normally that is
+/// local midnight, but when a spring-forward SKIPS midnight the day begins at
+/// the transition itself — which is not the same as disambiguating midnight
+/// "compatible". America/Toronto on 1919-03-31 jumped 23:30 → 00:30, so its day
+/// starts at 00:30, while disambiguated midnight lands at 01:00.
+pub(crate) fn tz_start_of_day(id: &str, local_midnight_ns: i128) -> Result<i128, Thrown> {
+    if id.starts_with(['+', '-']) {
+        return Ok(local_midnight_ns - parse_offset_ns(id).unwrap_or(0) as i128);
+    }
+    let zone = match tzdb::lookup(id) {
+        Some(z) => z.zone,
+        None => return Ok(local_midnight_ns),
+    };
+    let (sec, rem) =
+        (local_midnight_ns.div_euclid(1_000_000_000), local_midnight_ns.rem_euclid(1_000_000_000));
+    if let Some(&first) = tzdb::possible_instants(zone, sec as i64).first() {
+        return Ok(first as i128 * 1_000_000_000 + rem);
+    }
+    match tzdb::next_transition(zone, sec as i64 - 86_400) {
+        Some(t) => Ok(t as i128 * 1_000_000_000),
+        None => tz_local_to_instant(id, local_midnight_ns, "compatible"),
+    }
+}
+
+/// GetNamedTimeZoneNextTransition / …PreviousTransition, in nanoseconds. An
+/// offset zone never has one. The database works in whole seconds, so a
+/// sub-second instant is floored for "next" and ceilinged for "previous" —
+/// otherwise `getTimeZoneTransition("next")` called ON a transition with a
+/// nanosecond to spare would return that same transition again.
+pub(crate) fn tz_transition(id: &str, epoch_ns: i128, next: bool) -> Option<i128> {
+    if id.starts_with(['+', '-']) {
+        return None;
+    }
+    let z = tzdb::lookup(id)?;
+    let sec = if next {
+        epoch_ns.div_euclid(1_000_000_000) as i64
+    } else {
+        // A transition strictly BEFORE a sub-second instant may be in the same
+        // second, so round up before searching.
+        (-((-epoch_ns).div_euclid(1_000_000_000))) as i64
+    };
+    let t = if next {
+        tzdb::next_transition(z.zone, sec)
+    } else {
+        tzdb::previous_transition(z.zone, sec)
+    }?;
+    let ns = t as i128 * 1_000_000_000;
+    // The annual rules recur forever, but a transition outside the representable
+    // instant range is not one Temporal can name: `getTimeZoneTransition("next")`
+    // on the maximum instant must be null, not a RangeError.
+    (ns.abs() <= NS_MAX_INSTANT).then_some(ns)
+}
+
+/// InterpretISODateTimeOffset: turn a wall clock plus an (optional) explicit
+/// offset into an instant.
 ///
-/// The file defines `Etc/GMT+1`…`Etc/GMT+12` and `Etc/GMT-1`…`Etc/GMT-14` with
-/// the POSIX sign inversion (`Etc/GMT+7` is 7 hours WEST of Greenwich), plus the
-/// zero-offset spellings `GMT`, `GMT0`, `GMT+0`, `GMT-0`, `UTC`, `UCT`,
-/// `Universal`, `Zulu` and `Greenwich`. Everything else under `Etc/` — including
-/// a leading-zero form like `Etc/GMT-05` — does not exist.
-fn parse_etc_zone(rest: &str) -> Option<(String, i64)> {
-    for zero in ["GMT", "GMT0", "UTC", "UCT", "Universal", "Zulu", "Greenwich"] {
-        if rest.eq_ignore_ascii_case(zero) {
-            return Some((format!("Etc/{zero}"), 0));
+/// `behaviour` is how the offset was supplied — 0 WALL (none given), 1 EXACT (a
+/// `Z` designator, which fixes the instant outright), 2 OPTION (an explicit
+/// numeric offset that has to be reconciled with the zone). `match_minutes` is
+/// the MATCH-MINUTES rule for strings: an offset written to minute precision
+/// still matches a zone whose real offset has seconds in it (every pre-1900
+/// LMT offset does).
+pub(crate) fn interpret_iso_offset(
+    id: &str,
+    local_ns: i128,
+    behaviour: u8,
+    offset_ns: i64,
+    disambiguation: &str,
+    offset_option: &str,
+    match_minutes: bool,
+) -> Result<i128, Thrown> {
+    if behaviour == 0 || offset_option == "ignore" {
+        return tz_local_to_instant(id, local_ns, disambiguation);
+    }
+    if behaviour == 1 || offset_option == "use" {
+        return Ok(local_ns - offset_ns as i128);
+    }
+    // OPTION with "prefer"/"reject": an instant whose real offset IS the one
+    // written wins outright; only when none matches does the option decide
+    // between throwing and falling back to the zone's own answer.
+    if !id.starts_with(['+', '-']) {
+        if let Some(z) = tzdb::lookup(id) {
+            let (sec, rem) =
+                (local_ns.div_euclid(1_000_000_000), local_ns.rem_euclid(1_000_000_000));
+            for c in tzdb::possible_instants(z.zone, sec as i64) {
+                let cand = c as i128 * 1_000_000_000 + rem;
+                let off = tzdb::offset_seconds(z.zone, c) as i64 * 1_000_000_000;
+                let rounded = {
+                    let m = 60_000_000_000i64;
+                    // RoundNumberToIncrement(off, 60e9, "halfExpand").
+                    let (q, r) = (off / m, off % m);
+                    if r.abs() * 2 >= m {
+                        (q + if off < 0 { -1 } else { 1 }) * m
+                    } else {
+                        q * m
+                    }
+                };
+                if off == offset_ns || (match_minutes && rounded == offset_ns) {
+                    return Ok(cand);
+                }
+            }
+        }
+    } else if parse_offset_ns(id).unwrap_or(0) as i64 == offset_ns {
+        return Ok(local_ns - offset_ns as i128);
+    }
+    if offset_option == "reject" {
+        return Err(Thrown("RangeError: the offset does not match the time zone".into()));
+    }
+    tz_local_to_instant(id, local_ns, disambiguation)
+}
+
+/// GetPossibleEpochNanoseconds + DisambiguatePossibleEpochNanoseconds: the
+/// instant a local wall clock denotes in a zone. A spring-forward gap has no
+/// instant and a fall-back repeat has two, which is what `disambiguation`
+/// resolves ("reject" throws in either case).
+pub(crate) fn tz_local_to_instant(
+    id: &str,
+    local_ns: i128,
+    disambiguation: &str,
+) -> Result<i128, Thrown> {
+    if id.starts_with(['+', '-']) {
+        return Ok(local_ns - parse_offset_ns(id).unwrap_or(0) as i128);
+    }
+    let zone = match tzdb::lookup(id) {
+        Some(z) => z.zone,
+        None => return Ok(local_ns),
+    };
+    // Offsets are whole seconds, so the sub-second part of the wall clock rides
+    // along untouched and only the second-granular part needs the database.
+    let (sec, rem) = (local_ns.div_euclid(1_000_000_000), local_ns.rem_euclid(1_000_000_000));
+    let cands = tzdb::possible_instants(zone, sec as i64);
+    let pick = |v: &[i64], last: bool| -> i128 {
+        (if last { v[v.len() - 1] } else { v[0] }) as i128 * 1_000_000_000 + rem
+    };
+    match cands.len() {
+        1 => Ok(pick(&cands, false)),
+        n if n >= 2 => match disambiguation {
+            "reject" => Err(Thrown(
+                "RangeError: this wall-clock time occurs twice in this time zone".into(),
+            )),
+            "later" => Ok(pick(&cands, true)),
+            // "compatible" and "earlier" both take the first instant.
+            _ => Ok(pick(&cands, false)),
+        },
+        // A gap. Shift the wall clock by the size of the gap — the difference
+        // between the offsets a day either side — and take the instant on the
+        // far side of it: forwards for "compatible"/"later", backwards for
+        // "earlier".
+        _ => {
+            if disambiguation == "reject" {
+                return Err(Thrown(
+                    "RangeError: this wall-clock time does not exist in this time zone".into(),
+                ));
+            }
+            let before = tzdb::offset_seconds(zone, sec as i64 - 86_400) as i64;
+            let after = tzdb::offset_seconds(zone, sec as i64 + 86_400) as i64;
+            let shift = after - before;
+            let earlier = disambiguation == "earlier";
+            let shifted = sec as i64 + if earlier { -shift } else { shift };
+            let v = tzdb::possible_instants(zone, shifted);
+            if v.is_empty() {
+                // Cannot happen for a real zone (the shift is exactly the gap),
+                // but a bad table must not panic.
+                return Ok(local_ns - before as i128 * 1_000_000_000);
+            }
+            Ok(pick(&v, earlier))
         }
     }
-    let b = rest.as_bytes();
-    if b.len() < 3 || !b[..3].eq_ignore_ascii_case(b"GMT") {
-        return None;
-    }
-    // Safe: the first three bytes were just confirmed ASCII, so 3 is a boundary.
-    let after = &rest[3..];
-    let (sign, digits) = match after.as_bytes().first() {
-        Some(b'+') => (-1i64, &after[1..]),
-        Some(b'-') => (1i64, &after[1..]),
-        _ => return None,
-    };
-    // No leading zero and at most two digits: the file has `Etc/GMT+1`, never
-    // `Etc/GMT+01` or `Etc/GMT+001`.
-    if digits.is_empty()
-        || digits.len() > 2
-        || !digits.bytes().all(|b| b.is_ascii_digit())
-        || (digits.len() == 2 && digits.starts_with('0'))
-    {
-        return None;
-    }
-    let n: i64 = digits.parse().ok()?;
-    if n == 0 {
-        // `Etc/GMT+0` and `Etc/GMT-0` are both Links to Etc/GMT.
-        return Some((format!("Etc/GMT{}0", if sign > 0 { '-' } else { '+' }), 0));
-    }
-    if n > if sign > 0 { 14 } else { 12 } {
-        return None;
-    }
-    let id = format!("Etc/GMT{}{n}", if sign > 0 { '-' } else { '+' });
-    Some((id, sign * n * 3_600_000_000_000))
 }
 
 /// Add a Duration `f` ([y,mo,w,d,h,mi,s,ms,us,ns]) to a date-time `start`
@@ -732,7 +864,17 @@ fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String, i64, i8)> {
                 if !valid_offset_string(off_str) {
                     return None;
                 }
-                (&t[..opos], parse_offset_ns(off_str)? as i64, 2i8)
+                // Behaviour 2 is an OPTION offset written to MINUTE precision,
+                // which InterpretISODateTimeOffset then matches fuzzily against a
+                // zone whose real offset has seconds; 3 is the same but written
+                // with seconds, which must match exactly ("-00:45" matches
+                // Africa/Monrovia's -00:44:30, "-00:45:00" does not).
+                let sub_minute = off_str.matches(':').count() >= 2
+                    || off_str.contains('.')
+                    || off_str.contains(',')
+                    || (!off_str.contains(':')
+                        && off_str.bytes().filter(u8::is_ascii_digit).count() > 4);
+                (&t[..opos], parse_offset_ns(off_str)? as i64, if sub_minute { 3i8 } else { 2i8 })
             } else {
                 (t, tz_offset, 0i8)
             }
@@ -809,9 +951,27 @@ fn format_offset(ns: i64) -> String {
     }
 }
 
+/// FormatDateTimeUTCOffsetRounded: the offset a `toString()` prints, rounded to
+/// the nearest minute (half-expand). A zone whose real offset has seconds —
+/// Africa/Monrovia was −00:44:30 until 1972 — serializes as `-00:45` even though
+/// the `offset` PROPERTY reports the full precision and the wall clock shown is
+/// computed from the exact value.
+fn format_offset_rounded(ns: i64) -> String {
+    const MIN: i64 = 60_000_000_000;
+    let (q, r) = (ns / MIN, ns % MIN);
+    let minutes = if r.abs() * 2 >= MIN { q + if ns < 0 { -1 } else { 1 } } else { q };
+    let sign = if minutes < 0 { '-' } else { '+' };
+    let a = minutes.abs();
+    format!("{sign}{:02}:{:02}", a / 60, a % 60)
+}
+
 // submodules (split out of the former monolithic temporal.rs)
 mod calendar;
 pub(crate) use calendar::*;
+// The IANA time zone database: a generated table and the reader over it.
+#[rustfmt::skip]
+mod tzdata;
+pub(crate) mod tzdb;
 mod duration;
 mod plain_date;
 mod plain_time;

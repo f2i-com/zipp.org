@@ -359,16 +359,17 @@ impl<'p> Vm<'p> {
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
                     return Err(Thrown("TypeError: options must be an object or undefined".into()));
                 }
-                self.opt_string(
+                let disamb = self.opt_string(
                     opts,
                     "disambiguation",
                     "compatible",
                     &["compatible", "earlier", "later", "reject"],
                 )?;
-                let (id, offset) = self.parse_tz_arg(a0)?;
+                let (id, _) = self.parse_tz_arg(a0)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
-                let r = self.alloc_zdt(local - offset as i128, offset, id)?;
+                let ns = tz_local_to_instant(&id, local, &disamb)?;
+                let r = self.alloc_zdt(ns, tz_offset_ns_at(&id, ns), id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
             "with" => {

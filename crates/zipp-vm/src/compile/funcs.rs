@@ -1116,17 +1116,27 @@ impl<'a> FnCompiler<'a> {
             self.cx.functions.push(proto);
             static_setter_defs.push((sname.clone(), fid));
         }
-        // Constructor proto. With an explicit ctor: field inits prepended + the
-        // user body (which calls `super` itself). Without one but with fields: a
+        // Constructor proto. With an explicit ctor: the user body alone (field
+        // inits move to the thunk below). Without one but with fields: a
         // fields-only proto (the `new` path runs the parent ctor first). Neither:
         // None.
         let has_explicit_ctor = ctor_fn.is_some();
-        // A DERIVED class's EXPLICIT ctor defers its instance-field
-        // initializers to a separate thunk run by the SuperCtor ops right
-        // after super() completes (spec BindThisValue →
-        // InitializeInstanceElements); its body carries no entry inits.
-        // Base classes and implicit (fields-only) ctors keep the entry layout.
-        let defer_fields = has_explicit_ctor && self.cx.class_derived;
+        // ANY class with an EXPLICIT ctor defers its instance-field initializers
+        // to a separate thunk: a derived class's is run by the SuperCtor ops
+        // right after super() completes, a base class's by [[Construct]] before
+        // it enters the ctor (spec InitializeInstanceElements precedes
+        // OrdinaryCallEvaluateBody). Prepending them to the ctor body — which is
+        // what a base class used to do — put them AFTER
+        // FunctionDeclarationInstantiation, so `class A { #x = f(); constructor(o
+        // = g()) {} }` ran g before f (staging/sm/fields/init-order.js) and
+        // `constructor(o = this.#x)` could not even see the field
+        // (staging/sm/PrivateName/constructor-args.js). The thunk is also a fresh
+        // scope, so a field initializer's free variable no longer binds to a
+        // same-named CONSTRUCTOR PARAMETER — an initializer is evaluated in the
+        // class scope, never the ctor's.
+        // Implicit (fields-only) ctors keep the entry layout: there are no
+        // parameters and no body for the fields to race with.
+        let defer_fields = has_explicit_ctor;
         let empty_fields = Vec::new();
         let empty_cinits = Vec::new();
         let (ctor_fields, ctor_cinits) = if defer_fields {

@@ -1292,14 +1292,16 @@ impl<'p> Vm<'p> {
                 "dayOfWeek" => Value::num(iso_day_of_week(y, m, d) as f64),
                 "daysInWeek" => Value::num(7.0),
                 "hoursInDay" => {
-                    // (startOfDay(tomorrow) − startOfDay(today)) / 1h. A fixed-offset
-                    // (incl. UTC) zone's day is exactly 24h, but the next day's start
-                    // can fall outside the representable instant range at the max
-                    // boundary — a RangeError.
+                    // (startOfDay(tomorrow) − startOfDay(today)) / 1h. Both ends go
+                    // through the zone, so a DST day is 23 or 25 hours (or 23.5, in
+                    // Lord Howe); a fixed-offset zone's day is exactly 24.
                     const DAY_NS_I: i128 = 86_400_000_000_000;
                     const NS_MAX: i128 = 8_640_000_000_000_000_000_000;
-                    let today_start = iso_to_epoch_days(y, m, d) as i128 * DAY_NS_I - off as i128;
-                    let tomorrow_start = today_start + DAY_NS_I;
+                    let tz = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                    let today_local = iso_to_epoch_days(y, m, d) as i128 * DAY_NS_I;
+                    let start = crate::vm::temporal::tz_start_of_day;
+                    let today_start = start(&tz, today_local)?;
+                    let tomorrow_start = start(&tz, today_local + DAY_NS_I)?;
                     // GetStartOfDay throws for BOTH boundaries: a nonzero offset can
                     // push today's local midnight itself past the instant range.
                     if today_start.abs() > NS_MAX || tomorrow_start.abs() > NS_MAX {
@@ -1308,7 +1310,9 @@ impl<'p> Vm<'p> {
                                 .into(),
                         ));
                     }
-                    Value::num(((tomorrow_start - today_start) / 3_600_000_000_000) as f64)
+                    Value::num(
+                        (tomorrow_start - today_start) as f64 / 3_600_000_000_000.0,
+                    )
                 }
                 // FLOOR division (toward −∞), not truncation, for negative epochs.
                 "epochSeconds" => Value::num(epoch.div_euclid(1_000_000_000) as f64),

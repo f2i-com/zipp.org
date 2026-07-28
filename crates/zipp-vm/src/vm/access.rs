@@ -1155,6 +1155,16 @@ impl<'p> Vm<'p> {
             | HeapObj::Boxed { .. }
             | HeapObj::ArrayBuffer { .. }
             | HeapObj::DataView { .. } => true,
+            // A TypedArray's `length`/`byteLength`/`byteOffset`/`buffer`/
+            // @@toStringTag are getter-only accessors on %TypedArray%.prototype,
+            // so the same rule applies — but ONLY for a non-index key: a
+            // CanonicalNumericIndexString is absorbed by the integer-indexed
+            // exotic [[Set]] further down and must not walk the chain. Without
+            // this, `ta.length = 0` created a shadowing own data property (so
+            // `Array.from.call(Uint8Array, [])`, whose final
+            // Set(A,"length",0,true) must throw, silently succeeded —
+            // staging/sm/Array/from_errors.js).
+            HeapObj::TypedArray { .. } => !self.is_canonical_numeric_index(key),
             // An Array's NAMED (non-index) write consults the chain so an
             // inherited accessor (`Object.defineProperty(Array.prototype,
             // "prop", {set})`) governs it (15.2.3.6-4-579). Integer-index

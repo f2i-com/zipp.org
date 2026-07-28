@@ -721,6 +721,7 @@ impl<'s> Parser<'s> {
             // Like a static block, an initializer is the body of a synthetic
             // method, so `new.target` is legal (and `undefined`) here too.
             self.ctx.new_target = true;
+            self.field_init_await(is_static);
             let v = self.parse_assign_full()?;
             self.ctx = saved;
             Some(v)
@@ -729,6 +730,23 @@ impl<'s> Parser<'s> {
         };
         self.semicolon()?;
         Ok(ClassMember::Field(ClassField { key, value, is_static, accessor: None }))
+    }
+
+    /// The `[Await]` parameter for a FieldDefinition's Initializer.
+    ///
+    /// The production is `ClassElementName[?Yield, ?Await] Initializer[+In,
+    /// ~Yield, ~Await]`, so an INSTANCE field's initializer does NOT inherit the
+    /// enclosing function's `await`: inside `async function f(){ … }`,
+    /// `class { x = await; }` is a plain IdentifierReference and must parse
+    /// (staging/sm/fields/await-identifier-script.js), while `x = await 1` is
+    /// still a SyntaxError because `await` is then just an identifier followed by
+    /// a number.
+    ///
+    /// A STATIC field's initializer keeps `await` RESERVED — the same rule the
+    /// ClassStaticBlock arm above implements, and unconditional: node rejects
+    /// `class { static y = await; }` even in a plain sloppy Script.
+    fn field_init_await(&mut self, is_static: bool) {
+        self.ctx.await_ = is_static;
     }
 
     /// `accessor ClassElementName Initializer_opt`, with the `accessor` keyword
@@ -742,6 +760,7 @@ impl<'s> Parser<'s> {
             self.ctx.return_ = false;
             self.ctx.super_prop = true;
             self.ctx.new_target = true;
+            self.field_init_await(is_static);
             let v = self.parse_assign_full()?;
             self.ctx = saved;
             Some(v)

@@ -58,11 +58,11 @@ impl<'p> Vm<'p> {
         &mut self,
         options: Value,
         offset_default: &str,
-    ) -> Result<(String, bool), Thrown> {
+    ) -> Result<(String, String, bool), Thrown> {
         if options != Value::UNDEFINED && !self.is_object_value(options) {
             return Err(Thrown("TypeError: options must be an object or undefined".into()));
         }
-        self.opt_string(
+        let disamb = self.opt_string(
             options,
             "disambiguation",
             "compatible",
@@ -76,7 +76,7 @@ impl<'p> Vm<'p> {
             &["prefer", "use", "ignore", "reject"],
         )?;
         let reject = self.read_overflow(options)?;
-        Ok((off, reject))
+        Ok((off, disamb, reject))
     }
 
     /// Resolve a toString() options bag (fractionalSecondDigits / smallestUnit /
@@ -557,29 +557,32 @@ impl<'p> Vm<'p> {
                 // Spec item handling: an Object item (incl. a Proxy bag — gating on
                 // HeapObj::Object alone missed those) yields timeZone then plainTime
                 // via observable Gets; anything else is itself the time-zone-like.
-                let (id, offset, time) = if self.is_object_value(a0) {
+                let (id, time) = if self.is_object_value(a0) {
                     let tzv = self.get_prop(a0, "timeZone")?;
                     if tzv == Value::UNDEFINED {
                         // No timeZone property: the item itself is the
                         // time-zone-like (a ZonedDateTime carries its zone).
-                        let (id, offset) = self.parse_tz_arg(a0)?;
-                        (id, offset, [0i64; 6])
+                        (self.parse_tz_arg(a0)?.0, None)
                     } else {
-                        let (id, offset) = self.parse_tz_arg(tzv)?;
+                        let (id, _) = self.parse_tz_arg(tzv)?;
                         let pt = self.get_prop(a0, "plainTime")?;
-                        let time = if pt == Value::UNDEFINED {
-                            [0i64; 6]
-                        } else {
-                            self.to_plain_time(pt)?
-                        };
-                        (id, offset, time)
+                        let time =
+                            if pt == Value::UNDEFINED { None } else { Some(self.to_plain_time(pt)?) };
+                        (id, time)
                     }
                 } else {
-                    let (id, offset) = self.parse_tz_arg(a0)?;
-                    (id, offset, [0i64; 6])
+                    (self.parse_tz_arg(a0)?.0, None)
                 };
-                let local = (iso_to_epoch_days(y, m, d) as i128) * DAY_NS + time_to_ns(&time);
-                let r = self.alloc_zdt(local - offset as i128, offset, id)?;
+                // With NO plainTime the result is GetStartOfDay, which is not the
+                // same as disambiguating midnight: America/Toronto skipped
+                // 1919-03-31T00:00, so its day starts at the 00:30 transition
+                // while `{plainTime: new PlainTime()}` disambiguates to 01:00.
+                let midnight = (iso_to_epoch_days(y, m, d) as i128) * DAY_NS;
+                let ns = match time {
+                    None => tz_start_of_day(&id, midnight)?,
+                    Some(t) => tz_local_to_instant(&id, midnight + time_to_ns(&t), "compatible")?,
+                };
+                let r = self.alloc_zdt(ns, tz_offset_ns_at(&id, ns), id)?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
             "with" => {

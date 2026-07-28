@@ -1762,11 +1762,17 @@ impl<'p> Vm<'p> {
         // an object argument's @@toPrimitive/valueOf runs exactly once and its
         // exception propagates (`format({[Symbol.toPrimitive](){…}})`).
         let n = self.to_number_coerce(value)?;
-        let s = self.intl_number_format_str(resolved, n)?;
-        // The digits — and only the digits — follow the resolved numbering
-        // system; the separators around them are locale data this engine lacks.
-        let ns = self.display(self.intl_slot(resolved, "numberingSystem"));
-        let s = translate_digits(&s, &ns);
+        // FormatNumeric is FormatNumericToParts concatenated, so derive it from
+        // the SAME PartitionNumberPattern: `format` used to re-derive the string
+        // on its own and dropped the `unit` style's affix that `formatToParts`
+        // emits — `new Intl.NumberFormat("en",{style:"unit",unit:"day"})`
+        // formatted 1 as "1" while its parts said "1 day". Intl.DurationFormat
+        // builds its output from those parts and test262 grades it against
+        // `format`, so the two disagreeing is directly observable.
+        // (nf_parts applies the numbering system to the digit runs — and only
+        // to them; the separators around them are locale data this engine lacks.)
+        let parts = self.nf_parts(resolved, n)?;
+        let s: String = parts.into_iter().map(|(_, v)| v).collect();
         Ok(self.alloc_str(s))
     }
 
@@ -2240,6 +2246,173 @@ impl<'p> Vm<'p> {
         Ok(parts)
     }
 
+    /// PartitionDurationFormatPattern (ECMA-402 §1.1.14, with FormatNumericUnits
+    /// / FormatNumericHours / FormatNumericMinutes / FormatNumericSeconds folded
+    /// in) as a typed part list; `format` is this joined, `formatToParts` is this
+    /// wrapped. The third tuple slot is the part's `unit` field — the SINGULAR
+    /// unit identifier, empty for the pieces that belong to no unit (the ":"
+    /// separators and the list literals).
+    ///
+    /// Every numeric run is produced by a real `Intl.NumberFormat` built from the
+    /// spec's nfOpts, and the runs are joined by the real ListFormat pattern for
+    /// `{type:"unit", style:listStyle}`. Delegating rather than re-deriving is
+    /// load-bearing: test262 grades DurationFormat against exactly those two
+    /// services (`harness/testIntl.js` re-implements this algorithm on top of
+    /// them), so any label or separator zipp lacks cancels on both sides.
+    pub(crate) fn duration_format_parts(
+        &mut self,
+        resolved: u32,
+        dur: &[f64; 10],
+    ) -> Result<Vec<(String, String, &'static str)>, Thrown> {
+        /// The `unit` identifier NumberFormat takes for each Duration field, in
+        /// DURATION_FIELDS order (`years` → `year`).
+        const SINGULAR: [&str; 10] = [
+            "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
+            "microsecond", "nanosecond",
+        ];
+        let locale = self.intl_slot(resolved, "locale");
+        let ns = self.display(self.intl_slot(resolved, "numberingSystem"));
+        let base_style = self.display(self.intl_slot(resolved, "style"));
+        let frac_slot = self.intl_slot(resolved, "fractionalDigits");
+        let frac = frac_slot.is_number().then(|| frac_slot.as_f64() as i64);
+        // The duration record holds ℝ(field): ToIntegerIfIntegral maps -0 to +0,
+        // so `format({years:-0})` must print "0 yr", not "-0 yr"
+        // (`format/negative-zero.js` compares it against +0's output).
+        let d: [f64; 10] = dur.map(|v| if v == 0.0 { 0.0 } else { v });
+
+        // One entry per unit that gets displayed; the numeric hh:mm:ss run
+        // appends into the entry the first of its units opened.
+        let mut elements: Vec<Vec<(String, String, &'static str)>> = vec![];
+        let mut need_separator = false;
+        // "signDisplayed": only the FIRST displayed unit carries the sign; every
+        // later one is formatted with signDisplay "never" so "-1 hr, 2 min" does
+        // not become "-1 hr, -2 min".
+        let mut sign_displayed = true;
+
+        for i in 0..10 {
+            let unit_key = native::DURATION_FIELDS[i];
+            let nf_unit = SINGULAR[i];
+            let style = self.display(self.intl_slot(resolved, unit_key));
+            let display = self.display(self.intl_slot(resolved, &format!("{unit_key}Display")));
+            let mut opts = ObjMap::new();
+            let mut value = d[i];
+            // A decimal string when the exact sum needs more precision than f64
+            // addition would keep; see duration_fractional_decimal.
+            let mut exact: Option<String> = None;
+            let mut done = false;
+            // Steps 9.g/j: when the NEXT finer unit is "numeric" it is not a unit
+            // of its own — it is this unit's fraction, and the loop stops here.
+            if (6..=8).contains(&i) {
+                let next = self.display(self.intl_slot(resolved, native::DURATION_FIELDS[i + 1]));
+                if next == "numeric" {
+                    let exponent = [9u32, 6, 3][i - 6];
+                    exact = duration_fractional_decimal(&d, exponent);
+                    opts.set("maximumFractionDigits", Value::num(frac.unwrap_or(9) as f64));
+                    opts.set("minimumFractionDigits", Value::num(frac.unwrap_or(0) as f64));
+                    let tv = self.alloc_str("trunc".to_string());
+                    opts.set("roundingMode", tv);
+                    done = true;
+                }
+            }
+            // Step 9.f: zero minutes still print inside a numeric run when a
+            // seconds field will follow them ("1:00:30", not "1:30").
+            let mut display_required = false;
+            if i == 5 && need_separator {
+                display_required =
+                    self.display(self.intl_slot(resolved, "secondsDisplay")) == "always"
+                        || d[6..].iter().any(|&v| v != 0.0);
+            }
+            let is_zero = exact.is_none() && value == 0.0;
+            if is_zero && display == "auto" && !display_required {
+                if done {
+                    break;
+                }
+                continue;
+            }
+            if sign_displayed {
+                sign_displayed = false;
+                // The sign has to survive even when the unit that carries it is
+                // itself zero ("-0:00:01" for {hours:0, seconds:-1}), and the
+                // only value PartitionNumberPattern prints a minus for is -0.
+                if is_zero && d.iter().any(|&v| v < 0.0) {
+                    value = -0.0;
+                }
+            } else {
+                let nv = self.alloc_str("never".to_string());
+                opts.set("signDisplay", nv);
+            }
+            let nsv = self.alloc_str(ns.clone());
+            opts.set("numberingSystem", nsv);
+            if style == "2-digit" {
+                opts.set("minimumIntegerDigits", Value::num(2.0));
+            }
+            if style != "numeric" && style != "2-digit" {
+                let sv = self.alloc_str("unit".to_string());
+                opts.set("style", sv);
+                let uv = self.alloc_str(nf_unit.to_string());
+                opts.set("unit", uv);
+                let dv = self.alloc_str(style.clone());
+                opts.set("unitDisplay", dv);
+            } else {
+                // A numeric hh:mm:ss run never groups: "1234567:20:45".
+                opts.set("useGrouping", Value::bool(false));
+            }
+            let opts_v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(opts))));
+            let nf = self.make_intl(native::INTL_NUMBERFORMAT, locale, opts_v)?;
+            let nf_resolved = match self.heap.get(nf.heap_index()) {
+                HeapObj::Intl { resolved, .. } => *resolved,
+                _ => return Err(Thrown("TypeError: NumberFormat construction failed".into())),
+            };
+            // The exact decimal goes through ToIntlMathematicalValue the same way
+            // a caller's string would, so DurationFormat is never more (or less)
+            // precise than the NumberFormat it delegates to.
+            let n = match exact {
+                Some(s) => {
+                    let sv = self.alloc_str(s);
+                    self.to_number_coerce(sv)?
+                }
+                None => value,
+            };
+            let mut run: Vec<(String, String, &'static str)> =
+                self.nf_parts(nf_resolved, n)?.into_iter().map(|(t, v)| (t, v, nf_unit)).collect();
+            match elements.last_mut() {
+                Some(last) if need_separator => {
+                    // [[HoursMinutesSeparator]] / [[MinutesSecondsSeparator]]: a
+                    // literal that belongs to no unit, so it carries no `unit`.
+                    last.push(("literal".to_string(), ":".to_string(), ""));
+                    last.append(&mut run);
+                }
+                _ => {
+                    if style == "2-digit" || style == "numeric" {
+                        need_separator = true;
+                    }
+                    elements.push(run);
+                }
+            }
+            if done {
+                break;
+            }
+        }
+
+        // Steps 11-18: join the elements with ListFormat's `unit` type. "digital"
+        // is not a ListFormat style, so it maps to "short".
+        let list_style = if base_style == "digital" { "short" } else { base_style.as_str() };
+        let strings: Vec<String> = elements
+            .iter()
+            .map(|p| p.iter().map(|(_, v, _)| v.as_str()).collect::<String>())
+            .collect();
+        let mut out: Vec<(String, String, &'static str)> = vec![];
+        let mut runs = elements.into_iter();
+        for (ty, v) in list_parts_en(&strings, "unit", list_style) {
+            if ty == "element" {
+                out.extend(runs.next().unwrap_or_default());
+            } else {
+                out.push((ty.to_string(), v, ""));
+            }
+        }
+        Ok(out)
+    }
+
     /// FormatDateTimePattern for the en-US patterns this engine implements, as a
     /// typed part list. `format` is this joined; `formatToParts` is this wrapped.
     /// (The pattern is date-then-time, both fixed: no locale data behind it.)
@@ -2256,16 +2429,18 @@ impl<'p> Vm<'p> {
                 _ => None,
             }
         };
-        // GetNamedTimeZoneEpochNanoseconds for an OFFSET time zone is a plain
-        // shift of the epoch instant: no tz database is involved, so `+03:01`
-        // renders a real local wall clock instead of silently formatting UTC.
-        // (A named IANA zone still formats as UTC — that one needs the database.)
+        // The formatter's zone shifts the instant to a local wall clock. For a
+        // named IANA zone that shift depends on the instant itself, so it is
+        // looked up at `ms` rather than being a per-zone constant.
         //
         // A PLAIN Temporal value is not an instant: the spec converts its wall
         // clock to an epoch through the formatter's zone and straight back, so
         // the offset cancels and its own fields print unchanged
         // (`temporal-objects-resolved-time-zone.js`).
-        let tz_minutes = slot("timeZone").as_deref().and_then(time_zone_offset_minutes).unwrap_or(0);
+        let tz_minutes = slot("timeZone")
+            .as_deref()
+            .and_then(|tz| time_zone_offset_minutes_at(tz, ms as i128))
+            .unwrap_or(0);
         let offset_ms = if absolute { tz_minutes as i128 * 60_000 } else { 0 };
         let total_ms = ms as i128 + offset_ms;
         let days = total_ms.div_euclid(86_400_000) as i64;
@@ -2446,15 +2621,16 @@ impl<'p> Vm<'p> {
         locales: Value,
         options: Value,
     ) -> Result<Value, Thrown> {
-        use crate::vm::helpers_datetime::format_duration_en;
         if kind == 0 {
             // sec-temporal.duration.prototype.tolocalestring: construct an
             // Intl.DurationFormat (so the options are validated exactly as the
             // constructor would) and format the receiver with it.
             let df = self.make_intl(native::INTL_DURATIONFORMAT, locales, options)?;
-            let _ = self.intl_this(df, native::INTL_DURATIONFORMAT, "toLocaleString")?;
-            let dur = self.to_duration(this)?;
-            return Ok(self.alloc_str(format_duration_en(&dur)));
+            let resolved = self.intl_this(df, native::INTL_DURATIONFORMAT, "toLocaleString")?;
+            let dur = self.to_duration_f64(this)?;
+            let parts = self.duration_format_parts(resolved, &dur)?;
+            let s: String = parts.into_iter().map(|(_, v, _)| v).collect();
+            return Ok(self.alloc_str(s));
         }
         let mode = match kind {
             1 | 5 | 6 => DtfDefaults::Date, // PlainDate / PlainYearMonth / PlainMonthDay
@@ -2979,40 +3155,22 @@ pub(crate) fn currency_digits(code: &str) -> i64 {
     }
 }
 
-/// Accept a time-zone argument for Intl.DateTimeFormat: "UTC" (any case) is
-/// canonicalized, and a `±HH:MM`-style offset or an `Area/Location` identifier is
-/// taken verbatim. There is no tz database behind this yet — a syntactically
-/// valid but unknown IANA id is accepted rather than rejected, which is why the
-/// `timeZone`-lookup tests still fail honestly.
+/// Accept a time-zone argument for Intl.DateTimeFormat: an offset identifier
+/// (`±HH:MM`, canonicalized) or a Zone/Link name from the bundled IANA table,
+/// matched ASCII-case-insensitively and returned in its canonical spelling.
+///
+/// The IDENTIFIER is what comes back, not its primary identifier: ECMA-402
+/// CreateDateTimeFormat takes `[[Identifier]]`, so `{timeZone:"Etc/GMT"}`
+/// resolves to "Etc/GMT" and `{timeZone:"Europe/Bratislava"}` to
+/// "Europe/Bratislava" rather than either being folded onto its Link target.
+/// `None` means the identifier is not in the database -> RangeError.
 pub(crate) fn canonicalize_time_zone(s: &str) -> Option<String> {
-    if s.eq_ignore_ascii_case("UTC") {
-        return Some("UTC".to_string());
-    }
-    // An offset time zone identifier, checked BEFORE the name grammar so a
-    // malformed one ("+3", "-2400") is rejected instead of falling through.
+    // An offset time zone identifier, checked BEFORE the name lookup so a
+    // malformed one ("+3", "-2400") is rejected rather than looked up.
     if s.starts_with('+') || s.starts_with('-') {
         return offset_time_zone_minutes(s).map(format_offset_time_zone);
     }
-    if let Some(z) = canonicalize_etc_zone(s) {
-        return Some(z);
-    }
-    // `Etc/GMT…` is a CLOSED family (see `canonicalize_etc_zone`), so a spelling
-    // it rejected — "Etc/GMT+13", "Etc/GMT+00" — is definitively not a zone and
-    // must RangeError, rather than being waved through by the name grammar the
-    // way an unknown `Area/Location` still is.
-    if s.starts_with("Etc/GMT") {
-        return None;
-    }
-    // "Area/Location", and the single-token legacy ids ("GMT", "EST5EDT") —
-    // ECMA-402 keeps those verbatim rather than folding them onto "UTC".
-    let ok = s.split('/').all(|p| {
-        !p.is_empty()
-            && p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
-    }) && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
-    if ok {
-        return Some(s.to_string());
-    }
-    None
+    crate::vm::temporal::tzdb::lookup(s).map(|z| z.canonical.to_string())
 }
 
 /// Parse an offset time zone identifier to signed minutes, or `None` if it is
@@ -3052,69 +3210,22 @@ fn format_offset_time_zone(minutes: i64) -> String {
     format!("{sign}{:02}:{:02}", a / 60, a % 60)
 }
 
-/// The `Etc/…` family of the IANA database's `etcetera` file — the ONE part of
-/// the tz database that is a closed rule rather than a table of political
-/// history: every `Etc/GMT±N` is a fixed whole-hour offset with no DST and no
-/// transitions, so it can be implemented exactly without shipping the database.
-/// The sign is POSIX-inverted (`Etc/GMT+7` is UTC−7), the file defines `+1..+12`
-/// and `-1..-14`, and every zero-offset spelling in it Links to `Etc/UTC`,
-/// whose canonical identifier is "UTC".
-///
-/// Returns the canonical identifier, or `None` when `s` is not one of them (a
-/// named zone that needs the real database, or `Etc/GMT+13`, which does not
-/// exist). Named IANA zones outside this family still format as UTC — see
-/// `dtf_parts`.
-fn canonicalize_etc_zone(s: &str) -> Option<String> {
-    let rest = s.strip_prefix("Etc/")?;
-    if matches!(rest, "GMT" | "GMT0" | "UTC" | "UCT" | "Universal" | "Zulu" | "Greenwich") {
-        return Some("UTC".to_string());
-    }
-    let (sign, digits) = match rest.strip_prefix("GMT") {
-        Some(r) if r.starts_with('+') => (1i64, &r[1..]),
-        Some(r) if r.starts_with('-') => (-1i64, &r[1..]),
-        _ => return None,
-    };
-    // No leading zero: the file has `Etc/GMT+1`, never `Etc/GMT+01`.
-    if digits.is_empty() || digits.len() > 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if digits.len() == 2 && digits.starts_with('0') {
-        return None;
-    }
-    let n: i64 = digits.parse().ok()?;
-    if n == 0 {
-        return Some("UTC".to_string());
-    }
-    let limit = if sign > 0 { 12 } else { 14 };
-    (n <= limit).then(|| s.to_string())
-}
-
-/// The UTC offset a time zone identifier denotes, in minutes, when that is
-/// knowable without the tz database: an offset identifier, "UTC", or an
-/// `Etc/GMT±N`. `None` for a named zone (which this engine formats as UTC).
-pub(crate) fn time_zone_offset_minutes(tz: &str) -> Option<i64> {
+/// The UTC offset a time zone identifier has AT an instant, in minutes: fixed
+/// for an offset identifier, and the tz database's answer for a named zone.
+/// `ms` is the epoch milliseconds being formatted, which is what makes
+/// `{timeZone:"America/New_York"}` print EDT in July and EST in January.
+pub(crate) fn time_zone_offset_minutes_at(tz: &str, ms: i128) -> Option<i64> {
     if let Some(m) = offset_time_zone_minutes(tz) {
         return Some(m);
     }
-    let rest = tz.strip_prefix("Etc/GMT")?;
-    let (sign, digits) = match rest.as_bytes().first() {
-        // POSIX sign inversion: `Etc/GMT+7` is 7 hours WEST of Greenwich.
-        Some(b'+') => (-1i64, &rest[1..]),
-        Some(b'-') => (1i64, &rest[1..]),
-        _ => return None,
-    };
-    digits.parse::<i64>().ok().map(|n| sign * n * 60)
+    let z = crate::vm::temporal::tzdb::lookup(tz)?;
+    Some(crate::vm::temporal::tzdb::offset_seconds(z.zone, ms.div_euclid(1000) as i64) as i64 / 60)
 }
 
-/// AvailableTimeZones: "UTC" plus the closed `Etc/GMT±N` family above. Everything
-/// else in the IANA database needs the database itself.
+/// AvailableCanonicalTimeZones: the primary identifiers of the bundled IANA
+/// table, sorted and unique. "Etc/UTC" and "Etc/GMT" are absent because both
+/// carry the primary identifier "UTC" (ECMA-402
+/// sec-availablenamedtimezoneidentifiers step 5.c).
 pub(crate) fn available_time_zones() -> Vec<String> {
-    let mut out = vec!["UTC".to_string()];
-    for n in 1..=12 {
-        out.push(format!("Etc/GMT+{n}"));
-    }
-    for n in 1..=14 {
-        out.push(format!("Etc/GMT-{n}"));
-    }
-    out
+    crate::vm::temporal::tzdb::primary_ids().into_iter().map(str::to_string).collect()
 }
