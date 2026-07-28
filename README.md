@@ -451,6 +451,7 @@ python tools/run_test262.py --t262 <path> --dump-fails fails.txt
 diff <(sort fails.txt) <(sort tools/test262-expected-failures.txt)   # REG=0
 ZIPP_NOJIT=1 python tools/run_test262.py …             # and again, interpreter only
 python tools/bench.py --reps 7                         # ALL_CORRECT=1
+python tools/bench.py --reps 7 --readme                # + the two tables above
 ```
 
 On Windows the test262 runner needs `PYTHONUTF8=1` — a failing test can print a

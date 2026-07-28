@@ -72,6 +72,10 @@ def main():
     ap.add_argument("--reps", type=int, default=7, help="repetitions (default 7)")
     ap.add_argument("--benches", help="comma-separated subset")
     ap.add_argument("--json", help="write raw samples here")
+    ap.add_argument("--readme", action="store_true",
+                    help="also emit the README's two markdown tables (per-bench "
+                         "ratios and the geomean-under-parity scenarios) from "
+                         "these measurements, so the two cannot drift apart")
     ap.add_argument("--zipp", default=os.path.normpath(
         os.path.join(os.path.dirname(BENCH_DIR), "..", "target", "release", "zipp.exe")))
     ap.add_argument("--ab", nargs=2, metavar=("OLD", "NEW"),
@@ -159,6 +163,7 @@ def main():
     print("-" * len(hdr))
 
     ratios = []
+    readme_rows = []
     for b in benches:
         row = f"{b:<{w}}"
         med = {}
@@ -173,6 +178,7 @@ def main():
         else:
             r = med["zipp"] / med[baseline]
             ratios.append(r)
+            readme_rows.append((b, med[baseline], med["zipp"], r))
             row += f"{r:>7.2f}x"
         # spread of the engine under test, so a wide row is visible not implied
         u = "new" if args.ab else "zipp"
@@ -190,6 +196,55 @@ def main():
         print(f"geomean: {g:.2f}x slower than {baseline}")
     print("startup(ms, median): " + "  ".join(f"{n}={base_ms[n]:.0f}" for n, _ in engines))
     print(f"ALL_CORRECT={'1' if all_correct else '0'}  (exact bytes, no normalisation)")
+
+    # The README carries two tables: the per-bench ratios, and the geomean under
+    # hypothetical parities. They were maintained BY HAND and separately, and
+    # drifted out of agreement with each other three times in one session --
+    # each time understating how close the 2x goal had come, because the derived
+    # rows were computed from ratios several commits old. Emit both from the
+    # numbers just measured so a README edit is a paste, not an arithmetic
+    # exercise.
+    if args.readme and readme_rows:
+        import math
+
+        def geomean(rs):
+            return math.exp(sum(math.log(r) for r in rs) / len(rs))
+
+        def parity(*names):
+            """Geomean with `names` pinned to V8 parity (ratio 1.0)."""
+            return geomean([1.0 if b in names else r for b, _, _, r in readme_rows])
+
+        g = geomean([r for *_, r in readme_rows])
+        worst = sorted(readme_rows, key=lambda t: -t[3])[:2]
+        w1, w2 = worst[0][0], worst[1][0]
+
+        print()
+        print(f"**Performance — geomean {g:.2f}× slower than node (V8)** on the "
+              f"{len(readme_rows)} real-world")
+        print(f"benchmarks in `bench/real/`, paired medians of {args.reps}, every "
+              "output byte-identical")
+        print("to node:")
+        print()
+        print("| bench | node | zipp | ratio |")
+        print("|---|---|---|---|")
+        for b, nb, zp, r in sorted(readme_rows, key=lambda t: t[3]):
+            # A win is the one number a reader must not skim past.
+            cell = f"**{r:.2f}×**" if r < 1.0 else f"{r:.2f}×"
+            print(f"| {b} | {nb:.0f}ms | {zp:.0f}ms | {cell} |")
+        print()
+        print("| scenario | geomean |")
+        print("|---|---|")
+        print(f"| today | {g:.2f}× |")
+        for nm in (w1, w2):
+            p = parity(nm)
+            cell = f"**{p:.2f}×**" if p < 2.0 else f"{p:.2f}×"
+            print(f"| `{nm}` made *exactly* as fast as V8 | {cell} |")
+        print(f"| **both of the two worst at V8 parity** | **{parity(w1, w2):.2f}×** |")
+        # What every bench would have to give up to reach 2x without any single
+        # benchmark being fixed outright.
+        uni = 100 * (1 - 2.0 / g) if g > 2.0 else 0.0
+        print(f"| the uniform alternative | every bench {uni:.1f}% faster |")
+        print()
     for f in dict.fromkeys(failures):
         print(f"  FAIL: {f}")
 
