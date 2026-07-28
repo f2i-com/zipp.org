@@ -808,7 +808,15 @@ pub(crate) fn emit_mi_body(
             // `super.m()` — inline the resolved super body over its sub-window,
             // behind the baked super-chain hop version guards (a chain mutation
             // misses → helper). The super body runs over the SAME receiver.
-            Instr::SuperMethod { dst: d, .. } => {
+            //
+            // `super.v` (a getter READ inside a class getter, Stage 6) is the
+            // same emission with nothing changed: an accessor slot keeps its
+            // getter in `vals[slot]`, so the holder re-check below reads the
+            // right word, and invoking the getter IS running its body with
+            // `this` = this receiver — exactly what the method case does.
+            // Resolution is what differs, and that happens in the planner
+            // (`ic_super_getter_baked`). SETTERS are not admitted here.
+            Instr::SuperMethod { dst: d, .. } | Instr::SuperGet { dst: d, .. } => {
                 let s = supers
                     .get(&bi)
                     .expect("build_method_inline_plan baked a SuperInline for this op");

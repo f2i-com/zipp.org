@@ -1271,6 +1271,60 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// FILLED `SuperAcc` IC way at site `(func_id, ip)` whose `home` matches the
+    /// baked class — the `super.v` (accessor) twin of `ic_super_method_baked`,
+    /// for inlining a `SuperGet` inside a class GETTER body.
+    ///
+    /// The guard set is IDENTICAL to the method case, and that is not a
+    /// coincidence to be re-derived later: for an accessor slot `heap.rs` stores
+    /// the GETTER in `vals[i]` (`attrs[i].setter` holds the other half), so
+    /// `holder_vals_ptr[holder_slot] == fn_bits` re-checks exactly the function
+    /// this baked — the same load, at the same address, for the same reason.
+    /// A SETTER would need a second baked pointer into `attrs`, which is why
+    /// only the getter direction is resolved here.
+    ///
+    /// Everything else transfers verbatim: the hop version guards catch
+    /// `setPrototypeOf` and a holder realloc, and `mi_class_epoch` catches a
+    /// re-executed class declaration.
+    pub(crate) fn ic_super_getter_baked(
+        &self,
+        func_id: u32,
+        ip: usize,
+        home_class_id: u32,
+        key: &str,
+    ) -> Option<MiSuperResolved> {
+        let home = self.class_values.get(home_class_id as usize).copied().flatten()?;
+        let site = self.ic_site(func_id, ip)?;
+        for e in &site.entries[..site.n as usize] {
+            if let IcEntry::SuperAcc { home: h, hops, slot } = *e {
+                if h == home && self.ic_super_chain_ok(&hops) {
+                    if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
+                        let s = slot as usize;
+                        // The key must still name THIS slot and still be an
+                        // accessor: a `delete` + re-add shifts slots, and a
+                        // redefine to a data property changes what `vals[s]` means.
+                        if s < hm.keys.len() && hm.keys[s] == key && hm.attrs[s].accessor {
+                            let g = hm.vals[s];
+                            // A getter-less accessor (`set` only) reads as
+                            // `undefined` rather than calling anything — not
+                            // inlinable as a body, so decline to the helper.
+                            if let Some((fid, _closure)) = self.ic_plain_fn(g) {
+                                return Some(MiSuperResolved {
+                                    fid,
+                                    hops: hops.0[..hops.1 as usize].to_vec(),
+                                    holder_vals_ptr: hm.vals.as_ptr() as u64,
+                                    holder_slot: s as u32,
+                                    fn_bits: g.bits(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// IC for a `Call` site: callee identity (+ slot version) → (fid,
     /// closure) for a plain user function, skipping the Proxy/native/bound/
     /// ctor probes and flag loads. `None` ⇒ slow path.

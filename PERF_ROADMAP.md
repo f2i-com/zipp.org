@@ -1316,6 +1316,73 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B51 — `super.v` inside a class getter now inlines: class-prototype-hot −27%
+
+The first thing this session measured that MOVED. `build_accessor_shape` passed
+`allow_super = false`, so a getter whose body reads `super.v` got no JIT
+treatment at all while the *method* case had inlined `super.m()` since Stage 3.
+On `bench/real/class-prototype-hot.js` that is `Tri`/`Hex`, i.e. half of the
+four receivers in the accessor round-trip phase — visible in one log line:
+
+```
+before:  [mi] fn0@111 INLINE getter arms=2      <- Circle, Square only
+after:   [mi] fn0@111 INLINE getter arms=4
+```
+
+**Measured, `tools/bench.py --ab` against `b550a4c`, paired medians of 9:**
+
+| | old | new | |
+|---|---|---|---|
+| class-prototype-hot, alone (9 reps) | 933ms | 680ms | **−27.1%** |
+| class-prototype-hot, in the full suite | 903ms | 663ms | **−26.6%** |
+
+Two independent runs agreeing to 0.5 points, with a tight interval
+(p10 647 / p90 702), and every other row inside noise. ≈**−3.0% geomean**.
+
+**Why it was cheap, and the fact that made it cheap.** `heap.rs:257` stores an
+accessor's GETTER in `vals[i]` (`attrs[i].setter` holds the other half). The
+existing super guard set re-reads `holder_vals_ptr[holder_slot]` and compares it
+to the baked `fn_bits` — for a getter that is *the same load, at the same
+address, for the same reason*, so the whole guard set transfers verbatim and the
+emitter needed one changed line:
+
+```rust
+Instr::SuperMethod { dst: d, .. } | Instr::SuperGet { dst: d, .. } => { … }
+```
+
+Invoking a getter IS running its body with `this` = the receiver, which is
+exactly what the method arm already does. The work was resolution, not codegen:
+a `SuperGet` site fills `IcEntry::SuperAcc` rather than `SuperData`, hence
+`ic_super_getter_baked` — the `SuperAcc` twin of `ic_super_method_baked`,
+requiring `attrs[s].accessor` where the method version requires `!accessor`.
+
+**SETTERS are deliberately NOT admitted**, and this is the load-bearing
+asymmetry rather than an oversight to fix later: `super.v = x` resolves to
+`attrs[slot].setter`, which the `holder_vals_ptr[holder_slot]` re-check does not
+reach. Admitting it needs a second baked pointer into `attrs` plus its own
+staleness argument. `build_accessor_shape` therefore sets
+`allow_super = !is_setter`, and the setter site stays at `arms=2`. That leaves
+roughly half the phase's super traffic on the helper — the remaining prize here
+is real but it is NOT a flag flip.
+
+**Guards, each with a regression test that breaks it after the arm is baked**
+(`super_getter_inline_invalidates`, `super_getter_inline_preserves_values_and_effects`,
+plus a 16-case probe diffed against node on both tiers and under
+`ZIPP_GC_STRESS`): redefining the parent getter (caught by the holder slot
+re-read — the epoch alone does NOT catch this), replacing the accessor with a
+data property of the same name, `delete`, `setPrototypeOf` on the derived
+prototype, class re-declaration (`mi_class_epoch`), a receiver field mutated
+under the arm, a getter with side effects (it must still run every time — the
+body is re-executed, never memoised), a set-only parent (`undefined`, not a
+call), a Proxy receiver, a three-level super chain, and `-0`/NaN/string/object
+passing through unchanged.
+
+One process note worth keeping: the two regression expectations I hand-computed
+were both WRONG, and the test caught me rather than the engine —
+`assert_jit_matches` asserts JIT == NOJIT *before* comparing to the expectation,
+so the mismatch was provably mine. node arbitrated. Compute expectations with
+the reference engine, not by hand.
+
 ### B50 — The three JIT admission lists had drifted apart, and converging them
 naively is a WASH: two ops win, one loses, and the suite mean hid both
 

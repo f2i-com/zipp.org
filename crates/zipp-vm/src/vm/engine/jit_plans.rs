@@ -832,12 +832,58 @@ impl<'p> Vm<'p> {
             self.ic_class_getter_fid(func_id, ip, recv_class)?
         };
         let callee = self.func(fid as usize);
-        // v1 accessors: NO super (allow_super=false); a setter body ends in a
+        // A GETTER body may read `super.v` (Stage 6). A SETTER may not: its
+        // `super.v = x` target lives in `attrs[slot].setter`, not `vals[slot]`,
+        // so the holder re-check the super guard set is built on does not reach
+        // it — see `ic_super_getter_baked`. A setter body still ends in a
         // SetProp{obj:0} store (allow_setprop=is_setter).
-        let body_len = Self::method_inline_body_ok(callee, false, is_setter)?;
+        let allow_super = !is_setter;
+        let body_len = Self::method_inline_body_ok(callee, allow_super, is_setter)?;
         let body: Vec<Instr> = callee.code[..body_len].to_vec();
         let field_slots = self.mi_bake_fields(ridx, &body, &callee.string_constants)?;
         let consts = Self::mi_bake_consts(&callee.constants, &body);
+        // ── bake each `super.v` read in the body (Stage 6) ──
+        // Identical in shape to `build_method_shape`'s `super.m()` loop: the
+        // resolved getter runs over a sub-window with the SAME receiver, so
+        // `mi_bake_fields` resolves its `this.<field>` against the same instance.
+        let super_win = reg_window + callee.reg_count;
+        let mut supers = rustc_hash::FxHashMap::default();
+        let mut max_super_regs = 0u16;
+        for (bi, instr) in body.iter().enumerate() {
+            if let Instr::SuperGet { home_class_id, name: sname, .. } = *instr {
+                let skey = &callee.string_constants[sname as usize];
+                let sr = self.ic_super_getter_baked(fid, bi, home_class_id, skey)?;
+                let scallee = self.func(sr.fid as usize);
+                // The super getter must itself be inlinable and have NO nested
+                // super, and it is a GETTER so it performs no store.
+                let sblen = Self::method_inline_body_ok(scallee, false, false)?;
+                let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
+                let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
+                let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
+                max_super_regs = max_super_regs.max(scallee.reg_count);
+                supers.insert(
+                    bi,
+                    crate::codegen::SuperInline {
+                        epoch_ptr: &self.mi_class_epoch as *const u32 as u64,
+                        epoch_val: self.mi_class_epoch,
+                        hops: sr.hops,
+                        holder_vals_ptr: sr.holder_vals_ptr,
+                        holder_slot: sr.holder_slot,
+                        fn_bits: sr.fn_bits,
+                        field_slots: sfields,
+                        consts: sconsts,
+                        body: sbody,
+                        callee_reg_count: scallee.reg_count,
+                        win_off: super_win,
+                    },
+                );
+            }
+        }
+        let win_top = if supers.is_empty() {
+            reg_window + callee.reg_count
+        } else {
+            super_win + max_super_regs
+        };
         let recv_ver = self.heap.version_of(ridx);
         Some((
             crate::codegen::MethodInlineShape {
@@ -850,9 +896,9 @@ impl<'p> Vm<'p> {
                 param_count: callee.param_count,
                 body,
                 consts,
-                supers: rustc_hash::FxHashMap::default(),
+                supers,
             },
-            reg_window + callee.reg_count, // no super → window is just the body
+            win_top,
         ))
     }
 
@@ -952,6 +998,10 @@ impl<'p> Vm<'p> {
                 // `super.m()` admitted only in the outer body (Stage 3); the
                 // resolved super target is re-scanned with allow_super=false.
                 I::SuperMethod { .. } if allow_super => {}
+                // `super.v` READ inside a class getter (Stage 6), under the same
+                // rule: outer body only, and the resolved super getter is
+                // re-scanned with the flag off so there is no nested super.
+                I::SuperGet { .. } if allow_super => {}
                 // A setter's `this.<field> = val` store (Stage 5): the body's ONLY
                 // effect, so it must be the LAST op before the terminator (no later
                 // op can decline AFTER the store commits — the no-deopt-after-effect

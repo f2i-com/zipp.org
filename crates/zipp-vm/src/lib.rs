@@ -687,6 +687,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn super_getter_inline_invalidates() {
+        // A class GETTER whose body reads `super.v` now inlines the parent
+        // getter (Stage 6). The arm bakes the holder's slot, so each case here
+        // runs far past the OSR threshold to get the arm installed and THEN
+        // breaks one of the things the guard set is responsible for:
+        //
+        //   1. redefine the parent getter          → `mi_class_epoch` is NOT
+        //      enough; the holder slot re-read catches it (a getter lives in
+        //      `vals[slot]`, which is exactly what the re-read loads).
+        //   2. replace the accessor with a DATA property of the same name.
+        //   3. `delete` it, so `super.v` becomes undefined (→ NaN).
+        //   4. `setPrototypeOf` the derived prototype, swapping the chain the
+        //      hop version guards watch.
+        //   5. mutate the field the parent getter reads through `this`, which
+        //      must be observed because the body is re-run, not memoised.
+        assert_jit_matches(
+            "var out=[];\
+             (function(){class A{constructor(x){this._v=x}get v(){return this._v}}\
+              class B extends A{get v(){return super.v*2}}var b=new B(10),s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) Object.defineProperty(A.prototype,'v',{get:function(){return 100},configurable:true}); s+=b.v; }\
+              out.push(s);})();\
+             (function(){class A{constructor(x){this._v=x}get v(){return this._v}}\
+              class B extends A{get v(){return super.v*2}}var b=new B(3),s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) Object.defineProperty(A.prototype,'v',{value:55,writable:true,configurable:true}); s+=b.v; }\
+              out.push(s);})();\
+             (function(){class A{constructor(x){this._v=x}get v(){return this._v}}\
+              class B extends A{get v(){return super.v*2}}var b=new B(4),s=0,n=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) delete A.prototype.v; var t=b.v; if(t!==t) n++; else s+=t; }\
+              out.push(s+'/'+n);})();\
+             (function(){class A{constructor(x){this._v=x}get v(){return this._v}}\
+              class B extends A{get v(){return super.v*2}}var b=new B(9),s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) Object.setPrototypeOf(B.prototype,{get v(){return 1000}}); s+=b.v; }\
+              out.push(s);})();\
+             (function(){class A{constructor(x){this._v=x}get v(){return this._v}}\
+              class B extends A{get v(){return super.v+1}}var b=new B(4),s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) b._v=99; s+=b.v; }\
+              out.push(s);})();\
+             console.log(out.join('|'))",
+            &["22000000|11600000|800000/100000|201800000|10500000"],
+        );
+    }
+
+    #[test]
+    fn super_getter_inline_preserves_values_and_effects() {
+        // The inlined parent getter must be VALUE-transparent (`-0` survives,
+        // a non-number passes through) and must actually RUN — a getter with a
+        // side effect is not elidable, and a set-only parent accessor reads as
+        // `undefined` rather than calling anything.
+        assert_jit_matches(
+            "var out=[];\
+             (function(){class A{constructor(x){this._v=x}get v(){return this._v}}\
+              class B extends A{get v(){return super.v}}var b=new B(0);\
+              for(var i=0;i<200000;i++) b.v; b._v=-0; out.push(Object.is(b.v,-0));\
+              b._v='s'; out.push(b.v);})();\
+             (function(){var n=0;class A{constructor(x){this._v=x}get v(){n++;return this._v}}\
+              class B extends A{get v(){return super.v*2}}var b=new B(1);\
+              for(var i=0;i<200000;i++) b.v; out.push(n);})();\
+             (function(){class A{set v(x){this._v=x}}class B extends A{get v(){return super.v}}\
+              var b=new B(); for(var i=0;i<200000;i++) b.v; out.push(String(b.v));})();\
+             console.log(out.join('|'))",
+            &["true|s|200000|undefined"],
+        );
+    }
+
     // ── INT live-in interval contract ─────────────────────────────────────────
     // `emit_int_entry_load` admits an Int-tagged value OR a double holding an
     // exact integer in [-2^53, 2^53], so `plan_region` must seed the interval
