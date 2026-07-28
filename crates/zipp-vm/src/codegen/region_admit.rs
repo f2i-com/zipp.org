@@ -155,6 +155,28 @@ pub(crate) fn region_can_compile(
             // this fusion the bare form is rare enough not to be worth the
             // refetch plumbing.
             Instr::TypeOfIs { .. } => {}
+            // `Promise.resolve(x)` / `Number.is*(x)` at exactly one argument —
+            // MEM path via `jit_static_fn`. `Promise.resolve` was async-
+            // promise-chain's fill-loop's ONLY blocker (`a[j] =
+            // Promise.resolve(j)` blacklisted the whole region, B38/B42); the
+            // helper handles the non-heap-argument fast path (no user code, no
+            // microtask) and deopts a heap argument to the interpreter's
+            // identity/thenable protocol. Every other StaticFn keeps declining.
+            Instr::StaticFn { op, argc, .. } => {
+                use crate::bytecode::StaticFn as S;
+                let ok = argc == 1
+                    && matches!(
+                        op,
+                        S::PromiseResolve
+                            | S::NumberIsInteger
+                            | S::NumberIsNaN
+                            | S::NumberIsFinite
+                            | S::NumberIsSafeInteger
+                    );
+                if !ok {
+                    reject!("[decline] StaticFn {op:?}/{argc} at region [{start},{end}]");
+                }
+            }
             // `CheckCoercible` — RequireObjectCoercible before a member access
             // (`objs[i&3].area()` emits one). MEM path: a null/undefined operand
             // bails to the interpreter (which throws the TypeError); any other
@@ -658,6 +680,7 @@ pub(crate) struct HeapHelpers {
     /// Tier C `TypeOf` helper (v bits → heap-string Value bits).
     pub(crate) typeof_str: usize,
     pub(crate) typeof_is: usize,
+    pub(crate) static_fn: usize,
     /// Tier C `IsArray` helper (v bits → Bool bits / deopt sentinel).
     pub(crate) is_array: usize,
     /// Tier C `LenOf` helper (obj bits → length Value bits).

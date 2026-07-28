@@ -828,6 +828,32 @@ mod tests {
     }
 
     #[test]
+    fn static_fn_region_promise_resolve() {
+        // `a[j] = Promise.resolve(j)` in a hot loop now compiles (StaticFn was
+        // the region's only blocker). The helper's fast path is non-heap
+        // arguments ONLY; everything observable must still go through the
+        // interpreter: identity for an existing promise (constructor check),
+        // thenable adoption running user `then`, and resolution values.
+        // Expectations from node.
+        assert_jit_matches(
+            "var order=[];\
+             async function run(){\
+               var a=new Array(1000);\
+               for(var j=0;j<1000;j++) a[j]=Promise.resolve(j);\
+               var s=0; for(var j=0;j<1000;j++) s+=await a[j];\
+               order.push('sum='+s);\
+               var p0=Promise.resolve(42);\
+               order.push('identity='+(Promise.resolve(p0)===p0));\
+               var thenable={then:function(res){order.push('thenable');res(7);}};\
+               order.push('adopted='+(await Promise.resolve(thenable)));\
+               var q=Promise.resolve(1); order.push('chain='+(await q.then(function(x){return x+1;})));\
+             }\
+             run().then(function(){ console.log(order.join('|')); })",
+            &["sum=499500|identity=true|thenable|adopted=7|chain=2"],
+        );
+    }
+
+    #[test]
     fn typeof_is_fusion_semantics() {
         // `typeof x === "lit"` fuses to TypeOfIs (no heap string, no Eq). Pins:
         // a hot mixed-type JIT loop over all polarities; the undeclared-global

@@ -1746,6 +1746,48 @@ pub(crate) extern "win64" fn jit_forin_live(
 /// # Safety
 /// `vm` is a valid `*mut Vm`; `v_bits` is a valid Value whose heap object (if
 /// any) is rooted in the caller's frame registers.
+/// Win64 helper for a region `StaticFn` — the BOUNDED op set the admission
+/// check allows: `Promise.resolve(x)` and the four `Number.is*` predicates,
+/// all at exactly one argument. `code` is the emitter's own 0..=4 mapping (not
+/// the `StaticFn` discriminant), baked per-site.
+///
+/// `Promise.resolve` of a NON-heap value provably runs no user code: `resolve`
+/// short-circuits the cycle/adoption/thenable protocol for a non-heap value
+/// and settles a freshly allocated promise whose reaction Vecs are empty, so
+/// no microtask is enqueued (PERF_ROADMAP B42 verified this path). A heap
+/// argument returns SELF_CALL_DEOPT — the interpreter runs the identity check
+/// (`Get(p, "constructor")`, user-observable) and the thenable protocol. The
+/// promise ALLOCATES, so the emitter re-derives r13 after the call (the
+/// StrConcat discipline); no user code runs, so r14 and the TA snapshots are
+/// safe. The `Number.is*` arms are pure predicates.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `a0_bits` is a valid Value rooted in the caller.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_static_fn(
+    vm: *mut core::ffi::c_void,
+    code: u32,
+    a0_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let a0 = Value::from_bits(a0_bits);
+    match code {
+        0 => {
+            if a0.is_heap() {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let p = vm.alloc_promise();
+            vm.resolve(p, a0);
+            Value::heap(p).bits()
+        }
+        1 => Value::bool(crate::vm::helpers_num2::num_is_integer(a0)).bits(),
+        2 => Value::bool(a0.is_double() && a0.as_f64().is_nan()).bits(),
+        3 => Value::bool(crate::vm::helpers_num2::num_is_finite(a0)).bits(),
+        4 => Value::bool(crate::vm::helpers_num2::num_is_safe_integer(a0)).bits(),
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper for the fused `TypeOfIs` (`typeof a === "lit"`). `code_neg`
 /// packs `TypeOfIs::code` in the low byte and `neg` in bit 8. Returns the Bool
 /// Value bits. PURE — the classifier allocates nothing and runs no user code,

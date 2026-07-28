@@ -6323,6 +6323,7 @@ impl<'p> Vm<'p> {
             regs_fits: jit_regs_fits as usize,
             typeof_str: jit_typeof as usize,
             typeof_is: crate::vm::helpers_misc::jit_typeof_is as usize,
+            static_fn: crate::vm::helpers_misc::jit_static_fn as usize,
             is_array: jit_is_array as usize,
             len_of: jit_len_of as usize,
             forin_keys: jit_forin_keys as usize,

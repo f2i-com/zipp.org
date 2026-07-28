@@ -1715,6 +1715,40 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::StaticFn { dst, op, arg_base, argc: _ } => {
+                // Bounded set (admission gated argc == 1). PromiseResolve
+                // ALLOCATES ⇒ the StrConcat discipline: re-derive r13 (and the
+                // TA snapshots) after the call; no user code ⇒ r14 safe. A
+                // heap argument returns the deopt sentinel and the interpreter
+                // runs the full identity/thenable protocol at this ip.
+                use crate::bytecode::StaticFn as S;
+                let code: u32 = match op {
+                    S::PromiseResolve => 0,
+                    S::NumberIsInteger => 1,
+                    S::NumberIsNaN => 2,
+                    S::NumberIsFinite => 3,
+                    S::NumberIsSafeInteger => 4,
+                    _ => unreachable!("StaticFn op not admitted by region_can_compile"),
+                };
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov edx, code as i32                // op code (helper's own map)
+                    ; mov r8, [rbx + dreg(arg_base)]      // a0 bits
+                    ; mov rax, QWORD heap.static_fn as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // heap arg → interp protocol
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::StrAppendInPlace { dst, a, b } => {
                 // In-place `dst = a + b` via `jit_str_append` (mutates a's buffer
                 // when uniquely owned — the emitter proved linearity). DEOPTS
