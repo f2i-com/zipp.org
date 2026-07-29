@@ -35,12 +35,12 @@ are in B58.
 
 ## 1. Where the project actually is
 
-### Conformance — 99.994% test262, 96.9% intl402
+### Conformance — 99.994% test262, 96.8% intl402
 
 | slice | executions | pass | fail |
 |---|---|---|---|
 | ECMA-262 + `staging`, sloppy **and** strict | 95,942 | 95,936 (99.994%) | 6 |
-| `intl402` (opt-in) | 6,682 | 6,474 (96.9%) | 208 |
+| `intl402` (opt-in) | 6,714 | 6,502 (96.8%) | 212 |
 
 Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
 

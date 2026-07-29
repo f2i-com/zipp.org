@@ -1397,7 +1397,7 @@ fn format_offset_rounded(ns: i64) -> String {
 }
 
 // submodules (split out of the former monolithic temporal.rs)
-mod calendar;
+pub(crate) mod calendar;
 pub(crate) use calendar::*;
 // The one calendar family that is not arithmetic: chinese/dangi need true new
 // moons and solar terms, so they get their own astronomy.

@@ -42,7 +42,18 @@ pub(crate) fn canonical_display_names_code(ty: &str, code: &str) -> Option<Strin
         }),
         "currency" => (code.len() == 3 && code.bytes().all(|b| b.is_ascii_alphabetic()))
             .then(|| code.to_ascii_uppercase()),
-        "calendar" => is_well_formed_type_code(code).then(|| code.to_ascii_lowercase()),
+        "calendar" => is_well_formed_type_code(code).then(|| {
+            // CLDR's display-name table is keyed by the BCP-47 calendar name,
+            // which for two calendars differs from ECMA-402's canonical id.
+            // `Intl.supportedValuesOf("calendar")` reports the canonical form,
+            // and `calendars-accepted-by-DisplayNames.js` requires every value
+            // it reports to resolve here, so the alias has to be undone.
+            match code.to_ascii_lowercase().as_str() {
+                "ethioaa" => "ethiopic-amete-alem".to_string(),
+                "islamicc" => "islamic-civil".to_string(),
+                other => other.to_string(),
+            }
+        }),
         // dateTimeField takes one of the twelve field names, verbatim.
         _ => [
             "era", "year", "quarter", "month", "weekOfYear", "weekday", "day", "dayPeriod",

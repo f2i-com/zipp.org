@@ -34,6 +34,25 @@ import json
 import os
 import sys
 
+# ── ECMA-402 calendar id -> the CLDR package that carries its names ─────────
+# The ids are ECMA-402's; several share one CLDR file (see the note in main()).
+CAL_ID_SOURCE = [
+    ("buddhist", "buddhist"),
+    ("chinese", "chinese"),
+    ("coptic", "coptic"),
+    ("dangi", "dangi"),
+    ("ethioaa", "ethiopic"),
+    ("ethiopic", "ethiopic"),
+    ("hebrew", "hebrew"),
+    ("indian", "indian"),
+    ("islamic-civil", "islamic"),
+    ("islamic-tbla", "islamic"),
+    ("islamic-umalqura", "islamic"),
+    ("japanese", "japanese"),
+    ("persian", "persian"),
+    ("roc", "roc"),
+]
+
 # ── ECMA-402 Table 2, the sanctioned single units ───────────────────────────
 # `style:"unit"` accepts only these and `<a>-per-<b>` pairs of them, so the unit
 # names below are a closed 45-row subset of CLDR's ~225 — the rest of
@@ -111,6 +130,19 @@ def main():
     lists = lists["main"]["en"]["listPatterns"]
     ldn = get("localeDisplayNames.json", "cldr-localenames-full/main/en/localeDisplayNames.json")
     ldn = ldn["main"]["en"]["localeDisplayNames"]
+    # ── the non-gregorian calendars Intl.DateTimeFormat can resolve ──────────
+    # One CLDR package per calendar (`cldr-cal-<x>-full/main/en/ca-<x>.json`).
+    # `islamic` covers the three variants ECMA-402 lists separately
+    # (islamic-civil / islamic-tbla / islamic-umalqura) — they differ only in
+    # their day arithmetic, which lives in vm/temporal, never in their names.
+    # `ethioaa` (ethiopic-amete-alem) shares ethiopic's month names and differs
+    # only in era, so it reads the same file.
+    cal_files = ["buddhist", "chinese", "coptic", "dangi", "ethiopic", "hebrew",
+                 "indian", "islamic", "japanese", "persian", "roc"]
+    cal_data = {}
+    for c in cal_files:
+        obj = get("ca-%s.json" % c, "cldr-cal-%s-full/main/en/ca-%s.json" % (c, c))
+        cal_data[c] = obj["main"]["en"]["dates"]["calendars"][c]
 
     L = []
     w = L.append
@@ -170,6 +202,64 @@ def main():
     w("/// Day-period names, `(key, wide, abbreviated, narrow)`. `am`/`pm` are the")
     w("/// fixed pair a `h`/`K` pattern's `a` field prints; the rest are the FLEXIBLE")
     w("/// periods `B` prints, selected by `DAY_PERIOD_RULES`.")
+    # ── non-gregorian calendar names ────────────────────────────────────────
+    # Emitted as one flat table keyed by the ECMA-402 calendar id, so the
+    # formatter looks up (calendar, width) and gets a slice. Month lists are
+    # 1-based and dense: a calendar with 13 months emits 13 entries. Hebrew's
+    # "7-yeartype-leap" (Adar II) is emitted as a SEPARATE 14th entry because in
+    # a leap year month 7 renames and months 8..13 shift — vm/temporal already
+    # models that shift, so the formatter only needs the extra name.
+    def cal_months(node, width):
+        d = node["months"]["format"][width]
+        keys = [k for k in d if k.isdigit()]
+        out = [d[str(i)] for i in range(1, len(keys) + 1)]
+        if "7-yeartype-leap" in d:
+            out.append(d["7-yeartype-leap"])
+        return out
+
+    def cal_eras(node, kind):
+        d = node.get("eras", {}).get(kind, {})
+        keys = sorted((int(k) for k in d if k.isdigit()))
+        return [d[str(k)] for k in keys]
+
+    w("/// Month names per non-gregorian calendar, 1-based and dense.")
+    w("/// Hebrew carries a 14th entry: Adar II, used only in a leap year.")
+    w("/// `(calendar, wide, abbreviated, narrow)`.")
+    w("pub const CAL_MONTHS: &[(&str, &[&str], &[&str], &[&str])] = &[")
+    for cid, src in CAL_ID_SOURCE:
+        node = cal_data[src]
+        w("    (%s, &[%s], &[%s], &[%s])," % (
+            rs(cid),
+            ", ".join(rs(x) for x in cal_months(node, "wide")),
+            ", ".join(rs(x) for x in cal_months(node, "abbreviated")),
+            ", ".join(rs(x) for x in cal_months(node, "narrow")),
+        ))
+    w("];")
+    w("")
+    w("/// Era names per non-gregorian calendar, indexed by the era ORDINAL that")
+    w("/// `vm::temporal::calendar::cal_era` returns. `(calendar, wide, abbr, narrow)`.")
+    w("pub const CAL_ERAS: &[(&str, &[&str], &[&str], &[&str])] = &[")
+    for cid, src in CAL_ID_SOURCE:
+        node = cal_data[src]
+        w("    (%s, &[%s], &[%s], &[%s])," % (
+            rs(cid),
+            ", ".join(rs(x) for x in cal_eras(node, "eraNames")),
+            ", ".join(rs(x) for x in cal_eras(node, "eraAbbr")),
+            ", ".join(rs(x) for x in cal_eras(node, "eraNarrow")),
+        ))
+    w("];")
+    w("")
+    w("/// The four `dateStyle` patterns per non-gregorian calendar, in")
+    w("/// full/long/medium/short order. Most calendars differ from gregorian only")
+    w("/// by wanting an era; hebrew is day-first; chinese and dangi use `r(U)`")
+    w("/// (related ISO year + cyclic year name).")
+    w("pub const CAL_DATE_FORMATS: &[(&str, [&str; 4])] = &[")
+    for cid, src in CAL_ID_SOURCE:
+        df = cal_data[src]["dateFormats"]
+        w("    (%s, [%s, %s, %s, %s])," % (
+            rs(cid), rs(df["full"]), rs(df["long"]), rs(df["medium"]), rs(df["short"])))
+    w("];")
+    w("")
     w("pub const DAY_PERIODS: &[(&str, &str, &str, &str)] = &[")
     for k in present:
         row = [gregorian["dayPeriods"]["format"][x][k] for x in ("wide", "abbreviated", "narrow")]

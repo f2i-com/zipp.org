@@ -38,7 +38,7 @@ cheapest evidence that a JIT change has not quietly diverged:
 | slice | executions | pass |
 |---|---|---|
 | ECMA-262 + staging, both modes | 95,942 | 95,936 (99.994%) |
-| intl402 (opt-in, `--include-intl402`) | 6,682 | 6,474 (96.9%) |
+| intl402 (opt-in, `--include-intl402`) | 6,714 | 6,502 (96.8%) |
 
 Measured against tc39/test262 `defaaf15` (2026-07-27). The suite moves, so the
 commit is part of the number: it is worth re-pinning whenever this figure is.

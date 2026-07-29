@@ -906,9 +906,22 @@ pub(crate) fn resolve_ext_key(
     available: &[&str],
     default: &str,
 ) -> (String, bool) {
+    // BCP-47 carries deprecated aliases for two calendars; ECMA-402 works in the
+    // CANONICAL id, so `{calendar: "ethiopic-amete-alem"}` and `-u-ca-islamicc`
+    // must resolve exactly as `ethioaa` and `islamic-civil` do rather than being
+    // rejected as unsupported and falling back to the default
+    // (`canonicalize-calendar.js`). Applied before the availability filter, so
+    // the alias is measured against the same list as its canonical form.
+    let canon = |s: String| -> String {
+        match s.as_str() {
+            "ethiopic-amete-alem" => "ethioaa".to_string(),
+            "islamicc" => "islamic-civil".to_string(),
+            _ => s,
+        }
+    };
     let ok = |v: &String| available.is_empty() || available.contains(&v.as_str());
-    let opt = option.map(|s| s.to_ascii_lowercase()).filter(&ok);
-    let ext_ok = ext.map(|s| s.to_ascii_lowercase()).filter(&ok);
+    let opt = option.map(|s| canon(s.to_ascii_lowercase())).filter(&ok);
+    let ext_ok = ext.map(|s| canon(s.to_ascii_lowercase())).filter(&ok);
     let value = opt.or_else(|| ext_ok.clone()).unwrap_or_else(|| default.to_string());
     let reflect = ext_ok.as_deref() == Some(value.as_str());
     (value, reflect)

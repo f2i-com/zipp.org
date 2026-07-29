@@ -63,4 +63,13 @@ impl DtfDefaults {
 /// value (`{calendar: "bangla"}`, `-u-nu-adlm`) falls back to the default rather
 /// than being echoed back, which is what the supportedValuesOf round-trip tests
 /// and the future-calendar fallback tests require.
-pub(crate) const AVAILABLE_CALENDARS: &[&str] = &["gregory", "iso8601"];
+pub(crate) const AVAILABLE_CALENDARS: &[&str] = &[
+    // ECMA-402 AvailableCalendars: the calendars for which this implementation
+    // provides Intl.DateTimeFormat functionality. Sorted, as the spec requires.
+    // Each one formats through vm/temporal's arithmetic with CLDR `en` names
+    // (cldr_en::CAL_MONTHS / CAL_ERAS) — advertising one it cannot format would
+    // be worse than a short list.
+    "buddhist", "chinese", "coptic", "dangi", "ethioaa", "ethiopic", "gregory",
+    "hebrew", "indian", "islamic-civil", "islamic-tbla", "islamic-umalqura",
+    "iso8601", "japanese", "persian", "roc",
+];

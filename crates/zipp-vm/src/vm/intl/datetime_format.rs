@@ -619,9 +619,31 @@ impl<'p> Vm<'p> {
         let ds = slot("dateStyle").and_then(|s| dtf_pattern::style_index(&s));
         let ts = slot("timeStyle").and_then(|s| dtf_pattern::style_index(&s));
         if ds.is_some() || ts.is_some() {
-            let dpat = ds.map(|i| cldr_en::DATE_FORMATS[i].to_string());
+            // Each calendar stores its OWN four dateStyle patterns: most want an
+            // era that gregorian's do not, hebrew is day-first ("27 Nisan 5760",
+            // not "Nisan 27, 5760"), and chinese/dangi use `r(U)`. Falling back
+            // to gregorian's produced correct field VALUES in the wrong shape.
+            let cal_for_pat = slot("calendar").unwrap_or_else(|| "gregory".to_string());
+            let dpat = ds.map(|i| {
+                cldr_en::CAL_DATE_FORMATS
+                    .iter()
+                    .find(|(id, _)| *id == cal_for_pat)
+                    .map(|(_, pats)| pats[i])
+                    .unwrap_or(cldr_en::DATE_FORMATS[i])
+                    .to_string()
+            });
             let tpat = ts.map(|i| cldr_en::TIME_FORMATS[i].to_string());
-            let d_items = dpat.map(|p| Self::dtf_filter(dtf_pattern::parse_pattern(&p), &keep));
+            // A dateStyle pattern is used AS STORED (ECMA-402
+            // DateTimeStylePattern) — the style implies its own components, so
+            // the era that every non-gregorian calendar's pattern carries must
+            // survive the component keep-set, which only knows about explicitly
+            // requested fields. The rest of the keep-set still applies, so a
+            // Temporal argument that genuinely lacks a field still drops it.
+            let d_items = dpat.map(|p| {
+                Self::dtf_filter(dtf_pattern::parse_pattern(&p), &|c: char| {
+                    c == 'G' || keep(c)
+                })
+            });
             let t_items = tpat.map(|p| {
                 // `en`'s four stored time patterns are 12-hour (`h:mm:ss a …`).
                 // An h23/h24 request rewrites the hour field to the padded
@@ -682,14 +704,46 @@ impl<'p> Vm<'p> {
         let offset_ms = if absolute { tz_minutes as i128 * 60_000 } else { 0 };
         let total_ms = ms as i128 + offset_ms;
         let days = total_ms.div_euclid(86_400_000) as i64;
-        let (y, mo, d) = epoch_days_to_iso(days);
+        let (iso_y, iso_mo, iso_d) = epoch_days_to_iso(days);
         let rem_ns = total_ms.rem_euclid(86_400_000) * 1_000_000;
         let t = ns_to_time(rem_ns); // [h, mi, s, ms, us, ns]
         // 1970-01-01 was a Thursday, index 4 in CLDR's Sunday-first week.
         let weekday = (days.rem_euclid(7) + 4) as usize % 7;
-        // Proleptic Gregorian has no year 0: CLDR year 1 BC is ISO year 0, so the
-        // ERA YEAR is 1 - y below the epoch (`proleptic-gregorian-calendar.js`).
-        let (era_idx, era_year) = if y <= 0 { (0usize, 1 - y) } else { (1usize, y) };
+        // ── the resolved calendar ────────────────────────────────────────────
+        // `gregory` and `iso8601` ARE the proleptic Gregorian fields computed
+        // above. Any other calendar re-derives (year, month, day) from the same
+        // epoch day through vm/temporal's calendar arithmetic — the identical
+        // code Temporal uses, so `Intl` and `Temporal` cannot drift apart — and
+        // takes its month/era NAMES from the per-calendar CLDR tables.
+        let cal_id = slot("calendar").unwrap_or_else(|| "gregory".to_string());
+        let cal = match cal_id.as_str() {
+            "gregory" | "iso8601" => None,
+            other => crate::vm::temporal::calendar::calendar_by_id(other),
+        };
+        let (y, mo, d) = match cal {
+            None => (iso_y, iso_mo, iso_d),
+            Some(c) => crate::vm::temporal::calendar::cal_from_epoch_days(c, days),
+        };
+        // Era ordinal + era year. Proleptic Gregorian has no year 0: CLDR year
+        // 1 BC is ISO year 0, so the ERA YEAR is 1 - y below the epoch
+        // (`proleptic-gregorian-calendar.js`). A non-gregorian calendar asks its
+        // own `cal_era`, which returns the era CODE and the year within it; the
+        // code's position in the calendar's era list is the name index.
+        let (era_idx, era_year) = match cal {
+            None => {
+                if y <= 0 {
+                    (0usize, 1 - y)
+                } else {
+                    (1usize, y)
+                }
+            }
+            Some(c) => match crate::vm::temporal::calendar::cal_era(c, y, mo, d) {
+                Some((code, ey)) => (cal_era_index(&cal_id, code), ey),
+                // A calendar with no eras at all (chinese, dangi): nothing to
+                // index, and the `G` field never appears in its patterns.
+                None => (0usize, y),
+            },
+        };
         let minutes_of_day = (t[0] * 60 + t[1]) as i32;
         let mut out: Vec<(&'static str, String)> = vec![];
         for item in items {
@@ -706,12 +760,7 @@ impl<'p> Vm<'p> {
                     match c {
                         'G' => out.push((
                             "era",
-                            match text_width(n) {
-                                0 => cldr_en::ERAS_WIDE[era_idx],
-                                2 => cldr_en::ERAS_NARROW[era_idx],
-                                _ => cldr_en::ERAS_ABBR[era_idx],
-                            }
-                            .to_string(),
+                            cal_era_name(&cal_id, era_idx, text_width(n)),
                         )),
                         'y' | 'Y' | 'u' => {
                             let v = if *c == 'u' { y } else { era_year };
@@ -725,13 +774,12 @@ impl<'p> Vm<'p> {
                             out.push(("year", s));
                         }
                         'M' | 'L' => {
-                            let i = (mo - 1) as usize;
                             let s = match n {
                                 1 => mo.to_string(),
                                 2 => format!("{mo:02}"),
-                                3 => cldr_en::MONTHS_ABBR[i].to_string(),
-                                5 => cldr_en::MONTHS_NARROW[i].to_string(),
-                                _ => cldr_en::MONTHS_WIDE[i].to_string(),
+                                3 => cal_month_name(&cal_id, cal, y, mo, 1),
+                                5 => cal_month_name(&cal_id, cal, y, mo, 2),
+                                _ => cal_month_name(&cal_id, cal, y, mo, 0),
                             };
                             out.push(("month", s));
                         }
@@ -939,4 +987,125 @@ impl<'p> Vm<'p> {
         Ok(self.alloc_str(s))
     }
 
+}
+
+// ── per-calendar CLDR name lookup ───────────────────────────────────────────
+// `gregory`/`iso8601` keep the top-level MONTHS_*/ERAS_* tables; every other
+// calendar reads `cldr_en::CAL_MONTHS` / `CAL_ERAS`, both generated from the
+// same CLDR release by `tools/gen_cldr_en.py`.
+
+/// The name index for era CODE `code` in calendar `cal_id`. `cal_era` returns
+/// the spec's era code (`"be"`, `"ah"`, `"ce"`, …); CLDR stores era names in
+/// ordinal order, and for every calendar zipp implements the ordinal is simply
+/// the position of that code in the calendar's own era list — 0 for the single
+/// -era calendars, and 0/1 (reverse/forward) for the two-era ones.
+fn cal_era_index(cal_id: &str, code: &str) -> usize {
+    // Japanese is the one calendar with a long era list: CLDR carries all 237
+    // historical nengo, and the five modern ones sit at the end. `cal_era`
+    // only ever produces those five plus the ce/bce fallback for pre-Meiji
+    // dates, which CLDR indexes at 0/1 like any two-era calendar.
+    if cal_id == "japanese" {
+        return match code {
+            "meiji" => 232,
+            "taisho" => 233,
+            "showa" => 234,
+            "heisei" => 235,
+            "reiwa" => 236,
+            "bce" | "bc" => 0,
+            _ => 1,
+        };
+    }
+    match (cal_id, code) {
+        // Two-era calendars: the BEFORE era is ordinal 0.
+        (_, "bce") | (_, "bc") | (_, "broc") => 0,
+        // Coptic and Ethiopic both store a pre-era at 0 and the era actually in
+        // use at 1 (CLDR spells the coptic pair "ERA0"/"ERA1"); `cal_era`'s
+        // "am" is the latter for both. Ethioaa has a single era.
+        ("roc", "roc") | ("ethiopic", "am") | ("coptic", "am") => 1,
+        (_, "ce") | (_, "ad") => 1,
+        // Single-era calendars (buddhist BE, islamic AH, hebrew AM, persian AP,
+        // indian Saka, ethioaa) have exactly one name.
+        _ => 0,
+    }
+}
+
+/// The era NAME for `cal_id` at ordinal `idx` and CLDR width (0 wide, 1 abbr,
+/// 2 narrow). Falls back to the gregorian table for gregory/iso8601, and to the
+/// empty string when a calendar carries no era names at that width (chinese and
+/// dangi have none at all — their patterns never contain `G`).
+fn cal_era_name(cal_id: &str, idx: usize, width: usize) -> String {
+    if cal_id == "gregory" || cal_id == "iso8601" {
+        let t = match width {
+            0 => &cldr_en::ERAS_WIDE[..],
+            2 => &cldr_en::ERAS_NARROW[..],
+            _ => &cldr_en::ERAS_ABBR[..],
+        };
+        return t.get(idx).copied().unwrap_or_default().to_string();
+    }
+    for (id, wide, abbr, narrow) in cldr_en::CAL_ERAS {
+        if *id == cal_id {
+            let t = match width {
+                0 => wide,
+                2 => narrow,
+                _ => abbr,
+            };
+            // A width CLDR does not carry for this calendar falls back to the
+            // abbreviated list, which every era-bearing calendar has.
+            return t
+                .get(idx)
+                .or_else(|| abbr.get(idx))
+                .copied()
+                .unwrap_or_default()
+                .to_string();
+        }
+    }
+    String::new()
+}
+
+/// The month NAME for `cal_id`, month `mo` of calendar year `y`, at CLDR width
+/// (0 wide, 1 abbr, 2 narrow).
+///
+/// Hebrew is the one calendar whose month NAMES depend on the year: in a leap
+/// year an extra month is inserted, so CLDR carries a 13th name plus a separate
+/// "Adar II". vm/temporal already renumbers the months, so month 7 of a leap
+/// year is the one that renames — and its name is the extra trailing entry the
+/// generator appends.
+fn cal_month_name(
+    cal_id: &str,
+    cal: Option<crate::vm::temporal::calendar::Cal>,
+    y: i64,
+    mo: i64,
+    width: usize,
+) -> String {
+    if cal_id == "gregory" || cal_id == "iso8601" {
+        let i = (mo - 1) as usize;
+        let t = match width {
+            0 => &cldr_en::MONTHS_WIDE[..],
+            2 => &cldr_en::MONTHS_NARROW[..],
+            _ => &cldr_en::MONTHS_ABBR[..],
+        };
+        return t.get(i).copied().unwrap_or_default().to_string();
+    }
+    for (id, wide, abbr, narrow) in cldr_en::CAL_MONTHS {
+        if *id != cal_id {
+            continue;
+        }
+        let t = match width {
+            0 => wide,
+            2 => narrow,
+            _ => abbr,
+        };
+        let mut i = (mo - 1) as usize;
+        if cal_id == "hebrew" {
+            let leap = cal
+                .map(|c| crate::vm::temporal::calendar::cal_in_leap_year(c, y))
+                .unwrap_or(false);
+            // The trailing entry is Adar II; it is month 7 only in a leap year.
+            if leap && mo == 7 {
+                i = t.len() - 1;
+            }
+        }
+        return t.get(i).copied().unwrap_or_default().to_string();
+    }
+    String::new()
 }
