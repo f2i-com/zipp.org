@@ -1612,6 +1612,18 @@ impl<'p> Vm<'p> {
         // numeric kernel snapshots.
         // (The cheap NAME match runs first: `array_has_holes` is an O(len) scan,
         // which must not be paid by every other method call on a big clean array.)
+        //
+        // This gate and the `shift|reverse|pop|unshift|splice` one below keep the
+        // COARSE `contains_key` where the others narrowed to
+        // `array_elements_overlaid` — deliberately. `map`, `filter` and `splice`
+        // run ArraySpeciesCreate, which does `Get(O, "constructor")`, so an OWN
+        // `constructor` is observable even though it names no element. Narrowing
+        // these two broke `staging/sm/Array/splice-species-changes-length.js` in
+        // both tiers (`array.constructor = {[Symbol.species]: …}`, then the
+        // species callback pushes and makes `length` non-writable mid-splice —
+        // the dense Vec arm sees none of it). The two arms are not two paths to
+        // the same answer; they are two implementations of an observable
+        // protocol, and only the abstract one implements all of it.
         if matches!(
             name,
             "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
@@ -1634,7 +1646,7 @@ impl<'p> Vm<'p> {
         // read-as-undefined for includes) instead of paying a full-array hole
         // pre-scan on EVERY call.
         if matches!(name, "indexOf" | "lastIndexOf" | "includes")
-            && (self.arr_props.contains_key(&idx)
+            && (self.array_elements_overlaid(idx)
                 || self.array_js_len.contains_key(&idx)
                 || self.proto_of.contains_key(&idx)
                 || (self.array_proto_has_index && self.array_has_holes(idx)))

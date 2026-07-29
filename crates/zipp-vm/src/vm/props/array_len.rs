@@ -28,12 +28,35 @@ impl<'p> Vm<'p> {
     /// for that index (the dense slot is a placeholder kept only so `length` counts
     /// it). Returns `(attrs, stored)` — `stored` is the value, or the getter for an
     /// accessor. Cheap miss: arrays with no side table return `None` after one
-    /// HashMap probe.
+    /// slot-table probe, and one whose table names no element (a RegExp match
+    /// result's `index`/`input`/`groups`) returns before spelling the key and
+    /// scanning for it.
     pub(crate) fn array_index_override(&self, arr_idx: u32, i: usize) -> Option<(PropAttr, Value)> {
         let m = self.arr_props.get(&arr_idx)?;
+        if !m.has_element_key() {
+            return None;
+        }
         let mut buf = [0u8; 20];
         let p = m.pos(crate::heap::index_key(&mut buf, i))?;
         Some((m.attrs[p], m.vals[p]))
+    }
+
+    /// Can anything outside the dense `Vec` shadow, hide, or constrain an ELEMENT
+    /// (or `length`) of the array at `idx`? The precise form of the
+    /// `arr_props.contains_key(&idx)` test that the dense fast paths grew up on.
+    ///
+    /// A RegExp match result answers `false` here and `true` there: it always
+    /// carries a side table, because that is where `index`/`input`/`groups` live,
+    /// but none of those four names can shadow an element. Every `exec` result in
+    /// the program was falling off `map`/`filter`/`indexOf`/`slice`/`for-of`/
+    /// `JSON.stringify` and — worst — deopting every JIT'd `m[i]`, for metadata
+    /// that has nothing to do with its elements.
+    ///
+    /// Conservative direction is `true`. Callers that also care about NAMED
+    /// properties must keep asking [`Self::arr_props`] directly.
+    #[inline]
+    pub(crate) fn array_elements_overlaid(&self, idx: u32) -> bool {
+        self.arr_props.get(&idx).is_some_and(|m| m.overlays_elements())
     }
 
     /// The JS `length` of the array at `arr_idx`: the dense element count, unless

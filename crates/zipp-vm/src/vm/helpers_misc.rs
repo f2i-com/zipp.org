@@ -473,18 +473,20 @@ pub(crate) extern "win64" fn jit_get_index(
             None => crate::codegen::SELF_CALL_DEOPT,
         };
     }
-    // An array with a side table may carry a defineProperty'd index whose value or
-    // accessor lives in arr_props — deopt so the interpreter's override-aware
-    // get_index runs (keeps JIT/interpreter parity).
-    if arr.is_heap() && vm.arr_props.contains_key(&arr.heap_index()) {
+    // An array whose side table can shadow an ELEMENT — a defineProperty'd index
+    // whose value or accessor lives in arr_props, a sparse overlay, or an
+    // integrity level — deopts so the interpreter's override-aware get_index runs
+    // (keeps JIT/interpreter parity). Named properties that cannot name an element
+    // do NOT disqualify it: a RegExp match result carries `index`/`input`/`groups`
+    // and used to deopt every single `m[i]` because of them.
+    if arr.is_heap() && vm.array_elements_overlaid(arr.heap_index()) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     match vm.heap.get(arr.heap_index()) {
         HeapObj::Array(items) => match array_index(key) {
             // In range and present → the element. A HOLE must NOT be returned (it is
             // an internal sentinel): deopt so the interpreter's get_index applies the
-            // absent-index / prototype semantics. Out of range / negative /
-            // non-integral → undefined (matches JS and the interpreter).
+            // absent-index / prototype semantics.
             Some(i) if i < items.len() => {
                 if items[i].is_hole() {
                     crate::codegen::SELF_CALL_DEOPT
@@ -492,7 +494,20 @@ pub(crate) extern "win64" fn jit_get_index(
                     items[i].bits()
                 }
             }
-            _ => Value::UNDEFINED.bits(),
+            // Out of range / negative / non-integral. `undefined` is only right
+            // when nothing up the chain can supply that index — this returned it
+            // unconditionally, so with `Array.prototype[5] = "P"` a JIT'd `a[5]`
+            // read `undefined` while the interpreter and node both read `"P"`.
+            // Same guard the `i in a` inline uses: the protector flag (set the
+            // moment an integer-like key is defined on Array/Object.prototype)
+            // plus "no setPrototypeOf'd custom prototype".
+            _ => {
+                if vm.array_proto_has_index || vm.proto_of.contains_key(&arr.heap_index()) {
+                    crate::codegen::SELF_CALL_DEOPT
+                } else {
+                    Value::UNDEFINED.bits()
+                }
+            }
         },
         // Flat ASCII string `s[i]`: mirror the interpreter's get_index Str path
         // EXACTLY (the ASCII branch). The i-th unit is the i-th byte, and a

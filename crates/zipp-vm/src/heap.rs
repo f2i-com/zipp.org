@@ -185,6 +185,25 @@ impl PropIndex {
 ///
 /// 20 bytes holds `usize::MAX`.
 #[inline]
+/// Does `key` name an ELEMENT of an exotic object — a canonical decimal index,
+/// or `"length"`? Deliberately allocation-free (unlike `canonical_index_str`,
+/// which round-trips through `to_string`), because it runs on every structural
+/// append to every `ObjMap` in the engine.
+///
+/// Conservative: it accepts any all-digit key with no redundant leading zero,
+/// so `"4294967295"` and larger — which are ordinary NAMED properties, not
+/// array indices — answer `true`. Over-reporting only costs a fast path.
+#[inline]
+pub(crate) fn key_names_element(key: &str) -> bool {
+    let b = key.as_bytes();
+    match b.first() {
+        Some(&c) if c.is_ascii_digit() => {
+            (b.len() == 1 || c != b'0') && b[1..].iter().all(|c| c.is_ascii_digit())
+        }
+        _ => key == "length",
+    }
+}
+
 pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
     let mut n = i;
     let mut p = buf.len();
@@ -241,6 +260,19 @@ pub struct ObjMap {
     /// `Clone` clones the table verbatim, which is valid because the clone
     /// has identical keys at identical slots.
     index: Option<Box<PropIndex>>,
+    /// Does any key in this map name an ELEMENT of the exotic object it hangs
+    /// off — a canonical decimal index, or `"length"`? Maintained by the same
+    /// three appends and one removal that maintain `shape`, and read only
+    /// through [`ObjMap::overlays_elements`].
+    ///
+    /// It exists because ~15 dense-array fast paths ask "can an element of this
+    /// array be shadowed?" and answer it with `arr_props.contains_key(idx)` —
+    /// the presence of ANY entry. A RegExp match result always has one (it is
+    /// where `index`/`input`/`groups` live) and so falls off every one of them:
+    /// `m.map(…)`, `m.slice(1)`, `for (const x of m)`, `JSON.stringify(m)` and
+    /// every JIT'd `m[i]` (which deopts to the interpreter). None of those four
+    /// names can shadow an element, so the precise question is this bit.
+    has_element_key: bool,
     /// This object's hidden class — see [`crate::shape`]. A redundant summary of
     /// `keys` + `attrs`, maintained by the same methods that mutate them, so an
     /// inline cache can ask "same layout?" with one integer compare instead of
@@ -492,8 +524,31 @@ impl ObjMap {
             sealed: false,
             frozen: false,
             index: None,
+            has_element_key: false,
             shape: crate::shape::EMPTY,
         }
+    }
+
+    /// Can this side table shadow, hide, or constrain an ELEMENT (or `length`)
+    /// of the exotic object it belongs to? The precise form of the
+    /// `arr_props.contains_key(idx)` test that the dense-array fast paths use —
+    /// see [`ObjMap::has_element_key`]. Non-extensible/sealed/frozen counts
+    /// because an in-place `items[i]` store on a frozen array must not silently
+    /// succeed; `!extensible` subsumes both markers (`seal`/`freeze` clear it).
+    ///
+    /// Conservative direction is `true`: a `false` here licenses a dense path,
+    /// so anything uncertain must answer `true`.
+    #[inline]
+    pub fn overlays_elements(&self) -> bool {
+        self.has_element_key || !self.extensible
+    }
+
+    /// Whether any key here names an element — see [`ObjMap::has_element_key`].
+    /// Unlike [`ObjMap::overlays_elements`] this ignores the integrity flags, for
+    /// the one caller that is asking a pure key question (`array_index_override`).
+    #[inline]
+    pub fn has_element_key(&self) -> bool {
+        self.has_element_key
     }
 
     /// `Object.isSealed`: not extensible and every own property non-configurable.
@@ -571,6 +626,7 @@ impl ObjMap {
             self.vals.push(val);
             self.attrs.push(PropAttr::data());
             self.shape_pushed(key, &PropAttr::data());
+            self.has_element_key |= key_names_element(key);
             self.index_appended();
             true
         }
@@ -602,6 +658,7 @@ impl ObjMap {
             self.vals.push(val);
             self.attrs.push(attr);
             self.shape_pushed(key, &attr);
+            self.has_element_key |= key_names_element(key);
             self.index_appended();
             true
         }
@@ -612,6 +669,7 @@ impl ObjMap {
     /// caller MUST bump the object's version (a key add reallocs `vals`).
     pub fn push_data(&mut self, key: String, val: Value) {
         self.shape_pushed_owned(&key, &PropAttr::data());
+        self.has_element_key |= key_names_element(&key);
         self.keys.push(key);
         self.vals.push(val);
         self.attrs.push(PropAttr::data());
@@ -629,6 +687,13 @@ impl ObjMap {
             self.keys.remove(i);
             self.vals.remove(i);
             self.attrs.remove(i);
+            // Removing the last element-naming key must clear the bit, or a
+            // `delete arr[0]` would leave every dense fast path shut off for the
+            // life of the object. Recompute rather than count: deletion is rare
+            // and a stale count is a silent wrong answer.
+            if self.has_element_key && key_names_element(key) {
+                self.has_element_key = self.keys.iter().any(|k| key_names_element(k));
+            }
             if let Some(ix) = &mut self.index {
                 if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
                     self.index = None;
@@ -2398,6 +2463,20 @@ mod tests {
         }
         assert_eq!(m.pos("missing-key-never-inserted"), None);
         assert_shape_agrees(m);
+        assert_element_key_bit_agrees(m);
+    }
+
+    /// `has_element_key` is a cached summary of `keys`, and every dense-array
+    /// fast path trusts it to be exact in the FALSE direction — a stale `false`
+    /// licenses an in-place `items[i]` read/write past a defineProperty'd index
+    /// override. Recompute it from scratch and compare.
+    fn assert_element_key_bit_agrees(m: &ObjMap) {
+        assert_eq!(
+            m.has_element_key,
+            m.keys.iter().any(|k| key_names_element(k)),
+            "has_element_key disagrees with the key vector {:?}",
+            m.keys
+        );
     }
 
     /// THE invariant the whole hidden-class landing rests on: when a map claims

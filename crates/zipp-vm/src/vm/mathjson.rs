@@ -505,7 +505,7 @@ impl<'p> Vm<'p> {
                 // `json_get` generic-index dispatch (string-key coercion + chain
                 // resolution) per element. Any overlay / virtual-length / OOB falls
                 // back to `json_get` (which handles holes/proto exactly).
-                let direct = if !self.arr_props.contains_key(&idx) {
+                let direct = if !self.array_elements_overlaid(idx) {
                     match self.heap.get(idx) {
                         // A present (non-hole) dense element. A HOLE falls back to
                         // `json_get` so the prototype chain is walked exactly.

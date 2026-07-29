@@ -6448,9 +6448,7 @@ impl<'p> Vm<'p> {
                         if self.array_js_len.is_empty()
                             || !self.array_js_len.contains_key(&it.heap_index())
                         {
-                            if self.arr_props.is_empty()
-                                || !self.arr_props.contains_key(&it.heap_index())
-                            {
+                            if !self.array_elements_overlaid(it.heap_index()) {
                                 let cur =
                                     array_index(self.get(base, idx)).unwrap_or(0);
                                 let hit = match self.heap.get(it.heap_index()) {

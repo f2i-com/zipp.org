@@ -176,7 +176,7 @@ impl<'p> Vm<'p> {
                 // → identity miss → generic helper, so this is an optimisation,
                 // never a soundness gate).
                 (HeapObj::Array(items), Recv::Ta | Recv::Len)
-                    if !self.arr_props.contains_key(&live.heap_index())
+                    if !self.array_elements_overlaid(live.heap_index())
                         && !self.arguments_objs.contains_key(&live.heap_index()) =>
                 {
                     // All-Int (sampled) ⇒ offer the array to the INTEGER tier, which

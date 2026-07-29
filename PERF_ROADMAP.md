@@ -1668,6 +1668,96 @@ nearly free. The lesson generalises: `Vm` has ~40 more `HashMap<u32, _>` side
 tables keyed by heap slot, `proto_of` and `prototypes` among them, and this is
 the first evidence about what that shape costs.
 
+**Second half: a match result is not an element overlay. NEUTRAL on the suite,
+and it cost two of its eight sites to a test262 regression — which is the part
+worth reading.**
+
+~15 dense-array fast paths ask "can an element of this array be shadowed?" and
+answer it with `arr_props.contains_key(&idx)` — the presence of ANY entry. A match
+result always has one, because that is where `index`/`input`/`groups` live. So
+every `exec` result in every program fell off `map`/`filter`/`indexOf`/`slice`/
+`join`/`for…of`/`JSON.stringify`, could not be pinned by the region planner, and
+deopted the JIT on every `m[i]` — for four names that cannot shadow an element.
+`ObjMap::overlays_elements` asks the precise question: is there a canonical index
+key or `"length"`, or has an integrity level been applied? The bit is maintained by
+the same three appends and one removal that maintain `shape`, and
+`assert_map_consistent` recomputes and compares it.
+
+**Then test262 rejected two of the eight narrowed sites, and B55's warning was
+exactly right.** `staging/sm/Array/splice-species-changes-length.js` began failing
+in BOTH tiers. Its array is set up with `array.constructor = {[Symbol.species]:
+…}` — an own property that names no element, so `overlays_elements` says `false`
+and `splice` took the dense `Vec` arm. But `splice` runs ArraySpeciesCreate, which
+does `Get(O, "constructor")`; the species callback pushes three elements and makes
+`length` non-writable mid-operation, and the dense arm sees none of it. `map` and
+`filter` have the same exposure.
+
+The lesson generalises past the one key. **`array_ops.rs`'s family gates are not
+two paths to the same answer — they are two implementations of an observable
+protocol, and only `array_like_*` implements all of it.** The presence test was
+doing double duty: "no element overlay" AND, incidentally, "nothing here makes an
+array method's spec machinery observable". Narrowing it kept the first meaning and
+silently dropped the second. So those two gates keep the coarse
+`contains_key`, with the reason written above them. The six that stayed narrowed
+are pure ELEMENT READS with no array-method protocol in them at all — the JIT's
+`a[i]` helper, the region pin, `i in a`, JSON's per-element read, and `for…of`'s —
+plus `indexOf`/`lastIndexOf`/`includes`, which build no new array and never touch
+`constructor`. Pinned by two new tests and re-gated on the full suite.
+
+This is the first concrete instance of the failure mode B55's judge predicted for
+the whole `arr_props` centralization: "one wrong bucket is a silent wrong answer".
+It took **eight** buckets to produce one, and neither a 108-line reflection
+differential nor eight hand-written unit tests found it — test262's `staging/sm`
+corner did. Anyone sizing item 6's 147-site version should price that experience
+in.
+
+**It measured NOTHING on the suite: geomean +0.14% [−0.34, +0.88], every row
+inside noise, `regex-log-scan` −0.2% [−0.7, +0.2]**
+(`bench/overlay_narrow_ab_2026-07-29.json`, 15 pairs). The reason is mechanical,
+and `ZIPP_JITLOG` says it plainly: **`regex-log-scan` does not region-compile its
+`exec` loops at all** (a method call keeps them out), so the deopt gate is not on
+its hot path — and the bench never calls `indexOf`/`for…of`/`JSON.stringify` on a
+match result. The suite does not contain the pattern.
+
+The targeted micro does — 2,000 live match results against 2,000 identical plain
+arrays, the same operation on each, timed inside one process:
+
+| operation | before | after | plain-array control (before → after) | node (match/plain) |
+|---|---:|---:|---:|---:|
+| `m.indexOf(s)` | 251ms | **127ms** | 126 → 127ms | 7/5 |
+| `for (x of m)` | 197ms | **157ms** | 147 → 152ms | 5/4 |
+| `JSON.stringify(m)` | 267ms | **218ms** | 197 → 196ms | 29/27 |
+| JIT'd `m[i]` reads | 71ms | **59ms** | 62 → 55ms | 31/4 |
+| `m.map(fn)` | 292ms | 273ms | 173 → 161ms | 8/7 |
+
+Read the control column: a match result was **1.3–2.0× slower than a
+byte-identical plain array** at the same operation, and afterwards `indexOf` is
+exactly equal to one, `for…of` within 3%, and `JSON.stringify` within 11%. `map`
+is the row that did NOT move, and that is the species revert below, not a
+measurement failure.
+
+**Retained deliberately as a neutral-on-suite change** under §2's rule: it removes
+a real cliff on a common pattern, it costs one `bool` per `ObjMap` plus an
+allocation-free key test on append, and the alternative reading — that this is
+worth zero — is contradicted by the micro. Do not cite it as a suite win; it is
+not one.
+
+**Found while narrowing, and fixed here: a JIT/interpreter divergence.**
+`jit_get_index` returned `undefined` for an out-of-range array index without
+walking the prototype chain, so with `Array.prototype[5] = "P"` a hot `a[5]` read
+`undefined` while the interpreter and node both read `"P"`. Three shapes:
+`Array.prototype`, `Object.prototype`, and a `setPrototypeOf`'d custom prototype.
+It survived 95,936 test262 executions **because the JIT only compiles hot loop
+REGIONS and test262 asserts once, straight-line — `jit_get_index` is never
+reached**. That is a coverage hole in the standing gate worth more than the patch:
+§2 runs test262 under `ZIPP_NOJIT=1` to prove the interpreter, but has no
+corresponding mode that forces the region tier, so every JIT-only helper is
+gated only by the ten benchmarks' stdout. Match results were accidentally immune
+here precisely because they always deopted, so narrowing the gate without this fix
+would have shipped the bug straight into the regex row. Guarded now with the same
+pair the `i in a` inline uses: the `array_proto_has_index` protector plus "no
+custom prototype".
+
 ### B62 — `typeof` interned: json-large −6.7%, and the roadmap's own estimate for it was wrong in both directions
 
 The last unrefuted row of B50's prize table said "`typeof` allocates its result
@@ -3920,6 +4010,38 @@ current.
   (`ta_named_is_intrinsic`, `vm/typedarray.rs`) but cannot be enabled until
   **A5** — with a faithful walk, cross-realm TypedArrays return `undefined` and
   24 currently-passing tests break.
+- **Nine own-property divergences found by B63's adversarial review, all
+  pre-existing** (verified identical on the pre-B63 binary; none is test262-
+  visible). Each snippet below is `node` vs `zipp`:
+  - `String.prototype[7]="SP"; "ab"[7]` — `"SP"` vs `undefined`. The String
+    exotic's out-of-range index never reaches the prototype chain. Both tiers.
+  - `(function(){return Object.getOwnPropertyNames(arguments)})(1,2)` —
+    `["0","1","length","callee"]` vs a **duplicate** `"length"`.
+    `descriptors.rs:539` pushes `"length"` unconditionally and the named tail
+    then emits the stored one. Same in `Reflect.ownKeys`.
+  - an index override on a HOLE below the dense length vanishes from
+    `Object.getOwnPropertyNames` while `Object.keys` still reports it — zipp
+    disagreeing with itself. `enumerate.rs`'s dense loop consults
+    `array_index_override`; `descriptors.rs`'s does not.
+  - `"use strict"; Object.seal(a); a.length = 0` — TypeError vs silently
+    succeeding. `array_shrink_blocker` scans only per-key non-configurables, and
+    a sealed exotic's elements are non-configurable by the marker, with no key.
+  - `propertyIsEnumerable` on an Array ignores holes, non-canonical keys and
+    index attributes (`iterate.rs:571-580` short-circuits on
+    `i < items.len()`): `delete a[1]; a.propertyIsEnumerable("1")`,
+    `a.propertyIsEnumerable("01")`, and a non-enumerable index override all
+    report `true` where node reports `false` — and `Object.keys`/`for…in`/
+    `JSON.stringify` all honour the attribute that this does not.
+  - `Reflect.set(Object.preventExtensions(function f(){}), "nk", 1)` — `false`
+    vs `true` (the `fn_props.extensible` quirk).
+  None is a tier divergence, which is why the §2 gate never saw them.
+- **The standing gate cannot see a JIT-only bug.** test262 runs under the
+  default tier and under `ZIPP_NOJIT=1`, but the region JIT only compiles hot
+  LOOPS and test262 asserts once, straight-line — so a helper like
+  `jit_get_index` is never reached by 95,936 executions. B63 found a real
+  `arr[oob]` prototype-chain divergence that way, by hand, while doing something
+  else. The missing piece is a force-the-tier mode (an `OSR_THRESHOLD`
+  override), which would make the existing suite a JIT gate at no authoring cost.
 - **`console` is not an object.** It is a compile-time pattern match in
   `compile/`, so `typeof console === "undefined"` and `const log = console.log`
   throws.

@@ -969,7 +969,7 @@ impl<'p> Vm<'p> {
         // node's 0.9, and 55% of sparse-array's entire gap to node.
         if !self.array_proto_has_index && key.is_int() && obj.is_heap() {
             let idx = obj.heap_index();
-            if !self.proto_of.contains_key(&idx) && !self.arr_props.contains_key(&idx) {
+            if !self.proto_of.contains_key(&idx) && !self.array_elements_overlaid(idx) {
                 if let HeapObj::Array(items) = self.heap.get(idx) {
                     let k = key.as_int();
                     let absent = k < 0
