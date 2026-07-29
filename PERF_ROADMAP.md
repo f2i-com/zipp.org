@@ -164,24 +164,29 @@ is a `diff`, not a remembered number. It was stale for a long stretch (the
 2,194-line oxc-era list against a 938-failure run), which made that diff
 meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — cold geomean 1.89× at HEAD (2026-07-29, 21 reps)
+### Performance — cold geomean 1.86× at HEAD (2026-07-29, 21 reps)
 
-> **B63 (`arr_props` goes slot-indexed) moved it again**, and this is the first
-> capture in this file taken from a CLEAN tree — `zipp --version --json` reports
-> `dirty: false` at `d1a5c59` (`bench/b63_clean_2026-07-29.json`):
+> **B63/B64/B65 moved it three times in one session**, from a clean tree each
+> time — `zipp --version --json` reports `dirty: false` at `7c760c1`
+> (`bench/head_clean_7c760c1.json`):
 >
 > | | node | zipp | ratio | was (B62) |
 > |---|---:|---:|---:|---:|
-> | regex-log-scan | 474ms | 1746ms | **3.65×** | 4.14× |
-> | map-set-heavy | 862ms | 825ms | **0.93×** | 0.97× |
-> | json-large | 291ms | 485ms | 1.70× | 1.78× |
-> | geomean | | | **1.89×** [1.87, 1.90] | 1.95× |
+> | regex-log-scan | 469ms | 1709ms | **3.62×** | 4.14× |
+> | map-set-heavy | 907ms | 818ms | **0.90×** | 0.97× |
+> | async-promise-chain | 342ms | 617ms | **1.81×** | 1.90× |
+> | json-large | 292ms | 483ms | 1.66× | 1.78× |
+> | geomean | | | **1.86×** [1.85, 1.87] | 1.95× |
 >
-> `ALL_CORRECT=1`. The suite delta agrees with B63's isolated `--ab` (−3.63%) to
-> within noise, which is the check that the suite number and the paired A/B are
-> measuring the same thing. `map-set-heavy` is now clearly ahead of node rather
-> than at parity, and `regex-log-scan` has gone 4.46× → 4.12× → **3.65×** across
-> B60 and B63 without the compact-metadata project the plan called for.
+> `ALL_CORRECT=1`. The suite delta agrees with the isolated `--ab`s (−3.63% and
+> −1.06%, with B65 neutral) to within noise, which is the check that the suite
+> number and the paired A/Bs are measuring the same thing. `map-set-heavy` is now
+> clearly ahead of node rather than at parity, and `regex-log-scan` has gone
+> 4.46× → 4.12× → **3.62×** across B60/B63/B64 without the compact-metadata
+> project the audit plan called for.
+>
+> All three of those came from ONE observation — that a side table keyed by heap
+> slot was an `FxHashMap` — and none of them is on the audit plan's list.
 
 > **B60 (lazy Annex B legacy statics) moved it before that**, same box, same 21-rep
 > protocol (`bench/lazystatics_2026-07-29.json`):
@@ -1667,6 +1672,20 @@ functions were wrong. **That is B59's failure mode again** — the same fact
 hand-maintained in three places, drifting in one — and the third instance in this
 file. The audit plan's item 3 (one exhaustive `InstrInfo` + structured decline
 reasons) is the standing fix; this is the second measured argument for it.
+
+**And the class was already known.** `README.md` describes this exact bug, as one
+of the two tier divergences that mattered most while getting test262 to 99.994%:
+"`$262.evalScript`'s var/function bindings live as own properties of the global
+object with the slot left `UNINITIALIZED`, and every JIT tier reads the slot
+directly. A harness function called from a loop therefore worked for the
+interpreted iterations and became `undefined is not a function` the instant the
+region tiered up". It says *every* JIT tier — and the fix went into the region
+compiler and the leaf planner, both of which are reached from a LOOP, and never
+into the one tier a loop is not required to reach. The knowledge was written
+down, in prose, in the README, and the code still drifted. That is the argument
+for item 3 stated better than anything else in this file: the remedy for
+hand-maintained cross-cutting facts is not to write them down more carefully, it
+is to have one source the compiler checks.
 
 Fixed by giving Tier C the same scan plus `Jit::compile_defer`, the sibling of
 `region_defer` that was also missing. A function reading an own-prop global now
