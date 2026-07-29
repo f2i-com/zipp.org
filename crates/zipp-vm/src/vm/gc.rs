@@ -361,6 +361,12 @@ impl Vm<'_> {
         for v in &self.regexp_last {
             root_val!(*v);
         }
+        // The deferred half of those statics: slots 2..=13 are unit RANGES into
+        // this subject rather than strings, so the subject itself is what has to
+        // survive until something reads them (or the next match replaces it).
+        if let Some(lazy) = &self.regexp_last_lazy {
+            root_val!(lazy.subj);
+        }
         for v in self.zdt_tz.values() {
             root_val!(*v);
         }

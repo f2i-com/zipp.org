@@ -108,6 +108,7 @@ impl<'p> Vm<'p> {
             for_in_barren: rustc_hash::FxHashMap::default(),
             regexp_string_iters: std::collections::HashMap::new(),
             regexp_last: Vec::new(),
+            regexp_last_lazy: None,
             run_loop_depth: 0,
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),

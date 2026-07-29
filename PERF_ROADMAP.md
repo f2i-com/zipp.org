@@ -164,7 +164,20 @@ is a `diff`, not a remembered number. It was stale for a long stretch (the
 2,194-line oxc-era list against a 938-failure run), which made that diff
 meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — cold geomean 1.98× at HEAD (2026-07-29, 21 reps)
+### Performance — cold geomean 1.95× at HEAD (2026-07-29, 21 reps)
+
+> **B60 (lazy Annex B legacy statics) moved it again**, same box, same 21-rep
+> protocol (`bench/lazystatics_2026-07-29.json`):
+>
+> | | node | zipp | ratio | was (B59) |
+> |---|---:|---:|---:|---:|
+> | regex-log-scan | 451ms | 1842ms | **4.12×** | 4.46× |
+> | geomean | | | **1.95×** [1.94, 1.96] | 1.98× |
+>
+> Every other row inside its B59 interval; `ALL_CORRECT=1`. The row delta agrees
+> with the isolated `--ab` (−8.5%) to within noise, which is the check that the
+> suite number and the paired A/B are measuring the same thing.
+
 
 > **RE-MEASURED 2026-07-29 at `799ead6` + the B59 fix**, because the table below
 > had gone stale in a way that mattered: `class-prototype-hot` had silently
@@ -237,10 +250,16 @@ the phase-level measurements in B31–B33 — none of these is a tuning change:
    `{alpha,beta,gamma}` read costs 4.2ns at 8 distinct receivers and 18.9ns at
    16, where node is flat at 0.6ns. This is the only fix for that cliff and for
    the unconditional `pos()` the interpreter IC pays on every access.
-2. **A profitable compiled regex backend.** `regress` is a backtracking
-   interpreter at 6.9ns per failed match attempt against Irregexp's 0.37ns,
-   but B58's conservative regular-subset tier moved the complete row only 2.82%
-   and therefore remains off by default.
+2. ~~**A profitable compiled regex backend.**~~ **SUPERSEDED by B60 — the matcher
+   is the SMALLEST of the four terms in `regex-log-scan`.** Measured with `test`
+   only (no result object anywhere), an anchored 5-byte literal that hits at index
+   0 costs 197ns against node's 7ns, so ~113ns is a fixed per-call floor, ~85ns is
+   success bookkeeping and ~60ns is per capture group; the actual matching is ~4×
+   off and, as B8 said, flat in subject length. B58's regular-subset tier moved the
+   row 2.82% because it was aimed at that 4×. B60 landed one of the real terms
+   (−7.9%) and priced the next (−13.5%, the result array's `index`/`input`/
+   `groups` living in the `arr_props` side map). A further 27% of that row's gap is
+   corpus generation, which contains no regex at all.
 3. **An optimizing tier with SSA.** `typedarray-math`'s DataView phase and its
    prefix-sum phase are both op-count bound on a register machine with no such
    tier (B32, B7) — prefix-sum is already on the BEST tier and is still 3.4×.
@@ -1518,6 +1537,136 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B60 — regex-log-scan, phase by phase: B8 was measured on the one pattern shape where we win, and the success path is where the cost is
+
+**B8 says "the regex ENGINE is not the problem — matching cost is FLAT, we beat
+V8 at scanning". That is true of the pattern B8 measured and false in general, and
+the difference decides what to work on.** B8's probe is `/zqx/.test(s)` — a single
+literal that NEVER matches, i.e. exactly the case `regress`'s memchr prefilter
+answers. Every hot loop in `regex-log-scan` MATCHES (`ipMatches` is 150000 of
+150000). Re-measured with `test` only, so no result object exists in any row and
+the only variable is the pattern:
+
+| `re.test(LINE)`, 300k calls, LINE = 112 chars | zipp | node | ×  |
+|---|---:|---:|---:|
+| `/zqx/` — B8's case, never matches | 113ns | 13ns | 8.7 |
+| `/^2026-/` — anchored, hits at index 0, 5 literal bytes | **197ns** | **7ns** | **28** |
+| `/ERROR/` — hits, 0 capture groups | 220ns | 17ns | 13 |
+| `/\d{1,3}\.\d{1,3}/` — hits, 0 groups | 343ns | 20ns | 17 |
+| `/\d{1,3}\.\d{1,3}/` — same regex, MISSES | 107ns | 13ns | 8.2 |
+| `/(\d{1,3})\.(\d{1,3})/` — 2 groups | 453ns | 23ns | 20 |
+| the bench's 4-octet ip pattern | 590ns | 33ns | 18 |
+
+Read the third and fifth rows together: the SAME pattern costs 343ns when it hits
+and 107ns when it misses. **Failure is cheap and success is not**, so B8 measured
+the cheap half. `/^2026-/` isolates it — anchored, immediate hit, nothing to
+search — at 28× for essentially no matching work. Decomposed:
+
+    fixed per-call floor      ~113ns   (node ~13ns)   8.7x
+    success bookkeeping        ~85ns   (node  ~4ns)    21x
+    per capture group          ~60ns   (node  ~4ns)    15x
+    the actual MATCHING         ~4x off, and flat in subject length as B8 said
+
+**So the matcher is the least of the four problems, and a compiled-regex backend
+(B8b) is aimed at the smallest term.** Do not start there.
+
+**Phase table** (150k lines, `Date.now()` around each phase, min of 3):
+
+| phase | zipp | node | ×  | share of the 1579ms gap |
+|---|---:|---:|---:|---:|
+| corpus generation — **contains no regex** | 594ms | 164ms | 3.6 | **27%** |
+| `test`, literal `/\[ERROR\]/` | 58ms | 73ms | **0.79** | −1% |
+| `exec` + 4 captures + `+m[i]` | 258ms | 21ms | 12.3 | 15% |
+| `replace(/\/\/+(\w+)/g, "/$1")` | 83ms | 31ms | 2.7 | 3% |
+| `join("\n")` + fnv1a over it | 120ms | 28ms | 4.3 | 6% |
+| `matchAll` + `for-of` | 784ms | 70ms | 11.2 | **45%** |
+| `test`, anchored alternation | 78ms | 9ms | 8.7 | 4% |
+
+`matchAll` decomposes further (450k matches): 257ms is match+bookkeeping, 186ms
+result-object construction, 26ms group reads, 107ms the iterator. `for-of` itself
+is NOT the blocker — driving the same iterator by hand with `.next()` is SLOWER
+(803ms vs 576ms), and `for-of` over a plain 5-element array 150k times is 19ms.
+
+**Two ablations, each priced against the same binary** (`tools/bench.py --ab-env`,
+so the schedule is counterbalanced and the binary identical; both leave the
+bench's output byte-identical because it reads neither):
+
+| ablation | regex-log-scan | 95% CI |
+|---|---|---|
+| skip the Annex B legacy-statics refresh | **−8.65%** (2015→1844ms) | [−8.86, −7.77] |
+| skip the result array's `index`/`input`/`groups` | **−13.5%** (2009→1738ms) | [−14.09, −13.14] |
+| both | **−21.4%** (2011→1576ms) | [−22.51, −21.18] |
+
+Nearly additive, and together they are 4.46× → ~3.50× on the row, ~2.4% of the
+suite geomean. **Neither ablation is shippable** — the statics and the result
+properties are both observable — so each needs a real implementation. One landed:
+
+**LANDED: the legacy statics are now lazy — regex-log-scan 4.46× → 4.12×.** On the
+21-rep suite that is 2010ms → 1842ms and a geomean of 1.98× → 1.95×. Slots 2..=13
+(`lastParen`, `leftContext`, `rightContext`, `$1`..`$9`) are all slices of the
+subject, and `ascii_slice_value` COPIES: `as_bytes()[r].to_vec()`, an `is_ascii`
+rescan inside `from_wtf8`, and a heap slot. So the eager form copied
+`leftContext` + `rightContext` — together ~87% of the subject — on every
+successful match, `test` included (the refresh sits above the `!build`
+early-out), plus one slice per capture that the result array then sliced AGAIN.
+For ~800k successful matches on ~112-byte lines that is ~59MB of memcpy and ~1.2M
+heap strings, and virtually no program reads `RegExp.leftContext`.
+
+Now: root the subject, keep unit ranges (`RegexpLastLazy`), and materialise all
+twelve on the first getter read (`regexp_last_materialise`). Slots 0/1 stay eager
+— `input_val` is already a Value and `lastMatch` is computed for the result array
+regardless. Only a flat-ASCII subject defers, because a non-ASCII slice reads the
+locally decoded `u16s` buffer that does not outlive the call; that arm is
+unchanged. The deferred record roots the subject, or a collection between the
+match and the read would free the bytes still to be sliced.
+
+Measured `--ab` (committed HEAD `23975df` vs this, 15 counterbalanced paired reps,
+both binaries retained): **regex-log-scan −8.5% [−8.8, −8.2]**, 2003→1832ms — i.e.
+the whole −8.65% ablation ceiling. Suite geomean −1.18% [−1.53, −0.90]. Nothing
+off-target: every other row inside ±1.1%. Two rows read nominally better
+(`json-large` −2.6%, `async-promise-chain` −1.1%); the plausible cause is ~1.2M
+fewer short-lived heap strings and so fewer collections, but that is NOT claimed —
+it is one session and below the ~1% replication floor this file insists on.
+
+Gate: test262 95936/95942 with the FAIL set byte-identical to
+`tools/test262-expected-failures.txt`; `cargo test --workspace --release` green;
+12 new tests in `tests/regexp_legacy_statics.rs`; a 21-case × 19-static
+differential byte-identical to the PRE-CHANGE binary and, separately, identical
+under `ZIPP_NOJIT=1` and `ZIPP_GC_STRESS=1`.
+
+**A process note worth more than the patch.** The first pass of this gate was
+WORTHLESS and said so only because a number failed to move: `git stash`/rebuild
+to capture the A-side binary left `target/release/zipp.exe` at committed HEAD, and
+nothing rebuilt it afterwards, so test262 and the whole differential ran HEAD
+against HEAD and "passed" identically. The tell was the following suite run
+reporting `regex-log-scan` at 4.42× — unchanged. `sha256sum` on the three
+binaries showed `zipp.exe` byte-identical to the saved A side. **Hash the binary
+you are about to gate, and check that a measurement moved in the direction the
+change predicts before believing a green gate.**
+
+**NOT landed, and the bigger half: the result array's `index`/`input`/`groups`
+(−13.5%).** They cannot be skipped, but the price is not the three
+`"index".to_string()` allocations — it is that they live in `arr_props`, an
+`FxHashMap` keyed by heap index. Every `exec`/`matchAll` result inserts an entry
+plus a side-table `ObjMap` with three `Vec`s, the map grows to hundreds of
+thousands of entries inside one phase, and GC prunes it wholesale. That matches
+this file's own 456ns-to-create measurement almost exactly: 456ns × ~600k
+matches ≈ 274ms ≈ the measured 271ms. Note the shape of the fix is NOT the
+already-refuted result-object POOL: it is getting those three names off the side
+map, e.g. a dedicated match-result heap variant that answers them directly.
+Anyone picking this up should re-price it with `ZIPP_NO_REGEXP_RESULT_PROPS`-style
+ablation first — that switch was removed with this commit rather than left in as
+observably-wrong code behind an env var.
+
+**Third item, unpriced and NOT regex: corpus generation is 27% of this row's
+gap** — 594ms vs 164ms of string concat, `Array` stores and number→string, with
+no `RegExp` in it at all. Anyone trying to "fix regex-log-scan" should know that
+more than a quarter of it is the general string/number path.
+
+Also found: `String.prototype.replace` with a GLOBAL regex does not refresh the
+legacy statics (they keep the previous match's values); V8 refreshes them. Present
+in the pre-change binary too, so it predates this work — recorded in §6.
 
 ### B59 — `SuperBase` was not in the method-inline whitelist: class-prototype-hot had silently regressed 1.27× → 7.99×
 
@@ -3429,6 +3578,12 @@ before the object model is stable means speculating against a moving target.
 Things that are wrong on purpose, or wrong and unfixed. Keep this list short and
 current.
 
+- **`String.prototype.replace` with a global regex does not refresh the Annex B
+  legacy statics.** After `"a//b //c".replace(/\/\/+(\w+)/g, "/$1")`, `RegExp.$1`
+  and friends still hold the PREVIOUS match's values; V8 refreshes them from the
+  last replacement match. The per-match path there does not funnel through the
+  `regexp_exec_impl` refresh. Predates B60 (the pre-change binary agrees), and it
+  is the one row where a 21-case all-19-statics differential disagrees with node.
 - **`super.m(arg)` resolves the method AFTER the argument list.** Per 13.3.6.1
   the reference's `GetValue` — the `super.m` lookup itself — precedes
   ArgumentListEvaluation, so an argument that calls

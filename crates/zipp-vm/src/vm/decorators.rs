@@ -145,6 +145,12 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let slot = state[0].as_f64() as usize;
+                // Slots 2..=13 (lastParen/leftContext/rightContext/$1..$9) may be
+                // deferred ranges after an ASCII match — build them now. Slots 0/1
+                // (input, lastMatch) are always already materialised.
+                if slot >= 2 {
+                    self.regexp_last_materialise();
+                }
                 match self.regexp_last.get(slot).copied() {
                     Some(v) => Ok(v),
                     None => Ok(self.alloc_str(String::new())),

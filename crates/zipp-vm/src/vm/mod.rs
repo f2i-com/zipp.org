@@ -235,6 +235,20 @@ pub(crate) struct DeferredModuleExec {
     pub full2: Vec<(String, u32)>,
 }
 
+/// The deferred Annex B legacy statics: a ROOTED subject plus unit ranges for
+/// `regexp_last` slots 2..=13 (lastParen, leftContext, rightContext, `$1`..`$9`).
+///
+/// `subj` exists purely so GC keeps the subject string alive while the ranges
+/// point into it — dropping it would let a collection free the bytes a later
+/// `RegExp.leftContext` read still has to slice. `subj_idx` is its heap index (the
+/// form `ascii_slice_value` takes). `None` in `ranges` is the empty string, which
+/// is what the eager form pushed for a non-participating capture.
+pub(crate) struct RegexpLastLazy {
+    pub subj: Value,
+    pub subj_idx: u32,
+    pub ranges: [Option<(u32, u32)>; 12],
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
@@ -445,6 +459,13 @@ pub struct Vm<'p> {
     /// (14 slots). Refreshed by every successful RegExpBuiltinExec; empty until
     /// the first match (the accessors then yield their empty-string defaults).
     regexp_last: Vec<Value>,
+    /// Deferred form of `regexp_last`'s slots 2..=13 after a successful match on a
+    /// flat-ASCII subject: the twelve of them are all slices of that one subject,
+    /// and materialising them cost ~8.7% of `regex-log-scan` for values almost no
+    /// program reads (see `regexp_exec_impl` and `regexp_last_materialise`).
+    /// `Some` means slots 2..=13 of `regexp_last` hold placeholders and the getter
+    /// must materialise first. Cleared by the eager (non-ASCII) path.
+    regexp_last_lazy: Option<RegexpLastLazy>,
     /// Native re-entry depth of `run_loop`: calls INSIDE one interpreter
     /// invocation stay flat (frame push + re-loop), but every NESTED entry — a
     /// builtin callback's `call_value`, a generator/async resume, a direct
