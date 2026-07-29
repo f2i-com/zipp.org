@@ -545,12 +545,56 @@ beyond the number:
 
 ## 5. Track B — performance to V8 parity
 
+> ## ⚠ DO NOT WORK THIS LIST FROM THE TOP. B1–B6 ARE THE 3.31× PLAN AND MOST ARE REFUTED BELOW.
+>
+> B1–B6 were written when the suite was 3.31×, and their prose still reads as
+> actionable — unchecked boxes, effort estimates, "do this first". Nearly all of
+> it was later measured and closed **further down this same file**, where a reader
+> starting at the top will not look. Audited 2026-07-29 against every later entry:
+>
+> | item | verified disposition | refuted/landed in |
+> |---|---|---|
+> | **B1** property-name interning ("do this first") | **REFUTED ×3, CLOSED** — permanent-root, capped, and weak interning each failed for a separately measured reason; suite +0.9%, 7/10 benches slower | B29, **B49** |
+> | **B2** for-in enumeration cache | **SUPERSEDED.** The interning half is B29's no-op; the memo half became B48, and what remains is the narrow one-pass level gather | B29, B48 |
+> | **B3.1** `ObjMap` → `{shape, vals}` | **PREMISE STALE** — shapes already exist (`shape.rs`); the shape is maintained alongside the vectors, deliberately | `shape.rs` |
+> | **B3.2** shape-keyed JIT ICs | **STILL THE REAL ITEM, OPEN** — and the naive form has a fatal bug: `DICT == 0` plus a zero-filled IC table makes an unfilled way MATCH every dictionary receiver and dereference an empty `Vec` | §8 of the external audit |
+> | **B4** admit allocation into JIT regions | **REFUTED — built, correct, SLOWER** (`{}` 35→62ns), and separately hits a nesting trap that moves zero regions | **B24**, B50 |
+> | **B5.1** widen the `.length` hoist to live-ins | **0ms on every named bench** — `typedarray-math` has no `.length`, and every container is a global the existing hoist already covers | B50 |
+> | **B5.2** lazy RegExp result objects | already marked refuted in place; superseded again by **B60**, which priced the real term (the `arr_props` entry, −13.5%) | B60 |
+> | **B5.2b** `matchAll` iterator step | **ALREADY LANDED** (`fast0`). Re-measured ~10ms against the ~552ms still written beside it — "the largest phantom in this file" | B50 |
+> | **B5.3** builtin dispatch jump table | **OPEN**, unrefuted | — |
+> | **B5.4** `JSON.parse` double key allocation | **OPEN**, unrefuted, and independently re-proposed | external audit §7.4 |
+> | **B6** generational nursery | **OPEN but hard-gated on B6.0** — two thirds of the apparent "GC pressure" was allocator cost | B6.0, B37 |
+>
+> **Where to actually start:** the prize-ordered table at the end of **B50**, then
+> **B60** for `regex-log-scan` and **B61** for what is already refuted. Note B50's
+> own "still open" table has itself aged — entries are newest-first, so B51/B52
+> land *after* it, and its top row (accessor inlining declining on `super.v`,
+> ~300ms) was fixed by B51/B52, silently regressed by the `SuperBase` whitelist
+> gap, and re-fixed in **B59**.
+>
+> Kept rather than deleted: the reasoning is still the useful record. And the cost
+> of NOT having this banner is documented in the file itself — interning was built
+> three separate times before B49 closed it ("recorded three times on purpose"),
+> and DataView integer admission three times (B22, again per B32's warning, and
+> once more in B61) because each attempt reached a different gate. Both are in the
+> table above.
+
 Ordered by measured impact per unit of effort, not by the original stage
-numbering. B1 and B2 are the ones the measurements actually support.
+numbering. **The next sentence is preserved as written and is now FALSE — see the
+banner above; B1 is closed and B2 is superseded.**
 
-### B1 — Property-name interning (do this first)
+Original: B1 and B2 are the ones the measurements actually support.
 
-- [ ] **B1.1 Intern property names to a `u32` id.** Replace
+### B1 — Property-name interning — REFUTED THREE TIMES, CLOSED (see B29, B49)
+
+> Title kept for the cross-references. It said "do this first"; do not do it at
+> all. B49: "the item is closed, not parked" — permanent-root, capped and weak
+> interning each failed for a separately measured reason. The 12.2ns it saves is
+> real and simply not reachable by caching at this hit rate. B49's own pointer:
+> attack the ~20ns cost of CREATING a heap object (B37) instead.
+
+- [~] **B1.1 REFUTED — see the banner. Original text:** Intern property names to a `u32` id. Replace
   `ObjMap.keys: Vec<String>` with `Vec<NameId>` plus a crate-global interner.
   Removes the per-property `String` malloc on every object construction and
   turns every key comparison into a `u32` compare. ~122 sites touch `.keys`,
@@ -559,10 +603,10 @@ numbering. B1 and B2 are the ones the measurements actually support.
   **Gain:** should remove ~100 of the ~128 ns/property construction cost;
   helps json / parse / class / polymorphic / markdown simultaneously.
   **Effort:** L. **Risk:** med. **Gate:** `ZIPP_GC_STRESS` mandatory.
-- [ ] **B1.2 Re-measure** the microbenchmark table in §3 and the ten benches
+- [~] **B1.2 moot (B1.1 closed). Original text:** Re-measure the microbenchmark table in §3 and the ten benches
   before starting B2. B1 alone may change the ranking.
 
-### B2 — `for-in` / enumeration cache
+### B2 — `for-in` / enumeration cache — SUPERSEDED (B29 no-op; memo landed as B48)
 
 - [ ] **B2.1 Memoize the enumeration key vector** in
   `vm/props/enumerate.rs` (`for_in_keys`), keyed by
@@ -577,7 +621,7 @@ numbering. B1 and B2 are the ones the measurements actually support.
   strings, which sidesteps rooting entirely — prefer that unless measurement
   says otherwise).
 
-### B3 — Shared hidden classes (the substrate)
+### B3 — Shared hidden classes — B3.1's PREMISE IS STALE (shapes exist); B3.2 is the live item
 
 Only after B1. This is the months-long item; B1 is deliberately structured to
 be the first half of it.
@@ -589,17 +633,19 @@ be the first half of it.
   **Depends:** B3.1. **Effort:** L.
 - [ ] **B3.3** Megamorphic stub cache for sites that exceed the way count.
 
-### B4 — Admit allocation into JIT regions
+### B4 — Admit allocation into JIT regions — REFUTED: BUILT, CORRECT, SLOWER (B24)
 
-- [ ] **B4.1** Admit `NewObject`/`NewArray` (then `MakeClosure`/`CellSet`) in
+- [~] **B4.1 REFUTED (B24 built it; `{}` went 35→62ns) and separately blocked by a
+  nesting trap (B50: moves ZERO regions).** Original text: Admit `NewObject`/`NewArray` (then `MakeClosure`/`CellSet`) in
   `codegen/region_admit.rs`, using the GC-safepoint refetch discipline already
   proven for `StrConcat` in `codegen/region_mem.rs`. A dead literal currently
   blacklists an entire loop permanently. **Effort:** L. **Risk:** high (GC
   safepoints inside a region). **Gate:** `ZIPP_GC_STRESS` mandatory.
 
-### B5 — Contained wins, individually gateable
+### B5 — Contained wins — MIXED: B5.1 is 0ms, B5.2b ALREADY LANDED, B5.3/B5.4 still open
 
-- [ ] **B5.1 Widen the loop-invariant `.length` hoist to live-in registers.**
+- [~] **B5.1 Widen the loop-invariant `.length` hoist to live-in registers — WORTH 0ms
+  ON EVERY NAMED BENCH (B50). Do not schedule.**
   `codegen/region_admit.rs` (`hoistable_length`) only hoists when the container
   is loaded by `LoadGlobal`, so a container passed as a **parameter** re-reads
   its length through the miss helper every iteration. Measured on an
@@ -615,7 +661,10 @@ be the first half of it.
   `test()` — which builds no result at all — is already 375 ns vs node's 30 ns.
   A lazy-result change would win a few percent of a bench that is 42% of the
   total gap. The lever is B8, not this. Kept as a note so it is not re-derived.
-- [ ] **B5.2b `matchAll` iterator step overhead.** Measured 1.38 µs per match
+- [x] **B5.2b `matchAll` iterator step overhead — ALREADY LANDED** as the `fast0`
+  path in `proxy_regexp.rs`, and re-measured at ~10ms, NOT the ~552ms recorded
+  below. B50 calls this "the largest phantom in this file". Text preserved:
+  Measured 1.38 µs per match
   through `for-of matchAll` vs 678 ns through an equivalent manual
   `while ((m = re.exec(s)))` loop — so the iterator path costs ~700 ns per match
   ON TOP of the exec it performs. The `{value, done}` object is already skipped
@@ -634,7 +683,7 @@ be the first half of it.
   `key.to_string()` again. Subsumed by B1.1, but trivial standalone.
   **Effort:** S.
 
-### B6 — Generational nursery GC
+### B6 — Generational nursery GC — OPEN, hard-gated on B6.0 (allocator, not collector)
 
 - [ ] **B6.0 Measure first.** The previous roadmap asserted ~214 ns/object
   allocation against node's ~10 ns, but the microbenchmark above puts a
@@ -2462,13 +2511,18 @@ one-line change.
 **Still open and independently verified, in prize order** — these are the real
 backlog, and none of them is an admission change:
 
+> **This table has itself aged — re-audited 2026-07-29.** Entries in this file are
+> newest-first, so B51/B52 landed AFTER B50 and closed row 1; B60 priced row 2 and
+> landed part of it; row 3 landed as B57. Rows are struck through rather than
+> deleted so the prize estimates stay checkable against what actually happened.
+
 | item | prize | where |
 |---|---|---|
-| accessor inlining declines on `super.v` | **~300ms** (band 250–385) | `class-prototype-hot`; `jit_plans.rs::build_accessor_shape` handles no super, where `build_method_shape` does. Hazard: an accessor's setter lives in `attrs[slot].setter`, NOT `vals`, so the method case's `holder_vals_ptr[holder_slot] == fn_bits` re-check does not transfer to the setter arm |
-| the match result's `arr_props` side table | **~190ms** | `regex-log-scan`; B33-C's mechanism at 5× its recorded price — 456ns to CREATE the entry vs 115ns for a first property on a plain object. Effort XL |
-| `o["k" + i] = v` fusion, done soundly | ~108ms | `polymorphic-objects`; see the wrong answer above |
-| `ToPropKey` invisible to `writes_reg`/`instr_uses` | ~39ms | `typedarray-math` `normalize`; the ONE site in the whole suite where `read-only live-in used where a number isn't required` fires |
-| `typeof` allocates its result string | ~45ms suite-wide | `type_of` already returns `&'static str`; 8 permanent interned slots would do it |
+| ~~accessor inlining declines on `super.v`~~ **LANDED, then regressed, then re-fixed** | ~~**~300ms**~~ | Landed as B51 (getter) + B52 (setter). Then the `SuperBase` opcode arrived and one whitelist was not taught it, silently costing 6× on this row until **B59**. The setter hazard this row flags — the setter living in `attrs[slot].setter`, not `vals` — is exactly what `ic_super_setter_baked` handles |
+| the match result's `arr_props` side table — **STILL OPEN, now the largest measured item in the file** | **~190ms** est; **B60 ABLATED IT AT −13.5%** of the row | `regex-log-scan`; B33-C's mechanism at 5× its recorded price — 456ns to CREATE the entry vs 115ns for a first property on a plain object. Effort XL, and gated on centralizing ~257 `arr_props` references across 12+ files first |
+| ~~`o["k" + i] = v` fusion, done soundly~~ **LANDED as B57, −16.2%** | ~~~108ms~~ | `polymorphic-objects`; the second attempt was the sound one (`ToConcatKey`) |
+| ~~`ToPropKey` invisible to `writes_reg`/`instr_uses`~~ **LANDED as B53** | ~~~39ms~~ | `typedarray-math` `normalize`. The external audit's do-not-repeat list names re-adding this |
+| `typeof` allocates its result string — **OPEN**, and the cheapest unrefuted item here | ~45ms suite-wide | `type_of` already returns `&'static str`; 8 permanent interned slots would do it. NOTE: an adversarial verifier rejected the naive framing — price it by ablation before building, since B49 shows removing an allocation is not worth its allocation count |
 
 ### B49 — B36's MARGINAL term: 40% of it IS allocation, and interning it does
 not pay — CLOSED after three attempts
