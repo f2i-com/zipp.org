@@ -326,9 +326,15 @@ Every engine change must pass, in full:
    A/A, or differing `--ab-env` for an ablation), and `zipp --version` reports
    `<commit>+dirty.<digest>` so a dirty build stops claiming its parent commit.
 1. **Build:** `cargo build --release` — verify the binary mtime advanced.
-2. **test262, BOTH tiers:** `tools/run_test262.py --dump-fails f.txt`, then
+2. **test262, ALL THREE tiers:** `tools/run_test262.py --dump-fails f.txt`, then
    `diff <(sort f.txt) <(sort tools/test262-expected-failures.txt)` — zero new
-   entries. Repeat with `ZIPP_NOJIT=1`.
+   entries. Repeat with `ZIPP_NOJIT=1`, and repeat with `ZIPP_JIT_THRESHOLD=1`.
+   The third pass is not redundant: the region JIT compiles only hot LOOPS and
+   test262 asserts once, straight-line, so **the default pass never reaches Tier
+   C or any JIT-only helper**. B63 found an `arr[oob]` prototype divergence there
+   by hand; B65 added the switch and it immediately found a second bug —
+   `this.x = 0` globals reading as `NaN` from compiled code — that was live at
+   DEFAULT thresholds and invisible to 95,936 executions.
 3. **Unit tests:** `cargo test --workspace --release`. Check the summed pass
    count and every ignored test; do not rely on one package's summary.
 4. **Bench correctness:** `bash bench/run_real.sh` → `ALL_CORRECT=1`, default
@@ -1619,6 +1625,71 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B65 — `ZIPP_JIT_THRESHOLD` makes test262 a JIT gate, and it found a wrong answer on its first run
+
+B63 recorded a coverage hole rather than just a patch: §2 runs test262 under
+`ZIPP_NOJIT=1` to prove the interpreter, but nothing forces the JIT — and the
+region compiler only compiles hot LOOPS while test262 asserts once,
+straight-line. **So Tier C and every JIT-only helper are gated by ten benchmarks'
+stdout and nothing else.** B63's `arr[oob]` prototype divergence was found there
+by hand, while doing something unrelated. This closes it.
+
+`ZIPP_JIT_THRESHOLD=<n>` replaces both `JIT_THRESHOLD` and `OSR_THRESHOLD` for
+the process. Read once in `Jit::new` into a `threshold_override` field where `0`
+means "use the constants", so the count paths stay a field compare and a
+perfectly-predicted branch — no env read, no atomic, and `Default` (which yields
+0) cannot silently disable the tier.
+
+**First run at `ZIPP_JIT_THRESHOLD=1` produced four new failures**
+(`language/types/object/S8.6.2_A5_T1.js` and `_T2`, ×2 modes), and reducing them
+found a bug that is NOT an artifact of the low threshold — it reproduces on the
+committed binary at default settings with an ordinary 50-iteration loop:
+
+| global created as | interpreter | Tier C |
+|---|---:|---:|
+| `var v = 0` | 50 | 50 |
+| `this.count = 0` | 50 | **NaN** |
+| `globalThis.g = 0` | 50 | **NaN** |
+
+A binding created as an own PROPERTY of the global object does not live in the
+`globals` slot array. The interpreter's `LoadGlobal` sees the slot uninitialized
+and falls back to the global object's own property; Tier C emits
+`mov rax, [r12 + idx*8]`, reads the uninitialized sentinel, and `x++` quietly
+evaluates to `NaN`. Silent wrong arithmetic, not a crash.
+
+**The guard already existed in two of the three places that need it** —
+`region_globals_ok` in the region compiler (`dispatch.rs`) and the same scan in
+`build_leaf_inline_plan`, whose decline message even names the cause: "reads a
+global whose binding is an own property, not a slot". It was missing from the
+whole-function Tier C path, which is exactly why loops were right and plain hot
+functions were wrong. **That is B59's failure mode again** — the same fact
+hand-maintained in three places, drifting in one — and the third instance in this
+file. The audit plan's item 3 (one exhaustive `InstrInfo` + structured decline
+reasons) is the standing fix; this is the second measured argument for it.
+
+Fixed by giving Tier C the same scan plus `Jit::compile_defer`, the sibling of
+`region_defer` that was also missing. A function reading an own-prop global now
+stays interpreted rather than compiling wrong — the same trade the loop path has
+always made. Pinned by 6 tests in `tests/jit_global_own_prop.rs`, including the
+late-binding case (the global appears only after the function is already hot, so
+deferral must re-arm rather than blacklist).
+
+**Cost: none measurable.** `--ab` against `5198911`, 15 counterbalanced pairs
+(`bench/jit_global_guard_ab_2026-07-29.json`): geomean **−0.09% [−0.42, +0.34]**,
+`ALL_CORRECT=1`. The one row nominally outside its interval is
+`async-promise-chain` at **+1.8% [+1.1, +2.4]**, and it is NOT claimed as a
+mechanism: that bench declares no own-prop globals, so nothing in it can defer,
+and the two added costs are a once-per-compile body scan and a
+perfectly-predicted branch on a field. B61 measured this class of row moving
+±1.5% from pure code layout under fat LTO with one codegen unit. Recorded rather
+than explained away — and it ships regardless, because it is a correctness fix.
+
+**Gate updated: §2 step 2 now requires all THREE passes** — default,
+`ZIPP_NOJIT=1`, and `ZIPP_JIT_THRESHOLD=1`. All three fail sets are byte-identical
+to `tools/test262-expected-failures.txt` at this commit. It is one more test262
+run, it needs no new tests authored, and it caught a silent wrong answer the
+moment it existed.
 
 ### B64 — The same mechanism, four more tables: `proto_of`, `arguments_objs`, `array_js_len`, `fn_props` go slot-indexed — suite −1.06%
 

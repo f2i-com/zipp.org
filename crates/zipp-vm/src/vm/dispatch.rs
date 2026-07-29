@@ -238,6 +238,35 @@ impl<'p> Vm<'p> {
                         self.func(func_id as usize);
                     // SAFETY: program functions are immutable during execution.
                     let proto_ref = unsafe { &*proto };
+                    // A global op whose slot is still UNINITIALIZED may be
+                    // own-prop-backed — `this.x = v` / `globalThis.x = v` /
+                    // eval-created bindings live as own properties of the global
+                    // OBJECT, and the interpreter's LoadGlobal falls back to them.
+                    // The emitted `mov rax, [r12 + idx*8]` cannot: it reads the
+                    // uninitialized sentinel, so `x++` silently produced NaN.
+                    //
+                    // The region compiler (`region_globals_ok` below) and the
+                    // leaf-inline planner (`build_leaf_inline_plan`) already refuse
+                    // for exactly this reason. Tier C did not, which is why the
+                    // whole-function path had the bug and the loop path did not.
+                    // Once a slot holds a real value it can never go back, so
+                    // deferring is safe and a later call re-checks.
+                    let globals_ok = proto_ref.code.iter().all(|ins| {
+                        let slot = match *ins {
+                            Instr::LoadGlobal { idx, .. }
+                            | Instr::LoadGlobalOrUndefined { idx, .. }
+                            | Instr::StoreGlobal { idx, .. }
+                            | Instr::StoreGlobalStrict { idx, .. }
+                            | Instr::StoreGlobalResolved { idx, .. } => Some(idx),
+                            _ => None,
+                        };
+                        slot.map_or(true, |i| {
+                            self.globals.get(i as usize).is_none_or(|v| !v.is_uninitialized())
+                        })
+                    });
+                    if !globals_ok {
+                        self.jit.compile_defer(func_id);
+                    } else {
                     // The self-function's current global Value (a heap Func),
                     // stable since hoist_functions ran at startup. Embedded so a
                     // JIT'd `LoadGlobal(self_slot)` stores the REAL function (not
@@ -268,6 +297,7 @@ impl<'p> Vm<'p> {
                         &const_strs,
                         &leaf_plan,
                     );
+                    }
                 }
             }
 

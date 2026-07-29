@@ -749,6 +749,19 @@ pub const FN_DEAD: u8 = 2;
 /// `(func_id, loop_header_ip)`.
 #[derive(Default)]
 pub struct Jit {
+    /// `ZIPP_JIT_THRESHOLD=<n>` replaces BOTH [`JIT_THRESHOLD`] and
+    /// [`OSR_THRESHOLD`] for the process; `0` (the `Default`, and the absence of
+    /// the variable) means "use the constants". Read once in [`Jit::new`], so
+    /// the count paths stay a field compare.
+    ///
+    /// This exists because the standing gate cannot see a JIT-only bug. §2 runs
+    /// test262 under `ZIPP_NOJIT=1` to prove the interpreter, but the region JIT
+    /// only compiles hot LOOPS and test262 asserts once, straight-line — so
+    /// helpers like `jit_get_index` are never reached by 95,936 executions.
+    /// B63 found a real `arr[oob]` prototype-chain divergence there by hand,
+    /// while doing something else. With `ZIPP_JIT_THRESHOLD=1` the same suite
+    /// becomes a JIT gate at no authoring cost.
+    threshold_override: u32,
     counts: FxHashMap<u32, u32>,
     compiled: FxHashMap<u32, JitFn>,
     blacklist: FxHashSet<u32>,
@@ -803,7 +816,28 @@ pub struct Jit {
 
 impl Jit {
     pub fn new() -> Jit {
-        Jit::default()
+        let mut jit = Jit::default();
+        // Values below 1 are meaningless (a counter starts at 1, so `== 0` would
+        // never fire and would silently disable the tier — the opposite of what
+        // anyone setting this wants), so they are ignored.
+        jit.threshold_override = std::env::var("ZIPP_JIT_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(0);
+        jit
+    }
+
+    /// Interpreter entries before a function is offered to the JIT.
+    #[inline]
+    fn fn_threshold(&self) -> u32 {
+        if self.threshold_override != 0 { self.threshold_override } else { JIT_THRESHOLD }
+    }
+
+    /// Back-edges before a loop region is offered to the OSR compiler.
+    #[inline]
+    fn loop_threshold(&self) -> u32 {
+        if self.threshold_override != 0 { self.threshold_override } else { OSR_THRESHOLD }
     }
 
     /// Point compiled code at a step counter, and throw away everything already
@@ -864,7 +898,7 @@ impl Jit {
         }
         let c = self.counts.entry(func_id).or_insert(0);
         *c += 1;
-        *c == JIT_THRESHOLD
+        *c == self.fn_threshold()
     }
 
     /// Dense tier state of `func_id` — the frame-entry fast path.
@@ -1010,7 +1044,7 @@ impl Jit {
         }
         let c = self.region_counts.entry(key).or_insert(0);
         *c += 1;
-        *c == OSR_THRESHOLD
+        *c == self.loop_threshold()
     }
 
     /// Permanently blacklist the region headed at `entry_ip` (the dispatch-side
@@ -1021,6 +1055,18 @@ impl Jit {
             eprintln!("[jit] region fn{func_id} [{entry_ip}] DECLINED (call-mix gate)");
         }
         self.region_blacklist.insert((func_id, entry_ip));
+    }
+
+    /// Undo the threshold trip reported by [`Jit::record_and_should_compile`]:
+    /// the caller found the function not YET safe to compile (a global op whose
+    /// slot is still uninitialized, so the binding may be an own property of the
+    /// global object rather than a slot). Re-arm so a later call re-checks.
+    ///
+    /// The sibling of [`Jit::region_defer`], and it was missing — see B65.
+    pub fn compile_defer(&mut self, func_id: u32) {
+        if let Some(c) = self.counts.get_mut(&func_id) {
+            *c -= 1;
+        }
     }
 
     /// Undo the threshold trip reported by [`Jit::record_region`]: the caller

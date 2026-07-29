@@ -540,6 +540,7 @@ python tools/run_test262.py --t262 <path> --dump-fails fails.txt
 diff <(sort fails.txt) \
      <(tr -d '\r' < tools/test262-expected-failures.txt | sort)      # REG=0
 ZIPP_NOJIT=1 python tools/run_test262.py …             # and again, interpreter only
+ZIPP_JIT_THRESHOLD=1 python tools/run_test262.py …     # and again, JIT forced on
 python tools/bench.py --reps 15                        # ALL_CORRECT=1
 python tools/bench.py --reps 15 --readme               # + the tables above
 ```
@@ -548,9 +549,17 @@ On Windows the test262 runner needs `PYTHONUTF8=1` — a failing test can print 
 non-ASCII character, and the default console codec kills the whole run with a
 `UnicodeEncodeError` after it has already done the work.
 
-The two tiers must produce IDENTICAL failure sets. They currently do, exactly,
-which is worth re-checking rather than assuming: it is the cheapest evidence
-that a JIT change did not silently alter semantics.
+All three passes must produce IDENTICAL failure sets. They currently do, exactly,
+which is worth re-checking rather than assuming: it is the cheapest evidence that
+a JIT change did not silently alter semantics.
+
+The third pass is the one people skip and should not. `ZIPP_JIT_THRESHOLD=<n>`
+overrides both the function and loop compile thresholds, because **the default
+run never reaches Tier C**: the region JIT compiles only hot loops, and test262
+asserts once, straight-line. Without it, every JIT-only helper is gated by ten
+benchmarks' stdout. The first run of it found `this.x = 0` globals reading as
+`NaN` from compiled code — live at default thresholds, invisible to all 95,936
+executions (`PERF_ROADMAP.md` B65).
 
 Anything touching the embedding API or the wasm layer also has to clear the node
 harnesses in `crates/zipp-wasm/tests/node/` — `cargo test` covers the Rust side
