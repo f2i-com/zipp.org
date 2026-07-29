@@ -534,6 +534,7 @@ impl<'p> Vm<'p> {
                 }
             }
             // Build a guarded arm per candidate (any that declines is skipped).
+            let n_cands = cands.len();
             let mut shapes = Vec::new();
             let mut win_top = 0u16;
             for recv in cands {
@@ -551,15 +552,29 @@ impl<'p> Vm<'p> {
                     shapes.push(shape);
                 }
             }
+            let k = match kind {
+                MiKind::Method => "method",
+                MiKind::Getter => "getter",
+                MiKind::Setter => "setter",
+            };
             if shapes.is_empty() {
+                // Say so. This `continue` used to be silent, which is how B59
+                // stayed hidden for an unknown number of commits: every
+                // super-using body declined `build_method_shape`, no INLINE line
+                // appeared, and an absent line is indistinguishable from a site
+                // that was never a candidate. `ZIPP_NO_METHOD_INLINE=1` was no
+                // help either — killing a mechanism that is already declining
+                // everywhere measures 0ms. A DECLINE line paired with the INLINE
+                // line turns that 6x regression into one grep.
+                if log && n_cands != 0 {
+                    eprintln!(
+                        "[mi] fn{func_id}@{ip} DECLINE {k} key={key} \
+                         ({n_cands} candidate receivers, every arm declined)"
+                    );
+                }
                 continue;
             }
             if log {
-                let k = match kind {
-                    MiKind::Method => "method",
-                    MiKind::Getter => "getter",
-                    MiKind::Setter => "setter",
-                };
                 eprintln!(
                     "[mi] fn{func_id}@{ip} INLINE {k} arms={} win_top={win_top}",
                     shapes.len()
@@ -1010,6 +1025,54 @@ impl<'p> Vm<'p> {
         c
     }
 
+    /// Is the register a `SuperBase` at `at` writes unread by every LATER op in
+    /// `body`, except as the `base` field of a `Super*` op?
+    ///
+    /// `emit_mi_body` drops `SuperBase` — the inlined `SuperMethod`/`SuperGet`/
+    /// `SuperSet` arms resolve through their baked plan and never dereference
+    /// `base`, so the capture has no inlined consumer. This is the proof
+    /// obligation for that: it enumerates the reads of exactly the ops
+    /// [`Self::method_inline_body_ok`] admits, with the `base` fields left out on
+    /// purpose, and anything it does not recognise counts as a read. So growing
+    /// that whitelist without revisiting this makes the body DECLINE, never
+    /// silently read a register the emitter left stale.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_super_base_dst_dead(body: &[Instr], at: usize, dst: u16) -> bool {
+        use crate::bytecode::Instr as I;
+        for instr in &body[(at + 1).min(body.len())..] {
+            let reads_dst = match *instr {
+                I::LoadInt { .. } | I::LoadBool { .. } | I::LoadConst { .. } => false,
+                I::Move { src, .. } => src == dst,
+                I::GetProp { obj, .. } => obj == dst,
+                I::Add { a, b, .. }
+                | I::Sub { a, b, .. }
+                | I::Mul { a, b, .. }
+                | I::Div { a, b, .. }
+                | I::Mod { a, b, .. }
+                | I::Bitwise { a, b, .. } => a == dst || b == dst,
+                I::AddInt { a, .. } | I::Neg { a, .. } => a == dst,
+                // `base` is deliberately NOT compared: the inlined emission
+                // ignores it. The argument window is a real read.
+                I::SuperMethod { arg_base, argc, .. } => {
+                    (0..argc).any(|k| arg_base + k == dst)
+                }
+                I::SuperGet { .. } => false,
+                I::SuperSet { val, .. } => val == dst,
+                // A second capture in the same body may reuse the temp; it writes,
+                // and reads nothing.
+                I::SuperBase { .. } => false,
+                I::SetProp { obj, val, .. } => obj == dst || val == dst,
+                I::Return { src } => src == dst,
+                I::ReturnUndefined => false,
+                _ => true,
+            };
+            if reads_dst {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Trivial-method body scan for the Q7 in-region emitter. Returns the body
     /// length (ops up to and incl. the first `Return`/`ReturnUndefined`), or
     /// `None` to decline. `allow_super` admits `SuperMethod` (the outer body); a
@@ -1054,6 +1117,26 @@ impl<'p> Vm<'p> {
                 // `super.m()` admitted only in the outer body (Stage 3); the
                 // resolved super target is re-scanned with allow_super=false.
                 I::SuperMethod { .. } if allow_super => {}
+                // `GetSuperBase` — the base capture the compiler plants ahead of
+                // every `super.m()` and `super.x = v`, because
+                // MakeSuperPropertyReference must read the home object's
+                // [[Prototype]] BEFORE the argument list / RHS runs. The inlined
+                // Super* arms resolve through their BAKED plan (class epoch +
+                // per-hop versions + a holder-slot re-read) and never read `base`,
+                // so the register this writes is dead in an inlined body and
+                // `emit_mi_body` drops the op. `mi_super_base_dst_dead` PROVES
+                // that instead of assuming it: a future admitted op that reads the
+                // register declines here rather than silently reading a stale slot.
+                //
+                // Its absence was a 6x regression. `SuperBase` arrived with the
+                // MakeSuperPropertyReference ordering fix; the off-frame evaluator
+                // (`method_body_inlinable_scan`) was taught the op and this scan
+                // was not, so EVERY `super`-using method body declined here. That
+                // took class-prototype-hot's 32M polymorphic `objs[i&3].area()`
+                // calls off the native inline path and onto two nested frame calls
+                // — 3.1ns -> 56ns per call, and the row from 1.27x to 7.99x.
+                I::SuperBase { dst, .. }
+                    if allow_super && Self::mi_super_base_dst_dead(&code[..term], ix, dst) => {}
                 // `super.v` READ inside a class getter (Stage 6), under the same
                 // rule: outer body only, and the resolved super getter is
                 // re-scanned with the flag off so there is no nested super.

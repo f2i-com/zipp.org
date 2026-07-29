@@ -958,6 +958,16 @@ pub(crate) fn emit_mi_body(
                     ; mov [rcx + (slot as i32) * 8], rax
                 );
             }
+            // `GetSuperBase` — DROPPED, no code emitted. It captures the home
+            // object's live [[Prototype]] into a temp so MakeSuperPropertyReference
+            // happens before the argument list / RHS runs; the Super* arms above
+            // resolve through their BAKED plan (class epoch + per-hop version
+            // guards + a holder-slot re-read) and never dereference `base`, so the
+            // temp has no consumer here. `method_inline_body_ok` admits the op only
+            // after `mi_super_base_dst_dead` proves no other body op reads that
+            // register, which is what makes dropping it observably identical to the
+            // interpreter's pure read.
+            Instr::SuperBase { .. } => {}
             Instr::Return { src } => {
                 ret_reg = Some(rg(src));
             }

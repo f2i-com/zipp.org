@@ -191,6 +191,17 @@ Cold total is now the primary metric. In the historical convention that
 subtracts median process startup, the same captured run is **2.15×**. Zipp
 starts about 4× faster than Node (7.8ms vs 32.2ms — no snapshot to load).
 
+Those medians are from one captured run (`bench/final_default_2026-07-28.json`);
+re-measuring at a later commit gives the same ratios but not the same absolute
+milliseconds, because the box moves. **Re-verified 2026-07-29 at 21 paired reps**
+(`bench/final_2026-07-29.json`): geomean **1.98×** [1.97, 1.98],
+`ALL_CORRECT=1`, `class-prototype-hot` back to 1.28×. That check was worth
+running: between the captured run above and that one, `class-prototype-hot` had
+silently regressed to **7.99×** and the suite to 2.38× on one missing whitelist
+arm, with byte-identical output the whole time and nothing in the table to show
+it. See `PERF_ROADMAP.md` B59. Re-run the harness at HEAD before quoting a
+number from this table.
+
 zipp beats V8 on specific shapes: scalar-numeric kernels, self-recursive integer
 functions, `s += …` string accumulation, dense-integer `Array` loops
 (`for (i < a.length) s += a[i]` runs at 18ms against node's 12ms over 20M

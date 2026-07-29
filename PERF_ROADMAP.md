@@ -164,7 +164,40 @@ is a `diff`, not a remembered number. It was stale for a long stretch (the
 2,194-line oxc-era list against a 938-failure run), which made that diff
 meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — cold geomean 1.90×; historical adjusted geomean 2.15×
+### Performance — cold geomean 1.98× at HEAD (2026-07-29, 21 reps)
+
+> **RE-MEASURED 2026-07-29 at `799ead6` + the B59 fix**, because the table below
+> had gone stale in a way that mattered: `class-prototype-hot` had silently
+> regressed to **7.99×** and the suite to **2.38×**, and this file still said
+> 1.27× / 1.90×. See **B59** — the cause was one missing arm in a whitelist.
+>
+> | | node | zipp | cold paired ratio | baseline (regressed) |
+> |---|---|---|---|---|
+> | map-set-heavy | 709ms | 711ms | 1.00× | 1.00× |
+> | class-prototype-hot | 293ms | 378ms | **1.28×** | **7.99×** |
+> | markdown-render | 268ms | 447ms | 1.67× | 1.70× |
+> | json-large | 265ms | 498ms | 1.88× | 1.88× |
+> | polymorphic-objects | 324ms | 604ms | 1.86× | 1.86× |
+> | async-promise-chain | 330ms | 639ms | 1.93× | 1.90× |
+> | sparse-array | 80ms | 159ms | 1.99× | 2.03× |
+> | parse-large-js | 268ms | 596ms | 2.23× | 2.24× |
+> | typedarray-math | 202ms | 640ms | 3.16× | 3.17× |
+> | regex-log-scan | 451ms | 2010ms | 4.46× | 4.51× |
+>
+> Geomean **1.98×** (95% CI 1.97×–1.98×), from **2.38×**; startup node 29.8ms vs
+> zipp 7.7ms; `ALL_CORRECT=1`. Raw: `bench/final_2026-07-29.json`, with the
+> regressed baseline retained beside it as `bench/opt_baseline_2026-07-29.json`
+> so the delta is reproducible from artifacts rather than from this prose. The two
+> runs' NODE medians agree within 1% on every row, which is what makes the last
+> column a fair comparison; a third run mid-session on a loaded box put every row
+> ~10% slower on both engines and read 1.92× (`bench/superinline_2026-07-29.json`)
+> — same fix, same ratios, different absolute times.
+>
+> Note what did NOT move: nine of ten rows are inside their old intervals. The
+> whole 2.38× → 1.98× is one row. Two rows sit outside the 2026-07-28 table's
+> intervals in BOTH the before and after runs — `map-set-heavy` 0.90×→1.00× and
+> `regex-log-scan` 4.00×→4.46× — so they predate this work, are unexplained, and
+> want an independent session before anything is concluded from them.
 
 `bench/real/*.js` via the schema-v2 `tools/bench.py`, 15 counterbalanced paired
 observations, exact-byte output comparison. These are cold total medians and
@@ -1485,6 +1518,93 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B59 — `SuperBase` was not in the method-inline whitelist: class-prototype-hot had silently regressed 1.27× → 7.99×
+
+**The single largest performance item in this file, and it was a restoration, not
+an optimisation.** Between the `1388621` benchmark artifact and `799ead6`,
+`class-prototype-hot` went from 381ms / **1.27×** to 2340ms / **7.99×** — and the
+cold suite geomean from 1.90× to **2.38×**. Nothing in this document recorded it.
+Fixed; re-measured at 378ms / **1.28×** and geomean **1.98×** (21 counterbalanced
+paired reps, `bench/final_2026-07-29.json` against
+`bench/opt_baseline_2026-07-29.json`, node medians agreeing within 1% row-for-row,
+`ALL_CORRECT=1`). Nine of the ten rows did not move: the entire 0.40 geomean delta
+is this one row.
+
+**Cause.** `aca09d3` split `super.m()` codegen into a separate `SuperBase`
+capture plus `SuperMethod { base }`, because GetSuperBase happens at
+MakeSuperPropertyReference time — before the argument list runs. The compiler now
+plants `SuperBase` ahead of every `super.m()`, `super.x` write and computed super
+form (`compile/calls.rs:687`, `compile/assign.rs:296,304,787,907`,
+`compile/exprs.rs:1830,1865`). Two whitelists gate super bodies, and only one was
+taught the new op:
+
+  * `method_body_inlinable_scan` (`vm/engine/method_inline.rs:171`) — the
+    OFF-FRAME evaluator. Updated in the same commit. Still worked.
+  * `method_inline_body_ok` (`vm/engine/jit_plans.rs`) — the NATIVE region
+    inliner. Not updated, so every super-using body hit its `_ => return None`.
+    `build_method_shape` / `build_accessor_shape` then declined, and
+    `build_method_inline_plan` returned **silently** at its `shapes.is_empty()`
+    continue — no log line, no counter, no decline reason.
+
+So B51/B52's inlined `super.m()` / `super.v` / `super.v = x` all stopped being
+emitted, and `objs[i & 3].area()` fell back to two nested frame calls:
+
+    per-call, 8M iterations              was      now
+    mono `super.area()`                55.8ns    6.9ns
+    4-shape polymorphic, 2 use super   32.6ns    6.6ns
+    same method with NO super           4.3ns    4.3ns   (never regressed)
+
+    class-prototype-hot phase          was      now     node
+    32M polymorphic method calls      1923ms   261ms     40ms
+    8M accessor round-trips            339ms    63ms    183ms   (now 2.9x FASTER)
+    8M depth-5 proto-chain reads        61ms    62ms     31ms   (untouched)
+
+**Why it hid.** `ZIPP_NO_METHOD_INLINE=1` changed the regressed timings by 0ms —
+the kill switch for a mechanism that was already fully declining looks exactly
+like the mechanism being absent. There is no `[mi] … DECLINE` log to pair with
+`[mi] … INLINE`, and test262 cannot see it: these paths only compile in hot
+loops, and the output stayed byte-identical the whole time. It was found by
+re-running the suite at HEAD rather than trusting this file's table.
+
+**The fix** admits `I::SuperBase { dst, .. }` under `allow_super` and drops the op
+in `emit_mi_body`. Dropping it is what needs the argument: the inlined Super* arms
+resolve through their BAKED plan (class epoch + one version guard per chain hop +
+a holder-slot re-read) and never dereference `base`, so the register the capture
+writes has no inlined consumer. Rather than assert that, `mi_super_base_dst_dead`
+PROVES it per body — it enumerates the reads of exactly the ops
+`method_inline_body_ok` admits, with the `base` fields deliberately excluded, and
+counts anything it does not recognise as a read. Growing that whitelist without
+revisiting it therefore makes a body DECLINE, never silently read a register the
+emitter left stale. That is the property whose absence caused this entry.
+
+**Standing-gate lesson, and it is the same one as B50.** Two admission lists for
+the same concept drifted apart, silently, and the cost was 6× on a benchmark row
+for an unknown number of commits. B50 converged three of them and said so. This
+is the fourth. Any new bytecode op must be added to every whitelist that
+enumerates ops, or the emitters must share one list.
+
+**Two pre-existing spec deviations surfaced while writing the differential tests**
+(both identical under `ZIPP_NOJIT=1` and on the pre-fix build, so neither is
+caused by inlining — pinned in `tests/super_method_inline.rs` as tier-consistency
+tests and recorded in §6):
+
+  * `super.m(arg)` where `arg` re-targets the chain: zipp resolves the METHOD
+    after the argument list, V8 before it (13.3.6.1 GetValue precedes
+    ArgumentListEvaluation). `aca09d3` captured the base up front but not the
+    callee, so the ordering fix is only half done.
+  * Re-executing a class declaration retargets an OLD instance's `super`, because
+    `super` resolves through the one `class_values` slot a `class_id` owns.
+
+**Also re-confirmed here: B22/B32 stand.** Admitting a DV-pinned integer
+`CallMethod` to the INT tier was built again (`dv_get_kind_int`, planner
+receiver-exemption, and the int-lane load with both endianness branches) and
+**reverted again**. It moves the log line from `INT decline: region_is_int=false`
+to `[decline-reason] pinned receiver reg not cleanly excludable` and nothing else
+— `dv_ms` 370 → 361, inside noise — exactly the second gate B32 names. The
+emitter is correct and unreachable, which is the B9 failure mode. Do not restart
+it before the receiver multi-def blocker; and note B32's other gate too (a 43-op
+region exceeds the 14-home pool).
 
 ### B58 — The V8-parity plan audit: contained work is safe; the architectural gap remains
 
@@ -3309,6 +3429,23 @@ before the object model is stable means speculating against a moving target.
 Things that are wrong on purpose, or wrong and unfixed. Keep this list short and
 current.
 
+- **`super.m(arg)` resolves the method AFTER the argument list.** Per 13.3.6.1
+  the reference's `GetValue` — the `super.m` lookup itself — precedes
+  ArgumentListEvaluation, so an argument that calls
+  `Object.setPrototypeOf(C.prototype, other)` must not affect the call it is an
+  argument to. `aca09d3` fixed the BASE half of this (the `SuperBase` capture)
+  and not the callee half, so zipp prints `LATER2` where V8 prints `A2`. Both
+  tiers agree; pinned by `super_ordering_argument_list_swap_is_tier_consistent`
+  in `tests/super_method_inline.rs`. Closing it means carrying the resolved
+  callee out of `SuperBase`, not just the base.
+- **Re-executing a class declaration retargets an older instance's `super`.**
+  `super` resolves through the single `class_values` slot a `class_id` owns, so
+  a second evaluation of the same `class B extends A` — a class declared inside
+  a function called twice — makes the FIRST instance's `super.m()` reach the
+  SECOND `A.prototype`. V8 gives each evaluation a distinct class. Both tiers
+  agree; pinned by
+  `super_method_inline_class_redefinition_is_tier_consistent`. The fix is a
+  per-closure home object rather than a per-class-id slot.
 - **TypedArray named properties ignore the prototype chain.**
   `vm/props/member.rs` answers `length`/`byteLength`/`byteOffset`/`buffer`/
   `BYTES_PER_ELEMENT`/`@@toStringTag` from the instance, so
