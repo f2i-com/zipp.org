@@ -542,7 +542,7 @@ pub struct Vm<'p> {
     prototypes: std::collections::HashMap<u32, u32>,
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
-    proto_of: rustc_hash::FxHashMap<u32, Value>,
+    proto_of: crate::slot_table::SlotTable<Value>,
     /// Per-function-id LEARNED own-property count of the instances a user
     /// constructor produces, used to pre-size the next instance's `ObjMap`.
     ///
@@ -562,7 +562,7 @@ pub struct Vm<'p> {
     /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.
-    fn_props: rustc_hash::FxHashMap<u32, ObjMap>,
+    fn_props: crate::slot_table::SlotTable<ObjMap>,
     /// The own-property state of every exotic object that has nowhere inline to
     /// put it, keyed by its heap index: an Array's named props (`arr.foo = 1`,
     /// and a regex match-result's `index`/`input`/`groups`), a Map/Set/Date/
@@ -640,7 +640,7 @@ pub struct Vm<'p> {
     /// (`js_array_len` falls back to `items.len()`). Values are `1..=u32::MAX`
     /// (a JS length is at most 2^32-1) and always exceed both the dense length
     /// and `MAX_DENSE_ARRAY_LEN` at insertion time.
-    array_js_len: std::collections::HashMap<u32, u32>,
+    array_js_len: crate::slot_table::SlotTable<u32>,
     /// Set once an integer-indexed own property is defined on `Array.prototype` or
     /// `Object.prototype` (the prototypes in every plain array's chain). While false
     /// — the overwhelmingly common case — `a[i] = v` for an absent index takes the
@@ -884,7 +884,7 @@ pub struct Vm<'p> {
     /// for an unmapped one (strict / non-simple). Presence alone drives the
     /// `[object Arguments]` toString tag and the Array-exotic carve-outs
     /// (ordinary `length`, no Vec growth). Pruned on GC sweep.
-    arguments_objs: std::collections::HashMap<u32, Option<ArgsMap>>,
+    arguments_objs: crate::slot_table::SlotTable<Option<ArgsMap>>,
     /// Generator/async-function activations with a MAPPED `arguments` object:
     /// state heap index (HeapObj::Generator / AsyncState / AsyncGenState) → the
     /// arguments object's heap index. Each resume re-links the [[ParameterMap]]

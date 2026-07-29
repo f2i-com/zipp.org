@@ -1620,6 +1620,56 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B64 — The same mechanism, four more tables: `proto_of`, `arguments_objs`, `array_js_len`, `fn_props` go slot-indexed — suite −1.06%
+
+B63's closing note said `Vm` has ~40 more `HashMap<u32, _>` side tables keyed by
+heap slot and that B63 was the first evidence about what that shape costs. This
+collects on it. Reference counts said `proto_of` (190 uses) dwarfs the rest, but
+count is not hotness — the four picked here are the ones probed on paths that run
+per *operation* rather than per *object*, with no `is_empty()` guard in front:
+
+* **`proto_of`** — every prototype-chain walk, and `proto_chain_blocks_set` probes
+  it again at each of up to eight hops per property write;
+* **`arguments_objs`** — `args_mapped_get` does an unguarded
+  `arguments_objs.get(&idx)?` and is called from `get_index`'s Array arm and
+  `member.rs`, i.e. on **every array element read**, for a table that is empty in
+  any program with no mapped `arguments`;
+* **`array_js_len`** — `js_array_len` probes it for **every array `.length`**,
+  for a table only sparse arrays ever populate;
+* **`fn_props`** — every named property access on a callable.
+
+Deliberately NOT converted: `module_namespaces`, `deferred_ns_state` and
+`obj_realm`, which sit on the same hot paths but *are* behind `is_empty()` and are
+empty in every non-module program; and `array_length_nonwritable`, which is a
+`HashSet` and would need a set variant for a colder path. Converting a cold table
+buys nothing and costs its paged index.
+
+All four are drop-in — the only new `SlotTable` API this needed is one
+`Entry::or_default`, for `setup.rs:877`.
+
+Measured `--ab`, 15 counterbalanced paired reps, `3eaf9ed` vs this
+(`bench/slottable_4more_ab_2026-07-29.json`):
+
+| row | old | new | paired | 95% CI |
+|---|---:|---:|---:|---|
+| `async-promise-chain` | 634ms | 618ms | **−3.1%** | [−3.7, −1.8] |
+| `regex-log-scan` | 1706ms | 1657ms | **−2.9%** | [−4.8, −1.6] |
+| `parse-large-js` | 597ms | 589ms | −1.2% | [−1.8, −1.0] |
+| `sparse-array` | 158ms | 157ms | −1.1% | [−1.9, −0.6] |
+| `json-large` | 481ms | 473ms | −1.0% | [−2.0, +0.2] |
+| `markdown-render` | 460ms | 451ms | −0.7% | [−1.4, +0.6] |
+
+**Suite geomean −1.06% [−1.68, −0.70]**, nothing regressed, `ALL_CORRECT=1`. Not
+decomposed per table: they are one mechanism, B63 already priced that mechanism,
+and the row profile (async and regex first, both prototype-walk-heavy) is what
+`proto_of` predicts. Memory is self-limiting — `SlotTable` frees a page when its
+last entry goes, so the two tables that are empty in most programs cost nothing.
+
+**Running total for the container shape: −3.63% (B63) and −1.06% here, from a
+data-structure choice nobody had priced.** The remaining ~35 tables are colder
+and mostly `is_empty()`-guarded; the next one worth measuring is whichever a
+profiler says, not whichever has the most references.
+
 ### B63 — The match-result side table, decomposed: 79% of it is the CONTAINER. `arr_props` goes slot-indexed — regex-log-scan −10.6%, async-promise-chain −12.4%, suite −3.63%
 
 B33-C / RLS-1 again — the item B55 deferred and B60 called "the largest measured

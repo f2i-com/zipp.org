@@ -30,6 +30,16 @@
 //! write-plus-hop on for the rest of the process. Direct indexing makes that
 //! guard almost irrelevant.
 //!
+//! **Now backs five tables**, the other four picked for being probed per
+//! OPERATION rather than per object, with no `is_empty()` guard: `proto_of`
+//! (every prototype-chain walk, and again at each of up to eight hops in
+//! `proto_chain_blocks_set`), `arguments_objs` (`args_mapped_get`, on every
+//! array element read), `array_js_len` (every array `.length`), and `fn_props`.
+//! Together **−1.06%** [−1.68, −0.70] on top of the above. A table that is
+//! `is_empty()`-guarded and empty in most programs — `module_namespaces`,
+//! `deferred_ns_state`, `obj_realm` — is NOT worth converting: it is already
+//! free, and it would pay for a paged index it never uses.
+//!
 //! The API is deliberately the subset of `HashMap`'s that the VM actually uses,
 //! with identical signatures, so swapping a field's type is not a call-site
 //! change and cannot alter behaviour.
@@ -220,8 +230,8 @@ impl<V> SlotTable<V> {
     }
 }
 
-/// `HashMap::entry`'s shape, restricted to `or_insert_with` — the only form the
-/// VM uses, always as `.entry(idx).or_insert_with(ObjMap::new_side_table)`.
+/// `HashMap::entry`'s shape, restricted to the two forms the VM uses:
+/// `.entry(idx).or_insert_with(ObjMap::new_side_table)` and one `.or_default()`.
 pub(crate) struct Entry<'a, V> {
     table: &'a mut SlotTable<V>,
     key: u32,
@@ -239,6 +249,13 @@ impl<'a, V> Entry<'a, V> {
             }
         };
         &mut self.table.vals[p]
+    }
+}
+
+impl<'a, V: Default> Entry<'a, V> {
+    #[inline]
+    pub(crate) fn or_default(self) -> &'a mut V {
+        self.or_insert_with(V::default)
     }
 }
 
