@@ -1266,8 +1266,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::TypeOf { dst, a } => {
                         let va = self.get(base, a);
-                        let t = self.type_of(va);
-                        let v = self.alloc_str(t.to_string());
+                        let v = self.typeof_value(va);
                         self.set(base, dst, v);
                         ip += 1;
                     }

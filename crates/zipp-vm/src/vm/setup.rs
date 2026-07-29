@@ -272,6 +272,15 @@ impl<'p> Vm<'p> {
     /// usable as first-class values (what the test262 harness binds).
     pub(crate) fn setup_globals(&mut self) {
         use native::*;
+        // Intern the eight `typeof` results once. This runs before
+        // `set_gc_floor`, so the slots land below the floor and are pinned for
+        // the VM's lifetime — no rooting, no per-GC work. See
+        // `Vm::typeof_value`: the unfused `TypeOf` op previously allocated a
+        // fresh string per evaluation (65ns) and made the `t === "number"` that
+        // follows a content compare.
+        for (i, name) in crate::bytecode::TYPEOF_NAMES.iter().enumerate() {
+            self.typeof_strs[i] = self.alloc_str((*name).to_string());
+        }
         // A built-in method property: a native function, non-enumerable but
         // writable + configurable (matching built-in method descriptors).
         let method_attr = PropAttr {

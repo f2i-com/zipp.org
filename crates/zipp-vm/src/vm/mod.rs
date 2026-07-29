@@ -459,6 +459,15 @@ pub struct Vm<'p> {
     /// (14 slots). Refreshed by every successful RegExpBuiltinExec; empty until
     /// the first match (the accessors then yield their empty-string defaults).
     regexp_last: Vec<Value>,
+    /// The eight `typeof` result strings, interned once in `setup_globals` (so
+    /// below `gc_floor` and pinned for the VM's lifetime). Indexed by position in
+    /// [`crate::bytecode::TYPEOF_NAMES`]. `UNDEFINED` before setup runs, which
+    /// `typeof_value` treats as "not ready" and falls back to allocating.
+    ///
+    /// Before this, every unfused `typeof` allocated a fresh string and the
+    /// `t === "number"` that follows content-compared it: 65ns per evaluation
+    /// against the fused `TypeOfIs` form's 4ns.
+    typeof_strs: [Value; 8],
     /// Deferred form of `regexp_last`'s slots 2..=13 after a successful match on a
     /// flat-ASCII subject: the twelve of them are all slices of that one subject,
     /// and materialising them cost ~8.7% of `regex-log-scan` for values almost no

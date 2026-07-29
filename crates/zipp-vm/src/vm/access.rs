@@ -32,6 +32,33 @@ enum ProtoSet {
 impl<'p> Vm<'p> {
     /// JS `typeof` type-name. `null` is `"object"` (a historic quirk); functions
     /// and closures are `"function"`; arrays and objects are `"object"`.
+    /// `typeof v` as a heap string Value, using the eight PERMANENTLY interned
+    /// results rather than allocating one per evaluation.
+    ///
+    /// The unfused `TypeOf` op allocated a fresh heap string every time — a
+    /// `String` malloc, a `JsStr::new` ASCII scan and a heap slot — and because
+    /// each result was a distinct object, the `t === "number"` that almost always
+    /// follows had to CONTENT-compare it. Measured at **65ns per `typeof`**
+    /// against the fused `TypeOfIs` form's 4ns (5M iterations; node ~0ns for
+    /// both). Returning a shared handle removes the allocation and makes that
+    /// comparison a handle compare.
+    ///
+    /// Sharing is safe because heap strings are immutable and a primitive's
+    /// identity is not observable: `typeof a === typeof b` was already true
+    /// whenever the names matched, and is now true by pointer instead of by
+    /// content. The handles are allocated in `setup_globals`, i.e. below
+    /// `gc_floor`, so they are pinned for the VM's lifetime and need no rooting.
+    ///
+    /// Falls back to allocating if the table is not yet populated (a `typeof`
+    /// evaluated before `setup_globals`), so this can never return a bad handle.
+    pub(crate) fn typeof_value(&mut self, v: Value) -> Value {
+        let name = self.type_of(v);
+        match crate::bytecode::TYPEOF_NAMES.iter().position(|&n| n == name) {
+            Some(i) if !self.typeof_strs[i].is_undefined() => self.typeof_strs[i],
+            _ => self.alloc_str(name.to_string()),
+        }
+    }
+
     pub(crate) fn type_of(&self, v: Value) -> &'static str {
         if v.is_int() || v.is_double() {
             "number"

@@ -1603,6 +1603,78 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B62 — `typeof` interned: json-large −6.7%, and the roadmap's own estimate for it was wrong in both directions
+
+The last unrefuted row of B50's prize table said "`typeof` allocates its result
+string, ~45ms suite-wide, 8 permanent interned slots would do it". Both halves of
+that were off, and the way they were off is the useful part.
+
+**"~45ms suite-wide" was wrong: it is ONE site.** B54 fused `typeof x === "lit"`
+into `TypeOfIs`, which allocates nothing — so the estimate, written before B54,
+counted sites that no longer exist. Counting `TypeOf` vs `TypeOfIs` in the actual
+bytecode: `markdown-render` 0/0, `parse-large-js` 0/0, `polymorphic-objects` 0/0,
+`json-large` **1**/0, `map-set-heavy` 0/**2**. So the entire suite exposure is
+`json-large:68`, `var t = typeof v;` in `walk` — which escapes B54 precisely
+because the result goes through a local and is then compared three times, not
+compared inline.
+
+**And the per-call cost was much worse than "an allocation".** Isolated, 5M
+iterations:
+
+| | zipp | node |
+|---|---:|---:|
+| `var x = typeof v; x === "number"` | **345ms** (65ns) | 8ms |
+| `typeof v === "number"` (B54-fused) | 38ms (4ns) | 4ms |
+| control, no `typeof` | 18ms | 8ms |
+
+**16× between two spellings of the same operation.** Two mechanisms, not one:
+`alloc_str(type_of(v).to_string())` allocated a fresh heap string per evaluation
+AND, because each result was a distinct object, the `t === "number"` that follows
+had to CONTENT-compare it.
+
+**Landed:** the eight results are interned once in `setup_globals`, which runs
+before `set_gc_floor`, so they sit below the floor and are pinned for the VM's
+lifetime — no rooting, no per-GC work. `Vm::typeof_value` maps `type_of`'s
+`&'static str` through `bytecode::TYPEOF_NAMES` (already the canonical table, used
+by `TypeOfIs`) and both materialization sites — the interpreter arm and Tier C's
+`jit_typeof` — now share it. Sharing is sound because heap strings are immutable
+and a primitive's identity is not observable; `typeof a === typeof b` was already
+true whenever the names matched.
+
+Measured `--ab`, 15 counterbalanced paired reps: **json-large −6.7% [−8.5, −6.2]**
+(499→463ms), suite geomean **−1.01% [−1.44, −0.59]**, nothing regressed.
+
+The same run showed `markdown-render` −2.1% [−2.5, −0.7], and that is NOT claimed
+as a win: `markdown-render.js` contains no `typeof` at all (0 `TypeOf`, 0
+`TypeOfIs`), and B61 measured this exact row moving +1.5% from a pure code-layout
+perturbation. Attribute it to layout until something explains it. `json-large` is
+the only row here with a mechanism.
+
+**The estimate was also wrong in the OTHER direction, which is worth recording
+because it is the first time in this file.** Bottom-up, this should have been
+~13ms: 788k evaluations (150,021 nodes × 6 rounds, minus nulls) × the 17ns the
+microbenchmark attributes to the allocation. It measured 36ms. The difference is
+second-order: 788k fewer heap strings is 788k fewer `live` increments, so fewer
+collections on a row this file puts at ~22% GC. **Removing an allocation from a
+GC-heavy row can beat its own direct cost** — the mirror image of B29/B49/B33/B61,
+where allocation counts over-predicted. Neither direction is safe to assume; both
+need the ablation.
+
+Not done: the remaining 48ns. The interned handle still differs from the *bytecode
+string constant* `"number"`, so `t === "number"` is still a content compare. The
+real fix for that shape is to extend B54's fusion to a single-assignment local —
+if every use of a `TypeOf` dst is an `Eq`/`Ne` against a string literal, rewrite
+each to `TypeOfIs` and drop the `TypeOf`. The microbenchmark bounds that at
+another ~44ns/call, i.e. ~35ms of `json-large`. That is a compile-side peephole,
+not a runtime change.
+
+Gate: test262 95936/95942, FAIL set identical (6/6); `cargo test --workspace
+--release` green; 8 new tests in `tests/typeof_interned.rs`; a 22-value ×
+8-property differential identical to node, to the pre-change binary, and under
+both `ZIPP_NOJIT=1` and `ZIPP_GC_STRESS=1`; GC-stress also on a bounded
+`typeof`-over-JSON-walk built for this (the full `json-large` under
+`ZIPP_GC_STRESS=1` does not terminate in reasonable time, which is pre-existing).
+
 ### B61 — Build identity + an A/A refusal in the harness; and the async register-window allocation is REFUTED at 0.34%
 
 Three things, from acting on an external audit of `7dfcfe8`.
@@ -2522,7 +2594,7 @@ backlog, and none of them is an admission change:
 | the match result's `arr_props` side table — **STILL OPEN, now the largest measured item in the file** | **~190ms** est; **B60 ABLATED IT AT −13.5%** of the row | `regex-log-scan`; B33-C's mechanism at 5× its recorded price — 456ns to CREATE the entry vs 115ns for a first property on a plain object. Effort XL, and gated on centralizing ~257 `arr_props` references across 12+ files first |
 | ~~`o["k" + i] = v` fusion, done soundly~~ **LANDED as B57, −16.2%** | ~~~108ms~~ | `polymorphic-objects`; the second attempt was the sound one (`ToConcatKey`) |
 | ~~`ToPropKey` invisible to `writes_reg`/`instr_uses`~~ **LANDED as B53** | ~~~39ms~~ | `typedarray-math` `normalize`. The external audit's do-not-repeat list names re-adding this |
-| `typeof` allocates its result string — **OPEN**, and the cheapest unrefuted item here | ~45ms suite-wide | `type_of` already returns `&'static str`; 8 permanent interned slots would do it. NOTE: an adversarial verifier rejected the naive framing — price it by ablation before building, since B49 shows removing an allocation is not worth its allocation count |
+| ~~`typeof` allocates its result string~~ **LANDED as B62: json-large −6.7%** | ~~~45ms suite-wide~~ — the estimate was wrong BOTH ways: it is ONE site in the whole suite (B54 fused the rest), and it measured 36ms not 13ms because of second-order GC | Interned in `setup_globals` below `gc_floor`. Remaining ~44ns/call needs B54's fusion extended to a single-assignment local — see B62 |
 
 ### B49 — B36's MARGINAL term: 40% of it IS allocation, and interning it does
 not pay — CLOSED after three attempts

@@ -1902,8 +1902,7 @@ pub(crate) extern "win64" fn jit_typeof_is(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_typeof(vm: *mut core::ffi::c_void, v_bits: u64) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    let t: &'static str = vm.type_of(Value::from_bits(v_bits));
-    vm.alloc_str(t.to_string()).bits()
+    vm.typeof_value(Value::from_bits(v_bits)).bits()
 }
 
 /// Win64 helper for Tier C `IsArray` (`Array.isArray(v)`): returns the Bool
