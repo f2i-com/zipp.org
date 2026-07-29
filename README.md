@@ -170,38 +170,36 @@ for reasons that have nothing to do with the engine. If an existing clone has it
 on: `git config core.autocrlf false && git rm --cached -r -q . && git reset
 --hard`.
 
-**Performance — cold geomean 1.90× zipp/node (95% CI 1.87×–1.92×)** on the
-ten programs in `bench/real/`, 15 counterbalanced paired observations, every
+**Performance — cold geomean 1.89× zipp/node (95% CI 1.87×–1.90×)** on the
+ten programs in `bench/real/`, 21 counterbalanced paired observations, every
 output byte-identical to Node:
 
 | bench | node | zipp | paired ratio (95% CI) |
 |---|---|---|---|
-| map-set-heavy | 923ms | 818ms | **0.90× [0.82, 0.99]** |
-| class-prototype-hot | 299ms | 381ms | 1.27× [1.24, 1.30] |
-| markdown-render | 287ms | 478ms | 1.65× [1.61, 1.72] |
-| json-large | 300ms | 534ms | 1.77× [1.68, 1.82] |
-| async-promise-chain | 351ms | 644ms | 1.85× [1.84, 1.85] |
-| polymorphic-objects | 331ms | 622ms | 1.88× [1.85, 1.90] |
-| sparse-array | 85ms | 162ms | 1.92× [1.91, 1.94] |
-| parse-large-js | 280ms | 601ms | 2.16× [2.13, 2.19] |
-| typedarray-math | 210ms | 650ms | 3.11× [3.09, 3.17] |
-| regex-log-scan | 467ms | 1890ms | 4.00× [3.99, 4.05] |
+| map-set-heavy | 862ms | 825ms | **0.93× [0.85, 1.00]** |
+| class-prototype-hot | 297ms | 382ms | 1.29× [1.26, 1.31] |
+| markdown-render | 279ms | 468ms | 1.65× [1.63, 1.73] |
+| json-large | 291ms | 485ms | 1.70× [1.66, 1.73] |
+| polymorphic-objects | 331ms | 616ms | 1.87× [1.86, 1.88] |
+| async-promise-chain | 343ms | 637ms | 1.87× [1.86, 1.91] |
+| sparse-array | 81ms | 159ms | 1.94× [1.91, 1.98] |
+| parse-large-js | 279ms | 608ms | 2.20× [2.16, 2.22] |
+| typedarray-math | 204ms | 652ms | 3.18× [3.09, 3.22] |
+| regex-log-scan | 474ms | 1746ms | 3.65× [3.57, 3.69] |
 
-Cold total is now the primary metric. In the historical convention that
-subtracts median process startup, the same captured run is **2.15×**. Zipp
-starts about 4× faster than Node (7.8ms vs 32.2ms — no snapshot to load).
+Cold total is the primary metric. Zipp starts about 4× faster than Node (8.0ms
+vs 30.8ms — no snapshot to load).
 
-Those medians are from one captured run (`bench/final_default_2026-07-28.json`);
-re-measuring at a later commit gives the same ratios but not the same absolute
-milliseconds, because the box moves. **Re-verified 2026-07-29 at 21 paired reps**
-(`bench/lazystatics_2026-07-29.json`): geomean **1.95×** [1.94, 1.96],
-`ALL_CORRECT=1`, `class-prototype-hot` back to 1.30× and `regex-log-scan` down to
-**4.12×** from 4.46× (`PERF_ROADMAP.md` B60). That check was worth
-running: between the captured run above and that one, `class-prototype-hot` had
-silently regressed to **7.99×** and the suite to 2.38× on one missing whitelist
-arm, with byte-identical output the whole time and nothing in the table to show
-it. See `PERF_ROADMAP.md` B59. Re-run the harness at HEAD before quoting a
-number from this table.
+This capture is `bench/b63_clean_2026-07-29.json`, and it is the first one taken
+from a tree `zipp --version --json` reports as `dirty: false`, so the numbers and
+the source identity go together. Re-measuring at a later commit gives the same
+ratios but not the same absolute milliseconds, because the box moves.
+
+Checking this table is worth doing rather than trusting it: between two earlier
+captures `class-prototype-hot` had silently regressed to **7.99×** and the suite
+to 2.38× on one missing whitelist arm, with byte-identical output the whole time
+and nothing in the table to show it (`PERF_ROADMAP.md` B59). Re-run the harness
+at HEAD before quoting a number from here.
 
 zipp beats V8 on specific shapes: scalar-numeric kernels, self-recursive integer
 functions, `s += …` string accumulation, dense-integer `Array` loops
@@ -241,21 +239,20 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today (cold total) | 1.90× |
-| `regex-log-scan` at Node parity | **1.65×** |
-| `typedarray-math` at Node parity | **1.69×** |
-| **both of the two worst at Node parity** | **1.47×** |
+| today (cold total) | 1.89× |
+| `regex-log-scan` at Node parity | **1.66×** |
+| `typedarray-math` at Node parity | **1.68×** |
+| **both of the two worst at Node parity** | **1.48×** |
 
-(Computed from the captured table above, so 1.90× is that run's headline; the
-2026-07-29 re-measure is 1.95× with `regex-log-scan` at 4.12×. The *shape* of the
-arithmetic is what matters here and it does not move: the two worst rows going to
-parity is worth ~0.45 of geomean, and no contained fix reaches that.)
+(The *shape* of this arithmetic is what matters and it does not move as the
+headline does: the two worst rows going to parity is worth ~0.4 of geomean, and
+no contained fix reaches that.)
 
-The cold score being below 2× is not general parity: nine rows remain slower,
-the two worst are 4.00× and 3.11×, and the historical startup-adjusted score is
-2.15×. The contained fixes in `PERF_ROADMAP.md` are safe substrate, but moving
-toward 1× still requires stable shape metadata, an optimizing CFG/SSA tier, and
-arena/nursery allocation rather than a stack of unmeasured 1–2% tweaks.
+The cold score being below 2× is not general parity: nine rows remain slower and
+the two worst are 3.65× and 3.18×. The contained fixes in `PERF_ROADMAP.md` are
+safe substrate, but moving toward 1× still requires stable shape metadata, an
+optimizing CFG/SSA tier, and arena/nursery allocation rather than a stack of
+unmeasured 1–2% tweaks.
 
 **One number explains most of the rest: the general (boxed) JIT tier costs
 ~3.5ns per op.** A property read measured at 21ns is not a 21ns read — it is a

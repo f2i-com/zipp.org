@@ -164,9 +164,26 @@ is a `diff`, not a remembered number. It was stale for a long stretch (the
 2,194-line oxc-era list against a 938-failure run), which made that diff
 meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — cold geomean 1.95× at HEAD (2026-07-29, 21 reps)
+### Performance — cold geomean 1.89× at HEAD (2026-07-29, 21 reps)
 
-> **B60 (lazy Annex B legacy statics) moved it again**, same box, same 21-rep
+> **B63 (`arr_props` goes slot-indexed) moved it again**, and this is the first
+> capture in this file taken from a CLEAN tree — `zipp --version --json` reports
+> `dirty: false` at `d1a5c59` (`bench/b63_clean_2026-07-29.json`):
+>
+> | | node | zipp | ratio | was (B62) |
+> |---|---:|---:|---:|---:|
+> | regex-log-scan | 474ms | 1746ms | **3.65×** | 4.14× |
+> | map-set-heavy | 862ms | 825ms | **0.93×** | 0.97× |
+> | json-large | 291ms | 485ms | 1.70× | 1.78× |
+> | geomean | | | **1.89×** [1.87, 1.90] | 1.95× |
+>
+> `ALL_CORRECT=1`. The suite delta agrees with B63's isolated `--ab` (−3.63%) to
+> within noise, which is the check that the suite number and the paired A/B are
+> measuring the same thing. `map-set-heavy` is now clearly ahead of node rather
+> than at parity, and `regex-log-scan` has gone 4.46× → 4.12× → **3.65×** across
+> B60 and B63 without the compact-metadata project the plan called for.
+
+> **B60 (lazy Annex B legacy statics) moved it before that**, same box, same 21-rep
 > protocol (`bench/lazystatics_2026-07-29.json`):
 >
 > | | node | zipp | ratio | was (B59) |
