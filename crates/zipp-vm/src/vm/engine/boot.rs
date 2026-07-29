@@ -123,7 +123,7 @@ impl<'p> Vm<'p> {
             proto_of: rustc_hash::FxHashMap::default(),
             ctor_field_hint: Vec::new(),
             fn_props: rustc_hash::FxHashMap::default(),
-            arr_props: rustc_hash::FxHashMap::default(),
+            arr_props: crate::slot_table::SlotTable::default(),
             ab_max: std::collections::HashMap::new(),
             ta_tracking: std::collections::HashSet::new(),
             async_activations: Vec::new(),

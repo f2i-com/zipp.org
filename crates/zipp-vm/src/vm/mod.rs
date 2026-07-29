@@ -563,12 +563,26 @@ pub struct Vm<'p> {
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.
     fn_props: rustc_hash::FxHashMap<u32, ObjMap>,
-    /// Non-index string-keyed own properties of an Array (`arr.foo = 1`, and a
-    /// regex match-result's `index`/`input`/`groups`), keyed by the array's heap
-    /// index. `HeapObj::Array` is a dense `Vec<Value>` with no inline property
-    /// map, so its (rare) named own properties live here — exactly mirroring
-    /// `fn_props` for callables. Numeric indices + `length` stay in the Vec.
-    arr_props: rustc_hash::FxHashMap<u32, ObjMap>,
+    /// The own-property state of every exotic object that has nowhere inline to
+    /// put it, keyed by its heap index: an Array's named props (`arr.foo = 1`,
+    /// and a regex match-result's `index`/`input`/`groups`), a Map/Set/Date/
+    /// RegExp/Intl instance's assigned props, and the per-object
+    /// extensible/sealed/frozen markers. `HeapObj::Array` is a dense `Vec<Value>`
+    /// with no inline property map, so this mirrors `fn_props` for callables.
+    ///
+    /// NOT only named keys, despite the name: a SPARSE element past the dense
+    /// prefix and a `defineProperty`'d index override both live here under the
+    /// canonical decimal key, and `length` can too. That is why the dense-array
+    /// fast paths cannot use mere presence as their disqualifier — they have to
+    /// ask whether any key here actually names an element.
+    ///
+    /// Keyed by heap slot, so it is a [`crate::slot_table::SlotTable`] rather than
+    /// a hash map: `exec`/`matchAll` park `index`/`input`/`groups` here, which on
+    /// `regex-log-scan` inflates the table to hundreds of thousands of entries
+    /// inside one phase. Ablating those four properties is −14.9% of that row and
+    /// **79% of it survives when only the table insert is removed** — the cost was
+    /// the container, not the properties. See the `slot_table` module note.
+    arr_props: crate::slot_table::SlotTable<ObjMap>,
     /// Resizable ArrayBuffers: heap idx → maxByteLength. Presence marks a buffer
     /// as resizable (a side table avoids changing the ArrayBuffer heap variant).
     ab_max: std::collections::HashMap<u32, usize>,

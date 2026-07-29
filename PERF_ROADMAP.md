@@ -1603,6 +1603,71 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B63 — The match-result side table, decomposed: 79% of it is the CONTAINER. `arr_props` goes slot-indexed — regex-log-scan −10.6%, async-promise-chain −12.4%, suite −3.63%
+
+B33-C / RLS-1 again — the item B55 deferred and B60 called "the largest measured
+item in the file". B55 priced it as construction cost (~456ns/match) and specified
+an XL lazy sidecar gated on hand-bucketing ~256 `arr_props` uses. **The pricing was
+wrong, and one extra ablation says so.**
+
+**Re-price at HEAD first.** B60's −13.5% predates the lazy statics, so it is
+against a bigger denominator. The same switch rebuilt on `7d10389`, `--ab-env`
+against the identical binary, counterbalanced:
+
+| ablation on `regex-log-scan` | result | 95% CI | reps |
+|---|---|---|---|
+| skip `index`/`input`/`groups`/`indices` entirely | **−14.9%** (1882→1600ms) | [−15.4, −13.7] | 15 |
+| build the `ObjMap` exactly as now, then DROP it instead of inserting | **−12.2%** (1853→1629ms) | [−12.5, −12.0] | 11 |
+
+**Read those two together: 79% of the prize survives when the three `String`s, the
+three `Vec`s and all the shape work are still paid.** It was never the properties.
+It is that they are parked in an `FxHashMap<u32, ObjMap>` that a burst inflates to
+hundreds of thousands of entries, is probed with an effectively-random key, is
+walked whole for roots on every collection, is `retain`ed whole afterwards, and
+never shrinks. B55 attributed all 456ns to construction and designed against the
+21%. Artifacts: `bench/ablate_regexp_result_props_2026-07-29.json`,
+`bench/ablate_objmap_only_2026-07-29.json`.
+
+**Landed: `crate::slot_table::SlotTable<V>`.** A side table keyed by heap SLOT
+should not hash: slots are small, dense and handed out in ascending order. A paged
+slot→dense-position index (1024-slot 4 KiB pages, released the moment a page's last
+entry goes) over a dense value array — lookup is two dependent loads, insert is a
+store and a push, and the GC's prune walks the LIVE entries instead of the capacity
+a burst left behind. The API is deliberately the exact `HashMap` subset the VM uses
+(`get`/`get_mut`/`entry(..).or_insert_with(..)`/`contains_key`/`is_empty`/`values`/
+`retain`/`remove`/`insert`), so `arr_props`' type change is **two lines and zero
+call-site changes across all 147 of them**, and cannot alter behaviour. Iteration
+order is unspecified in both, and the only two iterations are the GC's root walk
+and its prune.
+
+Measured `--ab`, 15 counterbalanced paired reps, `bench/slottable_ab_2026-07-29.json`:
+
+| row | old | new | paired | 95% CI |
+|---|---:|---:|---:|---|
+| `async-promise-chain` | 717ms | 629ms | **−12.4%** | [−12.9, −11.4] |
+| `regex-log-scan` | 1883ms | 1687ms | **−10.6%** | [−10.9, −10.3] |
+| `parse-large-js` | 607ms | 595ms | −2.8% | [−3.0, −1.7] |
+| `sparse-array` | 162ms | 158ms | −2.4% | [−4.0, −2.0] |
+| `json-large` | 485ms | 473ms | −2.3% | [−3.9, −0.7] |
+| `markdown-render` | 462ms | 449ms | −2.3% | [−3.6, −1.0] |
+| `map-set-heavy` | 745ms | 735ms | −1.3% | [−3.5, −0.1] |
+| `polymorphic-objects` | 612ms | 604ms | −1.3% | [−1.8, −0.1] |
+| `class-prototype-hot` | 382ms | 382ms | −0.2% | [−1.6, +1.2] |
+| `typedarray-math` | 646ms | 647ms | +0.2% | [−0.6, +0.5] |
+
+**Suite geomean −3.63% [−3.94, −3.37]**, nothing regressed, `ALL_CORRECT=1`.
+
+**The async row is the interesting one, and it is not about regexes.**
+`ordinary_set_ok` (`access.rs:717`) probes this table on EVERY ordinary property
+write, and `proto_chain_blocks_set` (`:751`, `:769`) probes it again at every
+prototype hop, up to eight. Both sit behind `!arr_props.is_empty()` — so **one
+array named property, anywhere in the program, switches a hash probe per
+write-plus-hop on for the rest of the process**. That guard is why the cost was
+invisible to reasoning about regexes, and direct indexing is why it is now
+nearly free. The lesson generalises: `Vm` has ~40 more `HashMap<u32, _>` side
+tables keyed by heap slot, `proto_of` and `prototypes` among them, and this is
+the first evidence about what that shape costs.
+
 ### B62 — `typeof` interned: json-large −6.7%, and the roadmap's own estimate for it was wrong in both directions
 
 The last unrefuted row of B50's prize table said "`typeof` allocates its result
@@ -2591,7 +2656,7 @@ backlog, and none of them is an admission change:
 | item | prize | where |
 |---|---|---|
 | ~~accessor inlining declines on `super.v`~~ **LANDED, then regressed, then re-fixed** | ~~**~300ms**~~ | Landed as B51 (getter) + B52 (setter). Then the `SuperBase` opcode arrived and one whitelist was not taught it, silently costing 6× on this row until **B59**. The setter hazard this row flags — the setter living in `attrs[slot].setter`, not `vals` — is exactly what `ic_super_setter_baked` handles |
-| the match result's `arr_props` side table — **STILL OPEN, now the largest measured item in the file** | **~190ms** est; **B60 ABLATED IT AT −13.5%** of the row | `regex-log-scan`; B33-C's mechanism at 5× its recorded price — 456ns to CREATE the entry vs 115ns for a first property on a plain object. Effort XL, and gated on centralizing ~257 `arr_props` references across 12+ files first |
+| ~~the match result's `arr_props` side table~~ **MOSTLY COLLECTED as B63, suite −3.63%** | ~~~190ms est~~ — re-priced at HEAD as −14.9%, then DECOMPOSED: **79% was the container**, and a slot-indexed table collected it with zero call-site changes | `regex-log-scan` −10.6%, `async-promise-chain` −12.4%. What remains for the XL "compact metadata" project is the ~21% residue — see B63 before committing to the 147-site centralization it was gated on |
 | ~~`o["k" + i] = v` fusion, done soundly~~ **LANDED as B57, −16.2%** | ~~~108ms~~ | `polymorphic-objects`; the second attempt was the sound one (`ToConcatKey`) |
 | ~~`ToPropKey` invisible to `writes_reg`/`instr_uses`~~ **LANDED as B53** | ~~~39ms~~ | `typedarray-math` `normalize`. The external audit's do-not-repeat list names re-adding this |
 | ~~`typeof` allocates its result string~~ **LANDED as B62: json-large −6.7%** | ~~~45ms suite-wide~~ — the estimate was wrong BOTH ways: it is ONE site in the whole suite (B54 fused the rest), and it measured 36ms not 13ms because of second-order GC | Interned in `setup_globals` below `gc_floor`. Remaining ~44ns/call needs B54's fusion extended to a single-assignment local — see B62 |

@@ -29,6 +29,7 @@ pub mod embed;
 mod front;
 pub use front::set_pure_script_goal;
 mod heap;
+mod slot_table;
 /// Hand-written front end (lexer/AST/parser) being built to replace
 /// `oxc_parser` — see the module docs for why. Not yet wired in.
 mod parse;
