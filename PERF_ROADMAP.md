@@ -301,6 +301,13 @@ paired confidence interval rather than hand-repeated best-of-N timing.
 
 Every engine change must pass, in full:
 
+0. **Identity FIRST:** `zipp --version` on both sides, and confirm their
+   `sha256` differ. Not optional and not pedantry — B61 records a gate that
+   passed while comparing one build against itself, because a `git stash` +
+   rebuild cycle never rebuilt after `stash pop`. `--ab` now refuses two
+   byte-identical executables outright (exit 1; `--allow-aa` for a deliberate
+   A/A, or differing `--ab-env` for an ablation), and `zipp --version` reports
+   `<commit>+dirty.<digest>` so a dirty build stops claiming its parent commit.
 1. **Build:** `cargo build --release` — verify the binary mtime advanced.
 2. **test262, BOTH tiers:** `tools/run_test262.py --dump-fails f.txt`, then
    `diff <(sort f.txt) <(sort tools/test262-expected-failures.txt)` — zero new
@@ -319,7 +326,16 @@ JIT work is expected to add cases there.
 **Measurement protocol.** Use `tools/bench.py --ab old.exe new.exe` and retain
 its schema-v2 JSON. A change expected under 10% needs at least 15
 counterbalanced pairs (21 for a marginal decision), a paired-bootstrap 95%
-interval, exact output, and the full-suite regression check.
+interval, exact output, and the full-suite regression check. Confirm a MECHANISM
+counter moved, not just wall time — and confirm the row moved in the direction
+the change predicts before believing a green correctness gate.
+
+**Code layout is not free in this profile.** Release is fat LTO with one codegen
+unit, so adding code reachable from `main` can move hot rows with no runtime
+mechanism at all: B61's CLI-only `--version` change measured a replicated
+markdown-render +1.5% until `build_identity` was marked `#[cold]
+#[inline(never)]`. Mark genuinely cold additions cold, and do not attribute a
+~1% move to semantics before ruling layout out.
 
 **Heavy-codegen discipline.** Develop behind an opt-in env flag, flip the default
 last, only after the full gate is green across several milestones.
@@ -1537,6 +1553,110 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B61 — Build identity + an A/A refusal in the harness; and the async register-window allocation is REFUTED at 0.34%
+
+Three things, from acting on an external audit of `7dfcfe8`.
+
+**1. LANDED — `zipp --version` and `--ab` refusing two identical binaries.**
+
+The motivation is a measurement failure, not tidiness. B60's first gate was
+worthless: capturing the A-side binary with `git stash` + rebuild left
+`target/release/zipp.exe` at committed HEAD, nothing rebuilt it after
+`stash pop`, and so test262 and a 21-case differential ran HEAD against HEAD and
+"passed" identically. Two holes made that silent:
+
+  * nothing could ask a binary what it was built FROM. `zipp --version` did not
+    exist, so `engine_metadata`'s probe recorded only a failure string, and the
+    artifact's `git_commit` came from the harness's own `git rev-parse` — which
+    for a DIRTY tree names the parent commit. The external audit hit exactly this
+    and had to caveat its own baseline as "near-HEAD evidence".
+  * `--ab` recorded each side's `sha256` and never compared them.
+
+Now: a `build.rs` stamps commit, dirty flag, a digest of `git diff HEAD`, rustc,
+target, profile, opt-level, features and RUSTFLAGS; `zipp --version [--json]`
+prints it; `engine_metadata` embeds the JSON form as `build_identity`. The
+`source` field is `<commit>` clean or `<commit>+dirty.<digest>` — so two builds
+of DIFFERENT uncommitted edits have different identities, which a bare commit
+hash cannot express. `reject_identical_ab_binaries` then makes an accidental
+A/A a hard error (exit 1) BEFORE any measurement, with two deliberate escapes
+that must keep working: `--allow-aa`, and per-side `--ab-env` differing (the
+ablation-pricing idiom B60 relies on). Six tests in `tools/test_bench.py`.
+
+`jit_enabled()` is exported from zipp-vm rather than `cfg!`d in the CLI: the
+`jit` feature belongs to the VM crate, so a local `cfg!` reports every build as
+interpreter-only.
+
+**The build script had the bug it exists to prevent, twice.** Both were caught by
+running the obvious probe — edit a source file, rebuild, see whether the reported
+identity changes — and neither would have shown up in any test:
+
+  * v1 declared `rerun-if-changed` on `.git/HEAD` and `.git/index` only. Editing
+    `crates/zipp-vm/src` therefore did NOT re-run the script, so the rebuilt
+    binary reported the previous tree's digest: two different builds, same
+    claimed source. Exactly the failure the stamp is for.
+  * v2 tried to fix that by enumerating `git ls-files`. But `git ls-files` with no
+    pathspec lists only files under the CWD, and a build script's CWD is its own
+    package — so it watched `zipp-cli` alone and the staleness survived. Cargo
+    silently ignores a `rerun-if-changed` path it cannot match, so a wrong path
+    is indistinguishable from a correct one.
+
+v3 watches the `crates/` and `tools/` DIRECTORIES (cargo treats a directory as
+"anything beneath it changed"), plus the root manifests. Verified: adding a line
+to `zipp-vm/src/lib.rs` moved the digest `f57d79a1…` → `8cfbeea4…`, and removing
+it moved it back — the same tree gives the same digest. The digest also covers
+`git status --porcelain` WITH untracked names, so adding a new untracked source
+file changes the identity even though its content is absent from `git diff HEAD`.
+
+**Neutrality, and a layout lesson worth more than the feature.** A CLI-only
+change with no runtime mechanism measured a REPLICATED `markdown-render` +2.1%
+then +1.5% [+0.5, +2.4] and `json-large` +1.2%. Cause: release is fat LTO with
+ONE codegen unit, so adding `format!` machinery reachable from `main` perturbs
+hot-code placement. Marking `build_identity` `#[cold] #[inline(never)]` fixed it:
+final A/B on the committed build is `markdown-render` +0.4% [−0.6, +1.4],
+`json-large` −0.2% [−1.8, +0.8], geomean +0.13% [−0.90, +1.14] — every interval
+straddling zero. **In this build configuration,
+adding cold code is not free; mark it cold or it moves hot rows by ~1.5%.**
+
+**2. REFUTED — reusing the parked async register window (audit §7.1).**
+
+The audit sizes this at Part B's ~70ms, reasoning that every await resumption
+`mem::take`s the saved `Vec`, copies it into `self.regs`, and later `split_off`s
+a fresh one — one malloc + one free per resume, 1.5M times.
+
+The mechanism is real and was implemented: keep the resumed-from buffer alive and
+`clear()`/`extend_from_slice` the window back into it, so the round trip
+allocates nothing. **Measured −0.34% [−0.79, +0.19]** on `async-promise-chain`
+(21 paired reps) — interval straddles zero, fails the gate, reverted. Phase
+timings agree it is real but small: Part B 99→94ms.
+
+This is the FOURTH allocation-count over-prediction in this file (B29 ~0, B33,
+the SmallVec matcher case, this). Removing an allocation is not worth its
+allocation count.
+
+Where Part B's gap actually is, phase-split (1.5M awaits each):
+
+| | zipp | node |
+|---|---:|---:|
+| A then-chain, 1.5M links | 249ms | 154ms |
+| B await resolved | 99ms | 30ms |
+| B await, ~9 more live registers | **142ms** | **35ms** |
+| C `Promise.all` 30k×100 | 241ms | 96ms |
+
+The width row is the useful new datum: 9 extra live registers cost zipp +43ms and
+node +5ms, and that scaling SURVIVES removing the allocation — so it is the two
+memcpys of the window, ~2.7ns per register, not the malloc. The remaining ~63ns
+per await is frame push + microtask queue + `run_loop` re-entry. Anyone
+re-opening this should target those, not the `Vec`.
+
+**3. An unsoundness in the audit, worth recording before someone implements it.**
+Audit §7.1 step 1 says "if `self.regs` is empty during the normal microtask
+drain, swap the parked vector into `self.regs`". That is UNSOUND. `self.regs` is
+pinned for the VM's lifetime — `reserve_jit_regs` reserves the worst-case
+capacity precisely so a native frame's raw window pointer can never dangle, and
+`reg_capacity` records it for every growth guard. Swapping a different `Vec` in
+changes the base pointer and invalidates both. Only `truncate` and
+within-capacity `extend` are permitted.
 
 ### B60 — regex-log-scan, phase by phase: B8 was measured on the one pattern shape where we win, and the success path is where the cost is
 

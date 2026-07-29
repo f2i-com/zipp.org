@@ -40,6 +40,14 @@ mod shape;
 pub fn shape_stats() -> (usize, usize, usize) {
     shape::stats()
 }
+
+/// Whether this build actually has the native codegen tiers, i.e. the `jit`
+/// feature AND an x86-64 target. Exported for `zipp --version`: the feature lives
+/// on THIS crate, so a `cfg!` in the CLI would always read false and quietly
+/// report every build as interpreter-only.
+pub fn jit_enabled() -> bool {
+    cfg!(all(feature = "jit", target_arch = "x86_64"))
+}
 pub mod value;
 mod vm;
 

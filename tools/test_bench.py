@@ -485,6 +485,7 @@ class BenchResultTests(unittest.TestCase):
             zipp="unused",
             ab=None,
             ab_env=None,
+            allow_aa=False,
             baseline="node",
             engines="node,zipp",
         )
@@ -540,6 +541,7 @@ class BenchResultTests(unittest.TestCase):
                 zipp="unused",
                 ab=["old", "new"],
                 ab_env=None,
+                allow_aa=False,
                 baseline="node",
                 engines="node,zipp",
             )
@@ -566,6 +568,68 @@ class BenchResultTests(unittest.TestCase):
         self.assertIsNone(written["summary"])
         self.assertFalse(written["observations"][0]["valid_for_stats"])
         self.assertTrue(written["observations"][1]["valid_for_stats"])
+
+
+class AbBinaryGuardTests(unittest.TestCase):
+    """`--ab` must refuse two byte-identical executables.
+
+    The failure this prevents is silent: a `git stash`/rebuild cycle that forgets
+    the final rebuild leaves both sides on one binary, every gate "passes"
+    because it compares a build to itself, and only a ratio that fails to move
+    gives it away. See PERF_ROADMAP B61.
+    """
+
+    @staticmethod
+    def _write(path: Path, body: bytes) -> str:
+        path.write_bytes(body)
+        return str(path)
+
+    def test_identical_binaries_abort_before_measuring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a = self._write(root / "a.exe", b"same-bytes")
+            b = self._write(root / "b.exe", b"same-bytes")
+            with self.assertRaises(SystemExit) as caught:
+                bench.reject_identical_ab_binaries([a, b], ({}, {}), allow=False)
+            message = str(caught.exception)
+            self.assertIn("same executable", message)
+            self.assertIn("--allow-aa", message)
+
+    def test_same_path_twice_aborts(self):
+        # The literal shape of the mistake: one path passed for both sides.
+        with tempfile.TemporaryDirectory() as directory:
+            exe = self._write(Path(directory) / "zipp.exe", b"one")
+            with self.assertRaises(SystemExit):
+                bench.reject_identical_ab_binaries([exe, exe], ({}, {}), allow=False)
+
+    def test_allow_aa_permits_a_deliberate_calibration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            exe = self._write(Path(directory) / "zipp.exe", b"one")
+            bench.reject_identical_ab_binaries([exe, exe], ({}, {}), allow=True)
+
+    def test_differing_ab_env_permits_one_binary(self):
+        # The ablation-pricing idiom: same binary, behaviour switched by env, so
+        # the two sides are genuinely different runs.
+        with tempfile.TemporaryDirectory() as directory:
+            exe = self._write(Path(directory) / "zipp.exe", b"one")
+            bench.reject_identical_ab_binaries(
+                [exe, exe], ({}, {"ZIPP_NOJIT": "1"}), allow=False
+            )
+
+    def test_different_binaries_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a = self._write(root / "a.exe", b"old-build")
+            b = self._write(root / "b.exe", b"new-build")
+            bench.reject_identical_ab_binaries([a, b], ({}, {}), allow=False)
+
+    def test_unresolvable_executable_does_not_abort(self):
+        # Not this guard's job to report a missing file; the run fails later with
+        # a clearer error. Guarding here would turn a typo into a confusing
+        # "same executable" message.
+        bench.reject_identical_ab_binaries(
+            ["definitely-not-on-path-xyz", "also-not-here-xyz"], ({}, {}), allow=False
+        )
 
 
 if __name__ == "__main__":

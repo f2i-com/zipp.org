@@ -293,7 +293,70 @@ def engine_metadata(name: str, cmd: list[str], timeout: float) -> dict[str, Any]
         "size": stat.st_size if stat else None,
         "mtime_ns": stat.st_mtime_ns if stat else None,
         "sha256": file_digest(executable) if executable else None,
+        # `zipp --version --json`: the binary's own account of the SOURCE it was
+        # built from, including a digest of any uncommitted diff. The sha256
+        # above identifies the file; this identifies the code. A benchmark
+        # artifact recording only the parent commit for a dirty build is how a
+        # result came to name the wrong source (PERF_ROADMAP B61).
+        "build_identity": build_identity(executable, timeout),
     }
+
+
+def build_identity(executable: Path | None, timeout: float) -> dict[str, Any] | None:
+    """`zipp --version --json`, parsed. ``None`` for an engine without it (node)."""
+    if not executable:
+        return None
+    try:
+        probe = subprocess.run(
+            [str(executable), "--version", "--json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=min(timeout, 10.0),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if probe.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(probe.stdout.decode("utf-8", errors="replace"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def reject_identical_ab_binaries(
+    ab: list[str], ab_env: tuple[dict[str, str], dict[str, str]], *, allow: bool
+) -> None:
+    """Refuse an ``--ab`` whose two sides are the same executable.
+
+    This is a hard error before any measurement because the failure mode is
+    silent and expensive: a `git stash`/rebuild cycle that forgets to rebuild
+    afterwards leaves both sides pointing at the same binary, every correctness
+    gate "passes" because it is comparing a build against itself, and the only
+    tell is a ratio that fails to move (PERF_ROADMAP B61).
+
+    Two identical binaries ARE legitimate for an A/A calibration run and when the
+    two sides differ only by ``--ab-env`` (the ablation-pricing idiom), so those
+    pass: an explicit ``--allow-aa``, or per-side environments that actually
+    differ.
+    """
+    old_path, new_path = resolved_executable([ab[0]]), resolved_executable([ab[1]])
+    old_hash, new_hash = file_digest(old_path) if old_path else None, (
+        file_digest(new_path) if new_path else None
+    )
+    if old_hash is None or new_hash is None or old_hash != new_hash:
+        return
+    if allow or ab_env[0] != ab_env[1]:
+        return
+    raise SystemExit(
+        "refusing --ab: both sides are the same executable and no --ab-env "
+        f"distinguishes them.\n  old: {old_path}\n  new: {new_path}\n"
+        f"  sha256: {old_hash}\n"
+        "This measures a build against itself. Rebuild the side you meant to "
+        "change (and check `zipp --version` afterwards), or pass --allow-aa for "
+        "a deliberate A/A calibration."
+    )
 
 
 def parse_env_assignments(value: str) -> dict[str, str]:
@@ -1180,6 +1243,15 @@ def parse_args() -> argparse.Namespace:
         help="compare two zipp builds instead of the engine table",
     )
     parser.add_argument(
+        "--allow-aa",
+        action="store_true",
+        help=(
+            "permit --ab with two byte-identical executables (a deliberate A/A "
+            "calibration run); without it an accidental HEAD-vs-HEAD A/B is a "
+            "hard error before any measurement"
+        ),
+    )
+    parser.add_argument(
         "--ab-env",
         nargs=2,
         type=parse_env_assignments,
@@ -1356,6 +1428,7 @@ def main() -> int:
         baseline = "old"
         ab_env = args.ab_env or ({}, {})
         engine_env = {"old": ab_env[0], "new": ab_env[1]}
+        reject_identical_ab_binaries(args.ab, ab_env, allow=args.allow_aa)
     else:
         if args.ab_env:
             raise SystemExit("--ab-env requires --ab")

@@ -261,13 +261,92 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
             println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");
             println!("  zipp ast <file-or-dir>          parse and print the AST (--sweep for a corpus)");
+            println!("  zipp --version [--json]         build identity (commit, dirty digest, rustc, target)");
             println!("\nenvironment:");
             println!("  ZIPP_NOJIT=1                    interpreter only (no native codegen)");
             println!("  ZIPP_GC_STRESS=1                collect on every allocation");
             Ok(())
         }
+        // Build identity. Exists because a benchmark artifact records the
+        // executable's SHA-256 but nothing could say what that executable was
+        // built FROM — so a stale binary silently passed an A/B gate (see
+        // PERF_ROADMAP B61). `--json` is the form `tools/bench.py` embeds.
+        Some("--version") | Some("-V") | Some("version") => {
+            let json = it.next().map(|s| s.as_str()) == Some("--json");
+            print!("{}", build_identity(json));
+            Ok(())
+        }
         Some(other) => Err(format!("unknown command '{other}' (try `zipp js <file.js>`)")),
     }
+}
+
+/// This binary's build identity, as human text or as one JSON object.
+///
+/// `source` is the field that matters for a benchmark: `<commit>` when the tree
+/// was clean, `<commit>+dirty.<digest>` when it was not, where the digest covers
+/// `git diff HEAD`. Two builds of different uncommitted edits therefore differ,
+/// which a bare commit hash cannot express — and recording the parent commit for
+/// a dirty build is precisely how a benchmark artifact came to name the wrong
+/// source.
+///
+/// `#[cold]`/`#[inline(never)]` are not decoration. The release profile is fat
+/// LTO with one codegen unit, so adding `format!` machinery anywhere reachable
+/// from `main` perturbs hot-code placement: the first version of this function,
+/// left inlinable, cost a REPLICATED ~1.5% on markdown-render and ~1.2% on
+/// json-large with no runtime mechanism whatsoever. Keep it out of line.
+#[cold]
+#[inline(never)]
+fn build_identity(json: bool) -> String {
+    let commit = env!("ZIPP_BUILD_COMMIT");
+    let dirty = env!("ZIPP_BUILD_DIRTY") == "true";
+    let digest = env!("ZIPP_BUILD_DIFF_DIGEST");
+    let source = if dirty { format!("{commit}+dirty.{digest}") } else { commit.to_string() };
+    // Asked of the VM crate, not `cfg!` here: the `jit` feature belongs to
+    // zipp-vm, so a local `cfg!` would report every build as interpreter-only.
+    let jit = zipp_vm::jit_enabled();
+    let features = env!("ZIPP_BUILD_FEATURES");
+    let rustflags = env!("ZIPP_BUILD_RUSTFLAGS");
+    if json {
+        // Hand-rolled: the CLI has no JSON dependency and every value here is
+        // either a digest, an identifier or a compiler version string.
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        return format!(
+            concat!(
+                "{{\"name\":\"zipp\",\"version\":\"{}\",\"source\":\"{}\",\"commit\":\"{}\",",
+                "\"dirty\":{},\"diff_digest\":\"{}\",\"rustc\":\"{}\",\"target\":\"{}\",",
+                "\"profile\":\"{}\",\"opt_level\":\"{}\",\"features\":\"{}\",",
+                "\"rustflags\":\"{}\",\"jit\":{}}}\n"
+            ),
+            env!("CARGO_PKG_VERSION"),
+            esc(&source),
+            esc(commit),
+            dirty,
+            esc(digest),
+            esc(env!("ZIPP_BUILD_RUSTC")),
+            esc(env!("ZIPP_BUILD_TARGET")),
+            esc(env!("ZIPP_BUILD_PROFILE")),
+            esc(env!("ZIPP_BUILD_OPT_LEVEL")),
+            esc(features),
+            esc(rustflags),
+            jit,
+        );
+    }
+    let mut s = format!("zipp {}\n", env!("CARGO_PKG_VERSION"));
+    s += &format!("source:    {source}\n");
+    s += &format!("commit:    {commit}{}\n", if dirty { " (DIRTY)" } else { "" });
+    s += &format!("rustc:     {}\n", env!("ZIPP_BUILD_RUSTC"));
+    s += &format!("target:    {}\n", env!("ZIPP_BUILD_TARGET"));
+    s += &format!(
+        "profile:   {} (opt-level {})\n",
+        env!("ZIPP_BUILD_PROFILE"),
+        env!("ZIPP_BUILD_OPT_LEVEL")
+    );
+    s += &format!("features:  {}\n", if features.is_empty() { "(none)" } else { features });
+    s += &format!("jit:       {}\n", if jit { "x86-64 native" } else { "disabled (interpreter only)" });
+    if !rustflags.is_empty() {
+        s += &format!("rustflags: {rustflags}\n");
+    }
+    s
 }
 
 /// Every `.js`/`.mjs` file under `p` (or `p` itself if it is a file).

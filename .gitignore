@@ -7,5 +7,9 @@
 # Generated wasm-bindgen glue for the node harnesses (see crates/zipp-wasm/tests/node/README.md)
 crates/zipp-wasm/tests/node/pkg/
 
+# Python bytecode cache from tools/ (bench.py is imported by test_bench.py)
+__pycache__/
+*.pyc
+
 # Agent worktrees and session state
 .claude/
