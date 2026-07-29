@@ -617,6 +617,29 @@ pub(crate) extern "win64" fn jit_set_index(
     if arr.is_heap() && vm.arr_props.contains_key(&arr.heap_index()) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    // Creating a NEW own index — an append, or filling a HOLE — is not a store,
+    // it is OrdinarySet: it consults the prototype chain for a setter at that
+    // index, and an append also has to Set `length`, which can be non-writable.
+    // An in-range write over a PRESENT element is neither (an own data element
+    // shadows the chain, and `length` does not move), and the `arr_props` test
+    // above has already excluded a defineProperty'd override.
+    //
+    // Without this, `Object.defineProperty(a, "length", {writable: false})` then
+    // a hot `a[3] = i` grew the array to length 4 — the interpreter and node
+    // leave it at 3 — and an `Array.prototype[1]` setter never fired when the
+    // receiver had a hole there. `array_length_nonwritable` is its own side
+    // table, so `arr_props.contains_key` above does not see it.
+    let creates_new_index = match vm.heap.get(arr.heap_index()) {
+        HeapObj::Array(items) => i >= items.len() || items[i].is_hole(),
+        _ => false,
+    };
+    if creates_new_index
+        && (vm.array_length_nonwritable.contains(&arr.heap_index())
+            || vm.array_proto_has_index
+            || vm.proto_of.contains_key(&arr.heap_index()))
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
             let len = items.len();
@@ -962,6 +985,24 @@ pub(crate) extern "win64" fn jit_array_push(
     // governs (push must place the element AT that length and may throw): deopt
     // so the interpreter's length-aware push runs.
     if vm.array_js_len.contains_key(&arr.heap_index()) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // `push` is `Set(O, len, v, true)` then `Set(O, "length", …, true)`, and BOTH
+    // can fail. This arm was an unconditional `Vec::push`, so on a frozen, sealed
+    // or non-extensible array — or one whose `length` was made non-writable —
+    // a hot `a.push(x)` silently succeeded and grew the array where the
+    // interpreter and node both throw TypeError. `array_ops.rs` gates the
+    // interpreter's push on exactly these; this is the missing sibling.
+    //
+    // Also: a NEW index resolves through OrdinarySet, so an index property on
+    // the prototype chain can supply a setter that must run. `array_proto_has_index`
+    // is the existing protector for that, and a custom receiver prototype needs
+    // the general path too.
+    if vm.array_elements_overlaid(arr.heap_index())
+        || vm.array_length_nonwritable.contains(&arr.heap_index())
+        || vm.array_proto_has_index
+        || vm.proto_of.contains_key(&arr.heap_index())
+    {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     match vm.heap.get_mut(arr.heap_index()) {

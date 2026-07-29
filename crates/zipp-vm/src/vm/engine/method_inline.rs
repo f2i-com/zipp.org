@@ -624,6 +624,14 @@ impl<'p> Vm<'p> {
         if p.is_generator || p.is_async || p.param_count != 0 {
             return None;
         }
+        // An ARROW's reg 0 is its CAPTURED `this`, rebound at call entry and
+        // ignoring the receiver entirely (`lexical_this`). These shape matchers
+        // read `obj: 0` as "the receiver", so an arrow installed as an accessor
+        // would be served against the wrong object — `Object.defineProperty(p,
+        // "v", {get: () => this.f})` read `p.f` instead of the captured `this.f`.
+        if p.lexical_this {
+            return None;
+        }
         let c = &p.code;
         // [GetProp{dst, obj:0, name:N}, Return{src:dst}, ...]
         let (dst0, name) = match c.first()? {
@@ -650,6 +658,14 @@ impl<'p> Vm<'p> {
         use crate::bytecode::BitwiseOp;
         let p = self.func(fid as usize);
         if p.is_generator || p.is_async || p.param_count != 1 {
+            return None;
+        }
+        // An ARROW's reg 0 is its CAPTURED `this`, rebound at call entry and
+        // ignoring the receiver entirely (`lexical_this`). These shape matchers
+        // read `obj: 0` as "the receiver", so an arrow installed as an accessor
+        // would be served against the wrong object — `Object.defineProperty(p,
+        // "v", {get: () => this.f})` read `p.f` instead of the captured `this.f`.
+        if p.lexical_this {
             return None;
         }
         let c = &p.code;

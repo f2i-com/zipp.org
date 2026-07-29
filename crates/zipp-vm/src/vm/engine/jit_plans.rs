@@ -767,6 +767,20 @@ impl<'p> Vm<'p> {
                     HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => *func,
                     _ => return None,
                 };
+                // An ARROW must not be inlined here. `HeapObj::Closure` carries
+                // the arrow's captured `this_val`, and this match drops it — the
+                // spliced body would then run with reg 0 = the RECEIVER, which is
+                // exactly the binding `lexical_this` exists to suppress. For
+                // `function Maker(){ this.f=111; this.o={f:3, m:()=>this.f} }`
+                // the inlined `o.m()` returned 3 where the interpreter and node
+                // return 111 — a silent wrong answer at default thresholds, and
+                // an ordinary shape (an arrow stored as an object method).
+                //
+                // `upvalues.is_empty()` does NOT screen them out: an arrow that
+                // captures only `this` has no upvalues at all.
+                if self.func(f as usize).lexical_this {
+                    return None;
+                }
                 (f, Some((slot as u32, fv.bits())))
             }
             _ => return None,

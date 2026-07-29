@@ -1631,6 +1631,95 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B66 — Systematic sweep for the B59/B63/B65 shape: NINE tier divergences, six fixed, three left as failing specs
+
+B65 argued that the remedy for a fact hand-maintained across tiers is one source
+the compiler checks. Before building that, it is worth knowing **how big the
+existing drift is** — so: a workflow that enumerated every guard the JIT applies
+before compiling or before taking a fast path, recorded which of the six tiers
+applies each, and hunted the asymmetries with runnable probes.
+
+**Result: nine confirmed tier divergences, every one a silent WRONG ANSWER at
+DEFAULT thresholds** — the interpreter and node agree, compiled code does not.
+None is exotic; none was visible to 95,936 test262 executions in any of the three
+passes. Each was verified by hand afterwards, four ways (default,
+`ZIPP_JIT_THRESHOLD=1`, `ZIPP_NOJIT=1`, node), not taken on the agents' word.
+
+**Fixed here (six):**
+
+| # | what compiled code did | correct |
+|---|---|---|
+| 1 | `a.push(x)` on a FROZEN / sealed / non-extensible array succeeded and grew it | TypeError |
+| 2 | …and on one whose `length` was made non-writable | TypeError |
+| 3 | `a[3] = v` grew an array whose `length` is non-writable | no-op, `length` stays 3 |
+| 4 | an append / HOLE-fill skipped OrdinarySet, so an `Array.prototype[i]` setter never ran | setter runs, no own index created |
+| 5 | `o.m()` where `m` is an ARROW bound `this` to the RECEIVER | the arrow's captured `this` |
+| 6 | …same for an arrow installed as a getter/setter via `defineProperty` | the arrow's captured `this` |
+
+1–4 are one root cause: `jit_array_push` had **no** integrity guard at all, and
+`jit_set_index` tested only `arr_props` — but a non-writable `length` lives in
+`array_length_nonwritable`, a *different* side table, and creating a new index is
+OrdinarySet rather than a store. 5–6 are one root cause with three call sites:
+`HeapObj::Closure` carries the arrow's captured `this_val` and three separate
+paths dropped it (`build_method_shape`'s own-slot arm, `ic_call_method`'s
+`this_v = recv`, and both accessor arms in `jit_frame.rs`). Note that
+`jit_self_call_impl` and `jit_fast_call_impl` **already had** the arrow guard,
+with the same comment — a fourth instance of the same drift, inside one commit.
+
+**Left open (three), as `#[ignore]`d failing specs in
+`tests/jit_tier_parity.rs`** so `cargo test -- --ignored` is an accurate list:
+
+* **A `StoreGlobal` to a REAL own property of the global object** (defineProperty'd,
+  non-writable, accessor, or after `Object.freeze(globalThis)`) writes the slot
+  directly instead of routing through `[[Set]]`. B65's guard only catches an
+  UNINITIALIZED slot; here the slot is live *and* the object has a real own
+  property, and the interpreter's `global_real_own_route` handles it. Present in
+  Tier A/C, `region_globals_ok`, and `build_leaf_inline_plan` alike. The
+  interpreter also differs from node on part of this, so it is a tier divergence
+  AND a conformance gap — which is why it is described here rather than asserted
+  in the test file.
+* **`delete` of an implicit global returns its slot to the uninitialized
+  sentinel**, and already-compiled code keeps reading the slot as `undefined`
+  where the interpreter throws ReferenceError. B65's check is compile-time and is
+  never re-validated at entry, so this is the one case where "once a slot holds a
+  real value it can never go back" — the assumption `region_defer` and
+  `compile_defer` both rest on — is false.
+* **`setPrototypeOf(Array.prototype, x)` is invisible to `array_proto_has_index`**,
+  so B63's fix still invents absence for an out-of-range index the new prototype
+  supplies. The protector is set when an integer-like key is DEFINED on
+  Array/Object.prototype; re-prototyping is a different mutation.
+
+Two further candidates the agents reported were NOT reproducible under
+independent re-run and are not counted: a nested-leaf-splice double-apply and a
+strict-mode variant of the global-store hole (the latter is the same root cause
+as the first open item).
+
+**What this says about the plan's item 3.** Six bugs of one shape in three
+commits, plus three more still open, all from cross-cutting facts maintained by
+hand. The audit plan lists "central instruction effects and structured decline
+reasons" as P0 infrastructure with no measured payoff attached. It now has one:
+this file has spent B59, B63, B65 and B66 paying for its absence, and the cost is
+not performance — it is that the engine returns wrong answers on ordinary code
+while every gate is green.
+
+**Cost: +0.40% [+0.10, +0.67], and that is a REAL cost, not noise.** 15
+counterbalanced pairs (`bench/tier_parity_ab_2026-07-29.json`); every row inside
+±1.2%; the interval excludes zero. Correctness is not optional, so it ships — but
+it is recorded as a debit rather than rounded to "neutral", because this file's
+own rule is that an interval excluding zero means something moved.
+
+An attempt to buy it back was **refuted and reverted**: reordering the guards
+cheapest-first and putting the `array_length_nonwritable` `HashSet` probe behind
+its own `is_empty()` (the idiom five other sites use) measured **+0.55%
+[+0.13, +1.06]** — indistinguishable from the unoptimised form, so it was pure
+added complexity. The real fix for that probe is the B63/B64 one: it is a
+heap-slot-keyed `HashSet`, and it wants a `SlotSet` sibling of `SlotTable`. That
+is a separate, measurable change and it is not made here.
+
+Gate: test262 95936/95942 with the FAIL set byte-identical in all three passes;
+`cargo test --workspace --release` green; 5 new passing tests and 3 new failing
+specs in `tests/jit_tier_parity.rs`.
+
 ### B65 — `ZIPP_JIT_THRESHOLD` makes test262 a JIT gate, and it found a wrong answer on its first run
 
 B63 recorded a coverage hole rather than just a patch: §2 runs test262 under

@@ -305,6 +305,19 @@ impl<'p> Vm<'p> {
             // `func()` borrows &'p (program lifetime) — outlives `&mut self`.
             let key: &str = &self.func(func_id as usize).string_constants[name as usize];
             match self.ic_call_method(func_id, ip, recv, key) {
+                // An ARROW binds `this` LEXICALLY: reg 0 is its captured
+                // `this_val`, and the receiver is ignored entirely. This arm
+                // hands `this_v = recv` to `try_method_inline` (which evaluates
+                // the body off-frame against exactly that value), so
+                // `function Maker(){ this.f=111; this.o={f:3, m:()=>this.f} }`
+                // made a hot `o.m()` return 3 where the interpreter and node
+                // return 111 — silent, at default thresholds, and an ordinary
+                // shape. Deopt so `setup_call` does the rebinding, which is what
+                // the two sibling fast paths above already do for the same
+                // reason (`jit_self_call_impl`, `jit_fast_call_impl`).
+                Some((fid, _, _)) if self.func(fid as usize).lexical_this => {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
                 Some((fid, closure, callee)) => (fid, closure, recv, callee),
                 None => {
                     if jit_call_log() {

@@ -99,6 +99,16 @@ impl<'p> Vm<'p> {
             match self.ic_set_prop(func_id, ip, recv, key, val) {
                 SetAct::Done => 0,
                 SetAct::Setter { fid, closure, setter } => {
+                    // An ARROW accessor binds `this` LEXICALLY — reg 0 is its
+                    // captured `this_val`, not `recv`. Every path below hands it
+                    // `recv` (`accessor_fast_set`, `try_method_inline`, and
+                    // `jit_frame_call`'s explicit `this`), so
+                    // `Object.defineProperty(p, "v", {get: () => this.f})` served
+                    // `p.f` instead of the captured `this.f`. Deopt so
+                    // `setup_call` rebinds, as the sibling call fast paths do.
+                    if self.func(fid as usize).lexical_this {
+                        return SELF_CALL_DEOPT;
+                    }
                     // Q7 S-ACC: a trivial `this.field = arg|0` setter over an own
                     // writable data slot is served off-frame (no setup_call /
                     // run_loop) — the dominant cost of the rt loop.
@@ -137,6 +147,16 @@ impl<'p> Vm<'p> {
             match self.ic_get_prop(func_id, ip, recv, key) {
                 GetAct::Value(v) => v.bits(),
                 GetAct::Accessor { fid, closure, getter } => {
+                    // An ARROW accessor binds `this` LEXICALLY — reg 0 is its
+                    // captured `this_val`, not `recv`. Every path below hands it
+                    // `recv` (`accessor_fast_get`, `try_method_inline`, and
+                    // `jit_frame_call`'s explicit `this`), so
+                    // `Object.defineProperty(p, "v", {get: () => this.f})` served
+                    // `p.f` instead of the captured `this.f`. Deopt so
+                    // `setup_call` rebinds, as the sibling call fast paths do.
+                    if self.func(fid as usize).lexical_this {
+                        return SELF_CALL_DEOPT;
+                    }
                     // Q7 S-ACC: a trivial `return this.field` getter over an own
                     // data slot is served off-frame (no setup_call / run_loop).
                     if let Some(bits) = self.accessor_fast_get(fid, recv) {
