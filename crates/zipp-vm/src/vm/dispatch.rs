@@ -4151,7 +4151,9 @@ impl<'p> Vm<'p> {
                                     // promise waiting on them.
                                     match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
                                         None => Err(self.make_error(1, None)),
-                                        Some(p) => match self.deferred_namespace_for(&p) {
+                                        Some(p) => match self
+                                            .deferred_namespace_for(&p, mtype.as_deref())
+                                        {
                                             Ok(ns) => {
                                                 let canon = std::fs::canonicalize(&p)
                                                     .unwrap_or(p);

@@ -35,11 +35,11 @@ are in B58.
 
 ## 1. Where the project actually is
 
-### Conformance — 99.993% test262, 96.9% intl402
+### Conformance — 99.994% test262, 96.9% intl402
 
 | slice | executions | pass | fail |
 |---|---|---|---|
-| ECMA-262 + `staging`, sloppy **and** strict | 95,942 | 95,935 (99.993%) | 7 |
+| ECMA-262 + `staging`, sloppy **and** strict | 95,942 | 95,936 (99.994%) | 6 |
 | `intl402` (opt-in) | 6,682 | 6,474 (96.9%) | 208 |
 
 Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
@@ -81,7 +81,7 @@ that a block `function arguments(){}` NOT overwrite the arguments object;
 current text. So 95,942/95,942 does not exist for any engine; the ceiling is
 95,941.
 
-Of the remaining 7: 1 is that contradiction, 2 are CLDR data, and **4 are a real
+Of the remaining 6: 1 is that contradiction, 2 are CLDR data, and **3 are a real
 open engine defect** — module `[[EvaluationError]]` is recorded only on the
 synchronous rejection path, so a module that suspends at top-level `await` and
 rejects later memoises nothing, and a later `import()` of an already-fulfilled
@@ -391,7 +391,7 @@ This track did not exist in the previous roadmap; test262 was only a gate. It is
 now the shorter of the two tracks and should go first — the work is bounded and
 the payoff is a headline number.
 
-**Status 2026-07-29: 938 → 7 failures (99.0% → 99.993%), and intl402 2,778 →
+**Status 2026-07-29: 938 → 6 failures (99.0% → 99.994%), and intl402 2,778 →
 208 (16.9% → 96.9%).** Every step gated against the checked-in baseline with
 zero regressions, both tiers byte-identical, `cargo test --workspace --release`
 green at 421. **None of the 5 is a live engine defect** — 2 are fixed upstream in

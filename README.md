@@ -30,14 +30,14 @@ wasm32 are built and tested.
 Both figures are measured on this repo, not estimated. Neither is finished —
 they are the current state.
 
-**Conformance — 99.993% of test262**, 95,935 of 95,942 required executions
+**Conformance — 99.994% of test262**, 95,936 of 95,942 required executions
 (ECMA-262 + `staging`, run in both sloppy and strict mode as `INTERPRETING.md`
 requires). Both tiers produce a **byte-identical** failure set, which is the
 cheapest evidence that a JIT change has not quietly diverged:
 
 | slice | executions | pass |
 |---|---|---|
-| ECMA-262 + staging, both modes | 95,942 | 95,935 (99.993%) |
+| ECMA-262 + staging, both modes | 95,942 | 95,936 (99.994%) |
 | intl402 (opt-in, `--include-intl402`) | 6,682 | 6,474 (96.9%) |
 
 Measured against tc39/test262 `defaaf15` (2026-07-27). The suite moves, so the
@@ -46,7 +46,7 @@ commit is part of the number: it is worth re-pinning whenever this figure is.
 That is up from 96.97% under `oxc_parser`, and the increase is the whole reason
 the engine grew its own front end.
 
-7 executions still fail:
+6 executions still fail:
 
 * **The suite contains two tests with opposite expectations (1).**
   `annexB/language/function-code/block-decl-func-skip-arguments.js` quotes the
@@ -63,14 +63,15 @@ the engine grew its own front end.
   hand-written German pattern to turn this green is exactly the approximation
   this project refuses (see the intl402 note below); it stays red until real
   CLDR data lands.
-* **Module evaluation errors are not memoised across a cycle (4).** A module's
+* **Module evaluation errors are not memoised across a cycle (2).** A module's
   `[[EvaluationError]]` is recorded only on the SYNCHRONOUS rejection path, so a
   module that suspends at top-level `await` and rejects later leaves nothing
-  behind — and a subsequent `import()` of an already-fulfilled member of an
-  errored cycle resolves instead of re-throwing the original error. The two
-  `import-defer` failures are the same area: deferred-namespace evaluation and
-  top-level-await ordering inside a cycle containing a deferred module. Real
-  engine defects, open.
+  behind, and a subsequent `import()` of an already-fulfilled member of an
+  errored cycle resolves instead of re-throwing the original error. Open.
+* **Top-level-await ordering in a cycle containing a deferred module (1).**
+  `import-defer`'s eager async sweep evaluates the deferred graph's async
+  subgraph at load time, but interleaves it with the importer's own suspension
+  differently from the proposal. Open.
 
 Getting here meant fixing the harness as well as the engine, and the two engine
 bugs that mattered most were both **tier divergences** — the JIT disagreeing with

@@ -960,10 +960,15 @@ pub struct Vm<'p> {
     module_errors: std::collections::HashMap<std::path::PathBuf, Value>,
     /// Per-module DEFERRED namespace singleton (`import defer * as ns`):
     /// canonical path → the deferred namespace object. Values are GC ROOTS.
-    deferred_ns_cache: std::collections::HashMap<std::path::PathBuf, Value>,
+    deferred_ns_cache:
+        std::collections::HashMap<(std::path::PathBuf, Option<String>), Value>,
     /// Deferred namespaces NOT YET evaluated: object idx → module path.
     /// Removed when a triggering access evaluates the module.
-    deferred_ns_state: std::collections::HashMap<u32, std::path::PathBuf>,
+    /// Value carries the module TYPE alongside the path (`with { type: "json" }`):
+    /// the trigger re-imports through `import_module`, and dropping the type there
+    /// re-parsed a JSON module as JavaScript.
+    deferred_ns_state:
+        std::collections::HashMap<u32, (std::path::PathBuf, Option<String>)>,
     /// Async modules waiting on pending dependencies: capability-promise
     /// index → the state needed to run the body once the last dependency
     /// settles. Keys are GC roots (the capability promise must survive).

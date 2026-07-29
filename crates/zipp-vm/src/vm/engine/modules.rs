@@ -491,7 +491,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     IN::DeferNamespace => {
-                        let ns = self.deferred_namespace_for(&dep_raw)?;
+                        let ns = self.deferred_namespace_for(&dep_raw, e.mtype.as_deref())?;
                         ns_writes.push((e.local_slot, ns));
                     }
                     IN::SideEffect => {
@@ -980,6 +980,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn deferred_namespace_for(
         &mut self,
         raw_path: &std::path::Path,
+        mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
         let path = std::fs::canonicalize(raw_path).map_err(|_| {
             Thrown(format!(
@@ -987,38 +988,53 @@ impl<'p> Vm<'p> {
                 raw_path.display()
             ))
         })?;
-        if let Some(&ns) = self.deferred_ns_cache.get(&path) {
+        // Keyed by (path, type): the same file imported with and without
+        // `with { type: "json" }` is two different modules, so one cache entry
+        // must not answer for both.
+        let key = (path.clone(), mtype.map(str::to_string));
+        if let Some(&ns) = self.deferred_ns_cache.get(&key) {
             return Ok(ns);
         }
-        let mut seen = std::collections::HashSet::new();
-        self.prescan_module_requests(&path, &mut seen)?;
+        // A non-JS module type (`with { type: "json" }`, and the bytes/text
+        // forms) has no module requests and no top-level await by construction,
+        // so neither the prescan nor the eager-async sweep below applies — and
+        // both of them PARSE the file as JavaScript to find out, which turns a
+        // deferred JSON import into `SyntaxError: expected ';'` on the JSON's
+        // own opening brace. Skip straight to the deferred namespace object;
+        // the trigger re-imports through `import_module`, which knows how to
+        // read the type.
+        let non_js = matches!(mtype, Some("json") | Some("text") | Some("bytes"));
+        if !non_js {
+            let mut seen = std::collections::HashSet::new();
+            self.prescan_module_requests(&path, &mut seen)?;
         // The proposal evaluates a deferred graph's ASYNC subgraphs EAGERLY
         // at load time (so a later trigger can stay synchronous): import any
         // reachable module with top-level await now — its own dependencies
         // evaluate with it; sync-only parts of the graph stay deferred.
         // DFS request order (deterministic — evaluation logs are observable).
-        let mut graph: Vec<std::path::PathBuf> = Vec::new();
-        let mut gseen = std::collections::HashSet::new();
-        let mut stack = vec![path.clone()];
-        while let Some(m) = stack.pop() {
-            if !gseen.insert(m.clone()) {
-                continue;
-            }
-            graph.push(m.clone());
-            if let Ok(reqs) = self.module_requests(&m) {
-                // Reverse so the explicit stack pops requests in source order.
-                for r in reqs.into_iter().rev() {
-                    stack.push(r);
+            let mut graph: Vec<std::path::PathBuf> = Vec::new();
+            let mut gseen = std::collections::HashSet::new();
+            let mut stack = vec![path.clone()];
+            while let Some(m) = stack.pop() {
+                if !gseen.insert(m.clone()) {
+                    continue;
+                }
+                graph.push(m.clone());
+                if let Ok(reqs) = self.module_requests(&m) {
+                    // Reverse so the explicit stack pops requests in source order.
+                    for r in reqs.into_iter().rev() {
+                        stack.push(r);
+                    }
                 }
             }
-        }
-        for m in graph {
-            if !self.module_cache.contains_key(&m)
-                && !self.module_loading.contains(&m)
-                && !self.executing_modules.contains(&m)
-                && self.module_has_tla(&m)
-            {
-                self.import_module_sync(&m, None)?;
+            for m in graph {
+                if !self.module_cache.contains_key(&m)
+                    && !self.module_loading.contains(&m)
+                    && !self.executing_modules.contains(&m)
+                    && self.module_has_tla(&m)
+                {
+                    self.import_module_sync(&m, None)?;
+                }
             }
         }
         let _gc = self.gc_lock_guard();
@@ -1038,8 +1054,8 @@ impl<'p> Vm<'p> {
         m.extensible = false;
         let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
         self.proto_of.insert(idx, Value::NULL);
-        self.deferred_ns_cache.insert(path.clone(), Value::heap(idx));
-        self.deferred_ns_state.insert(idx, path);
+        self.deferred_ns_cache.insert(key, Value::heap(idx));
+        self.deferred_ns_state.insert(idx, (path, mtype.map(str::to_string)));
         Ok(Value::heap(idx))
     }
 
@@ -1049,7 +1065,7 @@ impl<'p> Vm<'p> {
     /// @@toStringTag. No-op for anything that is not an unevaluated deferred
     /// namespace. Call sites gate on `deferred_ns_state` being non-empty.
     pub(crate) fn defer_ns_trigger(&mut self, idx: u32) -> Result<(), Thrown> {
-        let Some(path) = self.deferred_ns_state.get(&idx).cloned() else {
+        let Some((path, mtype)) = self.deferred_ns_state.get(&idx).cloned() else {
             return Ok(());
         };
         // ReadyForSyncExecution: the module — or ANYTHING its graph reaches —
@@ -1063,7 +1079,7 @@ impl<'p> Vm<'p> {
                     .into(),
             ));
         }
-        let real = self.import_module(&path, None)?;
+        let real = self.import_module(&path, mtype.as_deref())?;
         // A TLA module's body may still be pending; its bindings update
         // through the shared live slots as it completes.
         self.pending_module_body = None;
