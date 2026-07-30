@@ -3,11 +3,24 @@
 A clean-sheet JavaScript engine written in Rust — a NaN-boxed, explicit-frame
 register VM with per-call-site inline caches and a native x86-64 OSR JIT.
 
+Home: <https://github.com/f2i-com/zipp.org>
+
+## Installing
+
+Build from source (stable Rust; no other dependencies):
+
 ```sh
+git clone https://github.com/f2i-com/zipp.org.git zipp
+cd zipp
 cargo build --release
 ./target/release/zipp js file.js
 ./target/release/zipp mjs file.mjs      # ES module entry (top-level await)
 ```
+
+Release builds use fat LTO with one codegen unit (measured ~2% on the benchmark
+suite), so expect the link step to take a minute. Put `target/release` on your
+`PATH`, or copy the single `zipp` executable wherever you like — it has no
+runtime files.
 
 The project is `crates/zipp-vm`. It owns the whole pipeline — its own lexer,
 parser and AST (`src/parse/`), the bytecode compiler, the interpreter and the
