@@ -34,7 +34,10 @@ are in B58.
 | B67 owned JSON keys (plan M2.2) | **LANDED, `json-large` −3.9% (REPLICATED)** | `ObjMap::set_owned` removes the second allocation per first-inserted JSON key. −3.9% [−5.4, −2.2] and −3.9% [−5.0, −3.2] across two independent 21-pair runs. Order/duplicate/reviver/`context.source` invariants pinned by `tests/json_owned_keys.rs` |
 | B67 corrected benchmarks (plan M0.3) | **ADDED, OUTSIDE `ALLBENCHES`** | `property-ic-shapes` (the M3 acceptance benchmark, 1..1024 same-shape receivers), `polymorphic-objects-v2`, `sparse-array-v2`. Output byte-identical to node. Excluded from the timed ten so the retained geomean stays comparable |
 | plan M2.1 `typeof`-local fusion | **OPEN — measurement-blocked** | needs an exact-HEAD baseline + 15-21 pairs; belongs in `compile/exprs.rs` beside the existing AST-level fusion, not in a bytecode def-use pass |
-| plan M2.3/M2.4 side tables | **OPEN** | `regexp_string_iters` → `SlotTable`; `array_length_nonwritable` → a `SlotSet` sibling, which B66 already identified as the real fix for that probe |
+| plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
+| plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
+| plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| regex-log-scan, rephased (B68) | **DECOMPOSED, NOTHING SHIPPED** | 42% of the row is corpus generation, which contains NO REGEX; 46% is matchAll (64ms of it in iterator CREATION, ~178ms stepping); the literal-`test` phase is **0.40x** — zipp wins. Per successful capturing `exec` the deficit is three comparable terms: +139ns result construction, +87ns matcher, +80ns fixed call overhead |
 
 ---
 
@@ -1635,6 +1638,176 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B68 — regex-log-scan rephased at HEAD: the row's two biggest terms are matchAll and a phase with NO REGEX IN IT. M2.3 REFUTED, M7.1's premise refuted
+
+An attempt to move `regex-log-scan` (3.65x, the worst row and the largest single
+contributor to the summed deficit). **Nothing shipped.** What came out is a corrected
+phase decomposition that contradicts three of this file's own standing assumptions, and
+two measured refutations. Recorded because the next person to open this row should start
+from these numbers, not from B60's.
+
+#### The decomposition, at `0b290a0`
+
+Six scripts, each = corpus generation + ONE phase, best-of-7, phase cost by subtraction.
+
+| phase | node | zipp | ratio | share of zipp's deficit |
+|---|---:|---:|---:|---:|
+| **corpus generation — CONTAINS NO REGEX** | 249ms | 628ms | **2.52x** | **42%** |
+| **matchAll** | 169ms | 584ms | **3.46x** | **46%** |
+| exec + captures | 96ms | 179ms | 1.86x | 9% |
+| replace with `$1` | 151ms | 213ms | 1.41x | 7% |
+| test, alternation + anchors | 65ms | 77ms | 1.18x | 1% |
+| test, literal `/\[ERROR\]/` | 94ms | **38ms** | **0.40x** | zipp WINS by 56ms |
+
+**42% of the worst regex row is not regex.** It is 150k iterations of a top-level loop
+doing string concatenation, ~10 small function calls (`ri`, `pad2`) and a dense array
+store. B60 put corpus generation at "about 27% of the older gap"; it is now the joint
+largest term. And the literal-`test` phase is 2.5x FASTER than node, which is the B8
+correction holding up.
+
+#### Per-call bisection: three roughly equal terms, none of them the gate
+
+150k calls, 1 per line, all matching, cost per call:
+
+| what | node | zipp | zipp − node |
+|---|---:|---:|---:|
+| `indexOf("status=")`, no regex | 53ns | 53ns | **0 — parity** |
+| `test /status=/` (literal, non-global) | 133ns | 213ns | +80ns |
+| `test /([a-z]+)=(\d+)/` (non-global) | 133ns | 300ns | +167ns |
+| …same, `/g` + `lastIndex = 0` | 107ns | 333ns | +226ns |
+| `exec`, non-global, 2 captures | 207ns | 513ns | +306ns |
+
+Reading the deltas WITHIN zipp: fixed regex-call overhead above `indexOf` is +160ns
+(node +80); the character class costs a further +87ns (node: **zero** — Irregexp compiles
+it); `/g` bookkeeping +33ns; and building the result with 2 captures +213ns (node +74).
+So the ~306ns deficit on a successful capturing `exec` is roughly **+139ns result
+construction, +87ns matcher, +80ns fixed call overhead** — three comparable terms, which
+is why no single fix moves this row much.
+
+#### `matchAll`: the per-CALL cost is as big a problem as the per-step cost
+
+| | count | node | zipp |
+|---|---:|---:|---:|
+| `matchAll()` call, iterator never stepped | 150k | 53ns | **480ns** |
+| per subsequent step | 450k | 22ns | **418ns** |
+
+That is 64ms of deficit in iterator CREATION and ~178ms in stepping. Creation is
+`regexp_matchall_fast_ok` — **nine `ObjMap::pos()` lookups** (5 on the instance's
+`arr_props`, 4 on %RegExp.prototype%, which is past `PROP_INDEX_THRESHOLD` so each is a
+hash) plus the iterator allocation and a side-table insert. The step is dominated by the
+`exec` inside it, not by iterator machinery: a bare `exec` measures 513ns against the
+step's 418ns.
+
+#### REFUTED 1 — `regexp_exec_fast_ok` is not material (M7.1's premise)
+
+The audit plan's M7.1 proposes protector-based RegExp fast-path gates, correctly hedged
+with "**after telemetry proves the fixed gate is material**". Telemetry says it is not.
+An ablation build short-circuiting `regexp_exec_fast_ok` to `true` (unsound, measurement
+only) saved **6ms of 209ms** on the global-`test` loop and **22ms of 290ms** on `exec` —
+~7%. The gate looks expensive when read (two side-table probes plus a `pos("exec")` over
+%RegExp.prototype%) and is not. Do not build the protector for this reason; if it is
+built, justify it from a workload where it actually shows.
+
+#### REFUTED 2 — `regexp_string_iters` → `SlotTable` (plan M2.3) is a wash
+
+Implemented (a pure type swap — `SlotTable` is API-compatible), plus removal of a genuine
+redundancy: `regexp_string_iter_step_inner` computed `pristine_exec` and then called
+`regexp_exec_abstract`, which re-evaluated the identical gate, so every step ran it twice.
+
+21 counterbalanced pairs (`bench/rx1_ab_2026-07-30.json`): **`regex-log-scan` +0.1%
+[−0.7, +1.0]** — no movement at all. Suite +0.29% [−0.08, +0.60]. It also perturbed
+`map-set-heavy` to +3.0% [+1.7, +4.6], a sentinel breach with no mechanism connecting the
+two (fat LTO + one codegen unit; the layout hazard §2 warns about). **Reverted**, both
+halves, under the §14 revert rule: the target row did not move and the result sits inside
+drift.
+
+The reason is now obvious from the decomposition and was hedged in the plan itself
+("do not overstate: the earlier supposed 552 ms iterator prize was superseded by the
+already-landed `fast0` path"). One SipHash probe per step is noise beside the ~418ns the
+step spends in `exec`.
+
+#### Three VERIFIED structural defects on the regex call path
+
+Found by a hot-path mapping pass and each confirmed by hand afterwards. None is fixed
+here; all three are cheap to re-verify from the file:line.
+
+1. **`dispatch_builtin_method_inner` has no `HeapObj::RegExp` arm** (`vm/builtins.rs:252`).
+   It has arms for Array, Str/Cons, Map, Set, Generator, AsyncGenerator, Promise, Date,
+   TypedArray, DataView and ArrayBuffer — and RegExp falls to `_ => Ok(None)`. So every
+   `re.test(s)` / `re.exec(s)` runs the ENTIRE builtin probe as dead work (several random
+   heap-discriminant loads, `is_callable`, a Boxed probe, a chain of `&str` compares),
+   returns `None`, and only then takes the generic route: `get_prop(recv, "test")` →
+   whose fast path bails on the RegExp discriminant into `get_member_slow`'s exotic
+   preamble (~10 guards, an `FxHashMap` probe on `module_namespaces`, a
+   `"test".parse::<usize>()`, two `SlotTable` probes, then a `PropIndex` hash + memcmp on
+   the **20-key** `%RegExp.prototype%`) → a per-call `Vec<Value>` allocation → `call_value`
+   → `call_native`'s ~600-arm jump table. That is the bulk of the +160ns of fixed
+   regex-call overhead measured above `indexOf`.
+2. **A hot loop containing `re.test()` cannot stay compiled.** In a region,
+   `jit_method_builtin_fallback` (`engine/jit_calls.rs:393`) calls `try_builtin_method`,
+   gets `Ok(None)` because of defect 1, and returns `SELF_CALL_DEOPT` **without setting
+   `osr_deopt_exempt`** — so every call exits the region AND is counted as a deopt by
+   `note_region_resume`. Past `OSR_DEOPT_LIMIT` the region is evicted. This is a
+   performance cliff of the same shape as B59's, and it is invisible to every gate.
+3. **One heap string allocated per successful `.test()`.** `whole = mk(self, mstart..mend)`
+   (`vm/proxy_regexp.rs:1060`) is computed before the `if !build { return TRUE }` early-out
+   at `:1125`. The comment there records that slots 2..=13 of the Annex B statics were
+   made lazy for exactly this reason; slot 1 (`lastMatch`) kept `whole` eager, so `test`
+   still allocates the matched substring it never returns.
+
+#### …and why the obvious fix for defect 1 is FORBIDDEN as written
+
+Adding a `regexp_method` arm beside the others would be wrong, because the existing arms
+are **not** override-safe and RegExp currently is:
+
+```js
+String.prototype.indexOf = function () { return "OVERRIDDEN"; };
+"abc".indexOf("b");        // node: "OVERRIDDEN"   zipp: 1
+Array.prototype.slice = function () { return "OVERRIDDEN"; };
+[1,2,3].slice(1);          // node: "OVERRIDDEN"   zipp: 2,3
+RegExp.prototype.test = function () { return "PROTO-OVERRIDDEN"; };
+/a/.test("a");             // node AND zipp: "PROTO-OVERRIDDEN"  ← correct TODAY
+```
+
+The receiver-kind fast paths bind a builtin target from its NAME, which the audit plan
+warns against in M2.6 ("Do not bind a builtin target solely from its name"). Only
+`toString`/`valueOf`/`toLocaleString`/`toJSON` are deferred to the prototype chain
+(`vm/builtins.rs:95`); every other builtin method name is shadow-blind. RegExp is correct
+precisely BECAUSE it has no fast path. Giving it one the same way would trade a correct
+path for a faster wrong one.
+
+**This reframes M7.1.** Its value is not skipping `regexp_exec_fast_ok` — that gate is
+~7% (refuted above). Its value is being the PROTECTOR that makes an override-safe
+dispatch arm possible: a pristine-`%RegExp.prototype%.test`/`exec` epoch plus a
+per-instance own-override check, checked once per call, admits the fast arm and falls back
+to the generic path the moment anything is shadowed. Cheap, and it fixes defect 2 as a
+side effect. Do that before the arm, not after.
+
+#### Where this row actually has to be attacked
+
+In order of measured size, with the honest difficulty attached:
+
+1. **Corpus generation, 379ms (42%).** Not a regex item at all, and it helps
+   `markdown-render`/`parse-large-js`/`json-large` too. The string paths are already
+   good — `add_values` has flat/rope fast paths and BOTH `string + int` and `int + string`
+   write the integer's decimal straight into the buffer, so there is no naive conversion
+   to remove. What is left is generic interpreted call overhead (~1.5M `ri`/`pad2` calls)
+   and the fact that this is a TOP-LEVEL loop. Note B56's in-place string accumulator does
+   handle a global target (`global_inits_string`), but `loop_inplace_safe` rejects a body
+   containing CALLS — and for a global accumulator that rejection is load-bearing, because
+   a callee can read the global directly. Extending it needs escape analysis, i.e. Tier D.
+2. **`matchAll()` creation, 64ms.** The nine `pos()` lookups in `regexp_matchall_fast_ok`
+   are a real, contained target — unlike the per-step gate, this one runs on a path with
+   no `exec` to hide behind. A version-keyed cache is the obvious shape, but note the trap
+   found in B67: `ObjMap::set` bumps the heap version only when a key is ADDED
+   (`if added`), so a plain `RegExp.prototype.exec = f` overwrite does NOT bump it. A
+   sound cache must key on `(version, keys.len(), slot, value bits, accessor bit)` and
+   re-read the slot each call — which still removes the key HASH, the expensive part.
+3. **Result construction + captures, +139ns/match.** Plan M7.2, explicitly "a measured
+   research item, not a guaranteed win".
+4. **The matcher on character classes, +87ns/match where node pays zero.** This is the
+   Irregexp gap (B8b), an XL epic, and it is the SMALLEST of the three per-match terms.
 
 ### B67 — B66's three open specs closed, and each one had an INTERPRETER bug underneath it
 
@@ -4552,6 +4725,16 @@ current.
   - `Reflect.set(Object.preventExtensions(function f(){}), "nk", 1)` — `false`
     vs `true` (the `fn_props.extensible` quirk).
   None is a tier divergence, which is why the §2 gate never saw them.
+- **The receiver-kind builtin fast paths ignore PROTOTYPE OVERRIDES.** `dispatch_builtin_method_inner`
+  binds a builtin from the method NAME plus the receiver's heap kind, and only
+  `toString`/`valueOf`/`toLocaleString`/`toJSON` are deferred to the prototype chain
+  (`vm/builtins.rs:95`). So `String.prototype.indexOf = f; "abc".indexOf("b")` gives `1`
+  where node gives the override's result, and the same for
+  `Array.prototype.slice`/`Map`/`Set`/`Date`/TypedArray methods. An OWN method on the
+  instance is honoured (the IC/get_prop path sees it); it is the PROTOTYPE replacement
+  that is missed. RegExp is unaffected only because it has no fast-path arm at all —
+  which is why B68 declined to add one without the M7.1 protector first. Both tiers
+  agree, so no gate sees it. Same family as B63's nine own-property divergences.
 - **`eval`, `new Function`, and every MODULE body are never JIT-compiled.**
   `dispatch.rs` gates the function JIT *and* the OSR tier on
   `func_id < self.main_func_count`, and runtime-compiled functions — including
