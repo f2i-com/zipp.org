@@ -969,6 +969,29 @@ impl<'p> Vm<'p> {
             // observed (e.g. by `@@match`/`@@replace`, which read Get(rx,"flags")),
             // rather than synthesizing from the internal flag string.
             if key == "flags" {
+                // ── pristine shortcut ──
+                // The eight reads below are the whole cost of this property, and it
+                // is not a small one: `re.flags` measured **200ns against node's
+                // 10ns**, because each is a full RegExp-exotic `get_member_slow`
+                // traversal. It is also on a hot path nobody looks at —
+                // `String.prototype.matchAll` reads `flags` purely to test for `g`,
+                // which made those eight reads ~175ns of a 493ns `matchAll()` call
+                // (node: 43ns).
+                //
+                // When every per-flag accessor is still the intrinsic and the
+                // receiver has no own shadow, all eight reads are unobservable and
+                // their answers are exactly the internal flag string — which is
+                // already stored in canonical order. So return it directly.
+                //
+                // `regexp_flag_accessors_pristine` proves that with eight `pos()`
+                // probes against %RegExp.prototype% instead of eight property
+                // traversals: same guarantee, and the guard is what keeps a
+                // `Object.defineProperty(RegExp.prototype, "global", {get(){...}})`
+                // or a per-instance `re.global = false` observable, which
+                // `@@match`/`@@replace` depend on.
+                if let Some(f) = self.regexp_pristine_flags(obj.heap_index(), receiver) {
+                    return Ok(self.alloc_str(f));
+                }
                 let mut out = String::new();
                 for (prop, ch) in [
                     ("hasIndices", 'd'),
@@ -1013,11 +1036,15 @@ impl<'p> Vm<'p> {
             // (`flags` never reaches here -- the spec-mandated per-flag-getter
             // synthesis above always returns.)
             if key == "source" {
-                let src = match self.heap.get(obj.heap_index()) {
-                    HeapObj::RegExp { source, .. } => source.clone(),
-                    _ => String::new(),
+                // The clone is an Arc refcount bump; the `&str` deref below is what
+                // `regexp_source_value` wants, so nothing is materialised here.
+                // An Arc bump, then a `&str` deref — `regexp_source_value` wants the
+                // latter, so no text is materialised here.
+                let src: Option<std::sync::Arc<str>> = match self.heap.get(obj.heap_index()) {
+                    HeapObj::RegExp { source, .. } => Some(source.clone()),
+                    _ => None,
                 };
-                return Ok(self.regexp_source_value(obj.heap_index(), &src));
+                return Ok(self.regexp_source_value(obj.heap_index(), src.as_deref().unwrap_or("")));
             }
             // Accessor-aware: an `exec`/`test`/… turned into a getter on
             // %RegExp.prototype% (staging/sm/String/matchAll.js) is INVOKED with

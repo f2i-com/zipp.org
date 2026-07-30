@@ -1902,8 +1902,22 @@ pub enum HeapObj {
     /// `Arc<regress::Regex>` is a pure compiled program), so GC need not trace it.
     RegExp {
         regex: std::sync::Arc<regress::Regex>,
-        source: String,
-        flags: String,
+        /// `Arc<str>`, not `String`, so that cloning a RegExp shares its text instead
+        /// of copying it. `matchAll` clones a matcher per call — the iterator has to
+        /// advance a `lastIndex` independently of the source regex, and that object is
+        /// observable to a user `exec` as its receiver, so the clone cannot be elided —
+        /// which meant two heap `String` allocations on a path measured at 480ns
+        /// against node's 53. Sharing makes it two atomic increments.
+        ///
+        /// MEASURED: −2.0pp of `regex-log-scan` (the row went −0.9% with only the
+        /// `flags` shortcut below, −2.9% with both; B70). Larger than it looks because
+        /// `source`/`flags` are cloned on several regex paths, not just `matchAll`.
+        ///
+        /// NOT for size — that hypothesis was refuted. This variant's payload does drop
+        /// 80 → 64 bytes, but `HeapObj` stays 80: `Generator` is 72 and something else
+        /// still pins the ceiling, so `heap_obj_slot_stays_small` sees no change.
+        source: std::sync::Arc<str>,
+        flags: std::sync::Arc<str>,
         last_index: Value,
         ascii_twin: Option<Option<std::sync::Arc<regress::Regex>>>,
     },

@@ -1306,6 +1306,85 @@ impl<'p> Vm<'p> {
     /// `exec` is still the intrinsic native data property. The drivers
     /// (@@match/@@replace/@@split/matchAll/exec_abstract) may then call
     /// `regexp_exec` directly, skipping the Get + generic call dispatch.
+    /// The eight per-flag accessor names, in the canonical order
+    /// `get RegExp.prototype.flags` reads them.
+    const FLAG_ACCESSORS: [(&'static str, u16); 8] = [
+        ("hasIndices", native::REGEXP_GET_HASINDICES),
+        ("global", native::REGEXP_GET_GLOBAL),
+        ("ignoreCase", native::REGEXP_GET_IGNORECASE),
+        ("multiline", native::REGEXP_GET_MULTILINE),
+        ("dotAll", native::REGEXP_GET_DOTALL),
+        ("unicode", native::REGEXP_GET_UNICODE),
+        ("unicodeSets", native::REGEXP_GET_UNICODESETS),
+        ("sticky", native::REGEXP_GET_STICKY),
+    ];
+
+    /// Canonical flag characters, index-parallel to [`Vm::FLAG_ACCESSORS`].
+    const FLAG_CHARS: [char; 8] = ['d', 'g', 'i', 'm', 's', 'u', 'v', 'y'];
+
+    /// `Some(flags)` when reading `receiver.flags` provably reduces to the internal
+    /// flag string: `re` is a real RegExp, `receiver` IS that object (not a
+    /// `Reflect.get` with a foreign receiver), its `[[Prototype]]` is
+    /// %RegExp.prototype%, it shadows none of the eight flag names, and each of those
+    /// eight on the prototype is still its intrinsic ACCESSOR.
+    ///
+    /// The internal string is stored **as the program wrote it**, NOT canonicalised —
+    /// `new RegExp("a", "ig")` keeps `"ig"` — so the result is rebuilt in canonical
+    /// `dgimsuvy` order by membership test, exactly as the eight reads would. Returning
+    /// the raw field was the first version of this and it was a conformance regression
+    /// (`"ig"` where node says `"gi"`); `tests/regexp_flags_fast_path.rs` diffs the two
+    /// paths over all 192 legal flag combinations and both spellings of each, which is
+    /// what caught it.
+    ///
+    /// Eight `contains` scans of a ≤8-byte string replace eight full property
+    /// traversals, so the shortcut still stands.
+    pub(crate) fn regexp_pristine_flags(&self, re: u32, receiver: Value) -> Option<String> {
+        if !receiver.is_heap() || receiver.heap_index() != re {
+            return None;
+        }
+        let flags = match self.heap.get(re) {
+            HeapObj::RegExp { flags, .. } => flags.clone(),
+            _ => return None,
+        };
+        match self.proto_of.get(&re) {
+            None => {}
+            Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
+            _ => return None,
+        }
+        // An own shadow of any flag name (or of `flags` itself) makes the reads
+        // observable again.
+        if let Some(m) = self.arr_props.get(&re) {
+            if m.pos("flags").is_some()
+                || Self::FLAG_ACCESSORS.iter().any(|(n, _)| m.pos(n).is_some())
+            {
+                return None;
+            }
+        }
+        let proto = match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => m,
+            _ => return None,
+        };
+        let mut out = String::with_capacity(8);
+        for (i, (name, want)) in Self::FLAG_ACCESSORS.iter().enumerate() {
+            let ok = proto.pos(name).is_some_and(|p| {
+                proto.attrs[p].accessor
+                    && proto.vals[p].is_heap()
+                    && matches!(self.heap.get(proto.vals[p].heap_index()),
+                                HeapObj::Native(n) if n == want)
+            });
+            if !ok {
+                return None;
+            }
+            // Canonical `dgimsuvy` order, by membership — the stored string is in
+            // SOURCE order, so it cannot be returned as-is.
+            let ch = Self::FLAG_CHARS[i];
+            if flags.as_bytes().contains(&(ch as u8)) {
+                out.push(ch);
+            }
+        }
+        Some(out)
+    }
+
     /// True when `re.<name>` provably resolves to the intrinsic native `want`, so the
     /// receiver-kind builtin fast path may serve it inline instead of going through
     /// `get_prop` + `call_value`.
@@ -1400,7 +1479,9 @@ impl<'p> Vm<'p> {
             .regexp_exact_source
             .get(&re_idx)
             .is_none()
-            .then(|| (source.clone(), rflags.clone(), true));
+            // The cache key owns its text, so the shared source is materialised
+            // here — once per twin build, never per match.
+            .then(|| (source.to_string(), rflags.clone(), true));
         let twin: Option<std::sync::Arc<regress::Regex>> =
             match cache_key.as_ref().and_then(|k| self.regex_compile_cache.get(k)) {
                 Some(rc) => Some(rc.clone()),

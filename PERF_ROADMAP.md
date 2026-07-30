@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| B70 `re.flags` pristine shortcut + RegExp text shared | **LANDED — FIRST SUITE-LEVEL WIN** | `re.flags` was reading EIGHT per-flag accessors per call (200ns vs node's 10); `matchAll` reads it just to test for `g`, making it 175ns of a 493ns call. Plus `source`/`flags` → `Arc<str>`, so a matcher clone shares text instead of copying it. **`regex-log-scan` −2.9% [−3.8, −1.5]; suite geomean −0.55% [−0.91%, −0.19%]**, both CIs excluding zero. `HeapObj` size hypothesis REFUTED (still 80) |
 | B69 RegExp `test`/`exec` dispatch arm | **LANDED** | the builtin dispatch had eleven receiver-kind arms and none for RegExp. A hot `re.test()` loop **−16.8%**, 1.17x → **0.97x node** (interleaved best-of-9); `regex-log-scan` only −1.1%, because the arm fires on a RegExp receiver and 88% of that row's deficit is elsewhere. Suite −0.16% [−0.40%, +0.09%]. Override-safe, unlike its siblings — 8 node-verified cases in `tests/regexp_dispatch_arm.rs` |
 | regex-log-scan, rephased (B68) | **DECOMPOSED; SMALL-PHASE NUMBERS CORRECTED IN B69** | 42% of the row is corpus generation, which contains NO REGEX; 46% is matchAll (64ms of it in iterator CREATION, ~178ms stepping); the literal-`test` phase is **0.40x** — zipp wins. Per successful capturing `exec` the deficit is three comparable terms: +139ns result construction, +87ns matcher, +80ns fixed call overhead |
 
@@ -1639,6 +1640,91 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B70 — `re.flags` was reading EIGHT properties, and a RegExp clone was copying its text: regex-log-scan −2.9%, suite −0.55%
+
+Two mechanisms on the `matchAll` creation path, which B69 left as the largest contained
+item. **First real suite-level improvement of this sequence: geomean −0.55%, 95% CI
+[−0.91%, −0.19%], interval excludes zero** (`bench/rx3_ab_2026-07-30.json`, 21 pairs).
+
+| row | paired | 95% CI |
+|---|---:|---|
+| **`regex-log-scan`** | **−2.9%** | [−3.8, −1.5] |
+| `map-set-heavy` | −3.0% | [−7.6, −0.1] |
+| `parse-large-js` | −0.6% | [−1.1, −0.1] |
+| `property-ic-shapes` | +0.4% | [+0.1, +0.8] |
+| **suite geomean** | **−0.55%** | **[−0.91%, −0.19%]** |
+
+#### Where the 480ns per `matchAll()` call actually went
+
+A hot-path attribution pass, anchored on ablations rather than reading. `s.matchAll(re)`
+with the iterator NEVER stepped: zipp 493ns, node 43ns. Of that, `@@matchAll`'s whole
+native body is only 134ns (27%). **The other 359ns is `String.prototype.matchAll`'s
+preamble**, which no earlier entry had looked at — and 175ns of it is one property read:
+
+`get_prop(re, "flags")`. `props/member.rs` synthesizes the flags string by reading the
+**eight** per-flag accessors off the receiver in canonical order, each a full
+RegExp-exotic `get_member_slow` traversal. `re.flags` measured **200ns against node's
+10ns**, and `matchAll` reads it purely to test for `g`. The code already knew: a comment
+there records "`re.flags` read nine such properties, so it cost 227ns against node's 3ns."
+
+Fixed with `regexp_pristine_flags`: when the receiver IS the regex, its `[[Prototype]]`
+is %RegExp.prototype%, it shadows none of the eight names nor `flags`, and all eight on
+the prototype are still their intrinsic ACCESSORS, the eight reads are unobservable and
+the answer is derivable from the internal flag string. Eight `pos()` probes replace eight
+property traversals. **`re.flags` −35%** (2M reads, 510ms → 331ms, interleaved).
+
+**The internal string is stored AS WRITTEN, not canonicalised** — `new RegExp("a","ig")`
+keeps `"ig"` — so the shortcut rebuilds the result in canonical `dgimsuvy` order by
+membership test. Returning the field raw was the first version and it was a conformance
+regression (`"ig"` where node says `"gi"`); `tests/regexp_flags_fast_path.rs` diffs the
+shortcut against the observable synthesis over all 192 legal flag combinations AND both
+spellings of each, which is what caught it.
+
+#### `source`/`flags` become `Arc<str>`
+
+`matchAll` clones a matcher per call — the iterator must advance a `lastIndex`
+independently of the source regex — and that clone allocated two heap `String`s. It
+cannot be elided: the matcher is observable to a user `exec` as its receiver, and
+`this === re` is `false` there in node too, verified by running it. But its TEXT need not
+be duplicated, so the fields are now shared and the clone is two atomic increments.
+
+**The size rationale was refuted.** The hypothesis was that this variant sets `HeapObj`'s
+width — its payload was exactly 80 (8+24+24+8+16), the cap `heap_obj_slot_stays_small`
+pins, and the roadmap records +64 bytes of padding costing 7.9% of the suite. `Arc<str>`
+does drop the payload to 64, and **`HeapObj` stayed 80**: `Generator` is 72 and something
+else still pins the ceiling. Measured payloads for the next time someone tries this:
+`Generator` 72, `Promise` 64, `RegExp` 64 (now), `IterHelper` 56, `Iterator`/`NativeClosure`/`Map` 48,
+`Str(JsStr)`/`Closure`/`Bound`/`Wrapped` 40.
+
+#### Attribution, and a method correction
+
+Two A/Bs, so the split is measured rather than asserted:
+
+| | `regex-log-scan` | suite geomean |
+|---|---:|---:|
+| `flags` shortcut alone (`rx4`) | −0.9% [−1.5, −0.7] | +0.23% [−0.33, +0.56] |
+| both (`rx3`, shipped) | **−2.9%** [−3.8, −1.5] | **−0.55%** [−0.91, −0.19] |
+
+So `Arc<str>` carries roughly −2.0pp of the row and −0.78pp of the suite — the larger
+half, because `source`/`flags` are cloned on several regex paths, not just `matchAll`.
+
+**And a repeat of B69's methodological lesson, which I walked into again.** An interleaved
+best-of-9 comparison put the `flags`-only row win at −3.0% and the bundle at −3.6%,
+i.e. it attributed almost everything to the `flags` shortcut. The 21-pair paired-bootstrap
+A/B says −0.9% vs −2.9%. **Best-of-N over ~9 samples on a 1600ms row cannot resolve 2pp**;
+it nearly caused the more valuable half of this change to be dropped as noise. Use
+`tools/bench.py --ab` for attribution, not shell timing loops — that is what §2's
+measurement protocol is for.
+
+#### Still open on this row, unchanged
+
+The two large terms remain: corpus generation (42% of the deficit, contains no regex) and
+`matchAll`'s per-step `exec`. Also still unfixed: the eager `whole` allocation per
+successful `.test()` (`proxy_regexp.rs:1060` above the `!build` early-out), the
+`regexp_exact_source` SipHash probe that is always a miss for patterns without lone
+surrogates, and a full clone of the receiver string at `string_ops.rs:298` that `matchAll`
+pays and never uses.
 
 ### B69 — the missing RegExp dispatch arm: `re.test()` loops −16.8%, and zipp now BEATS node on them. The ROW moves only −1.1%
 

@@ -1622,7 +1622,12 @@ impl<'p> Vm<'p> {
         // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when
         // none are given) via its slots, regardless of a falsy @@match override.
         let real_regexp = match p.is_heap().then(|| self.heap.get(p.heap_index())) {
-            Some(HeapObj::RegExp { source, flags, .. }) => Some((source.clone(), flags.clone())),
+            // The RegExp CONSTRUCTOR needs owned text (it may append a sticky flag,
+            // and the result becomes a different object's source), so materialise
+            // here — once per `new RegExp(...)`, never on a match path.
+            Some(HeapObj::RegExp { source, flags, .. }) => {
+                Some((source.to_string(), flags.to_string()))
+            }
             _ => None,
         };
         // EXACT pattern bytes, captured when the pattern VALUE is a string
@@ -1753,7 +1758,13 @@ impl<'p> Vm<'p> {
             };
         let idx = self
             .heap
-            .alloc(HeapObj::RegExp { regex, source, flags, last_index: Value::int(0), ascii_twin: None });
+            .alloc(HeapObj::RegExp {
+                regex,
+                source: source.into(),
+                flags: flags.into(),
+                last_index: Value::int(0),
+                ascii_twin: None,
+            });
         // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
         // the side table (the struct's `source: String` is lossy) so the
         // `source` getter / `toString` round-trip the surrogates. The heap
