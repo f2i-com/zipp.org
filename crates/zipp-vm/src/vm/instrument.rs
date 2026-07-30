@@ -74,8 +74,16 @@
 //! moves a row onto a different polynomial constraint. Add at the end.
 
 use crate::bytecode::Instr;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 use crate::codegen::meter::NATIVE_CHUNK;
 use crate::value::Value;
+
+/// Without a JIT tier there is no native code to lend budget to; the constant
+/// is only referenced by the metering loan path, which no build without
+/// `codegen` can reach. Keep the value in step with `codegen::meter` anyway, so
+/// the two never silently disagree about the unit.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+const NATIVE_CHUNK: i64 = 1 << 20;
 
 /// The trace opcode set — one per AIR selector column. A wire contract with the
 /// prover; see the module docs.
@@ -815,7 +823,7 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
             name as u64,
             Some(dst),
         ),
-        SetProp { obj, name, val } | InitDataProp { obj, name, val } => (
+        SetProp { obj, name, val, .. } | InitDataProp { obj, name, val } => (
             op::PROP,
             Claim::Flat,
             Some(obj),
