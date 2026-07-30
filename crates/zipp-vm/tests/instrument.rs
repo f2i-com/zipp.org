@@ -198,6 +198,46 @@ fn the_step_budget_stops_an_infinite_loop() {
     assert_eq!(st.steps_remaining(), 0);
 }
 
+/// The consumed count is the remaining budget's other half: a host billing
+/// for execution (gas) needs what the script DID, not just what it may still
+/// do. The two sum to the budget at every observational point — interpreter
+/// and native charges included.
+#[test]
+fn steps_used_reports_what_the_script_consumed() {
+    const BUDGET: u64 = 10_000_000;
+    let mut st = instrumented(BUDGET, None);
+    // The bootstrap already consumed some of the budget; the invariant holds.
+    assert_eq!(st.steps_used() + st.steps_remaining(), BUDGET);
+
+    let before = st.steps_used();
+    st.eval_in_context("(0,eval)('let s=0; for(let i=0;i<1000;i++) s+=i; s')")
+        .expect("a small loop runs");
+    let used = st.steps_used() - before;
+    assert!(
+        used > 1_000,
+        "a 1000-iteration loop consumed only {used} steps — is it counted at all?"
+    );
+    assert!(
+        used < 1_000_000,
+        "a 1000-iteration loop consumed {used} steps — the count is not sane"
+    );
+    assert_eq!(st.steps_used() + st.steps_remaining(), BUDGET);
+}
+
+/// Exhaustion reports exactly the budget — the number a gas meter charges for
+/// a rejected transaction.
+#[test]
+fn an_exhausted_budget_reports_the_full_cap() {
+    const BUDGET: u64 = 100_000;
+    let mut st = instrumented(BUDGET, None);
+    let err = st
+        .eval_in_context("(0,eval)('while(true){}')")
+        .expect_err("a runaway loop must not return");
+    assert!(err.contains("instruction budget"), "got {err:?}");
+    assert_eq!(st.steps_used(), BUDGET);
+    assert_eq!(st.steps_remaining(), 0);
+}
+
 /// The budget is a hard stop, not a catchable error: a script must not be able
 /// to `try`/`catch` its way past its own limit and keep running.
 #[test]

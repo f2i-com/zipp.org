@@ -450,6 +450,23 @@ impl ScriptState {
         }
         (rec.remaining + vm.jit_steps.max(0)).max(0) as u64
     }
+
+    /// Instructions actually executed since [`Self::set_limits`] attached the
+    /// recorder — the consumed half of [`Self::steps_remaining`], and 0 before
+    /// limits are set.
+    ///
+    /// This is the figure a host bills on (blockchain gas metering): what the
+    /// script DID, in the same unit `max_steps` caps, counted identically
+    /// whether the work ran in the interpreter, was charged per basic block by
+    /// compiled code, or ran in an off-loop kernel. With a finite budget,
+    /// `steps_used() + steps_remaining() == max_steps` at every observational
+    /// point — so a script stopped by its budget reports exactly the cap.
+    #[cfg(feature = "instrument")]
+    pub fn steps_used(&self) -> u64 {
+        let Some(vm) = self.vm.as_ref() else { return 0 };
+        let Some(rec) = vm.instr_rec.as_ref() else { return 0 };
+        rec.used
+    }
 }
 
 impl Drop for ScriptState {
