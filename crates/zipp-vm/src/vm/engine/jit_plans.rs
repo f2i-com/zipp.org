@@ -5,6 +5,15 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// `ZIPP_JITDECLINE` names the constraint a nested-leaf splice failed on —
+/// B75's survey showed a bare "Call" (and then a bare "wrapper's inner call not
+/// inlinable") cannot choose between the possible generalisations.
+fn nested_reject(why: &str) {
+    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+        eprintln!("[nested-reject] {why}");
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Build the TypedArray pin plan for the OSR region `[start, end]` from
     /// LIVE VM state (called right before `compile_region`, frame `base` on
@@ -621,28 +630,42 @@ impl<'p> Vm<'p> {
     )> {
         use crate::codegen::{callee_leaf_ok, NestedGuard};
         if !outer.upvalues.is_empty() {
+            nested_reject("outer-has-upvalues");
             return None;
         }
-        let (callee_reg, dst, argc) = match outer_body[call_at] {
-            Instr::Call { callee, dst, argc, .. } => (callee, dst, argc),
+        let (callee_reg, dst) = match outer_body[call_at] {
+            Instr::Call { callee, dst, .. } => (callee, dst),
             _ => return None,
         };
-        if argc != 0 {
-            return None;
-        }
+        // Any argc is admitted (B76). The emitter zero-fills every register past
+        // the OUTER window to undefined — which covers the inner's `this` (strict,
+        // plain call ⇒ undefined) and any params the call leaves unfilled — so the
+        // splice only has to SEED the params that are passed, with plain `Move`s
+        // inserted after the guard marker. Pure ops: a later bail re-runs the whole
+        // outer call with nothing committed, so deopt-idempotency is untouched.
+        // The B75/B76 surveys showed `inner-call-has-args` was EVERY remaining
+        // nested reject on the call-heavy rows (13 sites in parse-large-js alone).
         // Resolve the wrapper's own call site from ITS live IC.
-        let (bits, ver, inner_fid, inner_closure) = self.ic_call_mono(outer_fid, call_at)?;
+        let Some((bits, ver, inner_fid, inner_closure)) = self.ic_call_mono(outer_fid, call_at) else {
+            nested_reject("inner-call-site-not-monomorphic");
+            return None;
+        };
         let inner = self.func(inner_fid as usize);
         if inner.lexical_this || !inner.is_strict {
+            nested_reject("inner-lexical-this-or-sloppy");
             return None;
         }
-        let inner_body = callee_leaf_ok(inner)?;
+        let Some(inner_body) = callee_leaf_ok(inner) else {
+            nested_reject("inner-not-leaf");
+            return None;
+        };
         if inner_body.iter().any(|i| {
             matches!(
                 i,
                 Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }
             )
         }) {
+            nested_reject("inner-branchy");
             return None;
         }
         // Shift every inner register above the outer window.
@@ -662,6 +685,15 @@ impl<'p> Vm<'p> {
         let const_off = outer.constants.len() as u32;
         let mut consts = rustc_hash::FxHashMap::default();
         let mut flat: Vec<Instr> = outer_body[..=call_at].to_vec(); // keep the Call as the guard marker
+        // Seed the inner's params from the outer call's arg registers. Params the
+        // call does not fill stay at the emitter's undefined zero-fill.
+        let (arg_base, argc) = match outer_body[call_at] {
+            Instr::Call { arg_base, argc, .. } => (arg_base, argc),
+            _ => return None,
+        };
+        for k in 0..argc.min(inner.param_count) {
+            flat.push(Instr::Move { dst: off + 1 + k, src: arg_base + k });
+        }
         for instr in &inner_body[..inner_body.len() - 1] {
             if let Instr::LoadConst { idx, .. } = *instr {
                 let c = inner.constants.get(idx as usize)?;

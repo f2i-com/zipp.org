@@ -221,6 +221,17 @@ pub(crate) fn emit_inline_leaf_call(
                     ; mov [rbx + dreg(rg(d))], rax
                 );
             }
+            // A void inner return in a nested splice materialises as
+            // `LoadUndefined { dst }` — which had NO arm here, so a spliced inner
+            // ending in `ReturnUndefined` hit the `unreachable!` below at region
+            // compile time, under `panic = "abort"`. Latent until B76's
+            // args-passing splice widened what reaches this emitter.
+            Instr::LoadUndefined { dst: d } => {
+                dynasm!(ops
+                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+            }
             Instr::Move { dst: d, src } => {
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(rg(src))]

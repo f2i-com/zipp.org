@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| B76 nested splice admits ARGS | **LANDED, MECHANISM ONLY** | `wrap(n){ return inner(n,7)+1 }` was rejected (`inner-call-has-args`); now spliced: **−55.1%** on the 3M-call micro, faster than node. Suite uptake ZERO — every previously-blocked site moved to `inner-not-leaf` (depth ≥ 3), which is B75's real design task. Also fixed a latent `unreachable!` panic: the emitter had no `LoadUndefined` arm for a void inner return |
 | **B74 leaf inliner admits `GetProp`** | **LANDED** | the plain-call shape goes **29.2ns → 9.7ns (−66.8%)**; `class-prototype-hot` −1.0% [−1.5,−0.1], `polymorphic-objects` −0.9% [−1.3,−0.6], `async-promise-chain` −0.6% [−1.2,−0.2], suite −0.18% [−0.43,+0.03]. Measured with `--ab-env` on ONE binary, so no layout confound. Site-free helper (the `GetIndex` precedent), so B73's IC-budgeting problem never arose. Off-switch `ZIPP_NO_LEAF_GETPROP=1` |
 | ~~B73 leaf inliner lacks `GetProp`~~ | **CLOSED BY B74** | a plain `f(o)` whose body reads a NAMED property off an argument is `(not leaf-eligible)` and pays a full frame call per iteration in a hot loop: **30.1ns against 7.0ns** for the identical body written as a method, which the method inliner DOES inline. `callee_leaf_ok`'s whitelist admits `GetIndex` and not `GetProp`. 28 declined sites in `parse-large-js`, 20 in `markdown-render`, 7 in `json-large`, 5 in `regex-log-scan` — unweighted. Broader than any single row |
 | class-prototype-hot decomposed (B73) | **ACCESSOR PHASE IS A 2.9x WIN** | 66ms against node's 191ms with `super.v` chains and overridden setters — larger than the plan recorded. Do not "optimise" it. The row's loss is entirely method + plain calls |
@@ -1647,6 +1648,46 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B76 — the nested splice accepts arguments: −55% on the wrapper-with-args shape, zero suite uptake, and one latent panic fixed
+
+B75 said "every remaining leaf decline is `Call`" and framed the successor as a design
+task. Finer-grained logging (`[nested-reject]`, naming which CONSTRAINT a splice failed)
+splits that verdict into something much cheaper plus something that really is the design
+task:
+
+* the first-pass rejects were mostly retried and spliced (`NESTED-INLINE`) already;
+* every splice that still failed, failed on **`inner-call-has-args`** — the nested
+  splice only accepted a ZERO-arg inner call (13 sites in `parse-large-js`, 7 in
+  `markdown-render`).
+
+**Args are now admitted.** The emitter already zero-fills every register past the outer
+window to undefined — which covers the inner's `this` (strict plain call) and unfilled
+params — so the splice only seeds the params that ARE passed, with plain `Move`s inserted
+after the guard marker. Pure ops: a bail re-runs the whole outer call with nothing
+committed, so deopt-idempotency is untouched.
+
+**Mechanism: −55.1%** on a 3M-call `wrap(n){ return inner(n, 7) + 1 }` micro, 136ms →
+61ms, now FASTER than node (63ms).
+
+**Suite uptake: ZERO, stated plainly.** With the args gate cleared, all 20 previously
+argc-blocked sites moved to the NEXT constraint — `inner-not-leaf`: their inners contain
+calls themselves (depth ≥ 3) or non-admitted ops. Not one suite row contains the
+wrapper-with-args-over-a-leaf shape. So this ships on the mechanism and on generality
+(the shape is ordinary code), with no suite claim at all; B75's multi-level design task
+remains the real successor and is now precisely scoped to `inner-not-leaf`.
+
+**The latent panic mattered more than expected:** the splice has always been able to
+push `Instr::LoadUndefined` into a flat body (a VOID inner return), and the leaf emitter
+had **no arm for it** — `unreachable!` at region compile time under `panic = "abort"`.
+Unreachable before only because a zero-arg void inner never survived the other gates;
+args widened the reachable set and the new
+`a_void_inner_return_reads_undefined` test hits it directly. Arm added.
+
+`tests/nested_leaf_args.rs` (5 cases, all executed in node and byte-identical): args flow
+through, missing params read undefined, EXTRA args are still evaluated (observable
+side effects) though unbound, a void inner return, and rebinding the inner mid-loop
+falls back to the new function.
 
 ### B75 — every remaining leaf decline is `Call`: the next step is multi-level inlining, not another whitelist line
 

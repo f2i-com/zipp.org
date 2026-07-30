@@ -465,6 +465,24 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             Instr::Call { .. } if allow_one_call && !branchy && !seen_effect && call_at.is_none() => {
                 call_at = Some(i);
             }
+            // A `Call` that fails the splice guard: under ZIPP_JITDECLINE, say WHICH
+            // constraint, because "Call" alone (B75) cannot choose between the two
+            // possible generalisations — N splices vs branch-target remapping.
+            Instr::Call { .. } => {
+                if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                    let why = if !allow_one_call {
+                        "outer-context-disallows-call"
+                    } else if call_at.is_some() {
+                        "second-call"
+                    } else if branchy {
+                        "branchy-body"
+                    } else {
+                        "after-effect"
+                    };
+                    eprintln!("[leaf-reject] Call ({why})");
+                }
+                return None;
+            }
             // Buffered upvalue write — see `branchy` above. Deliberately does NOT
             // set `seen_effect`: nothing is committed to the cell until after the
             // body's last op, so deopt-capable ops may still follow it.
