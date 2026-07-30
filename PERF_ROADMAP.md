@@ -37,6 +37,9 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| B72 SetProp shape memo | **REFUTED, REVERTED** | +15.9% on the write micro. `PROP_INDEX_THRESHOLD` is 12, so a narrow map's `pos(key)` is a linear scan over a few short strings — cheaper than hashing a `(u32,u32)` and probing. Break-even is above the threshold; retry only gated on `keys.len() >= 12`, and re-measure the GET side the same way |
+| B72 string_method receiver clone | **REFUTED** | flagged as an O(len) copy every string method pays; `s.slice(0,5)` is FLAT from 64B to 32KB receivers and zipp beats node at every size. Needs a scaling curve before anyone "fixes" it |
+| typedarray-math decomposed (B72) | **63% IS DATAVIEW, NEEDS TIER D** | the DataView loop compiles but only to the MEM tier: `v = dv.getUint32(...)` ranges through 2^32-1 so INT declines. 4.9ns/call against node's 1.3 is a per-op arithmetic gap, not dispatch. f64 fill is another 20% |
 | B71 `.test()` allocates nothing | **LANDED, ROW FLAT** | Annex B statics slot 1 (`lastMatch`) joins the deferred-range set, so a successful `.test()` stops materialising the matched span; plus an `is_empty` gate on the always-missing `regexp_exact_source` probe. **−10.0% median on anchored `.test()` x300k**, but `regex-log-scan` −0.3% [−0.9, +0.2] — the `.test()` phases are ~2% of that row. Suite −0.28% [−0.62, +0.10]. Ships on the mechanism, not the row |
 | B70 `re.flags` pristine shortcut + RegExp text shared | **LANDED — FIRST SUITE-LEVEL WIN** | `re.flags` was reading EIGHT per-flag accessors per call (200ns vs node's 10); `matchAll` reads it just to test for `g`, making it 175ns of a 493ns call. Plus `source`/`flags` → `Arc<str>`, so a matcher clone shares text instead of copying it. **`regex-log-scan` −2.9% [−3.8, −1.5]; suite geomean −0.55% [−0.91%, −0.19%]**, both CIs excluding zero. `HeapObj` size hypothesis REFUTED (still 80) |
 | B69 RegExp `test`/`exec` dispatch arm | **LANDED** | the builtin dispatch had eleven receiver-kind arms and none for RegExp. A hot `re.test()` loop **−16.8%**, 1.17x → **0.97x node** (interleaved best-of-9); `regex-log-scan` only −1.1%, because the arm fires on a RegExp receiver and 88% of that row's deficit is elsewhere. Suite −0.16% [−0.40%, +0.09%]. Override-safe, unlike its siblings — 8 node-verified cases in `tests/regexp_dispatch_arm.rs` |
@@ -1641,6 +1644,74 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B72 — three refutations worth more than the code they killed: the string-clone "bonus", the SetProp shape memo, and where typedarray-math's deficit actually is
+
+No code shipped. Three things measured and closed, each of which would have been
+plausible to just implement.
+
+#### REFUTED — the "dead full-receiver clone" in `string_method`
+
+B68's hot-path pass flagged `js_recv = js.clone()` (`vm/string_ops.rs:298`) as an O(len)
+copy of the whole receiver that every string method past the early fast paths pays and
+`matchAll` never uses. It reads that way. **It is not measurable.** A constant-size
+operation on a growing receiver, 300k calls:
+
+| receiver length | node | zipp | |
+|---:|---:|---:|---|
+| 64 B | 217ns | 190ns | 0.9x |
+| 512 B | 233ns | 193ns | 0.8x |
+| 4 KB | 227ns | 197ns | 0.9x |
+| 32 KB | 223ns | 187ns | 0.8x |
+
+`s.slice(0, 5)` is FLAT in receiver length across a 512x range, and zipp beats node at
+every size. Either `slice` returns before that line or `JsStr::clone` is not a byte copy;
+either way there is nothing to reclaim. Do not "fix" this without a scaling curve that
+shows a slope.
+
+#### REFUTED — a shape memo for the SetProp miss path
+
+`jit_get_prop_miss` keeps a `(site, shape) -> slot` memo; `jit_set_prop_miss` never had
+one, so a SetProp site with more than `JIT_IC_WAYS` same-shape receivers redid the full
+key lookup on every access. Implemented as the mirror image (with the attributes still
+read live, since the memo is shared with the get side and says nothing about
+writability). **Measured +15.9% on the write micro** — median and best agreeing — and
++2.8% on `property-ic-shapes`. Reverted.
+
+The mechanism is the useful part: `PROP_INDEX_THRESHOLD` is 12, so a map below it resolves
+`pos(key)` by **linear scan over a handful of short strings**, and that is cheaper than
+hashing a `(u32, u32)` tuple and probing an `FxHashMap` — plus an insert per miss on the
+fill path. The memo's break-even is somewhere ABOVE the PropIndex threshold, and the
+receivers in both the micro and `property-ic-shapes` carry three keys. Anyone retrying
+this must gate it on `map.keys.len() >= PROP_INDEX_THRESHOLD` and bring a workload with
+wide objects AND >8 receivers; the get side is presumably paying the same tax on narrow
+maps and is worth re-measuring the same way.
+
+#### typedarray-math decomposed: 63% of it is DataView, and it needs Tier D
+
+Seven phase scripts, cost by subtraction against the relevant fill:
+
+| phase | node | zipp | ratio | share of deficit |
+|---|---:|---:|---:|---:|
+| **DataView swizzle** | 95ms | 363ms | **3.82x** | **63%** |
+| f64 fill (`x[i] = …`, top-level) | 96ms | 182ms | 1.90x | 20% |
+| prefix sum | 7ms | 30ms | 4.29x | 5% |
+| axpy + dot + normalize | 19ms | 47ms | ~2.5x | 7% |
+| i32 xorshift fill | 76ms | 97ms | 1.28x | 5% |
+
+The DataView loop DOES compile — two regions, `[67,115]` and `[61,119]` — but to the
+**MEM tier**, because the INT tier declines with `region_is_int=false` /
+"Bitwise on the double path". The reason is exactly M4.5's warning: the loop holds
+`v = dv.getUint32(...)`, a Uint32 that ranges through 2^32-1 and does not fit an i32
+register, then feeds it to `>>>` and `&`. There is no contained fix — this is the
+Int32/Uint32/Int53 representation problem, i.e. Tier D. §13's "DataView admission/helper
+alone — mispriced; most phase gap is surrounding arithmetic" holds, and the marginal
+per-call cost confirms it: 73.7M getter calls in 363ms is **4.9ns per call** against
+node's 1.3ns, which is a per-op arithmetic gap and not a dispatch gap.
+
+Note the two SMALL phases whose ratios look alarming (prefix 4.29x, dot 3.20x) are
+7-30ms marginals recovered by subtracting ~190ms fills — the B69/B70 lesson applies, and
+they should not be quoted without an interleaved re-measure.
 
 ### B71 — `.test()` becomes allocation-free: −10% on the shape it targets, and the ROW does not move at all
 
