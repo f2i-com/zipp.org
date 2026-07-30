@@ -2855,7 +2855,7 @@ impl<'p> Vm<'p> {
                 Value::UNDEFINED
             }
             AGENT_MONOTONIC_NOW => {
-                Value::num(self.vm_start.elapsed().as_secs_f64() * 1000.0)
+                Value::num(crate::vm::clock::now_mono_ms() - self.vm_start_mono_ms)
             }
             AGENT_SET_TIMEOUT => {
                 let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
