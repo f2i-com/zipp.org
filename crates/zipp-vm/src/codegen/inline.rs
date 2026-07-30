@@ -1085,6 +1085,27 @@ pub(crate) fn emit_inline_method_call(
                 ; jne => miss
             );
         }
+        // ── B78: INHERITED method ── the receiver's own version guard above
+        // already covers "no own shadow was added" and "the first proto link
+        // was not re-pointed" (`ordinary_set_prototype_of` bumps it). What is
+        // left is the rest of the chain and the holder's slot value — the same
+        // two guards, emitted the same way, that an inlined `super.m()` uses.
+        if let Some(pm) = &shape.proto_method {
+            for &(idx, ver) in &pm.hops {
+                dynasm!(ops
+                    ; mov edx, [r13 + (idx as i32) * 4]
+                    ; cmp edx, DWORD ver as i32
+                    ; jne => miss
+                );
+            }
+            dynasm!(ops
+                ; mov rcx, QWORD pm.holder_vals_ptr as i64
+                ; mov rcx, [rcx + (pm.holder_slot as i32) * 8]
+                ; mov r10, QWORD pm.fn_bits as i64
+                ; cmp rcx, r10
+                ; jne => miss
+            );
+        }
         dynasm!(ops
             // ── bind reg 0 = `this` (rax still = receiver) ──
             ; mov [rbx + dreg(w)], rax

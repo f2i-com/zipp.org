@@ -371,6 +371,37 @@ impl SuperInline {
     }
 }
 
+/// The extra guards a PROTOTYPE-CHAIN method arm needs (B78).
+///
+/// `build_method_shape` originally admitted two receiver shapes — a class
+/// instance, and a plain object holding the function in an OWN slot — and
+/// declined everything else. So `Object.create(proto)` and the classic
+/// `Ctor.prototype.m = function …` shape, which is most of the JavaScript
+/// written before 2015 and most of what transpilers still emit, inlined NEVER:
+/// measured 29.5ns/call at ONE receiver against 5.5ns for the identical method
+/// on an ES class, and 1.0ns in node. This closes that arm.
+///
+/// The receiver's own identity+version guard (already emitted for every arm)
+/// carries more weight here than it looks: the version bumps on an own-key ADD
+/// (so a later `recv.m = …` SHADOW misses) and inside `ordinary_set_prototype_of`
+/// (so a re-pointed first link misses). That leaves exactly two things for this
+/// struct: the rest of the chain, and the holder slot's value.
+pub struct ProtoMethodGuard {
+    /// `(heap_idx, version)` for every object from the receiver's prototype down
+    /// to the holder — the same hop set, checked the same way, as
+    /// [`SuperInline::hops`]. A `setPrototypeOf` or a key add/delete anywhere on
+    /// the chain bumps one of these.
+    pub hops: Vec<(u32, u32)>,
+    /// Holder's `vals` base + the method's slot + its baked function bits.
+    /// REQUIRED, not defensive, for the same reason
+    /// [`MethodInlineShape::method_slot`] is: `PROTO.m = other` overwrites an
+    /// existing slot in place and deliberately does not bump the holder's
+    /// version, so the hop guards alone would happily run the OLD body.
+    pub holder_vals_ptr: u64,
+    pub holder_slot: u32,
+    pub fn_bits: u64,
+}
+
 /// One receiver "shape" (arm) of a (possibly polymorphic) inlined CallMethod
 /// (Stage 4). Each arm guards a specific receiver instance's identity+version and
 /// runs that receiver's resolved class method inline; a miss tries the next arm,
@@ -410,6 +441,9 @@ pub struct MethodInlineShape {
     /// ordinary-set fast path keeps the shape unchanged so JIT caches stay
     /// valid), so identity+version alone would happily run the OLD body.
     pub method_slot: Option<(u32, u64)>,
+    /// For a receiver that resolves `name` on its PROTOTYPE CHAIN (B78) — no
+    /// class, no own slot. Mutually exclusive with `method_slot`.
+    pub proto_method: Option<ProtoMethodGuard>,
 }
 
 pub struct MethodInlinePlan {

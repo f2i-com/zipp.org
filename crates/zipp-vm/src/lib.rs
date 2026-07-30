@@ -1009,6 +1009,48 @@ mod tests {
     }
 
     #[test]
+    fn proto_method_inline_matches_across_tiers() {
+        // B78: the method inliner now bakes an arm for a receiver whose method
+        // is INHERITED (`Object.create(proto)` / `Ctor.prototype.m = fn`),
+        // which previously fell to the per-call helper on every iteration —
+        // 29.5ns/call at one receiver against 5.5ns for the same method on a
+        // class. Each case runs past the OSR threshold and then attacks one
+        // guarded fact:
+        //   1. reassign `P.m` in place — no version bump anywhere, so ONLY the
+        //      `holder_vals_ptr[slot] == fn_bits` compare catches it.
+        //   2. add an own SHADOW on the receiver (its version bumps).
+        //   3. `setPrototypeOf` the receiver — the reason this arm may guard
+        //      the first chain link by the receiver's version alone instead of
+        //      re-reading `proto_of` the way `ic_chain_ok` does.
+        //   4. an inherited ARROW must decline: inlining drops the captured
+        //      `this_val` and would bind reg 0 to the receiver (999 or 3, not
+        //      111) — the own-slot arm's `lexical_this` hazard, inherited.
+        //   5. an inherited GETTER must decline and run on EVERY call.
+        //   6. the pre-ES6 constructor-prototype shape, with an argument.
+        // Expectations computed with node (B51: never by hand).
+        assert_jit_matches(
+            "var out=[];\
+             (function(){var P={m:function(){return this.x+1}};var o=Object.create(P);o.x=41;var s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) P.m=function(){return this.x*2}; s=(s+o.m())|0; }\
+              out.push(s);})();\
+             (function(){var P={m:function(){return 1}};var o=Object.create(P);var s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) o.m=function(){return 7}; s=(s+o.m())|0; }\
+              out.push(s);})();\
+             (function(){var P={m:function(){return 1}};var Q={m:function(){return 2}};var o=Object.create(P);var s=0;\
+              for(var i=0;i<200000;i++){ if(i===100000) Object.setPrototypeOf(o,Q); s=(s+o.m())|0; }\
+              out.push(s);})();\
+             (function(){var holder={f:111};var P={f:3,m:(function(){return ()=>this.f}).call(holder)};\
+              var o=Object.create(P);o.f=999;var s=0;for(var i=0;i<200000;i++) s=o.m(); out.push(s);})();\
+             (function(){var n=0;var P={};Object.defineProperty(P,'m',{get:function(){n++;return function(){return 9}}});\
+              var o=Object.create(P);var s=0;for(var i=0;i<200000;i++) s=o.m(); out.push(s+'/'+n);})();\
+             (function(){function K(i){this.v=i}K.prototype.m=function(a){return (this.v*2+a)|0};\
+              var k=new K(21),s=0;for(var i=0;i<200000;i++) s=k.m(i&7); out.push(s);})();\
+             console.log(out.join('|'))",
+            &["12400000|800000|300000|111|9/200000|49"],
+        );
+    }
+
+    #[test]
     fn set_index_concat_fusion_order() {
         // `o["k" + e] = v` fuses to ToConcatKey + SetIndexConcat. Case 1 is
         // the wrong answer a previous fusion shipped and reverted (B50): the

@@ -14,6 +14,28 @@ fn nested_reject(why: &str) {
     }
 }
 
+/// `ZIPP_NO_PROTO_METHOD_INLINE=1` drops the B78 prototype-chain arm back out of
+/// `build_method_shape`, leaving the class and own-slot arms untouched. Exists so
+/// the change can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
+/// which removes the fat-LTO code-layout confound §2 warns about and that B77 was
+/// reverted for. Cached, because this is read once per candidate receiver per
+/// region compile. (`ZIPP_NO_METHOD_INLINE=1` remains the whole-mechanism switch;
+/// it is no use for attribution, since it also kills the class and own-slot arms.)
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn proto_method_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROTO_METHOD_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Build the TypedArray pin plan for the OSR region `[start, end]` from
     /// LIVE VM state (called right before `compile_region`, frame `base` on
@@ -766,6 +788,7 @@ impl<'p> Vm<'p> {
         reg_window: u16,
     ) -> Option<(crate::codegen::MethodInlineShape, u16)> {
         use crate::heap::HeapObj;
+        use crate::vm::ic::Walked;
         let ridx = recv.heap_index();
         if !self.ic_obj_ok(ridx) {
             return None;
@@ -786,8 +809,60 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => m.pos(key),
             _ => None,
         };
+        let mut proto_method = None;
         let (fid, method_slot) = match (recv_class, own_slot) {
             (Some(c), None) => (self.ic_class_method_fid(func_id, ip, c)?, None),
+            // ── B78: the method is INHERITED ── a plain object with neither a
+            // class nor an own slot for `key`. `Object.create(proto)` and
+            // `Ctor.prototype.m = fn` both land here, and both used to fall
+            // through the `_` arm below to the per-call helper: 29.5ns/call at
+            // ONE receiver, against 5.5ns for the same method on an ES class.
+            //
+            // Resolution is `ic_walk`, the interpreter's own side-effect-free
+            // fill walk — so what gets baked is by construction what the
+            // interpreter would resolve, and the exclusions it already makes
+            // (exotic receivers, class links mid-chain, chains deeper than
+            // IC_MAX_HOPS, accessors, `#`-names) are inherited rather than
+            // re-derived here.
+            (None, None) => {
+                if !proto_method_inline_enabled() {
+                    return None;
+                }
+                let (hops, slot) = match self.ic_walk(recv, key) {
+                    Walked::ChainData { hops, slot, .. } => (hops, slot),
+                    _ => return None, // accessor / chain miss / not cacheable
+                };
+                let n = hops.1 as usize;
+                if n == 0 {
+                    return None;
+                }
+                let holder = hops.0[n - 1].0;
+                let (fv, hvals) = match self.heap.get(holder) {
+                    HeapObj::Object(hm) => (hm.vals[slot as usize], hm.vals.as_ptr() as u64),
+                    _ => return None,
+                };
+                if !fv.is_heap() {
+                    return None;
+                }
+                // Same callee restrictions as the own-slot arm: a plain
+                // capture-free function, never an arrow (whose `this` is
+                // lexical and would be silently rebound to the receiver).
+                let f = match self.heap.get(fv.heap_index()) {
+                    HeapObj::Func(f) => *f,
+                    HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => *func,
+                    _ => return None,
+                };
+                if self.func(f as usize).lexical_this {
+                    return None;
+                }
+                proto_method = Some(crate::codegen::ProtoMethodGuard {
+                    hops: hops.0[..n].to_vec(),
+                    holder_vals_ptr: hvals,
+                    holder_slot: slot,
+                    fn_bits: fv.bits(),
+                });
+                (f, None)
+            }
             (_, Some(slot)) => {
                 // The own property must be a plain data slot (an accessor would
                 // have to RUN, not be called) holding a closure with no
@@ -876,6 +951,7 @@ impl<'p> Vm<'p> {
         Some((
             crate::codegen::MethodInlineShape {
                 method_slot,
+                proto_method,
                 recv_bits: recv.bits(),
                 recv_ver,
                 vals_ptr,
@@ -1011,6 +1087,7 @@ impl<'p> Vm<'p> {
         Some((
             crate::codegen::MethodInlineShape {
                 method_slot: None,
+                proto_method: None,
                 recv_bits: recv.bits(),
                 recv_ver,
                 vals_ptr,

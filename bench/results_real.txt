@@ -9,20 +9,23 @@ class-prototype-hot: OK
 async-promise-chain: OK
 polymorphic-objects: OK
 sparse-array: OK
+property-ic-shapes: OK
+polymorphic-objects-v2: OK
+sparse-array-v2: OK
 ALL_CORRECT=1
 
-startup(ms): node=55 bun=165 deno=75 zipp=27 zipp_nojit=27   (best of 5)
+startup(ms): node=55 bun=179 deno=80 zipp=30 zipp_nojit=28   (best of 5)
 
 bench                      node      bun     deno     zipp   zipp_nojit  zipp/node
 ----------------------   ------   ------   ------   ------   ----------  ---------
-parse-large-js            239ms    177ms    198ms    597ms       3221ms      2.50x
-json-large                233ms    139ms    238ms    537ms       1339ms      2.30x
-markdown-render           238ms    158ms    233ms    671ms       1848ms      2.82x
-map-set-heavy             670ms    774ms   1369ms    837ms       1018ms      1.25x
-typedarray-math           174ms    877ms     88ms    682ms       7720ms      3.92x
-regex-log-scan            413ms    509ms    364ms   1771ms       3626ms      4.29x
-class-prototype-hot       262ms    282ms    238ms    754ms       5184ms      2.88x
-async-promise-chain       301ms    322ms    285ms    711ms        764ms      2.36x
-polymorphic-objects       294ms    273ms    260ms    716ms       1499ms      2.44x
-sparse-array               49ms     53ms     51ms    161ms        628ms      3.29x
+parse-large-js            238ms    174ms    208ms    583ms       3276ms      2.45x
+json-large                256ms    185ms    241ms    441ms       1232ms      1.72x
+markdown-render           235ms    161ms    229ms    438ms       1643ms      1.86x
+map-set-heavy             681ms    778ms   1130ms    675ms        795ms      0.99x
+typedarray-math           168ms    853ms     82ms    644ms       7948ms      3.83x
+regex-log-scan            417ms    499ms    383ms   1567ms       3560ms      3.76x
+class-prototype-hot       263ms    273ms    241ms    372ms       5651ms      1.41x
+async-promise-chain       298ms    333ms    268ms    625ms        723ms      2.10x
+polymorphic-objects       290ms    273ms    249ms    616ms       1396ms      2.12x
+sparse-array               47ms     48ms     44ms    149ms        605ms      3.17x
 DONE

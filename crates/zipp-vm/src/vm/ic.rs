@@ -178,7 +178,7 @@ enum SetPlan {
 }
 
 /// Side-effect-free provenance of a property resolution (the fill walk).
-enum Walked {
+pub(crate) enum Walked {
     OwnData { slot: usize },
     OwnAcc { slot: usize },
     /// Hit on the class chain: methods-before-getters per level, like
@@ -301,7 +301,7 @@ impl<'p> Vm<'p> {
     /// Resolve `recv.key` with provenance, mirroring `get_member`'s fast path
     /// EXACTLY and performing no side effects. Anything the fast path would
     /// delegate to the slow path reports `Walked::No`.
-    fn ic_walk(&self, recv: Value, key: &str) -> Walked {
+    pub(crate) fn ic_walk(&self, recv: Value, key: &str) -> Walked {
         if !self.deferred_ns_state.is_empty() || !recv.is_heap() {
             return Walked::No;
         }
@@ -1124,6 +1124,14 @@ impl<'p> Vm<'p> {
                 let v = hm.vals[slot as usize];
                 match self.ic_plain_fn(v) {
                     Some((fid, closure)) => {
+                        // B78: the method inliner now bakes arms for INHERITED
+                        // methods too, so this fill is worth recording for the
+                        // same reason the class one is. Without it the planner
+                        // sees only the live exemplar at the receiver register
+                        // plus the `arr[idx]` dense scan, so `var o = list[i];
+                        // o.m()` — the receiver loaded indirectly — would get
+                        // exactly ONE arm.
+                        self.mi_record_recv(func_id, ip, recv);
                         self.ic_install(func_id, ip, IcEntry::ProtoData { first, hops, slot });
                         Some((fid, closure, v))
                     }

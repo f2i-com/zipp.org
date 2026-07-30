@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B78 method inliner admits the PROTOTYPE chain** | **LANDED, MECHANISM ONLY** | `build_method_shape` had arms for a class instance and for an own data slot, and declined everything else — so `Object.create(proto)` and `Ctor.prototype.m = fn` inlined NEVER, at any receiver count: **29.5ns/call at ONE receiver against 5.5ns for the same method on a class**, node 1.0ns. With the arm: **5.5ns (−81%)**, and the indirectly-loaded receiver 34.8ns → 6.0ns. Guards reuse `SuperInline`'s hop-version emission plus a `holder_vals_ptr[slot] == fn_bits` re-read; resolution is `ic_walk`, so the baked answer is by construction the interpreter's. Suite `--ab-env` on ONE binary, 21 pairs: geomean **−0.28% [−0.81, +0.17]**, **no row regressing with an interval excluding zero**. Ships on the mechanism — the ten rows do not contain the construct, which is a fact about the benches. Off-switch `ZIPP_NO_PROTO_METHOD_INLINE=1` |
 | B77 pristine matchAll dispatch | **REVERTED — layout collateral, REPLICATED** | won its row twice (−2.1%, −2.8%, CIs excluding zero) and regressed `async-promise-chain` twice (+5.4%, +3.1%, CIs excluding zero) — a row with no `matchAll` in it. The fat-LTO layout hazard, confirmed by replication for the first time this session. §14's unrelated-row rule applies. The guards themselves are sound and node-verified; a retry should change the code PLACEMENT, not the semantics |
 | B76 nested splice admits ARGS | **LANDED, MECHANISM ONLY** | `wrap(n){ return inner(n,7)+1 }` was rejected (`inner-call-has-args`); now spliced: **−55.1%** on the 3M-call micro, faster than node. Suite uptake ZERO — every previously-blocked site moved to `inner-not-leaf` (depth ≥ 3), which is B75's real design task. Also fixed a latent `unreachable!` panic: the emitter had no `LoadUndefined` arm for a void inner return |
 | **B74 leaf inliner admits `GetProp`** | **LANDED** | the plain-call shape goes **29.2ns → 9.7ns (−66.8%)**; `class-prototype-hot` −1.0% [−1.5,−0.1], `polymorphic-objects` −0.9% [−1.3,−0.6], `async-promise-chain` −0.6% [−1.2,−0.2], suite −0.18% [−0.43,+0.03]. Measured with `--ab-env` on ONE binary, so no layout confound. Site-free helper (the `GetIndex` precedent), so B73's IC-budgeting problem never arose. Off-switch `ZIPP_NO_LEAF_GETPROP=1` |
@@ -1649,6 +1650,121 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B78 — the method inliner had no arm for an INHERITED method: 29.5ns → 5.5ns at every receiver count, suite flat
+
+`build_method_shape` resolved exactly two receiver shapes and declined the third
+in a single unreachable line:
+
+```rust
+let (fid, method_slot) = match (recv_class, own_slot) {
+    (Some(c), None) => (self.ic_class_method_fid(func_id, ip, c)?, None), // class instance
+    (_, Some(slot)) => { … }                                             // own data slot
+    _ => return None,                                                    // ← everything else
+};
+```
+
+`(None, None)` is a plain object whose method is **inherited** — which is
+`Object.create(proto)`, `Ctor.prototype.m = function …`, and most of what a
+transpiler emits. Every such site fell through to `jit_call_method_ic` →
+`jit_region_call_impl` → `ic_call_method` → `try_method_inline` on **every
+iteration**, and it was invisible in the shape of the numbers precisely because
+it never degraded: there is no cliff to see when the arm count is zero. The
+existing suite could not have found it either — `class-prototype-hot` is the
+only one of the ten rows that defines a user method at all, and it uses `class`.
+
+Measured, `objs[k].m()` over a 4M-iteration loop, each phase owning its own loop
+function so no two phases share an IC site:
+
+| receivers | 1 | 8 | 9 | 16 | 1024 |
+|---|---:|---:|---:|---:|---:|
+| ES class method | 5.5 | 5.5 | 8.3 | 16.3 | 25.5 |
+| own-slot function | 5.0 | 6.0 | 8.8 | 17.3 | 27.3 |
+| **prototype method, before** | **29.5** | **31.0** | **30.0** | **30.0** | **29.8** |
+| **prototype method, after** | **5.5** | **5.8** | **8.3** | **18.8** | **31.5** |
+| node | 1.0 | 1.0 | 1.3 | 0.8 | 0.8 |
+
+**−81% at one receiver**, and the row now has the same SHAPE as the other two:
+flat to the 8-arm cap, then a linear decay as the arms stop covering. A receiver
+loaded INDIRECTLY (`var o = a[k]; o.m()`, which defeats the planner's `arr[idx]`
+dense-element scan) goes **34.8ns → 6.0ns**; that one needed `mi_record_recv`
+extended to the `ChainData` IC fill, which previously recorded only class
+receivers.
+
+**What the arm guards, and why it is allowed to guard so little.** The receiver
+identity+version compare that every arm already emits does more work here than
+it looks like it does: the version bumps on an own-key ADD, so a later
+`recv.m = …` SHADOW misses it, and it bumps inside `ordinary_set_prototype_of`
+(`props/descriptors.rs`, the single choke point for `Object.setPrototypeOf`,
+`Reflect.setPrototypeOf` and the `__proto__` setter — and `proto_of` has no
+`remove` anywhere in the crate), so a re-pointed first link misses it too. That
+is the whole reason this arm may guard the first chain link by the receiver's
+version alone where the interpreter's `ic_chain_ok` re-reads `proto_of`
+explicitly. What is left is:
+
+* one version compare per chain hop, receiver's prototype down to the holder,
+  emitted exactly as `SuperInline::hops` already emits them; and
+* `holder_vals_ptr[slot] == fn_bits`, which is REQUIRED and not defensive —
+  `PROTO.m = other` overwrites an existing slot in place and deliberately does
+  not bump the holder's version, so the hop guards alone would keep running the
+  OLD body.
+
+Resolution goes through `ic_walk`, the interpreter's own side-effect-free fill
+walk, so what gets baked is BY CONSTRUCTION what the interpreter resolves, and
+every exclusion it already makes (accessors, `#`-names, a class link mid-chain,
+chains past `IC_MAX_HOPS`, exotic receivers) is inherited rather than re-derived
+here. The callee restrictions are the own-slot arm's verbatim: a plain
+capture-free function, never an arrow — inlining drops `HeapObj::Closure`'s
+captured `this_val` and would silently rebind `this` to the receiver.
+
+**Suite, `--ab-env` on ONE binary** (`ZIPP_NO_PROTO_METHOD_INLINE=1` vs unset),
+21 pairs, `bench/b78_abenv_2026-07-31.json`, `ALL_CORRECT=1`:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| `map-set-heavy` | −3.1% | [−6.5, −0.3] |
+| `class-prototype-hot` | −1.4% | [−2.8, +0.2] |
+| `async-promise-chain` | −1.0% | [−2.9, +0.4] |
+| `sparse-array` | +1.7% | [−0.9, +4.2] |
+| `markdown-render` | +0.6% | [−1.2, +2.4] |
+| suite geomean (13 rows) | −0.28% | [−0.81%, +0.17%] |
+
+**This ships as a MECHANISM, not as a row** — the B76 disposition. The geomean
+interval includes zero and the only interval excluding it is `map-set-heavy`
+going the RIGHT way, on a row with no user prototype method in it, which is a
+layout/noise artefact and is not claimed. What matters for the promote/revert
+rule is the other direction: **no row regresses with an interval excluding
+zero**, which is the §14 condition B77 failed. The honest summary is that the
+ten benches do not contain the construct this fixes, and that is a fact about
+the benches — `Object.create`/`prototype.m =` is not exotic JavaScript, it is
+what every pre-2015 library and most transpiler output is made of.
+
+**Cost where it does not hit.** A region that gains a method plan flips
+`refetch_pinned` on (`region_mem.rs`: `has_prop || do_leaf || do_method`), which
+adds the two r13/r14 re-derivation calls after every helper call in that region,
+and a fully-missing 8-arm tree with hop guards is ~1.5ns of dead compares. That
+is the 29.8 → 31.5 at 1024 receivers in the table above, and it is the same
+trade the class and own-slot arms already made.
+
+Pinned by 13 cases in `tests/proto_method_inline.rs` (mid-loop `P.m` reassign,
+own shadow, `setPrototypeOf`, a nearer holder gaining the name, an inherited
+arrow keeping its lexical `this`, an inherited getter still running on every
+call, a `delete` mid-loop, 20 receivers past the arm cap, the constructor-
+prototype shape, sloppy `this`) plus `proto_method_inline_matches_across_tiers`
+in `lib.rs`. Every expectation was executed in node as a SCRIPT and diffs
+byte-identical, and each was confirmed identical under `ZIPP_NOJIT=1` and
+`ZIPP_JIT_THRESHOLD=1`. Off-switch `ZIPP_NO_PROTO_METHOD_INLINE=1` (the B74
+pattern), which is what let the A/B run on one binary and carry no fat-LTO
+layout confound at all — the thing B77 was reverted for.
+
+**Note on the refreshed `bench/results_real.txt`.** It was re-run at ITERS=5 on
+the same box an hour after the pre-B78 table and several ratios moved
+(`regex-log-scan` 3.48x → 3.76x, `sparse-array` 2.96x → 3.17x). Both engines got
+FASTER in absolute terms between the two runs — node's `regex-log-scan` went
+475ms → 417ms while zipp's went 1651ms → 1567ms — so the ratio movement is
+node's best-of-5 variance, not a zipp regression. This is exactly the confound
+the paired A/B above exists to remove, and it is why the A/B and not the table
+is the evidence for this entry.
 
 ### B77 — REVERTED: the pristine matchAll dispatch shortcut wins its row and loses a bigger one to LAYOUT
 
@@ -4239,6 +4355,19 @@ Suite effect **+0.4% mean**, i.e. nothing — no bench in `bench/real/` is
 megamorphic by identity while monomorphic by shape. Real code frequently is
 (every `for (const o of manyObjectsOfOneKind)`), which is why this is kept.
 
+**Do not read that +0.4% as "M3 was tried and failed" — it prices a different
+thing.** B44 made no codegen change at all: what it measured is the MISS path in
+plain Rust (a `(site, shape) -> slot` memo and a thrash-gated refill). The
+shape-keyed guard in the EMITTED probe — the route to a call-free shape hit —
+is still unbuilt, and `region_mem.rs` still opens each way with `cmp rax, [r9]
+// identity`. So M3's codegen half is UNMEASURED, not refuted. What the +0.4%
+does license is the narrower claim that the ten timed rows would not pay for it:
+no timed row has a constant-name `GetProp`/`SetProp` site with more than eight
+same-layout receivers. (`polymorphic-objects` does build 30,000 objects over
+~1,071 shapes, but every access in that loop uses a COMPUTED key, which no
+inline cache in this engine serves — so it is not the counter-example it looks
+like. B78's adversarial pass raised it, and that is the answer.)
+
 ### B43 — Hidden classes, part 1: the shape tree and a shape-keyed interpreter IC
 
 **What landed.** `crates/zipp-vm/src/shape.rs` — a transition tree in which each
@@ -5301,6 +5430,30 @@ current.
   elements mid-iteration.
 - **`Number.prototype.toString(radix)` drops the fraction** — `(1.5).toString(2)`
   gives `"1"`, not `"1.1"`.
+- **`ObjMap::set_attr_at` — the method written to enforce the shape invariant —
+  has ZERO callers, and the one place that needs it writes `attrs` raw.**
+  `heap.rs:377` exists so that an in-place attribute change drops the object to
+  `shape::DICT`; nothing in the crate calls it. `vm/engine/eval_prog.rs` instead
+  does `m.attrs[i] = attr;` directly on the GLOBAL object's map, and under
+  `script_gdi` that attr carries `configurable: false` over a previously
+  configurable property — a shape-relevant flag change that leaves the shape
+  claiming the old bits. The same block then calls `m.define(&name, v, attr)`, a
+  key ADD on a live object, with no `Heap::bump_version`. Both are contained
+  today *only* because `ic_obj_ok` (`vm/ic.rs`) bans `globalThis` from every
+  cache in the engine — so neither is reachable as a wrong answer, and neither
+  would survive that exclusion being relaxed. Found by B78's adversarial audit
+  of the premises a shape-keyed cache would rest on; verified by hand, not taken
+  from the report. Any future shape-keyed IC has to close both first.
+- **`vm/construct/construct.rs` replaces a whole `HeapObj` at an allocated index
+  — freeing the old `ObjMap` and its `vals` buffer — with no version bump**
+  (`*self.heap.get_mut(oidx) = cloned`, ~10 sites, `grep -c bump_version` is 0
+  for the file). Audited and judged BENIGN, and recorded so the next audit does
+  not have to re-derive it: `oidx` is the instance the `class D extends
+  DataView` construction just allocated, and a slot recycled from the free list
+  has already had its version bumped by `Heap::alloc`, so no live cache entry
+  can name it. The same reasoning is what `bytecode.rs` writes out for
+  `InitDataProp`/`AppendDataProp`. It is one `bump_version` away from not
+  needing the argument at all.
 - **No CI.** No `.github/workflows`. The gate in §2 is run by hand.
 - **No profiler.** There is no way to attribute engine time to a source
   construct, which is precisely how the two reverted epics happened. A sampling
