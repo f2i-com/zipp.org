@@ -1057,7 +1057,6 @@ impl<'p> Vm<'p> {
                 vm.units_value(&u16s[r])
             }
         };
-        let whole = mk(self, mstart..mend);
         // Annex B legacy RegExp statics (RegExp.input/$_, lastMatch/$&,
         // lastParen/$+, leftContext/$`, rightContext/$', $1–$9): refreshed by
         // EVERY successful RegExpBuiltinExec — `exec`, `test`, and the String /
@@ -1071,9 +1070,17 @@ impl<'p> Vm<'p> {
         // then sliced again. Virtually no program reads `RegExp.leftContext`.
         //
         // Defer them: root the subject and keep unit RANGES, and materialise all
-        // twelve on the first legacy-static getter read (see
-        // `Vm::regexp_last_materialise`). Slots 0/1 stay eager — `input_val` is
-        // already a Value and `whole` is computed for the result array regardless.
+        // THIRTEEN on the first legacy-static getter read (see
+        // `Vm::regexp_last_materialise`). Only slot 0 stays eager — `input_val` is
+        // already a Value.
+        //
+        // Slot 1 (lastMatch) was eager on the stated grounds that `whole` "is
+        // computed for the result array regardless". That holds for `exec` and NOT
+        // for `test`, which returns a boolean: every successful `.test()` was paying
+        // one `ascii_slice_value` — a malloc, a memcpy of the matched span, an
+        // `is_ascii` rescan of those same bytes, and a heap slot — for a string
+        // nothing ever read. On `regex-log-scan`'s anchored phase the match IS the
+        // whole ~112-byte line, ~90k times.
         //
         // MEASURED (tools/bench.py --ab-env against the same binary, 21 paired
         // reps): ablating this block entirely was -8.65% on regex-log-scan
@@ -1086,27 +1093,32 @@ impl<'p> Vm<'p> {
         // range casts below from truncating silently — unreachable in practice (a
         // 4GB flat string), and a wrong slice is exactly what it would produce.
         if is_ascii && subj_units <= u32::MAX as usize {
-            let mut ranges: [Option<(u32, u32)>; 12] = [None; 12];
+            // ranges[i] is slot 1+i: lastMatch, lastParen, leftContext,
+            // rightContext, $1..$9.
+            let mut ranges: [Option<(u32, u32)>; 13] = [None; 13];
+            ranges[0] = Some((mstart as u32, mend as u32));
             // lastParen: the LAST participating capture, "" when none did.
-            ranges[0] = m.captures.iter().rev().find_map(|c| c.clone()).map(|r| (r.start as u32, r.end as u32));
-            ranges[1] = Some((0, mstart as u32));
-            ranges[2] = Some((mend as u32, subj_units as u32));
+            ranges[1] = m.captures.iter().rev().find_map(|c| c.clone()).map(|r| (r.start as u32, r.end as u32));
+            ranges[2] = Some((0, mstart as u32));
+            ranges[3] = Some((mend as u32, subj_units as u32));
             for i in 0..9 {
-                ranges[3 + i] =
+                ranges[4 + i] =
                     m.captures.get(i).and_then(|c| c.clone()).map(|r| (r.start as u32, r.end as u32));
             }
             self.regexp_last.clear();
             self.regexp_last.push(input_val);
-            self.regexp_last.push(whole);
             // Placeholders the getter never returns: `regexp_last_lazy` being
-            // `Some` is what routes slots >= 2 through materialisation first.
+            // `Some` is what routes slots >= 1 through materialisation first.
             self.regexp_last.resize(14, Value::UNDEFINED);
             self.regexp_last_lazy = Some(RegexpLastLazy { subj: input_val, subj_idx: s_idx, ranges });
         } else {
+            // A non-ASCII subject cannot defer: the slices read the locally-decoded
+            // `u16s` buffer, which does not outlive this call.
             let empty = self.alloc_str(String::new());
             let mut rec = Vec::with_capacity(14);
             rec.push(input_val);
-            rec.push(whole);
+            let whole_units = mk(self, mstart..mend);
+            rec.push(whole_units);
             rec.push(match m.captures.iter().rev().find_map(|c| c.clone()) {
                 Some(r) => mk(self, r),
                 None => empty,
@@ -1123,8 +1135,11 @@ impl<'p> Vm<'p> {
             self.regexp_last_lazy = None;
         }
         if !build {
+            // `test`: nothing below is reachable, and with slot 1 deferred there is
+            // no longer any string to build here at all.
             return Ok(Value::TRUE);
         }
+        let whole = mk(self, mstart..mend);
         let mut elems = Vec::with_capacity(1 + m.captures.len());
         elems.push(whole);
         for cap in &m.captures {
@@ -1263,7 +1278,7 @@ impl<'p> Vm<'p> {
             self.regexp_last.resize(14, Value::UNDEFINED);
         }
         for (i, r) in ranges.iter().enumerate() {
-            self.regexp_last[2 + i] = match *r {
+            self.regexp_last[1 + i] = match *r {
                 Some((s, e)) => self.ascii_slice_value(subj_idx, s as usize..e as usize),
                 None => self.alloc_str(String::new()),
             };

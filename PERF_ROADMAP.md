@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| B71 `.test()` allocates nothing | **LANDED, ROW FLAT** | Annex B statics slot 1 (`lastMatch`) joins the deferred-range set, so a successful `.test()` stops materialising the matched span; plus an `is_empty` gate on the always-missing `regexp_exact_source` probe. **−10.0% median on anchored `.test()` x300k**, but `regex-log-scan` −0.3% [−0.9, +0.2] — the `.test()` phases are ~2% of that row. Suite −0.28% [−0.62, +0.10]. Ships on the mechanism, not the row |
 | B70 `re.flags` pristine shortcut + RegExp text shared | **LANDED — FIRST SUITE-LEVEL WIN** | `re.flags` was reading EIGHT per-flag accessors per call (200ns vs node's 10); `matchAll` reads it just to test for `g`, making it 175ns of a 493ns call. Plus `source`/`flags` → `Arc<str>`, so a matcher clone shares text instead of copying it. **`regex-log-scan` −2.9% [−3.8, −1.5]; suite geomean −0.55% [−0.91%, −0.19%]**, both CIs excluding zero. `HeapObj` size hypothesis REFUTED (still 80) |
 | B69 RegExp `test`/`exec` dispatch arm | **LANDED** | the builtin dispatch had eleven receiver-kind arms and none for RegExp. A hot `re.test()` loop **−16.8%**, 1.17x → **0.97x node** (interleaved best-of-9); `regex-log-scan` only −1.1%, because the arm fires on a RegExp receiver and 88% of that row's deficit is elsewhere. Suite −0.16% [−0.40%, +0.09%]. Override-safe, unlike its siblings — 8 node-verified cases in `tests/regexp_dispatch_arm.rs` |
 | regex-log-scan, rephased (B68) | **DECOMPOSED; SMALL-PHASE NUMBERS CORRECTED IN B69** | 42% of the row is corpus generation, which contains NO REGEX; 46% is matchAll (64ms of it in iterator CREATION, ~178ms stepping); the literal-`test` phase is **0.40x** — zipp wins. Per successful capturing `exec` the deficit is three comparable terms: +139ns result construction, +87ns matcher, +80ns fixed call overhead |
@@ -1640,6 +1641,64 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B71 — `.test()` becomes allocation-free: −10% on the shape it targets, and the ROW does not move at all
+
+The last two contained items B70 left open. Both are pure removals of dead work, both
+mechanisms move, and **`regex-log-scan` does not: −0.3% [−0.9, +0.2]**, CI including
+zero. Suite −0.28% [−0.62%, +0.10%], also including zero
+(`bench/rx6_ab_2026-07-30.json`, 21 pairs).
+
+**1. Slot 1 of the Annex B statics joins the deferred set.** B60 deferred slots 2..=13 of
+`regexp_last` to unit ranges over a rooted subject, materialised on the first
+legacy-static read, and left slots 0/1 eager with the justification that `input_val` is
+already a Value and `whole` "is computed for the result array regardless". That second
+half is true for `exec` and **false for `test`**, which returns a boolean: every
+successful `.test()` computed `whole = mk(self, mstart..mend)` 65 lines above the
+`if !build { return TRUE }` early-out, i.e. a `Vec<u8>` malloc, a memcpy of the matched
+span, an `is_ascii` rescan of those same bytes inside `JsStr::from_wtf8`, and a heap slot,
+for a string nothing ever reads.
+
+`RegexpLastLazy::ranges` widens 12 → 13 to cover slots 1..=13, the getter gate moves from
+`slot >= 2` to `slot >= 1`, and `whole` moves below the early-out. **The `test` path on an
+ASCII subject now allocates nothing at all.** No new GC root: the ranges point into
+`lazy.subj`, which `gc.rs` already roots for exactly this reason.
+
+Measured on the shape it targets — an anchored pattern whose match IS the whole ~112-byte
+line, 300k calls: **−10.0% median, −8.2% best** over 15 interleaved pairs (both statistics
+agree, which after B69/B70 is the bar for believing a shell-timed number at all).
+
+**2. `regexp_exact_source` is gated on `is_empty()`.** It is a SipHash `HashMap` holding
+only lone-surrogate patterns, so on the `matchAll` fast path the probe is a guaranteed
+miss for every ordinary regex — once per call.
+
+#### Why the row is flat, and why this still ships
+
+The `.test()` phases are **~2% of `regex-log-scan`'s deficit** (phase 1 is 38ms against
+node's 94 — zipp already wins it; phase 5 is 77ms against 65). A −10% on 2% of the row is
+unmeasurable there, and phase 5 is only ~65ms of a 675ms script, so the phase script
+cannot resolve it either (+0.1%). Nothing contradicts anything; the row simply has almost
+no `.test()` in it.
+
+Shipped on the same basis as B69: the mechanism moves decisively on its shape, no row
+regressed beyond +0.5%, the suite is favourable-but-inconclusive, and both halves are
+strict removals of work rather than additions. **It does NOT meet §14's row-based
+promotion bar and is not claimed to.** `json-large` −1.3% [−2.6, −0.3] and
+`sparse-array-v2` −0.8% [−1.5, −0.4] came along with it; neither has a mechanism connecting
+it to regex, so both are read as layout, not as wins.
+
+`tests/regexp_legacy_statics.rs` gains two cases for the newly-deferred slot: that the
+range reads back exactly after `test`/a second match/a failed match, and that it survives
+a 20k-object GC churn *and* a `RegExp.input = x` write that clobbers the only other
+reference to the subject.
+
+#### Correction to §6
+
+The known-deviation entry says `String.prototype.replace` fails to refresh the Annex B
+statics "with a global regex". Checked while verifying this change: a **non-global**
+regex has the same defect — after `"aXbXc".replace(/X(b)/, "-")`, `RegExp["$&"]` still
+holds the previous match. Verified identical before and after B71, so it is pre-existing
+and the entry is simply narrower than the bug.
 
 ### B70 — `re.flags` was reading EIGHT properties, and a RegExp clone was copying its text: regex-log-scan −2.9%, suite −0.55%
 
@@ -4819,8 +4878,9 @@ before the object model is stable means speculating against a moving target.
 Things that are wrong on purpose, or wrong and unfixed. Keep this list short and
 current.
 
-- **`String.prototype.replace` with a global regex does not refresh the Annex B
-  legacy statics.** After `"a//b //c".replace(/\/\/+(\w+)/g, "/$1")`, `RegExp.$1`
+- **`String.prototype.replace` does not refresh the Annex B legacy statics** —
+  with a global regex OR a non-global one (B71 checked the latter; the entry used to
+  say "global").** After `"a//b //c".replace(/\/\/+(\w+)/g, "/$1")`, `RegExp.$1`
   and friends still hold the PREVIOUS match's values; V8 refreshes them from the
   last replacement match. The per-match path there does not funnel through the
   `regexp_exec_impl` refresh. Predates B60 (the pre-change binary agrees), and it

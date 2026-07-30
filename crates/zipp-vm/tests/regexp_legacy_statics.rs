@@ -199,3 +199,48 @@ fn match_and_match_all_refresh_the_statics() {
     // matchAll leaves the LAST match consumed.
     assert_eq!(out[1], r#"matchAll "k=1 j=22" "j=22" "22" "k=1 " "" "j" "22" """#);
 }
+
+/// B71 moved slot 1 (`lastMatch` / `RegExp["$&"]`) into the DEFERRED set, so that a
+/// successful `.test()` — which returns a boolean — stops materialising the matched
+/// span. The slot is now a unit range into a rooted subject, and these pin the two
+/// ways that can go wrong: the range must still read back exactly, and the subject
+/// must survive until it does.
+#[test]
+fn deferred_last_match_reads_back_after_test() {
+    let out = run_ok(
+        r#"
+        /b(c)(d)/.test("abcde");
+        console.log(RegExp["$&"] + "|" + RegExp.lastMatch + "|" + RegExp["$`"] + "|" +
+                    RegExp["$'"] + "|" + RegExp["$+"] + "|" + RegExp.$1 + RegExp.$2);
+        // a second test overwrites the deferred record
+        /x(y)/.test("wxyz");
+        console.log(RegExp["$&"] + "|" + RegExp.$1);
+        // a FAILED match must leave the previous values intact
+        /nope/.test("wxyz");
+        console.log(RegExp["$&"] + "|" + RegExp.$1);
+        "#,
+    );
+    assert_eq!(out[0], "bcd|bcd|a|e|d|cd");
+    assert_eq!(out[1], "xy|y");
+    assert_eq!(out[2], "xy|y");
+}
+
+#[test]
+fn a_deferred_last_match_survives_gc_and_input_overwrite() {
+    // The ranges point into the subject, which `regexp_last_lazy.subj` roots. Churn
+    // the heap between the match and the read, and separately clobber slot 0 —
+    // `RegExp.input = x` overwrites the only OTHER reference to that subject.
+    let out = run_ok(
+        r#"
+        (function () { /l(o)ng/.test("a-long-subject-string-here"); })();
+        var junk = [];
+        for (var i = 0; i < 20000; i++) junk.push({ a: i, s: "pad" + i });
+        console.log(RegExp["$&"] + "|" + RegExp.$1 + "|" + RegExp["$`"]);
+        /m(i)d/.test("xx-mid-yy");
+        RegExp.input = "clobbered";
+        console.log(RegExp["$&"] + "|" + RegExp.$1 + "|" + RegExp.input);
+        "#,
+    );
+    assert_eq!(out[0], "long|o|a-");
+    assert_eq!(out[1], "mid|i|clobbered");
+}

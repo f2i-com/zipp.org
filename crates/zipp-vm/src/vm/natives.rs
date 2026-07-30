@@ -2367,8 +2367,15 @@ impl<'p> Vm<'p> {
                             ascii_twin: twin,
                         });
                         // A lone-surrogate pattern keeps its exact source bytes.
-                        if let Some(b) = self.regexp_exact_source.get(&re_idx).cloned() {
-                            self.regexp_exact_source.insert(matcher_idx, b);
+                        // `regexp_exact_source` is a SipHash `HashMap` that only ever
+                        // holds lone-surrogate patterns, so for every ordinary regex
+                        // this probe is a guaranteed miss — paid once per
+                        // `matchAll()`. Gate it on `is_empty`, the idiom the other
+                        // rare-side-table reads in this file already use.
+                        if !self.regexp_exact_source.is_empty() {
+                            if let Some(b) = self.regexp_exact_source.get(&re_idx).cloned() {
+                                self.regexp_exact_source.insert(matcher_idx, b);
+                            }
                         }
                         self.proto_of.insert(matcher_idx, Value::heap(self.regexp_proto));
                         let proto = self.regexp_string_iter_proto;

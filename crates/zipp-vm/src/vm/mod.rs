@@ -246,7 +246,15 @@ pub(crate) struct DeferredModuleExec {
 pub(crate) struct RegexpLastLazy {
     pub subj: Value,
     pub subj_idx: u32,
-    pub ranges: [Option<(u32, u32)>; 12],
+    /// Unit ranges for `regexp_last` slots **1..=13** — lastMatch, lastParen,
+    /// leftContext, rightContext, `$1`..`$9`. Slot 0 (`input`) is a whole Value and
+    /// stays eager.
+    ///
+    /// Slot 1 joined this in B71. It used to be eager because `whole` "is computed
+    /// for the result array regardless" — true for `exec`, false for `test`, which
+    /// returns a boolean and so paid a malloc + memcpy + `is_ascii` rescan of the
+    /// matched text per successful call for nothing.
+    pub ranges: [Option<(u32, u32)>; 13],
 }
 
 pub struct Vm<'p> {
