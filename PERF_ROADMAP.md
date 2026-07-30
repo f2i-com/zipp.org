@@ -37,6 +37,8 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B73 leaf inliner lacks `GetProp`** | **OPEN — MOST ACTIONABLE ITEM** | a plain `f(o)` whose body reads a NAMED property off an argument is `(not leaf-eligible)` and pays a full frame call per iteration in a hot loop: **30.1ns against 7.0ns** for the identical body written as a method, which the method inliner DOES inline. `callee_leaf_ok`'s whitelist admits `GetIndex` and not `GetProp`. 28 declined sites in `parse-large-js`, 20 in `markdown-render`, 7 in `json-large`, 5 in `regex-log-scan` — unweighted. Broader than any single row |
+| class-prototype-hot decomposed (B73) | **ACCESSOR PHASE IS A 2.9x WIN** | 66ms against node's 191ms with `super.v` chains and overridden setters — larger than the plan recorded. Do not "optimise" it. The row's loss is entirely method + plain calls |
 | B72 SetProp shape memo | **REFUTED, REVERTED** | +15.9% on the write micro. `PROP_INDEX_THRESHOLD` is 12, so a narrow map's `pos(key)` is a linear scan over a few short strings — cheaper than hashing a `(u32,u32)` and probing. Break-even is above the threshold; retry only gated on `keys.len() >= 12`, and re-measure the GET side the same way |
 | B72 string_method receiver clone | **REFUTED** | flagged as an O(len) copy every string method pays; `s.slice(0,5)` is FLAT from 64B to 32KB receivers and zipp beats node at every size. Needs a scaling curve before anyone "fixes" it |
 | typedarray-math decomposed (B72) | **63% IS DATAVIEW, NEEDS TIER D** | the DataView loop compiles but only to the MEM tier: `v = dv.getUint32(...)` ranges through 2^32-1 so INT declines. 4.9ns/call against node's 1.3 is a per-op arithmetic gap, not dispatch. f64 fill is another 20% |
@@ -1644,6 +1646,84 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B73 — a plain function call in a hot loop costs 4.3x a METHOD call, and one missing opcode explains it. THE most actionable un-started item
+
+`class-prototype-hot` decomposed (five phase scripts + two controls), and it does not say
+what its 1.27x ratio suggests:
+
+| phase | node | zipp | ratio | ns/op |
+|---|---:|---:|---:|---|
+| polymorphic `.area()` x32M | 38ms | 281ms | 7.39x | 1.2 → 8.8 |
+| MONOMORPHIC `.area()` x32M | 7ms | 224ms | 32x | 0.2 → 7.0 |
+| **plain `area0(one)` x32M** | 6ms | **962ms** | **160x** | 0.2 → **30.1** |
+| accessor round-trip x8M | 191ms | **66ms** | **0.35x** | 23.9 → 8.2 |
+| depth-5 proto reads x8M | 29ms | 65ms | 2.24x | 3.6 → 8.1 |
+
+(node's 0.2ns figures are a loop it optimised away; the number that matters is zipp
+against itself.) Two things fall out.
+
+**The accessor phase is a 2.9x WIN.** The plan's claim that this row's aggregate hides a
+method loss behind an accessor win is confirmed, and the win is larger than recorded:
+66ms against node's 191ms, with `super.v` chains and overridden setters. Do not "optimise"
+this phase.
+
+**A plain function call costs 4.3x what the same body costs as a method** — 30.1ns against
+7.0ns — which is backwards. The JIT log says exactly why:
+
+```text
+c4_mono   [mi]   fn0@77 INLINE method arms=1 win_top=28          <- inlined
+c5_plainfn [leaf] fn0@78 callee fn16 DECLINE (not leaf-eligible)  <- NOT inlined
+```
+
+Same body (`return o._v + 1`). The METHOD inliner takes it; the LEAF-call inliner refuses.
+The disqualifying op is a single missing entry in `callee_leaf_ok`'s whitelist
+(`codegen/region_admit.rs`): it admits `GetIndex` — indexed reads — and **not `GetProp`**.
+So any plain function that reads a NAMED property off an argument (`o._v`, `tok.kind`,
+`node.len`) pays a full frame call per iteration in a hot loop, while the identical code
+written as a method is inlined.
+
+**This is broader than any single row**, which is why it is worth doing before more
+row-specific work. Declines observed with `ZIPP_JITDECLINE=1`, every one
+`(not leaf-eligible)`:
+
+| bench | leaf declines |
+|---|---:|
+| `parse-large-js` (2.20x) | 28 |
+| `markdown-render` (1.67x) | 20 |
+| `json-large` (1.65x) | 7 |
+| `regex-log-scan` (3.18x) | 5 |
+| `polymorphic-objects` | 0 |
+
+A decline count is not a hotness measure and these have NOT been weighted — that is step
+one for whoever picks this up. But `parse-large-js` and `markdown-render` are the
+call-and-string-heavy rows, and B68 already established that
+`regex-log-scan`'s largest single term is a corpus-generation loop calling `ri()`/`pad2()`.
+Note `ri` is separately covered by `callee_leaf_ok_one_call` (the nested-forwarder case
+that exists precisely because `ri` contains a `Call`), so its remaining barrier may be the
+same `GetProp` gap or something else — measure before assuming.
+
+#### What implementing it requires
+
+Three coordinated pieces, none of them speculative:
+
+1. **The whitelist** (`region_admit.rs::leaf_ok_impl`). `GetProp` is deopt-capable, so it
+   joins the existing `seen_effect` ordering rule — it may not follow a committed effect,
+   because a bail re-runs the WHOLE call from the call ip. That machinery is already there
+   for `GetIndex`/`charCodeAt`/the comparisons.
+2. **An emitter arm** (`codegen/inline.rs`). The file already carries IC/shape machinery
+   (~30 references) and emits `GetIndex` and `CallMethod`, so this is an addition rather
+   than new infrastructure. The cheaper variant is to copy what the METHOD inliner already
+   does — observe the live receiver at plan time and bake a shape-guarded slot
+   (`build_method_inline_plan`) — instead of allocating a full 8-way IC.
+3. **IC-site budgeting**, which is the actual plumbing. `reserve_ic_sites(n)` counts only
+   the GetProp/SetProp in the REGION's own code (`codegen/mod.rs:985`, `:1191`); inlined
+   leaf bodies would need sites of their own, and the table must not grow during a native
+   run (the pinned `r14` base). Option 2's shape-guarded bake sidesteps this entirely,
+   which is the reason to prefer it.
+
+Gate it behind an env flag first, per §2's heavy-codegen discipline, and weight the
+decline sites before promising a number.
 
 ### B72 — three refutations worth more than the code they killed: the string-clone "bonus", the SetProp shape memo, and where typedarray-math's deficit actually is
 
