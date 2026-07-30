@@ -37,7 +37,8 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
-| regex-log-scan, rephased (B68) | **DECOMPOSED, NOTHING SHIPPED** | 42% of the row is corpus generation, which contains NO REGEX; 46% is matchAll (64ms of it in iterator CREATION, ~178ms stepping); the literal-`test` phase is **0.40x** — zipp wins. Per successful capturing `exec` the deficit is three comparable terms: +139ns result construction, +87ns matcher, +80ns fixed call overhead |
+| B69 RegExp `test`/`exec` dispatch arm | **LANDED** | the builtin dispatch had eleven receiver-kind arms and none for RegExp. A hot `re.test()` loop **−16.8%**, 1.17x → **0.97x node** (interleaved best-of-9); `regex-log-scan` only −1.1%, because the arm fires on a RegExp receiver and 88% of that row's deficit is elsewhere. Suite −0.16% [−0.40%, +0.09%]. Override-safe, unlike its siblings — 8 node-verified cases in `tests/regexp_dispatch_arm.rs` |
+| regex-log-scan, rephased (B68) | **DECOMPOSED; SMALL-PHASE NUMBERS CORRECTED IN B69** | 42% of the row is corpus generation, which contains NO REGEX; 46% is matchAll (64ms of it in iterator CREATION, ~178ms stepping); the literal-`test` phase is **0.40x** — zipp wins. Per successful capturing `exec` the deficit is three comparable terms: +139ns result construction, +87ns matcher, +80ns fixed call overhead |
 
 ---
 
@@ -1638,6 +1639,69 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B69 — the missing RegExp dispatch arm: `re.test()` loops −16.8%, and zipp now BEATS node on them. The ROW moves only −1.1%
+
+B68 verified that `dispatch_builtin_method_inner` has arms for eleven receiver kinds
+and **none for RegExp**, so `re.test(s)` / `re.exec(s)` ran the entire builtin probe as
+dead work, returned `Ok(None)`, and then took the generic route: `get_prop(recv,"test")`
+→ `get_member_slow`'s exotic preamble → a per-call `Vec<Value>` → `call_value`. Arm added.
+
+**Measured, interleaved best-of-9 (alternating binaries per rep to cancel drift):**
+
+| workload | node | before | after | |
+|---|---:|---:|---:|---|
+| hot `re.test()` loop, 300k iters | 112ms | 131ms (1.17x) | **109ms (0.97x)** | **−16.8%** |
+| `regex-log-scan` (the row) | — | 1670ms | 1652ms | **−1.1%** |
+
+21-pair A/B (`bench/rx2_ab_2026-07-30.json`): suite geomean **−0.16%, 95% CI
+[−0.40%, +0.09%]**; `regex-log-scan` −0.3% [−1.6, +0.3]; no row regressed; binary
++1,024 bytes (+0.017%); startup unchanged.
+
+**Why the row barely moves, stated plainly.** The arm only fires when the RECEIVER is a
+RegExp. Of the row's deficit, 42% is corpus generation (no regex at all) and 46% is
+`matchAll` — whose receiver is a STRING and whose per-step `exec` goes through
+`regexp_exec` internally, never through builtin dispatch. Only phases 1, 2 and 5 call
+`re.test`/`re.exec` on a RegExp receiver, and they are 11% of the deficit between them.
+So this is a real win on a very common shape that this particular row mostly does not
+exercise. It is below the §14 promotion bar for a target row (2–3%); it ships on the
+strength of the isolated −16.8%, a non-regressing suite, and being a strict removal of
+work rather than an addition.
+
+**CORRECTION to B68's phase table.** B68 reported per-phase figures obtained by
+subtracting a generation-only run from a generation-plus-one-phase run. **That method is
+too noisy for the small phases and B68's numbers for them are not trustworthy.**
+Subtracting two ~610ms runs to recover a ~50ms phase amplifies drift: a 3% wobble on the
+baseline is ±18ms, i.e. ±36% of the phase. It first showed this change as −76% on
+`test-literal`; interleaved measurement of the same scripts put it at −2.0% of the script,
+about −26% of the phase. The two LARGE terms — corpus generation (628ms, measured
+directly) and `matchAll` (584ms) — are 600ms-scale and their 42%/46% shares stand. Every
+small-phase number in B68 should be re-measured interleaved before it is used.
+
+#### The guard, and why it is not cached
+
+The sibling arms are **not** override-safe — B68 measured
+`String.prototype.indexOf = f; "abc".indexOf("b")` answering `1` against node's override —
+and RegExp was correct precisely because it had no arm. So `regexp_method_is_intrinsic`
+checks all three ways the name can stop reaching the intrinsic, per call: the instance's
+`[[Prototype]]` is still %RegExp.prototype%, the instance has no own `test`/`exec`, and
+the prototype's slot still holds the intrinsic native as a non-accessor data property.
+
+Deliberately uncached. `ObjMap::set` bumps the heap version only when a key is ADDED
+(`if added` — B67), so `RegExp.prototype.test = f` is invisible to a version-keyed cache;
+`a_prototype_method_replaced_AFTER_the_loop_is_hot_still_wins` is that exact case. The
+uncached form is affordable because B68's ablation put the near-identical
+`regexp_exec_fast_ok` at ~7% of the call while the generic path being skipped is the bulk.
+
+`tests/regexp_dispatch_arm.rs` pins eight ways the arm must NOT fire — own method,
+replaced prototype method, replaced after warmup, an accessor holding the same intrinsic
+value, a re-prototyped instance, a patched `exec` under an intrinsic `test`, and a
+subclass override — plus the unpatched fast path itself. **Every expectation was executed
+in node and the outputs diff byte-identical**, rather than reasoned about.
+
+Not fixed, still open from B68: the eager `whole` allocation per successful `.test()`
+(`proxy_regexp.rs:1060` above the `!build` early-out at `:1125`), and the two large row
+terms — corpus generation and `matchAll()` creation's nine `pos()` lookups.
 
 ### B68 — regex-log-scan rephased at HEAD: the row's two biggest terms are matchAll and a phase with NO REGEX IN IT. M2.3 REFUTED, M7.1's premise refuted
 

@@ -121,6 +121,33 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. }) {
             return self.string_method(idx, name, args);
         }
+        // ── RegExp `test` / `exec` ──
+        // The terminal receiver-kind match below has arms for eleven heap kinds and
+        // NONE for RegExp, so `re.test(s)` used to run this whole probe as dead work,
+        // return `Ok(None)`, and then take the generic route: `get_prop(recv,"test")`
+        // (whose fast path bails on the RegExp discriminant into `get_member_slow`'s
+        // exotic preamble, ending in a `PropIndex` hash over %RegExp.prototype%'s 20
+        // keys), a per-call `Vec<Value>`, and `call_value`. B68 measured the fixed
+        // overhead of a successful `test` at 213ns against node's 133 and against
+        // `indexOf`'s 53 — where `indexOf`, which has an arm, is at exact parity.
+        //
+        // Worse, it was a JIT cliff: in a region `jit_method_builtin_fallback` calls
+        // `try_builtin_method`, got `Ok(None)` here, and returned `SELF_CALL_DEOPT`
+        // without `osr_deopt_exempt` — so every `re.test()` exited the region AND was
+        // counted as a deopt, and past `OSR_DEOPT_LIMIT` the region was evicted. A hot
+        // loop containing `re.test()` could not stay compiled. Returning `Some` here
+        // keeps it compiled.
+        //
+        // Guarded, unlike its siblings — see `regexp_method_is_intrinsic`. `test` also
+        // needs `exec` to be intrinsic (RegExpExec reads it), and the natives already
+        // check that and fall back correctly, so only the entry point is guarded here.
+        if matches!(name, "test" | "exec") && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+            let want = if name == "test" { native::REGEXP_TEST } else { native::REGEXP_EXEC };
+            if self.regexp_method_is_intrinsic(idx, name, want) {
+                let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                return self.call_native(want, recv, &[a0]).map(Some);
+            }
+        }
         // Temporal receivers route to their own dispatch (so valueOf throws and
         // toString gives the ISO string, not the generic Object behavior).
         if matches!(self.heap.get(idx), HeapObj::Temporal { .. }) {

@@ -1306,6 +1306,49 @@ impl<'p> Vm<'p> {
     /// `exec` is still the intrinsic native data property. The drivers
     /// (@@match/@@replace/@@split/matchAll/exec_abstract) may then call
     /// `regexp_exec` directly, skipping the Get + generic call dispatch.
+    /// True when `re.<name>` provably resolves to the intrinsic native `want`, so the
+    /// receiver-kind builtin fast path may serve it inline instead of going through
+    /// `get_prop` + `call_value`.
+    ///
+    /// This is the OVERRIDE-SAFE guard the other receiver-kind arms lack. B68 measured
+    /// that `String.prototype.indexOf = f; "abc".indexOf("b")` still answers `1` in zipp
+    /// against node's override, because those arms bind a builtin from its NAME alone;
+    /// RegExp was correct only because it had no arm at all. So an arm may be added here
+    /// ONLY behind a check that the name still reaches the intrinsic — all three ways it
+    /// could stop doing so:
+    ///
+    /// * the instance's `[[Prototype]]` is no longer %RegExp.prototype% (a subclass, or
+    ///   `setPrototypeOf`);
+    /// * the instance has an OWN `name` shadowing the prototype;
+    /// * %RegExp.prototype%'s `name` slot no longer holds the intrinsic native — it was
+    ///   reassigned, deleted, or turned into an accessor.
+    ///
+    /// Deliberately NOT cached behind a version: B67 established that `ObjMap::set`
+    /// bumps the heap version only when a key is ADDED (`if added`), so a plain
+    /// `RegExp.prototype.test = f` overwrite would leave a version-keyed cache stale and
+    /// silently reinstate the bug this guard exists to prevent. The uncached form is
+    /// affordable — B68's ablation put the near-identical `regexp_exec_fast_ok` at ~7% of
+    /// the call, while the generic path this skips is the bulk of it.
+    pub(crate) fn regexp_method_is_intrinsic(&self, re: u32, name: &str, want: u16) -> bool {
+        match self.proto_of.get(&re) {
+            None => {}
+            Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
+            _ => return false,
+        }
+        if self.arr_props.get(&re).is_some_and(|m| m.pos(name).is_some()) {
+            return false;
+        }
+        match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => m.pos(name).is_some_and(|i| {
+                !m.attrs[i].accessor
+                    && m.vals[i].is_heap()
+                    && matches!(self.heap.get(m.vals[i].heap_index()),
+                                HeapObj::Native(n) if *n == want)
+            }),
+            _ => false,
+        }
+    }
+
     pub(crate) fn regexp_exec_fast_ok(&self, re: u32) -> bool {
         match self.proto_of.get(&re) {
             None => {}
