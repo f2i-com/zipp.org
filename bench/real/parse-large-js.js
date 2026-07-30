@@ -2,6 +2,17 @@
 // real-world bench 1: build ~2MB synthetic JS-like source, tokenize it with a
 // hand-written charCodeAt scanner, then run a recursive-descent expression
 // parser over the `var <id> = <expr>;` token spans. Deterministic (mulberry32).
+//
+// WHAT THIS ROW MEASURES — read the name carefully. It is USERLAND SOURCE
+// TOKENIZATION, a parser written IN JavaScript. It does NOT benchmark zipp's own
+// parser or compiler: the engine parses this ~200-line file once and then runs it.
+// So the row is a string / array / branch / call workload that happens to be
+// shaped like a parser, and it belongs in the same mental bucket as
+// `markdown-render`, not in any claim about frontend speed.
+//
+// A real frontend comparison (parse+compile a fixed source WITHOUT executing it,
+// against node's parse/compile time, with source generation outside the timed
+// phase) is a separate benchmark this suite does not yet have.
 function mulberry32(seed) {
   var a = seed | 0;
   return function () {

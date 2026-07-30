@@ -4,6 +4,21 @@
 // (incl. a proto-chain hit and an accessor-backed shape) read in a hot loop;
 // plus dictionary-mode churn (add 60 props, delete half, re-add, read) and
 // proto-chain walks. Deterministic sums.
+//
+// SCOPE NOTE — this row STOPS AT THE IC WAY COUNT. `shapes[i & 7]` means every
+// site sees exactly eight receivers, and `JIT_IC_WAYS` is 8, so the ways always
+// fill and never thrash. The identity-keyed native IC's 8->9 receiver cliff (B44:
+// 5.67ns -> 11.67ns, where node goes 0.67 -> 0.33) is INVISIBLE here, and this row
+// can therefore neither justify nor reject a shape-keyed IC.
+//
+// It also sums three unrelated mechanisms — megamorphic reads, dictionary churn,
+// prototype walks — into one wall time, so a win in one can hide a loss in
+// another. `class-prototype-hot` demonstrated exactly that failure: a 6x
+// method-call loss sat behind an accessor win for months.
+//
+// Kept byte-identical anyway, because the retained headline is a geomean over this
+// exact file. `polymorphic-objects-v2.js` is the split, past-the-cliff sibling;
+// `property-ic-shapes.js` is the receiver-count acceptance benchmark.
 
 // ---- 8 layouts, same property name at different positions ----
 function mkAccessor(seed) {

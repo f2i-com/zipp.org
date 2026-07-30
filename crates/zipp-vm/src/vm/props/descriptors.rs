@@ -254,41 +254,13 @@ impl<'p> Vm<'p> {
                 if let Some(i) = m.pos(key) {
                     Some((m.attrs[i], m.vals[i]))
                 } else if idx == self.global_this && self.global_this != 0 {
-                    // globalThis own properties: SCRIPT-declared var/function
-                    // globals are { writable, ENUMERABLE, non-configurable }
-                    // bindings; built-ins are { writable, non-enumerable,
-                    // configurable }; NaN/Infinity/undefined are frozen.
-                    if let Some(v) = self.global_by_name(key) {
-                        let script_decl = self
-                            .program
-                            .global_names
-                            .iter()
-                            .position(|n| n == key)
-                            .is_some_and(|i| {
-                                self.program.hoisted_globals.contains(&(i as u32))
-                                    || self.program.decl_globals.contains(&(i as u32))
-                            });
-                        // An IMPLICIT global (created by a sloppy assignment to
-                        // an undeclared name — its slot holds a value but it is
-                        // neither script-declared nor a built-in): CreateData-
-                        // Property semantics — writable, ENUMERABLE, configurable.
-                        let implicit = !script_decl
-                            && !self.builtin_globals.contains_key(key)
-                            && self
-                                .program
-                                .global_names
-                                .iter()
-                                .position(|n| n == key)
-                                .and_then(|i| self.globals.get(i))
-                                .is_some_and(|v| !v.is_uninitialized());
-                        return match key {
-                            "NaN" | "Infinity" | "undefined" => {
-                                self.make_data_descriptor(v, false, false, false)
-                            }
-                            _ if script_decl => self.make_data_descriptor(v, true, true, false),
-                            _ if implicit => self.make_data_descriptor(v, true, true, true),
-                            _ => self.make_data_descriptor(v, true, false, true),
-                        };
+                    // A binding that lives only in a global SLOT still presents as an
+                    // own property of the global object. `global_slot_binding_descriptor`
+                    // owns that classification — shared with `object_define_property`,
+                    // which materializes the same descriptor before applying a partial
+                    // one over it.
+                    if let Some((v, a)) = self.global_slot_binding_descriptor(key) {
+                        return self.make_data_descriptor(v, a.writable, a.enumerable, a.configurable);
                     }
                     None
                 } else {
@@ -1070,6 +1042,21 @@ impl<'p> Vm<'p> {
         // lookup THROUGH it resolves — bump its version so version-guarded
         // caches (the interpreter property/call ICs' chain hops) miss.
         self.heap.bump_version(o.heap_index());
+        // Re-prototyping %Array.prototype% / %Object.prototype% splices an entire
+        // new chain into every plain array's lookup path. A version bump does NOT
+        // cover it: the hole/OOB/append fast paths are gated on the indexed-proto
+        // PROTECTOR, not on versions, and the protector until now only watched for
+        // an integer key being DEFINED on those two objects. So
+        // `setPrototypeOf(Array.prototype, {5: "M5"})` left a hot `a[5]` answering
+        // `undefined` where the interpreter and node answer `"M5"` (B66's third
+        // open tier divergence).
+        //
+        // Invalidate unconditionally — do NOT try to prove the new chain carries no
+        // index. `x` can be index-free here and gain `x[5] = …` a line later, and
+        // that later write lands on an ordinary object no protector is watching.
+        if self.is_indexed_proto_anchor(o.heap_index()) {
+            self.invalidate_indexed_proto_protector();
+        }
         Ok(true)
     }
 

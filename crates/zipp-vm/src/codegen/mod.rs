@@ -595,6 +595,20 @@ fn fnjit_mem_enabled() -> bool {
 pub struct JitFn {
     _buf: ExecutableBuffer,
     entry: *const u8,
+    /// `(global slot, the Value bits it held at compile time)` when this body
+    /// contains a SELF-CALL — Tier A's `emit_self_call`, which emits a direct
+    /// `call` to this function's own entry with no callee guard at all.
+    ///
+    /// That direct call is only equivalent to the bytecode `LoadGlobal(self_slot)
+    /// + Call` it replaces while the slot still holds THIS function. Rebind the
+    /// name (`fib = function (n) { return 0; }`) and the interpreter's every inner
+    /// `fib(n-1)` re-resolves to the new function, collapsing the recursion on the
+    /// first hop, while compiled code kept calling itself — B66's second open tier
+    /// divergence, and a wrong ANSWER, not a crash.
+    ///
+    /// `None` for a body with no self-call and for every Tier C / region / kernel
+    /// compile, which resolve callees the ordinary way.
+    self_binding: Option<(u32, u64)>,
 }
 
 impl JitFn {
@@ -602,6 +616,12 @@ impl JitFn {
     /// same code through the win64 trampoline).
     pub fn entry(&self) -> *const u8 {
         self.entry
+    }
+
+    /// The compile-time self-binding assumption, if this body made one.
+    #[inline]
+    pub fn self_binding(&self) -> Option<(u32, u64)> {
+        self.self_binding
     }
 
     /// Run the native code over `regs`. ABI: `(regs, bail_ip, vm) -> result`.

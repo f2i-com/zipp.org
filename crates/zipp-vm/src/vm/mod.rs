@@ -618,6 +618,34 @@ pub struct Vm<'p> {
     /// gates on it — making get/has-own/descriptor all agree the property is gone.
     /// Empty in normal programs; cleared for a name when it's re-defined.
     deleted_globals: std::collections::HashSet<String>,
+    /// THE GLOBAL-ROUTE EPOCH. Bumped whenever a global slot stops being the thing
+    /// compiled code assumes every slot is — "a live, plain, writable data binding
+    /// readable and writable as `[r12 + idx*8]`".
+    ///
+    /// Compiled code checks that assumption ONCE, at compile time
+    /// (`globals_ok` in the Tier A/C gate, `region_globals_ok`,
+    /// `build_leaf_inline_plan`), and those checks all rest on "once a slot holds a
+    /// real value it can never go back". That is false in exactly two ways, and both
+    /// were silent wrong answers at default thresholds (B66's first two open items):
+    ///
+    /// * `delete implicitG` returns the slot to `UNINITIALIZED`. The interpreter's
+    ///   `LoadGlobal` throws ReferenceError on the sentinel; the emitted
+    ///   `mov rax, [r12 + idx*8]` handed it back as a value, which prints
+    ///   `undefined`.
+    /// * a REAL own property appears on the global object behind a slot
+    ///   (`Object.defineProperty(globalThis, "x", …)`), after which a store must
+    ///   route through `[[Set]]` — `global_real_own_route`, which the interpreter
+    ///   consults and native code did not.
+    ///
+    /// `0` — the value for every program that does neither — makes the entry check a
+    /// single compare against zero, so the common path pays one `cmp`. See
+    /// `Vm::jit_globals_still_routable`.
+    global_route_epoch: u32,
+    /// Memo for the (rare) non-zero-epoch entry check: `func_id` → the epoch at
+    /// which its direct global accesses were last VALIDATED, and the verdict. Keeps a
+    /// hot function that survived a global delete from re-scanning its whole body on
+    /// every call. Only ever touched while `global_route_epoch != 0`.
+    jit_global_route_ok: rustc_hash::FxHashMap<u32, (u32, bool)>,
     /// Global-slot indices that `CheckGlobalResolvable` (a strict `name = …` on
     /// a name this program never declares) found UNRESOLVABLE when the reference
     /// was created, i.e. before the RHS evaluated. PutValue's ReferenceError
@@ -641,11 +669,25 @@ pub struct Vm<'p> {
     /// (a JS length is at most 2^32-1) and always exceed both the dense length
     /// and `MAX_DENSE_ARRAY_LEN` at insertion time.
     array_js_len: crate::slot_table::SlotTable<u32>,
-    /// Set once an integer-indexed own property is defined on `Array.prototype` or
-    /// `Object.prototype` (the prototypes in every plain array's chain). While false
-    /// — the overwhelmingly common case — `a[i] = v` for an absent index takes the
-    /// fast own-write path with NO prototype walk; once true, set_index performs the
-    /// full OrdinarySet (a prototype setter at `i` runs, a non-writable one rejects).
+    /// The INDEXED-PROTOTYPE PROTECTOR, inverted: `false` means "nothing in a plain
+    /// array's prototype chain can supply an integer index", which is the state every
+    /// hole/OOB/append/bounded-gap fast path — interpreter and JIT helper alike —
+    /// requires before it may answer absence itself.
+    ///
+    /// Sticky: it is set, never cleared, for the life of the VM. Reconstructing
+    /// validity after the mutations that invalidate it is not worth the correctness
+    /// risk, and they are rare. Two distinct mutations invalidate it, and BOTH must
+    /// go through [`Vm::invalidate_indexed_proto_protector`]:
+    ///
+    /// 1. an integer-like own property DEFINED on `Array.prototype`/`Object.prototype`
+    ///    (`note_array_proto_index`);
+    /// 2. RE-PROTOTYPING one of them — `Object.setPrototypeOf(Array.prototype, x)`
+    ///    splices a whole new chain in, and `x` may supply the index now or gain one
+    ///    later. B66 left this half open: the protector saw only (1), so a hot
+    ///    `a[5]` kept inventing `undefined` where the interpreter answered `"M5"`.
+    ///
+    /// Every reader must treat `true` as "MAY supply an index" — i.e. as a demand for
+    /// the full protocol — never as an assertion that one exists.
     array_proto_has_index: bool,
     /// Heap indices of derived-class instances whose `super(...)` has run during
     /// construction (set by the SuperCtor ops, read+cleared in `construct`). A

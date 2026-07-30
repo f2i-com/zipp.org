@@ -2,6 +2,13 @@
 // real-world bench 4: Map/Set churn. String-key + integer-key inserts,
 // interleaved hit/miss lookups, deletes of every 3rd, re-inserts, full
 // iteration sums. Deterministic; prints final sizes + checksum.
+//
+// ROLE — this is a NO-REGRESSION SENTINEL, not an optimization target. It is the
+// one row zipp already wins (0.897x node in the retained baseline), so its job is
+// to fail loudly when an unrelated change costs it. The standing gate holds it to
+// no worse than +2%. Attempts to widen the win have measured net zero (relaxing
+// the Map method gates), which is the expected result for a row already ahead:
+// spend the effort on the rows that are 2-3.6x instead.
 // (Sized so node lands in the suite's 150-800ms compute band; zipp's
 // 2026-06-12 Map/Set rework handles this scale fine — its previous
 // linear-scan Map/Set was quadratic and could not.)

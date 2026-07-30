@@ -35,6 +35,34 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
         }
         self.note_array_proto_index(obj.heap_index(), key);
+        // …and the sibling protector: a real own descriptor on the GLOBAL object
+        // shadowing a slot-backed binding turns every store to that slot into an
+        // OrdinarySet, which a compiled raw slot write would bypass.
+        self.note_global_own_property_change(obj.heap_index(), key);
+        // ── materialize a slot-only global binding before redefining it ──
+        // The global object's properties and the global slots are two views of one
+        // set of bindings, but only the slot view exists for `foo = 1` / `var foo`.
+        // So a define here was a CREATE, not a REDEFINE: it built a fresh property
+        // from the incoming descriptor alone, and a descriptor that omits `value`
+        // (`{writable: false}`) produced a property holding `undefined` and lost the
+        // binding's enumerability.
+        //
+        // Writing the current descriptor into the ObjMap first makes the ordinary
+        // redefine path below correct by construction — ValidateAndApplyProperty-
+        // Descriptor keeps every field the incoming descriptor omits, which is
+        // exactly the rule that was missing. Guarded on there being no entry yet, so
+        // a second define is an ordinary redefine and this is a no-op.
+        if self.global_this != 0 && obj.heap_index() == self.global_this {
+            let absent =
+                matches!(self.heap.get(self.global_this), HeapObj::Object(m) if m.pos(key).is_none());
+            if absent {
+                if let Some((v, a)) = self.global_slot_binding_descriptor(key) {
+                    if let HeapObj::Object(m) = self.heap.get_mut(self.global_this) {
+                        m.define(key, v, a);
+                    }
+                }
+            }
+        }
         // Module Namespace exotic [[DefineOwnProperty]]: true ONLY when the
         // descriptor is compatible with the live binding ({value: current,
         // writable:true, enumerable:true, configurable:false}, data); any

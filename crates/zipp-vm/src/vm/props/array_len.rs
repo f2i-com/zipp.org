@@ -365,11 +365,27 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// The ONE way to invalidate the indexed-prototype protector (see the field's
+    /// doc comment on `Vm`). Sticky — no caller ever restores validity.
+    ///
+    /// `#[inline]` and branchless-ish on purpose: the callers sit on
+    /// `defineProperty`/`setPrototypeOf`, not on a hot path, but keeping the write
+    /// unconditional means no caller can accidentally guard it wrongly.
+    #[inline]
+    pub(crate) fn invalidate_indexed_proto_protector(&mut self) {
+        self.array_proto_has_index = true;
+    }
+
+    /// True when `obj_idx` is one of the two prototypes that sit in EVERY plain
+    /// array's chain, so a mutation to it is protector-relevant.
+    #[inline]
+    pub(crate) fn is_indexed_proto_anchor(&self, obj_idx: u32) -> bool {
+        obj_idx == self.arr_proto || obj_idx == self.obj_proto
+    }
+
     pub(crate) fn note_array_proto_index(&mut self, obj_idx: u32, key: &str) {
-        if (obj_idx == self.arr_proto || obj_idx == self.obj_proto)
-            && canonical_index_str(key).is_some()
-        {
-            self.array_proto_has_index = true;
+        if self.is_indexed_proto_anchor(obj_idx) && canonical_index_str(key).is_some() {
+            self.invalidate_indexed_proto_protector();
             // %Array.prototype% is an Array exotic: an index definition on it
             // grows its own `length` (ArraySetLength step for index defines).
             if obj_idx == self.arr_proto {

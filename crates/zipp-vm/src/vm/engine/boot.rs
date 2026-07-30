@@ -130,6 +130,8 @@ impl<'p> Vm<'p> {
             dv_tracking: std::collections::HashSet::new(),
             deleted_callable_intrinsics: std::collections::HashSet::new(),
             deleted_globals: std::collections::HashSet::new(),
+            global_route_epoch: 0,
+            jit_global_route_ok: rustc_hash::FxHashMap::default(),
             strict_unresolvable_globals: Vec::new(),
             array_length_nonwritable: std::collections::HashSet::new(),
             array_js_len: crate::slot_table::SlotTable::default(),

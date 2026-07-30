@@ -6,9 +6,21 @@
 //! ANSWERS at DEFAULT thresholds, not crashes, and all of them were invisible to
 //! 95,936 test262 executions.
 //!
-//! The `#[ignore]`d block at the bottom is the part NOT yet fixed. Each is a
-//! runnable specification of the correct behaviour, so `cargo test -- --ignored`
-//! reports exactly what is still open. Do not delete one without fixing it.
+//! B66 left three of the nine as `#[ignore]`d failing specs. All three are now
+//! fixed and unignored, so `cargo test -- --ignored` reports nothing here. Two of
+//! them turned out to be a tier divergence sitting on top of an INTERPRETER
+//! conformance bug, and needed both halves:
+//!
+//! * `delete globalThis.implicitG` never cleared the global slot at all, so the
+//!   interpreter answered `5` too. Only the unqualified `delete implicitG` cleared
+//!   it, which is the pure tier case.
+//! * a real own descriptor on the global object governed STORES but not LOADS, in
+//!   both tiers — so a getter installed over a live binding never ran.
+//!
+//! The lesson B66 drew still holds: every one of these was a fact maintained by
+//! hand in several tiers. Where a fix had a choice, it added ONE predicate the
+//! gates share (`global_slot_directly_routable`,
+//! `invalidate_indexed_proto_protector`) rather than a fourth copy.
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
@@ -120,17 +132,23 @@ fn non_arrow_methods_still_bind_the_receiver() {
     assert_eq!(out[0], "7,9");
 }
 
-// ─────────────────────── open: still diverging ───────────────────────
-// Each of these FAILS today. They are written as the correct behaviour so that
-// `cargo test -- --ignored` is an accurate list of what is still broken.
-// See PERF_ROADMAP B66 for the analysis of each.
+// ────────────── was open in B66, closed in B67 ──────────────
+// These three were `#[ignore]`d failing specs. See PERF_ROADMAP B67: two of them
+// had an INTERPRETER conformance bug underneath the tier bug, so both halves had
+// to be fixed — teaching the JIT to agree with the interpreter would have turned
+// them green while leaving every answer wrong.
 
 /// `delete` of an implicit global returns its slot to the uninitialized
-/// sentinel. Already-compiled code keeps reading the slot and sees `undefined`
-/// where the interpreter throws ReferenceError — the compile-time check is never
+/// sentinel. Already-compiled code kept reading the slot and seeing `undefined`
+/// where the interpreter throws ReferenceError — the compile-time check was never
 /// re-validated at entry.
+///
+/// Two bugs in one, which is why this spec used to fail for a reason B66 did not
+/// predict: `delete globalThis.implicitG` never cleared the slot AT ALL, so the
+/// INTERPRETER answered `5` too. The slot-clearing half is the conformance fix; the
+/// global-route epoch checked at native entry is the tier fix. `delete implicitG`
+/// (the unqualified spelling, which did clear the slot) is the pure tier case.
 #[test]
-#[ignore = "open tier divergence — see PERF_ROADMAP B66"]
 fn reading_a_deleted_implicit_global_still_throws() {
     let out = run_ok(&format!(
         r#"
@@ -146,11 +164,79 @@ fn reading_a_deleted_implicit_global_still_throws() {
     assert_eq!(out[0], "throw:ReferenceError");
 }
 
-/// Tier A's self-recursive call emits a direct `call` to its own entry with no
-/// callee-identity guard, so it keeps calling itself after its global name has
-/// been rebound to something else.
+/// The UNQUALIFIED spelling of the same deletion — the pure tier divergence, with no
+/// interpreter bug in front of it. `delete implicitG` has always returned the slot to
+/// the sentinel, so before the global-route epoch the interpreter threw and the
+/// compiled `read` handed back the sentinel as `undefined`.
 #[test]
-#[ignore = "open tier divergence — see PERF_ROADMAP B66"]
+fn reading_an_unqualified_deleted_global_still_throws() {
+    let out = run_ok(&format!(
+        r#"
+        implicitU = 5;
+        function read() {{ return implicitU; }}
+        for (var i = 0; i < {HOT}; i++) read();
+        delete implicitU;
+        var got;
+        try {{ got = "value:" + read(); }} catch (e) {{ got = "throw:" + e.constructor.name; }}
+        console.log(got + " typeof=" + typeof implicitU);
+        "#
+    ));
+    assert_eq!(out[0], "throw:ReferenceError typeof=undefined");
+}
+
+/// Re-creating the deleted binding must bring the compiled body back: the entry check
+/// declines while the slot is dead and admits it again once it is live, rather than
+/// blacklisting the function for the life of the process.
+#[test]
+fn a_recreated_global_is_readable_from_compiled_code_again() {
+    let out = run_ok(&format!(
+        r#"
+        implicitR = 1;
+        function read() {{ return implicitR; }}
+        var a = 0; for (var i = 0; i < {HOT}; i++) a = read();
+        delete implicitR;
+        var mid; try {{ mid = "v" + read(); }} catch (e) {{ mid = "throw"; }}
+        implicitR = 7;
+        var b = 0; for (var j = 0; j < {HOT}; j++) b = read();
+        console.log(a + "," + mid + "," + b);
+        "#
+    ));
+    assert_eq!(out[0], "1,throw,7");
+}
+
+/// A REAL own property on the global object shadowing a live slot IS the binding: a
+/// load runs its getter and a store its setter. `StoreGlobal` routed this; `LoadGlobal`
+/// did not, in either tier — so the setter ran on every write while the read returned
+/// the stale slot. Both halves must agree, and both tiers must agree with the
+/// interpreter, INCLUDING when the descriptor appears after the loop is already
+/// compiled.
+#[test]
+fn a_real_own_global_descriptor_governs_reads_and_writes() {
+    let out = run_ok(&format!(
+        r#"
+        imp = 1;
+        var seen = 0;
+        function w(n) {{ var last; for (var i = 0; i < n; i++) {{ imp = i; last = imp; }} return last; }}
+        w({HOT});
+        Object.defineProperty(globalThis, "imp", {{
+          set: function (v) {{ seen++; }}, get: function () {{ return "G"; }}, configurable: true
+        }});
+        var after = w({HOT});
+        console.log("after=" + after + " seen=" + seen);
+        "#
+    ));
+    // One setter call per write, and only the SECOND loop runs with the descriptor
+    // installed — the first ran before `defineProperty` and wrote the raw slot.
+    assert_eq!(out[0], format!("after=G seen={HOT}"));
+}
+
+/// Tier A's self-recursive call emits a direct `call` to its own entry with no
+/// callee-identity guard, so it kept calling itself after its global name had
+/// been rebound to something else. Fixed by recording the compile-time
+/// self-binding on the `JitFn` and re-checking it at OUTER entry — declining
+/// there makes the whole activation interpret, and the interpreter re-resolves
+/// every inner call, so `fib`'s hot path pays nothing per recursion.
+#[test]
 fn self_recursion_rechecks_callee_identity() {
     let out = run_ok(&format!(
         r#"
@@ -167,11 +253,11 @@ fn self_recursion_rechecks_callee_identity() {
     assert_eq!(out[0], "after:0");
 }
 
-/// `setPrototypeOf(Array.prototype, x)` is invisible to the
-/// `array_proto_has_index` protector, so the JIT still invents absence for an
-/// out-of-range index that the new prototype supplies.
+/// `setPrototypeOf(Array.prototype, x)` was invisible to the
+/// `array_proto_has_index` protector, so the JIT invented absence for an
+/// out-of-range index that the new prototype supplies. Fixed by routing BOTH
+/// invalidating mutations through `invalidate_indexed_proto_protector`.
 #[test]
-#[ignore = "open tier divergence — see PERF_ROADMAP B66"]
 fn reprototyping_array_prototype_invalidates_the_index_protector() {
     let out = run_ok(&format!(
         r#"

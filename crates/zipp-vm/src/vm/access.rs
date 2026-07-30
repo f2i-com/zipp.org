@@ -202,6 +202,19 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                 m.remove(key);
             }
+            // Removing the shadowing own entry and recording the name is not enough
+            // for a SLOT-BACKED binding: `implicitG = 5` allocates a real global slot
+            // and every `implicitG` reference compiles to `LoadGlobal <slot>`, which
+            // never consults `deleted_globals`. So `delete globalThis.implicitG`
+            // reported success while `implicitG` still read 5 — in the interpreter as
+            // well as in compiled code, where node throws ReferenceError.
+            //
+            // The unqualified `delete implicitG` op has always cleared the slot; these
+            // two spellings of the same deletion simply disagreed. Both now go through
+            // `uninitialize_global`, which also bumps the global-route epoch.
+            if let Some(slot) = self.global_slot_of_name(key) {
+                self.uninitialize_global(slot);
+            }
             self.deleted_globals.insert(key.to_string());
             self.heap.bump_version(idx);
             return Value::bool(true);
@@ -852,6 +865,13 @@ impl<'p> Vm<'p> {
                 self.globals[s as usize] = val;
                 return Ok(true);
             }
+        }
+        // `globalThis.x = v` for a name that is ALSO a slot-backed binding adds a real
+        // own property to the global object, after which `global_real_own_route` sends
+        // every bare `x = …` through [[Set]]. Compiled code emitted a raw slot write
+        // before that was true, so tell the route protector.
+        if self.global_this != 0 && obj.heap_index() == self.global_this {
+            self.note_global_own_property_change(obj.heap_index(), key);
         }
         // A plain assignment can put an integer index on Array/Object.prototype
         // just like defineProperty — flag it so index stores/mutators consult

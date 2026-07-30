@@ -448,6 +448,6 @@ pub(crate) fn compile_region_regalloc(
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr })
+    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }
 

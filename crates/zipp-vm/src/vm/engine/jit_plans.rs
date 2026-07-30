@@ -385,16 +385,20 @@ impl<'p> Vm<'p> {
             // the interpreted iterations and became "undefined is not a function"
             // the instant the leaf inline kicked in, always at the same
             // iteration, which reads like a scoping bug and is not one.
-            if body.iter().any(|ins| {
-                let g = match *ins {
-                    Instr::LoadGlobal { idx, .. }
-                    | Instr::LoadGlobalOrUndefined { idx, .. }
-                    | Instr::StoreGlobal { idx, .. }
-                    | Instr::StoreGlobalStrict { idx, .. }
-                    | Instr::StoreGlobalResolved { idx, .. } => idx,
-                    _ => return false,
-                };
-                self.globals.get(g as usize).is_some_and(|v| v.is_uninitialized())
+            // One shared predicate with the region and Tier A/C gates — see
+            // `global_slot_directly_routable`. It also rejects a STORE to a slot the
+            // global object now shadows with a real descriptor, which this copy of the
+            // scan did not check.
+            if !body.iter().all(|ins| match *ins {
+                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                    self.global_slot_directly_routable(idx)
+                }
+                Instr::StoreGlobal { idx, .. }
+                | Instr::StoreGlobalStrict { idx, .. }
+                | Instr::StoreGlobalResolved { idx, .. } => {
+                    self.global_slot_directly_routable(idx)
+                }
+                _ => true,
             }) {
                 if log {
                     eprintln!(

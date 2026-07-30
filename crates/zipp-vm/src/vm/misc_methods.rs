@@ -271,6 +271,29 @@ impl<'p> Vm<'p> {
             // SAFETY: program functions are immutable during execution; the raw
             // ptr dodges the self.jit (&mut) vs self.program (&) borrow conflict.
             let proto_ref = unsafe { &*proto };
+            // ── globals that are NOT slot bindings ── the Tier A/C gate, the region
+            // gate and the leaf-inline planner all refuse a body whose direct global
+            // access would not observe what the interpreter observes. This path — a
+            // Tier A compile of an array-builtin CALLBACK — had no such check at all,
+            // so a callback reading an own-property-backed global got the
+            // UNINITIALIZED sentinel handed back as `undefined`.
+            //
+            // It must come BEFORE `jit.compile`: compile blacklists on failure and
+            // FN_DEAD is sticky, so declining afterwards would kill the callback for
+            // the life of the process instead of for this call.
+            if !proto_ref.code.iter().all(|ins| match *ins {
+                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                    self.global_slot_directly_routable(idx)
+                }
+                Instr::StoreGlobal { idx, .. }
+                | Instr::StoreGlobalStrict { idx, .. }
+                | Instr::StoreGlobalResolved { idx, .. } => {
+                    self.global_slot_directly_routable(idx)
+                }
+                _ => true,
+            }) {
+                return None;
+            }
             let self_val = proto_ref
                 .name_global
                 .and_then(|s| self.globals.get(s as usize).copied())

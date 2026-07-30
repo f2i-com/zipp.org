@@ -749,6 +749,80 @@ impl<'p> Vm<'p> {
             })
     }
 
+    /// The global SLOT behind a name — the inverse of `global_slot_name`. Main-program
+    /// compile-time names first, then bindings a later script/eval introduced.
+    pub(crate) fn global_slot_of_name(&self, name: &str) -> Option<u32> {
+        if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
+            return Some(i as u32);
+        }
+        self.eval_global_map.get(name).copied()
+    }
+
+    /// The own-property descriptor a SLOT-BACKED global binding PRESENTS as, when the
+    /// global object has no real `ObjMap` entry for it yet. `None` when the name is not
+    /// a live global binding at all.
+    ///
+    /// The global object's properties and the global slots are two views of one thing,
+    /// and this is the conversion between them. Both consumers need it:
+    ///
+    /// * `object_get_own_property_descriptor`, to report a binding that lives only in a
+    ///   slot;
+    /// * `object_define_property`, to MATERIALIZE that binding before applying a partial
+    ///   descriptor on top of it. Without the materialization step,
+    ///   `Object.defineProperty(globalThis, "foo", {writable: false})` on the live
+    ///   binding `foo = 1` created a fresh property with NO value — so `foo` read
+    ///   `undefined` where node reads `1`, and the property lost its enumerability
+    ///   (staging/sm/Proxy/regress-bug1037770). Latent while `LoadGlobal` still read
+    ///   the raw slot; live once it routes through the real own descriptor.
+    ///
+    /// The three classifications, which is why this is one function and not three:
+    /// a SCRIPT-declared `var`/function binding is `{writable, enumerable,
+    /// NON-configurable}`; an IMPLICIT global (sloppy assignment to an undeclared name)
+    /// is CreateDataProperty — `{writable, enumerable, configurable}`; a BUILT-IN is
+    /// `{writable, non-enumerable, configurable}`; and `NaN`/`Infinity`/`undefined` are
+    /// frozen.
+    pub(crate) fn global_slot_binding_descriptor(
+        &self,
+        key: &str,
+    ) -> Option<(Value, crate::heap::PropAttr)> {
+        if self.global_this == 0 {
+            return None;
+        }
+        let v = self.global_by_name(key)?;
+        let named = self.program.global_names.iter().position(|n| n == key);
+        let script_decl = named.is_some_and(|i| {
+            self.program.hoisted_globals.contains(&(i as u32))
+                || self.program.decl_globals.contains(&(i as u32))
+        });
+        let implicit = !script_decl
+            && !self.builtin_globals.contains_key(key)
+            && named.and_then(|i| self.globals.get(i)).is_some_and(|v| !v.is_uninitialized());
+        let attr = |writable, enumerable, configurable| crate::heap::PropAttr {
+            writable,
+            enumerable,
+            configurable,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        Some(match key {
+            "NaN" | "Infinity" | "undefined" => (v, attr(false, false, false)),
+            _ if script_decl => (v, attr(true, true, false)),
+            _ if implicit => (v, attr(true, true, true)),
+            _ => (v, attr(true, false, true)),
+        })
+    }
+
+    /// The CHEAP precondition for `global_real_own_route`: does the global object carry
+    /// any real own property at all? One heap load and an `is_empty`. False for every
+    /// program that never writes `globalThis.x = …` or `defineProperty(globalThis, …)`,
+    /// which keeps the O(#globals) name lookup inside `global_real_own_route` off
+    /// `LoadGlobal`'s hot path.
+    #[inline]
+    pub(crate) fn global_obj_has_own_keys(&self) -> bool {
+        self.global_this != 0
+            && matches!(self.heap.get(self.global_this), HeapObj::Object(m) if !m.keys.is_empty())
+    }
+
     /// True when the global OBJECT carries a REAL own property (an ObjMap entry,
     /// e.g. from `Object.defineProperty(this, "x", {writable:false})`) behind
     /// global slot `idx`. The slot fast path models every slot-backed binding as
@@ -779,6 +853,121 @@ impl<'p> Vm<'p> {
             Some(n) => m.pos(n).is_some(),
             None => false,
         }
+    }
+
+    /// Return global slot `slot` to the never-initialized sentinel — the ONE way a
+    /// slot may go backwards — and bump [`Vm::global_route_epoch`] so already-compiled
+    /// code stops trusting its compile-time "this slot is live" finding.
+    ///
+    /// Every writer of `Value::UNINITIALIZED` into `globals` AFTER startup must come
+    /// through here. `delete implicitG` (the `DeleteGlobal` op) and
+    /// `delete globalThis.implicitG` (`delete_prop`'s global arm) are the two callers;
+    /// they used to disagree — only the first cleared the slot at all, so the second
+    /// left `read()` answering `5` in BOTH tiers where node throws.
+    pub(crate) fn uninitialize_global(&mut self, slot: u32) {
+        if let Some(g) = self.globals.get_mut(slot as usize) {
+            *g = Value::UNINITIALIZED;
+        }
+        self.note_global_route_change();
+    }
+
+    /// Bump the global-route epoch: some global slot no longer matches what compiled
+    /// code assumes about it. Saturating rather than wrapping — a wrap could land back
+    /// on an epoch a stale memo entry recorded as valid.
+    #[inline]
+    pub(crate) fn note_global_route_change(&mut self) {
+        self.global_route_epoch = self.global_route_epoch.saturating_add(1);
+        self.jit_global_route_ok.clear();
+    }
+
+    /// A REAL own property has appeared on (or been redefined on) the global object.
+    /// If it shadows a live global SLOT, every store to that slot is now an
+    /// OrdinarySet through `[[Set]]` — so already-compiled code that emitted a raw
+    /// slot write must stop being entered.
+    ///
+    /// The compile-time gates catch this when the property exists *before* the
+    /// compile. This is the after-the-fact half: with a region already compiled,
+    /// `Object.defineProperty(globalThis, "x", {set})` left the setter unrun where the
+    /// interpreter ran it on every iteration.
+    ///
+    /// Narrow on purpose — the shadowing test means `globalThis.someNewName = v` in a
+    /// loop does not churn the epoch (and so does not repeatedly clear the memo).
+    #[inline]
+    pub(crate) fn note_global_own_property_change(&mut self, obj_idx: u32, key: &str) {
+        if self.global_this == 0 || obj_idx != self.global_this {
+            return;
+        }
+        if self.global_slot_of_name(key).is_some() {
+            self.note_global_route_change();
+        }
+    }
+
+    /// The per-slot predicate that EVERY JIT admission gate and the entry-time
+    /// revalidation share, so they can never drift apart — the single source B66 asked
+    /// for. A raw `[r12 + slot*8]` access is observationally identical to the
+    /// interpreter's Load/StoreGlobal only when both hold:
+    ///
+    /// * the slot is LIVE. An `UNINITIALIZED` slot is not an empty binding: a script's
+    ///   GlobalDeclarationInstantiation parks var/function bindings as own properties
+    ///   of the global object and leaves the slot sentinel on purpose, and `delete`
+    ///   puts the sentinel back on a binding that must now throw.
+    /// * the global object does NOT shadow it with a real own property. Such a
+    ///   property IS the binding: a load must run its getter and a store its setter,
+    ///   and a raw slot access does neither.
+    #[inline]
+    pub(crate) fn global_slot_directly_routable(&self, slot: u32) -> bool {
+        if self.globals.get(slot as usize).is_none_or(|v| v.is_uninitialized()) {
+            return false;
+        }
+        if !self.global_obj_has_own_keys() || !self.global_real_own_route(slot) {
+            return true;
+        }
+        // A global LEXICAL (`let x` / `const x` at top level) is NOT a property of the
+        // global object, so a same-named own entry does not govern its write and the
+        // slot stays authoritative. `StoreGlobal`'s interpreter arm makes exactly this
+        // exception (`!global_name_is_lexical`); omitting it here would decline
+        // compilation for `let Array`-style shadowing, which is merely slower — but
+        // the two must agree, because this predicate is what claims to BE the
+        // interpreter's rule.
+        let name = self.global_slot_name(slot).unwrap_or_default();
+        self.global_name_is_lexical(&name)
+    }
+
+    /// Entry-time revalidation for Tier A/C: may `func_id`'s compiled body still be
+    /// entered, given what has happened to the globals it accesses directly?
+    ///
+    /// Cost in a normal program is the `!= 0` compare in the caller — this function is
+    /// not even called. Once some global HAS gone backwards, the answer is memoized per
+    /// `(func_id, epoch)`, so a hot survivor rescans its body once per epoch, not once
+    /// per call.
+    ///
+    /// Returning `false` does NOT evict: the compiled code stays installed and this
+    /// call interprets, exactly like the SROA shape guard in `try_run_osr`. If the
+    /// binding is later re-created the next epoch bump re-validates it and native
+    /// execution resumes on its own.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_globals_still_routable(&mut self, func_id: u32) -> bool {
+        let epoch = self.global_route_epoch;
+        if let Some(&(seen, ok)) = self.jit_global_route_ok.get(&func_id) {
+            if seen == epoch {
+                return ok;
+            }
+        }
+        let proto: *const crate::bytecode::FuncProto = self.func(func_id as usize);
+        // SAFETY: program and leaked eval FuncProtos are immutable while running.
+        let ok = unsafe { &*proto }.code.iter().all(|ins| match *ins {
+            Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                self.global_slot_directly_routable(idx)
+            }
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } => {
+                self.global_slot_directly_routable(idx)
+            }
+            _ => true,
+        });
+        self.jit_global_route_ok.insert(func_id, (epoch, ok));
+        ok
     }
 
     pub(crate) fn do_eval(
@@ -951,6 +1140,26 @@ impl<'p> Vm<'p> {
         // GetMethod per iterator symbol, the async-from-sync VALUE await, and
         // AsyncIteratorClose on exactly the abrupt completions the spec closes on
         // (k-limit, sync-value await, mapfn, define) — never on next() itself.
+        //
+        // The iterator keys are the ENGINE-INTERNAL well-known-symbol strings
+        // ("@@asyncIterator"/"@@iterator" — see `well_known_symbol_key`), NOT
+        // `Symbol.asyncIterator`. The spec says %Symbol.asyncIterator%, an
+        // intrinsic; reading it off the global `Symbol` binding lets user code
+        // redirect it:
+        //
+        //     globalThis.Symbol = { asyncIterator: Symbol("asyncIterator"), … };
+        //     Array.fromAsync(objWithThatFakeKey)   // must NOT call the fake
+        //
+        // (`built-ins/Array/fromAsync/asyncitems-uses-intrinsic-iterator-symbols`
+        // is exactly that test.) This was latent only because a bare `Symbol` in a
+        // polyfill used to read the raw global SLOT and so could not see an own
+        // property shadowing it on the global object; fixing `LoadGlobal` to route
+        // through a real own descriptor made the shadow visible and the bug live.
+        //
+        // Any other intrinsic a JS-implemented polyfill reads off a global name
+        // (`TypeError`, `Object`, `Array`) is shadowable the same way. Not fixed
+        // here — only the symbols are test262-visible today — but the pattern is
+        // the hazard, not these two lines.
         const SRC: &str = r#"(async function fromAsync(items, mapfn, thisArg) {
   'use strict';
   var C = this;
@@ -959,12 +1168,12 @@ impl<'p> Vm<'p> {
   var mapping = mapfn !== undefined;
   if (mapping && typeof mapfn !== 'function')
     throw new TypeError('Array.fromAsync mapper is not a function');
-  var method = items[Symbol.asyncIterator];
+  var method = items['@@asyncIterator'];
   if (method === undefined || method === null) method = undefined;
   else if (typeof method !== 'function') throw new TypeError('@@asyncIterator is not a function');
   var isSync = false;
   if (method === undefined) {
-    var syncMethod = items[Symbol.iterator];
+    var syncMethod = items['@@iterator'];
     if (syncMethod === undefined || syncMethod === null) syncMethod = undefined;
     else if (typeof syncMethod !== 'function') throw new TypeError('@@iterator is not a function');
     if (syncMethod !== undefined) { method = syncMethod; isSync = true; }

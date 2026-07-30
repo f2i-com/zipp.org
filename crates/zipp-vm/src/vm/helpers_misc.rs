@@ -1348,8 +1348,12 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     let func_id = (packed >> 32) as u32;
     let name_idx = packed as u32;
     let idx = obj.heap_index();
-    let prog = vm.program;
-    let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
+    // `vm.func` — NOT `vm.program.functions[..]`, for the reason spelled out in
+    // `jit_get_prop_miss` above: a JIT-compiled function can be an EVAL function
+    // living in `vm.eval_funcs` past `main_func_count`, and indexing the program's
+    // table directly is an out-of-bounds panic the moment such a function gets hot
+    // and takes a `SetProp` miss. The get side was fixed; this one was missed.
+    let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Keys with exotic write interception (the inherited `__proto__` setter,
     // restricted names, private names, canonical-index-ish keys) and exotic
     // receivers — same exclusions as the interpreter's SetProp IC: defer.

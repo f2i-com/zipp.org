@@ -297,6 +297,9 @@ pub(crate) fn compile_proto(
     // path. Charges land out of line, next to the epilogue.
     let blocks = crate::codegen::meter::block_map(meter, &proto.code, 0, n - 1);
     let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
+    // Whether any `emit_self_call` ran — i.e. whether this body baked in "the global
+    // `self_slot` still holds me". Recorded on the `JitFn` so `try_run_jit` re-checks.
+    let mut emitted_self_call = false;
 
     // ── prologue ── save callee-saved regs, stash the 3 inputs, reserve shadow.
     // 3 pushes (24B) + sub 48 = 72B; +8 (return addr) = 80 ⇒ 16-aligned. The 48
@@ -438,6 +441,7 @@ pub(crate) fn compile_proto(
                             Cmp::Eq | Cmp::Ne => unreachable!("base_case yields only Lt/Le/Gt/Ge"),
                         }
                         dynasm!(ops ; => do_call);
+                        emitted_self_call = true;
                         emit_self_call(
                             &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst,
                             callee, arg_base, argc, proto.reg_count, self_val_bits,
@@ -451,6 +455,7 @@ pub(crate) fn compile_proto(
                         );
                     }
                     _ => {
+                        emitted_self_call = true;
                         emit_self_call(
                             &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst,
                             callee, arg_base, argc, proto.reg_count, self_val_bits,
@@ -509,7 +514,16 @@ pub(crate) fn compile_proto(
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr })
+    // Record the self-binding this body assumed, for `try_run_jit` to re-check at
+    // every entry. Only when a self-call was actually emitted — a Tier A body with
+    // no recursion must not be declined merely because its own global name was
+    // reassigned (`function f(){…}; var g = f; f = 1;` keeps `g` fast).
+    let self_binding = if emitted_self_call {
+        self_slot.map(|s| (s, self_val_bits))
+    } else {
+        None
+    };
+    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding })
 }
 
 #[derive(Clone, Copy)]

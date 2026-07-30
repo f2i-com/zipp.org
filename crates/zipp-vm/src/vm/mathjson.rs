@@ -746,9 +746,14 @@ impl<'p> Vm<'p> {
             }
         }
         *i += 1; // '}'
-        let mut map = crate::heap::ObjMap::new();
+        // `set_owned`, not `set(&k, …)`: the parser already allocated each key
+        // (`to_lossy_string` above), and `set` cloned a SECOND copy on first
+        // insertion only to drop the first. `with_capacity` then sizes the three
+        // parallel vectors once instead of growing them log n times — `pairs.len()`
+        // is exact for a duplicate-free object and a harmless over-reserve otherwise.
+        let mut map = crate::heap::ObjMap::with_capacity(pairs.len());
         for (k, v) in pairs {
-            map.set(&k, v);
+            map.set_owned(k, v);
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map)))))
     }
@@ -1003,9 +1008,13 @@ impl<'p> Vm<'p> {
             }
         }
         *i += 1; // '}'
-        let mut map = crate::heap::ObjMap::new();
+        // As in `json_parse_object`. The `key.clone()` above stays: this variant
+        // maintains a PARALLEL source tree that needs the key too, so one of the two
+        // must own a copy. `set_owned` still removes the third allocation — the one
+        // `set` made inside the map.
+        let mut map = crate::heap::ObjMap::with_capacity(pairs.len());
         for (k, v) in pairs {
-            map.set(&k, v);
+            map.set_owned(k, v);
         }
         let ov = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
         Ok((ov, JsonSrc::Obj(srcs, ov)))

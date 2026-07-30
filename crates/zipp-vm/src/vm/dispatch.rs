@@ -249,20 +249,28 @@ impl<'p> Vm<'p> {
                     // leaf-inline planner (`build_leaf_inline_plan`) already refuse
                     // for exactly this reason. Tier C did not, which is why the
                     // whole-function path had the bug and the loop path did not.
-                    // Once a slot holds a real value it can never go back, so
-                    // deferring is safe and a later call re-checks.
-                    let globals_ok = proto_ref.code.iter().all(|ins| {
-                        let slot = match *ins {
-                            Instr::LoadGlobal { idx, .. }
-                            | Instr::LoadGlobalOrUndefined { idx, .. }
-                            | Instr::StoreGlobal { idx, .. }
-                            | Instr::StoreGlobalStrict { idx, .. }
-                            | Instr::StoreGlobalResolved { idx, .. } => Some(idx),
-                            _ => None,
-                        };
-                        slot.map_or(true, |i| {
-                            self.globals.get(i as usize).is_none_or(|v| !v.is_uninitialized())
-                        })
+                    //
+                    // "Once a slot holds a real value it can never go back" was the
+                    // stated justification for checking here and never again. It is
+                    // FALSE — `delete implicitG` puts the sentinel back — so
+                    // `try_run_jit` now revalidates at entry against the global-route
+                    // epoch. This stays as the cheap first filter.
+                    //
+                    // A STORE carries a second condition: a real own property on the
+                    // global object (non-writable, accessor, frozen) makes the write
+                    // an OrdinarySet the raw slot store would bypass. Both live in
+                    // `global_slot_directly_routable`, shared with the entry check so
+                    // the two cannot drift.
+                    let globals_ok = proto_ref.code.iter().all(|ins| match *ins {
+                        Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                            self.global_slot_directly_routable(idx)
+                        }
+                        Instr::StoreGlobal { idx, .. }
+                        | Instr::StoreGlobalStrict { idx, .. }
+                        | Instr::StoreGlobalResolved { idx, .. } => {
+                            self.global_slot_directly_routable(idx)
+                        }
+                        _ => true,
                     });
                     if !globals_ok {
                         self.jit.compile_defer(func_id);
@@ -479,6 +487,54 @@ impl<'p> Vm<'p> {
                             let gobj = Value::heap(self.global_this);
                             let val = self.get_prop(gobj, &name)?;
                             self.set(base, dst, val);
+                            ip += 1;
+                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
+                            // A LIVE slot whose name the global object shadows with a
+                            // REAL own property: the property is the binding, so
+                            // GetBindingValue reads it through [[Get]] — running a
+                            // getter, and seeing a `writable: false` value the slot
+                            // never received.
+                            //
+                            // `StoreGlobal` has routed this case for a while;
+                            // `LoadGlobal` did not, so after
+                            // `defineProperty(globalThis, "imp", {get, set})` the
+                            // setter ran on every write while the read still returned
+                            // the stale slot — `imp` read `2999` where node reads `G`.
+                            // Both zipp tiers agreed, which is why B66 filed it as a
+                            // conformance gap alongside the tier divergence.
+                            //
+                            // A global LEXICAL is not an object property (same
+                            // exception `StoreGlobal` makes): its slot stays
+                            // authoritative.
+                            //
+                            // GATED ON THE EPOCH, and that is a measured decision.
+                            // Reading ground truth instead — one heap load plus
+                            // `keys.is_empty()` through globalThis's cold `ObjMap`
+                            // box — cost **+12%** on a hot top-level global loop
+                            // (585ms -> 655ms, `ZIPP_NOJIT=1`, 20M iterations),
+                            // which showed up as `map-set-heavy` +3.9% and
+                            // `polymorphic-objects` +2.4% in the 21-pair A/B. Both
+                            // are top-level scripts whose hot loops read globals,
+                            // so every iteration paid it. `LoadGlobal` is far too
+                            // hot to touch the heap speculatively.
+                            //
+                            // The epoch is bumped by `note_global_own_property_change`
+                            // (a descriptor or assignment on globalThis shadowing a
+                            // live slot) and by `uninitialize_global`. If a future
+                            // path adds such a shadow without bumping, this arm is
+                            // skipped and the read falls back to the SLOT — i.e. to
+                            // the pre-B67 answer. Wrong, but no worse than before,
+                            // and NOT a tier divergence: the JIT gates read ground
+                            // truth via `global_slot_directly_routable`, so they
+                            // decline and the interpreter answers, consistently.
+                            let name = self.global_slot_name(idx).unwrap_or_default();
+                            if self.global_name_is_lexical(&name) {
+                                self.set(base, dst, v);
+                            } else {
+                                let gobj = Value::heap(self.global_this);
+                                let val = self.get_prop(gobj, &name)?;
+                                self.set(base, dst, val);
+                            }
                             ip += 1;
                         } else {
                             self.set(base, dst, v);
@@ -3289,16 +3345,20 @@ impl<'p> Vm<'p> {
                                     let proto = self.func(func_id as usize);
                                     let s = t as usize;
                                     let e = region_end;
-                                    proto.code[s..=e].iter().all(|ins| {
-                                        let slot = match *ins {
-                                            Instr::LoadGlobal { idx, .. } => Some(idx),
-                                            Instr::LoadGlobalOrUndefined { idx, .. } => Some(idx),
-                                            Instr::StoreGlobal { idx, .. } => Some(idx),
-                                            Instr::StoreGlobalStrict { idx, .. } => Some(idx),
-                                            Instr::StoreGlobalResolved { idx, .. } => Some(idx),
-                                            _ => None,
-                                        };
-                                        slot.map_or(true, |i| !self.globals[i as usize].is_uninitialized())
+                                    // Shared predicate — see `global_slot_directly_routable`.
+                                    // A store additionally refuses a slot the global
+                                    // object now shadows with a real descriptor.
+                                    proto.code[s..=e].iter().all(|ins| match *ins {
+                                        Instr::LoadGlobal { idx, .. }
+                                        | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                                            self.global_slot_directly_routable(idx)
+                                        }
+                                        Instr::StoreGlobal { idx, .. }
+                                        | Instr::StoreGlobalStrict { idx, .. }
+                                        | Instr::StoreGlobalResolved { idx, .. } => {
+                                            self.global_slot_directly_routable(idx)
+                                        }
+                                        _ => true,
                                     })
                                 };
                                 if !region_globals_ok {
@@ -3481,28 +3541,16 @@ impl<'p> Vm<'p> {
                                 // always at the same iteration, which reads like a
                                 // scoping bug and is not one. Decline the region;
                                 // the interpreter is already correct.
-                                let uninit_global = proto_ref.code[t..=region_end].iter().any(|ins| {
-                                    let g = match *ins {
-                                        Instr::LoadGlobal { idx, .. }
-                                        | Instr::LoadGlobalOrUndefined { idx, .. }
-                                        | Instr::StoreGlobal { idx, .. }
-                                        | Instr::StoreGlobalStrict { idx, .. }
-                                        | Instr::StoreGlobalResolved { idx, .. } => idx,
-                                        _ => return false,
-                                    };
-                                    self.globals
-                                        .get(g as usize)
-                                        .is_some_and(|v| v.is_uninitialized())
-                                });
-                                if uninit_global {
-                                    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
-                                        eprintln!(
-                                            "[region] fn{func_id}@{t} DECLINE (global slot is own-property-backed, not a slot binding)"
-                                        );
-                                    }
-                                    ip = t;
-                                    continue;
-                                }
+                                //
+                                // The scan that used to sit HERE was a byte-for-byte
+                                // duplicate of `region_globals_ok` above, over the
+                                // identical `[t..=region_end]` range — and it declined
+                                // WITHOUT `region_defer`, so a region rejected only by
+                                // this copy was never reconsidered even after the
+                                // binding became a real slot (`record_region` returns
+                                // true once per key). Folded into the single gate
+                                // above, which does re-arm. One fewer hand-maintained
+                                // copy of a cross-tier fact is the whole point of B66.
                                 self.jit.compile_region(
                                     func_id,
                                     proto_ref,
@@ -4804,9 +4852,11 @@ impl<'p> Vm<'p> {
                             }
                         }
                         if ok {
-                            if let Some(g) = self.globals.get_mut(slot as usize) {
-                                *g = Value::UNINITIALIZED;
-                            }
+                            // Through `uninitialize_global`, not a bare write: the
+                            // slot going backwards is what invalidates every
+                            // compile-time "this slot is live" finding, and the epoch
+                            // bump is how already-compiled code learns.
+                            self.uninitialize_global(slot);
                             // Clearing the SLOT is not enough for a BUILT-IN name:
                             // `global_by_name` falls back to the builtin table, so
                             // %Function% stayed visible to `"Function" in this` /
@@ -6939,7 +6989,38 @@ impl<'p> Vm<'p> {
     /// in between can resize `self.regs` (the JIT subset issues no calls/allocs).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn try_run_jit(&mut self, func_id: u32, base: usize) -> Option<(Value, u32)> {
+        // ── global-route revalidation ── the compile-time `globals_ok` scan below
+        // proved every global this body touches directly was a live, plain, writable
+        // slot. A `delete` can take a slot back to UNINITIALIZED and a
+        // `defineProperty(globalThis, …)` can put a real descriptor behind one, after
+        // which the emitted `mov rax, [r12 + idx*8]` is wrong (it hands back the
+        // sentinel instead of throwing, or bypasses a setter). Nothing re-checked.
+        //
+        // Zero-cost while no program has done either: `global_route_epoch` is 0 and
+        // this is one compare. Falling back interprets THIS call and leaves the
+        // compiled code installed, so a re-created binding heals on its own.
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(func_id) {
+            return None;
+        }
         let jitfn = self.jit.get(func_id)? as *const crate::codegen::JitFn;
+        // ── self-binding revalidation ── a Tier A body containing a self-call emits a
+        // direct `call` to its own entry in place of `LoadGlobal(self_slot) + Call`,
+        // with NO callee guard. Rebind the name and the interpreter's inner calls
+        // re-resolve to the new function while native code keeps calling itself.
+        //
+        // Checked here rather than inline at each recursive call because declining the
+        // OUTER entry is enough: the whole activation then interprets, and the
+        // interpreter re-resolves every inner call the way the spec says. The common
+        // case — a name nobody rebinds — is one load and one compare per outer call,
+        // not per recursion, so `fib`'s hot path is untouched.
+        //
+        // SAFETY: `jitfn` points into `self.jit.compiled`, which this function already
+        // relies on being stable for the duration (see the note below).
+        if let Some((slot, expect)) = unsafe { (*jitfn).self_binding() } {
+            if self.globals.get(slot as usize).map(|v| v.bits()) != Some(expect) {
+                return None;
+            }
+        }
         // SAFETY: `jitfn` points into self.jit.compiled (stable for the call).
         // `regs_ptr` is valid for the frame's reg_count slots. A self-call op
         // routes through `jit_self_call` (passed the `vm` pointer below) which
@@ -7018,6 +7099,14 @@ impl<'p> Vm<'p> {
     /// `self.regs`/`self.globals`, so the raw pointers stay valid for the call.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn try_run_osr(&mut self, func_id: u32, entry_ip: u32, base: usize) -> Option<usize> {
+        // Global-route revalidation, as in `try_run_jit`. Scoped to the whole
+        // FUNCTION rather than the region's `[header, back-edge)` slice: declining a
+        // region because a global elsewhere in the body went backwards is
+        // conservative in the safe direction, it shares the per-func memo, and this
+        // path is only reachable at all once some program has deleted a global.
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(func_id) {
+            return None;
+        }
         // Copy the native entry pointer and the SROA plan OUT of the region
         // before running: a region's call helper can re-enter the interpreter,
         // which may compile NEW regions (rehashing `jit.regions` — any &Region

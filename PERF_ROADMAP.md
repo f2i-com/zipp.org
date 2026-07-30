@@ -30,6 +30,11 @@ are in B58.
 | default regex capture-name clone removal | **REVERTED** | restoring the original code measured −0.51% (95% CI −1.05% to −0.24%), inside the independently observed ~1% A/A drift floor |
 | M4.0 TypedArray guard reduction | **REVERTED** | −0.11% (95% CI −1.10% to +0.55%): statistically neutral |
 | M3-M5 object metadata, CFG/SSA, arena/nursery | **OPEN** | these remain the required architectural path toward broad V8 parity |
+| B67 three open tier divergences + eval `SetProp` | **LANDED, FREE** | `tests/jit_tier_parity.rs` 11/11 with zero ignored; two of the three had an interpreter conformance bug UNDERNEATH the tier bug, so four interpreter answers changed to match node as a script. Suite geomean **+0.23%, 95% CI [−0.16%, +0.42%]** (21 pairs, interval includes zero); binary 2,560 bytes smaller. The first attempt cost `map-set-heavy` +3.9% by reading the heap on every `LoadGlobal` — re-gated on a `u32` epoch compare, isolated at +12% on a top-level global loop |
+| B67 owned JSON keys (plan M2.2) | **LANDED, `json-large` −3.9% (REPLICATED)** | `ObjMap::set_owned` removes the second allocation per first-inserted JSON key. −3.9% [−5.4, −2.2] and −3.9% [−5.0, −3.2] across two independent 21-pair runs. Order/duplicate/reviver/`context.source` invariants pinned by `tests/json_owned_keys.rs` |
+| B67 corrected benchmarks (plan M0.3) | **ADDED, OUTSIDE `ALLBENCHES`** | `property-ic-shapes` (the M3 acceptance benchmark, 1..1024 same-shape receivers), `polymorphic-objects-v2`, `sparse-array-v2`. Output byte-identical to node. Excluded from the timed ten so the retained geomean stays comparable |
+| plan M2.1 `typeof`-local fusion | **OPEN — measurement-blocked** | needs an exact-HEAD baseline + 15-21 pairs; belongs in `compile/exprs.rs` beside the existing AST-level fusion, not in a bytecode def-use pass |
+| plan M2.3/M2.4 side tables | **OPEN** | `regexp_string_iters` → `SlotTable`; `array_length_nonwritable` → a `SlotSet` sibling, which B66 already identified as the real fix for that probe |
 
 ---
 
@@ -1630,6 +1635,272 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B67 — B66's three open specs closed, and each one had an INTERPRETER bug underneath it
+
+B66 left three `#[ignore]`d failing specs in `tests/jit_tier_parity.rs` as "open tier
+divergences". `cargo test -- --ignored` now reports nothing there: all three are fixed
+and unignored, 11/11 green.
+
+The finding worth recording is not that they closed. It is that **two of the three were
+not tier divergences at all** — or not only. B66 diagnosed them from the JIT side and
+was wrong about the mechanism in both cases, which the first `ZIPP_NOJIT=1` run said
+immediately:
+
+| B66 said | what was actually true |
+|---|---|
+| "compiled code keeps reading the slot as `undefined` where the interpreter throws ReferenceError" | `delete globalThis.implicitG` **never cleared the slot at all**, so the INTERPRETER answered `5` too. Only the unqualified `delete implicitG` cleared it. Two spellings of one deletion disagreeing. |
+| "a `StoreGlobal` to a REAL own property of the global object writes the slot directly" | true, AND `LoadGlobal` never routed either — in both tiers. AND `defineProperty(globalThis, …)` on a slot-only binding built a property with no value. Three bugs stacked, only the first visible from the JIT. |
+
+**Lesson for the audit plan's M1.1, which called this out and was right:** "fix the
+interpreter semantics against the specification/Node first; making native code match
+the current interpreter is not sufficient." Had the JIT been taught to agree with the
+interpreter here, all three would have gone green while every answer stayed wrong.
+
+#### What landed
+
+**1. The indexed-prototype protector now has ONE invalidation point.**
+`array_proto_has_index` is read by 11 sites (interpreter fast paths, JIT helpers) and
+every one treats `true` as "MAY supply an index ⇒ run the full protocol" — verified
+site by site, and `codegen/` never bakes it, so flipping the bool is enough and takes
+effect at the next helper call. It was set only when an integer-like key was DEFINED on
+`Array.prototype`/`Object.prototype`; `setPrototypeOf(Array.prototype, x)` splices a
+whole new chain in and was invisible. Both mutations now go through
+`invalidate_indexed_proto_protector`, called from `note_array_proto_index` and from
+`ordinary_set_prototype_of`. Invalidation is unconditional — NOT "does the new chain
+carry an index" — because `x` can be index-free at `setPrototypeOf` and gain `x[5] = …`
+a line later, on an ordinary object no protector watches.
+
+**2. A global-route epoch, checked at native entry.** Every JIT tier proves each direct
+global access legal at COMPILE time, on the stated assumption that "once a slot holds a
+real value it can never go back". `delete` falsifies that. `Vm::global_route_epoch`
+is bumped by `uninitialize_global` (both delete spellings) and by
+`note_global_own_property_change` (a real descriptor appearing on the global object
+behind a slot); `try_run_jit`/`try_run_osr` refuse to enter when it moved and the
+function's globals no longer check out. Cost in a program that never does either — i.e.
+every program — is **one compare against zero**; the rescan is memoized per
+`(func_id, epoch)` for programs that do. Declining does not evict, so a re-created
+binding heals by itself (`a_recreated_global_is_readable_from_compiled_code_again`).
+
+**3. One predicate instead of five copies.** `global_slot_directly_routable` is now the
+single source for "may a tier emit a raw `[r12 + slot*8]` access", used by the Tier A/C
+gate, `region_globals_ok`, `build_leaf_inline_plan`, the array-builtin callback compile,
+and the entry revalidation. Three things fell out of consolidating them:
+
+* the region gate had a **byte-for-byte duplicate** scan over the identical range 200
+  lines later, and that copy declined **without** `region_defer` — so a region rejected
+  only by it was never reconsidered even after the binding became a real slot. Deleted.
+* `native_cb_entry` (Tier A compile of an array-builtin callback) had **no global scan
+  at all**. Added, and deliberately BEFORE `jit.compile`, because compile blacklists on
+  failure and `FN_DEAD` is sticky.
+* stores now also refuse a slot the global object shadows with a real descriptor, which
+  only the interpreter checked.
+
+**4. Self-call callee identity.** Tier A's `emit_self_call` emits a direct `call` to its
+own entry in place of `LoadGlobal(self_slot) + Call`, with no callee guard, so a rebound
+name kept recursing into the old function. `JitFn` now records
+`self_binding: Option<(slot, expected bits)>` — set only when a self-call was actually
+emitted, so `function f(){…}; var g = f; f = 1;` keeps `g` fast — and `try_run_jit`
+checks it. Checked at the OUTER entry, not inline per recursion: declining there makes
+the whole activation interpret, and the interpreter re-resolves every inner call
+correctly. `fib`'s hot path is untouched.
+
+**5. Four interpreter conformance fixes, all verified against node as a SCRIPT.**
+`node file.js` runs CommonJS, where top-level `var` is module-scoped and never a global
+property — comparing against it silently tests the wrong semantics. Use
+`node -e 'require("vm").runInThisContext(require("fs").readFileSync(process.argv[1],"utf8"))'`.
+
+| case | was | now (== node) |
+|---|---|---|
+| `delete globalThis.implicitG; implicitG` | `5` | ReferenceError |
+| `defineProperty(globalThis,"imp",{get,set}); imp` | stale slot `2999` | `"G"` — the getter runs |
+| `foo=1; defineProperty(globalThis,"foo",{writable:false}); foo` | `undefined` | `1` |
+| `var late=…; defineProperty(globalThis,"late",{…,configurable:true})` | silently accepted | `TypeError: Cannot redefine property: late` |
+
+The third and fourth are one fix: the global object's properties and the global slots
+are two views of one set of bindings, but only the slot view existed for `var foo` /
+`foo = 1`, so a define was a CREATE rather than a REDEFINE. `object_define_property`
+now MATERIALIZES the binding's current descriptor into the `ObjMap` first, after which
+the ordinary redefine path is correct by construction —
+ValidateAndApplyPropertyDescriptor keeps every field the incoming descriptor omits, and
+rejects a `configurable: true` request on a non-configurable `var` binding.
+`global_slot_binding_descriptor` owns that slot→descriptor classification and is shared
+with `object_get_own_property_descriptor`.
+
+**6. A latent OOB, and a JIT coverage hole nobody had named.**
+`jit_set_prop_miss` indexed `vm.program.functions[func_id]` where `jit_get_prop_miss`
+was already fixed to use `vm.func` — an out-of-bounds panic for an eval/module function.
+It is currently UNREACHABLE, and the reason is itself a finding: `dispatch.rs` gates
+**both** the function JIT and the OSR tier on `func_id < main_func_count`, so **eval,
+`new Function`, and every MODULE body are never JIT-compiled at all** (module functions
+also live in `eval_funcs`). Fixed anyway, because the gate is what makes it latent and
+the gate is a performance debt someone will want to lift.
+
+#### Fallout from fixing `LoadGlobal`, which is the interesting risk
+
+Making a bare global read route through a real own descriptor makes **every
+JS-implemented polyfill shadowable**. `Array.fromAsync` is one: its polyfill read
+`items[Symbol.asyncIterator]` off the global `Symbol` binding, so
+`globalThis.Symbol = {asyncIterator: Symbol("asyncIterator")}` redirected an INTRINSIC
+lookup and the polyfill called the user's fake method —
+`built-ins/Array/fromAsync/asyncitems-uses-intrinsic-iterator-symbols` failed both ways
+the moment the shadow became visible. Fixed by keying off the engine-internal
+`'@@asyncIterator'` / `'@@iterator'` strings. **Any other intrinsic a polyfill reads by
+global name (`TypeError`, `Object`, `Array`) has the same exposure**; only the symbols
+are test262-visible today, but the pattern is the hazard.
+
+#### Gate
+
+test262 95936/95942 with the fail set byte-identical to
+`tools/test262-expected-failures.txt` in all three passes (default, `ZIPP_NOJIT=1`,
+`ZIPP_JIT_THRESHOLD=1`); `cargo test --workspace --release` 495 passed / 0 failed;
+bench correctness `ALL_CORRECT=1` over all 13 files, JIT and NOJIT, plus `ALL_CORRECT=1`
+from the A/B harness itself (exact bytes, no normalisation); `ZIPP_GC_STRESS=1` over the
+changed paths identical to node in all three tier modes.
+`tests/jit_tier_parity.rs` 11/11 with **zero** ignored (was 5 passing + 3 ignored),
+`tests/json_owned_keys.rs` (6), and 6 new `assert_jit_matches` cases in `lib.rs` — which
+is the gate clause that matters here, since each asserts JIT-on == JIT-off rather than
+just the right answer.
+
+#### Measured: FREE, after the first attempt was not
+
+21 counterbalanced pairs against a clean `735535c` build (both sides' sha256 recorded;
+new binary is 2,560 bytes SMALLER). **Suite geomean +0.23%, 95% CI [−0.16%, +0.42%] —
+the interval includes zero**, so the correctness work is free. `bench/b67b_ab_2026-07-30.json`.
+
+The first attempt was NOT free, and the reason is worth keeping. Run 1
+(`bench/b67_ab_2026-07-30.json`) measured **`map-set-heavy` +3.9% [+0.5, +5.6]** — a
+sentinel breach, the gate caps it at +2% — and `polymorphic-objects` +2.4% [+1.2, +3.6].
+
+The mechanism was one line. The new `LoadGlobal` arm gated its route check on ground
+truth: `global_obj_has_own_keys()`, which is a heap load plus `keys.is_empty()` through
+globalThis's cold `ObjMap` box. **`LoadGlobal` is far too hot to touch the heap
+speculatively**, and both offending rows are top-level scripts whose hot loops read
+globals — so every iteration paid it. Isolated on a 20M-iteration top-level global loop
+under `ZIPP_NOJIT=1`: **585ms → 655ms, +12%.** (Default mode was 46 vs 47ms — the region
+JIT covers that micro entirely, which is why only the interpreter-bound rows moved.)
+
+Re-gated on `global_route_epoch != 0`, a single `u32` compare against a field that is
+zero in every program that neither deletes a global nor puts a descriptor on one:
+
+| row | run 1 (ground truth) | run 2 (epoch) |
+|---|---:|---:|
+| `map-set-heavy` (sentinel) | +3.9% [+0.5, +5.6] | **+1.8% [−0.5, +3.3]** — CI includes zero |
+| `polymorphic-objects` | +2.4% [+1.2, +3.6] | **+1.5% [+0.5, +1.7]** |
+| suite geomean | +0.32% [−0.08, +0.61] | **+0.23% [−0.16, +0.42]** |
+
+The tradeoff is stated at the code: if a future path shadows a live slot without bumping
+the epoch, that read falls back to the SLOT — the pre-B67 answer. Wrong, but no worse
+than before, and **not a tier divergence**, because the JIT gates still read ground truth
+through `global_slot_directly_routable` and so decline, leaving the interpreter to answer
+consistently.
+
+#### An engine table from the same session, and why it is NOT a new headline
+
+15 pairs, node vs the B67 build, historical ten rows (`bench/head_b67b_15.json`):
+
+| workload | node | zipp | zipp/node |
+|---|---:|---:|---:|
+| `map-set-heavy` | 681ms | 713ms | 1.03x |
+| `class-prototype-hot` | 297ms | 378ms | 1.27x |
+| `json-large` | 273ms | 449ms | 1.65x |
+| `markdown-render` | 268ms | 446ms | 1.67x |
+| `polymorphic-objects` | 325ms | 615ms | 1.89x |
+| `async-promise-chain` | 331ms | 626ms | 1.89x |
+| `sparse-array` | 79ms | 157ms | 1.98x |
+| `parse-large-js` | 270ms | 597ms | 2.20x |
+| `typedarray-math` | 204ms | 642ms | 3.15x |
+| `regex-log-scan` | 459ms | 1671ms | 3.65x |
+
+geomean **1.91x** [1.89, 1.92]; startup node 29.6ms vs zipp 8.5ms (0.29x).
+
+**Do not read 1.8626x → 1.91x as a 2.5% regression, and do not install this as the
+retained headline.** It is a different day on a host that was demonstrably drifting — the
+`LoadGlobal` micro above measured its own baseline at 585ms in one run and 834ms in
+another, and `map-set-heavy` here reports 1.03x against the retained 0.897x with a p10/p90
+of 681/809ms, the widest spread in the table. B66's +0.40% and B67's +0.23% together
+account for ~0.63% of the difference; the rest is host condition.
+
+The A/B is the number that means something, because it is counterbalanced, same-session
+and same-host: **+0.23%, CI includes zero**. M0.1's rebaseline still wants what it always
+wanted — a quiet host, a deliberate A/A calibration alongside it, and the peak-RSS and
+counter captures this run does not have. This table is an indicative snapshot, nothing more.
+
+Two side lessons from having run it twice. `markdown-render` measured −2.0% [−3.1, −0.4]
+in run 1 and +0.2% [−1.4, +1.1] in run 2 — an interval excluding zero that did not
+replicate, exactly the ~1% drift M0.1 warns about; no claim was made for it. And the
+`json-large` win DID replicate (−3.9% [−5.4, −2.2] then −3.9% [−5.0, −3.2]), which is
+what makes it quotable.
+
+### B67b — Contained: owned JSON keys, and the three corrected benchmarks
+
+**Owned JSON keys (audit plan M2.2) — LANDED, UNMEASURED.** `json_parse_object` and
+`json_parse_object_src` built `Vec<(String, Value)>` and then called `map.set(&k, v)`,
+which cloned a SECOND copy of a key the parser had already allocated and dropped the
+first. `ObjMap::set_owned(String, Value)` is `set`'s clone-free twin over the existing
+`push_data`, and both sites now also `with_capacity(pairs.len())`. Duplicate-key
+last-value-wins, first-insertion position, integer-key enumeration order, reviver
+visitation order and `context.source`-reports-the-last-duplicate are pinned by
+`tests/json_owned_keys.rs`; the reviver-order expectation was checked against node
+rather than reasoned about, and the first guess was wrong (`b` comes FIRST — the
+duplicate keeps its original position).
+
+**Measured: `json-large` −3.9%, and it REPLICATED.** Two independent 21-pair runs against
+clean `735535c`: −3.9% [−5.4, −2.2] (`bench/b67_ab_2026-07-30.json`) and −3.9%
+[−5.0, −3.2] (`bench/b67b_ab_2026-07-30.json`). Same point estimate twice, both intervals
+excluding zero, comfortably past the 2–3% target-row promotion threshold — and the plan's
+own estimate for this item was only "unknown-small until measured".
+
+Caveat on attribution: this A/B carries the whole B67 changeset, so −3.9% is the NET
+`json-large` movement, not an isolated measurement of `set_owned`. The mechanism is
+certain (one fewer allocation per first-inserted key, on the row whose generator produces
+effectively random keys) and nothing else in the changeset plausibly speeds JSON parsing
+up, but an ablation would be needed to attribute the number to this line alone.
+
+**Three corrected benchmarks (audit plan M0.3) — ADDED, NOT in `ALLBENCHES`.** All three
+produce byte-identical output to node. They are deliberately excluded from the timed
+default set, because the retained headline is a geomean over exactly ten rows and adding
+rows would silently redefine the number every earlier entry is quoted against. Run them
+with `BENCHES="…" bash bench/run_real.sh`; `CORRECTBENCHES` checks them by default.
+
+* **`property-ic-shapes.js`** — 1/2/4/8/9/16/1024 receivers sharing ONE shape, separate
+  `GetProp` and existing-slot `SetProp`, plus distinct-shape, dictionary-mode and
+  prototype-chain controls. **This is the acceptance benchmark for M3** and it exists
+  before the implementation it judges. The wrap is an explicit counter, never
+  `i & (n - 1)`: 9 and 1024 are not both powers of two and a mask would have benchmarked
+  8 and 1024 while the phase name claimed otherwise. Each phase reads a distinct
+  property name so phases cannot share an IC site and measure the order they ran in.
+  First look: node 346ms, zipp 1814ms.
+* **`polymorphic-objects-v2.js`** — the original row split into
+  same-layout-many-instances (the case it omits entirely), 8/9/16 LAYOUTS, dict churn,
+  proto walk and enumeration, each with its own checksum. node 166ms, zipp 442ms.
+* **`sparse-array-v2.js`** — gap-size and logical-length curves with packed / holey /
+  `in` / `for-in` / read / create-write / slice / concat separated, and a final phase
+  that re-runs the hole reads with the indexed-proto protector INVALIDATED, so no
+  hole/OOB fast path can be promoted on protector-valid numbers alone.
+
+  Writing it produced a finding: **`concat` on a 4089-length sparse array costs zipp
+  ~300 µs per call.** At the same iteration count as `slice` it was 6.0s of a 6.9s run —
+  one builtin drowning every other phase, and the file would have reported "sparse
+  arrays are 22× node". Sized to 1,000 iterations against `slice`'s 20,000, with both
+  counts printed so the two numbers are not read as comparable throughputs.
+  `slice(0, 64)` over the same receiver is ~1000× cheaper. node 305ms, zipp 1086ms.
+
+Benchmark headers corrected per M0.4: `parse-large-js` now says it measures USERLAND
+source tokenization and not zipp's frontend; `polymorphic-objects` says it stops at the
+IC way count and cannot judge a shape IC; `map-set-heavy` says it is a no-regression
+sentinel, not a target.
+
+**Not started, with reasons.** `typeof`-local fusion (M2.1) — its promotion gate needs
+an exact-HEAD baseline plus 15–21 pairs, and the compiler has no AST visitor, so the
+pass is real work whose value cannot be confirmed in the same sitting; note the existing
+fusion is an AST-level match in `compile/exprs.rs::binary`, so the local form belongs
+there rather than in a bytecode def-use pass, and the safe rule is to fuse only when the
+`typeof` operand is a LOCAL register (storing the operand in the local's slot and
+rewriting each comparison to `TypeOfIs`), declining a bare global operand because
+`typeof undeclaredGlobal` must not throw. `regexp_string_iters` → `SlotTable` (M2.3) and
+`array_length_nonwritable` → `SlotSet` (M2.4) are unstarted; B66 already established the
+latter is the right fix for the probe its guard-reordering attempt failed to buy back.
 
 ### B66 — Systematic sweep for the B59/B63/B65 shape: NINE tier divergences, six fixed, three left as failing specs
 
@@ -4281,6 +4552,27 @@ current.
   - `Reflect.set(Object.preventExtensions(function f(){}), "nk", 1)` — `false`
     vs `true` (the `fn_props.extensible` quirk).
   None is a tier divergence, which is why the §2 gate never saw them.
+- **`eval`, `new Function`, and every MODULE body are never JIT-compiled.**
+  `dispatch.rs` gates the function JIT *and* the OSR tier on
+  `func_id < self.main_func_count`, and runtime-compiled functions — including
+  module bodies, which `prepare_eval_program` also parks in `eval_funcs` — sit
+  past that bound. So a module's hot loop always interprets. Found while fixing
+  `jit_set_prop_miss`'s `program.functions[..]` out-of-bounds (B67): the OOB is
+  unreachable *because* of this gate. Lifting the gate is a real performance item
+  and needs the `vm.func` route audited everywhere the JIT resolves a name.
+- **`StoreGlobalResolved` has no `global_real_own_route` arm.** The other four
+  global-store ops route through `[[Set]]` when the global object shadows the
+  slot with a real descriptor; this one (strict `x += 1` / `x++` after a
+  `CheckGlobalResolvable`) writes the slot. Both tiers agree, so it is a pure
+  conformance gap, not a divergence — but fixing it will CREATE a divergence
+  unless the JIT's `global_slot_directly_routable` check covers the same op,
+  which it already does. Reported by B67's recon and left alone.
+- **`Object.freeze(globalThis)` does not make slot-backed bindings non-writable.**
+  Freeze marks existing `ObjMap` keys non-writable, and a `var x` / `x = 1`
+  binding has no key, so `global_real_own_route` stays false and `x = 2` still
+  writes the slot. Both tiers agree. The B67 materialization fix covers
+  `defineProperty` on a single name; freeze would need the same treatment applied
+  to every live slot binding at once.
 - **The standing gate cannot see a JIT-only bug.** test262 runs under the
   default tier and under `ZIPP_NOJIT=1`, but the region JIT only compiles hot
   LOOPS and test262 asserts once, straight-line — so a helper like

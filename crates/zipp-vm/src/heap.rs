@@ -632,6 +632,29 @@ impl ObjMap {
         }
     }
 
+    /// [`ObjMap::set`] for a caller that already OWNS the key string: on the
+    /// first-insertion path the `String` moves into `keys` instead of being cloned
+    /// out of a `&str` and dropped.
+    ///
+    /// Same contract as `set` in every respect — data attributes for a new key,
+    /// attributes preserved on overwrite, `true` iff a key was appended (so the
+    /// caller still bumps the object's version, since an append can realloc
+    /// `vals`). A duplicate key overwrites the existing slot IN PLACE, keeping its
+    /// original insertion position, and the incoming `String` is dropped.
+    ///
+    /// `JSON.parse` is the motivating caller: it builds `Vec<(String, Value)>` and
+    /// then handed each key to `set` as a `&str`, so every first insertion
+    /// allocated a second copy of a string the parser had already allocated.
+    pub fn set_owned(&mut self, key: String, val: Value) -> bool {
+        if let Some(i) = self.pos(&key) {
+            self.vals[i] = val;
+            false
+        } else {
+            self.push_data(key, val);
+            true
+        }
+    }
+
     /// Define `key` with explicit attributes (`Object.defineProperty`, or a method
     /// with non-default enumerability). Overwrites any existing slot. Returns
     /// `true` if a new key was appended.

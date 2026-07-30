@@ -13,3 +13,8 @@ __pycache__/
 
 # Agent worktrees and session state
 .claude/
+
+# A/B comparison binaries. The raw schema-v2 JSON in bench/ IS retained (it carries
+# each side's sha256, so a run stays attributable), but the ~6MB executables it was
+# measured from are rebuildable from the commit the JSON names.
+bench/bin/

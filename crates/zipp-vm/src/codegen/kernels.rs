@@ -258,7 +258,7 @@ pub(crate) fn compile_map_kernel(proto: &FuncProto) -> Option<JitFn> {
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr })
+    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }
 
 /// Compile a fused native `reduce` kernel for callback `proto` (2-param
@@ -346,7 +346,7 @@ pub(crate) fn compile_reduce_kernel(proto: &FuncProto) -> Option<JitFn> {
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr })
+    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }
 
 /// Compile a fused native `filter` kernel for predicate `proto`. The predicate
@@ -465,7 +465,7 @@ pub(crate) fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr })
+    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }
 
 // ════════════════════════════════════════════════════════════════════════════

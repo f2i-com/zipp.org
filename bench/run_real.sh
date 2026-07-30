@@ -11,7 +11,30 @@ ZIPP=${ZIPP:-./target/release/zipp.exe}
 OUT=bench/results_real.txt
 ITERS=${ITERS:-5}
 ALLBENCHES="parse-large-js json-large markdown-render map-set-heavy typedarray-math regex-log-scan class-prototype-hot async-promise-chain polymorphic-objects sparse-array"
+# M0.3 diagnostic siblings. DELIBERATELY NOT in ALLBENCHES: the retained headline
+# (bench/head_clean_7c760c1.json, geomean 1.8626x) is a geomean over exactly the ten
+# rows above, and adding rows would silently redefine the number every past entry in
+# PERF_ROADMAP is quoted against. These exist to answer questions the ten cannot:
+#
+#   property-ic-shapes      1/2/4/8/9/16/1024 receivers sharing ONE shape. The
+#                           acceptance benchmark for the shape-keyed IC (M3) — the
+#                           original polymorphic-objects row stops at `i & 7`, i.e.
+#                           exactly the IC way count, so it cannot see the 8->9 cliff.
+#   polymorphic-objects-v2  the same row split into same-layout-many-instances,
+#                           8/9/16 layouts, dict churn, proto walk and enumeration.
+#   sparse-array-v2         gap-size and logical-length curves, with packed / holey /
+#                           in / for-in / read / write / slice / concat separated, and
+#                           a final phase that re-runs the hole reads with the
+#                           indexed-proto protector INVALIDATED.
+#
+# Run them explicitly:  BENCHES="property-ic-shapes sparse-array-v2" bash bench/run_real.sh
+# Correctness-check every file, historical and diagnostic:  CORRECT_ALL=1 …
+DIAGBENCHES="property-ic-shapes polymorphic-objects-v2 sparse-array-v2"
 BENCHES=${BENCHES:-$ALLBENCHES}
+# Which files the correctness pass compares against node. Defaults to the timed set
+# plus the diagnostics, since a diagnostic whose output drifted from node is
+# worthless and costs nothing to check.
+CORRECTBENCHES=${CORRECTBENCHES:-"$ALLBENCHES $DIAGBENCHES"}
 APPEND=${APPEND:-0}
 FINAL=${FINAL:-1}
 
@@ -33,7 +56,7 @@ if [ "$APPEND" = "0" ]; then
   : > "$OUT"
   echo "=== correctness (zipp stdout must equal node stdout) ===" >> "$OUT"
   ALLOK=1
-  for b in $ALLBENCHES; do
+  for b in $CORRECTBENCHES; do
     n=$(node bench/real/$b.js 2>/dev/null | tr -d '\200-\377')
     z=$("$ZIPP" js bench/real/$b.js 2>/dev/null | tr -d '\200-\377')
     if [ "$n" = "$z" ]; then echo "$b: OK" >> "$OUT"; else echo "$b: MISMATCH node=[$n] zipp=[$z]" >> "$OUT"; ALLOK=0; fi

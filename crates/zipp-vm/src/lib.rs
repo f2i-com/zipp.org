@@ -652,6 +652,110 @@ mod tests {
         assert_jit_matches("let s=0; for(let i=0;i<1000;i++){ s-=i; } console.log(s)", &["-499500"]);
     }
 
+    // ── B67: the tier facts whose guards live in more than one place ──
+    // `tests/jit_tier_parity.rs` runs these at the DEFAULT tier and asserts the
+    // right answer. These run each one JIT-on AND JIT-off and assert the two
+    // AGREE, which is the property that actually broke: every one of B66's nine
+    // divergences was a case where the interpreter was already right.
+
+    #[test]
+    fn jit_matches_deleted_global_throws() {
+        // Both spellings of the deletion. `delete implicitG` always returned the
+        // slot to the sentinel; `delete globalThis.implicitG` never cleared it at
+        // all, so this used to disagree with node in BOTH tiers.
+        assert_jit_matches(
+            "implicitA = 5; function ra() { return implicitA; } \
+             for (var i = 0; i < 3000; i++) ra(); \
+             delete implicitA; \
+             var a; try { a = 'v' + ra(); } catch (e) { a = 'throw'; } \
+             implicitB = 6; function rb() { return implicitB; } \
+             for (var j = 0; j < 3000; j++) rb(); \
+             delete globalThis.implicitB; \
+             var b; try { b = 'v' + rb(); } catch (e) { b = 'throw'; } \
+             console.log(a + ',' + b)",
+            &["throw,throw"],
+        );
+    }
+
+    #[test]
+    fn jit_matches_recreated_global_is_readable_again() {
+        // The entry check must DECLINE, not evict: re-creating the binding has to
+        // bring the compiled body back on its own.
+        assert_jit_matches(
+            "impR = 1; function r() { return impR; } \
+             var a = 0; for (var i = 0; i < 3000; i++) a = r(); \
+             delete impR; \
+             var m; try { m = 'v' + r(); } catch (e) { m = 'throw'; } \
+             impR = 7; \
+             var b = 0; for (var j = 0; j < 3000; j++) b = r(); \
+             console.log(a + ',' + m + ',' + b)",
+            &["1,throw,7"],
+        );
+    }
+
+    #[test]
+    fn jit_matches_real_own_global_descriptor() {
+        // A real own descriptor on the global object IS the binding: the getter
+        // runs on a read and the setter on a write, including when the descriptor
+        // appears after the loop has already been compiled.
+        assert_jit_matches(
+            "impG = 1; var seen = 0; \
+             function w(n) { var last; for (var i = 0; i < n; i++) { impG = i; last = impG; } return last; } \
+             w(3000); \
+             Object.defineProperty(globalThis, 'impG', { \
+               set: function (v) { seen++; }, get: function () { return 'G'; }, configurable: true }); \
+             console.log(w(3000) + ',' + seen)",
+            &["G,3000"],
+        );
+    }
+
+    #[test]
+    fn jit_matches_reprototyped_array_prototype() {
+        // The indexed-proto protector must see `setPrototypeOf`, not just an
+        // integer key being DEFINED on Array.prototype.
+        assert_jit_matches(
+            "var a = [1, 2]; \
+             function read(o, n) { var s; for (var i = 0; i < n; i++) s = o[5]; return s; } \
+             read(a, 3000); \
+             Object.setPrototypeOf(Array.prototype, { 5: 'M5' }); \
+             console.log(read(a, 3000) + ',' + (5 in a))",
+            &["M5,true"],
+        );
+    }
+
+    #[test]
+    fn jit_matches_self_recursion_after_rebind() {
+        // Tier A's direct `call` to its own entry has no callee guard, so the
+        // recursion has to be refused at entry once the name is rebound.
+        assert_jit_matches(
+            "function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); } \
+             var orig = fib; var w = 0; \
+             for (var i = 0; i < 60; i++) w = orig(18); \
+             fib = function (n) { return 0; }; \
+             console.log((w > 0 ? 'after:' + orig(18) : 'warmup-failed'))",
+            &["after:0"],
+        );
+    }
+
+    #[test]
+    fn jit_matches_global_define_materializes_the_binding() {
+        // `defineProperty` on a slot-only binding is a REDEFINE, not a create: a
+        // descriptor omitting `value` keeps the binding's value, and a
+        // `configurable: true` request on a non-configurable `var` is rejected.
+        assert_jit_matches(
+            "foo = 1; \
+             Object.defineProperty(globalThis, 'foo', { writable: false, configurable: true }); \
+             var before = foo; foo = 2; \
+             var d = Object.getOwnPropertyDescriptor(globalThis, 'foo'); \
+             var thrown = 'none'; \
+             var lateV = 0; \
+             try { Object.defineProperty(globalThis, 'lateV', { value: 9, configurable: true }); } \
+             catch (e) { thrown = e.constructor.name; } \
+             console.log(before + ',' + foo + ',' + d.value + ',' + d.enumerable + ',' + thrown)",
+            &["1,1,1,true,TypeError"],
+        );
+    }
+
     #[test]
     fn heap_obj_slot_stays_small() {
         // Every heap slot is one `HeapObj`, so the enum's size multiplies across
