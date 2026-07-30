@@ -756,6 +756,34 @@ mod tests {
         );
     }
 
+    // ── B73: GetProp inside an inlined leaf body ──
+    // The inline only exists once the enclosing loop is hot, so JIT-on vs JIT-off is
+    // the axis that matters; `tests/leaf_getprop_inline.rs` carries the full matrix.
+
+    #[test]
+    fn jit_matches_leaf_getprop_own_and_inherited() {
+        assert_jit_matches(
+            "function get(o) { return o.v; }              var own = { v: 1 }, inh = Object.create({ v: 2 }), absent = { w: 3 };              var a = 0, b = 0, c = 'x';              for (var i = 0; i < 4000; i++) { a = get(own); b = get(inh); c = get(absent); }              console.log(a + ',' + b + ',' + c)",
+            &["1,2,undefined"],
+        );
+    }
+
+    #[test]
+    fn jit_matches_leaf_getprop_defers_accessors_and_proxies() {
+        assert_jit_matches(
+            "var gc = 0, pc = 0;              var acc = {}; Object.defineProperty(acc, 'v', { get: function () { gc++; return 5; } });              var prox = new Proxy({ v: 6 }, { get: function (t, k) { pc++; return t[k] + 1; } });              function get(o) { return o.v; }              var a = 0, b = 0;              for (var i = 0; i < 4000; i++) { a = get(acc); b = get(prox); }              console.log(a + ',' + b + ',' + (gc === 4000) + ',' + (pc === 4000))",
+            &["5,7,true,true"],
+        );
+    }
+
+    #[test]
+    fn jit_matches_leaf_getprop_when_the_shape_changes_mid_loop() {
+        assert_jit_matches(
+            "function get(o) { return o.v; }              var o = { v: 'data' }, first = '', last = '';              for (var i = 0; i < 4000; i++) {                if (i === 2000) Object.defineProperty(o, 'v', { get: function () { return 'getter'; }, configurable: true });                var r = get(o); if (i === 0) first = r; last = r;              }              console.log(first + ',' + last)",
+            &["data,getter"],
+        );
+    }
+
     #[test]
     fn heap_obj_slot_stays_small() {
         // Every heap slot is one `HeapObj`, so the enum's size multiplies across

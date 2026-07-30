@@ -1323,6 +1323,113 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
 /// only costs the key scan it was avoiding.
 const JIT_SHAPE_SLOT_MAX: usize = 1 << 16;
 
+/// Win64 helper: a SITE-FREE named property read, for a `GetProp` inside an
+/// INLINED LEAF BODY.
+///
+/// The leaf inliner previously had no `GetProp` at all, so a plain
+/// `function f(o) { return o._v + 1; }` was `(not leaf-eligible)` and a hot loop
+/// calling it paid a full frame call per iteration — measured at **30.1ns against
+/// 7.0ns** for the identical body written as a method, which the METHOD inliner
+/// does inline. That is the single commonest call shape in the language taking the
+/// slowest path (B73).
+///
+/// Site-FREE on purpose, exactly like `jit_get_index` which the leaf emitter
+/// already uses: an inlined body has no inline-cache site of its own, and giving it
+/// one would mean growing `ic_table` past what `reserve_ic_sites` reserved for the
+/// region — the table's base is pinned in a callee-saved register for the whole
+/// native run, so it must not move. No IC also means no `(site, shape)` memo, which
+/// is fine: B72 measured that memo as a PESSIMISATION for maps below
+/// `PROP_INDEX_THRESHOLD`, and a leaf's receiver is usually a small object.
+///
+/// `packed = (callee_func_id << 32) | name_idx` — the CALLEE's id and its own
+/// string-constant index, since the body's ops carry the callee's numbering.
+///
+/// Returns the value bits, or `SELF_CALL_DEOPT` for anything the interpreter must
+/// do instead. Deopting re-runs the WHOLE call from the call ip, which is sound
+/// because `callee_leaf_ok` admits `GetProp` only before a committed effect.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_get_prop_leaf(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    packed: u64,
+) -> u64 {
+    let obj = Value::from_bits(obj_bits);
+    if !obj.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: exclusive view; the running region holds no conflicting borrow.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let func_id = (packed >> 32) as u32;
+    let name_idx = packed as u32;
+    let idx = obj.heap_index();
+    // `vm.func`, not `program.functions[..]` — the callee can be an eval function
+    // (the M1.3 lesson).
+    let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
+    // Same exclusions as the interpreter IC: a private name needs brand checks, and
+    // an exotic receiver has live semantics layered over its ObjMap.
+    if key.as_bytes().first() == Some(&b'#')
+        || !vm.deferred_ns_state.is_empty()
+        || !vm.ic_obj_ok(idx)
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // Own data property — the case this exists for.
+    match vm.heap.get(idx) {
+        HeapObj::Object(map) => {
+            if let Some(s) = map.pos(key) {
+                if map.attrs[s].accessor {
+                    return crate::codegen::SELF_CALL_DEOPT; // getter runs user code
+                }
+                return map.vals[s].bits();
+            }
+            // Not own. Walk a PROVABLY clean prototype chain so a legitimately
+            // inherited read (or a provably absent one) does not deopt on every
+            // iteration — a leaf that deopted per call would drive the enclosing
+            // region past `OSR_DEOPT_LIMIT` and get it evicted, which is the cliff
+            // shape B69 fixed elsewhere. Anything unclean defers instead.
+            if map.class.is_some() {
+                return crate::codegen::SELF_CALL_DEOPT; // class chain: methods/getters
+            }
+            let mut cur = idx;
+            let mut hops = 0u32;
+            loop {
+                let next = match vm.proto_of.get(&cur) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => return Value::UNDEFINED.bits(), // explicit null proto
+                    None => {
+                        if vm.obj_proto == 0 || cur == vm.obj_proto {
+                            return Value::UNDEFINED.bits(); // chain end, absent
+                        }
+                        vm.obj_proto
+                    }
+                };
+                hops += 1;
+                if hops > 64 || !vm.ic_obj_ok(next) {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                match vm.heap.get(next) {
+                    HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
+                        if let Some(i) = m2.pos(key) {
+                            if m2.attrs[i].accessor {
+                                return crate::codegen::SELF_CALL_DEOPT;
+                            }
+                            return m2.vals[i].bits();
+                        }
+                    }
+                    _ => return crate::codegen::SELF_CALL_DEOPT, // exotic link
+                }
+                cur = next;
+            }
+        }
+        // Array/Str/TypedArray/… named reads (`.length`, index-ish keys, exotics)
+        // all have their own semantics — the interpreter owns them.
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `SetProp`. Performs
 /// `obj.<key> = val`, then (for a plain Object) fills inline-cache slot `site` so
 /// later writes are call-free. Returns `0` (success — incl. a heap non-Object,

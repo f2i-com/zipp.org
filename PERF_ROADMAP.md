@@ -37,7 +37,8 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
-| **B73 leaf inliner lacks `GetProp`** | **OPEN — MOST ACTIONABLE ITEM** | a plain `f(o)` whose body reads a NAMED property off an argument is `(not leaf-eligible)` and pays a full frame call per iteration in a hot loop: **30.1ns against 7.0ns** for the identical body written as a method, which the method inliner DOES inline. `callee_leaf_ok`'s whitelist admits `GetIndex` and not `GetProp`. 28 declined sites in `parse-large-js`, 20 in `markdown-render`, 7 in `json-large`, 5 in `regex-log-scan` — unweighted. Broader than any single row |
+| **B74 leaf inliner admits `GetProp`** | **LANDED** | the plain-call shape goes **29.2ns → 9.7ns (−66.8%)**; `class-prototype-hot` −1.0% [−1.5,−0.1], `polymorphic-objects` −0.9% [−1.3,−0.6], `async-promise-chain` −0.6% [−1.2,−0.2], suite −0.18% [−0.43,+0.03]. Measured with `--ab-env` on ONE binary, so no layout confound. Site-free helper (the `GetIndex` precedent), so B73's IC-budgeting problem never arose. Off-switch `ZIPP_NO_LEAF_GETPROP=1` |
+| ~~B73 leaf inliner lacks `GetProp`~~ | **CLOSED BY B74** | a plain `f(o)` whose body reads a NAMED property off an argument is `(not leaf-eligible)` and pays a full frame call per iteration in a hot loop: **30.1ns against 7.0ns** for the identical body written as a method, which the method inliner DOES inline. `callee_leaf_ok`'s whitelist admits `GetIndex` and not `GetProp`. 28 declined sites in `parse-large-js`, 20 in `markdown-render`, 7 in `json-large`, 5 in `regex-log-scan` — unweighted. Broader than any single row |
 | class-prototype-hot decomposed (B73) | **ACCESSOR PHASE IS A 2.9x WIN** | 66ms against node's 191ms with `super.v` chains and overridden setters — larger than the plan recorded. Do not "optimise" it. The row's loss is entirely method + plain calls |
 | B72 SetProp shape memo | **REFUTED, REVERTED** | +15.9% on the write micro. `PROP_INDEX_THRESHOLD` is 12, so a narrow map's `pos(key)` is a linear scan over a few short strings — cheaper than hashing a `(u32,u32)` and probing. Break-even is above the threshold; retry only gated on `keys.len() >= 12`, and re-measure the GET side the same way |
 | B72 string_method receiver clone | **REFUTED** | flagged as an O(len) copy every string method pays; `s.slice(0,5)` is FLAT from 64B to 32KB receivers and zipp beats node at every size. Needs a scaling curve before anyone "fixes" it |
@@ -1646,6 +1647,71 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B74 — `GetProp` admitted to the leaf inliner: the plain-call shape goes 29.2ns → 9.7ns, three rows move
+
+B73's finding, implemented. A plain `function f(o) { return o.k; }` called from a hot
+loop was `(not leaf-eligible)` because `callee_leaf_ok`'s whitelist admitted `GetIndex`
+and not `GetProp`, so it paid a full frame call per iteration while the identical body
+written as a METHOD was inlined.
+
+**Mechanism, decisive:** the plain-call phase of `class-prototype-hot` goes
+**935ms → 310ms, 29.2ns → 9.7ns per call, −66.8%**. The method version of the same body
+is 7.0ns, so the remaining 2.7ns is the helper call the method inliner avoids by baking a
+shape-guarded slot — a later refinement, not a blocker.
+
+**Suite, measured with `--ab-env` on ONE binary** so there is no code-layout confound at
+all (the thing §2 warns about and B70 had to reason around).
+`bench/b73_abenv_2026-07-30.json`, 21 pairs, `ZIPP_NO_LEAF_GETPROP=1` vs unset:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| `class-prototype-hot` | **−1.0%** | [−1.5, −0.1] |
+| `polymorphic-objects` | **−0.9%** | [−1.3, −0.6] |
+| `async-promise-chain` | **−0.6%** | [−1.2, −0.2] |
+| `parse-large-js` | −0.5% | [−1.2, +0.3] |
+| `map-set-heavy` | +1.0% | [−0.5, +1.2] |
+| suite geomean | **−0.18%** | [−0.43%, +0.03%] |
+
+Three rows improve with intervals excluding zero and none regresses with one, which is
+the corroboration the suite interval (just touching zero) does not give on its own. It is
+below §14's 2–3% row bar and is not claimed to meet it; it ships as a broad improvement
+to the commonest call shape in the language, behind an off-switch.
+
+#### Design: site-free, which is why the budgeting problem vanished
+
+B73 named IC-site budgeting as the hard part — `reserve_ic_sites` counts only the
+REGION's own GetProp/SetProp, and `ic_table`'s base is pinned in a callee-saved register
+for the whole native run, so it must not grow. That problem does not arise, because the
+leaf emitter's existing `GetIndex` arm shows the way: it calls a **site-free helper** and
+bails on the deopt sentinel. `jit_get_prop_leaf` is the same shape — three register args,
+no IC, no site.
+
+No inline cache also means no `(site, shape)` memo, which is the right call independently:
+B72 measured that memo as a PESSIMISATION below `PROP_INDEX_THRESHOLD`, and a leaf's
+receiver is usually a small object.
+
+The helper answers an own non-accessor data property, walks a provably clean prototype
+chain, and returns `undefined` for a provably absent one. That last case is deliberate
+rather than a convenience: a leaf that deopted on every call would drive the enclosing
+region past `OSR_DEOPT_LIMIT` and get it evicted for the life of the process — the cliff
+shape B69 fixed elsewhere. Everything else defers: accessors (own and inherited), class
+chains, Proxies, exotic receivers, private names, module-namespace state.
+
+`packed` carries the CALLEE's func id, because a body's `GetProp` indexes the callee's own
+string constants; the caller's id would resolve a different string. It goes through
+`vm.func`, not `program.functions[..]` — the M1.3 lesson.
+
+#### Correctness
+
+`tests/leaf_getprop_inline.rs` (12 cases) pins every deferral: own and inherited getters
+still run exactly N times, a getter installed MID-loop starts running, a Proxy trap fires
+per access, a deleted own property falls through to the prototype, a polymorphic receiver
+reads each shape, `.length` on Array/String/Function stays right, `null` still throws, and
+a class with private fields reads its public one. **All twelve expectations were executed
+in node and diff byte-identical**, and identical again with the flag off and under
+`ZIPP_NOJIT=1`. Three `assert_jit_matches` cases in `lib.rs` pin JIT-on == JIT-off, which
+is the axis that matters since the inline only exists once the loop is hot.
 
 ### B73 — a plain function call in a hot loop costs 4.3x a METHOD call, and one missing opcode explains it. THE most actionable un-started item
 

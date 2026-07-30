@@ -444,6 +444,8 @@ impl<'p> Vm<'p> {
                     upvals,
                     cell_get: crate::vm::helpers_misc::jit_cell_get as usize,
                     cell_set: crate::vm::helpers_misc::jit_cell_set as usize,
+                    prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as usize,
+                    callee_fid: fid,
                 },
             );
         }

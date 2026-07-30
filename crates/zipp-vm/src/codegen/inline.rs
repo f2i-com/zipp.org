@@ -455,6 +455,31 @@ pub(crate) fn emit_inline_leaf_call(
                 );
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }
+            // ── o.k ── a NAMED property read, through the site-free
+            // `jit_get_prop_leaf` (plan.prop_get). Exactly the `GetIndex` shape
+            // above: three register args, deopt sentinel → region bail. `packed`
+            // carries the CALLEE's func id, because `name` indexes the callee's own
+            // string constants and the caller's id would resolve a different string.
+            //
+            // Read-only and allocation-free on the hit path (it returns a Value
+            // already in the map), so no pinned-pointer refetch is needed — same
+            // reasoning as `GetIndex`.
+            Instr::GetProp { dst: d, obj, name } => {
+                let bail = ops.new_dynamic_label();
+                let packed: u64 = ((plan.callee_fid as u64) << 32) | name as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi                              // vm
+                    ; mov rdx, [rbx + dreg(rg(obj))]            // receiver bits
+                    ; mov r8, QWORD packed as i64               // (callee_fid<<32)|name
+                    ; mov rax, QWORD plan.prop_get as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+                emit_region_bail(ops, call_ip, bail, epilogue);
+            }
             // ── str.charCodeAt(i) ── `callee_leaf_ok` admitted only this 1-arg
             // method. Uses `cc_helper` (jit_char_code_at) — NEVER the fallback
             // `helper` (call_ic). Read-only, no alloc → no refetch.

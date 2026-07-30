@@ -267,6 +267,13 @@ pub struct LeafInlinePlan {
     /// documented as load-bearing.
     pub cell_get: usize,
     pub cell_set: usize,
+    /// `jit_get_prop_leaf`, and the CALLEE's func id so the emitter can bake
+    /// `(callee_fid << 32) | name_idx` for a body `GetProp` — the body's operands
+    /// carry the callee's own numbering, so the caller's id would resolve the wrong
+    /// string constant. Carried here rather than as more positional parameters, for
+    /// the reason above.
+    pub prop_get: usize,
+    pub callee_fid: u32,
     /// Nested (wrapper) inline: body index of the spliced-in `Call` → the guard
     /// that must hold for the spliced body to be the right one. See
     /// `callee_leaf_ok_one_call`.

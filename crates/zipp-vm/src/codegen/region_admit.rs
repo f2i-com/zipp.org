@@ -339,6 +339,14 @@ pub fn callee_leaf_ok_one_call(callee: &FuncProto) -> Option<(Vec<Instr>, usize)
     Some((body, call_at?))
 }
 
+/// `ZIPP_NO_LEAF_GETPROP=1` drops `GetProp` back out of the leaf whitelist, so the
+/// change can be A/B'd with `tools/bench.py --ab-env` against ONE binary — which
+/// removes the fat-LTO code-layout confound that §2 warns about and that B70 had to
+/// reason around.
+fn leaf_getprop_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_LEAF_GETPROP").is_none()
+}
+
 fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>, Option<usize>)> {
     if callee.is_generator || callee.is_async {
         return None;
@@ -429,6 +437,22 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             // to be bail-free — `_ => return None` below still rejects
             // `UpvalSet`/`CellSet`/`StoreUpvalDyn`.
             | Instr::UpvalGet { .. } => {
+                if seen_effect {
+                    return None;
+                }
+            }
+            // A NAMED property read, through the site-free `jit_get_prop_leaf`. Its
+            // absence from this list is why a plain `f(o)` whose body reads `o.k`
+            // was `(not leaf-eligible)`, so a hot loop calling it paid a full frame
+            // call per iteration — 30.1ns against 7.0ns for the identical body
+            // written as a METHOD, which the method inliner does inline (B73).
+            //
+            // Its own arm rather than joining the group above, because it carries an
+            // env guard: `ZIPP_NO_LEAF_GETPROP=1` drops it back out so the change
+            // can be measured with `--ab-env` on ONE binary. Deopt-capable (the
+            // helper defers accessors, class chains and exotic receivers), so it
+            // obeys the same effect-ordering rule.
+            Instr::GetProp { .. } if leaf_getprop_enabled() => {
                 if seen_effect {
                     return None;
                 }
