@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| B77 pristine matchAll dispatch | **REVERTED — layout collateral, REPLICATED** | won its row twice (−2.1%, −2.8%, CIs excluding zero) and regressed `async-promise-chain` twice (+5.4%, +3.1%, CIs excluding zero) — a row with no `matchAll` in it. The fat-LTO layout hazard, confirmed by replication for the first time this session. §14's unrelated-row rule applies. The guards themselves are sound and node-verified; a retry should change the code PLACEMENT, not the semantics |
 | B76 nested splice admits ARGS | **LANDED, MECHANISM ONLY** | `wrap(n){ return inner(n,7)+1 }` was rejected (`inner-call-has-args`); now spliced: **−55.1%** on the 3M-call micro, faster than node. Suite uptake ZERO — every previously-blocked site moved to `inner-not-leaf` (depth ≥ 3), which is B75's real design task. Also fixed a latent `unreachable!` panic: the emitter had no `LoadUndefined` arm for a void inner return |
 | **B74 leaf inliner admits `GetProp`** | **LANDED** | the plain-call shape goes **29.2ns → 9.7ns (−66.8%)**; `class-prototype-hot` −1.0% [−1.5,−0.1], `polymorphic-objects` −0.9% [−1.3,−0.6], `async-promise-chain` −0.6% [−1.2,−0.2], suite −0.18% [−0.43,+0.03]. Measured with `--ab-env` on ONE binary, so no layout confound. Site-free helper (the `GetIndex` precedent), so B73's IC-budgeting problem never arose. Off-switch `ZIPP_NO_LEAF_GETPROP=1` |
 | ~~B73 leaf inliner lacks `GetProp`~~ | **CLOSED BY B74** | a plain `f(o)` whose body reads a NAMED property off an argument is `(not leaf-eligible)` and pays a full frame call per iteration in a hot loop: **30.1ns against 7.0ns** for the identical body written as a method, which the method inliner DOES inline. `callee_leaf_ok`'s whitelist admits `GetIndex` and not `GetProp`. 28 declined sites in `parse-large-js`, 20 in `markdown-render`, 7 in `json-large`, 5 in `regex-log-scan` — unweighted. Broader than any single row |
@@ -1648,6 +1649,35 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B77 — REVERTED: the pristine matchAll dispatch shortcut wins its row and loses a bigger one to LAYOUT
+
+A pristine-guarded direct dispatch for `String.prototype.matchAll` (skip IsRegExp's
+`@@match` Get, `Get(@@matchAll)` and the `call_value` when both symbols and the flag
+accessors are provably intrinsic — the B69/B70 guard pattern, override semantics
+node-verified including a non-global regex with a lying `global` getter).
+
+Two independent 21-pair A/Bs (`bench/b77_ab_2026-07-30.json`, `b77_ab2_…`):
+
+| | run 1 | run 2 |
+|---|---:|---:|
+| `regex-log-scan` (target) | −2.1% [−3.7, −0.8] | −2.8% [−3.7, −1.3] |
+| `async-promise-chain` (unrelated) | **+5.4% [+3.1, +6.4]** | **+3.1% [+0.6, +4.2]** |
+| suite geomean | +0.04% | −0.16% |
+
+Both effects REPLICATED. The target win is real — and so is a regression on a row that
+contains no `matchAll` at all, which is the fat-LTO code-layout hazard §2 documents,
+twice confirmed with intervals excluding zero. §14 is unambiguous ("no unrelated row
+above +2% outside its CI") — **reverted**, raw JSONs retained.
+
+Two notes for whoever retries. First, the mechanism itself is good: the guards passed
+every override test byte-identical to node, and the row moved as predicted twice; the
+failure is where the linker put ~40 lines of hot code, not what they do. A retry should
+measure with the code placed differently (a separate `#[inline(never)]` function, or
+landed alongside other changes) rather than re-derive the semantics. Second, this is the
+first time this session the "unrelated CI excludes zero" signal REPLICATED — B70's
+`markdown-render` −2.0% and B72's `map-set-heavy` +3.0% did not — so the replication rule
+is doing its job in both directions: it saved the B70 bundle and it kills this one.
 
 ### B76 — the nested splice accepts arguments: −55% on the wrapper-with-args shape, zero suite uptake, and one latent panic fixed
 
