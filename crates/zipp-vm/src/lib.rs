@@ -55,17 +55,26 @@ mod vm;
 
 pub use value::Value;
 
-/// Install the host's clocks — required on wasm32, ignored everywhere else.
+/// Install the host's clocks — honored on every target, required on wasm32.
 ///
 /// wasm32 has no clock of its own: `std`'s `Instant::now`/`SystemTime::now`
 /// there are stubs that PANIC, and `Vm::new` reads one, so on that target an
 /// embedder must call this before constructing a VM or the engine traps before
-/// running a line of JS. On every other target `std::time` is already the best
-/// available source and this is a no-op, so a host may call it unconditionally.
+/// running a line of JS.
 ///
-/// `epoch_ms` is milliseconds since the Unix epoch (`Date.now`); `mono_ms` is a
-/// monotonically non-decreasing millisecond count with an arbitrary zero
-/// (`performance.now`). See `vm::clock` for what the engine does without them.
+/// Everywhere else the engine reads `std::time` until this is called; from
+/// then on EVERY time read — `Date.now()`, `new Date()`, `Temporal.Now`,
+/// `performance.now()`, including their intrinsified opcode forms, which never
+/// consult the JS bindings — goes through the installed functions. That is how
+/// a host running untrusted JS makes time deterministic. `setTimeout`
+/// deadlines and `Atomics.wait` timeouts keep the real monotonic clock; see
+/// `vm::clock` for why.
+///
+/// `epoch_ms` is milliseconds since the Unix epoch (`Date.now`); `mono_ms` is
+/// a monotonically non-decreasing millisecond count with an arbitrary zero
+/// (`performance.now`). Call before constructing the first VM
+/// (`performance.now()` measures from a reading taken in `Vm::new`); safe to
+/// call again, the last call wins.
 pub use vm::clock::install as install_clock;
 
 /// Result of running a program: console output plus an optional uncaught-throw

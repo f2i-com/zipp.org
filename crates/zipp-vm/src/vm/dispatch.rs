@@ -1052,7 +1052,7 @@ impl<'p> Vm<'p> {
                             crate::vm::clock::now_epoch_ms()
                         } else {
                             // performance.now(): fractional ms since VM start.
-                            self.start.elapsed().as_secs_f64() * 1000.0
+                            crate::vm::clock::now_mono_ms() - self.start_mono_ms
                         };
                         self.set(base, dst, Value::num(ms));
                         ip += 1;

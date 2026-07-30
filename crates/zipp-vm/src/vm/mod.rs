@@ -361,9 +361,11 @@ pub struct Vm<'p> {
     /// Taken out of the `Vm` for the duration of the call so the closure may
     /// re-enter the VM (a host that evaluates JS re-borrows `&mut self`).
     pub(crate) host: Option<Box<dyn FnMut(&str, &[String]) -> Result<String, String>>>,
-    /// VM start instant — the zero point for `performance.now()` (which reports
-    /// fractional milliseconds elapsed since the program began).
-    start: clock::Instant,
+    /// Monotonic-clock reading at VM start — the zero point for
+    /// `performance.now()` (which reports fractional milliseconds elapsed
+    /// since the program began). A host-installed clock's reading when one
+    /// is installed (see `clock::now_mono_ms`).
+    start_mono_ms: f64,
     /// The JS value currently being thrown, set when a `Throw` (or an internal
     /// error) begins unwinding and cleared when a `catch` handler receives it.
     /// Carrying the real `Value` (not just a message) lets `catch (e)` bind the
@@ -1017,8 +1019,9 @@ pub struct Vm<'p> {
     /// `$262.agent.setTimeout` macrotasks: (due, callback). Callback Values
     /// are GC ROOTS.
     timer_queue: Vec<(clock::Instant, Value)>,
-    /// VM construction time — the `$262.agent.monotonicNow()` epoch.
-    vm_start: clock::Instant,
+    /// Monotonic-clock reading at VM construction — the
+    /// `$262.agent.monotonicNow()` epoch.
+    vm_start_mono_ms: f64,
     /// Cross-agent state for the `$262.agent` worker subsystem (report FIFO +
     /// one handle per started agent). `None` until the first `agent.start` —
     /// a run that never starts an agent pays nothing; each worker Vm holds a

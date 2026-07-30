@@ -74,8 +74,16 @@
 //! moves a row onto a different polynomial constraint. Add at the end.
 
 use crate::bytecode::Instr;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 use crate::codegen::meter::NATIVE_CHUNK;
 use crate::value::Value;
+
+/// Without a JIT tier there is no native code to lend budget to; the constant
+/// is only referenced by the metering loan path, which no build without
+/// `codegen` can reach. Keep the value in step with `codegen::meter` anyway, so
+/// the two never silently disagree about the unit.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+const NATIVE_CHUNK: i64 = 1 << 20;
 
 /// The trace opcode set — one per AIR selector column. A wire contract with the
 /// prover; see the module docs.
@@ -186,6 +194,13 @@ pub(crate) struct Recorder {
     /// native tier charges a whole basic block at a time and can overshoot zero
     /// by up to one block; `i64::MAX` means unlimited.
     pub(crate) remaining: i64,
+    /// Instructions actually executed since the recorder was attached: the
+    /// interpreter's per-instruction charge, the native tier's net lending
+    /// (lent at `meter_lend`, unspent refunded at `meter_return`), and off-loop
+    /// work charged through `charge_steps`. The consumed half of `remaining` —
+    /// the number a host billing for execution (gas metering) needs, rather
+    /// than the cap it enforces.
+    pub(crate) used: u64,
     /// Set by another thread to stop a running script.
     pub(crate) abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Approximate heap ceiling in bytes; `usize::MAX` means unlimited.
@@ -213,6 +228,7 @@ impl Recorder {
     pub(crate) fn new() -> Self {
         Self {
             remaining: i64::MAX,
+            used: 0,
             abort: None,
             heap_limit: usize::MAX,
             steps: Vec::new(),
@@ -347,11 +363,13 @@ impl super::Vm<'_> {
             let Some(rec) = self.instr_rec.as_mut() else { return 0 };
             let lend = rec.remaining.min(NATIVE_CHUNK).max(0);
             rec.remaining -= lend;
+            rec.used = rec.used.wrapping_add(lend as u64);
             self.jit_steps = lend;
             return lend;
         }
         let lend = rec.remaining.min(NATIVE_CHUNK).max(0);
         rec.remaining -= lend;
+        rec.used = rec.used.wrapping_add(lend as u64);
         self.jit_steps = lend;
         lend
     }
@@ -367,6 +385,11 @@ impl super::Vm<'_> {
             if rec.remaining != i64::MAX {
                 rec.remaining += unspent;
             }
+            // The lend counted against `used` up front; hand back what native
+            // code did not spend even when the budget is unlimited (where
+            // `remaining` is not refunded), so `used` stays the count of work
+            // that actually happened.
+            rec.used = rec.used.saturating_sub(unspent as u64);
         }
     }
 
@@ -382,6 +405,7 @@ impl super::Vm<'_> {
             if rec.remaining != i64::MAX {
                 rec.remaining -= n;
             }
+            rec.used = rec.used.wrapping_add(n.max(0) as u64);
         }
     }
 
@@ -423,6 +447,10 @@ impl super::Vm<'_> {
             }
             rec.remaining -= 1;
         }
+        // Counted unconditionally — `used` is the host's consumption figure,
+        // meaningful with or without a budget. The budget-exhausted return
+        // above precedes this, so a stopped script reports exactly its cap.
+        rec.used = rec.used.wrapping_add(1);
         // Heap ceiling rides the abort poll's schedule. Measuring it needs
         // `&self.heap`, which cannot be borrowed while `rec` is, so the limit
         // comes out here and the comparison happens once the borrow ends.
@@ -815,7 +843,7 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
             name as u64,
             Some(dst),
         ),
-        SetProp { obj, name, val } | InitDataProp { obj, name, val } => (
+        SetProp { obj, name, val, .. } | InitDataProp { obj, name, val } => (
             op::PROP,
             Claim::Flat,
             Some(obj),
