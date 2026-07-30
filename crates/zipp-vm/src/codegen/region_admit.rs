@@ -539,9 +539,17 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             | Instr::StoreGlobalResolved { .. } => {
                 seen_effect = true;
             }
-            // Anything else (calls, heap props, branches, closures, throw, …)
-            // declines — the inline emitter doesn't implement it.
-            _ => return None,
+            // Anything else (calls, heap writes, closures, throw, …) declines —
+            // the inline emitter doesn't implement it. Under `ZIPP_JITDECLINE=1`,
+            // name the op: B74 found that a decline COUNT without the disqualifying
+            // opcode makes the next whitelist candidate a guess, and guessing is
+            // exactly what the flag exists to prevent.
+            _ => {
+                if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                    eprintln!("[leaf-reject] {instr:?}");
+                }
+                return None;
+            }
         }
     }
     // A `LoadConst` must be a NUMERIC constant (the inline emitter materialises

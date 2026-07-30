@@ -1648,6 +1648,32 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B75 — every remaining leaf decline is `Call`: the next step is multi-level inlining, not another whitelist line
+
+After B74, the `(not leaf-eligible)` message now names the disqualifying op under
+`ZIPP_JITDECLINE=1` (`[leaf-reject]` in `region_admit.rs` — a decline COUNT without the
+opcode made the next whitelist candidate a guess). The survey answer is unanimous:
+
+| bench | leaf rejects | op |
+|---|---:|---|
+| `parse-large-js` | 39 | **`Call` — all of them** |
+| `markdown-render` | 30 | `Call` |
+| `regex-log-scan` | 25 | `Call` |
+| `json-large` | 11 | `Call` |
+
+Not one site rejects on a missing simple op any more — B74 consumed that category
+(several `parse-large-js` sites with bodies up to 38 ops now report INLINE-ELIGIBLE,
+including nested splices). What remains is functions whose bodies CALL other functions,
+beyond the existing single-call wrapper splice (`callee_leaf_ok_one_call`, which is
+one call, branch-free, pre-effect).
+
+So the next capability on this path is **multi-level leaf inlining** — either
+generalising the splice to N call sites with per-site guards, or making the plan builder
+recursive with a depth/size budget. That is a design task with real deopt-ordering
+implications (every spliced call must still precede any committed effect, or carry its
+own resume semantics), not an afternoon whitelist edit. Recorded here as the measured
+successor; nothing beyond the logging shipped in this entry.
+
 ### B74 — `GetProp` admitted to the leaf inliner: the plain-call shape goes 29.2ns → 9.7ns, three rows move
 
 B73's finding, implemented. A plain `function f(o) { return o.k; }` called from a hot
