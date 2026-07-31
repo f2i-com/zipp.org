@@ -674,6 +674,7 @@ impl JitFn {
     /// `regs` must point to at least the function's `reg_count` valid `Value`
     /// slots; `vm` must be a valid `*mut Vm`; the buffer outlives the call.
     pub unsafe fn run(&self, regs: *mut u64, vm: *mut core::ffi::c_void) -> (u64, u32) {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
         let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
             mem::transmute(self.entry);
         let mut bail: u32 = NO_BAIL;

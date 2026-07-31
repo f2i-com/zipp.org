@@ -83,12 +83,15 @@ impl<'p> Vm<'p> {
         // Call the cached native entry directly (same win64 ABI as JitFn::run).
         // SAFETY: `entry` is this function's compiled win64 code (stable across
         // HashMap rehashes); the window has `reg_count` valid slots; vm is valid.
-        let (bits, bail) = unsafe {
-            let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
-                core::mem::transmute(entry);
-            let mut bail: u32 = crate::codegen::NO_BAIL;
-            let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
-            (r, bail)
+        let (bits, bail) = {
+            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            unsafe {
+                let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+                    core::mem::transmute(entry);
+                let mut bail: u32 = crate::codegen::NO_BAIL;
+                let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+                (r, bail)
+            }
         };
 
         let result_bits = if bail == crate::codegen::NO_BAIL {

@@ -19,6 +19,10 @@ impl<'p> Vm<'p> {
     /// propagates out (with `pending_throw` left set so an enclosing `run_loop`
     /// â€” e.g. the caller of a builtin callback â€” can still catch it).
     pub(crate) fn run_loop(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
+        // Tagged explicitly (not merely "not Jit"): a region call helper
+        // re-enters the interpreter, and without this its nested time would be
+        // charged to the enclosing compiled region.
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Interp);
         // Native re-entry guard: a NESTED run_loop (builtin callback, generator
         // resume, direct eval, JIT bail) is a real Rust frame, and runaway
         // recursion through such re-entries would exhaust the OS stack before
@@ -7154,12 +7158,18 @@ impl<'p> Vm<'p> {
         let outer_steps = self.jit_steps;
         #[cfg(feature = "instrument")]
         let _ = self.meter_lend();
-        let resume = unsafe {
-            let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
-                std::mem::transmute(entry);
-            let mut resume: u32 = crate::codegen::NO_BAIL;
-            let _ = f(regs_ptr, &mut resume as *mut u32, vm_ptr);
-            resume
+        let resume = {
+            // Tagged around the native call ONLY, so a region helper that
+            // re-enters the interpreter (`run_loop` re-tags itself `Interp`)
+            // does not have its nested time charged to compiled code.
+            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            unsafe {
+                let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+                    std::mem::transmute(entry);
+                let mut resume: u32 = crate::codegen::NO_BAIL;
+                let _ = f(regs_ptr, &mut resume as *mut u32, vm_ptr);
+                resume
+            }
         };
         // Running out of lent steps is a normal, periodic exit, not a signal
         // about this region's quality — the interpreter tops the budget up and

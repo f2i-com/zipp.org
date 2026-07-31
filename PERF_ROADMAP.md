@@ -37,7 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
-| **B85 `ZIPP_PROF=1` sampling profiler — §6's item since B3** | **LANDED; it reprioritises B6 vs M4 on its first run** | Phase-tagged sampler (200µs), not a stack sampler — fat LTO would have inlined away most frames a `StackWalk64` wanted, and suspending the engine thread to symbolize is a deadlock hazard. First run: **`interp+jit` is 99.2% of `parse-large-js`, 96.6% of `polymorphic-objects`, 88.7% of `markdown-render`, 78.4% of `json-large`, 50.1% of `regex-log-scan`** — that tag is time RUNNING JAVASCRIPT, not in an engine service. GC reads 0.8-12.6%, independently corroborating B84's `ZIPP_GCSTATS` numbers. So the dominant substrate item is **M4 (memory-backed register file + per-op NaN-boxing)**, not B6 — `parse-large-js` is 2.49x with 99.2% of its time executing JS, which no allocator or collector fix can reach. Built because B84 had to revert a real −35% win for want of attribution |
+| **B85 `ZIPP_PROF=1` sampling profiler — §6's item since B3** | **LANDED; it reprioritises B6 vs M4 on its first run** | Phase-tagged sampler (200µs), not a stack sampler — fat LTO would have inlined away most frames a `StackWalk64` wanted, and suspending the engine thread to symbolize is a deadlock hazard. Splitting `interp` from `jit-native` is what made it actionable — the two have OPPOSITE fixes. **Compiled-code-bound: `typedarray-math` 99.7%, `parse-large-js` 91.3%, `markdown-render` 68.6% in native code** (only M4 reaches these). **Interpreter-bound: `polymorphic-objects` 60.5%, `json-large` 42.2% INTERPRETED**, with only 6 and 11 decline messages — so their loops are not rejected, they are never offered, which is a tier-entry lead rather than a codegen-quality one. GC reads 0.8-12.6%, independently corroborating B84's `ZIPP_GCSTATS` numbers. So the dominant substrate item is **M4 (memory-backed register file + per-op NaN-boxing)**, not B6 — `parse-large-js` is 2.49x with 99.2% of its time executing JS, which no allocator or collector fix can reach. Built because B84 had to revert a real −35% win for want of attribution |
 | **B84 GC is 2-12% of the suite — B81 CORRECTED; `ZIPP_GCSTATS=1` added** | **INSTRUMENT LANDED; ObjMap pool measured −35% on construction and REVERTED anyway** | Per-phase collector timing says GC is **12% of `regex-log-scan`, 8% of `json-large`, 5% of `markdown-render`, 2% of `polymorphic-objects`** — their live sets (1.4k-78k) never reach where B81's micro curve bites, so the cost is CONSTRUCTION, not collection. B81's table stands; its conclusion did not. The pool's first null result was also wrong — a 4096 cap against a 65,536 GC threshold serves ~6% of a cycle. Re-capped it is **`{a:1}` 71.0 → 46.5ns, `{a,b,c,d}` 138.5 → 88.5ns (−35%)** — but `polymorphic-objects` −5.7% came with `json-large` +1.6% (which RETAINS its tree, so the pool stays empty), a suite CI including zero, and a targeted fix that made BOTH rows worse. Two runs disagreeing by five points on the same change ⇒ revert per §14 | **B81**, B6 |
 | **B81 the COLLECTOR is 10-50x node — B6.0's precondition met, its guess REFUTED** | **MEASURED; ObjMap recycle pool built and REVERTED as a null result; B6 is now the best-evidenced item in this file** | `{}` 41.0ns vs 3.5ns, `{a:1}` 81.5 vs 2.5, `{a,b,c,d}` **148 vs 3.0 (49x)**, `[]` 23.5 vs 2.5, `s.slice(0,5)` 38.5 vs 4.0 — and the no-allocation control is 1.0ns vs node's 1.5ns, i.e. **zipp is FASTER when it allocates nothing**. Reached independently from `regex-log-scan`'s phase split (matchAll 496 vs 71ms; `exec` = 227ns scan + 169ns result object + ~60ns/capture against node's 40ns total, while the non-capturing literal `test` is **0.53x — zipp wins**) and from the object-literal micro. A 4-property literal has gone 513ns → 148ns since B6.0 was written and is still 49x. An `ObjMap` recycle pool (reset + stash the swept box, capacity retained) measured **ZERO** and was reverted — because `[]` costs 24.5ns while mallocing nothing at all, so the malloc is only ~7ns of an object. The cost that remains is the COLLECTOR: holding a larger live set makes the IDENTICAL allocation loop cost more — 74.5 → 101.5 → 122.5ns at live sets of ~0 / 400k / 1.2M, i.e. **+48ns per allocation from nothing but a bigger heap to mark**, where node goes 2.0 → 7.5 → 9.5. B6.0 asked whether the cost was construction or collection and guessed construction; it is both, and only the collection term scales. `typedarray-math` is the one row this does NOT explain — its DataView loop allocates nothing and is already a fully inlined native load, so that one is M4 | **B6.0**, B1 |
 | **B80 sparse enumeration hoists its overlay probe** | **LANDED — `sparse-array` −16.2%, suite −1.41%, THE LARGEST SUITE WIN IN THIS FILE** | `object_enum_own`'s array arm walked `0..dense_len` doing an `array_index_override` HASH PROBE per slot. Strided writes grow the dense vector far past the populated count — measured `dense_len=1,040,001` holding **105** elements for an array with 5,000 keys — so `Object.keys` paid **1.04M hash probes to find 105 elements**: 25ms against node's 0ms, and independent of key count, which is the shape that gave it away. Asked once over the overlay's keys instead; a `defineProperty` on a dense index keeps the per-slot probe. `for…in` 50e6/5k **26ms → 2ms**; the bench phase 42ms → 18ms. Row **−16.2% [−16.9, −14.5]**, suite **−1.41% [−1.90, −1.05]**, both CIs excluding zero, no row regressing outside its CI. Found by phase-timing the SMALLEST bad row, not the largest. Off-switch `ZIPP_NO_ENUM_HOIST=1`; both paths byte-identical on the whole case set |
@@ -1725,7 +1725,44 @@ sampling, and it cannot be lied to by inlining, because the boundaries are
 placed by hand rather than recovered from frames. Off, `enter()` is a cached
 `AtomicU8` load and a branch, and no thread is spawned.
 
-**First run, and it reprioritises the roadmap:**
+**Splitting `interp` from `jit-native` is what made it actionable**, and it was
+worth the second pass: the two have OPPOSITE fixes. Time in `jit-native` means
+compiled code is slow (M4). Time in `interp` means code is not being COMPILED —
+a completely different, and usually much cheaper, problem. `run_loop` is tagged
+`Interp` explicitly rather than by omission, so a region call helper that
+re-enters the interpreter has its nested time charged correctly instead of to
+the enclosing region.
+
+| bench | jit-native | interp | gc | other |
+|---|---:|---:|---:|---|
+| `typedarray-math` | **99.7%** | 0.3% | — | — |
+| `parse-large-js` | **91.3%** | 7.7% | 1.0% | — |
+| `markdown-render` | 68.6% | 20.3% | 6.8% | string-ops 4.1% |
+| `regex-log-scan` | 37.0% | 13.5% | 13.1% | regex 28.0%, string 8.5% |
+| `json-large` | 36.4% | **42.2%** | 8.8% | json-parse 12.6% |
+| `polymorphic-objects` | 36.0% | **60.5%** | 3.4% | — |
+
+**The suite is two different diseases, not one.**
+
+* **Compiled-code-bound** — `typedarray-math` (99.7%), `parse-large-js` (91.3%),
+  `markdown-render` (68.6%). Nothing but M4 reaches these. `typedarray-math`
+  spends essentially ALL of its time in native code that is still 3.7x node,
+  which is the cleanest statement of the M4 case in this file.
+* **Interpreter-bound** — `polymorphic-objects` (**60.5%** interpreted),
+  `json-large` (**42.2%**). These rows are slow because their hot code never
+  becomes native, and `ZIPP_JITDECLINE=1` shows only **6 and 11** decline
+  messages respectively — so the loops are not being REJECTED, they are never
+  being offered. That is a lead, and a cheap one: it is a tier-entry question,
+  not a codegen-quality question. It did not exist before this instrument.
+
+**NEXT SESSION STARTS HERE**: find why `polymorphic-objects`' dict-churn loop and
+`json-large`'s tree build never reach a region. Both allocate object literals in
+the loop body, and `NewObject`/`NewArray` appear NOWHERE in `codegen/` — worth
+checking against B4, which built "admit allocation into JIT regions", measured
+it SLOWER (`{}` 35→62ns), and may have been answering a narrower question than
+this one.
+
+**First run, before the split (kept for the record):**
 
 | bench | interp+jit | regex-exec | gc | string-ops | json-parse |
 |---|---:|---:|---:|---:|---:|

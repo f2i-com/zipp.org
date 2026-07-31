@@ -50,12 +50,17 @@ pub(crate) enum Phase {
     Alloc = 7,
     JitCompile = 8,
     Sort = 9,
+    /// Executing NATIVE compiled code (a Tier A/C function body or an OSR
+    /// region). Distinct from `Interp` because the two have opposite fixes:
+    /// time in `Interp` means not enough code is COMPILED, time in `Jit` means
+    /// compiled code is SLOW (M4's register file and per-op boxing).
+    Jit = 10,
 }
 
-const N_PHASES: usize = 10;
+const N_PHASES: usize = 11;
 
 const NAMES: [&str; N_PHASES] = [
-    "interp+jit",
+    "interp",
     "gc",
     "regex-exec",
     "json-parse",
@@ -65,12 +70,14 @@ const NAMES: [&str; N_PHASES] = [
     "alloc",
     "jit-compile",
     "sort",
+    "jit-native",
 ];
 
 static CURRENT: AtomicU8 = AtomicU8::new(Phase::Interp as u8);
 static COUNTS: [AtomicU64; N_PHASES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
