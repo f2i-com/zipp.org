@@ -49,8 +49,9 @@ pub(crate) fn plan_region(
     end: u32,
     ta_plan: &TaPinPlan,
     admit_bitwise: bool,
+    admit_split: bool,
 ) -> Option<RegionPlan> {
-    plan_region_cold(proto, start, end, ta_plan, admit_bitwise, &FxHashSet::default())
+    plan_region_cold(proto, start, end, ta_plan, admit_bitwise, admit_split, &FxHashSet::default())
 }
 
 /// `cold`: ips the caller will emit as SIDE EXITS (B9) rather than as native
@@ -64,6 +65,12 @@ pub(crate) fn plan_region_cold(
     end: u32,
     ta_plan: &TaPinPlan,
     admit_bitwise: bool,
+    // B94 live-range splitting. Only the REGALLOC (double) path implements the
+    // three emitter halves — the receiver `LoadGlobal` as a real store, the
+    // write-through at numeric defs, and the flush skip. `region_int` shares this
+    // planner but not those, and panicked looking up a home the plan deliberately
+    // withheld ("no entry found for key"), so the int path passes `false`.
+    admit_split: bool,
     cold: &FxHashSet<usize>,
 ) -> Option<RegionPlan> {
     let code = &proto.code;
@@ -112,6 +119,10 @@ pub(crate) fn plan_region_cold(
                 .map_or(false, |&j| ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND)
     };
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
+    // B94: at most one recycled receiver register per region (see `plan::RegionPlan`).
+    let mut split_recv: Option<u16> = None;
+    let mut split_recv_lg: FxHashSet<usize> = FxHashSet::default();
+    let mut recv_glob: Option<u32> = None;
     {
         // Candidate receiver regs: the `obj` of every pinned index op, and the
         // `obj` of every pinned-STRING charCodeAt/length access.
@@ -201,12 +212,78 @@ pub(crate) fn plan_region_cold(
                 let clean_param = def_n.get(&r).is_none() && !used_elsewhere.contains(&r);
                 if clean_global || clean_param {
                     ta_recv_regs.insert(r);
+                } else if admit_split && split_recv.is_none() && def_lg.contains(&r) && {
+                    // Every pinned access with THIS receiver must read its
+                    // identity from a global slot, and all from the SAME one.
+                    // A `TaPinSrc::Reg` pin reads `[rbx + dreg(r)]`, which the
+                    // numeric half of a recycled register also owns; that case
+                    // is not separable and declines below.
+                    let mut g0: Option<u32> = None;
+                    let mut ok = true;
+                    for (off, i) in code[s..=e].iter().enumerate() {
+                        if cold.contains(&(s + off)) || !pinned_elem(s + off) {
+                            continue;
+                        }
+                        if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *i {
+                            if obj != r {
+                                continue;
+                            }
+                            match ta_plan.access.get(&(s + off)).map(|&j| ta_plan.pins[j as usize].src) {
+                                Some(TaPinSrc::Global(g)) if g0.is_none() || g0 == Some(g) => g0 = Some(g),
+                                _ => ok = false,
+                            }
+                        }
+                    }
+                    if let Some(g) = g0.filter(|_| ok) {
+                        recv_glob = Some(g);
+                    }
+                    ok && g0.is_some()
+                } {
+                    // ── B94 live-range splitting ── the bytecode compiler RECYCLED
+                    // this register: pinned receiver over one range, arithmetic temp
+                    // over another (in `p_ta2` r17 is the array at ip37, the running
+                    // sum at ip45 and the loop counter at ip49). The ranges are
+                    // disjoint, so give it a numeric home and keep its memory slot
+                    // authoritative for the receiver half: the receiver `LoadGlobal`
+                    // is emitted as a real store, every numeric def writes through,
+                    // and `flush_exit` skips it. What must still be PROVED is that no
+                    // use reads the home before a numeric def fills it — the home is
+                    // deliberately not entry-loaded, so it starts as garbage.
+                    let g = recv_glob.unwrap();
+                    let recv_lg_ips: FxHashSet<usize> = (s..=e)
+                        .filter(|&ip| matches!(code[ip], Instr::LoadGlobal { dst, idx } if dst == r && idx == g))
+                        .collect();
+                    let recv_use_at = |ip: usize| -> Option<u16> {
+                        match code[ip] {
+                            Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. }
+                                if pinned_elem(ip) =>
+                            {
+                                Some(obj)
+                            }
+                            Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
+                                if pinned_str(ip) || pinned_arr_len(ip) =>
+                            {
+                                Some(obj)
+                            }
+                            Instr::ToPropKey { obj, .. } => Some(obj),
+                            _ => None,
+                        }
+                    };
+                    if !recv_lg_ips.is_empty()
+                        && crate::codegen::plan::split_home_provably_safe(
+                            code, s, e, r, cold, &recv_lg_ips, &recv_use_at,
+                        )
+                    {
+                        split_recv = Some(r);
+                        split_recv_lg = recv_lg_ips;
+                    } else {
+                        decline!("split receiver: home not provably live at a use");
+                    }
                 } else {
                     // A receiver register reused for other (numeric) values can't be
                     // cleanly excluded under the non-SSA register model → memory path.
-                    // (Generalizing this needs SSA-like per-use disambiguation; it
-                    // currently blocks e.g. the xorshift-fill `iv[i] = st|0` loop whose
-                    // bytecode reuses the `iv` register for bitwise temps.)
+                    // (B94 handles the single-split case above; a SECOND split in the
+                    // same region would need more than the emitter's two flush blocks.)
                     decline!("pinned receiver reg not cleanly excludable");
                 }
             }
@@ -324,7 +401,10 @@ pub(crate) fn plan_region_cold(
             }
         }
         // A TA-receiver reg is NOT typed/homed (sourced via the pin); skip its def.
-        if let Some(d) = def.filter(|d| !ta_recv_regs.contains(d)) {
+        // A B94 SPLIT receiver keeps its numeric home, but its `LoadGlobal` def is
+        // the RECEIVER half — typing that as Num would home an object.
+        let is_split_recv_load = split_recv_lg.contains(&(s + off));
+        if let Some(d) = def.filter(|d| !ta_recv_regs.contains(d) && !is_split_recv_load) {
             // Move's dst type follows its src; default Num is corrected here.
             let t = if let Instr::Move { src, .. } = *instr {
                 *ty.get(&src).unwrap_or(&VTy::Num)
@@ -338,7 +418,10 @@ pub(crate) fn plan_region_cold(
         // Globals: order + first-touch direction. A TA-receiver's LoadGlobal is
         // excluded (no numeric home; the element emitter reads it via the pin).
         match *instr {
-            Instr::LoadGlobal { dst, .. } if ta_recv_regs.contains(&dst) => {}
+            // Neither a pinned receiver's global nor a B94 split receiver's gets an
+            // xmm home: the value is an object, and the entry guard would reject it.
+            Instr::LoadGlobal { dst, .. }
+                if ta_recv_regs.contains(&dst) || split_recv_lg.contains(&(s + off)) => {}
             Instr::LoadGlobal { idx, .. } => {
                 glob_first_read.entry(idx).or_insert(true);
                 if !glob_order.contains(&idx) {
@@ -963,7 +1046,12 @@ pub(crate) fn plan_region_cold(
                 // value into it is unobservable, and they may SHARE an xmm with
                 // another register, which makes a per-register entry load
                 // meaningless (the loads would overwrite each other).
-                if !hoisted.contains(&r) && !shareable(r) {
+                // A B94 split receiver is a THIRD exception, and a load-bearing
+                // one: its memory slot holds the receiver OBJECT, so an entry load
+                // would hand `emit_box_to_home` a non-number and `entry_bail` on
+                // every single OSR entry. Its home is filled by its own numeric
+                // def, and `split_home_invalid` covers every exit before that.
+                if !hoisted.contains(&r) && !shareable(r) && Some(r) != split_recv {
                     live_in_regs.push((r, x));
                 }
             }
@@ -1012,6 +1100,8 @@ pub(crate) fn plan_region_cold(
         gpr_const,
         jump_targets,
         ta_recv_regs,
+        split_recv,
+        split_recv_lg,
     })
 }
 

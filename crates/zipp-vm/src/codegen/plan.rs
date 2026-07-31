@@ -87,6 +87,32 @@ pub(crate) struct RegionPlan {
     /// pin's source for its identity guard — so their defining LoadGlobal body op is
     /// a no-op. Empty unless the f64-TA element fast path admitted this region.
     pub(crate) ta_recv_regs: FxHashSet<u16>,
+    /// B94 live-range splitting. A VM register the bytecode compiler RECYCLED:
+    /// it is a pinned-access receiver (an object) over one range and a numeric
+    /// value over a disjoint one. `ta_recv_regs` cannot hold it — the numeric
+    /// range needs a real home — and the one-def test rejected it, which is why
+    /// the simplest `for (i…) { v = a[i]; s = s + v; }` declined and regalloc's
+    /// pinned-element path was near-dead on real code (B93).
+    ///
+    /// It gets a NUMERIC home, and its memory slot `[rbx + dreg(r)]` is kept
+    /// AUTHORITATIVE at all times: its `LoadGlobal` is emitted as a real store
+    /// (not elided as a `ta_recv_regs` one is), and every numeric def writes the
+    /// home THROUGH to memory. `flush_exit` therefore skips it entirely.
+    ///
+    /// Write-through costs two instructions per numeric def and buys the
+    /// property that makes this reviewable: **every exit is correct without
+    /// knowing which path reached it.** The alternative — flush variants picked
+    /// by a per-ip validity dataflow — needs the exit stubs keyed by SOURCE
+    /// rather than target, and cannot recover the source for a jump that leaves
+    /// the region.
+    ///
+    /// At most ONE per region; a second declines.
+    pub(crate) split_recv: Option<u16>,
+    /// Region ips of `split_recv`'s RECEIVER `LoadGlobal` (the one reading the
+    /// pinned array's global slot). These emit a real memory store and are the
+    /// only defs of the register that do NOT fill its numeric home — the same
+    /// register is also loaded from other globals, and those are numeric defs.
+    pub(crate) split_recv_lg: FxHashSet<usize>,
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops
@@ -174,6 +200,124 @@ pub(crate) fn region_jump_targets(code: &[Instr], s: usize, e: usize) -> FxHashS
         }
     }
     t
+}
+
+/// B94. Prove that a candidate SPLIT receiver `r` never has a numeric operand
+/// read its xmm home before a numeric def has filled it. Returns false when that
+/// cannot be proved, and the caller then declines exactly as before.
+///
+/// The check is needed because `r` is deliberately NOT entry-loaded
+/// (`live_in_regs` skips it: its memory slot holds the receiver OBJECT, so an
+/// entry load would hand `emit_box_to_home` a non-number and bail on every OSR
+/// entry). Its home therefore starts as GARBAGE, and a numeric use reaching it
+/// first would silently compute a wrong answer -- the failure mode that must not
+/// survive a green gate, so this is a whole-region veto, not a per-site
+/// fallback.
+///
+/// The transfer function is per-instruction:
+///   * `LoadGlobal r`  → home INVALID after (the object went to memory instead)
+///   * any other def of `r` → home VALID after (a number was written to it)
+///   * anything else   → unchanged
+///
+/// The meet is AND (a join is valid only if EVERY predecessor is valid), and
+/// region entry is INVALID for the reason above.
+///
+/// Receiver uses need no condition: memory is authoritative for `r` throughout
+/// (its `LoadGlobal` stores, every numeric def writes through, `flush_exit`
+/// skips it), and every pinned access re-checks receiver identity anyway.
+pub(crate) fn split_home_provably_safe(
+    code: &[Instr],
+    s: usize,
+    e: usize,
+    r: u16,
+    cold: &FxHashSet<usize>,
+    recv_lg_ips: &FxHashSet<usize>,
+    recv_use_at: &dyn Fn(usize) -> Option<u16>,
+) -> bool {
+    let n = e - s + 1;
+    // Successors of each region ip, as region-relative indices.
+    let succ = |i: usize| -> Vec<usize> {
+        let ip = s + i;
+        let mut v = Vec::new();
+        let (target, falls) = match code[ip] {
+            Instr::Jump { target } => (Some(target as usize), false),
+            Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => (Some(target as usize), true),
+            _ => (None, true),
+        };
+        if let Some(t) = target {
+            if t >= s && t <= e {
+                v.push(t - s);
+            }
+        }
+        if falls && ip < e {
+            v.push(i + 1);
+        }
+        v
+    };
+    // valid_in[i]: does the home hold r's value on entry to region ip s+i?
+    let mut valid_in = vec![false; n];
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for t in succ(i) {
+            preds[t].push(i);
+        }
+    }
+    // Transfer: what a block leaves behind, given its input.
+    let out_of = |i: usize, vin: bool| -> bool {
+        if cold.contains(&(s + i)) {
+            return vin;
+        }
+        // The RECEIVER LoadGlobal puts the object in memory and leaves the home
+        // holding the previous iteration's number, which is no longer this
+        // register's value: the home is invalid from here until a numeric def.
+        // (Keying this on "any LoadGlobal of r" was wrong -- the same recycled
+        // register is also loaded from OTHER globals, and those ARE numeric defs.)
+        if recv_lg_ips.contains(&(s + i)) {
+            return false;
+        }
+        match writes_reg(&code[s + i]) {
+            Some(d) if d == r => true,
+            _ => vin,
+        }
+    };
+    // Fixed point. Entry (i == 0) is pinned INVALID; it has no home yet.
+    for _ in 0..(n + 2) {
+        let mut changed = false;
+        for i in 0..n {
+            let nv = if i == 0 || preds[i].is_empty() {
+                false
+            } else {
+                preds[i].iter().all(|&p| out_of(p, valid_in[p]))
+            };
+            if nv != valid_in[i] {
+                valid_in[i] = nv;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Veto if ANY use of r reads a home that is not provably live there. Every
+    // use except the pinned-receiver one (which reads memory or the pin's global,
+    // never the home) goes through the home, so the check covers `StoreGlobal`
+    // and `Move` sources as well as arithmetic operands.
+    for i in 0..n {
+        let ip = s + i;
+        if cold.contains(&ip) {
+            continue;
+        }
+        let recv = recv_use_at(ip);
+        for u in instr_uses(&code[ip]) {
+            if u == r && Some(u) != recv && !valid_in[i] {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Detect regs that can share a GLOBAL's home: every def of `r` is either

@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B94 live-range splitting for a recycled receiver** | **MECHANISM ONLY — 3.2x on the shape, ZERO suite regions** | Gives a VM register the bytecode compiler recycled (pinned array at ip37, sum at ip45, counter at ip49) a numeric xmm home while its memory slot stays the receiver's, via write-through at every numeric def + a flush skip — chosen over per-ip flush variants because it makes every exit correct without knowing the path. Delivers the number B93 lacked: an `a[i&1023]` loop goes **98ms -> 31ms (node 16ms), 6.5x -> 1.94x, 99.5% jit-mem -> 100% jit-fast** — so promoting a real array loop is worth **3.2x**. But the trigger needs a GLOBAL receiver and every benchmark loop is inside a function (`TaPinSrc::Reg`), where one slot cannot hold both the array and the number: **0 splits in all ten rows**, decline histogram unchanged. Method note: the first differential passed in 4 modes while the feature NEVER FIRED (IIFE locals emit no LoadGlobal) — a green differential proves nothing until ZIPP_JITLOG shows the mechanism ran. Also fixed a panic from sharing the planner with region_int |
 | **B93 `jit-native` was TWO tiers wearing one name** | **INSTRUMENT ADDED; the B90/B92 reading of four rows INVERTED** | Splitting the profiler's `jit-native` bucket by tier shows six rows are **57-100% in the MEMORY tier**: class-prototype-hot **99.9%**, typedarray-math 87.8%, map-set-heavy 84.5%, parse-large-js 78.3%, polymorphic-objects 67.5%, sparse-array 57.0%. class-prototype-hot was cited as the row where tier entry is SOLVED. Counting the ops responsible: **2-5% of a region's ops force the other 95-98% onto the slow tier** (polymorphic-objects 3 of 135, class-prototype-hot 3 of 71, sparse-array 2 of 63) and the blocking set is Call/CallMethod/GetIndex/SetIndex. Root cause under several declines is **bytecode temp-register recycling**, not the ops: the simplest possible Float64Array loop declines `pinned receiver reg not cleanly excludable` because r17 is the pinned receiver at ip37 and an arithmetic temp at ip45 — so regalloc's pinned-element `movsd` path is near-dead on real code. Validated on two known-answer workloads + ZIPP_JITLOG. Ceiling is INFERRED from B92's 4.20->1.05ns, not proven on these rows |
 | **B92 one bitwise op demoted a whole region out of register homes** | **LANDED as a MECHANISM (suite flat, mechanism 4x)** | Corrects B81/B83/B90: there are **three** region tiers, and the middle one (`compile_region_regalloc`) ALREADY has the f64 xmm/gpr homes that M4 describes — it just declined `Instr::Bitwise` outright. One `&`/`\|`/`>>>`/`\|0` in a loop demoted the whole region to memory: an identical 20M-iteration loop went **0.75 -> 4.20ns/iter** from adding `i & 1023` (node 0.75 either way). Emitting ToInt32 inline via 64-bit `cvttsd2si` (exact below 2^63; the INT64_MIN indefinite bails) fixes it: **4.20 -> 1.05ns/iter**, verified over **6,144 cases** against node in 4 modes. Suite **-0.39% [-0.78, +0.25]** — flat, because the Bitwise declines went to zero and every one of those 13 regions hit its NEXT blocker. **Tier promotion is a ladder, not a switch**; the next rungs are counted: read-only live-in (5), unpinned GetIndex/SetIndex (7). `ZIPP_NO_DOUBLE_BITWISE=1` |
 | **B91 INT-tier promotion is closed by B9** | **NO CODE CHANGE; hazard documented at the switch** | Four rows are >=85% native, so promoting regions to the INT tier (xmm homes, at parity with V8) is the cheap route to M4. The declines are everywhere — `typedarray-math` 7 regions, `sparse-array` 8, `polymorphic-objects` 7 — under one blanket reason that names nothing, and `compile_region_int_maybe_cold` ALREADY implements the fix behind a `cold_exit` flag the only caller hardcodes to `false`. **That flag is dead on purpose: it is B9, which passed a fully green gate (96,029 test262 executions, both tiers, GC stress) and still returned `s = 0` for `3050`.** The comment now carries the warning at the point of temptation, including that the soundness argument beneath it is the one B9 shipped with and is wrong. Stopped one edit short of reintroducing it — by a kept negative result |
@@ -1709,6 +1710,90 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B94 — live-range splitting: the tier gap on an array loop is 3.2×, and the mechanism reaches ZERO suite regions
+
+B93 ended with a gap it was explicit about: six rows are 57–100% in the memory
+tier, but nothing had measured what promotion is *worth* on those shapes,
+because every attempt to build a comparable array-read loop on the register tier
+declined. This closes that gap, and the honest headline is two numbers pointing
+opposite ways.
+
+**The mechanism.** The bytecode compiler recycles temp registers, so one VM
+register plays several roles in a loop. In the simplest Float64Array loop
+writable, `r17` is the pinned array at ip37, the running sum at ip45 and the
+loop counter at ip49:
+
+```
+37: LoadGlobal dst=17 idx=0      ; r17 = a  (the pinned receiver)
+39: GetIndex   dst=16 obj=17 key=18
+45: Add        dst=17 a=18 b=19  ; r17 = the sum
+49: LoadGlobal dst=17 idx=1      ; r17 = i
+51: StoreGlobal idx=1 src=17
+```
+
+`def_n[17] == 4`, so the receiver failed the one-def "cleanly excludable" test
+and the whole region went to memory. Splitting the ranges gives `r17` a numeric
+xmm home while its memory slot stays the receiver's storage: its receiver
+`LoadGlobal` emits a real store, every numeric def writes THROUGH to memory, and
+`flush_exit` skips it.
+
+Write-through (two instructions per def) was chosen over the alternative — flush
+variants selected by a per-ip validity dataflow — because it makes **every exit
+correct without knowing which path reached it.** The dataflow version needs the
+exit stubs keyed by SOURCE rather than target, and cannot recover the source for
+a jump leaving the region. What remains to be proved is only that no use reads
+the home before a numeric def fills it (the home is deliberately not
+entry-loaded — its slot holds the receiver OBJECT, so an entry load would bail
+on every OSR entry), and that is a forward fixed-point meeting to INVALID, run
+as a whole-region veto.
+
+**Result on the shape — the number B93 was missing:**
+
+| `a[i & 1023]`, 20M iterations | before | after | node |
+|---|---:|---:|---:|
+| median of 9 | 98ms | **31ms** | 16ms |
+| vs node | 6.5× | **1.94×** | — |
+| tier | 99.5% `jit-mem` | **100% `jit-fast`** | — |
+
+**So promoting a real array-read loop from the memory tier to the register tier
+is worth 3.2×.** That is the first direct measurement of the tier gap on an
+array shape rather than B92's bitwise micro, and it is what justifies the whole
+promotion programme.
+
+**And the mechanism fires on ZERO benchmark regions.** Not "the suite is flat" —
+the trigger never engages. `ZIPP_JITLOG` counts splits: 1 in the micro, 2 in the
+differential, **0 in each of the ten rows**, and the decline histogram is
+byte-identical to B93's. The cause is that the split requires the receiver to
+come from a GLOBAL slot (`TaPinSrc::Global`); real hot loops live inside
+functions, where the receiver is a local and the pin is `TaPinSrc::Reg(r)`. For
+those, the pin's identity guard re-reads `[rbx + dreg(r)]` — the same slot the
+numeric half must own — so one storage location genuinely cannot hold both the
+array and the number. That case is NOT solved here.
+
+**A method note that nearly cost a false pass.** The first differential suite —
+10 cases attacking exactly the deopt paths this change touches (out-of-bounds,
+fractional and NaN indices, receiver swapped mid-loop, array grown mid-loop,
+element turned non-numeric, exception unwinding out of the region, Int32Array
+with bitwise, GC stress) — passed in all four modes while the feature **never
+fired**, because the cases were wrapped in IIFEs and IIFE locals produce no
+`LoadGlobal`. Rewritten at top level it fires twice and still passes all four
+modes. A green differential proves nothing until the mechanism is shown to have
+run; `ZIPP_JITLOG` is the check.
+
+**Also fixed here:** admitting the split on the shared planner panicked
+`region_int` (`no entry found for key` — it looks up a home the plan
+deliberately withheld). `plan_region` now takes an explicit `admit_split`, true
+only for the regalloc path.
+
+**Disposition.** Lands as a mechanism with no suite claim, because it has none to
+make. Its value is the 3.2× measurement and the analysis that names the real
+blocker: the double tier accepts only kind-8 (Float64Array) elements
+(`pin_kind = if admit_bitwise { 5 } else { 8 }`), while the INT tier already
+admits dense ordinary Arrays via `ARR_INT_PIN_KIND` with a per-access tag guard.
+Twelve declining regions across four rows are waiting on exactly that, including
+`polymorphic-objects`' single 135-op region whose ONLY blockers are three
+`GetIndex`. That is B95.
 
 ### B93 — `jit-native` was two tiers wearing one name: six rows are 57–100% in the SLOW one, blocked by 2–5% of their ops
 

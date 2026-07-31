@@ -261,7 +261,7 @@ pub(crate) fn compile_region_int_maybe_cold(
     // The i64 homes carry sign-extended integers, so Bitwise (int32-lane) ops run
     // inline here with no per-op reload/rebox — admit them (admit_bitwise=true), and
     // plan_region's pinned-element handling targets kind-5 (Int32) elements.
-    let plan = match plan_region_cold(proto, start, end, ta_plan, true, &cold) {
+    let plan = match plan_region_cold(proto, start, end, ta_plan, true, false, &cold) {
         Some(p) => p,
         None => {
             if std::env::var_os("ZIPP_JITLOG").is_some() {

@@ -24,7 +24,12 @@ pub(crate) fn compile_region_regalloc(
     }
     // The regalloc path uses boxed-double semantics and cannot host Bitwise
     // (int32-lane) ops — they decline to the memory path here.
-    let plan = plan_region(proto, start, end, ta_plan, false)?;
+    let plan = plan_region(proto, start, end, ta_plan, false, true)?;
+    if let Some(sr) = plan.split_recv {
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!("[jit] DOUBLE region [{start},{end}] B94 split receiver r{sr}");
+        }
+    }
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let (s, e) = (start as usize, end as usize);
 
@@ -190,6 +195,17 @@ pub(crate) fn compile_region_regalloc(
             // element-access emitter reads the receiver via the pin's source.
             Instr::LoadGlobal { dst, .. } if plan.ta_recv_regs.contains(&dst) => {
                 flag_cmp = prev_flag; // nothing emitted; flags still live
+            }
+            // ── B94 split receiver ── this LoadGlobal is the RECEIVER half of a
+            // recycled register. Its xmm home belongs to the register's numeric
+            // half, so the object goes to the memory slot, which every pinned
+            // access reads via `TaPinSrc::Reg` and which stays authoritative for
+            // this register throughout the region.
+            Instr::LoadGlobal { dst, idx } if plan.split_recv_lg.contains(&ip) => {
+                dynasm!(ops
+                    ; mov rax, [r12 + (idx as i32) * 8]
+                    ; mov [rbx + dreg(dst)], rax
+                );
             }
             Instr::LoadGlobal { dst, idx } => {
                 let d = xh(&plan, dst);
@@ -468,6 +484,19 @@ pub(crate) fn compile_region_regalloc(
             }
             _ => return None,
         }
+        // ── B94 write-through ── a numeric def of the split receiver must reach
+        // MEMORY as well as its home, because `flush_exit` deliberately skips
+        // this register and memory is what the interpreter reads on any exit.
+        // Two instructions, once per def; the LoadGlobal half already stored.
+        if let Some(sr) = plan.split_recv {
+            if !plan.split_recv_lg.contains(&ip) && writes_reg(&proto.code[ip]) == Some(sr) {
+                let h = xh(&plan, sr);
+                dynasm!(ops
+                    ; movq rax, Rx(h)
+                    ; mov [rbx + dreg(sr)], rax
+                );
+            }
+        }
     }
 
     // ── exit stubs ── set the resume ip, then flush+restore+ret.
@@ -484,6 +513,12 @@ pub(crate) fn compile_region_regalloc(
     // and return. [rsi] already holds the resume ip.
     dynasm!(ops ; => flush_exit);
     for &(r, x) in &plan.num_regs {
+        // The B94 split receiver is written through at each def, so memory is
+        // already current; flushing its home here would overwrite the receiver
+        // object at any exit taken inside the receiver range.
+        if Some(r) == plan.split_recv {
+            continue;
+        }
         dynasm!(ops ; movq rax, Rx(x) ; mov [rbx + dreg(r)], rax);
     }
     for &(r, g) in &plan.bool_regs {
