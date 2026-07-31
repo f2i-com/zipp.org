@@ -51,6 +51,13 @@ fn main() -> ExitCode {
         );
         eprintln!("[gc] avg slots/collection {slots}  avg live {live}  total swept {swept}");
     }
+    if std::env::var_os("ZIPP_ASYNCSTATS").is_some() {
+        let (reparks, reused, grew, values) = zipp_vm::async_stats();
+        let pct = if reparks == 0 { 0.0 } else { reused as f64 * 100.0 / reparks as f64 };
+        eprintln!(
+            "[async] {reparks} window re-parks  {reused} reused ({pct:.1}%)  {grew} grew  {values} values copied"
+        );
+    }
     if bstats {
         let rows = zipp_vm::builtin_stats();
         let total: u64 = rows.iter().map(|(_, _, c)| *c).sum();

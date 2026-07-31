@@ -55,6 +55,15 @@ pub fn gc_stats() -> (u64, f64, f64, f64, f64, u64, u64, u64) {
     vm::gc_stats()
 }
 
+/// `ZIPP_ASYNCSTATS=1` activation-window re-park counters:
+/// `(reparks, reused, grew, values_copied)`. A re-park is one suspension of an
+/// async function, async generator or generator; `reused` is the ones that fit
+/// in the buffer the resume detached, which is what WP-1B bought. Zeroed unless
+/// the variable was set.
+pub fn async_stats() -> (u64, u64, u64, u64) {
+    vm::async_stats()
+}
+
 /// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,
 /// most-called first. Empty unless the variable was set. See
 /// `vm::builtins::bstats` for why this exists rather than a reading of

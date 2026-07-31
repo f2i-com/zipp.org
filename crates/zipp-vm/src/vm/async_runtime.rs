@@ -18,7 +18,111 @@ enum GenResumeMode {
     Return(Value),
 }
 
+/// `ZIPP_ASYNCSTATS=1` -- how many activation re-parks reused the buffer the
+/// resume detached, and how many had to grow it. Exists because "the allocation
+/// is gone" is not a performance result on its own and this file's standing rule
+/// is that a mechanism must be shown to have fired.
+///
+/// Off, this costs one relaxed atomic load per suspension (against ~400ns of
+/// await round-trip), so it is left compiled in rather than behind a feature.
+mod asyncstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static REPARKS: AtomicU64 = AtomicU64::new(0);
+    static REUSED: AtomicU64 = AtomicU64::new(0);
+    static GREW: AtomicU64 = AtomicU64::new(0);
+    static VALUES: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_ASYNCSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    /// `had` is the recycled buffer's capacity BEFORE the copy, `want` the window
+    /// length being parked. `had >= want` is the reuse we are buying.
+    #[inline]
+    pub(super) fn repark(had: usize, want: usize) {
+        if !enabled() {
+            return;
+        }
+        REPARKS.fetch_add(1, Ordering::Relaxed);
+        if had >= want {
+            REUSED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            GREW.fetch_add(1, Ordering::Relaxed);
+        }
+        VALUES.fetch_add(want as u64, Ordering::Relaxed);
+    }
+
+    static REUSE_ON: AtomicU8 = AtomicU8::new(2);
+
+    /// `ZIPP_NO_BUF_REUSE=1` restores `Vec::split_off` at every suspension --
+    /// the rollback switch, and the two sides of the one-binary A/B (fat LTO
+    /// makes a two-binary comparison a layout confound; see B77).
+    #[inline]
+    pub(super) fn reuse_enabled() -> bool {
+        match REUSE_ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_NO_BUF_REUSE").is_none() as u8;
+                REUSE_ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    /// `(reparks, reused, grew, values_copied)`
+    pub fn dump() -> (u64, u64, u64, u64) {
+        (
+            REPARKS.load(Ordering::Relaxed),
+            REUSED.load(Ordering::Relaxed),
+            GREW.load(Ordering::Relaxed),
+            VALUES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub use asyncstats::dump as async_stats;
+
 impl<'p> Vm<'p> {
+    /// Park the live register window `[new_base..]` back onto a suspended
+    /// activation, REUSING `buf` -- the buffer this resume detached from that
+    /// same activation with `mem::take`.
+    ///
+    /// The obvious spelling is `self.regs.split_off(new_base)`, and that is what
+    /// every suspension point used to do. `split_off` allocates a fresh Vec sized
+    /// to the tail and memcpys into it; the detached buffer then went out of scope
+    /// and was freed. Since the two are the same size in steady state -- an
+    /// activation's window length is fixed by its `reg_count` -- the pair was a
+    /// malloc and a free per await for no reason. `clear` + `extend_from_slice`
+    /// keeps the capacity and does the identical memcpy.
+    ///
+    /// The length is taken from the live file rather than from `buf`, because a
+    /// `finally` that runs between two suspension points can leave the window at
+    /// a different height than the one that was restored.
+    #[inline]
+    fn repark_window(&mut self, mut buf: Vec<Value>, new_base: usize) -> Vec<Value> {
+        if !asyncstats::reuse_enabled() {
+            return self.regs.split_off(new_base);
+        }
+        let want = self.regs.len() - new_base;
+        asyncstats::repark(buf.capacity(), want);
+        buf.clear();
+        buf.extend_from_slice(&self.regs[new_base..]);
+        self.regs.truncate(new_base);
+        buf
+    }
+
     /// Calling a `function*` does NOT run its body — it allocates a suspended
     /// Generator whose DETACHED register window holds `this` + the bound args
     /// (incl. a rest array). Resumed later by `generator_method`.
@@ -341,7 +445,7 @@ impl<'p> Vm<'p> {
         if let Some((y, yield_ip)) = self.pending_yield.take() {
             // Re-suspended at another yield: park the window AND the live handlers.
             let raw = std::mem::replace(&mut self.pending_yield_raw, false);
-            let back = self.regs.split_off(new_base);
+            let back = self.repark_window(saved, new_base);
             let parked = std::mem::take(&mut self.pending_yield_handlers);
             let esc = std::mem::replace(&mut self.pending_yield_eval_scope, u32::MAX);
             if esc != u32::MAX {
@@ -1402,7 +1506,7 @@ impl<'p> Vm<'p> {
             // to drop them.
             let handlers = std::mem::take(&mut self.pending_yield_handlers);
             self.pending_yield_eval_scope = u32::MAX;
-            let back = self.regs.split_off(new_base);
+            let back = self.repark_window(saved, new_base);
             let front = match self.heap.get_mut(idx) {
                 HeapObj::AsyncGenerator(g) => {
                     g.state = GenState::Suspended(yield_ip);
@@ -1424,7 +1528,7 @@ impl<'p> Vm<'p> {
         }
         // Awaited → park and subscribe; the front promise stays pending.
         if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
-            let back = self.regs.split_off(new_base);
+            let back = self.repark_window(saved, new_base);
             if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
                 g.state = GenState::Suspended(await_ip);
                 g.regs = back;
@@ -2230,7 +2334,7 @@ impl<'p> Vm<'p> {
         };
         // Suspended again at an await?
         if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
-            let back = self.regs.split_off(new_base);
+            let back = self.repark_window(saved, new_base);
             if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
                 a.state = GenState::Suspended(await_ip);
                 a.regs = back;

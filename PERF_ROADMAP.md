@@ -38,6 +38,7 @@ are in B58.
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
 | **B102 B95 shipped a 19x pathology the benchmarks could not see** | **FIXED; a third sampled pin kind** | B95 admitted dense-Array `GetIndex` to the DOUBLE tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND` — **any** dense array, including one of OBJECTS. The element's dst then takes a numeric home, `live_in_regs` entry-loads it, the load sees the previous iteration's object, and the region `entry_bail`s on EVERY OSR entry, self-evicts, and displaces the memory compile that was working: **124ms -> 2349ms, 19x, running 100% interpreted**. Found from a CONTROL micro that was SLOWER than the thing it controlled for (property reads *removed*: 509ms -> 2047ms). The fix is a THIRD kind, not a narrower one — restricting to `ARR_INT_PIN_KIND` killed the pathology but cost `sparse-array-v2` **+6.2% [+0.9, +13.9]** by excluding arrays of DOUBLES, which the double tier hosts fine. `ARR_NUM_PIN_KIND` samples all-NUMBER over the same bounded 64-head/64-stride walk and sits between the two. Suite A/B vs the unsampled build, 21 pairs: **+0.64% [-1.84, +2.66]** — neutral, with `sparse-array-v2`'s regression gone. **All 13 benches stayed byte-identical and the gate was green through the whole pathology**; two of this session's three real defects (this and B97's flush bug) were invisible to the suite and both surfaced as "a number that cannot be right". `ZIPP_ARR_PIN_LOOSE=1` |
+| **B104 one malloc + one free per `await`, for a buffer already in hand** | **LANDED, MECHANISM; ~1% and at the drift floor** | Resuming a suspended activation detaches its parked register window with `mem::take` (a move) and memcpys it onto the live file; re-suspending then called `Vec::split_off`, which **allocates a fresh right-sized Vec** while the detached buffer fell out of scope and was freed. Same size, every time — an activation's window is fixed by its `reg_count`. `clear` + `extend_from_slice` keeps the capacity and does the identical memcpy. One `repark_window` now serves all five suspension points (`drive_async`, `drive_async_gen` yield and await, `gen_resume`); the two INITIAL parks keep `split_off` as there is no buffer to recycle at a generator's birth. Mechanism: **1,530,000 re-parks, 100% reused, 0 grew, 26.55M values copied**. Result: `async-promise-chain` **−0.7% [−1.3, +0.2]** over 21 pairs and **−0.9% [−1.3, −0.2]** over 41 — reproducing, second interval excluding zero — but `map-set-heavy` −0.9% and `polymorphic-objects-v2` −1.0% in the same run have no `await` in them, so **it is not distinguishable from the ~1% A/A drift M0.1 measured**. Below §14's bar; landed on the mechanism like B78/B92. Prices a small-class mimalloc alloc/free pair at **~3ns**, which is why removing allocations one site at a time is not a route to parity. `ZIPP_NO_BUF_REUSE=1`, `ZIPP_ASYNCSTATS=1` |
 | **B103 the harness could name a commit it never measured** | **FIXED; provenance gated BEFORE measurement** | `README.md` cites `bench/head_clean_2a616f5.json`; that artifact records `git_commit: 2a616f5` and an engine reporting `cdda4e8 + dirty:true` — the PARENT commit, from a dirty tree, in a file named "head_clean". `bench.py` collected the workspace HEAD and the binary's own build identity from two independent sources, both AFTER measurement and only under `--json`, and never compared them; a sweep of all 57 retained artifacts found a second disagreement and only **two** that were ever clean. A headline capture now fails before the first benchmark runs unless identity is present, the tree is clean, the engine's commit equals HEAD, and neither the binary hash nor the reported source changes between the probes taken before and after the run — overridable only by `--allow-dirty-engine`/`--allow-nonhead-engine`, which set `publishable:false`. An **A/B is never blocked**: it compares two builds that cannot both be HEAD, and the `--ab-env`-on-one-binary idiom reports the same source on both sides by design. Also moves the retained-ten/diagnostic-three split out of `run_real.sh` shell variables and into the harness — a default run globbed all 13 files and printed one geomean about **0.43x high**; artifacts now carry both row sets and both bootstrapped geomeans. 17 new tests (45 total) where provenance had zero |
 | **B101 the tier programme has a ~15% CEILING** | **COSTING; B94's 3.2x does NOT transfer to real code** | Prices the FINISHED programme (heap ops hosted on the register tier) before building it. Homes in **callee-saved xmm6..15 survive helper calls**, so no spilling is needed and the earlier "spill 12 homes per call" estimate was far too pessimistic; a heap op costs only boxing its operands and unboxing its result. `7 x reads - 10 x heapops`, weighted by each row's mem share: **32 / 22 / 15 / 14 / 12 / 5 / 4%**, geomean **~15%** — **1.79x -> ~1.51x, not parity**. B94's 3.2x micro is ~100% numeric ops; real regions are 10-25% heap ops and (B99) mostly single-use temps. Parity has to attack the NUMBER and COST of heap ops instead: GetProp/SetProp are helper calls (~20-40 instrs) where an inline monomorphic access behind a shape check is 3-4 — the same order as the whole tier merge, and they compose |
 | **B99 register homes IN the memory tier** | **REFUTED BY MEASUREMENT; no code written** | A home saves ~7 instructions per operand read but costs ~7 to FILL, so it breaks even at one use. Counting the biggest region per row, only **6-17 of 34-88** numeric reads land on a multi-use register: net instructions/iteration from promoting the ten best candidates is **0, 0, 0, -28, -14, +42** — five of six rows gain nothing or LOSE. Cause is the bytecode shape (`LoadGlobal t; use t` per operand, so almost everything is a single-use temp), the cost-side view of B93's "LoadGlobal is 29-37% of every mem region". Corrects why the register tier is fast: not caching multi-use values (there are none) but keeping a GLOBAL in one home for the whole region, guarded once. Next probe is therefore LoadGlobal/consumer FUSION — which was then priced the same way and ALSO refuted: only **0-11%** of numeric reads are fusable (0% on map-set-heavy, parse-large-js and markdown-render), because a global must be used ONLY numerically to be homeable and these regions use globals for objects, strings and receivers too. Both local routes into the memory tier are closed; whole-region TYPE SPECIALISATION is the only thing that removes the per-operand check, and the hot regions cannot have it while they contain Call/CallMethod |
@@ -1717,6 +1718,68 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B104 — one malloc and one free per `await`, for a buffer already in hand
+
+Every resume of a suspended async activation DETACHES its parked register window
+with `mem::take` — a move, no allocation — memcpys it onto the live register
+file, and runs. Every re-suspension then called `Vec::split_off(new_base)`, which
+**allocates a fresh right-sized `Vec`** and memcpys the tail into it. The buffer
+the resume had detached went out of scope unused and was freed.
+
+The two are the same size: an activation's window length is fixed by its
+`reg_count`. So the steady state was a malloc and a free per suspension for a
+buffer that was sitting in a local variable. `clear` + `extend_from_slice` keeps
+the capacity and does the identical memcpy.
+
+Five suspension points share the shape and all five now go through one
+`repark_window`: `drive_async` (async functions), `drive_async_gen` at both its
+yield and await parks, and `gen_resume` (sync generators). The two INITIAL parks
+(`alloc_generator`, `alloc_async_generator`) keep `split_off` — there is no
+detached buffer to recycle at a generator's birth.
+
+The length comes from the LIVE file (`self.regs.len() - new_base`), not from the
+recycled buffer, because a `finally` running between two suspension points can
+leave the window at a different height than the one that was restored.
+
+**Mechanism, on `async-promise-chain`** (`ZIPP_ASYNCSTATS=1`):
+
+```
+1530000 window re-parks   1530000 reused (100.0%)   0 grew   26550000 values copied
+```
+
+1.53M allocation/free pairs removed, 17.35 values per window, and not one window
+outgrew the buffer it was handed.
+
+**And it is worth about 1%.** Two independent runs:
+
+| run | rows | `async-promise-chain` | control |
+|---|---|---|---|
+| 21 pairs, all 13 | 13 | **−0.7% [−1.3, +0.2]** | suite −0.32% [−0.60, +0.05] |
+| 41 pairs, 2 rows | 2 | **−0.9% [−1.3, −0.2]** | `json-large` −0.6% [−1.8, +1.1] |
+
+It reproduces, and the second run's interval excludes zero. But look at the first
+run's other rows: `map-set-heavy` −0.9%, `polymorphic-objects-v2` −1.0%,
+`markdown-render` −0.7% — rows with no `await` in them, moving as much as the row
+that has 1.5 million. **The async row is not distinguishable from the drift
+floor**, which M0.1 measured at ~1% and which reversed a nominal −0.4% into +1.1%
+on an identical binary. `json-large` as an explicit no-promise control in run 2
+moved −0.6% with an interval spanning zero.
+
+So: below §14's 2–3% promotion bar, and landed anyway on the same footing as B78
+and B92 — the mechanism provably fires, it removes work rather than adding a
+path, and there is no branch that can be slower. What it is NOT is a
+demonstrated 1% win, and the entry should not be read as one.
+
+This also prices B81's finding for this case: 1.53M alloc/free pairs against a
+row that moved ≲1% puts a small-class mimalloc pair at **~3ns**, not the ~7ns B81
+attributed to the malloc inside a `{}`. Removing allocations one call site at a
+time is not a route to parity; that arithmetic is why WP-1C targets the
+allocation COUNT per promise rather than another buffer.
+
+`ZIPP_NO_BUF_REUSE=1` restores `split_off` at every suspension — the rollback
+switch, and the two sides of the one-binary A/B (fat LTO makes a two-binary
+comparison a layout confound; see B77). `ZIPP_ASYNCSTATS=1` prints the counters.
 
 ### B103 — the harness could name a commit it had never measured
 
