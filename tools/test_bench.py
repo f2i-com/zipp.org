@@ -632,5 +632,226 @@ class AbBinaryGuardTests(unittest.TestCase):
         )
 
 
+def engine_meta(name, *, commit, dirty=False, diff="d1", sha="ab" * 32):
+    """A synthetic `engine_metadata` row.
+
+    Real fake-engine executables would have to be `.exe`/`.bat` on Windows and
+    plain scripts elsewhere; the decision logic under test never touches the
+    filesystem, so the probe results are injected directly and `engine_metadata`
+    itself is exercised through `main()` with a mock.
+    """
+    identity = {"commit": commit, "dirty": dirty}
+    if dirty:
+        identity["diff_digest"] = diff
+    return {"name": name, "sha256": sha, "build_identity": identity}
+
+
+class ProvenanceTests(unittest.TestCase):
+    """The artifact must not be able to name a commit it did not measure.
+
+    `bench/head_clean_2a616f5.json` is named for 2a616f5 and its engine reports
+    `cdda4e8 + dirty:true`. The harness recorded the workspace HEAD and the
+    engine's build identity from two independent sources, after measurement, and
+    never compared them.
+    """
+
+    HEAD = "a" * 40
+    OTHER = "b" * 40
+
+    def test_source_identity_distinguishes_dirty_from_its_parent(self):
+        clean = {"commit": self.HEAD, "dirty": False}
+        dirty = {"commit": self.HEAD, "dirty": True, "diff_digest": "beef"}
+        self.assertEqual(bench.source_identity(clean), self.HEAD)
+        self.assertEqual(bench.source_identity(dirty), f"{self.HEAD}+dirty.beef")
+        self.assertNotEqual(
+            bench.source_identity(clean), bench.source_identity(dirty)
+        )
+        self.assertIsNone(bench.source_identity(None))
+        self.assertIsNone(bench.source_identity({"dirty": False}))
+
+    def test_clean_head_engine_has_no_reasons(self):
+        reasons = bench.check_engine_provenance(
+            [engine_meta("zipp", commit=self.HEAD)],
+            self.HEAD,
+            is_ab=False,
+            allow_dirty=False,
+            allow_nonhead=False,
+        )
+        self.assertEqual(reasons, [])
+
+    def test_dirty_engine_is_a_reason_and_is_fatal_for_a_headline(self):
+        reasons = bench.check_engine_provenance(
+            [engine_meta("zipp", commit=self.HEAD, dirty=True)],
+            self.HEAD,
+            is_ab=False,
+            allow_dirty=False,
+            allow_nonhead=False,
+        )
+        self.assertTrue(any("DIRTY" in reason for reason in reasons))
+        self.assertTrue(
+            bench.provenance_is_fatal(reasons, is_ab=False, overridden=False)
+        )
+
+    def test_nonhead_engine_is_a_reason(self):
+        reasons = bench.check_engine_provenance(
+            [engine_meta("zipp", commit=self.OTHER)],
+            self.HEAD,
+            is_ab=False,
+            allow_dirty=False,
+            allow_nonhead=False,
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn(self.OTHER, reasons[0])
+        self.assertIn(self.HEAD, reasons[0])
+
+    def test_the_exact_head_clean_artifact_failure_is_caught(self):
+        # git_commit 2a616f5..., engine cdda4e8... + dirty. Both rules fire.
+        reasons = bench.check_engine_provenance(
+            [engine_meta("zipp", commit="cdda4e8", dirty=True, diff="a8cbe062")],
+            "2a616f5",
+            is_ab=False,
+            allow_dirty=False,
+            allow_nonhead=False,
+        )
+        self.assertEqual(len(reasons), 2)
+        self.assertTrue(
+            bench.provenance_is_fatal(reasons, is_ab=False, overridden=False)
+        )
+
+    def test_overrides_downgrade_fatal_to_recorded(self):
+        meta = [engine_meta("zipp", commit=self.OTHER, dirty=True)]
+        reasons = bench.check_engine_provenance(
+            meta, self.HEAD, is_ab=False, allow_dirty=True, allow_nonhead=True
+        )
+        self.assertEqual(reasons, [])
+        # An override that does not cover the reason still stops the run.
+        partial = bench.check_engine_provenance(
+            meta, self.HEAD, is_ab=False, allow_dirty=True, allow_nonhead=False
+        )
+        self.assertEqual(len(partial), 1)
+        self.assertFalse(
+            bench.provenance_is_fatal(partial, is_ab=False, overridden=True)
+        )
+
+    def test_missing_identity_is_a_reason(self):
+        reasons = bench.check_engine_provenance(
+            [{"name": "node", "sha256": "cd" * 32, "build_identity": None}],
+            self.HEAD,
+            is_ab=False,
+            allow_dirty=False,
+            allow_nonhead=False,
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("build identity", reasons[0])
+
+    def test_ab_of_two_commits_is_allowed_and_never_fatal(self):
+        # The point of an A/B: two builds, neither of which can be HEAD.
+        reasons = bench.check_engine_provenance(
+            [
+                engine_meta("old", commit=self.OTHER, sha="11" * 32),
+                engine_meta("new", commit=self.HEAD, sha="22" * 32),
+            ],
+            self.HEAD,
+            is_ab=True,
+            allow_dirty=False,
+            allow_nonhead=False,
+        )
+        self.assertEqual(reasons, [])
+        self.assertFalse(
+            bench.provenance_is_fatal(["x"], is_ab=True, overridden=False)
+        )
+
+    def test_ab_sides_reporting_one_source_is_a_reason(self):
+        reasons = bench.check_engine_provenance(
+            [
+                engine_meta("old", commit=self.HEAD, sha="11" * 32),
+                engine_meta("new", commit=self.HEAD, sha="22" * 32),
+            ],
+            self.HEAD,
+            is_ab=True,
+            allow_dirty=False,
+            allow_nonhead=False,
+        )
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("SAME source", reasons[0])
+
+    def test_ab_env_ablation_on_one_binary_is_not_a_reason(self):
+        # The idiom this repo measures with: ONE binary, two --ab-env sides. Both
+        # sides report the same source BY CONSTRUCTION, and flagging it would
+        # reject the protocol rather than a mistake.
+        reasons = bench.check_engine_provenance(
+            [
+                engine_meta("old", commit=self.HEAD, sha="11" * 32),
+                engine_meta("new", commit=self.HEAD, sha="11" * 32),
+            ],
+            self.HEAD,
+            is_ab=True,
+            allow_dirty=False,
+            allow_nonhead=False,
+            ab_sides_distinguished=True,
+        )
+        self.assertEqual(reasons, [])
+
+    def test_binary_change_during_the_run_is_drift(self):
+        before = [engine_meta("zipp", commit=self.HEAD, sha="11" * 32)]
+        after = [engine_meta("zipp", commit=self.HEAD, sha="22" * 32)]
+        drift = bench.engine_drift(before, after)
+        self.assertEqual(len(drift), 1)
+        self.assertIn("sha256 changed", drift[0])
+
+    def test_identity_change_during_the_run_is_drift(self):
+        before = [engine_meta("zipp", commit=self.HEAD, sha="11" * 32)]
+        after = [engine_meta("zipp", commit=self.OTHER, sha="11" * 32)]
+        drift = bench.engine_drift(before, after)
+        self.assertEqual(len(drift), 1)
+        self.assertIn("build identity changed", drift[0])
+
+    def test_a_stable_engine_shows_no_drift(self):
+        before = [engine_meta("zipp", commit=self.HEAD)]
+        self.assertEqual(bench.engine_drift(before, list(before)), [])
+
+
+class RowSetTests(unittest.TestCase):
+    """Headline vs diagnostic must live in the harness, not in a person's head.
+
+    A default run globs all 13 programs; the three diagnostics are 3.5-5.5x rows
+    and inflate the geomean by roughly 0.43x, so a 13-row number silently is not
+    the retained series.
+    """
+
+    def test_classification_splits_the_retained_ten(self):
+        sets = bench.classify_benches(bench.discover_benches())
+        self.assertEqual(len(sets["headline_benches"]), 10)
+        self.assertEqual(len(sets["diagnostic_benches"]), 3)
+        self.assertEqual(sets["unclassified_benches"], [])
+        self.assertNotIn("sparse-array-v2", sets["headline_benches"])
+
+    def test_headline_list_is_the_documented_ten(self):
+        self.assertEqual(len(set(bench.HEADLINE_BENCHES)), 10)
+        self.assertFalse(
+            set(bench.HEADLINE_BENCHES) & set(bench.DIAGNOSTIC_BENCHES)
+        )
+
+    def test_a_new_benchmark_is_unclassified_not_headline(self):
+        sets = bench.classify_benches(["json-large", "brand-new-row"])
+        self.assertEqual(sets["headline_benches"], ["json-large"])
+        self.assertEqual(sets["unclassified_benches"], ["brand-new-row"])
+
+    def test_subset_geomean_uses_only_its_rows(self):
+        samples = {
+            "zipp": {"fast": [1.0, 1.0], "slow": [4.0, 4.0]},
+            "node": {"fast": [1.0, 1.0], "slow": [1.0, 1.0]},
+        }
+        fast_only = bench.subset_geomean(
+            samples, ["fast"], "node", "zipp", seed=1, bootstrap_samples=32
+        )
+        both = bench.subset_geomean(
+            samples, ["fast", "slow"], "node", "zipp", seed=1, bootstrap_samples=32
+        )
+        self.assertAlmostEqual(fast_only["geomean_paired_ratio"], 1.0)
+        self.assertAlmostEqual(both["geomean_paired_ratio"], 2.0)
+        self.assertEqual(fast_only["benches"], ["fast"])
+
+
 if __name__ == "__main__":
     unittest.main()

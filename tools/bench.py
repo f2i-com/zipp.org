@@ -41,9 +41,54 @@ BOOTSTRAP_SAMPLES = 10_000
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "bench" / "real"
 
+# The RETAINED TEN. This list is the historical series and must not change: every
+# geomean in README.md and PERF_ROADMAP.md is comparable only because these ten
+# programs, in this form, have been the headline since the series started.
+HEADLINE_BENCHES = (
+    "parse-large-js",
+    "json-large",
+    "markdown-render",
+    "map-set-heavy",
+    "typedarray-math",
+    "regex-log-scan",
+    "class-prototype-hot",
+    "async-promise-chain",
+    "polymorphic-objects",
+    "sparse-array",
+)
+
+# M0.3 diagnostic siblings -- deliberately OUT of series. They exist to expose a
+# specific mechanism (>8 same-shape receivers, computed-key churn, sparse growth)
+# and are far slower than the headline rows, so folding them in inflates the
+# geomean by ~0.43x. bench.py used to compute one 13-row number and leave the
+# split to whoever remembered to pass --benches; now both are in the artifact.
+DIAGNOSTIC_BENCHES = (
+    "property-ic-shapes",
+    "polymorphic-objects-v2",
+    "sparse-array-v2",
+)
+
 
 def discover_benches(bench_dir: Path = BENCH_DIR) -> list[str]:
     return sorted(path.stem for path in bench_dir.glob("*.js"))
+
+
+def classify_benches(benches: list[str]) -> dict[str, list[str]]:
+    """Split a bench list into the retained-ten series and everything else.
+
+    Returns the three lists the artifact records. `unclassified` is not an error
+    -- a new benchmark simply is not in the historical series until someone adds
+    it to `HEADLINE_BENCHES` on purpose.
+    """
+    return {
+        "headline_benches": [b for b in benches if b in HEADLINE_BENCHES],
+        "diagnostic_benches": [b for b in benches if b in DIAGNOSTIC_BENCHES],
+        "unclassified_benches": [
+            b
+            for b in benches
+            if b not in HEADLINE_BENCHES and b not in DIAGNOSTIC_BENCHES
+        ],
+    }
 
 
 def percentile(xs: Iterable[float], quantile: float) -> float:
@@ -325,6 +370,157 @@ def build_identity(executable: Path | None, timeout: float) -> dict[str, Any] | 
     return parsed if isinstance(parsed, dict) else None
 
 
+def source_identity(identity: dict[str, Any] | None) -> str | None:
+    """The one string that names the SOURCE a binary was built from.
+
+    `commit` alone is not it: a dirty build's commit is the parent it was based
+    on, which is exactly how an artifact came to be named for a commit it was not
+    measuring. The `+dirty.<digest>` suffix is what makes the two distinguishable.
+    """
+    if not isinstance(identity, dict):
+        return None
+    # `zipp --version --json` composes this itself; prefer the binary's own
+    # answer over reconstructing it, so the two can never drift apart.
+    reported = identity.get("source")
+    if isinstance(reported, str) and reported:
+        return reported
+    commit = identity.get("commit")
+    if not isinstance(commit, str) or not commit:
+        return None
+    if identity.get("dirty"):
+        digest = identity.get("diff_digest")
+        return f"{commit}+dirty.{digest}" if digest else f"{commit}+dirty"
+    return commit
+
+
+def check_engine_provenance(
+    engines_meta: list[dict[str, Any]],
+    workspace_commit: str | None,
+    *,
+    is_ab: bool,
+    allow_dirty: bool,
+    allow_nonhead: bool,
+    ab_sides_distinguished: bool = False,
+) -> list[str]:
+    """Reasons this run's engines cannot back a PUBLISHED number.
+
+    Two different questions, deliberately answered differently:
+
+    A HEADLINE capture (Node vs zipp, the thing README quotes) claims to measure
+    a commit, so it has to be measuring that commit: identity present, tree not
+    dirty, and the engine's commit equal to the workspace HEAD. Failing these is
+    fatal unless explicitly overridden, because the artifact's whole value is the
+    attribution.
+
+    An A/B compares two builds that by construction cannot both be HEAD, and the
+    ablation idiom this repo uses most is ONE binary with two ``--ab-env`` sides,
+    where both sides report the SAME source on purpose. So an A/B is never
+    blocked here; its reasons only mark the artifact unpublishable, which it
+    already is -- an A/B measures a delta, not a headline. The failure an A/B
+    does need to catch (a rebuild that silently did not happen) is caught by
+    ``reject_identical_ab_binaries`` on the binary HASH, before measurement, and
+    is repeated here on the reported SOURCE for the case where the two binaries
+    differ but were built from the same tree.
+    """
+    reasons: list[str] = []
+    identified = [
+        (m["name"], source_identity(m.get("build_identity")), m.get("build_identity"))
+        for m in engines_meta
+        if m.get("build_identity") is not None
+    ]
+    # An engine with no `--version --json` at all (node, bun, deno) is not a zipp
+    # build and is out of scope -- its version string is all the provenance it
+    # has. But if NOTHING under measurement identifies its source, the artifact
+    # names a commit it cannot support.
+    if not identified:
+        reasons.append(
+            "no engine reported a build identity (`--version --json`); "
+            "nothing identifies the source under measurement"
+        )
+        return reasons
+    for name, source, identity in identified:
+        if source is None:
+            reasons.append(f"{name}: build identity present but has no commit")
+            continue
+        if identity.get("dirty") and not allow_dirty:
+            reasons.append(
+                f"{name}: built from a DIRTY tree ({source}); the commit it "
+                "names is the parent it was based on, not the code that ran"
+            )
+        if is_ab:
+            continue
+        if workspace_commit is None:
+            reasons.append(
+                f"{name}: workspace HEAD is unknown, so the engine's commit "
+                "cannot be checked against it"
+            )
+        elif identity.get("commit") != workspace_commit and not allow_nonhead:
+            reasons.append(
+                f"{name}: built from {identity.get('commit')} but the workspace "
+                f"is at {workspace_commit}"
+            )
+    if is_ab and len(identified) == 2 and not ab_sides_distinguished:
+        (name_a, src_a, _), (name_b, src_b, _) = identified
+        if src_a is not None and src_a == src_b:
+            reasons.append(
+                f"--ab sides {name_a} and {name_b} report the SAME source "
+                f"({src_a}); one of them was not rebuilt"
+            )
+    return reasons
+
+
+def provenance_is_fatal(reasons: list[str], *, is_ab: bool, overridden: bool) -> bool:
+    """Whether `reasons` should stop the run rather than just mark the artifact.
+
+    Only a headline capture is stopped. See `check_engine_provenance`.
+    """
+    return bool(reasons) and not is_ab and not overridden
+
+
+def engine_drift(
+    before: list[dict[str, Any]], after: list[dict[str, Any]]
+) -> list[str]:
+    """Engines whose binary or reported source CHANGED during the run.
+
+    A rebuild landing mid-measurement silently mixes two engines into one column.
+    Cheap to detect (one stat + one `--version --json` per engine) and otherwise
+    invisible.
+    """
+    drift: list[str] = []
+    for old_meta, new_meta in zip(before, after):
+        name = old_meta["name"]
+        if old_meta.get("sha256") != new_meta.get("sha256"):
+            drift.append(
+                f"{name}: executable sha256 changed during the run "
+                f"({old_meta.get('sha256')} -> {new_meta.get('sha256')})"
+            )
+        old_src = source_identity(old_meta.get("build_identity"))
+        new_src = source_identity(new_meta.get("build_identity"))
+        if old_src != new_src:
+            drift.append(
+                f"{name}: build identity changed during the run "
+                f"({old_src} -> {new_src})"
+            )
+    return drift
+
+
+def harness_digest() -> dict[str, Any]:
+    """Hash the harness itself, so an artifact records how it was measured."""
+    return {
+        "bench_py_sha256": file_digest(Path(__file__).resolve()),
+        "run_real_sh_sha256": file_digest(ROOT / "bench" / "run_real.sh"),
+    }
+
+
+def bench_input_digests(bench_dir: Path, benches: list[str]) -> dict[str, str | None]:
+    """Hash every benchmark program actually run.
+
+    A row's number means nothing without the program that produced it, and these
+    files do change (B67 corrected three of them).
+    """
+    return {b: file_digest(bench_dir / f"{b}.js") for b in benches}
+
+
 def reject_identical_ab_binaries(
     ab: list[str], ab_env: tuple[dict[str, str], dict[str, str]], *, allow: bool
 ) -> None:
@@ -505,6 +701,51 @@ def metric_summary(
         "paired_ratio": ratio,
         "paired_ratio_ci95": [ci_low, ci_high],
         "nonpositive_pairs": 0,
+    }
+
+
+def subset_geomean(
+    samples: dict[str, dict[str, list[float]]],
+    benches: list[str],
+    baseline: str,
+    compare_name: str,
+    *,
+    seed: int,
+    bootstrap_samples: int,
+) -> dict[str, Any] | None:
+    """Paired geomean + cluster-bootstrap CI over an explicit subset of rows.
+
+    The artifact carries one of these per ROW SET rather than one number for
+    whatever happened to be measured. A default `bench.py` run globs all 13
+    programs and used to print a single geomean that is not comparable to the
+    retained ten -- the three diagnostics are 3.5-5.5x rows and inflate it by
+    roughly 0.43x. Nothing about the split should depend on a person remembering
+    to pass --benches.
+    """
+    rows = [b for b in benches if b in samples[compare_name]]
+    if not rows:
+        return None
+    ratios_by_bench = []
+    for bench in rows:
+        pairs = list(zip(samples[compare_name][bench], samples[baseline][bench]))
+        if not pairs or any(num <= 0 or den <= 0 for num, den in pairs):
+            return None
+        ratios_by_bench.append(
+            paired_ratios(samples[compare_name][bench], samples[baseline][bench])
+        )
+    point = geometric_mean(
+        statistics.median(ratios) for ratios in ratios_by_bench
+    )
+    try:
+        ci_low, ci_high = bootstrap_geomean_of_medians_ci(
+            ratios_by_bench, seed=seed, samples=bootstrap_samples
+        )
+    except ValueError:
+        return {"benches": rows, "geomean_paired_ratio": point, "ci95": None}
+    return {
+        "benches": rows,
+        "geomean_paired_ratio": point,
+        "ci95": [ci_low, ci_high],
     }
 
 
@@ -1268,6 +1509,23 @@ def parse_args() -> argparse.Namespace:
         default="node,bun,deno,zipp",
         help="comma-separated engine subset outside --ab (default all)",
     )
+    parser.add_argument(
+        "--allow-dirty-engine",
+        action="store_true",
+        help=(
+            "measure a binary built from a dirty tree. The artifact is marked "
+            "publishable:false -- a dirty build's reported commit is the parent "
+            "it was based on, so the number cannot be attributed to any commit"
+        ),
+    )
+    parser.add_argument(
+        "--allow-nonhead-engine",
+        action="store_true",
+        help=(
+            "measure a binary built from a commit other than the workspace HEAD. "
+            "The artifact is marked publishable:false"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1471,6 +1729,48 @@ def main() -> int:
             "(pass --overwrite-json to replace it)"
         )
 
+    # Provenance BEFORE the first measurement. The harness used to collect this
+    # only at the end, inside `if json_path:` -- so a run without --json recorded
+    # nothing, and a run with it could not tell whether the binary it had just
+    # spent twenty minutes measuring was the one it was about to name.
+    workspace_commit = git_revision()
+    engines_meta_before = [
+        {**engine_metadata(name, cmd, args.timeout), "environment": engine_env[name]}
+        for name, cmd in engines
+    ]
+    ab_sides_distinguished = bool(args.allow_aa) or (
+        args.ab_env is not None and args.ab_env[0] != args.ab_env[1]
+    )
+    provenance_reasons = check_engine_provenance(
+        engines_meta_before,
+        workspace_commit,
+        is_ab=bool(args.ab),
+        allow_dirty=getattr(args, "allow_dirty_engine", False),
+        allow_nonhead=getattr(args, "allow_nonhead_engine", False),
+        ab_sides_distinguished=ab_sides_distinguished,
+    )
+    if provenance_reasons:
+        print("engine provenance:", file=sys.stderr)
+        for reason in provenance_reasons:
+            print(f"  {reason}", file=sys.stderr)
+        overridden = getattr(args, "allow_dirty_engine", False) or getattr(
+            args, "allow_nonhead_engine", False
+        )
+        if provenance_is_fatal(
+            provenance_reasons, is_ab=bool(args.ab), overridden=overridden
+        ):
+            raise SystemExit(
+                "refusing to measure: the engine cannot be attributed to a "
+                "commit (see above).\n"
+                "Rebuild from a clean checkout of the tree you mean to measure, "
+                "or pass --allow-dirty-engine / --allow-nonhead-engine to record "
+                "an explicitly UNPUBLISHABLE artifact."
+            )
+        print(
+            "  recorded; this artifact is publishable:false",
+            file=sys.stderr,
+        )
+
     cold = {name: {bench: [] for bench in benches} for name in engine_names}
     startup = {name: {bench: [] for bench in benches} for name in engine_names}
     adjusted = {name: {bench: [] for bench in benches} for name in engine_names}
@@ -1593,6 +1893,16 @@ def main() -> int:
         except OSError:
             pass
 
+    # Re-probe. A rebuild that lands mid-run replaces the binary under
+    # measurement without changing anything the harness would otherwise notice.
+    engines_meta_after = [
+        {**engine_metadata(name, cmd, args.timeout), "environment": engine_env[name]}
+        for name, cmd in engines
+    ]
+    drift_reasons = engine_drift(engines_meta_before, engines_meta_after)
+    for reason in drift_reasons:
+        failures.append(f"engine changed during the run: {reason}")
+
     failures.extend(health_failures)
     failures.extend(correctness_failures)
     all_correct = not health_failures and not correctness_failures
@@ -1657,11 +1967,72 @@ def main() -> int:
     for failure in unique_failures:
         print(f"  FAIL: {failure}")
 
+    row_sets = classify_benches(benches)
+    metric_source = {"cold": cold, "startup": startup, "adjusted": adjusted}[
+        args.metric if args.metric in ("cold", "adjusted") else "cold"
+    ]
+    row_set_summaries = {
+        set_name: subset_geomean(
+            metric_source,
+            set_benches,
+            baseline,
+            compare_name,
+            seed=derived_seed(args.seed, set_name),
+            bootstrap_samples=args.bootstrap_samples,
+        )
+        for set_name, set_benches in (
+            ("headline", row_sets["headline_benches"]),
+            ("diagnostic", row_sets["diagnostic_benches"]),
+            ("all_measured", benches),
+        )
+        if set_benches
+    }
+    if not health_failures:
+        for set_name, detail in row_set_summaries.items():
+            if detail is None:
+                continue
+            ci = detail["ci95"]
+            span = (
+                f" [{ci[0]:.3f}, {ci[1]:.3f}]" if ci else ""
+            )
+            print(
+                f"geomean[{set_name}] {detail['geomean_paired_ratio']:.4f}x"
+                f"{span}  ({len(detail['benches'])} rows)"
+            )
+
     if json_path:
+        # The artifact's own account of what it measured. `workspace_source` is
+        # the TREE; `engine_source_before/after` is what the BINARY says it was
+        # built from. These are different questions and the harness used to
+        # answer only the first, which is how bench/head_clean_2a616f5.json came
+        # to be named for a commit its engine had never seen.
+        publishable = not provenance_reasons and not drift_reasons
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "git_commit": git_revision(),
+            "git_commit": workspace_commit,
+            "workspace_source": workspace_commit,
+            "engine_source_before": {
+                m["name"]: source_identity(m.get("build_identity"))
+                for m in engines_meta_before
+            },
+            "engine_source_after": {
+                m["name"]: source_identity(m.get("build_identity"))
+                for m in engines_meta_after
+            },
+            "engine_binary_sha_before": {
+                m["name"]: m.get("sha256") for m in engines_meta_before
+            },
+            "engine_binary_sha_after": {
+                m["name"]: m.get("sha256") for m in engines_meta_after
+            },
+            "publishable": publishable,
+            "provenance_reasons": provenance_reasons,
+            "engine_drift": drift_reasons,
+            "harness": harness_digest(),
+            "bench_input_sha256": bench_input_digests(bench_dir, benches),
+            **row_sets,
+            "row_set_summaries": row_set_summaries,
             "seed": args.seed,
             "reps": args.reps,
             "metric": "historical-adjusted" if args.historical else args.metric,
@@ -1674,13 +2045,7 @@ def main() -> int:
             "benches": benches,
             "bench_dir": str(bench_dir),
             "baseline": baseline,
-            "engines": [
-                {
-                    **engine_metadata(name, cmd, args.timeout),
-                    "environment": engine_env[name],
-                }
-                for name, cmd in engines
-            ],
+            "engines": engines_meta_after,
             "host": {
                 "platform": platform.platform(),
                 "machine": platform.machine(),

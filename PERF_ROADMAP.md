@@ -38,6 +38,7 @@ are in B58.
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
 | **B102 B95 shipped a 19x pathology the benchmarks could not see** | **FIXED; a third sampled pin kind** | B95 admitted dense-Array `GetIndex` to the DOUBLE tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND` — **any** dense array, including one of OBJECTS. The element's dst then takes a numeric home, `live_in_regs` entry-loads it, the load sees the previous iteration's object, and the region `entry_bail`s on EVERY OSR entry, self-evicts, and displaces the memory compile that was working: **124ms -> 2349ms, 19x, running 100% interpreted**. Found from a CONTROL micro that was SLOWER than the thing it controlled for (property reads *removed*: 509ms -> 2047ms). The fix is a THIRD kind, not a narrower one — restricting to `ARR_INT_PIN_KIND` killed the pathology but cost `sparse-array-v2` **+6.2% [+0.9, +13.9]** by excluding arrays of DOUBLES, which the double tier hosts fine. `ARR_NUM_PIN_KIND` samples all-NUMBER over the same bounded 64-head/64-stride walk and sits between the two. Suite A/B vs the unsampled build, 21 pairs: **+0.64% [-1.84, +2.66]** — neutral, with `sparse-array-v2`'s regression gone. **All 13 benches stayed byte-identical and the gate was green through the whole pathology**; two of this session's three real defects (this and B97's flush bug) were invisible to the suite and both surfaced as "a number that cannot be right". `ZIPP_ARR_PIN_LOOSE=1` |
+| **B103 the harness could name a commit it never measured** | **FIXED; provenance gated BEFORE measurement** | `README.md` cites `bench/head_clean_2a616f5.json`; that artifact records `git_commit: 2a616f5` and an engine reporting `cdda4e8 + dirty:true` — the PARENT commit, from a dirty tree, in a file named "head_clean". `bench.py` collected the workspace HEAD and the binary's own build identity from two independent sources, both AFTER measurement and only under `--json`, and never compared them; a sweep of all 57 retained artifacts found a second disagreement and only **two** that were ever clean. A headline capture now fails before the first benchmark runs unless identity is present, the tree is clean, the engine's commit equals HEAD, and neither the binary hash nor the reported source changes between the probes taken before and after the run — overridable only by `--allow-dirty-engine`/`--allow-nonhead-engine`, which set `publishable:false`. An **A/B is never blocked**: it compares two builds that cannot both be HEAD, and the `--ab-env`-on-one-binary idiom reports the same source on both sides by design. Also moves the retained-ten/diagnostic-three split out of `run_real.sh` shell variables and into the harness — a default run globbed all 13 files and printed one geomean about **0.43x high**; artifacts now carry both row sets and both bootstrapped geomeans. 17 new tests (45 total) where provenance had zero |
 | **B101 the tier programme has a ~15% CEILING** | **COSTING; B94's 3.2x does NOT transfer to real code** | Prices the FINISHED programme (heap ops hosted on the register tier) before building it. Homes in **callee-saved xmm6..15 survive helper calls**, so no spilling is needed and the earlier "spill 12 homes per call" estimate was far too pessimistic; a heap op costs only boxing its operands and unboxing its result. `7 x reads - 10 x heapops`, weighted by each row's mem share: **32 / 22 / 15 / 14 / 12 / 5 / 4%**, geomean **~15%** — **1.79x -> ~1.51x, not parity**. B94's 3.2x micro is ~100% numeric ops; real regions are 10-25% heap ops and (B99) mostly single-use temps. Parity has to attack the NUMBER and COST of heap ops instead: GetProp/SetProp are helper calls (~20-40 instrs) where an inline monomorphic access behind a shape check is 3-4 — the same order as the whole tier merge, and they compose |
 | **B99 register homes IN the memory tier** | **REFUTED BY MEASUREMENT; no code written** | A home saves ~7 instructions per operand read but costs ~7 to FILL, so it breaks even at one use. Counting the biggest region per row, only **6-17 of 34-88** numeric reads land on a multi-use register: net instructions/iteration from promoting the ten best candidates is **0, 0, 0, -28, -14, +42** — five of six rows gain nothing or LOSE. Cause is the bytecode shape (`LoadGlobal t; use t` per operand, so almost everything is a single-use temp), the cost-side view of B93's "LoadGlobal is 29-37% of every mem region". Corrects why the register tier is fast: not caching multi-use values (there are none) but keeping a GLOBAL in one home for the whole region, guarded once. Next probe is therefore LoadGlobal/consumer FUSION — which was then priced the same way and ALSO refuted: only **0-11%** of numeric reads are fusable (0% on map-set-heavy, parse-large-js and markdown-render), because a global must be used ONLY numerically to be homeable and these regions use globals for objects, strings and receivers too. Both local routes into the memory tier are closed; whole-region TYPE SPECIALISATION is the only thing that removes the per-operand check, and the hot regions cannot have it while they contain Call/CallMethod |
 | **B97/B98 write-through home sharing + Add live-ins (double path)** | **MECHANISM; suite NULL; first DOUBLE regions ever compiled here** | B97 lets a `read_outside` register SHARE an xmm home by generalising B94's write-through (store each def to `[rbx+dreg(r)]`, skip it in the flush) — removing the `xmm pool exhausted` blocker B95 called terminal. B98 admits `Add` operands as numeric-required uses of a read-only live-in **on the double path only**: the 3.31x->3.45x regression that refuted this was BLANKET admission on the INT path, and its stated causes were string/double/object live-ins — a double is native here, so the largest cause does not apply. Together: **class-prototype-hot 3 declines -> 1**, polymorphic-objects 7 -> 3, and DOUBLE regions **0 -> 1 / 0 -> 1 / 0 -> 3**. Suite **-0.16% [-1.87, +1.42]** — null; the promoted regions are COLD, and the hot ones are now blocked by `CallMethod`, a MISSING CAPABILITY (the register tier issues no calls; B78's method inlining is memory-path only) rather than an admission gate. **Introduced a wrong-answer bug** (a shareable reg loses its entry load; an untaken-branch def then flushed a garbage home) caught by the kept `hoisted_const_on_untaken_branch` tests while all 13 benches still said ALL_CORRECT=1. Also: a pre-fix A/B showed sparse-array -3.0% twice; it did NOT reproduce on the fixed build. `ZIPP_NO_WT_SHARE=1` |
@@ -1716,6 +1717,71 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B103 — the harness could name a commit it had never measured
+
+`README.md` cites `bench/head_clean_2a616f5.json`. That artifact records
+`git_commit: 2a616f5…` and its zipp engine reports
+`commit: cdda4e8…, dirty: true, diff_digest: a8cbe062…`. cdda4e8 is 2a616f5's
+PARENT. The file named "head_clean" was measured by a binary built from a dirty
+tree one commit behind the name it carries.
+
+Not a slip — a missing check. `tools/bench.py` collected provenance from two
+independent sources, both at the very END of `main()` and both only when
+`--json` was passed:
+
+| source | function | lands at |
+|---|---|---|
+| the WORKSPACE's HEAD | `git_revision()` | `git_commit` |
+| the BINARY's own account | `build_identity()` | `engines[i].build_identity` |
+
+Nothing compared them. `build_identity` appeared exactly twice in the file: its
+own `def`, and the dict key it fills. Sweeping all 57 retained artifacts found a
+second disagreement (`overlay_narrow_ab_2026-07-29.json`) and only **two**
+artifacts that were ever clean.
+
+**The gate is asymmetric on purpose.** A HEADLINE capture claims to measure a
+commit, so it must: identity present, tree not dirty, engine commit == workspace
+HEAD, and neither the binary hash nor the reported source may change between the
+probe before the first measurement and the probe after the last. Failing any of
+those is now fatal before a single benchmark runs, overridable only by
+`--allow-dirty-engine` / `--allow-nonhead-engine`, which mark the artifact
+`publishable: false`.
+
+An **A/B is never blocked**, because two of its rules would reject the protocol
+rather than a mistake: an A/B compares two builds that by construction cannot
+both be HEAD, and this repo's most-used ablation idiom is ONE binary with two
+`--ab-env` sides, which reports the same source on both sides deliberately. A/B
+reasons are recorded and mark the artifact unpublishable, which it already is.
+The rebuild-that-did-not-happen case an A/B *does* need is still caught by
+`reject_identical_ab_binaries` on the binary hash, and now also on the reported
+source when the two binaries differ but the tree did not.
+
+**The row sets moved out of a person's head.** The retained-ten/diagnostic-three
+split lived only as shell variables in `bench/run_real.sh`; `bench.py` globbed
+all thirteen `.js` files and printed one geomean. The three diagnostics are
+3.5–5.5× rows, so that number ran about **0.43× high** and was not the historical
+series. `HEADLINE_BENCHES` and `DIAGNOSTIC_BENCHES` are now constants in the
+harness, every artifact carries `headline_benches` / `diagnostic_benches` /
+`unclassified_benches`, and both geomeans are computed with their own bootstrap
+CI and printed.
+
+Also added: `workspace_source`, `engine_source_before` / `engine_source_after`,
+`engine_binary_sha_before` / `engine_binary_sha_after`, `publishable`,
+`provenance_reasons`, `engine_drift`, a sha256 of the harness itself, and a
+sha256 of every benchmark program actually run.
+
+17 new tests (45 total) cover clean match, dirty build, non-HEAD build, the exact
+`head_clean_2a616f5` shape, identity drift, binary drift, deliberate A/A,
+deliberate A/B, `--ab-env` on one binary, each override in isolation, and the row
+sets. Provenance had zero test coverage before this.
+
+Verified on the tree as it stood: the gate refuses a headline run against the
+current (dirty) binary, and the `--ab-env` ablation still measures.
+
+No engine code changed. The point is narrow: **no performance claim in this file
+can be attributed to a commit unless the harness proves the binary came from it**,
+and until now it could not.
 
 ### B102 — B95 shipped a 19× pathology, and the benchmarks could not see it
 
