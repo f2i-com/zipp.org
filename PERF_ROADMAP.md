@@ -37,7 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
-| **B81 allocation is 10-50x node — B6.0's precondition met** | **MEASURED; substrate item now the best-evidenced in this file** | `{}` 41.0ns vs 3.5ns, `{a:1}` 81.5 vs 2.5, `{a,b,c,d}` **148 vs 3.0 (49x)**, `[]` 23.5 vs 2.5, `s.slice(0,5)` 38.5 vs 4.0 — and the no-allocation control is 1.0ns vs node's 1.5ns, i.e. **zipp is FASTER when it allocates nothing**. Reached independently from `regex-log-scan`'s phase split (matchAll 496 vs 71ms; `exec` = 227ns scan + 169ns result object + ~60ns/capture against node's 40ns total, while the non-capturing literal `test` is **0.53x — zipp wins**) and from the object-literal micro. A 4-property literal has gone 513ns → 148ns since B6.0 was written and is still 49x. Re-prices B1: the `{}` row has zero properties, so at least half the cost is the object-header allocation B1 does not touch. `typedarray-math` is the one row this does NOT explain — its DataView loop allocates nothing and is already a fully inlined native load, so that one is M4 | **B6.0**, B1 |
+| **B81 the COLLECTOR is 10-50x node — B6.0's precondition met, its guess REFUTED** | **MEASURED; ObjMap recycle pool built and REVERTED as a null result; B6 is now the best-evidenced item in this file** | `{}` 41.0ns vs 3.5ns, `{a:1}` 81.5 vs 2.5, `{a,b,c,d}` **148 vs 3.0 (49x)**, `[]` 23.5 vs 2.5, `s.slice(0,5)` 38.5 vs 4.0 — and the no-allocation control is 1.0ns vs node's 1.5ns, i.e. **zipp is FASTER when it allocates nothing**. Reached independently from `regex-log-scan`'s phase split (matchAll 496 vs 71ms; `exec` = 227ns scan + 169ns result object + ~60ns/capture against node's 40ns total, while the non-capturing literal `test` is **0.53x — zipp wins**) and from the object-literal micro. A 4-property literal has gone 513ns → 148ns since B6.0 was written and is still 49x. An `ObjMap` recycle pool (reset + stash the swept box, capacity retained) measured **ZERO** and was reverted — because `[]` costs 24.5ns while mallocing nothing at all, so the malloc is only ~7ns of an object. The cost that remains is the COLLECTOR: holding a larger live set makes the IDENTICAL allocation loop cost more — 74.5 → 101.5 → 122.5ns at live sets of ~0 / 400k / 1.2M, i.e. **+48ns per allocation from nothing but a bigger heap to mark**, where node goes 2.0 → 7.5 → 9.5. B6.0 asked whether the cost was construction or collection and guessed construction; it is both, and only the collection term scales. `typedarray-math` is the one row this does NOT explain — its DataView loop allocates nothing and is already a fully inlined native load, so that one is M4 | **B6.0**, B1 |
 | **B80 sparse enumeration hoists its overlay probe** | **LANDED — `sparse-array` −16.2%, suite −1.41%, THE LARGEST SUITE WIN IN THIS FILE** | `object_enum_own`'s array arm walked `0..dense_len` doing an `array_index_override` HASH PROBE per slot. Strided writes grow the dense vector far past the populated count — measured `dense_len=1,040,001` holding **105** elements for an array with 5,000 keys — so `Object.keys` paid **1.04M hash probes to find 105 elements**: 25ms against node's 0ms, and independent of key count, which is the shape that gave it away. Asked once over the overlay's keys instead; a `defineProperty` on a dense index keeps the per-slot probe. `for…in` 50e6/5k **26ms → 2ms**; the bench phase 42ms → 18ms. Row **−16.2% [−16.9, −14.5]**, suite **−1.41% [−1.90, −1.05]**, both CIs excluding zero, no row regressing outside its CI. Found by phase-timing the SMALLEST bad row, not the largest. Off-switch `ZIPP_NO_ENUM_HOIST=1`; both paths byte-identical on the whole case set |
 | **B79 B5.3 refuted; `promise.then` pristine guard** | **LANDED — `async-promise-chain` −3.2%** | `ZIPP_BUILTINSTATS=1` (new) counts the builtin calls that reach the generic chain: `parse-large-js` **89**, `polymorphic-objects` **0**, `markdown-render` 252,669 (~2.3% of its row) — so **B5.3 is REFUTED**, Effort-M saved. The one row it pointed at is `async-promise-chain`, whose 1,500,003 dispatches are **100% `promise.then`**; that arm proved intrinsic-ness with a full `get_prop` chain walk per call and now uses B69's three-read pristine probe. **100ns → 87ns** per `.then()` (node 73ns); row **−3.2% [−4.0, −2.5]**, suite −0.48% [−0.91, +0.01], no timed row regressing outside its CI. Second finding, bigger than the first: for every builtin WITHOUT a region intrinsic the JIT is SLOWER than the interpreter (`str.startsWith` 44.5 vs 39.0ns) — the generic `CallMethod` arm has no native IC where `GetProp` has an 8-way one. Off-switch `ZIPP_NO_PROMISE_PRISTINE=1` |
 | **B78 method inliner admits the PROTOTYPE chain** | **LANDED, MECHANISM ONLY** | `build_method_shape` had arms for a class instance and for an own data slot, and declined everything else — so `Object.create(proto)` and `Ctor.prototype.m = fn` inlined NEVER, at any receiver count: **29.5ns/call at ONE receiver against 5.5ns for the same method on a class**, node 1.0ns. With the arm: **5.5ns (−81%)**, and the indirectly-loaded receiver 34.8ns → 6.0ns. Guards reuse `SuperInline`'s hop-version emission plus a `holder_vals_ptr[slot] == fn_bits` re-read; resolution is `ic_walk`, so the baked answer is by construction the interpreter's. Suite `--ab-env` on ONE binary, 21 pairs: geomean **−0.28% [−0.81, +0.17]**, **no row regressing with an interval excluding zero**. Ships on the mechanism — the ten rows do not contain the construct, which is a fact about the benches. Off-switch `ZIPP_NO_PROTO_METHOD_INLINE=1` |
@@ -1752,12 +1752,50 @@ DataView swizzle (359ms vs 97ms) allocates nothing and is already a fully
 inlined native load with a pinned bounds check. That gap is the MEM tier's
 memory-backed register file and per-op NaN-boxing, i.e. M4.
 
+**It is the COLLECTOR, not the allocator — and two experiments say so.**
+
+*First, a null result.* An `ObjMap` recycle pool was built and measured: the
+sweep drops each `Box<ObjMap>` and its three parallel `Vec`s, so
+`Heap::free_slot` was changed to reset and stash the box (capacity retained) and
+`NewObject` to take one. Bounded at 4096, off-switch `ZIPP_NO_OBJMAP_POOL=1`.
+Result, on one binary:
+
+| shape | pool ON | pool OFF |
+|---|---:|---:|
+| `{}` | 31.5ns | 31.5ns |
+| `{a:1}` | 72.5ns | 77.0ns |
+| `{a,b,c,d}` | 130.5ns | 131.5ns |
+
+Nothing. **REVERTED.** And the reason is visible in the table above it: `[]`
+costs 24.5ns while allocating no `malloc` at all (`Vec::new()` does not
+allocate), against `{}`'s 31.5ns WITH a `Box`. So the malloc is ~7ns of an
+object's cost and everything else is elsewhere. Recycling what is already cheap
+buys what it should: nothing.
+
+*Second, the experiment that finds the "elsewhere".* Hold a larger LIVE SET and
+re-run the identical allocation loop:
+
+| live set | zipp | node |
+|---|---:|---:|
+| tiny | 74.5ns | 2.0ns |
+| 400,000 objects | 101.5ns | 7.5ns |
+| 1,200,000 objects | 122.5ns | 9.5ns |
+
+**+48ns per allocation from nothing but a bigger heap to trace.** zipp marks the
+whole live heap every `GC_MIN_THRESHOLD` (65,536) allocations, so the cost of
+allocating an object is partly the cost of re-marking every object that already
+exists. node's curve has the same SHAPE — a generational collector still pays
+something — but 13x smaller, because a scavenge traces the nursery rather than
+the heap.
+
 **What this licenses.** B6 is no longer speculative and B6.0's precondition is
-met: the nursery/arena work now has a measured 10-50x to aim at, reached by
-three independent routes. It also re-prices B1 — B6.0 guessed *"B1 is likely to
-remove more of this than a nursery would"*, and the `{}` row (41ns with ZERO
-properties, before any key `String` or `Vec` growth exists) says at least half
-the cost is the object header allocation itself, which B1 does not touch.
+met — with its own question answered against its guess. B6.0 asked whether the
+cost is *construction* or *collection* and reasoned it was construction
+(*"B1 is likely to remove more of this than a nursery would"*). The answer is
+BOTH, split: a fixed construction term (~31ns for `{}`, ~74ns for `{a:1}` at a
+small live set) and a collection term proportional to the live set that
+overtakes it on any real heap. **A nursery is the item that addresses the part
+that scales, and B1 does not touch either half.**
 
 **What it does NOT license**: a claim that any contained change closes it.
 Nothing in §5 does. This is the M5/B6 substrate item, and it is now the
