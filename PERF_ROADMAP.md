@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B87 same fix for `SetIndex`** | **REFUTED, REVERTED** | `json-large`'s `build` deopted **101 times** at a `SetIndex` (42.2% of that row interpreted), so B86's fix was applied to it — narrowly, only the plain-object/string-key branch. Deopts **101 → 0**, interpreted 42.2% → 36.3%, all 13 benches byte-identical — and the row got **+1.1% SLOWER [+0.4, +2.0]**, suite +0.09%. Because the delegating helper can allocate and frame-call a setter, the emitter needed `emit_refetch_pinned` (two native calls) after EVERY `SetIndex` including the hot dense store that never delegates. **Where the new cost lands matters more than how much old cost was removed**: `SetIndexConcat` is rare so B86 was nearly free; `SetIndex` is `a[i] = v`. "Deopts went to zero" is not evidence of a win |
 | **B86 `SetIndexConcat` appends instead of deopting** | **LANDED — `polymorphic-objects` −3.9%** | The profiler's first catch. That row was **60.5% interpreted with six decline messages** — not rejected, but compiled and then thrown away: `SetIndexConcat` handled only an own-slot HIT, and the dict-churn loop writes sixty NEW keys into a fresh `{}` per iteration, so it deopted every time (**131 deopts**), passed `OSR_DEOPT_LIMIT`, and got the region evicted and blacklisted. New keys now delegate to `set_index_concat` — the interpreter's own function, so semantics are identical by construction — with `CALL_THREW` and the pinned refetch the newly-allocating path requires. **Deopts 131 → 0, interpreted 60.5% → 26.6%**, row **−3.9% [−4.5, −2.9]**, no row past the +2% rule, gate green. Invisible to every tool that existed this morning: B83's own phase decomposition called this row "diffuse, no single term to attack" |
 | **B85 `ZIPP_PROF=1` sampling profiler — §6's item since B3** | **LANDED; it reprioritises B6 vs M4 on its first run** | Phase-tagged sampler (200µs), not a stack sampler — fat LTO would have inlined away most frames a `StackWalk64` wanted, and suspending the engine thread to symbolize is a deadlock hazard. Splitting `interp` from `jit-native` is what made it actionable — the two have OPPOSITE fixes. **Compiled-code-bound: `typedarray-math` 99.7%, `parse-large-js` 91.3%, `markdown-render` 68.6% in native code** (only M4 reaches these). **Interpreter-bound: `polymorphic-objects` 60.5%, `json-large` 42.2% INTERPRETED**, with only 6 and 11 decline messages — so their loops are not rejected, they are never offered, which is a tier-entry lead rather than a codegen-quality one. GC reads 0.8-12.6%, independently corroborating B84's `ZIPP_GCSTATS` numbers. So the dominant substrate item is **M4 (memory-backed register file + per-op NaN-boxing)**, not B6 — `parse-large-js` is 2.49x with 99.2% of its time executing JS, which no allocator or collector fix can reach. Built because B84 had to revert a real −35% win for want of attribution |
 | **B84 GC is 2-12% of the suite — B81 CORRECTED; `ZIPP_GCSTATS=1` added** | **INSTRUMENT LANDED; ObjMap pool measured −35% on construction and REVERTED anyway** | Per-phase collector timing says GC is **12% of `regex-log-scan`, 8% of `json-large`, 5% of `markdown-render`, 2% of `polymorphic-objects`** — their live sets (1.4k-78k) never reach where B81's micro curve bites, so the cost is CONSTRUCTION, not collection. B81's table stands; its conclusion did not. The pool's first null result was also wrong — a 4096 cap against a 65,536 GC threshold serves ~6% of a cycle. Re-capped it is **`{a:1}` 71.0 → 46.5ns, `{a,b,c,d}` 138.5 → 88.5ns (−35%)** — but `polymorphic-objects` −5.7% came with `json-large` +1.6% (which RETAINS its tree, so the pool stays empty), a suite CI including zero, and a targeted fix that made BOTH rows worse. Two runs disagreeing by five points on the same change ⇒ revert per §14 | **B81**, B6 |
@@ -1702,6 +1703,48 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B87 — REFUTED: removing 101 deopts made the row SLOWER, because the fix taxed the path that was already fast
+
+B86 fixed `polymorphic-objects` by letting `SetIndexConcat` append a NEW key
+instead of deopting. `json-large` looked like the same disease in a different
+op: fn6 (`build`) region [40] deopted **101 times** at ip 54, a `SetIndex`, and
+that row ran **42.2% interpreted**. `jit_set_index`'s own comment named the
+cause — *"Everything else keeps deopting — a NEW key (shape change)…"* — and
+`build` assigns a fresh computed key on every write.
+
+The same fix was applied, deliberately narrower than B86's: only the
+plain-object-with-string-key branch delegates to `set_index` (the interpreter's
+own function, so semantics identical by construction), leaving every array and
+TypedArray path alone, because each of those deopts guards a documented hazard —
+one exists so that a huge sparse resize panics on the interpreter's stack rather
+than across an `extern "win64"` boundary, where it would be UB.
+
+**Mechanically it worked and it still lost.** Deopts 101 → **0**, interpreted
+42.2% → 36.3%, jit-native 36.4% → 41.8%, all 13 benches byte-identical to node:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| `json-large` | **+1.1%** | **[+0.4, +2.0]** |
+| suite geomean | +0.09% | [−0.16, +0.40] |
+
+**REVERTED.** And the mechanism is visible in the diff rather than hypothetical:
+because the delegating helper can allocate and can frame-call an inherited
+setter, the emitter had to gain `emit_refetch_pinned` — TWO native calls — after
+**every** `SetIndex` in every region, including the hot dense-array store path
+that never delegates and never needed it. The change taxed every array write in
+the engine to remove deopts from one loop, and the tax was larger than the
+deopts.
+
+**The lesson generalises past this patch, and it is the reason B86 worked and
+B87 did not.** B86's helper (`SetIndexConcat`) is a rare op that appears only in
+`obj["k" + e] = v`, so making it heavier is nearly free. `SetIndex` is the
+generic `a[i] = v` — one of the hottest ops in the engine. *Where you put the
+new cost matters more than how much of the old cost you removed*, and "deopts
+went to zero" is not by itself evidence of a win. Any future attempt here has to
+keep the dense-array fast path free of the refetch — e.g. by giving the
+delegating case its own opcode or its own emitted branch, so the common path
+never reaches the code that can allocate.
 
 ### B86 — the profiler's first catch: a region that compiled, then threw itself away
 
