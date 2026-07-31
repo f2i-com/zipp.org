@@ -776,14 +776,21 @@ pub(crate) fn compile_region(
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
     meter: Option<crate::codegen::meter::Meter>,
-) -> Option<JitFn> {
+) -> Option<(JitFn, bool)> {
     // The register/SROA paths decline any region containing a Call/CallMethod, so
     // leaf inlining and method inlining (which apply only to those sites) are
     // reachable only via the memory path below.
+    //
+    // The returned flag is `is_mem` — true when the register-homed path declined
+    // and this region runs out of `[rbx + dreg(r)]`. It exists so the sampling
+    // profiler can charge time to `jit-mem` rather than `jit-fast`: B92 showed the
+    // two tiers differ by ~4x on the same loop, so a single `jit-native` bucket
+    // cannot say whether a row that is 99% native is fast or slow.
     if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot, meter) {
-        return Some(f);
+        return Some((f, false));
     }
     compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan, meter)
+        .map(|f| (f, true))
 }
 
 /// Compile a (rewritten, purely-numeric) field-promoted region via the integer or

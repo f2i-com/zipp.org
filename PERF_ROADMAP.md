@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B93 `jit-native` was TWO tiers wearing one name** | **INSTRUMENT ADDED; the B90/B92 reading of four rows INVERTED** | Splitting the profiler's `jit-native` bucket by tier shows six rows are **57-100% in the MEMORY tier**: class-prototype-hot **99.9%**, typedarray-math 87.8%, map-set-heavy 84.5%, parse-large-js 78.3%, polymorphic-objects 67.5%, sparse-array 57.0%. class-prototype-hot was cited as the row where tier entry is SOLVED. Counting the ops responsible: **2-5% of a region's ops force the other 95-98% onto the slow tier** (polymorphic-objects 3 of 135, class-prototype-hot 3 of 71, sparse-array 2 of 63) and the blocking set is Call/CallMethod/GetIndex/SetIndex. Root cause under several declines is **bytecode temp-register recycling**, not the ops: the simplest possible Float64Array loop declines `pinned receiver reg not cleanly excludable` because r17 is the pinned receiver at ip37 and an arithmetic temp at ip45 — so regalloc's pinned-element `movsd` path is near-dead on real code. Validated on two known-answer workloads + ZIPP_JITLOG. Ceiling is INFERRED from B92's 4.20->1.05ns, not proven on these rows |
 | **B92 one bitwise op demoted a whole region out of register homes** | **LANDED as a MECHANISM (suite flat, mechanism 4x)** | Corrects B81/B83/B90: there are **three** region tiers, and the middle one (`compile_region_regalloc`) ALREADY has the f64 xmm/gpr homes that M4 describes — it just declined `Instr::Bitwise` outright. One `&`/`\|`/`>>>`/`\|0` in a loop demoted the whole region to memory: an identical 20M-iteration loop went **0.75 -> 4.20ns/iter** from adding `i & 1023` (node 0.75 either way). Emitting ToInt32 inline via 64-bit `cvttsd2si` (exact below 2^63; the INT64_MIN indefinite bails) fixes it: **4.20 -> 1.05ns/iter**, verified over **6,144 cases** against node in 4 modes. Suite **-0.39% [-0.78, +0.25]** — flat, because the Bitwise declines went to zero and every one of those 13 regions hit its NEXT blocker. **Tier promotion is a ladder, not a switch**; the next rungs are counted: read-only live-in (5), unpinned GetIndex/SetIndex (7). `ZIPP_NO_DOUBLE_BITWISE=1` |
 | **B91 INT-tier promotion is closed by B9** | **NO CODE CHANGE; hazard documented at the switch** | Four rows are >=85% native, so promoting regions to the INT tier (xmm homes, at parity with V8) is the cheap route to M4. The declines are everywhere — `typedarray-math` 7 regions, `sparse-array` 8, `polymorphic-objects` 7 — under one blanket reason that names nothing, and `compile_region_int_maybe_cold` ALREADY implements the fix behind a `cold_exit` flag the only caller hardcodes to `false`. **That flag is dead on purpose: it is B9, which passed a fully green gate (96,029 test262 executions, both tiers, GC stress) and still returned `s = 0` for `3050`.** The comment now carries the warning at the point of temptation, including that the soundness argument beneath it is the one B9 shipped with and is wrong. Stopped one edit short of reintroducing it — by a kept negative result |
 | **B90 the profiler mis-attributed 24% of json-large** | **INSTRUMENT FIXED; a B83 conclusion CORRECTED** | Single-argument JSON.stringify/JSON.parse are FUSED by the compiler into their own ops and never reach call_native, where the tag sat — a 470ms stringify-only workload reported **100% interp**. Retagging moves json-large to **stringify 24.0%, interp 40.0% -> 15.4%**. B83 had read that 40% as the row not compiling, and B87 was aimed at it. The resting bucket is now interp/untagged, documented as no-tag-active rather than interpreter-running. Added a microtask phase: async-promise-chain splits 79.1% into **60.6% real interpreted user JS + 16.9% event loop**. Corrected profile: **four rows at or above 85% jit-native**, the clearest statement yet that M4 is the wall |
@@ -1708,6 +1709,100 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B93 — `jit-native` was two tiers wearing one name: six rows are 57–100% in the SLOW one, blocked by 2–5% of their ops
+
+B92 established that there are three region tiers and that the middle one already
+has register homes. It could not say **which tier the benchmarks actually run
+in**, because the profiler had a single `jit-native` bucket. Splitting that
+bucket is a four-line change and it inverts the reading of every row:
+
+| row | jit-fast | **jit-mem** | interp/untagged | other |
+|---|---:|---:|---:|---|
+| `class-prototype-hot` | 0.0% | **99.9%** | 0.1% | — |
+| `typedarray-math` | 11.7% | **87.8%** | 0.4% | — |
+| `map-set-heavy` | 0.0% | **84.5%** | 10.7% | gc 4.7% |
+| `parse-large-js` | 14.3% | **78.3%** | 6.5% | — |
+| `polymorphic-objects` | 0.0% | **67.5%** | 28.7% | gc 3.8% |
+| `sparse-array` | 0.0% | **57.0%** | 42.6% | — |
+| `regex-log-scan` | 5.6% | 27.1% | 13.2% | regex 29.8%, gc 16.2% |
+| `markdown-render` | 50.3% | 18.4% | 20.1% | gc 6.9% |
+| `async-promise-chain` | 0.9% | 8.8% | 61.7% | microtask 16.5% |
+| `json-large` | 39.2% | 0.2% | 14.0% | stringify 23.9%, parse 13.8% |
+
+**`class-prototype-hot` was reported as 99.9% `jit-native` and taken as the row
+where "tier entry is solved". It is 99.9% in the memory tier.** So were three of
+the other four rows that carried that reading. B90's corrected profile was right
+about the numbers and wrong about what they meant, and README.md said so too.
+
+**Instrument check first**, since two instruments have already been wrong this
+session. A pure numeric loop reports 98.8% `jit-fast`; a loop over an array of
+64 distinct objects (which defeats field promotion) reports 100.0% `jit-mem`;
+`ZIPP_JITLOG=1` independently confirms one `MEM region` for the latter and
+`INT`/`DOUBLE` for the former. One prediction failed and the instrument was
+right: `o.a` in a loop reports `jit-fast`, because SROA rewrites the field to a
+scratch global and the region genuinely does compile to a register path.
+
+**Then the part that changes what to build.** Counting the ops in each memory
+region that are the reason it is *in* the memory region:
+
+| row | region | ops | blocking | share |
+|---|---|---:|---:|---:|
+| `polymorphic-objects` | 0 | 135 | **3** (GetIndex) | **2%** |
+| `class-prototype-hot` | 0 | 71 | **3** (CallMethod 1, GetIndex 2) | **4%** |
+| `sparse-array` | 1 | 63 | **2** (GetIndex) | **3%** |
+| `sparse-array` | 0 | 132 | 7 | 5% |
+| `typedarray-math` | 0 | 114 | 6 (CallMethod 3, SetIndex 3) | 5% |
+| `typedarray-math` | 1 | 79 | 4 | 5% |
+| `map-set-heavy` | 0 | 241 | 20 (CallMethod) | 8% |
+| `parse-large-js` | 2 | 404 | 33 (CallMethod) | 8% |
+
+Admission is all-or-nothing, so **2–5% of a region's ops force the other 95–98%
+onto the slow tier**. That is B92's cliff again, general: B92 removed one op
+class and the regions kept declining, because the blocking set is
+`Call`/`CallMethod`/`GetIndex`/`SetIndex`, not `Bitwise`.
+
+**And the root cause under several of the declines is register recycling, not
+the ops themselves.** The simplest Float64Array loop that can be written —
+
+```js
+for (var i = 0; i < 1024; i++) { var v = a[i]; s = s + v * 1.5 - 0.25; }
+```
+
+— declines with `pinned receiver reg not cleanly excludable`, so regalloc's
+pinned-element fast path (a direct `movsd` into an xmm home) is close to dead
+code on real programs. The bytecode says why:
+
+```
+37: LoadGlobal dst=17 idx=0      ; r17 = a, the pinned receiver
+39: GetIndex   dst=16 obj=17 key=18
+45: Add        dst=17 a=18 b=19  ; r17 REDEFINED as an arithmetic temp
+```
+
+`def_n[17] == 2`, so the receiver fails the `Some(&1)` test and the region
+declines. r18 is recycled the same way (index `i`, then `s`). The two live
+ranges are disjoint and never interfere — this is temp-register recycling by the
+bytecode compiler, and the planner's non-SSA register model cannot see past it.
+The same cause produces `type conflict on a reused register`. The existing
+comment predicted it: *"Generalizing this needs SSA-like per-use
+disambiguation."*
+
+**What this does and does not license.** It is measured that six rows are in the
+memory tier and that 2–5% of their ops put them there. It is NOT measured what
+those rows would gain from promotion — every attempt to construct a comparable
+array-read loop on the register tier declined for the reason above, which is
+itself the finding. The only tier-gap number in hand is B92's, on a shape both
+tiers accept: **4.20 → 1.05ns/iter**. Treat the ceiling as inferred, not proven.
+For scale, the array-read loop above runs 120ms (Float64Array) / 129ms (Array)
+against node's 17–18ms — **7×**, on the shape zipp is supposedly strongest at.
+
+Two routes out, and the measurement favours the second: make the memory tier
+faster (M4 as written since B81), or stop regions landing there. The blocking
+ops being 2–5% is the argument for the second, and **live-range splitting inside
+the region** is the prerequisite for most of it.
+
+No behaviour change in this entry — `is_mem` is diagnostic and only selects a
+profiler phase.
 
 ### B92 — one bitwise op demoted a whole region out of register homes: 4.20 → 1.05ns on the shape, suite flat
 

@@ -7127,9 +7127,9 @@ impl<'p> Vm<'p> {
         // which may compile NEW regions (rehashing `jit.regions` — any &Region
         // would dangle) or even evict THIS region (parked in `Jit::retired`,
         // so the mmap'd code stays alive for the in-flight run).
-        let (entry, field_plan) = {
+        let (entry, field_plan, is_mem) = {
             let region = self.jit.get_region(func_id, entry_ip)?;
-            (region.entry(), region.field_plan().cloned())
+            (region.entry(), region.field_plan().cloned(), region.is_mem())
         };
 
         // â”€â”€ pre-run sync â”€â”€ load the promoted object's fields into the scratch
@@ -7172,8 +7172,14 @@ impl<'p> Vm<'p> {
         let resume = {
             // Tagged around the native call ONLY, so a region helper that
             // re-enters the interpreter (`run_loop` re-tags itself `Interp`)
-            // does not have its nested time charged to compiled code.
-            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            // does not have its nested time charged to compiled code. Split by
+            // TIER: `jit-mem` is the memory-backed path, which B92 measured ~4x
+            // slower than the register-homed one on an identical loop.
+            let _prof = crate::vm::prof::enter(if is_mem {
+                crate::vm::prof::Phase::JitMem
+            } else {
+                crate::vm::prof::Phase::Jit
+            });
             unsafe {
                 let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
                     std::mem::transmute(entry);

@@ -69,9 +69,15 @@ pub(crate) enum Phase {
     /// runs that is not user JS. `async-promise-chain` reported **79.1% `interp`**
     /// before this existed, and almost none of it was interpreting bytecode.
     Microtask = 11,
+    /// Native compiled code running on the MEMORY-backed register path
+    /// (`region_mem`): every intermediate goes through `[rbx + dreg(r)]` and is
+    /// re-boxed at each step. Split out from `Jit` because B92 measured the two
+    /// tiers ~4x apart on the SAME loop, so "99.7% jit-native" was compatible
+    /// with a row being entirely in the slow tier and said nothing either way.
+    JitMem = 12,
 }
 
-const N_PHASES: usize = 12;
+const N_PHASES: usize = 13;
 
 const NAMES: [&str; N_PHASES] = [
     "interp/untagged",
@@ -84,15 +90,16 @@ const NAMES: [&str; N_PHASES] = [
     "alloc",
     "jit-compile",
     "sort",
-    "jit-native",
+    "jit-fast",
     "microtask",
+    "jit-mem",
 ];
 
 static CURRENT: AtomicU8 = AtomicU8::new(Phase::Interp as u8);
 static COUNTS: [AtomicU64; N_PHASES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
 ];
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);

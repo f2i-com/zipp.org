@@ -699,6 +699,10 @@ pub struct Region {
     /// True if compiled by the integer path. On eviction an int region falls
     /// back to the double path (rather than full-blacklisting the loop).
     is_int: bool,
+    /// True if compiled by the MEMORY path (`region_mem`) rather than one of the
+    /// register-homed paths. Purely diagnostic: `try_run_osr` uses it to pick the
+    /// profiler phase, so `ZIPP_PROF=1` can separate `jit-fast` from `jit-mem`.
+    is_mem: bool,
     /// Set when this region was object-scalar-replaced (SROA): its GetProp/SetProp
     /// were rewritten to scratch field-globals. The interpreter must sync the
     /// object's fields ↔ the pool slots around each native run.
@@ -1201,7 +1205,7 @@ impl Jit {
                         };
                         self.regions.insert(
                             key,
-                            Region { code, start, end, deopts: 0, ok_runs: 0, is_int, field_plan: Some(plan) },
+                            Region { code, start, end, deopts: 0, ok_runs: 0, is_int, is_mem: false, field_plan: Some(plan) },
                         );
                         return;
                     }
@@ -1220,7 +1224,7 @@ impl Jit {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
                 }
                 self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, field_plan: None });
+                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, is_mem: false, field_plan: None });
                 return;
             }
         }
@@ -1233,12 +1237,13 @@ impl Jit {
         let ic_base_idx = self.reserve_ic_sites(n_sites);
         let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
         match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, meter) {
-            Some(code) => {
+            Some((code, is_mem)) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
-                    eprintln!("[jit] DOUBLE/MEM region fn{func_id} [{start},{end}] compiled");
+                    let tier = if is_mem { "MEM" } else { "DOUBLE" };
+                    eprintln!("[jit] {tier} region fn{func_id} [{start},{end}] compiled");
                 }
                 self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: false, field_plan: None });
+                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: false, is_mem, field_plan: None });
             }
             None => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -1377,6 +1382,11 @@ impl Region {
     /// The interpreter syncs the object's fields ↔ the pool globals around `run`.
     pub fn field_plan(&self) -> Option<&FieldSyncPlan> {
         self.field_plan.as_ref()
+    }
+
+    /// True if this region runs on the memory-backed path. Diagnostic only.
+    pub fn is_mem(&self) -> bool {
+        self.is_mem
     }
 }
 
