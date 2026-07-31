@@ -47,6 +47,19 @@ pub(crate) fn wt_share_enabled() -> bool {
     }
 }
 
+pub(crate) fn arr_pin_loose() -> bool {
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match ON.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_ARR_PIN_LOOSE").is_some();
+            ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+            v
+        }
+    }
+}
+
 pub(crate) fn double_bitwise_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -139,7 +152,25 @@ pub(crate) fn plan_region_cold(
             // snapshot's `base` goes stale on any Vec growth, and a regalloc region
             // contains no Call/CallMethod and (by the line above) no SetIndex, so
             // nothing in it can grow the array or trigger a GC.
-            !admit_bitwise && is_arr_pin(k) && matches!(code[ip], Instr::GetIndex { .. })
+            //
+            // B102 FIX: `ARR_INT_PIN_KIND`, not `is_arr_pin`. The latter also
+            // matches `ARR_PIN_KIND`, which is ANY dense array — including an
+            // array of OBJECTS. Its dst then gets a numeric home, `live_in_regs`
+            // entry-loads that home from the previous iteration's element, the
+            // guard sees a heap value and `entry_bail`s — on EVERY OSR entry. The
+            // region self-evicts, displaces the memory compile that was working,
+            // and the loop ends up fully interpreted: measured **204ms -> 2349ms,
+            // an 11x regression**, on `for (…) { o = objs[i & 63]; s += 1.5; }`.
+            // ARR_INT_PIN_KIND carries the plan-time all-Int SAMPLE, which is the
+            // same hint the int path relies on to avoid exactly this thrash.
+            // The double tier takes the two SAMPLED-numeric kinds only. Not
+            // `is_arr_pin`, which also matches `ARR_PIN_KIND` — any dense array,
+            // including one of OBJECTS; see `ARR_NUM_PIN_KIND` for the 11x
+            // entry-bail that caused. `ZIPP_ARR_PIN_LOOSE=1` restores the
+            // unsampled B95 behaviour for A/B.
+            !admit_bitwise
+                && (k == ARR_INT_PIN_KIND || k == ARR_NUM_PIN_KIND || (arr_pin_loose() && is_arr_pin(k)))
+                && matches!(code[ip], Instr::GetIndex { .. })
         })
     };
     // A pinned flat-ASCII STRING access (kind 254): `str.charCodeAt(i)` (CallMethod)

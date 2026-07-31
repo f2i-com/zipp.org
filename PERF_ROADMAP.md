@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B102 B95 shipped a 19x pathology the benchmarks could not see** | **FIXED; a third sampled pin kind** | B95 admitted dense-Array `GetIndex` to the DOUBLE tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND` — **any** dense array, including one of OBJECTS. The element's dst then takes a numeric home, `live_in_regs` entry-loads it, the load sees the previous iteration's object, and the region `entry_bail`s on EVERY OSR entry, self-evicts, and displaces the memory compile that was working: **124ms -> 2349ms, 19x, running 100% interpreted**. Found from a CONTROL micro that was SLOWER than the thing it controlled for (property reads *removed*: 509ms -> 2047ms). The fix is a THIRD kind, not a narrower one — restricting to `ARR_INT_PIN_KIND` killed the pathology but cost `sparse-array-v2` **+6.2% [+0.9, +13.9]** by excluding arrays of DOUBLES, which the double tier hosts fine. `ARR_NUM_PIN_KIND` samples all-NUMBER over the same bounded 64-head/64-stride walk and sits between the two. Suite A/B vs the unsampled build, 21 pairs: **+0.64% [-1.84, +2.66]** — neutral, with `sparse-array-v2`'s regression gone. **All 13 benches stayed byte-identical and the gate was green through the whole pathology**; two of this session's three real defects (this and B97's flush bug) were invisible to the suite and both surfaced as "a number that cannot be right". `ZIPP_ARR_PIN_LOOSE=1` |
 | **B101 the tier programme has a ~15% CEILING** | **COSTING; B94's 3.2x does NOT transfer to real code** | Prices the FINISHED programme (heap ops hosted on the register tier) before building it. Homes in **callee-saved xmm6..15 survive helper calls**, so no spilling is needed and the earlier "spill 12 homes per call" estimate was far too pessimistic; a heap op costs only boxing its operands and unboxing its result. `7 x reads - 10 x heapops`, weighted by each row's mem share: **32 / 22 / 15 / 14 / 12 / 5 / 4%**, geomean **~15%** — **1.79x -> ~1.51x, not parity**. B94's 3.2x micro is ~100% numeric ops; real regions are 10-25% heap ops and (B99) mostly single-use temps. Parity has to attack the NUMBER and COST of heap ops instead: GetProp/SetProp are helper calls (~20-40 instrs) where an inline monomorphic access behind a shape check is 3-4 — the same order as the whole tier merge, and they compose |
 | **B99 register homes IN the memory tier** | **REFUTED BY MEASUREMENT; no code written** | A home saves ~7 instructions per operand read but costs ~7 to FILL, so it breaks even at one use. Counting the biggest region per row, only **6-17 of 34-88** numeric reads land on a multi-use register: net instructions/iteration from promoting the ten best candidates is **0, 0, 0, -28, -14, +42** — five of six rows gain nothing or LOSE. Cause is the bytecode shape (`LoadGlobal t; use t` per operand, so almost everything is a single-use temp), the cost-side view of B93's "LoadGlobal is 29-37% of every mem region". Corrects why the register tier is fast: not caching multi-use values (there are none) but keeping a GLOBAL in one home for the whole region, guarded once. Next probe is therefore LoadGlobal/consumer FUSION — which was then priced the same way and ALSO refuted: only **0-11%** of numeric reads are fusable (0% on map-set-heavy, parse-large-js and markdown-render), because a global must be used ONLY numerically to be homeable and these regions use globals for objects, strings and receivers too. Both local routes into the memory tier are closed; whole-region TYPE SPECIALISATION is the only thing that removes the per-operand check, and the hot regions cannot have it while they contain Call/CallMethod |
 | **B97/B98 write-through home sharing + Add live-ins (double path)** | **MECHANISM; suite NULL; first DOUBLE regions ever compiled here** | B97 lets a `read_outside` register SHARE an xmm home by generalising B94's write-through (store each def to `[rbx+dreg(r)]`, skip it in the flush) — removing the `xmm pool exhausted` blocker B95 called terminal. B98 admits `Add` operands as numeric-required uses of a read-only live-in **on the double path only**: the 3.31x->3.45x regression that refuted this was BLANKET admission on the INT path, and its stated causes were string/double/object live-ins — a double is native here, so the largest cause does not apply. Together: **class-prototype-hot 3 declines -> 1**, polymorphic-objects 7 -> 3, and DOUBLE regions **0 -> 1 / 0 -> 1 / 0 -> 3**. Suite **-0.16% [-1.87, +1.42]** — null; the promoted regions are COLD, and the hot ones are now blocked by `CallMethod`, a MISSING CAPABILITY (the register tier issues no calls; B78's method inlining is memory-path only) rather than an admission gate. **Introduced a wrong-answer bug** (a shareable reg loses its entry load; an untaken-branch def then flushed a garbage home) caught by the kept `hoisted_const_on_untaken_branch` tests while all 13 benches still said ALL_CORRECT=1. Also: a pre-fix A/B showed sparse-array -3.0% twice; it did NOT reproduce on the fixed build. `ZIPP_NO_WT_SHARE=1` |
@@ -1715,6 +1716,69 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B102 — B95 shipped a 19× pathology, and the benchmarks could not see it
+
+Found while pricing inline property access. The control micro — the SAME loop
+with the property reads *removed* — ran **four times slower** than the one with
+them:
+
+```js
+for (i = 0; i < 20000000; i++) { o = objs[i & 63]; s = s + o.a + o.b + o.c; }  // 509ms
+for (i = 0; i < 20000000; i++) { o = objs[i & 63]; s = s + 1.5 + 2.5 + 3.5; }  // 2047ms
+```
+
+Removing work made it slower, which is always a compiled-tier accident. It was:
+`ZIPP_JITLOG` shows the second loop compiling a **DOUBLE region**, then
+`deopt at ip 33` — the region header — on every entry, self-evicting, displacing
+the memory compile that had been working, and ending **100% interpreted**.
+
+**The cause is B95, landed earlier tonight.** It admitted a dense-Array
+`GetIndex` to the double tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND`:
+**any** dense array, including an array of OBJECTS. The element's dst then gets a
+numeric home, and `live_in_regs` entry-loads every numeric home (deliberately —
+so an early exit flushes the frame's own value rather than garbage). That entry
+load sees the previous iteration's object, `emit_box_to_home` rejects it, and
+`entry_bail` fires before the loop body ever runs.
+
+The INT tier never had this problem because it requires `ARR_INT_PIN_KIND`, a
+bounded plan-time SAMPLE of the elements. **B95 took the emitter idiom and
+dropped the sampling hint that makes it safe** — and the entry in this file even
+quotes the reason it exists ("Sampling keeps a known-double array from compiling
+INT and then deopt-thrashing to eviction").
+
+**The fix is a third pin kind, not a narrower one.** The first attempt restricted
+the double tier to `ARR_INT_PIN_KIND`; that killed the pathology but cost
+`sparse-array-v2` **+6.2% [+0.9, +13.9]**, because it also excluded arrays of
+DOUBLES, which the double tier can host perfectly well and was legitimately
+promoting. So `ARR_NUM_PIN_KIND` samples for all-NUMBER (Int or double) with the
+same bounded 64-head-plus-64-stride walk, and sits between the two existing kinds:
+
+| kind | sample | tier that can host it |
+|---|---|---|
+| `ARR_INT_PIN_KIND` | all Int | INT (i64 homes) |
+| **`ARR_NUM_PIN_KIND`** | **all number** | **DOUBLE (f64 homes)** |
+| `ARR_PIN_KIND` | none | memory only |
+
+| shape | B95 | first fix | B102 |
+|---|---:|---:|---:|
+| array of OBJECTS (the pathology) | 2349ms | 181ms | **124ms** |
+| array of doubles | promoted | *declined* | **promoted** |
+| `sparse-array-v2` vs loose | — | **+6.2%** | **−0.1%** |
+
+Suite A/B against the unsampled version, 21 pairs: geomean **+0.64%
+[−1.84, +2.66]** — neutral, `polymorphic-objects` −2.8% [−12.0, −0.1], and
+`sparse-array-v2`'s regression gone.
+
+**Method.** The benchmarks never saw this. All 13 stayed byte-identical, the
+gate was green, and the A/B I ran at the time showed nothing — because none of
+the ten rows indexes an array of objects in a hot loop while the JIT is deciding
+tiers. It surfaced only from a CONTROL micro built to isolate something else, and
+only because the control was *slower than the thing it controlled for*. Two of
+tonight's three real defects (this and B97's flush bug) were invisible to the
+benchmark suite; both showed up as "a number that cannot be right".
+
+`ZIPP_ARR_PIN_LOOSE=1` restores the unsampled behaviour for bisection.
 
 ### B101 — the whole tier programme has a ceiling of ~15%, and B94's 3.2× does not transfer
 

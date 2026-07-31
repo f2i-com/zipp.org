@@ -180,9 +180,26 @@ pub const ARR_PIN_KIND: u8 = 253;
 /// deopt-thrashing to eviction.
 pub const ARR_INT_PIN_KIND: u8 = 252;
 
-/// Both dense-Array pin kinds — same snapshot and same memory-path treatment.
+/// `TaPin::kind` for a dense Array **observed to hold only NUMBERS** (Int-tagged
+/// or double) at OSR compile time. Identical to `ARR_PIN_KIND` in layout,
+/// snapshotting and every memory-path use; the separate kind exists so the
+/// DOUBLE tier can admit `arr[i]`, unboxing the element into an f64 home.
+///
+/// It is the middle of three deliberately: `ARR_INT_PIN_KIND` excludes arrays of
+/// doubles (an i64 home cannot hold one), and `ARR_PIN_KIND` includes arrays of
+/// OBJECTS. B95 admitted the latter to the double tier and the element's numeric
+/// home was then ENTRY-LOADED from the previous iteration's object, so the region
+/// `entry_bail`ed on every OSR entry, self-evicted, displaced the memory compile
+/// that was working, and the loop ran interpreted — **181ms → 2349ms**.
+///
+/// Same contract as its siblings: the sample is a HEURISTIC deciding only whether
+/// the tier is worth attempting, and soundness rests on the per-access tag guard
+/// that re-checks the element actually loaded.
+pub const ARR_NUM_PIN_KIND: u8 = 251;
+
+/// All three dense-Array pin kinds — same snapshot and same memory-path treatment.
 pub fn is_arr_pin(kind: u8) -> bool {
-    kind == ARR_PIN_KIND || kind == ARR_INT_PIN_KIND
+    kind == ARR_PIN_KIND || kind == ARR_INT_PIN_KIND || kind == ARR_NUM_PIN_KIND
 }
 
 /// Compile-time plan for inline TypedArray element access in a memory-path

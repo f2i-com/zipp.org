@@ -227,7 +227,22 @@ impl<'p> Vm<'p> {
                     if all_int {
                         crate::codegen::ARR_INT_PIN_KIND
                     } else {
-                        crate::codegen::ARR_PIN_KIND
+                        // Not all-Int, but possibly all-NUMBER (an array of
+                        // doubles). Same bounded sample; offers the array to the
+                        // DOUBLE tier, which unboxes the element into an f64 home.
+                        // Without this middle kind the double tier either excludes
+                        // arrays of doubles or admits arrays of OBJECTS and
+                        // entry-bails forever (see `ARR_NUM_PIN_KIND`).
+                        let all_num = items[..head].iter().all(|v| v.is_number())
+                            && (n <= head || {
+                                let step = (n - head).div_ceil(64).max(1);
+                                items[head..].iter().step_by(step).all(|v| v.is_number())
+                            });
+                        if all_num {
+                            crate::codegen::ARR_NUM_PIN_KIND
+                        } else {
+                            crate::codegen::ARR_PIN_KIND
+                        }
                     }
                 }
                 (HeapObj::DataView { .. }, Recv::Dv) => crate::codegen::DV_PIN_KIND,
