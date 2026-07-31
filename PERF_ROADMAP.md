@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B81 allocation is 10-50x node — B6.0's precondition met** | **MEASURED; substrate item now the best-evidenced in this file** | `{}` 41.0ns vs 3.5ns, `{a:1}` 81.5 vs 2.5, `{a,b,c,d}` **148 vs 3.0 (49x)**, `[]` 23.5 vs 2.5, `s.slice(0,5)` 38.5 vs 4.0 — and the no-allocation control is 1.0ns vs node's 1.5ns, i.e. **zipp is FASTER when it allocates nothing**. Reached independently from `regex-log-scan`'s phase split (matchAll 496 vs 71ms; `exec` = 227ns scan + 169ns result object + ~60ns/capture against node's 40ns total, while the non-capturing literal `test` is **0.53x — zipp wins**) and from the object-literal micro. A 4-property literal has gone 513ns → 148ns since B6.0 was written and is still 49x. Re-prices B1: the `{}` row has zero properties, so at least half the cost is the object-header allocation B1 does not touch. `typedarray-math` is the one row this does NOT explain — its DataView loop allocates nothing and is already a fully inlined native load, so that one is M4 | **B6.0**, B1 |
 | **B80 sparse enumeration hoists its overlay probe** | **LANDED — `sparse-array` −16.2%, suite −1.41%, THE LARGEST SUITE WIN IN THIS FILE** | `object_enum_own`'s array arm walked `0..dense_len` doing an `array_index_override` HASH PROBE per slot. Strided writes grow the dense vector far past the populated count — measured `dense_len=1,040,001` holding **105** elements for an array with 5,000 keys — so `Object.keys` paid **1.04M hash probes to find 105 elements**: 25ms against node's 0ms, and independent of key count, which is the shape that gave it away. Asked once over the overlay's keys instead; a `defineProperty` on a dense index keeps the per-slot probe. `for…in` 50e6/5k **26ms → 2ms**; the bench phase 42ms → 18ms. Row **−16.2% [−16.9, −14.5]**, suite **−1.41% [−1.90, −1.05]**, both CIs excluding zero, no row regressing outside its CI. Found by phase-timing the SMALLEST bad row, not the largest. Off-switch `ZIPP_NO_ENUM_HOIST=1`; both paths byte-identical on the whole case set |
 | **B79 B5.3 refuted; `promise.then` pristine guard** | **LANDED — `async-promise-chain` −3.2%** | `ZIPP_BUILTINSTATS=1` (new) counts the builtin calls that reach the generic chain: `parse-large-js` **89**, `polymorphic-objects` **0**, `markdown-render` 252,669 (~2.3% of its row) — so **B5.3 is REFUTED**, Effort-M saved. The one row it pointed at is `async-promise-chain`, whose 1,500,003 dispatches are **100% `promise.then`**; that arm proved intrinsic-ness with a full `get_prop` chain walk per call and now uses B69's three-read pristine probe. **100ns → 87ns** per `.then()` (node 73ns); row **−3.2% [−4.0, −2.5]**, suite −0.48% [−0.91, +0.01], no timed row regressing outside its CI. Second finding, bigger than the first: for every builtin WITHOUT a region intrinsic the JIT is SLOWER than the interpreter (`str.startsWith` 44.5 vs 39.0ns) — the generic `CallMethod` arm has no native IC where `GetProp` has an 8-way one. Off-switch `ZIPP_NO_PROMISE_PRISTINE=1` |
 | **B78 method inliner admits the PROTOTYPE chain** | **LANDED, MECHANISM ONLY** | `build_method_shape` had arms for a class instance and for an own data slot, and declined everything else — so `Object.create(proto)` and `Ctor.prototype.m = fn` inlined NEVER, at any receiver count: **29.5ns/call at ONE receiver against 5.5ns for the same method on a class**, node 1.0ns. With the arm: **5.5ns (−81%)**, and the indirectly-loaded receiver 34.8ns → 6.0ns. Guards reuse `SuperInline`'s hop-version emission plus a `holder_vals_ptr[slot] == fn_bits` re-read; resolution is `ic_walk`, so the baked answer is by construction the interpreter's. Suite `--ab-env` on ONE binary, 21 pairs: geomean **−0.28% [−0.81, +0.17]**, **no row regressing with an interval excluding zero**. Ships on the mechanism — the ten rows do not contain the construct, which is a fact about the benches. Off-switch `ZIPP_NO_PROTO_METHOD_INLINE=1` |
@@ -762,6 +763,18 @@ be the first half of it.
   `CallMethod` arm has no native inline cache at all, unlike `GetProp` in the
   same file. THAT is the real open item, and it is a codegen item, not a naming
   one.
+- [ ] **B82 Inline the target of `f.call(…)` / `f.apply(…)`.** Measured in B80:
+  `.call`, `.apply` and a PRE-BOUND function all cost ~60ns against node's
+  1-3ns, while the same function called directly costs 2.5ns because B78's
+  inliner inlines it. The pre-bound number is the one that localises the cause —
+  a bound call never enters `dispatch_builtin_method_inner`, so this is not
+  builtin name dispatch, it is `call_value`'s `frames.push` + nested `run_loop`,
+  which no inliner reaches. The fix is to recognise the `call`/`apply` shape at
+  a `CallMethod` site and inline the TARGET, continuing B74/B76/B78. Suite prize
+  is small (`sparse-array` alone, 135,715 calls, ~4% of that row); the
+  real-world prize is every polyfill, `hasOwn.call(o, k)` and
+  `Array.prototype.slice.call(arguments)`. **Effort:** M. **Gain:** ~4% on one
+  row, 20-60x on a ubiquitous idiom.
 - [ ] **B5.4 `JSON.parse` allocates every key twice.** `vm/mathjson.rs` collects
   `Vec<(String, Value)>` and then calls `map.set(&k, …)`, which does
   `key.to_string()` again. Subsumed by B1.1, but trivial standalone.
@@ -1687,6 +1700,69 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B81 — B6.0's measurement, finally taken: ALLOCATION is 10-50x node, and it is the largest systemic cost in the engine
+
+B6.0 has gated the nursery since it was written — *"Measure first. The previous
+roadmap asserted ~214 ns/object allocation against node's ~10 ns, but the
+microbenchmark above puts a 4-property literal at 513 ns total, most of it
+construction rather than collection."* Here is that measurement, taken from
+three independent directions that all converged on it.
+
+**Direct, by shape** (2M allocations per loop, each discarded immediately):
+
+| shape | zipp | node | ratio |
+|---|---:|---:|---:|
+| `{}` | 41.0ns | 3.5ns | 12x |
+| `{a:1}` | 81.5ns | 2.5ns | 33x |
+| `{a,b,c,d}` | **148.0ns** | 3.0ns | **49x** |
+| `[]` | 23.5ns | 2.5ns | 9x |
+| `[1,2,3]` | 29.5ns | 2.5ns | 12x |
+| `"str" + int` | 38.0ns | 15.0ns | 2.5x |
+| `s.slice(0,5)` | 38.5ns | 4.0ns | 10x |
+| *no allocation (control)* | *1.0ns* | *1.5ns* | *0.7x* |
+
+The control row is the important one: with no allocation zipp is FASTER than
+node. Every gap above is allocation and nothing else. A 4-property literal has
+come 513ns → 148ns since B6.0 was written (mimalloc plus the intervening work),
+and is still **49x** node — because V8 bump-allocates into a nursery with inline
+properties, and zipp mallocs a `Box<ObjMap>` plus a `String` per key plus the
+first push on each of three parallel `Vec`s, then frees all of it on sweep
+(`Heap::free_slot` replaces the object with a tombstone, dropping the Box).
+
+**Why this is the headline and not a footnote — the two worst rows both reduce
+to it.** `regex-log-scan` (3.69x), phase-timed:
+
+| phase | zipp | node | gap |
+|---|---:|---:|---:|
+| **matchAll** | 496ms | 71ms | **425ms** |
+| **corpus generation** | 560ms | 211ms | **349ms** |
+| ip capture | 165ms | 21ms | 144ms |
+| replace | 199ms | 60ms | 139ms |
+| alternation | 61ms | 8ms | 53ms |
+| literal test | 37ms | 70ms | **−33ms (zipp WINS)** |
+
+and `exec` decomposes as **227ns scan + 169ns result object + ~60ns per capture
+group**, against node's 40ns total. The result object is an Array allocation
+plus one string allocation per capture — i.e. the table above. That the
+non-capturing literal `test` is 0.53x is the control that proves it: B8's "we
+beat V8 at scanning" survives, and what does not survive is producing objects.
+
+`typedarray-math` (3.74x) is the one row where this is NOT the story — its
+DataView swizzle (359ms vs 97ms) allocates nothing and is already a fully
+inlined native load with a pinned bounds check. That gap is the MEM tier's
+memory-backed register file and per-op NaN-boxing, i.e. M4.
+
+**What this licenses.** B6 is no longer speculative and B6.0's precondition is
+met: the nursery/arena work now has a measured 10-50x to aim at, reached by
+three independent routes. It also re-prices B1 — B6.0 guessed *"B1 is likely to
+remove more of this than a nursery would"*, and the `{}` row (41ns with ZERO
+properties, before any key `String` or `Vec` growth exists) says at least half
+the cost is the object header allocation itself, which B1 does not touch.
+
+**What it does NOT license**: a claim that any contained change closes it.
+Nothing in §5 does. This is the M5/B6 substrate item, and it is now the
+best-evidenced item in this file.
+
 ### B80 — a sparse array's enumeration paid 1.04 MILLION hash probes to find 105 elements
 
 **How it was found: by decomposing the worst small row, not by reading code.**
@@ -1769,6 +1845,40 @@ loop-invariant, in a function nobody had profiled, found by phase-timing the
 smallest bad row instead of the largest. `sparse-array` is 149ms — the whole
 investigation, from first phase timing to landed fix, cost less wall-clock than
 one 21-pair A/B.
+
+**What the same decomposition found NEXT, measured and left open.** After the
+hoist, `sparse-array` is 120ms against node's 50ms and the remaining gap is:
+`delete`+hole-iter 46 vs 18ms, `in`+`hasOwn` 22 vs 7ms, slice/concat 18 vs 7ms,
+`for…in` 15 vs 9ms, packed-build+indexOf 11 vs 5ms, stride-writes 8 vs 4ms.
+Splitting the `in`+`hasOwn` phase produced the sharpest number in this file:
+
+| | zipp | node | ratio |
+|---|---:|---:|---:|
+| `triv()` (direct, inlined) | 2.5ns | 0.5ns | 5x |
+| `o.m()` (method, inlined) | 2.5ns | 0.5ns | 5x |
+| **`triv.call(null)`** | **63.0ns** | 3.0ns | **21x** |
+| `triv.apply(null)` | 61.5ns | 0.5ns | 123x |
+| **pre-bound `bound()`** | **59.5ns** | 1.0ns | **60x** |
+| `Reflect.apply(triv, null, [])` | 111.0ns | 3.5ns | 32x |
+
+The pre-bound row is what localises it: a bound call never touches
+`dispatch_builtin_method_inner` at all, so the ~60ns is NOT the builtin
+name-dispatch preamble — it is the generic reflective call path (`call_value`),
+which `.call`, `.apply` and a bound function all share. And the reason a direct
+call is 2.5ns is that B78's inliner INLINES it; `call_value` ends in
+`frames.push` + a nested `run_loop`, which no inliner reaches.
+
+So the fix is not a faster `call_value` — it is teaching the call inliner to
+recognise `Function.prototype.call`/`apply` at a call site and inline the
+TARGET, which is the natural continuation of B74/B76/B78. `hasOwn.call(o, k)`,
+`Array.prototype.slice.call(arguments)` and every polyfill in existence are this
+shape. Suite prize is small (only `sparse-array` uses it, 135,715 times, ~4% of
+that row); the real-world prize is not. **Recorded, not started.**
+
+Also measured while there and left alone: `delete a[i]` on a dense array is a
+FLAT ~50-60ns/op at every scale tested (200k and 1M elements, stride 5 and 50)
+against node's ~25ns. Flat means it is a per-op constant, not an algorithmic
+problem — worth ~7ms of `sparse-array` and nothing structural to fix.
 
 Pinned by 8 cases in `tests/sparse_enum_hoist.rs`, all node-verified, and the
 whole case set produces byte-identical output with `ZIPP_NO_ENUM_HOIST=1` (the

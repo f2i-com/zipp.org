@@ -14,18 +14,18 @@ polymorphic-objects-v2: OK
 sparse-array-v2: OK
 ALL_CORRECT=1
 
-startup(ms): node=55 bun=179 deno=80 zipp=30 zipp_nojit=28   (best of 5)
+startup(ms): node=55 bun=164 deno=77 zipp=28 zipp_nojit=28   (best of 9)
 
 bench                      node      bun     deno     zipp   zipp_nojit  zipp/node
 ----------------------   ------   ------   ------   ------   ----------  ---------
-parse-large-js            238ms    174ms    208ms    583ms       3276ms      2.45x
-json-large                256ms    185ms    241ms    441ms       1232ms      1.72x
-markdown-render           235ms    161ms    229ms    438ms       1643ms      1.86x
-map-set-heavy             681ms    778ms   1130ms    675ms        795ms      0.99x
-typedarray-math           168ms    853ms     82ms    644ms       7948ms      3.83x
-regex-log-scan            417ms    499ms    383ms   1567ms       3560ms      3.76x
-class-prototype-hot       263ms    273ms    241ms    372ms       5651ms      1.41x
-async-promise-chain       298ms    333ms    268ms    625ms        723ms      2.10x
-polymorphic-objects       290ms    273ms    249ms    616ms       1396ms      2.12x
-sparse-array               47ms     48ms     44ms    149ms        605ms      3.17x
+parse-large-js            239ms    186ms    210ms    594ms       3295ms      2.49x
+json-large                264ms    205ms    239ms    445ms       1237ms      1.69x
+markdown-render           242ms    176ms    228ms    455ms       1655ms      1.88x
+map-set-heavy             772ms    808ms   1352ms    788ms        913ms      1.02x
+typedarray-math           174ms    892ms     89ms    650ms       8268ms      3.74x
+regex-log-scan            432ms    529ms    375ms   1592ms       3564ms      3.69x
+class-prototype-hot       275ms    287ms    241ms    376ms       5571ms      1.37x
+async-promise-chain       305ms    310ms    273ms    590ms        690ms      1.93x
+polymorphic-objects       279ms    275ms    249ms    593ms       1374ms      2.13x
+sparse-array               45ms     59ms     44ms    124ms        564ms      2.76x
 DONE
