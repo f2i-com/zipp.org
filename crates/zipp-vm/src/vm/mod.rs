@@ -1402,6 +1402,7 @@ mod props;
 mod mathjson;
 mod access;
 mod builtins;
+pub(crate) use builtins::builtin_stats;
 mod values;
 mod temporal;
 mod intl;

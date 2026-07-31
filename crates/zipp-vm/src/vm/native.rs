@@ -884,6 +884,30 @@ pub fn proto_method(id: u16) -> Option<(&'static str, u8, u8)> {
         .and_then(|i| PROTO_METHODS.get(i as usize).copied())
 }
 
+/// The native id of `Promise.prototype.<name>` for the three methods
+/// `dispatch_builtin_method_inner` claims (kind 7), or `None` for any other
+/// name. The reverse of [`proto_method`] for exactly that slice.
+///
+/// Resolved by scanning the table ONCE and caching, rather than by hard-coding
+/// three indices: the ids are positional (`PROTO_METHODS[i]` has id
+/// `PROTO_METHOD_BASE + i`), so a literal would silently point at the wrong
+/// native the first time someone inserts a row above the Promise block.
+pub fn promise_proto_method_id(name: &str) -> Option<u16> {
+    use std::sync::OnceLock;
+    static IDS: OnceLock<[(&'static str, u16); 3]> = OnceLock::new();
+    let ids = IDS.get_or_init(|| {
+        let find = |want: &str| {
+            PROTO_METHODS
+                .iter()
+                .position(|(n, k, _)| *k == 7 && *n == want)
+                .map(|i| PROTO_METHOD_BASE + i as u16)
+                .expect("Promise.prototype method missing from PROTO_METHODS")
+        };
+        [("then", find("then")), ("catch", find("catch")), ("finally", find("finally"))]
+    });
+    ids.iter().find(|(n, _)| *n == name).map(|(_, id)| *id)
+}
+
 /// The spec `name` and `length` of a static/namespace native (Object.*,
 /// Reflect.*, Function.prototype.call, …) so it exposes real own `name`/
 /// `length` properties like any function. (Proto methods use `proto_method`.)

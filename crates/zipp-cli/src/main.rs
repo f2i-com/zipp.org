@@ -17,6 +17,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stats = std::env::var_os("ZIPP_SHAPESTATS").is_some();
+    let bstats = std::env::var_os("ZIPP_BUILTINSTATS").is_some();
     // Run the engine on a dedicated thread with a large stack. The interpreter
     // keeps JS recursion in an explicit frame stack, but every NATIVE re-entry
     // (a builtin callback, a generator/async resume, a direct eval, a JIT
@@ -34,6 +35,15 @@ fn main() -> ExitCode {
     if stats {
         let (n, mx, tot) = zipp_vm::shape_stats();
         eprintln!("[shape] nodes={n} max_fanout={mx} edges={tot}");
+    }
+    if bstats {
+        let rows = zipp_vm::builtin_stats();
+        let total: u64 = rows.iter().map(|(_, _, c)| *c).sum();
+        eprintln!("[builtin] {} distinct (kind, name) pairs, {total} calls", rows.len());
+        for (kind, name, calls) in rows.iter().take(40) {
+            let pct = if total == 0 { 0.0 } else { *calls as f64 * 100.0 / total as f64 };
+            eprintln!("[builtin] {calls:>10}  {pct:>5.1}%  {kind}.{name}");
+        }
     }
     match r {
         Ok(()) => ExitCode::SUCCESS,

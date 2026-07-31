@@ -7,6 +7,122 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// `ZIPP_BUILTINSTATS=1` counts every builtin method dispatch by
+/// `(receiver kind, method name)` and prints the histogram at exit.
+///
+/// It exists because the B5.3 target list should come from the benchmarks, not
+/// from reading `string_ops.rs` and picking what looks expensive — §5's standing
+/// lesson is that every probe which started from reading the code and reasoning
+/// about what ought to be costly has been wrong. Measured with it OFF the
+/// counter is one relaxed atomic load, and the `Mutex` is only ever reached when
+/// it is on.
+///
+/// What makes the list actionable: a builtin that HAS a region intrinsic runs at
+/// or near node (`charCodeAt` 0.5ns, `map.get` 6.5ns, `set.has` 7.0ns) and one
+/// that does not costs 26-45ns in BOTH tiers — and in compiled code it is
+/// actually slower than the interpreter, because the region pays the
+/// `jit_call_method_ic` round trip on top of the identical shared dispatch
+/// (`str.startsWith` 44.5ns JIT against 39.0ns NOJIT).
+mod bstats {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Mutex;
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static TABLE: Mutex<Option<HashMap<(&'static str, String), u64>>> = Mutex::new(None);
+
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_BUILTINSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    pub(super) fn bump(kind: &'static str, name: &str) {
+        let mut g = match TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *g.get_or_insert_with(HashMap::new)
+            .entry((kind, name.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    /// `(kind, name, calls)` sorted by call count, descending.
+    pub fn dump() -> Vec<(&'static str, String, u64)> {
+        let g = match TABLE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut v: Vec<_> = match &*g {
+            Some(m) => m.iter().map(|((k, n), c)| (*k, n.clone(), *c)).collect(),
+            None => Vec::new(),
+        };
+        v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(b.0)).then_with(|| a.1.cmp(&b.1)));
+        v
+    }
+}
+
+pub use bstats::dump as builtin_stats;
+
+/// Classify a receiver for the [`bstats`] histogram. Deliberately coarse — the
+/// question it answers is "which (kind, name) pairs deserve a region intrinsic",
+/// and that is decided per heap kind.
+#[inline]
+fn builtin_stats_count(vm: &Vm<'_>, recv: Value, name: &str) {
+    if !bstats::enabled() {
+        return;
+    }
+    let kind = if recv.is_number() {
+        "number"
+    } else if !recv.is_heap() {
+        "primitive"
+    } else {
+        match vm.heap.get(recv.heap_index()) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => "string",
+            HeapObj::Array(_) => "array",
+            HeapObj::Object(_) => "object",
+            HeapObj::Map { .. } => "map",
+            HeapObj::Set(_) => "set",
+            HeapObj::Promise { .. } => "promise",
+            HeapObj::RegExp { .. } => "regexp",
+            HeapObj::Date(_) => "date",
+            HeapObj::TypedArray { .. } => "typedarray",
+            HeapObj::DataView { .. } => "dataview",
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) => "function",
+            _ => "other",
+        }
+    };
+    bstats::bump(kind, name);
+}
+
+/// `ZIPP_NO_PROMISE_PRISTINE=1` makes `promise_method_is_intrinsic` always
+/// decline, which restores the original `get_prop`-walk proof EXACTLY — the
+/// probe sits behind a `||`, so a `false` runs the old expression unchanged.
+/// Exists so B79 can be A/B'd with `tools/bench.py --ab-env` on ONE binary (no
+/// fat-LTO layout confound, the thing B77 was reverted for), and so any
+/// behaviour question can be bisected against the old path without a rebuild.
+#[inline]
+fn promise_pristine_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROMISE_PRISTINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Try a builtin method on an array or string receiver. Returns
     /// `Ok(Some(result))` when `name` is a recognised builtin, `Ok(None)` when
@@ -83,6 +199,7 @@ impl<'p> Vm<'p> {
         name: &str,
         args: &[Value],
     ) -> Result<Option<Value>, Thrown> {
+        builtin_stats_count(self, recv, name);
         // The reassignable prototype methods (`toString`/`valueOf`/
         // `toLocaleString`) must resolve through the prototype chain, not be
         // shadowed by the built-in type fast path. After e.g.
@@ -292,11 +409,37 @@ impl<'p> Vm<'p> {
                 // the chain resolves to the matching kind-7 intrinsic native
                 // does the inline path fire; otherwise defer to the caller's
                 // get_prop + call_value so the override runs.
-                let m = self.get_prop(recv, name)?;
-                let is_intrinsic = m.is_heap()
-                    && matches!(self.heap.get(m.heap_index()),
-                                HeapObj::Native(id) if native::proto_method(*id)
-                                    .is_some_and(|(n, k, _)| k == 7 && n == name));
+                //
+                // B79: that proof used to be a full `get_prop(recv, name)` — a
+                // Promise receiver misses `get_member`'s fast path on the heap
+                // discriminant, so it took `get_member_slow`'s exotic preamble
+                // and then walked the chain, on EVERY `.then()`. The pristine
+                // probe below decides the same question from three cheap reads
+                // (`proto_of` is a paged `SlotTable`, not a hash map), and it is
+                // the guard shape B69 already uses for `re.test`/`re.exec`.
+                // `async-promise-chain` makes 1,500,003 of these calls and
+                // nothing else — 100% of its builtin dispatches.
+                //
+                // A subclass instance, an own shadow, or a patched
+                // `Promise.prototype.then` all fail the probe and fall through
+                // to the unchanged `get_prop` proof below, so the override
+                // semantics the tests observe are decided by exactly the same
+                // code as before.
+                let is_intrinsic = if let Some(want) = native::promise_proto_method_id(name) {
+                    self.promise_method_is_intrinsic(idx, name, want) || {
+                        let m = self.get_prop(recv, name)?;
+                        m.is_heap()
+                            && matches!(self.heap.get(m.heap_index()),
+                                        HeapObj::Native(id) if native::proto_method(*id)
+                                            .is_some_and(|(n, k, _)| k == 7 && n == name))
+                    }
+                } else {
+                    let m = self.get_prop(recv, name)?;
+                    m.is_heap()
+                        && matches!(self.heap.get(m.heap_index()),
+                                    HeapObj::Native(id) if native::proto_method(*id)
+                                        .is_some_and(|(n, k, _)| k == 7 && n == name))
+                };
                 if is_intrinsic {
                     self.promise_method(idx, name, args)
                 } else {
@@ -308,6 +451,46 @@ impl<'p> Vm<'p> {
             HeapObj::DataView { .. } => self.dataview_method(idx, name, args),
             HeapObj::ArrayBuffer { .. } => self.arraybuffer_method(idx, name, args),
             _ => Ok(None),
+        }
+    }
+
+    /// True when `p.<name>` provably resolves to the intrinsic
+    /// `Promise.prototype.<name>` native `want`, decided WITHOUT walking the
+    /// prototype chain (B79). The `re.test`/`re.exec` guard
+    /// (`regexp_method_is_intrinsic`) verbatim, over `promise_proto`:
+    ///
+    ///   * the receiver's `[[Prototype]]` is %Promise.prototype% — either
+    ///     explicitly, or by absence, since `object_get_prototype_of` sends a
+    ///     `HeapObj::Promise` with no `proto_of` entry there. A SUBCLASS
+    ///     instance has an explicit entry naming the subclass prototype and so
+    ///     fails here;
+    ///   * the instance carries no OWN shadow of `name` (own properties of a
+    ///     non-`Object` heap kind live in the `arr_props` side table); and
+    ///   * %Promise.prototype% still holds `want` at that key as a plain data
+    ///     property.
+    ///
+    /// A `false` costs nothing but the fallback proof the caller ran anyway, so
+    /// this is only ever allowed to be conservative — never permissive.
+    pub(crate) fn promise_method_is_intrinsic(&self, p: u32, name: &str, want: u16) -> bool {
+        if !promise_pristine_enabled() {
+            return false; // ZIPP_NO_PROMISE_PRISTINE=1 → the old get_prop proof
+        }
+        match self.proto_of.get(&p) {
+            None => {}
+            Some(pr) if pr.is_heap() && pr.heap_index() == self.promise_proto => {}
+            _ => return false,
+        }
+        if self.arr_props.get(&p).is_some_and(|m| m.pos(name).is_some()) {
+            return false;
+        }
+        match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => m.pos(name).is_some_and(|i| {
+                !m.attrs[i].accessor
+                    && m.vals[i].is_heap()
+                    && matches!(self.heap.get(m.vals[i].heap_index()),
+                                HeapObj::Native(n) if *n == want)
+            }),
+            _ => false,
         }
     }
 

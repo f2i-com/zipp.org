@@ -42,6 +42,14 @@ pub fn shape_stats() -> (usize, usize, usize) {
     shape::stats()
 }
 
+/// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,
+/// most-called first. Empty unless the variable was set. See
+/// `vm::builtins::bstats` for why this exists rather than a reading of
+/// `string_ops.rs`.
+pub fn builtin_stats() -> Vec<(&'static str, String, u64)> {
+    vm::builtin_stats()
+}
+
 /// Whether this build actually has the native codegen tiers, i.e. the `jit`
 /// feature AND an x86-64 target. Exported for `zipp --version`: the feature lives
 /// on THIS crate, so a `cfg!` in the CLI would always read false and quietly

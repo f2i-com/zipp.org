@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B79 B5.3 refuted; `promise.then` pristine guard** | **LANDED — `async-promise-chain` −3.2%** | `ZIPP_BUILTINSTATS=1` (new) counts the builtin calls that reach the generic chain: `parse-large-js` **89**, `polymorphic-objects` **0**, `markdown-render` 252,669 (~2.3% of its row) — so **B5.3 is REFUTED**, Effort-M saved. The one row it pointed at is `async-promise-chain`, whose 1,500,003 dispatches are **100% `promise.then`**; that arm proved intrinsic-ness with a full `get_prop` chain walk per call and now uses B69's three-read pristine probe. **100ns → 87ns** per `.then()` (node 73ns); row **−3.2% [−4.0, −2.5]**, suite −0.48% [−0.91, +0.01], no timed row regressing outside its CI. Second finding, bigger than the first: for every builtin WITHOUT a region intrinsic the JIT is SLOWER than the interpreter (`str.startsWith` 44.5 vs 39.0ns) — the generic `CallMethod` arm has no native IC where `GetProp` has an 8-way one. Off-switch `ZIPP_NO_PROMISE_PRISTINE=1` |
 | **B78 method inliner admits the PROTOTYPE chain** | **LANDED, MECHANISM ONLY** | `build_method_shape` had arms for a class instance and for an own data slot, and declined everything else — so `Object.create(proto)` and `Ctor.prototype.m = fn` inlined NEVER, at any receiver count: **29.5ns/call at ONE receiver against 5.5ns for the same method on a class**, node 1.0ns. With the arm: **5.5ns (−81%)**, and the indirectly-loaded receiver 34.8ns → 6.0ns. Guards reuse `SuperInline`'s hop-version emission plus a `holder_vals_ptr[slot] == fn_bits` re-read; resolution is `ic_walk`, so the baked answer is by construction the interpreter's. Suite `--ab-env` on ONE binary, 21 pairs: geomean **−0.28% [−0.81, +0.17]**, **no row regressing with an interval excluding zero**. Ships on the mechanism — the ten rows do not contain the construct, which is a fact about the benches. Off-switch `ZIPP_NO_PROTO_METHOD_INLINE=1` |
 | B77 pristine matchAll dispatch | **REVERTED — layout collateral, REPLICATED** | won its row twice (−2.1%, −2.8%, CIs excluding zero) and regressed `async-promise-chain` twice (+5.4%, +3.1%, CIs excluding zero) — a row with no `matchAll` in it. The fat-LTO layout hazard, confirmed by replication for the first time this session. §14's unrelated-row rule applies. The guards themselves are sound and node-verified; a retry should change the code PLACEMENT, not the semantics |
 | B76 nested splice admits ARGS | **LANDED, MECHANISM ONLY** | `wrap(n){ return inner(n,7)+1 }` was rejected (`inner-call-has-args`); now spliced: **−55.1%** on the 3M-call micro, faster than node. Suite uptake ZERO — every previously-blocked site moved to `inner-not-leaf` (depth ≥ 3), which is B75's real design task. Also fixed a latent `unreachable!` panic: the emitter had no `LoadUndefined` arm for a void inner return |
@@ -610,7 +611,7 @@ beyond the number:
 > | **B5.1** widen the `.length` hoist to live-ins | **0ms on every named bench** — `typedarray-math` has no `.length`, and every container is a global the existing hoist already covers | B50 |
 > | **B5.2** lazy RegExp result objects | already marked refuted in place; superseded again by **B60**, which priced the real term (the `arr_props` entry, −13.5%) | B60 |
 > | **B5.2b** `matchAll` iterator step | **ALREADY LANDED** (`fast0`). Re-measured ~10ms against the ~552ms still written beside it — "the largest phantom in this file" | B50 |
-> | **B5.3** builtin dispatch jump table | **OPEN**, unrefuted | — |
+> | **B5.3** builtin dispatch jump table | **REFUTED as a suite lever (B79)** — `ZIPP_BUILTINSTATS=1` counts the dispatches that actually reach the generic chain: `parse-large-js` makes **89**, `json-large` 13, `polymorphic-objects` **0**, `class-prototype-hot` 12, `typedarray-math` 47. `markdown-render`, which this row called "the largest single term", makes 252,669 — ~10ms of a 438ms row at 40ns each, i.e. ≤2.3%, and much of that 40ns is real work. Only two rows light up, and neither wants a jump table: `map-set-heavy` (4.0M, already 0.99x node) and `async-promise-chain` (1.5M, 100% `promise.then` — taken by B79 instead) | **B79** |
 > | **B5.4** `JSON.parse` double key allocation | **OPEN**, unrefuted, and independently re-proposed | external audit §7.4 |
 > | **B6** generational nursery | **OPEN but hard-gated on B6.0** — two thirds of the apparent "GC pressure" was allocator cost | B6.0, B37 |
 >
@@ -722,10 +723,44 @@ be the first half of it.
   left; unlike B5.2 it is measured against a control. **Effort:** M.
   **Gain:** the bench's matchAll section is 552 ms of ~1276 ms.
 
-- [ ] **B5.3 Builtin method dispatch jump table.** `vm/builtins.rs` and
-  `vm/string_ops.rs` resolve `CallMethod` by a chained `match` on `&str`.
-  Resolve to a `u16` builtin id at compile time. **Effort:** M. **Gain:**
-  the largest single term in markdown-render.
+- [x] ~~**B5.3 Builtin method dispatch jump table.**~~ **REFUTED (B79) — do not
+  build this.** The premise was that `vm/builtins.rs` and `vm/string_ops.rs`
+  resolve `CallMethod` by a chained `match` on `&str`, and that this is "the
+  largest single term in markdown-render". The first half is true and the second
+  is not. `ZIPP_BUILTINSTATS=1` counts every dispatch that actually reaches the
+  generic chain (calls a region intrinsic already serves never get there, which
+  is the point):
+
+  | bench | dispatches | ≈cost @40ns | row | share |
+  |---|---:|---:|---:|---:|
+  | `parse-large-js` | **89** | ~0 | 583ms | ~0% |
+  | `json-large` | 13 | ~0 | 441ms | ~0% |
+  | `polymorphic-objects` | **0** | 0 | 616ms | 0% |
+  | `class-prototype-hot` | 12 | ~0 | 372ms | ~0% |
+  | `typedarray-math` | 47 | ~0 | 644ms | ~0% |
+  | `markdown-render` | 252,669 | ~10ms | 438ms | ~2.3% |
+  | `regex-log-scan` | 750,009 | ~30ms | 1567ms | ~1.9% |
+  | `sparse-array` | 137,720 | ~5.5ms | 149ms | ~3.7% |
+  | `map-set-heavy` | 3,999,908 | ~160ms | 675ms | ~24% |
+  | `async-promise-chain` | 1,500,003 | ~60ms | 625ms | ~10% |
+
+  Eight of the ten rows are at or under 4%, and five make essentially none at
+  all. The 40ns unit price is itself measured and real — a builtin WITH a region
+  intrinsic runs at or near node (`charCodeAt` 0.5ns, `map.get` 6.5ns, `set.has`
+  7.0ns) and one WITHOUT costs 26-45ns — but almost nothing in this suite pays
+  it. The two rows that do are not jump-table problems: `map-set-heavy` is
+  already 0.99x node, and `async-promise-chain`'s 1.5M calls are 100%
+  `promise.then`, which B79 took directly.
+
+  **The finding worth keeping from this probe is a different one.** Comparing
+  the tiers, for every builtin WITHOUT a working region intrinsic the JIT is
+  *slower than the interpreter* — `str.charAt` 30.0 vs 26.0ns, `str.startsWith`
+  44.5 vs 39.0, `arr.indexOf` 45.0 vs 41.0, `Object.keys` 108 vs 95.5 — because
+  the region pays the `jit_call_method_ic` round trip (plus the two r13/r14
+  refetch calls) on top of the identical shared dispatch. The generic
+  `CallMethod` arm has no native inline cache at all, unlike `GetProp` in the
+  same file. THAT is the real open item, and it is a codegen item, not a naming
+  one.
 - [ ] **B5.4 `JSON.parse` allocates every key twice.** `vm/mathjson.rs` collects
   `Vec<(String, Value)>` and then calls `map.set(&k, …)`, which does
   `key.to_string()` again. Subsumed by B1.1, but trivial standalone.
@@ -1650,6 +1685,92 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B79 — B5.3 refuted by counting, and the one row it pointed at taken directly: async-promise-chain −3.2%
+
+**The probe that refuted the plan.** B5.3 ("builtin method dispatch jump table",
+Effort M, *"Gain: the largest single term in markdown-render"*) had sat OPEN and
+unrefuted since B5. Before building it, `ZIPP_BUILTINSTATS=1` was added — a
+histogram of every `(receiver kind, method name)` that reaches
+`dispatch_builtin_method_inner`, i.e. every builtin call a region intrinsic does
+NOT already serve. The table is in §5's B5.3 entry; the headline is that
+`parse-large-js` makes **89** such calls, `polymorphic-objects` makes **zero**,
+and `markdown-render` — the row the plan named — makes 252,669, worth ~10ms of
+438ms. Eight of the ten rows are at or under 4%.
+
+The unit price the plan assumed is real and was measured on the way past: a
+builtin WITH a region intrinsic runs at or near node (`charCodeAt` 0.5ns,
+`map.get` 6.5ns, `set.has` 7.0ns), one WITHOUT costs 26-45ns in both tiers.
+Almost nothing in this suite pays it. **A second finding is worth more than the
+first**: comparing tiers, every builtin without a working intrinsic is SLOWER in
+compiled code than interpreted — `str.startsWith` 44.5 vs 39.0ns, `arr.indexOf`
+45.0 vs 41.0, `Object.keys` 108 vs 95.5 — because the region pays the
+`jit_call_method_ic` round trip plus two pinned-pointer refetches on top of the
+identical shared dispatch. The generic `CallMethod` arm has no native inline
+cache, where `GetProp` twenty lines away in `region_mem.rs` has an 8-way one.
+That is the real open item, and it is codegen, not naming.
+
+**What landed.** Exactly one row lit up in a way a contained change could take:
+`async-promise-chain` makes 1,500,003 builtin dispatches and **100% of them are
+`promise.then`**. That arm has always had to prove `then`/`catch`/`finally`
+really resolve to the intrinsic — an own shadow, a patched
+`Promise.prototype.then` and a subclass override must each win, and test262
+observes all three — and it proved it with a full `get_prop(recv, name)`. A
+Promise receiver misses `get_member`'s fast path on the heap discriminant, so
+that meant `get_member_slow`'s exotic preamble plus a chain walk, per call.
+
+`promise_method_is_intrinsic` decides the same question from three cheap reads —
+the `proto_of` slot table (a paged direct index, not a hash map), the
+`arr_props` own-property side table, and one `pos` on %Promise.prototype% — and
+is `regexp_method_is_intrinsic` (B69) verbatim over `promise_proto`. A Promise
+with no `proto_of` entry is accepted because `object_get_prototype_of` sends
+`HeapObj::Promise` to `promise_proto` by default; a SUBCLASS instance has an
+explicit entry naming the subclass prototype and fails on the first check.
+
+**The probe sits behind a `||`, so a decline runs the ORIGINAL expression
+unchanged** — which is what makes the override semantics provably untouched, and
+what let `ZIPP_NO_PROMISE_PRISTINE=1` be used as a bisector rather than just an
+A/B switch.
+
+| | old | new | node |
+|---|---:|---:|---:|
+| per `p.then(f)` | 100-103ns | **87-90ns** | 73ns |
+
+**Suite, `--ab-env` on ONE binary**, 21 pairs,
+`bench/b79_abenv_2026-07-31.json`, `ALL_CORRECT=1`:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| **`async-promise-chain`** | **−3.2%** | **[−4.0, −2.5]** |
+| `json-large` | −1.4% | [−2.4, +1.7] |
+| `map-set-heavy` | −1.4% | [−4.1, +0.3] |
+| `sparse-array-v2` (diagnostic) | +0.3% | [+0.1, +0.8] |
+| suite geomean (13 rows) | −0.48% | [−0.91%, +0.01%] |
+
+The target row clears §14's 2-3% bar with a tight interval excluding zero, and
+**no timed row regresses with an interval excluding zero**. The single
+interval-excluding-zero regression is `sparse-array-v2` at +0.3%, a diagnostic
+outside `ALLBENCHES` and an order of magnitude under the +2% rule.
+
+**What the histogram itself costs, stated rather than assumed.** With
+`ZIPP_BUILTINSTATS` unset the counter is one relaxed atomic load and a
+predicted branch, on a path that already costs 26-45ns — under 0.1% of it, and
+~1ms on `map-set-heavy`'s four million dispatches. It is NOT separately priced
+against a pre-instrumentation binary: both sides of the A/B above carry it (it
+is one binary), and pricing it would need a two-binary A/B, which reintroduces
+exactly the fat-LTO layout confound the `--ab-env` protocol exists to avoid.
+The trade was taken deliberately — an unpriced sub-0.1% against never again
+guessing which builtins matter.
+
+**Two pre-existing bugs found and NOT introduced**, both confirmed by running
+the same case with `ZIPP_NO_PROMISE_PRISTINE=1` (which restores the old proof
+exactly) and both now in §6: a null-prototype Promise answers `p.then(f)` where
+node throws `TypeError`, and an accessor `Promise.prototype.then` is read TWICE
+per call. The second is pinned AT THE WRONG VALUE by
+`tests/promise_pristine_dispatch.rs`, so whoever closes it gets a failing test
+rather than a silent pass. Its fix — hand the resolved callee back to the caller
+instead of discarding it — would also delete the second lookup on the ordinary
+path, so it is a performance item as well as a conformance one.
 
 ### B78 — the method inliner had no arm for an INHERITED method: 29.5ns → 5.5ns at every receiver count, suite flat
 
@@ -5454,6 +5575,29 @@ current.
   can name it. The same reasoning is what `bytecode.rs` writes out for
   `InitDataProp`/`AppendDataProp`. It is one `bump_version` away from not
   needing the argument at all.
+- **An ACCESSOR `Promise.prototype.then` is read TWICE per call.**
+  `Object.defineProperty(Promise.prototype, "then", {get(){…}})` then
+  `p.then(f)` runs the getter twice where node runs it once — an observable
+  side effect, duplicated. When `dispatch_builtin_method_inner`'s Promise arm
+  cannot prove the intrinsic it re-proves with `get_prop` (running the getter),
+  returns `Ok(None)`, and the caller's `get_prop` + `call_value` runs it again.
+  Both tiers agree. Confirmed PRE-EXISTING via `ZIPP_NO_PROMISE_PRISTINE=1`.
+  Pinned at the wrong value on purpose by
+  `an_accessor_on_the_prototype_is_not_taken_as_intrinsic` in
+  `tests/promise_pristine_dispatch.rs`, so closing it makes that test fail
+  rather than pass silently. The fix is for the arm to hand the resolved callee
+  back to the caller instead of discarding it — which would also delete the
+  second lookup on the ordinary path.
+- **A null-prototype Promise answers `p.then(f)` instead of throwing.**
+  `Object.setPrototypeOf(p, null); p.then(f)` returns without error where node
+  throws `TypeError` — there is no `then` anywhere on that receiver's (empty)
+  chain, so the call has nothing to invoke. Both tiers agree, so no gate sees
+  it. Found while building B79 and confirmed PRE-EXISTING by running the same
+  case with `ZIPP_NO_PROMISE_PRISTINE=1`, which restores the old `get_prop`
+  proof exactly: both paths print `nothrow`. The bug is in what
+  `dispatch_builtin_method_inner`'s Promise arm does after its proof FAILS — it
+  returns `Ok(None)` and the caller's `get_prop` + `call_value` should raise,
+  and does not.
 - **No CI.** No `.github/workflows`. The gate in §2 is run by hand.
 - **No profiler.** There is no way to attribute engine time to a source
   construct, which is precisely how the two reverted epics happened. A sampling
