@@ -1700,6 +1700,49 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B83 — every remaining row decomposed, and what parity actually costs
+
+The three worst rows and `parse-large-js` were phase-timed against node in one
+sitting. Together they say the remaining distance is THREE substrate items and
+essentially nothing else — which is worth writing down plainly, because the
+contained-fix well is now visibly dry.
+
+**`parse-large-js` (2.49x), zipp 569ms / node 223ms:**
+
+| phase | zipp | node | ratio | gap |
+|---|---:|---:|---:|---:|
+| **recursive-descent parse** | **162ms** | **17ms** | **9.5x** | **145ms** |
+| tokenize | 239ms | 117ms | 2.0x | 122ms |
+| mix-hash | 114ms | 68ms | 1.7x | 46ms |
+| gen-source | 54ms | 21ms | 2.6x | 33ms |
+
+The parse phase is the worst ratio in the row and `ZIPP_JITDECLINE=1` names the
+cause without ambiguity — 47 × `[leaf-reject] Call (outer-context-disallows-call)`,
+13 × `[nested-reject] inner-not-leaf`, 5 × `[leaf-reject] Call (branchy-body)`,
+and **not one global-read reject**. `pExpr → pTerm → pFactor → pExpr` is MUTUAL
+RECURSION: no inliner flattens it, so every call is a full frame call, and the
+row is paying B73's un-inlined call cost several million times. This is not a
+whitelist line away — it needs either cheaper non-inlined calls or bounded
+recursive inlining.
+
+**The synthesis.** Across `sparse-array`, `regex-log-scan`, `typedarray-math` and
+`parse-large-js`, every phase gap now attributes to one of three things:
+
+| substrate item | evidence | rows |
+|---|---|---|
+| **B6 generational GC** | allocation cost rises 74.5 → 122.5ns purely from a bigger live set; node 2.0 → 9.5 | `regex-log-scan` (result objects), `json-large`, `markdown-render`, corpus generation |
+| **M4 CFG/SSA + real regalloc** | the DataView loop is ALREADY a fully inlined native load with a pinned bounds check, and still 3.7x — the cost is the memory-backed register file and per-op NaN-boxing | `typedarray-math`, and the general 2-3x on basic ops |
+| **B75/B82 call inlining depth** | mutual recursion and `f.call`/`f.apply` both fall to `call_value`'s `frames.push` + nested `run_loop` | `parse-large-js` parse phase, `sparse-array`'s `hasOwn.call` |
+
+**What that means for parity.** The geomean moved 2.161x → 2.100x this session
+on three contained wins, the largest of which (B80, −1.41%) is the biggest in
+this file's history. Nothing left in the decompositions is that shape. Closing
+the remaining 2.1x is the three items above, and they are architectural: a
+generational collector, an SSA register allocator, and deeper inlining. They are
+each multi-session, and they are now each backed by a specific measurement
+rather than an assertion — which is the state this file has always asked its
+work to reach BEFORE the work starts.
+
 ### B81 — B6.0's measurement, finally taken: ALLOCATION is 10-50x node, and it is the largest systemic cost in the engine
 
 B6.0 has gated the nursery since it was written — *"Measure first. The previous
