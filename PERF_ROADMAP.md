@@ -1725,14 +1725,33 @@ row is paying B73's un-inlined call cost several million times. This is not a
 whitelist line away — it needs either cheaper non-inlined calls or bounded
 recursive inlining.
 
-**The synthesis.** Across `sparse-array`, `regex-log-scan`, `typedarray-math` and
-`parse-large-js`, every phase gap now attributes to one of three things:
+**The three remaining rows, decomposed for completeness — and no cliff in any
+of them:**
+
+| row | dominant phase | zipp | node | ratio | gap |
+|---|---|---:|---:|---:|---:|
+| `polymorphic-objects` | dict churn, 30k objects × 60 props | 502ms | 255ms | 2.0x | 247ms |
+| `markdown-render` | 6 render rounds | 416ms | 222ms | 1.9x | 194ms |
+| `json-large` | 6 stringify/parse rounds | 383ms | 210ms | 1.8x | 173ms |
+
+Each is a DIFFUSE ~2x over allocation and string building, with no single term
+to attack — which is the opposite of `sparse-array`, where one hoisted
+loop-invariant was worth 16%. Two contained hypotheses were tested and refuted
+on the way: array `push` is **6.20ns against node's 9.20ns — zipp WINS** (and
+reads are 3.80 vs 3.00), so `parse-large-js`'s tokenizer gap is not its 14M
+array pushes; and the `ObjMap` recycle pool above measured zero.
+
+**The synthesis. All ten rows are now phase-decomposed against node**, and every
+phase gap attributes to one of three things:
 
 | substrate item | evidence | rows |
 |---|---|---|
 | **B6 generational GC** | allocation cost rises 74.5 → 122.5ns purely from a bigger live set; node 2.0 → 9.5 | `regex-log-scan` (result objects), `json-large`, `markdown-render`, corpus generation |
 | **M4 CFG/SSA + real regalloc** | the DataView loop is ALREADY a fully inlined native load with a pinned bounds check, and still 3.7x — the cost is the memory-backed register file and per-op NaN-boxing | `typedarray-math`, and the general 2-3x on basic ops |
 | **B75/B82 call inlining depth** | mutual recursion and `f.call`/`f.apply` both fall to `call_value`'s `frames.push` + nested `run_loop` | `parse-large-js` parse phase, `sparse-array`'s `hasOwn.call` |
+
+and the diffuse ~2x rows (`polymorphic-objects`, `markdown-render`,
+`json-large`) are the first item arriving without a cliff to mark it.
 
 **What that means for parity.** The geomean moved 2.161x → 2.100x this session
 on three contained wins, the largest of which (B80, −1.41%) is the biggest in
