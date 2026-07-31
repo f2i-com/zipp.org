@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B88 `===` deopted the region on a double operand** | **LANDED — suite −1.64%, THE LARGEST WIN IN THIS FILE** | `region_poly_eq` jumped to the numeric compare as soon as operand **a** was a double, without checking **b** — and that path bails for a tagged non-number. So `x !== undefined` / `!== null` / `!== "s"` with `x` a double bailed EVERY iteration: 64 deopts, eviction, loop interpreted forever. `map-set-heavy` contains its own control — the same comparison twenty lines earlier does NOT deopt, because that map holds Ints. Fix is a definition, not a heuristic: a Number is never `===` to a non-Number, so a tagged non-Int operand has a constant answer. Isolated **49→8ms / 49→8ms / 83→8ms** (int arms unchanged; node ~2ms); deopts **64 → 0**. **`map-set-heavy` −11.3% [−15.9, −8.4]**, `json-large` −3.1%, `typedarray-math` −1.0%, `property-ic-shapes` −0.9%, **suite −1.64% [−2.21, −1.00]**, no row regressing. 362-pair exhaustive `===`/`!==` matrix (NaN, −0/0, every tag pair) byte-identical to node on all three tiers. Found by a 3-probe workflow whose adversarial pass refuted **12 of 14** claims; this was one of two survivors. Off-switch `ZIPP_NO_POLYEQ_FAST=1` |
 | **B87 same fix for `SetIndex`** | **REFUTED, REVERTED** | `json-large`'s `build` deopted **101 times** at a `SetIndex` (42.2% of that row interpreted), so B86's fix was applied to it — narrowly, only the plain-object/string-key branch. Deopts **101 → 0**, interpreted 42.2% → 36.3%, all 13 benches byte-identical — and the row got **+1.1% SLOWER [+0.4, +2.0]**, suite +0.09%. Because the delegating helper can allocate and frame-call a setter, the emitter needed `emit_refetch_pinned` (two native calls) after EVERY `SetIndex` including the hot dense store that never delegates. **Where the new cost lands matters more than how much old cost was removed**: `SetIndexConcat` is rare so B86 was nearly free; `SetIndex` is `a[i] = v`. "Deopts went to zero" is not evidence of a win |
 | **B86 `SetIndexConcat` appends instead of deopting** | **LANDED — `polymorphic-objects` −3.9%** | The profiler's first catch. That row was **60.5% interpreted with six decline messages** — not rejected, but compiled and then thrown away: `SetIndexConcat` handled only an own-slot HIT, and the dict-churn loop writes sixty NEW keys into a fresh `{}` per iteration, so it deopted every time (**131 deopts**), passed `OSR_DEOPT_LIMIT`, and got the region evicted and blacklisted. New keys now delegate to `set_index_concat` — the interpreter's own function, so semantics are identical by construction — with `CALL_THREW` and the pinned refetch the newly-allocating path requires. **Deopts 131 → 0, interpreted 60.5% → 26.6%**, row **−3.9% [−4.5, −2.9]**, no row past the +2% rule, gate green. Invisible to every tool that existed this morning: B83's own phase decomposition called this row "diffuse, no single term to attack" |
 | **B85 `ZIPP_PROF=1` sampling profiler — §6's item since B3** | **LANDED; it reprioritises B6 vs M4 on its first run** | Phase-tagged sampler (200µs), not a stack sampler — fat LTO would have inlined away most frames a `StackWalk64` wanted, and suspending the engine thread to symbolize is a deadlock hazard. Splitting `interp` from `jit-native` is what made it actionable — the two have OPPOSITE fixes. **Compiled-code-bound: `typedarray-math` 99.7%, `parse-large-js` 91.3%, `markdown-render` 68.6% in native code** (only M4 reaches these). **Interpreter-bound: `polymorphic-objects` 60.5%, `json-large` 42.2% INTERPRETED**, with only 6 and 11 decline messages — so their loops are not rejected, they are never offered, which is a tier-entry lead rather than a codegen-quality one. GC reads 0.8-12.6%, independently corroborating B84's `ZIPP_GCSTATS` numbers. So the dominant substrate item is **M4 (memory-backed register file + per-op NaN-boxing)**, not B6 — `parse-large-js` is 2.49x with 99.2% of its time executing JS, which no allocator or collector fix can reach. Built because B84 had to revert a real −35% win for want of attribution |
@@ -1703,6 +1704,84 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B88 — `===` deopted the whole region whenever one operand was a double
+
+A codegen bug, not a tuning question. `region_poly_eq` (`codegen/emit_misc.rs`)
+dispatches on operand tags:
+
+```
+; ja => numeric      // a is a double (tag out of tagged range)
+```
+
+It jumps to the numeric path as soon as **a** is a double, without ever looking
+at **b**. That path then calls `load_num_xmm` on BOTH operands, and
+`load_num_xmm` bails for any tagged non-number. So `x === undefined`,
+`x !== null`, `x !== "s"` — with `x` holding a double — **bailed out of the
+region on every iteration**: 64 deopts, `OSR_DEOPT_LIMIT`, eviction, and the
+whole enclosing loop ran interpreted for the rest of the program.
+
+**`map-set-heavy` contains its own control**, which is how the bug was confirmed
+rather than merely spotted. Its lookup loop does `m.get(k) !== undefined` twice.
+The first (line 30) does NOT deopt; the second (line 32) deopts 64 times. The
+difference is not the comparison — it is that the first map was filled with an
+Int and the second with `i * 2 + 1`, a double.
+
+**The fix is a definition, not a heuristic.** A Number is never `===` to a
+non-Number, so when one operand is a double and the other is a tagged non-Int,
+the answer is a CONSTANT — emit it (`false` for `===`, `true` for `!==`) and
+stay in the region. Double-vs-Int still takes the real f64 compare, because
+`1.0 === 1` is true, and double-vs-double is unchanged.
+
+| shape, 2M iterations | before | after | node |
+|---|---:|---:|---:|
+| `!== undefined`, double operand | 49ms | **8ms** | 2ms |
+| `!== null`, double operand | 49ms | **8ms** | 2ms |
+| `!== "zz"`, double operand | 83ms | **8ms** | 2ms |
+| the same three with an Int operand | ~10ms | ~10ms | ~2ms |
+
+The int arms are untouched, which is the check that the fix is on the path it
+claims to be. `map-set-heavy` deopts **64 → 0**.
+
+
+**Suite, `--ab-env` on ONE binary**, 21 pairs, `bench/b88_abenv_2026-07-31.json`,
+`ALL_CORRECT=1`:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| **`map-set-heavy`** | **−11.3%** | **[−15.9, −8.4]** |
+| **`json-large`** | **−3.1%** | [−4.6, −1.0] |
+| `typedarray-math` | −1.0% | [−1.9, −0.3] |
+| `property-ic-shapes` (diagnostic) | −0.9% | [−2.3, −0.5] |
+| **suite geomean (13 rows)** | **−1.64%** | **[−2.21%, −1.00%]** |
+
+**The largest suite win in this file**, past B80's −1.41% from earlier the same
+day. Four rows improve with intervals excluding zero and none regresses.
+
+**The `map-set-heavy` result deserves its own sentence.** That row is §14's
+designated NO-REGRESSION SENTINEL — it sits at 1.02x node and exists to catch
+collateral damage, not to be optimised. It had a 400,000-iteration loop running
+interpreted the whole time. A row already at parity attracts no attention, which
+is exactly why the bug survived: nobody profiles the control.
+
+**Semantics were verified, not argued.** An exhaustive matrix of `===` and `!==`
+over every operand-tag pair — 362 comparisons including `NaN` (never equal to
+itself), `-0` against `0` (equal), `Infinity`, interned and non-interned
+strings, and every double-against-tagged combination — is byte-identical to node
+under the JIT, under `ZIPP_NOJIT=1`, under `ZIPP_JIT_THRESHOLD=1`, and identical
+again with `ZIPP_NO_POLYEQ_FAST=1` flipped both ways.
+
+**How it was found.** A three-probe workflow over the deopt inventory, the
+emitted per-op cost, and the interpreter loop. Its adversarial pass then refuted
+**twelve of fourteen** claims, including two that read persuasively: a
+`DeleteIndexConcat` admission whose prize arithmetic was wrong by 4-7x (it
+assumed compiling the loop removes cost that is paid inside the helper and would
+still be paid), and a "blacklisted function never runs native" lead where the
+blacklisted version measured **2.2x FASTER** than the compiled one. This was one
+of only two findings to survive all three checks — source, reproduction, and
+prize arithmetic.
+
+Off-switch `ZIPP_NO_POLYEQ_FAST=1`.
 
 ### B87 — REFUTED: removing 101 deopts made the row SLOWER, because the fix taxed the path that was already fast
 

@@ -5,6 +5,25 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// `ZIPP_NO_POLYEQ_FAST=1` restores the pre-B88 `region_poly_eq`, where either
+/// operand being a double jumped to the numeric path unconditionally — and that
+/// path bails for a tagged non-number, so `x !== undefined` deopted the region
+/// on every iteration whenever `x` held a double. Read once per region compile.
+#[inline]
+fn poly_eq_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_POLYEQ_FAST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Resolve a jump `target` to a label: an in-region ip uses its own label; an
 /// out-of-region ip gets (or reuses) an exit stub label.
 pub(crate) fn region_target(
@@ -333,6 +352,14 @@ pub(crate) fn region_poly_eq(
     strict_eq_helper: usize,
 ) {
     let numeric = ops.new_dynamic_label();
+    // B88: reached when exactly ONE operand is a double and the other is a
+    // TAGGED non-number (undefined / null / bool / heap). `===` is false and
+    // `!==` is true for every such pair, by definition — a Number is never
+    // SameValueZero with a non-Number — so the answer is a constant and the
+    // region does not have to leave.
+    let definitely_ne = ops.new_dynamic_label();
+    let a_is_dbl = ops.new_dynamic_label();
+    let b_is_dbl = ops.new_dynamic_label();
     let a_not_heap = ops.new_dynamic_label();
     let do_bits = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
@@ -347,13 +374,13 @@ pub(crate) fn region_poly_eq(
         ; shr rdx, 48
         ; sub edx, TAG_LO as i32
         ; cmp edx, (TAG_HI - TAG_LO) as i32
-        ; ja => numeric                       // a is a double (tag out of tagged range)
+        ; ja => a_is_dbl                      // a is a double (tag out of tagged range)
         // is b a double?
         ; mov rdx, rcx
         ; shr rdx, 48
         ; sub edx, TAG_LO as i32
         ; cmp edx, (TAG_HI - TAG_LO) as i32
-        ; ja => numeric                       // b is a double
+        ; ja => b_is_dbl                      // b is a double, a is tagged
         // Neither is a double. Bail if EITHER is a heap value with index ≥ 129
         // (a non-interned string / object — needs full strict_eq).
         ; mov rdx, rax
@@ -377,7 +404,51 @@ pub(crate) fn region_poly_eq(
         ; jae => slow                          // b: non-interned heap → helper
         ; jmp => do_bits
     );
-    // ── numeric path (a or b is a double): f64 compare, identical to dcmp. ──
+    // ── one operand is a double ──────────────────────────────────────────────
+    // The numeric path below calls `load_num_xmm` on BOTH operands, and that
+    // bails for any tagged non-number. Jumping there on "a is a double" alone —
+    // which is what this did — meant `x === undefined` / `!== null` / `!== "s"`
+    // deopted the region on EVERY iteration whenever `x` held a double. Measured
+    // in isolation: an Int-valued arm 9ms against a double-valued one 62ms
+    // (6.9x, node 2ms for both), with 64 deopts and then eviction on the double
+    // arm only — so the whole enclosing loop fell back to the interpreter
+    // permanently. It is what killed `map-set-heavy`'s 400,000-iteration lookup
+    // loop, where `m.get(k) !== undefined` reads a double because the map was
+    // filled with `i * 2 + 1`.
+    //
+    // Only a NUMBER can compare equal to a double, so the other operand needs a
+    // real f64 compare when it is a double or an Int, and has a constant answer
+    // otherwise.
+    if poly_eq_fast_enabled() {
+        dynasm!(ops
+            ; => a_is_dbl
+            ; mov rdx, rcx
+            ; shr rdx, 48
+            ; sub edx, TAG_LO as i32
+            ; cmp edx, (TAG_HI - TAG_LO) as i32
+            ; ja => numeric                       // b is a double too
+            ; mov rdx, rcx
+            ; shr rdx, 48
+            ; cmp edx, INT_TAG_HI as i32
+            ; je => numeric                       // b is an Int: 1.0 === 1 is true
+            ; jmp => definitely_ne                // b is undefined/null/bool/heap
+            ; => b_is_dbl
+            ; mov rdx, rax
+            ; shr rdx, 48
+            ; cmp edx, INT_TAG_HI as i32
+            ; je => numeric                       // a is an Int
+            ; jmp => definitely_ne                // a is undefined/null/bool/heap
+            ; => definitely_ne
+            ; mov al, ne as i8                    // `!==` → true, `===` → false
+            ; jmp => store
+        );
+    } else {
+        // `ZIPP_NO_POLYEQ_FAST=1`: the pre-B88 shape — either operand being a
+        // double goes straight to the numeric path, which bails on a tagged
+        // non-number. Kept so the change is A/B-able on ONE binary.
+        dynasm!(ops ; => a_is_dbl ; jmp => numeric ; => b_is_dbl ; jmp => numeric ; => definitely_ne ; jmp => numeric);
+    }
+    // ── numeric path (both operands numeric): f64 compare, identical to dcmp. ──
     dynasm!(ops ; => numeric);
     load_num_xmm(ops, a, 0, bail);
     load_num_xmm(ops, b, 1, bail);
