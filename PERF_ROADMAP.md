@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B91 INT-tier promotion is closed by B9** | **NO CODE CHANGE; hazard documented at the switch** | Four rows are >=85% native, so promoting regions to the INT tier (xmm homes, at parity with V8) is the cheap route to M4. The declines are everywhere — `typedarray-math` 7 regions, `sparse-array` 8, `polymorphic-objects` 7 — under one blanket reason that names nothing, and `compile_region_int_maybe_cold` ALREADY implements the fix behind a `cold_exit` flag the only caller hardcodes to `false`. **That flag is dead on purpose: it is B9, which passed a fully green gate (96,029 test262 executions, both tiers, GC stress) and still returned `s = 0` for `3050`.** The comment now carries the warning at the point of temptation, including that the soundness argument beneath it is the one B9 shipped with and is wrong. Stopped one edit short of reintroducing it — by a kept negative result |
 | **B90 the profiler mis-attributed 24% of json-large** | **INSTRUMENT FIXED; a B83 conclusion CORRECTED** | Single-argument JSON.stringify/JSON.parse are FUSED by the compiler into their own ops and never reach call_native, where the tag sat — a 470ms stringify-only workload reported **100% interp**. Retagging moves json-large to **stringify 24.0%, interp 40.0% -> 15.4%**. B83 had read that 40% as the row not compiling, and B87 was aimed at it. The resting bucket is now interp/untagged, documented as no-tag-active rather than interpreter-running. Added a microtask phase: async-promise-chain splits 79.1% into **60.6% real interpreted user JS + 16.9% event loop**. Corrected profile: **four rows at or above 85% jit-native**, the clearest statement yet that M4 is the wall |
 | **B89 pure `ToNum` helper for a string operand** | **REFUTED, REVERTED** | `+x` bailed for every non-number; a string's ToNumber is a pure parse, so `+m[1]` / `+k` deopted 64 and 128 times and evicted. Built to dodge B87's trap — no refetch (the helper cannot allocate or re-enter) and `ToNum` is rare — and it dodged it: deopts **64 → 0**, 28 operand kinds node-identical on all tiers, user `valueOf`/`toString` running exactly once per `+`. Still lost: `regex-log-scan` **−0.2% [−0.4, +0.1]**, `sparse-array` **+1.3% [+0.5, +1.9]**, suite +0.04%. `sparse-array` now pays a helper call per for-in key where interpreting was cheaper. **Second consecutive deopt-removal to measure ≤0**: a deopt is only worth removing when the replacement beats the interpreter ON THAT PATH — B88 won because it was a wrong branch, B86 because the op was rare |
 | **B88 `===` deopted the region on a double operand** | **LANDED — suite −1.64%, THE LARGEST WIN IN THIS FILE** | `region_poly_eq` jumped to the numeric compare as soon as operand **a** was a double, without checking **b** — and that path bails for a tagged non-number. So `x !== undefined` / `!== null` / `!== "s"` with `x` a double bailed EVERY iteration: 64 deopts, eviction, loop interpreted forever. `map-set-heavy` contains its own control — the same comparison twenty lines earlier does NOT deopt, because that map holds Ints. Fix is a definition, not a heuristic: a Number is never `===` to a non-Number, so a tagged non-Int operand has a constant answer. Isolated **49→8ms / 49→8ms / 83→8ms** (int arms unchanged; node ~2ms); deopts **64 → 0**. **`map-set-heavy` −11.3% [−15.9, −8.4]**, `json-large` −3.1%, `typedarray-math` −1.0%, `property-ic-shapes` −0.9%, **suite −1.64% [−2.21, −1.00]**, no row regressing. 362-pair exhaustive `===`/`!==` matrix (NaN, −0/0, every tag pair) byte-identical to node on all three tiers. Found by a 3-probe workflow whose adversarial pass refuted **12 of 14** claims; this was one of two survivors. Off-switch `ZIPP_NO_POLYEQ_FAST=1` |
@@ -1706,6 +1707,49 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B91 — the INT-promotion route is CLOSED, and the dead switch that hides it now says so
+
+The profiler put four of the ten rows at or above 85% native, which makes the
+general tier's code quality the wall. The cheap route to that is not building
+MEM register allocation but PROMOTING regions to the INT tier, which already has
+xmm homes, a copy-elision peephole, and measured parity with V8 on shapes it
+accepts (`s = s + 1.25`: 0.45ns/iter against 0.40ns).
+
+The decline inventory says the opportunity is real and everywhere:
+`typedarray-math` 7 regions, `sparse-array` 8, `polymorphic-objects` 7,
+`parse-large-js` 5, `json-large` 3, `class-prototype-hot` 3 — all reporting the
+same blanket reason, `INT decline: region_is_int=false`, which names nothing.
+
+Reading the predicate turns up `int_unadmitted_ips`, which already returns the
+exact blocking ips, and `compile_region_int_maybe_cold`, which already compiles
+them as SIDE EXITS instead of declining the region — behind a `cold_exit: bool`
+that the only live caller hardcodes to `false`. A dormant feature with a written
+soundness argument, one line from being switched on.
+
+**It is dead on purpose. This is B9, and B9 shipped wrong answers.** It went out
+opt-in after a fully green gate — test262 byte-identical across 96,029
+executions on BOTH tiers, GC stress, and six hand-written cold-block shapes —
+and still returned `s = 0` where every other engine returns `3050`, on a ten-line
+`delete`-and-rebuild loop. The register plan is built by SKIPPING the cold
+blocks, so the plan and the emitted code disagree about what those blocks do, and
+the disagreement only surfaces for region shapes nobody thought to write down.
+
+Nothing was changed except the comment on `cold_exit`, which now carries the
+warning at the point of temptation rather than three thousand lines away in this
+file. It states plainly that the parameter is always `false`, that the soundness
+argument printed beneath it is the one B9 shipped with and is wrong, where the
+reproduction lives, and what a correct version would need (a register plan that
+accounts for the cold blocks, not block-granular exits over a plan that ignored
+them).
+
+**Worth recording as a process result, not just a code comment.** The reasoning
+that led here was sound at every step — profiler says native-bound, INT tier is
+at parity, promotion is cheaper than new regalloc, the mechanism already exists,
+the flag is one line — and it terminated one edit away from reintroducing a
+known wrong-answer bug in a JIT tier. What stopped it was `PERF_ROADMAP.md`
+keeping a REMOVED feature and its counterexample. A repository that records only
+what worked would have shipped it.
 
 ### B90 — the profiler was lying about a quarter of `json-large`, and `interp` never meant what it said
 

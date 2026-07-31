@@ -162,11 +162,35 @@ pub(crate) fn compile_region_int(
 }
 
 /// `cold_exit`: compile ops the INT emitter has no arm for as SIDE EXITS rather
-/// than declining the region (B9). Sound because every i64 home is loaded from
-/// the register file at region entry and only ever updated by ops that actually
-/// execute natively — an op we exit at never runs natively, so no home can hold
-/// a value it did not produce, and `flush_exit` writes every home back before
-/// the interpreter resumes at that exact ip.
+/// than declining the region.
+///
+/// ⚠️ **ALWAYS PASSED `false`. DO NOT TURN IT ON — this is B9, and B9 SHIPPED
+/// WRONG ANSWERS.** The soundness argument below is the one B9 shipped with, it
+/// reads convincingly, and it is wrong; keep reading before acting on it.
+///
+/// The argument was: every i64 home is loaded from the register file at region
+/// entry and only ever updated by ops that actually execute natively, so an op
+/// we exit at never runs natively, no home can hold a value it did not produce,
+/// and `flush_exit` writes every home back before the interpreter resumes at
+/// that exact ip.
+///
+/// What it misses is that the REGISTER PLAN is built by skipping the cold
+/// blocks, so the plan and the emitted code disagree about what those blocks do.
+/// `PERF_ROADMAP.md` B9 has the ten-line reproduction (a `delete` + rebuild loop
+/// that returns `s = 0` instead of `3050`). It was found only after
+/// `GetIndexConcat` was admitted, which let a region shape reach the tier that
+/// had never reached it before.
+///
+/// It passed the whole gate first: test262 byte-identical across 96,029
+/// executions on both tiers, GC stress, and six hand-written cold-block shapes.
+/// For codegen that changes TIER SELECTION, a green gate is not evidence of
+/// correctness — only of not having produced the counterexample yet. The
+/// regression test `fused_concat_key_in_a_branchy_loop` pins the shape.
+///
+/// The IDEA — one op in a cold block should not demote a whole region — is still
+/// sound and still worth up to 4.7x locally. It needs a register plan that
+/// accounts for the cold blocks, not block-granular exits over a plan that
+/// ignored them.
 pub(crate) fn compile_region_int_maybe_cold(
     proto: &FuncProto,
     start: u32,
