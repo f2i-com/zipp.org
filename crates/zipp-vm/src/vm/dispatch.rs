@@ -1381,6 +1381,12 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::JsonStringify { dst, val, space } => {
+                        // The compiler FUSES single-argument `JSON.stringify(v)`
+                        // into this op (compile/calls.rs), so it never reaches
+                        // `call_native`'s JSON_STRINGIFY arm — only the
+                        // replacer form does. Tagging only that arm left a
+                        // stringify-dominated workload reporting 100% `interp`.
+                        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonStringify);
                         let v = self.get(base, val);
                         let indent = self.json_indent(self.get(base, space));
                         // `JSON.stringify(undefined)` (and of a function) is undefined.
@@ -1407,6 +1413,11 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::JsonParse { dst, a } => {
+                        // Fused single-argument `JSON.parse(s)` — same story as
+                        // `JsonStringify` above. The `json-parse` samples seen
+                        // before this came from the reviver form via
+                        // `mathjson.rs`; the fused op was untagged.
+                        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
                         let arg = self.get(base, a);
                         // ToString (invokes toString/valueOf; throws TypeError for a Symbol).
                         // EXACT bytes for a string argument (raw lone surrogates

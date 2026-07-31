@@ -37,6 +37,8 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B90 the profiler mis-attributed 24% of json-large** | **INSTRUMENT FIXED; a B83 conclusion CORRECTED** | Single-argument JSON.stringify/JSON.parse are FUSED by the compiler into their own ops and never reach call_native, where the tag sat — a 470ms stringify-only workload reported **100% interp**. Retagging moves json-large to **stringify 24.0%, interp 40.0% -> 15.4%**. B83 had read that 40% as the row not compiling, and B87 was aimed at it. The resting bucket is now interp/untagged, documented as no-tag-active rather than interpreter-running. Added a microtask phase: async-promise-chain splits 79.1% into **60.6% real interpreted user JS + 16.9% event loop**. Corrected profile: **four rows at or above 85% jit-native**, the clearest statement yet that M4 is the wall |
+| **B89 pure `ToNum` helper for a string operand** | **REFUTED, REVERTED** | `+x` bailed for every non-number; a string's ToNumber is a pure parse, so `+m[1]` / `+k` deopted 64 and 128 times and evicted. Built to dodge B87's trap — no refetch (the helper cannot allocate or re-enter) and `ToNum` is rare — and it dodged it: deopts **64 → 0**, 28 operand kinds node-identical on all tiers, user `valueOf`/`toString` running exactly once per `+`. Still lost: `regex-log-scan` **−0.2% [−0.4, +0.1]**, `sparse-array` **+1.3% [+0.5, +1.9]**, suite +0.04%. `sparse-array` now pays a helper call per for-in key where interpreting was cheaper. **Second consecutive deopt-removal to measure ≤0**: a deopt is only worth removing when the replacement beats the interpreter ON THAT PATH — B88 won because it was a wrong branch, B86 because the op was rare |
 | **B88 `===` deopted the region on a double operand** | **LANDED — suite −1.64%, THE LARGEST WIN IN THIS FILE** | `region_poly_eq` jumped to the numeric compare as soon as operand **a** was a double, without checking **b** — and that path bails for a tagged non-number. So `x !== undefined` / `!== null` / `!== "s"` with `x` a double bailed EVERY iteration: 64 deopts, eviction, loop interpreted forever. `map-set-heavy` contains its own control — the same comparison twenty lines earlier does NOT deopt, because that map holds Ints. Fix is a definition, not a heuristic: a Number is never `===` to a non-Number, so a tagged non-Int operand has a constant answer. Isolated **49→8ms / 49→8ms / 83→8ms** (int arms unchanged; node ~2ms); deopts **64 → 0**. **`map-set-heavy` −11.3% [−15.9, −8.4]**, `json-large` −3.1%, `typedarray-math` −1.0%, `property-ic-shapes` −0.9%, **suite −1.64% [−2.21, −1.00]**, no row regressing. 362-pair exhaustive `===`/`!==` matrix (NaN, −0/0, every tag pair) byte-identical to node on all three tiers. Found by a 3-probe workflow whose adversarial pass refuted **12 of 14** claims; this was one of two survivors. Off-switch `ZIPP_NO_POLYEQ_FAST=1` |
 | **B87 same fix for `SetIndex`** | **REFUTED, REVERTED** | `json-large`'s `build` deopted **101 times** at a `SetIndex` (42.2% of that row interpreted), so B86's fix was applied to it — narrowly, only the plain-object/string-key branch. Deopts **101 → 0**, interpreted 42.2% → 36.3%, all 13 benches byte-identical — and the row got **+1.1% SLOWER [+0.4, +2.0]**, suite +0.09%. Because the delegating helper can allocate and frame-call a setter, the emitter needed `emit_refetch_pinned` (two native calls) after EVERY `SetIndex` including the hot dense store that never delegates. **Where the new cost lands matters more than how much old cost was removed**: `SetIndexConcat` is rare so B86 was nearly free; `SetIndex` is `a[i] = v`. "Deopts went to zero" is not evidence of a win |
 | **B86 `SetIndexConcat` appends instead of deopting** | **LANDED — `polymorphic-objects` −3.9%** | The profiler's first catch. That row was **60.5% interpreted with six decline messages** — not rejected, but compiled and then thrown away: `SetIndexConcat` handled only an own-slot HIT, and the dict-churn loop writes sixty NEW keys into a fresh `{}` per iteration, so it deopted every time (**131 deopts**), passed `OSR_DEOPT_LIMIT`, and got the region evicted and blacklisted. New keys now delegate to `set_index_concat` — the interpreter's own function, so semantics are identical by construction — with `CALL_THREW` and the pinned refetch the newly-allocating path requires. **Deopts 131 → 0, interpreted 60.5% → 26.6%**, row **−3.9% [−4.5, −2.9]**, no row past the +2% rule, gate green. Invisible to every tool that existed this morning: B83's own phase decomposition called this row "diffuse, no single term to attack" |
@@ -1704,6 +1706,118 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B90 — the profiler was lying about a quarter of `json-large`, and `interp` never meant what it said
+
+Found while checking that a newly-added `json-stringify` tag actually fired. It
+did not: a workload that is 470ms of nothing but `JSON.stringify` reported
+**100% `interp`**.
+
+The cause is a compiler fusion. `compile/calls.rs` turns single-argument
+`JSON.stringify(v)` and `JSON.parse(s)` into dedicated ops
+(`Instr::JsonStringify` / `Instr::JsonParse`); only the replacer and reviver
+forms reach `call_native`. The tag had been placed on the `call_native` arm —
+the path almost nothing takes.
+
+**It changes a conclusion this file drew earlier the same day:**
+
+| `json-large` | before | after |
+|---|---:|---:|
+| `jit-native` | 38.0% | 38.1% |
+| **`json-stringify`** | *(invisible)* | **24.0%** |
+| `interp` | **40.0%** | **15.4%** |
+| `json-parse` | 12.7% | 13.1% |
+
+B83 read that 40% as "its hot code never becomes native" and made the row its
+headline interpreter-bound example. **A quarter of it was `JSON.stringify`
+wearing the interpreter name.** B87 — the `SetIndex` delegation that removed 101
+deopts and made the row 1.1% SLOWER — was aimed at that mis-measurement.
+
+**So the resting bucket is now called `interp/untagged`**, and `prof.rs` says
+plainly that it means "no tag was active", not "the interpreter was running
+bytecode": any native work reached through an untagged path lands there and
+reads as interpretation. A large `interp` share is a question, not a finding.
+
+A `microtask` phase was added at the same time, which splits
+`async-promise-chain` 79.1% into **60.6% genuinely-interpreted user JS** (1.5M
+`addOne` reactions, each a fresh frame the loop-based OSR JIT never sees) plus
+**16.9%** event-loop machinery. The nesting is correct: `run_microtask`
+re-enters `run_loop`, which re-tags itself, so callback time is charged to the
+callback rather than to the drain.
+
+**Corrected profile of all ten rows** (post-B86/B88):
+
+| row | jit-native | interp/untagged | gc | other |
+|---|---:|---:|---:|---|
+| `class-prototype-hot` | 99.9% | 0.1% | — | — |
+| `typedarray-math` | 99.7% | 0.3% | — | — |
+| `parse-large-js` | 91.6% | 7.6% | 0.8% | — |
+| `map-set-heavy` | 84.8% | 11.4% | 3.8% | — |
+| `markdown-render` | 67.4% | 21.2% | 7.7% | string-ops 3.8% |
+| `polymorphic-objects` | 66.9% | 28.0% | 5.1% | — |
+| `sparse-array` | 55.1% | 44.1% | 0.9% | — |
+| `json-large` | 38.1% | 15.4% | 9.4% | stringify 24.0%, parse 13.1% |
+| `regex-log-scan` | 36.7% | 12.6% | 13.9% | regex 27.4%, string-ops 9.5% |
+| `async-promise-chain` | 13.2% | 60.6% | 9.3% | microtask 16.9% |
+
+Four rows are now at or above 85% in native code, which is the clearest
+statement yet that **M4 — the memory-backed register file and per-op NaN-boxing
+— is the wall**, not tier entry. The exceptions each name their own subsystem:
+`regex-log-scan` its matcher, `json-large` its serialiser, `async-promise-chain`
+its event loop.
+
+**Method note.** This is the second instrument bug this session (after B84
+`ZIPP_GCSTATS`, which corrected B81 claiming the collector dominates). Both were
+found by checking that a measurement said what it appeared to say, on a workload
+constructed so the answer was known in advance. That check is cheap and has now
+twice overturned a conclusion that had already been acted on.
+
+### B89 — REFUTED: the second "remove the deopts" fix in a row that bought nothing
+
+`ToNum` (`+x`) bailed the region for every non-number operand. A STRING is the
+common one — `+m[1]` on a regex capture (`regex-log-scan`), `+k` on a for-in key
+(`sparse-array`) — and its ToNumber is a pure numeric-literal parse, so it
+deopted 64 and 128 times respectively, evicted, and left the loops interpreted.
+
+The fix routed those through a helper. It was built to avoid B87's trap
+explicitly: `to_number` takes `&self`, allocates nothing and cannot re-enter the
+VM, so **no pinned-pointer refetch was needed**, and `ToNum` is a rare op whose
+Int/double fast path never reaches the call. One real hazard was found and
+handled — `to_number`'s own doc records that it *"returns NaN for an un-handled
+object"* while `+obj` must run ToPrimitive, so the helper takes only strings and
+the non-object primitives and still deopts objects, Dates, boxed primitives and
+Symbols. Verified: a user `valueOf`/`toString` ran EXACTLY once per `+` over 500
+iterations, 28 operand kinds byte-identical to node on all three tiers.
+
+`regex-log-scan` deopts **64 → 0**. And:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| `regex-log-scan` (the target) | −0.2% | [−0.4, +0.1] |
+| **`sparse-array`** | **+1.3%** | **[+0.5, +1.9]** |
+| suite geomean | +0.04% | [−0.42, +0.47] |
+
+**REVERTED.** The target row did not move, and the only interval excluding zero
+points the wrong way — `sparse-array` now pays a helper CALL per for-in key
+where it previously ran the loop interpreted, and interpreting it was cheaper.
+
+**Two of these in a row is a pattern, and it is worth naming.** B87 and B89 both
+removed real deopts (101 and 64), both were semantically verified, and both
+measured zero or negative. B86 and B88 removed deopts and won big. The
+difference is not the deopt count:
+
+* **B88** was a WRONG BRANCH — `===` jumped to the numeric path without checking
+  the second operand. Fixing it removed work and added none.
+* **B86** was a missing case on a RARE op (`SetIndexConcat` exists only for
+  `obj["k" + e] = v`), so the added work landed where nothing hot pays it.
+* **B87** put the new cost on `SetIndex` — the generic `a[i] = v`.
+* **B89** put it on a path whose alternative (interpreting) was already cheap.
+
+So: **a deopt is only worth removing when the replacement is cheaper than the
+interpreter doing the same work, on the same path.** Deopt count is not a proxy
+for time, and "the region now survives" is not a result. Both of this session's
+real wins were found by the PROFILER pointing at interpreted time, then
+`ZIPP_JITLOG` explaining it — not by counting deopts and fixing the biggest.
 
 ### B88 — `===` deopted the whole region whenever one operand was a double
 

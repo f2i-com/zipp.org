@@ -2379,6 +2379,7 @@ impl<'p> Vm<'p> {
     /// Drain the microtask queue to empty (FIFO; tasks enqueued during the drain
     /// run in the same drain). The whole event loop.
     pub fn drain_microtasks(&mut self) {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Microtask);
         while let Some(t) = self.microtasks.pop_front() {
             // The popped microtask `t` holds Values (callback/arg/dependent) in a
             // Rust local that are NOT reachable from the GC roots while

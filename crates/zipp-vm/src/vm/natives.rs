@@ -3792,6 +3792,12 @@ impl<'p> Vm<'p> {
                 }
             }
             JSON_STRINGIFY => {
+                // The `json-stringify` phase tag was declared in `prof.rs` and
+                // never applied, which is worse than not declaring it: the dump
+                // filters zero-count phases, so a reader would see `json-parse`
+                // listed, no `json-stringify`, and conclude serialisation costs
+                // nothing. It is 6 of `json-large`'s 12 rounds.
+                let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonStringify);
                 let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 let space = self.json_coerce_space(space)?;
                 let indent = self.json_indent(space);

@@ -34,9 +34,19 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-/// Subsystem tags. `Interp` is the resting state: time attributed to it is time
-/// in the dispatch loop or in compiled regions, i.e. running JavaScript rather
-/// than sitting in an engine service.
+/// Subsystem tags.
+///
+/// `Interp` is the RESTING state, and its display name is `interp/untagged` for
+/// a reason learned the hard way: it means "no tag was active", NOT "the
+/// interpreter was running bytecode". Any native engine work reached through a
+/// path nobody tagged lands here and reads as interpretation.
+///
+/// That is not hypothetical. `JSON.stringify(v)` with one argument is FUSED by
+/// the compiler into `Instr::JsonStringify` and never reaches `call_native`, so
+/// tagging only the native arm left a stringify-only workload reporting **100%
+/// `interp`** — and made `json-large` look 40% interpreted when 24 points of
+/// that were stringify. Before drawing "this row is not compiling" from a large
+/// `interp` share, check that the work in it is actually tagged.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum Phase {
@@ -55,12 +65,16 @@ pub(crate) enum Phase {
     /// time in `Interp` means not enough code is COMPILED, time in `Jit` means
     /// compiled code is SLOW (M4's register file and per-op boxing).
     Jit = 10,
+    /// Promise / microtask machinery: the event-loop drain and everything it
+    /// runs that is not user JS. `async-promise-chain` reported **79.1% `interp`**
+    /// before this existed, and almost none of it was interpreting bytecode.
+    Microtask = 11,
 }
 
-const N_PHASES: usize = 11;
+const N_PHASES: usize = 12;
 
 const NAMES: [&str; N_PHASES] = [
-    "interp",
+    "interp/untagged",
     "gc",
     "regex-exec",
     "json-parse",
@@ -71,13 +85,14 @@ const NAMES: [&str; N_PHASES] = [
     "jit-compile",
     "sort",
     "jit-native",
+    "microtask",
 ];
 
 static CURRENT: AtomicU8 = AtomicU8::new(Phase::Interp as u8);
 static COUNTS: [AtomicU64; N_PHASES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0),
 ];
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);
