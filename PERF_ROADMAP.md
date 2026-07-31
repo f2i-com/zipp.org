@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B80 sparse enumeration hoists its overlay probe** | **LANDED — `sparse-array` −16.2%, suite −1.41%, THE LARGEST SUITE WIN IN THIS FILE** | `object_enum_own`'s array arm walked `0..dense_len` doing an `array_index_override` HASH PROBE per slot. Strided writes grow the dense vector far past the populated count — measured `dense_len=1,040,001` holding **105** elements for an array with 5,000 keys — so `Object.keys` paid **1.04M hash probes to find 105 elements**: 25ms against node's 0ms, and independent of key count, which is the shape that gave it away. Asked once over the overlay's keys instead; a `defineProperty` on a dense index keeps the per-slot probe. `for…in` 50e6/5k **26ms → 2ms**; the bench phase 42ms → 18ms. Row **−16.2% [−16.9, −14.5]**, suite **−1.41% [−1.90, −1.05]**, both CIs excluding zero, no row regressing outside its CI. Found by phase-timing the SMALLEST bad row, not the largest. Off-switch `ZIPP_NO_ENUM_HOIST=1`; both paths byte-identical on the whole case set |
 | **B79 B5.3 refuted; `promise.then` pristine guard** | **LANDED — `async-promise-chain` −3.2%** | `ZIPP_BUILTINSTATS=1` (new) counts the builtin calls that reach the generic chain: `parse-large-js` **89**, `polymorphic-objects` **0**, `markdown-render` 252,669 (~2.3% of its row) — so **B5.3 is REFUTED**, Effort-M saved. The one row it pointed at is `async-promise-chain`, whose 1,500,003 dispatches are **100% `promise.then`**; that arm proved intrinsic-ness with a full `get_prop` chain walk per call and now uses B69's three-read pristine probe. **100ns → 87ns** per `.then()` (node 73ns); row **−3.2% [−4.0, −2.5]**, suite −0.48% [−0.91, +0.01], no timed row regressing outside its CI. Second finding, bigger than the first: for every builtin WITHOUT a region intrinsic the JIT is SLOWER than the interpreter (`str.startsWith` 44.5 vs 39.0ns) — the generic `CallMethod` arm has no native IC where `GetProp` has an 8-way one. Off-switch `ZIPP_NO_PROMISE_PRISTINE=1` |
 | **B78 method inliner admits the PROTOTYPE chain** | **LANDED, MECHANISM ONLY** | `build_method_shape` had arms for a class instance and for an own data slot, and declined everything else — so `Object.create(proto)` and `Ctor.prototype.m = fn` inlined NEVER, at any receiver count: **29.5ns/call at ONE receiver against 5.5ns for the same method on a class**, node 1.0ns. With the arm: **5.5ns (−81%)**, and the indirectly-loaded receiver 34.8ns → 6.0ns. Guards reuse `SuperInline`'s hop-version emission plus a `holder_vals_ptr[slot] == fn_bits` re-read; resolution is `ic_walk`, so the baked answer is by construction the interpreter's. Suite `--ab-env` on ONE binary, 21 pairs: geomean **−0.28% [−0.81, +0.17]**, **no row regressing with an interval excluding zero**. Ships on the mechanism — the ten rows do not contain the construct, which is a fact about the benches. Off-switch `ZIPP_NO_PROTO_METHOD_INLINE=1` |
 | B77 pristine matchAll dispatch | **REVERTED — layout collateral, REPLICATED** | won its row twice (−2.1%, −2.8%, CIs excluding zero) and regressed `async-promise-chain` twice (+5.4%, +3.1%, CIs excluding zero) — a row with no `matchAll` in it. The fat-LTO layout hazard, confirmed by replication for the first time this session. §14's unrelated-row rule applies. The guards themselves are sound and node-verified; a retry should change the code PLACEMENT, not the semantics |
@@ -1685,6 +1686,97 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B80 — a sparse array's enumeration paid 1.04 MILLION hash probes to find 105 elements
+
+**How it was found: by decomposing the worst small row, not by reading code.**
+`sparse-array` is 3.17x and only 149ms, which makes it the cheapest high-ratio
+row to iterate on. Phase-timing it against node put two thirds of the gap in two
+places:
+
+| phase | zipp | node | gap |
+|---|---:|---:|---:|
+| stride-writes | 8ms | 5ms | 3ms |
+| in+hasOwn | 21ms | 7ms | 14ms |
+| **for-in** | **42ms** | **9ms** | **33ms** |
+| packed-build+indexOf | 11ms | 4ms | 7ms |
+| delete+hole-iter | 50ms | 15ms | 35ms |
+| slice/concat+iter | 21ms | 8ms | 13ms |
+
+Scaling the `for…in` phase produced the shape that gave it away — a cost almost
+INDEPENDENT of how many keys the array has, where node's is purely per-key:
+
+| populated keys (length 50e6) | zipp | node |
+|---:|---:|---:|
+| 5,000 | 26ms | 0ms |
+| 20,000 | 31ms | 3ms |
+| 80,000 | 47ms | 17ms |
+
+`Object.keys` alone accounted for 25 of those 26ms, so it was the enumeration
+and not the for-in protocol. Two hypotheses died on the way — it is not O(length)
+(500k length is fast, 5M and 50M are the same 29ms) and not about WHERE the keys
+sit (5,000 CONTIGUOUS keys enumerate in 0ms wherever they start). A one-line
+debug print settled it:
+
+```
+[enum] dense_len=1040001 arr_props_keys=4895
+```
+
+**Writing `a[i] = v` on a stride extends the DENSE vector until it stops
+growing.** For 5,000 strided keys over a 50e6 length that vector reaches
+1,040,001 slots holding 105 elements, and the other 4,895 keys go to the
+`arr_props` overlay. `object_enum_own`'s array arm then walks `0..dense_len`
+calling `array_index_override(idx, i)` — a `pos()` HASH PROBE on the overlay —
+per slot. **1.04 million hash probes to discover 105 elements**, every one of
+them destined to return `None`.
+
+They were destined to return `None` because the overlay exists precisely to hold
+the indices ABOVE the dense prefix. So the question is now asked ONCE, over the
+overlay's own keys, instead of once per dense slot. The case that puts an
+overlay key BELOW the prefix — a `defineProperty` on a dense index — keeps the
+per-slot probe exactly.
+
+| shape | before | after | node |
+|---|---:|---:|---:|
+| `for…in`, 50e6 / 5,000 keys | 26ms | **2ms** | 0ms |
+| `for…in`, 50e6 / 20,000 keys | 31ms | **5ms** | 3ms |
+| `for…in`, 50e6 / 80,000 keys | 47ms | **22ms** | 17ms |
+| `for…in`, 5e6 / 20,000 keys | 29ms | **4ms** | 5ms — now FASTER than node |
+| `Object.keys`, 50e6 / 5,000 keys | 25ms | **1ms** | 0ms |
+
+The bench's `for-in` phase goes **42ms → 18ms**.
+
+**Suite, `--ab-env` on ONE binary**, 21 pairs,
+`bench/b80_abenv_2026-07-31.json`, `ALL_CORRECT=1`:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| **`sparse-array`** | **−16.2%** | **[−16.9, −14.5]** |
+| `property-ic-shapes` (diagnostic) | −0.8% | [−1.4, −0.3] |
+| `polymorphic-objects` | −0.5% | [−1.9, −0.1] |
+| `sparse-array-v2` (diagnostic) | −0.9% | [−1.8, +0.0] |
+| **suite geomean (13 rows)** | **−1.41%** | **[−1.90%, −1.05%]** |
+
+**The largest suite-level win recorded in this file** — 2.6x B70's −0.55%, which
+had held the record — and the interval excludes zero comfortably. Three rows
+improve with intervals excluding zero and none regresses with one. The two
+unrelated movers are not a surprise: `polymorphic-objects` walks 30,000
+dictionaries with `for…in`, and `property-ic-shapes` builds its receivers with
+`Object.create` and enumerates them.
+
+Worth noting WHY this was available: nothing here is clever. It is one hoisted
+loop-invariant, in a function nobody had profiled, found by phase-timing the
+smallest bad row instead of the largest. `sparse-array` is 149ms — the whole
+investigation, from first phase timing to landed fix, cost less wall-clock than
+one 21-pair A/B.
+
+Pinned by 8 cases in `tests/sparse_enum_hoist.rs`, all node-verified, and the
+whole case set produces byte-identical output with `ZIPP_NO_ENUM_HOIST=1` (the
+old per-slot path) — which is the check that this is a pure speedup and not a
+semantic change. One case in that set fails against node either way: a
+non-enumerable index override is missing from `Object.getOwnPropertyNames`. That
+is the §6 divergence `descriptors.rs`'s dense loop already owned, confirmed
+pre-existing by rebuilding HEAD without the change; it is untouched here.
 
 ### B79 — B5.3 refuted by counting, and the one row it pointed at taken directly: async-promise-chain −3.2%
 

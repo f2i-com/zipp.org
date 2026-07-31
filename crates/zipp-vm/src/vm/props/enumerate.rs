@@ -5,6 +5,25 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// `ZIPP_NO_ENUM_HOIST=1` restores the per-dense-slot `array_index_override`
+/// probe that `object_enum_own` used to pay. See the comment at its call site
+/// for why hoisting it is sound; this exists purely so the change is A/B-able
+/// and bisectable on one binary.
+#[inline]
+fn enum_hoist_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ENUM_HOIST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
         pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
         self.defer_check_all(obj)?;
@@ -86,9 +105,40 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(items) => items.len(),
                 _ => 0,
             };
+            // Does ANY overlay key name an index inside the dense range? Asked
+            // ONCE, over the overlay's own keys, instead of once per dense slot.
+            //
+            // `array_index_override` is a `pos()` hash probe on the overlay map,
+            // and the loop below used to pay one for every slot in `0..len`. A
+            // sparse array makes that quadratic-feeling in the worst way: writing
+            // `a[i] = v` on a stride extends the DENSE vector until it stops
+            // growing (measured: 1,040,001 slots for an array with 5,000 keys,
+            // only 105 of them dense — the rest went to the overlay). Enumerating
+            // it then cost 1.04M hash probes to discover 105 elements: 25ms, and
+            // node does the whole thing in 0ms. It is the entire fixed cost of a
+            // sparse `for…in` / `Object.keys`, independent of key count.
+            //
+            // When no overlay key parses to an index below `len`, every one of
+            // those probes was going to return `None` by construction — which is
+            // the overwhelmingly common shape, since the overlay exists precisely
+            // to hold the indices that sit ABOVE the dense prefix. A
+            // `defineProperty` on a dense index is what puts one below it, and
+            // that case keeps the old per-slot probe exactly.
+            //
+            // `ZIPP_NO_ENUM_HOIST=1` forces the old per-slot probe, so the change
+            // can be A/B'd with `tools/bench.py --ab-env` on ONE binary and any
+            // behaviour question bisected against it without a rebuild.
+            let dense_overlaid = !enum_hoist_enabled()
+                || self.arr_props.get(&idx).is_some_and(|m| {
+                    m.has_element_key()
+                        && m.keys.iter().any(|k| {
+                            canonical_index_str(k).is_some_and(|n| n < len)
+                        })
+                });
             let mut ks: Vec<String> = Vec::new();
             for i in 0..len {
-                let overridden = self.array_index_override(idx, i);
+                let overridden =
+                    if dense_overlaid { self.array_index_override(idx, i) } else { None };
                 // A hole (an absent element) with no defineProperty'd override is not
                 // an own property — skip it.
                 if overridden.is_none()
