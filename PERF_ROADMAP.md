@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B84 GC is 2-12% of the suite — B81 CORRECTED; `ZIPP_GCSTATS=1` added** | **INSTRUMENT LANDED; ObjMap pool measured −35% on construction and REVERTED anyway** | Per-phase collector timing says GC is **12% of `regex-log-scan`, 8% of `json-large`, 5% of `markdown-render`, 2% of `polymorphic-objects`** — their live sets (1.4k-78k) never reach where B81's micro curve bites, so the cost is CONSTRUCTION, not collection. B81's table stands; its conclusion did not. The pool's first null result was also wrong — a 4096 cap against a 65,536 GC threshold serves ~6% of a cycle. Re-capped it is **`{a:1}` 71.0 → 46.5ns, `{a,b,c,d}` 138.5 → 88.5ns (−35%)** — but `polymorphic-objects` −5.7% came with `json-large` +1.6% (which RETAINS its tree, so the pool stays empty), a suite CI including zero, and a targeted fix that made BOTH rows worse. Two runs disagreeing by five points on the same change ⇒ revert per §14 | **B81**, B6 |
 | **B81 the COLLECTOR is 10-50x node — B6.0's precondition met, its guess REFUTED** | **MEASURED; ObjMap recycle pool built and REVERTED as a null result; B6 is now the best-evidenced item in this file** | `{}` 41.0ns vs 3.5ns, `{a:1}` 81.5 vs 2.5, `{a,b,c,d}` **148 vs 3.0 (49x)**, `[]` 23.5 vs 2.5, `s.slice(0,5)` 38.5 vs 4.0 — and the no-allocation control is 1.0ns vs node's 1.5ns, i.e. **zipp is FASTER when it allocates nothing**. Reached independently from `regex-log-scan`'s phase split (matchAll 496 vs 71ms; `exec` = 227ns scan + 169ns result object + ~60ns/capture against node's 40ns total, while the non-capturing literal `test` is **0.53x — zipp wins**) and from the object-literal micro. A 4-property literal has gone 513ns → 148ns since B6.0 was written and is still 49x. An `ObjMap` recycle pool (reset + stash the swept box, capacity retained) measured **ZERO** and was reverted — because `[]` costs 24.5ns while mallocing nothing at all, so the malloc is only ~7ns of an object. The cost that remains is the COLLECTOR: holding a larger live set makes the IDENTICAL allocation loop cost more — 74.5 → 101.5 → 122.5ns at live sets of ~0 / 400k / 1.2M, i.e. **+48ns per allocation from nothing but a bigger heap to mark**, where node goes 2.0 → 7.5 → 9.5. B6.0 asked whether the cost was construction or collection and guessed construction; it is both, and only the collection term scales. `typedarray-math` is the one row this does NOT explain — its DataView loop allocates nothing and is already a fully inlined native load, so that one is M4 | **B6.0**, B1 |
 | **B80 sparse enumeration hoists its overlay probe** | **LANDED — `sparse-array` −16.2%, suite −1.41%, THE LARGEST SUITE WIN IN THIS FILE** | `object_enum_own`'s array arm walked `0..dense_len` doing an `array_index_override` HASH PROBE per slot. Strided writes grow the dense vector far past the populated count — measured `dense_len=1,040,001` holding **105** elements for an array with 5,000 keys — so `Object.keys` paid **1.04M hash probes to find 105 elements**: 25ms against node's 0ms, and independent of key count, which is the shape that gave it away. Asked once over the overlay's keys instead; a `defineProperty` on a dense index keeps the per-slot probe. `for…in` 50e6/5k **26ms → 2ms**; the bench phase 42ms → 18ms. Row **−16.2% [−16.9, −14.5]**, suite **−1.41% [−1.90, −1.05]**, both CIs excluding zero, no row regressing outside its CI. Found by phase-timing the SMALLEST bad row, not the largest. Off-switch `ZIPP_NO_ENUM_HOIST=1`; both paths byte-identical on the whole case set |
 | **B79 B5.3 refuted; `promise.then` pristine guard** | **LANDED — `async-promise-chain` −3.2%** | `ZIPP_BUILTINSTATS=1` (new) counts the builtin calls that reach the generic chain: `parse-large-js` **89**, `polymorphic-objects` **0**, `markdown-render` 252,669 (~2.3% of its row) — so **B5.3 is REFUTED**, Effort-M saved. The one row it pointed at is `async-promise-chain`, whose 1,500,003 dispatches are **100% `promise.then`**; that arm proved intrinsic-ness with a full `get_prop` chain walk per call and now uses B69's three-read pristine probe. **100ns → 87ns** per `.then()` (node 73ns); row **−3.2% [−4.0, −2.5]**, suite −0.48% [−0.91, +0.01], no timed row regressing outside its CI. Second finding, bigger than the first: for every builtin WITHOUT a region intrinsic the JIT is SLOWER than the interpreter (`str.startsWith` 44.5 vs 39.0ns) — the generic `CallMethod` arm has no native IC where `GetProp` has an 8-way one. Off-switch `ZIPP_NO_PROMISE_PRISTINE=1` |
@@ -1699,6 +1700,67 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B84 — the collector is 2-12%, not dominant: B81 CORRECTED, and the ObjMap pool reverted twice
+
+Two of this session's own claims turned out to be wrong, and the instrument that
+caught both is now committed (`ZIPP_GCSTATS=1`).
+
+**Correction 1 — B81 overstated the collector.** B81 concluded from a micro that
+"the collector is the largest systemic cost", on the strength of the same
+allocation loop costing 74.5 → 122.5ns as the live set grew to 1.2M. That effect
+is real, but the SUITE never reaches it:
+
+| bench | collections | trace | sweep | retain | GC total | row | GC share |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `regex-log-scan` | 74 | 53.0ms | 96.6ms | 28.5ms | 185.7ms | 1592ms | **12%** |
+| `json-large` | 7 | 22.2ms | 14.1ms | 0.0ms | 36.5ms | 445ms | 8% |
+| `markdown-render` | 20 | 7.2ms | 15.4ms | 0.0ms | 22.8ms | 455ms | 5% |
+| `polymorphic-objects` | 28 | 0.3ms | 12.8ms | 0.0ms | 13.3ms | 593ms | 2% |
+
+**GC is 2-12% of these rows.** Their average live sets are 1,378 to 78,160 —
+one to three orders of magnitude below where the micro's curve bites. The cost
+is CONSTRUCTION, not collection. B81's table stands; its conclusion did not.
+
+**Correction 2 — the pool's first "null result" was a bad experiment.** B81
+reported an `ObjMap` recycle pool measuring zero and reverted it. The cap was
+4096 against a `GC_MIN_THRESHOLD` of 65,536, so it could serve ~6% of the next
+cycle's allocations — indistinguishable from none. Re-capped at
+`GC_MIN_THRESHOLD * 2` the mechanism is real:
+
+| shape | pool ON | pool OFF |
+|---|---:|---:|
+| `{}` | 25.0ns | 30.5ns |
+| `{a:1}` | **46.5ns** | 71.0ns |
+| `{a,b,c,d}` | **88.5ns** | 138.5ns |
+
+−35% on object construction. It still does not ship, and the reason is the
+suite rather than the mechanism.
+
+**Why it was reverted anyway.** 21 pairs, `--ab-env` on one binary, gate fully
+green (37 suites / 0 failures, test262 ×3 byte-identical, and an adversarial
+freeze/seal/delete/`defineProperty`/`setPrototypeOf`/class-churn script
+byte-identical across pool on/off × `ZIPP_GC_STRESS` on/off and against node):
+
+| row | run 1 | run 2 (after a fast-path meant to help `json-large`) |
+|---|---:|---:|
+| `polymorphic-objects` | **−5.7%** [−6.2, −4.9] | −0.9% [−1.2, −0.3] |
+| `json-large` | +1.6% [+0.8, +4.0] | **+2.9%** [+1.7, +3.3] |
+| suite geomean | −0.34% [−0.89, **+0.09**] | — |
+
+`json-large` RETAINS its tree, so almost nothing is swept, the pool stays empty,
+and the row pays the check for no benefit. The targeted fix — skip the 80-byte
+`mem::replace` unless the object is actually recyclable — made BOTH rows worse,
+which no mechanism story explains and which means the two runs disagree about
+the same change by five points. Combined with a suite interval that included
+zero even in the favourable run, and one row now clearly past §14's +2% bar,
+this is a revert on the rules as written.
+
+**What survives**: `ZIPP_GCSTATS=1` (per-phase collector timing — it is what
+corrected B81 and it costs one relaxed atomic load per collection when off), and
+the knowledge that a recycle pool is worth −35% on construction for anything
+whose objects actually die. A nursery gets that win *and* the retention case,
+which is the argument for doing B6 properly rather than approximating it.
 
 ### B83 — every remaining row decomposed, and what parity actually costs
 

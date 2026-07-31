@@ -36,6 +36,14 @@ fn main() -> ExitCode {
         let (n, mx, tot) = zipp_vm::shape_stats();
         eprintln!("[shape] nodes={n} max_fanout={mx} edges={tot}");
     }
+    if std::env::var_os("ZIPP_GCSTATS").is_some() {
+        let (c, r, t, sw, re, slots, live, swept) = zipp_vm::gc_stats();
+        eprintln!(
+            "[gc] {c} collections  roots {r:.1}ms  trace {t:.1}ms  sweep {sw:.1}ms  retain {re:.1}ms  (total {:.1}ms)",
+            r + t + sw + re
+        );
+        eprintln!("[gc] avg slots/collection {slots}  avg live {live}  total swept {swept}");
+    }
     if bstats {
         let rows = zipp_vm::builtin_stats();
         let total: u64 = rows.iter().map(|(_, _, c)| *c).sum();

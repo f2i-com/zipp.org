@@ -1431,6 +1431,7 @@ mod helpers_numeric;
 mod helpers_json;
 pub(crate) mod helpers_num2;
 mod gc;
+pub(crate) use gc::gc_stats;
 mod ic;
 pub(crate) mod decorators;
 

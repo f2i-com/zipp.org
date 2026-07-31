@@ -42,6 +42,13 @@ pub fn shape_stats() -> (usize, usize, usize) {
     shape::stats()
 }
 
+/// `ZIPP_GCSTATS=1` per-phase collector timing:
+/// `(collections, roots_ms, trace_ms, sweep_ms, retain_ms, avg_slots, avg_live,
+/// total_swept)`. Zeroed unless the variable was set.
+pub fn gc_stats() -> (u64, f64, f64, f64, f64, u64, u64, u64) {
+    vm::gc_stats()
+}
+
 /// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,
 /// most-called first. Empty unless the variable was set. See
 /// `vm::builtins::bstats` for why this exists rather than a reading of

@@ -69,6 +69,13 @@ impl Vm<'_> {
             self.heap.note_gc_done(n);
             return;
         }
+        // `ZIPP_GCSTATS=1`: per-phase timing, printed at exit. B81 measured the
+        // per-allocation cost rising 74.5 -> 122.5ns purely from a larger live
+        // set, which says the collector dominates — but NOT which phase of it.
+        // Tracing, the sweep and the ~30 side-table `retain` passes are three
+        // very different fixes, so measure before choosing (B5.3's lesson).
+        let stats = gcstats::enabled();
+        let t_start = gcstats::now(stats);
         let mut marks = vec![false; n];
         let mut stack: Vec<u32> = Vec::with_capacity(1024);
 
@@ -407,17 +414,22 @@ impl Vm<'_> {
         });
         self.async_activations = acts;
 
+        let t_roots = gcstats::now(stats);
         // --- Trace ---------------------------------------------------------
         while let Some(idx) = stack.pop() {
             self.trace_edges(idx, &mut marks, &mut stack, n);
         }
+        let t_trace = gcstats::now(stats);
 
         // --- Sweep + prune -------------------------------------------------
+        let mut swept = 0usize;
         for i in floor..n {
             if !marks[i] {
                 self.heap.free_slot(i as u32);
+                swept += 1;
             }
         }
+        let t_sweep = gcstats::now(stats);
         // Drop side-table entries whose keyed object was reclaimed.
         self.proto_of.retain(|&k, _| marks[k as usize]);
         // Derived-ctor `this` state: a thrown-off constructor leaves these
@@ -489,6 +501,7 @@ impl Vm<'_> {
 
         let free_after = self.heap.free_indices().len();
         let _ = free_before;
+        gcstats::record(stats, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
         self.heap.note_gc_done(n - free_after);
     }
 
@@ -723,3 +736,93 @@ impl Vm<'_> {
         }
     }
 }
+
+/// `ZIPP_GCSTATS=1` — per-collection phase timing, summed and printed at exit.
+///
+/// Exists for the same reason `ZIPP_BUILTINSTATS` does: B81 established that the
+/// COLLECTOR is the dominant systemic cost (the same allocation loop goes 74.5 ->
+/// 122.5ns purely from a larger live set) without establishing WHICH PHASE of it.
+/// Root scan, tracing, the sweep and the ~30 side-table `retain` passes have four
+/// completely different fixes, and this file's standing lesson is that reasoning
+/// about which one *ought* to be expensive has been wrong every time it was tried.
+///
+/// Off, this costs one relaxed atomic load per collection.
+mod gcstats {
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::time::Instant;
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static COLLECTIONS: AtomicU64 = AtomicU64::new(0);
+    static NS_ROOTS: AtomicU64 = AtomicU64::new(0);
+    static NS_TRACE: AtomicU64 = AtomicU64::new(0);
+    static NS_SWEEP: AtomicU64 = AtomicU64::new(0);
+    static NS_RETAIN: AtomicU64 = AtomicU64::new(0);
+    static SLOTS: AtomicU64 = AtomicU64::new(0);
+    static LIVE: AtomicU64 = AtomicU64::new(0);
+    static SWEPT: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_GCSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn now(on: bool) -> Option<Instant> {
+        on.then(Instant::now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record(
+        on: bool,
+        slots: usize,
+        live: usize,
+        swept: usize,
+        t_start: Option<Instant>,
+        t_roots: Option<Instant>,
+        t_trace: Option<Instant>,
+        t_sweep: Option<Instant>,
+    ) {
+        if !on {
+            return;
+        }
+        let (Some(a), Some(b), Some(c), Some(d)) = (t_start, t_roots, t_trace, t_sweep) else {
+            return;
+        };
+        let end = Instant::now();
+        COLLECTIONS.fetch_add(1, Ordering::Relaxed);
+        NS_ROOTS.fetch_add((b - a).as_nanos() as u64, Ordering::Relaxed);
+        NS_TRACE.fetch_add((c - b).as_nanos() as u64, Ordering::Relaxed);
+        NS_SWEEP.fetch_add((d - c).as_nanos() as u64, Ordering::Relaxed);
+        NS_RETAIN.fetch_add((end - d).as_nanos() as u64, Ordering::Relaxed);
+        SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
+        LIVE.fetch_add(live as u64, Ordering::Relaxed);
+        SWEPT.fetch_add(swept as u64, Ordering::Relaxed);
+    }
+
+    /// `(collections, roots_ms, trace_ms, sweep_ms, retain_ms, avg_slots, avg_live, total_swept)`
+    pub fn dump() -> (u64, f64, f64, f64, f64, u64, u64, u64) {
+        let c = COLLECTIONS.load(Ordering::Relaxed);
+        let ms = |x: u64| x as f64 / 1.0e6;
+        let per = |x: u64| if c == 0 { 0 } else { x / c };
+        (
+            c,
+            ms(NS_ROOTS.load(Ordering::Relaxed)),
+            ms(NS_TRACE.load(Ordering::Relaxed)),
+            ms(NS_SWEEP.load(Ordering::Relaxed)),
+            ms(NS_RETAIN.load(Ordering::Relaxed)),
+            per(SLOTS.load(Ordering::Relaxed)),
+            per(LIVE.load(Ordering::Relaxed)),
+            SWEPT.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub use gcstats::dump as gc_stats;
