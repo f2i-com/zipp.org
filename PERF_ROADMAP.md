@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B99 register homes IN the memory tier** | **REFUTED BY MEASUREMENT; no code written** | A home saves ~7 instructions per operand read but costs ~7 to FILL, so it breaks even at one use. Counting the biggest region per row, only **6-17 of 34-88** numeric reads land on a multi-use register: net instructions/iteration from promoting the ten best candidates is **0, 0, 0, -28, -14, +42** — five of six rows gain nothing or LOSE. Cause is the bytecode shape (`LoadGlobal t; use t` per operand, so almost everything is a single-use temp), the cost-side view of B93's "LoadGlobal is 29-37% of every mem region". Corrects why the register tier is fast: not caching multi-use values (there are none) but keeping a GLOBAL in one home for the whole region, guarded once. Next probe is therefore LoadGlobal/consumer FUSION, and it must be priced the same way first |
 | **B97/B98 write-through home sharing + Add live-ins (double path)** | **MECHANISM; suite NULL; first DOUBLE regions ever compiled here** | B97 lets a `read_outside` register SHARE an xmm home by generalising B94's write-through (store each def to `[rbx+dreg(r)]`, skip it in the flush) — removing the `xmm pool exhausted` blocker B95 called terminal. B98 admits `Add` operands as numeric-required uses of a read-only live-in **on the double path only**: the 3.31x->3.45x regression that refuted this was BLANKET admission on the INT path, and its stated causes were string/double/object live-ins — a double is native here, so the largest cause does not apply. Together: **class-prototype-hot 3 declines -> 1**, polymorphic-objects 7 -> 3, and DOUBLE regions **0 -> 1 / 0 -> 1 / 0 -> 3**. Suite **-0.16% [-1.87, +1.42]** — null; the promoted regions are COLD, and the hot ones are now blocked by `CallMethod`, a MISSING CAPABILITY (the register tier issues no calls; B78's method inlining is memory-path only) rather than an admission gate. **Introduced a wrong-answer bug** (a shareable reg loses its entry load; an untaken-branch def then flushed a garbage home) caught by the kept `hoisted_const_on_untaken_branch` tests while all 13 benches still said ALL_CORRECT=1. Also: a pre-fix A/B showed sparse-array -3.0% twice; it did NOT reproduce on the fixed build. `ZIPP_NO_WT_SHARE=1` |
 | **B96 B95's register-pressure figure was a bad proxy** | **CORRECTION; the fix is smaller than B95 concluded** | B95 priced the wall as 40/76/73/70 distinct VM regs vs 14 homes. Max SIMULTANEOUSLY live is **12/14/16/13** (8/11/17/15 with ranges split), plus 9-17 permanently-homed globals — a **~1.5x shortfall, not 5x**. And the excess is PERMANENCE, not liveness: `read_outside`, live-in and hoisted regs each pin a whole-region home, and every global does unconditionally. The `read_outside` rule is conservative for exactly the unsoundness **B94 already fixed** (flush_exit writing a shared home into every sharer's slot) — write-through makes sharing safe. So the next step is NOT a general spilling allocator: generalise B94's write-through to `read_outside` regs, admit Add-using read-only live-ins backed by a plan-time numeric OBSERVATION (blanket admission measured 3.31x -> 3.45x), and spill only if pressure still exceeds 14. Adds a `[pool]` demand diagnostic, which prints nothing until the read-only-live-in rung is cleared |
 | **B95 dense-Array reads on the double tier; the ladder ENDS at register pressure** | **MECHANISM (12 declines cleared, 0 promotions); the wall is now NAMED and MEASURED** | The double tier admitted only kind-8 Float64Array elements (`pin_kind = if admit_bitwise {5} else {8}`); a dense ORDINARY Array — what almost all JS indexing touches — declined the whole region. Now admitted with the INT tier's per-access tag guard (`emit_box_to_home`): Int converts, double moves, HOLE/bool/null/heap deopts. Writes still decline (Value::num narrowing is separate). GetIndex declines: polymorphic-objects **3->0**, class-prototype-hot **2->0**, sparse-array 5->2. **Not one region promoted** — third consecutive rung. So the REST of the ladder was priced in one experiment instead of climbed: admitting `Add` operands clears the read-only-live-in blocker and reveals **`xmm pool exhausted even with home reuse`** as terminal. It is a hard limit — **14 homes** against **40 / 76 / 73 / 70 distinct VM regs** plus 10-17 globals in the four regions — and the tier gives one PERMANENT home per value with **NO SPILLING**, so an oversized region declines wholesale to a tier B94 measured at 3.2x slower. Retires the B81/B83/B90 framing AND the B92/B94/B95 ladder: the one remaining item is a real register allocator with spill/reload |
@@ -1713,6 +1714,60 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B99 — register homes IN the memory tier: refuted before it was built
+
+With the hot regions unable to leave the memory tier (B97/B98: they are blocked by
+`CallMethod`, a capability the register tier does not have), the obvious remaining
+move is to bring the registers to them — keep numeric values in xmm6..15 homes
+inside `region_mem`, write through to memory so deopts stay correct, and let
+operand reads skip the load-and-tag-check dance. That is M4 as B81/B83/B90 stated
+it, and B97 had just proved the write-through half works.
+
+**Priced first, and it does not pay.** The memory tier reads an operand with
+~8 instructions (`mov` from `[rbx + dreg(r)]`, shift, two tag compares, branch,
+`movq`/`cvtsi2sd`). A home turns that into one `movapd` — but it must be FILLED,
+which costs the same ~8 at the def. So promoting register R saves
+`7 x (uses - defs)`: it breaks even at one use and only wins on multi-use values.
+
+Counting the biggest region of each row — numeric operand reads, how many land on
+a register with two or more such reads, and the net instructions per iteration
+from promoting the ten best candidates:
+
+| row | numeric reads | reads on multi-use regs | net instrs/iter |
+|---|---:|---:|---:|
+| `class-prototype-hot` | 34 | 8 | **0** |
+| `polymorphic-objects` | 63 | 6 | **0** |
+| `sparse-array` | 56 | 17 | **0** |
+| `map-set-heavy` | 81 | 6 | **-28** |
+| `typedarray-math` | 63 | 7 | **-14** |
+| `parse-large-js` | 88 | 8 | +42 |
+
+**Five of six rows gain nothing or lose.** The cause is the bytecode shape: the
+compiler emits `LoadGlobal t; <use t>` per operand, so almost every value is a
+SINGLE-USE temp. B93 already measured `LoadGlobal` at 29-37% of every memory
+region's ops; this is the same fact seen from the cost side.
+
+**And it corrects the mental model of why the register tier is fast.** It is not
+that it caches multi-use values — there are barely any. It is that a GLOBAL lives
+in one xmm home for the whole region, guarded once at entry, so `LoadGlobal`
+becomes a register move or nothing at all and no operand is ever tag-checked. The
+memory tier reloads and re-checks the same global every iteration.
+
+That points at the actual next probe — **fuse `LoadGlobal` into its single-use
+consumer**, reading a global's entry-guarded home instead of round-tripping
+through the temp's frame slot (~7 instructions saved on the 30-45% of numeric
+reads that are LoadGlobal temps, with no per-def cost). It is NOT free: it needs
+the memory tier to home globals with an entry guard, and a memory region routinely
+carries string and object globals that cannot inhabit an f64 home. Promoting only
+globals whose every in-region use is a numeric-required read makes an entry bail
+equivalent to the bail those uses would take anyway — that is the shape a next
+attempt should take, and it should be priced the same way before it is built.
+
+No code change. Recorded because building it first would have cost hours to reach
+a table of zeroes, and because the "extend register homes to the memory tier"
+framing carried from B81 to B90 is now refuted on its own terms rather than
+sidestepped.
 
 ### B97/B98 — the first regions actually reach the register tier, and the hot ones are blocked by `CallMethod`
 
