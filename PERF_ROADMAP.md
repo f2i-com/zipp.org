@@ -1763,6 +1763,34 @@ the cost is the object header allocation itself, which B1 does not touch.
 Nothing in §5 does. This is the M5/B6 substrate item, and it is now the
 best-evidenced item in this file.
 
+**Where the 169ns result object goes, and why no contained fix exists.** Per
+`exec`, `regexp_build_result` allocates: the result Array (~30ns), one string
+per capture (~38ns each), and a side-table `ObjMap` in `arr_props` carrying
+`index`/`input`/`groups` — which costs **~100ns**, because three of its four
+allocations are `"index".to_string()`, `"input".to_string()`,
+`"groups".to_string()`. Those are compile-time constants, allocated fresh
+450,000 times in the `matchAll` phase, and NONE of them is ever read by that
+loop.
+
+Three routes out were considered and all of them leave "contained":
+
+* **Intern the key strings.** `ObjMap.keys` is `Vec<String>`, so a key must be
+  owned; sharing needs `Rc<str>`/`Arc<str>` across every property path in the
+  engine. B17 already measured key interning as SLOWER once.
+* **Defer the side table** until one of the three names is read. The natural
+  marker for "no side table" is the `arr_props` entry's absence, which is
+  already load-bearing, so the pending `(index, input, groups)` would need a
+  second side structure — and every named read on ANY array would have to
+  consult it. That is the hottest path in several rows, to save allocations in
+  one.
+* **Defer the capture strings** the same way. Needs a sentinel `Value` meaning
+  "unmaterialised range", checked on every array element read. Same objection,
+  worse blast radius.
+
+So the regex result object is not a regex problem. It is the allocator, arriving
+by a different road — which is the same conclusion the table above reaches, and
+the reason B6 is the item rather than another `proxy_regexp.rs` fast path.
+
 ### B80 — a sparse array's enumeration paid 1.04 MILLION hash probes to find 105 elements
 
 **How it was found: by decomposing the worst small row, not by reading code.**
