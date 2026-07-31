@@ -94,7 +94,28 @@ pub(crate) fn plan_region_cold(
             // element unboxed into an i64 home under a per-access tag guard. This is
             // what admits `for (i < a.length) s += a[i]` — the most common hot loop
             // in JS, and previously demoted to the boxed memory path in full.
-            k == pin_kind || (admit_bitwise && k == ARR_INT_PIN_KIND)
+            if k == pin_kind || (admit_bitwise && k == ARR_INT_PIN_KIND) {
+                return true;
+            }
+            // B95: the DOUBLE path admits a dense ordinary Array READ on the same
+            // terms — receiver via the pin, index via `key`'s home — but the
+            // element is a NaN-boxed `Value`, not a raw f64, so it needs the
+            // per-access tag guard (`emit_box_to_home`) instead of kind-8's bare
+            // `movsd`. A double or an Int lands in the f64 home; a HOLE, a bool,
+            // null/undefined or a heap value deopts AT this ip. That guard is what
+            // makes the plan-time all-numeric sample a hint and not a soundness
+            // gate, exactly as it is on the int path.
+            //
+            // WRITES are deliberately NOT admitted: storing an f64 home back as a
+            // `Value` must reproduce `Value::num`'s exact-int narrowing (and -0 /
+            // NaN handling) bit-for-bit, which is separate work. A `SetIndex` on an
+            // Array pin still declines the region to the memory path.
+            //
+            // Staleness cannot bite here the way it can on the memory path: the
+            // snapshot's `base` goes stale on any Vec growth, and a regalloc region
+            // contains no Call/CallMethod and (by the line above) no SetIndex, so
+            // nothing in it can grow the array or trigger a GC.
+            !admit_bitwise && is_arr_pin(k) && matches!(code[ip], Instr::GetIndex { .. })
         })
     };
     // A pinned flat-ASCII STRING access (kind 254): `str.charCodeAt(i)` (CallMethod)

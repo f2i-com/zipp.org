@@ -437,7 +437,19 @@ pub(crate) fn compile_region_regalloc(
                     ; cmp rcx, [rsp + off + 16]       // unsigned: i < len (catches <0)
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]        // pinned base
-                    ; movsd Rx(d), [rdx + rcx * 8]    // f64 element → home
+                );
+                if is_arr_pin(ta_plan.pins[j].kind) {
+                    // B95 dense ORDINARY Array: the element is a NaN-boxed Value
+                    // (stride 8). `emit_box_to_home` is the same guard the prologue
+                    // uses on a live-in — Int → cvtsi2sd, real double → movq,
+                    // anything else (HOLE, bool, null/undefined, heap) → deopt.
+                    dynasm!(ops ; mov rax, [rdx + rcx * 8]);
+                    emit_box_to_home(&mut ops, d, deopt);
+                } else {
+                    // kind-8 Float64Array: the element IS a raw f64.
+                    dynasm!(ops ; movsd Rx(d), [rdx + rcx * 8]);
+                }
+                dynasm!(ops
                     ; jmp => done
                     ; => deopt
                     ; mov DWORD [rsi], ip as i32      // resume AT this ip

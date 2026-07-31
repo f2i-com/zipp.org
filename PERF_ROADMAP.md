@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B95 dense-Array reads on the double tier; the ladder ENDS at register pressure** | **MECHANISM (12 declines cleared, 0 promotions); the wall is now NAMED and MEASURED** | The double tier admitted only kind-8 Float64Array elements (`pin_kind = if admit_bitwise {5} else {8}`); a dense ORDINARY Array — what almost all JS indexing touches — declined the whole region. Now admitted with the INT tier's per-access tag guard (`emit_box_to_home`): Int converts, double moves, HOLE/bool/null/heap deopts. Writes still decline (Value::num narrowing is separate). GetIndex declines: polymorphic-objects **3->0**, class-prototype-hot **2->0**, sparse-array 5->2. **Not one region promoted** — third consecutive rung. So the REST of the ladder was priced in one experiment instead of climbed: admitting `Add` operands clears the read-only-live-in blocker and reveals **`xmm pool exhausted even with home reuse`** as terminal. It is a hard limit — **14 homes** against **40 / 76 / 73 / 70 distinct VM regs** plus 10-17 globals in the four regions — and the tier gives one PERMANENT home per value with **NO SPILLING**, so an oversized region declines wholesale to a tier B94 measured at 3.2x slower. Retires the B81/B83/B90 framing AND the B92/B94/B95 ladder: the one remaining item is a real register allocator with spill/reload |
 | **B94 live-range splitting for a recycled receiver** | **MECHANISM ONLY — 3.2x on the shape, ZERO suite regions** | Gives a VM register the bytecode compiler recycled (pinned array at ip37, sum at ip45, counter at ip49) a numeric xmm home while its memory slot stays the receiver's, via write-through at every numeric def + a flush skip — chosen over per-ip flush variants because it makes every exit correct without knowing the path. Delivers the number B93 lacked: an `a[i&1023]` loop goes **98ms -> 31ms (node 16ms), 6.5x -> 1.94x, 99.5% jit-mem -> 100% jit-fast** — so promoting a real array loop is worth **3.2x**. But the trigger needs a GLOBAL receiver and every benchmark loop is inside a function (`TaPinSrc::Reg`), where one slot cannot hold both the array and the number: **0 splits in all ten rows**, decline histogram unchanged. Method note: the first differential passed in 4 modes while the feature NEVER FIRED (IIFE locals emit no LoadGlobal) — a green differential proves nothing until ZIPP_JITLOG shows the mechanism ran. Also fixed a panic from sharing the planner with region_int |
 | **B93 `jit-native` was TWO tiers wearing one name** | **INSTRUMENT ADDED; the B90/B92 reading of four rows INVERTED** | Splitting the profiler's `jit-native` bucket by tier shows six rows are **57-100% in the MEMORY tier**: class-prototype-hot **99.9%**, typedarray-math 87.8%, map-set-heavy 84.5%, parse-large-js 78.3%, polymorphic-objects 67.5%, sparse-array 57.0%. class-prototype-hot was cited as the row where tier entry is SOLVED. Counting the ops responsible: **2-5% of a region's ops force the other 95-98% onto the slow tier** (polymorphic-objects 3 of 135, class-prototype-hot 3 of 71, sparse-array 2 of 63) and the blocking set is Call/CallMethod/GetIndex/SetIndex. Root cause under several declines is **bytecode temp-register recycling**, not the ops: the simplest possible Float64Array loop declines `pinned receiver reg not cleanly excludable` because r17 is the pinned receiver at ip37 and an arithmetic temp at ip45 — so regalloc's pinned-element `movsd` path is near-dead on real code. Validated on two known-answer workloads + ZIPP_JITLOG. Ceiling is INFERRED from B92's 4.20->1.05ns, not proven on these rows |
 | **B92 one bitwise op demoted a whole region out of register homes** | **LANDED as a MECHANISM (suite flat, mechanism 4x)** | Corrects B81/B83/B90: there are **three** region tiers, and the middle one (`compile_region_regalloc`) ALREADY has the f64 xmm/gpr homes that M4 describes — it just declined `Instr::Bitwise` outright. One `&`/`\|`/`>>>`/`\|0` in a loop demoted the whole region to memory: an identical 20M-iteration loop went **0.75 -> 4.20ns/iter** from adding `i & 1023` (node 0.75 either way). Emitting ToInt32 inline via 64-bit `cvttsd2si` (exact below 2^63; the INT64_MIN indefinite bails) fixes it: **4.20 -> 1.05ns/iter**, verified over **6,144 cases** against node in 4 modes. Suite **-0.39% [-0.78, +0.25]** — flat, because the Bitwise declines went to zero and every one of those 13 regions hit its NEXT blocker. **Tier promotion is a ladder, not a switch**; the next rungs are counted: read-only live-in (5), unpinned GetIndex/SetIndex (7). `ZIPP_NO_DOUBLE_BITWISE=1` |
@@ -1710,6 +1711,93 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B95 — dense-Array reads on the double tier, and the ladder's LAST rung is register pressure
+
+The double/regalloc tier admitted exactly one element kind:
+
+```rust
+let pin_kind: u8 = if admit_bitwise { 5 } else { 8 };   // int path: Int32Array
+                                                        // double path: Float64Array
+```
+
+Everything else — including a dense ORDINARY `Array`, which is what almost all JS
+indexing actually touches — declined the whole region to memory. The INT tier had
+already solved this for itself via `ARR_INT_PIN_KIND`: pin the array, guard the
+element's tag per access, unbox into a home. B95 gives the double tier the same
+treatment, with `emit_box_to_home` (the guard the prologue already uses on
+live-ins) instead of kind-8's bare `movsd`: an Int element converts, a real
+double moves, and a HOLE, bool, null/undefined or heap value **deopts at that
+ip**. The plan-time sample stays a hint; the per-access guard is the soundness.
+
+Writes are deliberately not admitted — boxing an f64 home back to a `Value` must
+reproduce `Value::num`'s exact-int narrowing and `-0`/NaN handling bit for bit,
+which is separate work — so a `SetIndex` on an Array pin still declines.
+Staleness cannot bite: the snapshot's `base` goes stale on Vec growth, and a
+regalloc region contains no `Call`/`CallMethod` and (by that same rule) no
+`SetIndex`, so nothing in it can grow the array or trigger a GC.
+
+**It clears what it aimed at.** `GetIndex/SetIndex (element not a pinned
+TypedArray)` declines:
+
+| row | before | after |
+|---|---:|---:|
+| `polymorphic-objects` | 3 | **0** |
+| `class-prototype-hot` | 2 | **0** |
+| `sparse-array` | 5 | 2 *(the remaining two are `SetIndex`)* |
+| `typedarray-math` | 2 | 2 *(both `SetIndex`)* |
+
+**And not one region promoted.** Every row's `jit-fast`/`jit-mem` split is within
+noise of B93's. The regions cleared this blocker and hit the next one, for the
+third time in a row (B92 → B94 → B95).
+
+**So the ladder was priced in one experiment instead of climbed.** Temporarily
+admitting `Add` operands and branch conditions as read-only-live-in uses — the
+blocker that B95 exposed, 10 occurrences across three rows — cleared them and
+revealed the terminus:
+
+| row | blockers with `Add` admitted | `jit-mem` |
+|---|---|---:|
+| `class-prototype-hot` | **xmm pool exhausted (2)**, CallMethod (1) | 99.9% |
+| `polymorphic-objects` | **xmm pool exhausted (2)**, live-in (2), type conflict (1) | 65.0% |
+
+**`xmm pool exhausted even with home reuse` is the real wall**, and it is a hard
+resource limit, not a gate:
+
+| region | ops | distinct VM regs | globals | homes available |
+|---|---:|---:|---:|---:|
+| `class-prototype-hot` 0 | 71 | **40** | 10 | **14** |
+| `polymorphic-objects` 0 | 135 | **76** | 15 | **14** |
+| `sparse-array` 0 | 132 | **73** | 17 | **14** |
+| `typedarray-math` 0 | 114 | **70** | 12 | **14** |
+
+The tier gives every value ONE PERMANENT home for the whole region
+(`HOME_XMM_FIRST=2 ..= HOME_XMM_LAST=15`), and **there is no spilling** — a region
+that does not fit declines wholesale to a tier B94 measured at 3.2× slower. These
+regions want 3–6× the pool. Linear-scan reuse already runs (that is what "even
+with home reuse" means) and still overflows.
+
+**This retires the framing every entry since B81 has used.** It is not "extend
+register homes to the memory tier" (B81/B83/B90), and it is not the op-admission
+ladder (B92/B94/B95). Both were real and both are now cleared far enough to see
+past. The single remaining item is **spilling in the register tier**: keep the
+hot ~14 values in homes and spill the rest to `[rbx + dreg(r)]`, so a 76-value
+region compiles at register speed for the 14 that matter instead of declining
+entirely. That is a genuine register allocator, and it is the only thing left
+between these six rows and the 3.2× B94 measured.
+
+The `Add` admission itself was NOT kept: it promoted nothing, and the note at
+`ro_live_in` records it was measured slower before (suite 3.31× → 3.45×) because
+the int path then accepts string live-ins and entry-bails on every OSR entry.
+
+Verified over a 10-case differential built for this change — plain doubles,
+all-Int elements, an element turned into a string mid-loop, HOLES,
+null/undefined/bool/object elements, `-0`/NaN/±Infinity/denormal round-trips, the
+array shrunk mid-loop, grown mid-loop (base realloc), a `defineProperty` accessor
+overlay, and fractional/NaN/negative indices — byte-identical to node under the
+JIT, `ZIPP_NOJIT=1`, `ZIPP_JIT_THRESHOLD=1` and `ZIPP_GC_STRESS=1`, with
+`ZIPP_JITLOG` confirming the path compiled (B94's lesson: a green differential
+proves nothing until the mechanism is shown to have run).
 
 ### B94 — live-range splitting: the tier gap on an array loop is 3.2×, and the mechanism reaches ZERO suite regions
 
