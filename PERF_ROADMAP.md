@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B92 one bitwise op demoted a whole region out of register homes** | **LANDED as a MECHANISM (suite flat, mechanism 4x)** | Corrects B81/B83/B90: there are **three** region tiers, and the middle one (`compile_region_regalloc`) ALREADY has the f64 xmm/gpr homes that M4 describes — it just declined `Instr::Bitwise` outright. One `&`/`\|`/`>>>`/`\|0` in a loop demoted the whole region to memory: an identical 20M-iteration loop went **0.75 -> 4.20ns/iter** from adding `i & 1023` (node 0.75 either way). Emitting ToInt32 inline via 64-bit `cvttsd2si` (exact below 2^63; the INT64_MIN indefinite bails) fixes it: **4.20 -> 1.05ns/iter**, verified over **6,144 cases** against node in 4 modes. Suite **-0.39% [-0.78, +0.25]** — flat, because the Bitwise declines went to zero and every one of those 13 regions hit its NEXT blocker. **Tier promotion is a ladder, not a switch**; the next rungs are counted: read-only live-in (5), unpinned GetIndex/SetIndex (7). `ZIPP_NO_DOUBLE_BITWISE=1` |
 | **B91 INT-tier promotion is closed by B9** | **NO CODE CHANGE; hazard documented at the switch** | Four rows are >=85% native, so promoting regions to the INT tier (xmm homes, at parity with V8) is the cheap route to M4. The declines are everywhere — `typedarray-math` 7 regions, `sparse-array` 8, `polymorphic-objects` 7 — under one blanket reason that names nothing, and `compile_region_int_maybe_cold` ALREADY implements the fix behind a `cold_exit` flag the only caller hardcodes to `false`. **That flag is dead on purpose: it is B9, which passed a fully green gate (96,029 test262 executions, both tiers, GC stress) and still returned `s = 0` for `3050`.** The comment now carries the warning at the point of temptation, including that the soundness argument beneath it is the one B9 shipped with and is wrong. Stopped one edit short of reintroducing it — by a kept negative result |
 | **B90 the profiler mis-attributed 24% of json-large** | **INSTRUMENT FIXED; a B83 conclusion CORRECTED** | Single-argument JSON.stringify/JSON.parse are FUSED by the compiler into their own ops and never reach call_native, where the tag sat — a 470ms stringify-only workload reported **100% interp**. Retagging moves json-large to **stringify 24.0%, interp 40.0% -> 15.4%**. B83 had read that 40% as the row not compiling, and B87 was aimed at it. The resting bucket is now interp/untagged, documented as no-tag-active rather than interpreter-running. Added a microtask phase: async-promise-chain splits 79.1% into **60.6% real interpreted user JS + 16.9% event loop**. Corrected profile: **four rows at or above 85% jit-native**, the clearest statement yet that M4 is the wall |
 | **B89 pure `ToNum` helper for a string operand** | **REFUTED, REVERTED** | `+x` bailed for every non-number; a string's ToNumber is a pure parse, so `+m[1]` / `+k` deopted 64 and 128 times and evicted. Built to dodge B87's trap — no refetch (the helper cannot allocate or re-enter) and `ToNum` is rare — and it dodged it: deopts **64 → 0**, 28 operand kinds node-identical on all tiers, user `valueOf`/`toString` running exactly once per `+`. Still lost: `regex-log-scan` **−0.2% [−0.4, +0.1]**, `sparse-array` **+1.3% [+0.5, +1.9]**, suite +0.04%. `sparse-array` now pays a helper call per for-in key where interpreting was cheaper. **Second consecutive deopt-removal to measure ≤0**: a deopt is only worth removing when the replacement beats the interpreter ON THAT PATH — B88 won because it was a wrong branch, B86 because the op was rare |
@@ -1707,6 +1708,85 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B92 — one bitwise op demoted a whole region out of register homes: 4.20 → 1.05ns on the shape, suite flat
+
+**This entry begins with a correction to several earlier ones in this file.**
+B81, B83 and B90 all concluded "M4 — the memory-backed register file — is the
+wall", on the strength of the profiler putting four rows at or above 85%
+`jit-native`. That framing had the architecture wrong. There are **three**
+region tiers, not two:
+
+| tier | homes | restriction |
+|---|---|---|
+| `region_int` | i64 in xmm | every op must be integer-valued |
+| **`compile_region_regalloc`** | **f64 in xmm / bool in gpr** | **no `Bitwise`** |
+| `region_mem` | the register file, in memory | none |
+
+The middle one already does what M4 asks for — its own doc says fixed homes,
+"NO per-op guards or memory traffic (this is what makes it competitive with
+V8)". So the question was never "build register allocation"; it was "why do hot
+regions keep missing the tier that already has it".
+
+For 13 regions across four rows, the answer was one line: `plan_region.rs`
+declined `Instr::Bitwise` on the double path outright, because those homes are
+f64 rather than the int path's sign-extended i64. A single `&`, `|`, `>>>` or
+`|0` anywhere in a loop sent the whole region to memory:
+
+| 20M-iteration loop | before | after | node |
+|---|---:|---:|---:|
+| double arithmetic, no bitwise | 0.75ns/iter | 0.75ns/iter | 0.75ns |
+| **identical + one `i & 1023`** | **4.20ns/iter** | **1.05ns/iter** | 0.75ns |
+| bitwise-dominated | 2.85ns/iter | 2.90ns/iter | 0.95ns |
+
+**How ToInt32 is done without a call.** `cvttsd2si` in its 64-BIT form truncates
+toward zero exactly for |x| < 2^63 — which covers every u32, the case that
+matters for `dv.getUint32(…) >>> 24` — and ToInt32 is then just the low 32 bits
+of that i64, because ToInt32 *is* trunc-then-mod-2^32 and taking `eax` performs
+the mod. The only unrepresentable input is the "integer indefinite" INT64_MIN
+that `cvttsd2si` returns for NaN, ±Infinity and |x| ≥ 2^63; those bail to the
+interpreter, which computes the real answer. A legitimate operand of exactly
+INT64_MIN also bails — correct, merely slower, and unreachable from an f64 that
+is not already enormous. `>>>` takes its u32 result from the full 64-bit `rax`
+so the value comes back positive.
+
+Verified before timing, because this changes emitted arithmetic: **6,144 cases**
+— 1,024 operand pairs across all six operators, the operands including `NaN`,
+`±Infinity`, `±0`, 2^31, 2^32, 2^53, 1e300, 1e21, fractionals and negatives —
+byte-identical to node under the JIT, `ZIPP_NOJIT=1`, `ZIPP_JIT_THRESHOLD=1`,
+and again with `ZIPP_NO_DOUBLE_BITWISE=1` flipped both ways. All 13 benchmarks
+also stay byte-identical.
+
+**Suite, `--ab-env` on ONE binary**, 21 pairs, `bench/b92_abenv_2026-07-31.json`:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| `polymorphic-objects-v2` (diagnostic) | −1.7% | [−2.4, −1.2] |
+| `sparse-array` | −1.6% | [−2.4, +0.4] |
+| `class-prototype-hot` | −0.5% | [−2.1, −0.1] |
+| `typedarray-math` | **+0.0%** | [−0.8, +0.7] |
+| suite geomean | −0.39% | [−0.78, +0.25] |
+
+**Ships as a MECHANISM (§14, in the manner of B76/B78), and the reason the suite
+is flat is the useful part.** The `Bitwise` declines are now **zero** in every
+row that had them — and each of those regions immediately hit its NEXT blocker:
+
+| row | what blocks it now |
+|---|---|
+| `typedarray-math` | type conflict on a reused register (2), `GetIndex`/`SetIndex` element not a pinned TypedArray (2), pinned receiver reg not cleanly excludable (1) |
+| `polymorphic-objects` | read-only live-in used where a number isn't required (4), `GetIndex`/`SetIndex` (3) |
+| `class-prototype-hot` | `GetIndex`/`SetIndex` (2), read-only live-in (1) |
+
+A region needs EVERY blocker cleared to promote, so removing one of three moves
+nothing — which is exactly what a verified 4× on the shape and a +0.0% on
+`typedarray-math` look like together. That is not an argument against the change
+(it is strictly better on the shape, nothing regresses, and the cliff is real
+and measured); it is the discovery that **tier promotion is a ladder, not a
+switch**, and the next two rungs are now named and counted: `read-only live-in
+used where a number isn't required` (5 across two rows) and `GetIndex`/`SetIndex`
+on an unpinned element (7 across three).
+
+Off-switch `ZIPP_NO_DOUBLE_BITWISE=1`.
 
 ### B91 — the INT-promotion route is CLOSED, and the dead switch that hides it now says so
 

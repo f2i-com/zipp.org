@@ -23,6 +23,26 @@ macro_rules! decline {
 /// later increment can admit a pinned-Float64Array element GetIndex/SetIndex as a
 /// VTy::Num xmm home. Not yet consulted — the blanket index/call/bitwise decline
 /// below still applies (regions with those take the memory path).
+/// `ZIPP_NO_DOUBLE_BITWISE=1` restores the pre-B92 behaviour, where a single
+/// `&`/`|`/`>>>`/`|0` demoted a whole region from the register-promoting tier to
+/// the memory path. Measured cost of that demotion on an otherwise identical
+/// 20M-iteration loop: **0.75ns/iter -> 4.15ns/iter**, against node unchanged at
+/// 0.75 either way.
+#[inline]
+pub(crate) fn double_bitwise_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_DOUBLE_BITWISE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 pub(crate) fn plan_region(
     proto: &FuncProto,
     start: u32,
@@ -234,7 +254,14 @@ pub(crate) fn plan_region_cold(
             // i64 homes hold sign-extended integers, so the low 32 bits ARE ToInt32
             // and the op runs inline with no reload/rebox. The regalloc/double path
             // passes admit_bitwise=false (its homes are f64, not int32 lanes).
-            Instr::Bitwise { .. } if !admit_bitwise => decline!("Bitwise on the double path"),
+            // B92: the double path now hosts Bitwise too, via a 64-bit
+            // `cvttsd2si` whose low 32 bits ARE ToInt32 (exact for |x| < 2^63,
+            // which covers every u32), so this no longer declines. Kept as an
+            // env-gated escape hatch: `ZIPP_NO_DOUBLE_BITWISE=1` restores the
+            // old behaviour for A/B and bisection.
+            Instr::Bitwise { .. } if !admit_bitwise && !double_bitwise_enabled() => {
+                decline!("Bitwise on the double path")
+            }
             Instr::GetIndex { .. } | Instr::SetIndex { .. } => {
                 if !pinned_elem(s + off) {
                     decline!("GetIndex/SetIndex (element not a pinned TypedArray)");

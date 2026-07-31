@@ -215,6 +215,68 @@ pub(crate) fn compile_region_regalloc(
                     flag_cmp = prev_flag;
                 }
             }
+            // B92: Bitwise on the DOUBLE path. Previously one `&`/`|`/`>>>`/`|0`
+            // demoted the whole region to the memory tier — measured on an
+            // otherwise identical 20M-iteration loop, 0.75ns/iter -> 4.15ns/iter
+            // (node: 0.75 either way), i.e. a 5.5x cliff behind a single op.
+            //
+            // The homes here are f64, not the int path's sign-extended i64, so
+            // each operand needs ToInt32. `cvttsd2si` in its 64-BIT form
+            // truncates toward zero exactly for |x| < 2^63 — which covers every
+            // u32, the case that matters for `dv.getUint32(...) >>> 24` — and
+            // ToInt32 is then just the low 32 bits of that i64, because ToInt32
+            // is trunc-then-mod-2^32 and the mod is what taking `eax` does.
+            //
+            // The one value `cvttsd2si` cannot represent is the "integer
+            // indefinite" INT64_MIN it returns for NaN, ±Infinity and |x| >=
+            // 2^63. Those bail to the interpreter, which computes the real
+            // answer (0 for NaN/Inf; a modular reduction for the huge case).
+            // A legitimate operand of exactly INT64_MIN also bails — correct,
+            // just slower, and unreachable from an f64 that is not already huge.
+            Instr::Bitwise { dst, a, b, op } => {
+                use crate::bytecode::BitwiseOp as B;
+                let (d, ax, bx) = (xh(&plan, dst), xh(&plan, a), xh(&plan, b));
+                copy_clobber(&mut lc, d);
+                let bw_bail = ops.new_dynamic_label();
+                let bw_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; cvttsd2si rax, Rx(ax)
+                    ; mov r10, QWORD i64::MIN
+                    ; cmp rax, r10
+                    ; je => bw_bail
+                    ; cvttsd2si rcx, Rx(bx)
+                    ; cmp rcx, r10
+                    ; je => bw_bail
+                );
+                // x86 masks the shift count in cl to 5 bits, which is exactly
+                // JS's `& 31`.
+                match op {
+                    B::And => dynasm!(ops ; and eax, ecx ; movsxd rax, eax),
+                    B::Or => dynasm!(ops ; or eax, ecx ; movsxd rax, eax),
+                    B::Xor => dynasm!(ops ; xor eax, ecx ; movsxd rax, eax),
+                    B::Shl => dynasm!(ops ; shl eax, cl ; movsxd rax, eax),
+                    B::Shr => dynasm!(ops ; sar eax, cl ; movsxd rax, eax),
+                    // `>>>` yields a u32 (0..2^32-1); the 32-bit `shr` zero-
+                    // extends into rax, and converting the 64-bit rax gives the
+                    // unsigned value as a double rather than a negative one.
+                    B::Ushr => dynasm!(ops ; shr eax, cl),
+                }
+                // `xorps` first: `cvtsi2sd` merges into the low lane and would
+                // otherwise carry a false dependency on the home's old contents.
+                dynasm!(ops
+                    ; xorps Rx(d), Rx(d)
+                    ; cvtsi2sd Rx(d), rax
+                    ; jmp => bw_done
+                    // Resume at THIS ip: nothing has been written yet (the bail
+                    // precedes the only store to `d`), so every home is still
+                    // consistent and `flush_exit` writes them all back before
+                    // the interpreter re-executes the op with full semantics.
+                    ; => bw_bail
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => flush_exit
+                    ; => bw_done
+                );
+            }
             Instr::Add { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Add, &mut lc),
             Instr::Sub { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Sub, &mut lc),
             Instr::Mul { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Mul, &mut lc),
