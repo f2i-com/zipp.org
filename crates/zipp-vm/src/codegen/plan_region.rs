@@ -935,7 +935,18 @@ pub(crate) fn plan_region_cold(
         for (a, b, v) in intervals {
             let x = match alloc.alloc(a, b) {
                 Some(x) => x,
-                None => decline!("xmm pool exhausted even with home reuse"),
+                None => {
+                    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                        let nregs = reg_order.iter().filter(|r| ty[r] == VTy::Num).count();
+                        let perm = reg_order.iter().filter(|r| ty[r] == VTy::Num && !shareable(**r)).count();
+                        let ro = reg_order.iter().filter(|r| ty[r] == VTy::Num && read_outside.contains(r)).count();
+                        let li = reg_order.iter().filter(|r| ty[r] == VTy::Num && first_seen.get(r) == Some(&false)).count();
+                        let ho = reg_order.iter().filter(|r| ty[r] == VTy::Num && hoisted.contains(r)).count();
+                        eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
+                            glob_order.len(), nregs - perm);
+                    }
+                    decline!("xmm pool exhausted even with home reuse")
+                }
             };
             match v {
                 NumVal::Reg(r) => {

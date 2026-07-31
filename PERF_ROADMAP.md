@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B96 B95's register-pressure figure was a bad proxy** | **CORRECTION; the fix is smaller than B95 concluded** | B95 priced the wall as 40/76/73/70 distinct VM regs vs 14 homes. Max SIMULTANEOUSLY live is **12/14/16/13** (8/11/17/15 with ranges split), plus 9-17 permanently-homed globals — a **~1.5x shortfall, not 5x**. And the excess is PERMANENCE, not liveness: `read_outside`, live-in and hoisted regs each pin a whole-region home, and every global does unconditionally. The `read_outside` rule is conservative for exactly the unsoundness **B94 already fixed** (flush_exit writing a shared home into every sharer's slot) — write-through makes sharing safe. So the next step is NOT a general spilling allocator: generalise B94's write-through to `read_outside` regs, admit Add-using read-only live-ins backed by a plan-time numeric OBSERVATION (blanket admission measured 3.31x -> 3.45x), and spill only if pressure still exceeds 14. Adds a `[pool]` demand diagnostic, which prints nothing until the read-only-live-in rung is cleared |
 | **B95 dense-Array reads on the double tier; the ladder ENDS at register pressure** | **MECHANISM (12 declines cleared, 0 promotions); the wall is now NAMED and MEASURED** | The double tier admitted only kind-8 Float64Array elements (`pin_kind = if admit_bitwise {5} else {8}`); a dense ORDINARY Array — what almost all JS indexing touches — declined the whole region. Now admitted with the INT tier's per-access tag guard (`emit_box_to_home`): Int converts, double moves, HOLE/bool/null/heap deopts. Writes still decline (Value::num narrowing is separate). GetIndex declines: polymorphic-objects **3->0**, class-prototype-hot **2->0**, sparse-array 5->2. **Not one region promoted** — third consecutive rung. So the REST of the ladder was priced in one experiment instead of climbed: admitting `Add` operands clears the read-only-live-in blocker and reveals **`xmm pool exhausted even with home reuse`** as terminal. It is a hard limit — **14 homes** against **40 / 76 / 73 / 70 distinct VM regs** plus 10-17 globals in the four regions — and the tier gives one PERMANENT home per value with **NO SPILLING**, so an oversized region declines wholesale to a tier B94 measured at 3.2x slower. Retires the B81/B83/B90 framing AND the B92/B94/B95 ladder: the one remaining item is a real register allocator with spill/reload |
 | **B94 live-range splitting for a recycled receiver** | **MECHANISM ONLY — 3.2x on the shape, ZERO suite regions** | Gives a VM register the bytecode compiler recycled (pinned array at ip37, sum at ip45, counter at ip49) a numeric xmm home while its memory slot stays the receiver's, via write-through at every numeric def + a flush skip — chosen over per-ip flush variants because it makes every exit correct without knowing the path. Delivers the number B93 lacked: an `a[i&1023]` loop goes **98ms -> 31ms (node 16ms), 6.5x -> 1.94x, 99.5% jit-mem -> 100% jit-fast** — so promoting a real array loop is worth **3.2x**. But the trigger needs a GLOBAL receiver and every benchmark loop is inside a function (`TaPinSrc::Reg`), where one slot cannot hold both the array and the number: **0 splits in all ten rows**, decline histogram unchanged. Method note: the first differential passed in 4 modes while the feature NEVER FIRED (IIFE locals emit no LoadGlobal) — a green differential proves nothing until ZIPP_JITLOG shows the mechanism ran. Also fixed a panic from sharing the planner with region_int |
 | **B93 `jit-native` was TWO tiers wearing one name** | **INSTRUMENT ADDED; the B90/B92 reading of four rows INVERTED** | Splitting the profiler's `jit-native` bucket by tier shows six rows are **57-100% in the MEMORY tier**: class-prototype-hot **99.9%**, typedarray-math 87.8%, map-set-heavy 84.5%, parse-large-js 78.3%, polymorphic-objects 67.5%, sparse-array 57.0%. class-prototype-hot was cited as the row where tier entry is SOLVED. Counting the ops responsible: **2-5% of a region's ops force the other 95-98% onto the slow tier** (polymorphic-objects 3 of 135, class-prototype-hot 3 of 71, sparse-array 2 of 63) and the blocking set is Call/CallMethod/GetIndex/SetIndex. Root cause under several declines is **bytecode temp-register recycling**, not the ops: the simplest possible Float64Array loop declines `pinned receiver reg not cleanly excludable` because r17 is the pinned receiver at ip37 and an arithmetic temp at ip45 — so regalloc's pinned-element `movsd` path is near-dead on real code. Validated on two known-answer workloads + ZIPP_JITLOG. Ceiling is INFERRED from B92's 4.20->1.05ns, not proven on these rows |
@@ -1712,6 +1713,73 @@ Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
 
+### B96 — correcting B95's pressure figure: it is ~22 against 14, not 76, and the excess is PERMANENCE not liveness
+
+B95 reported the register-pressure wall using "distinct VM registers in the
+region" — 40, 76, 73, 70 against a 14-home pool. **That proxy is wrong**, and it
+overstates the problem by a factor of about four. Counting max SIMULTANEOUSLY
+live values instead:
+
+| region | ops | distinct regs *(B95's figure)* | max simultaneous, by VM-register | by VALUE (ranges split) | globals |
+|---|---:|---:|---:|---:|---:|
+| `class-prototype-hot` 0 | 71 | ~~40~~ | **12** | 8 | 10 |
+| `polymorphic-objects` 0 | 135 | ~~76~~ | **14** | 11 | 15 |
+| `sparse-array` 0 | 132 | ~~73~~ | **16** | 17 | 17 |
+| `sparse-array` 1 | 63 | ~~34~~ | **6** | 5 | 9 |
+| `typedarray-math` 0 | 114 | ~~70~~ | **13** | 15 | 12 |
+| `typedarray-math` 1 | 79 | ~~38~~ | **24** | 11 | 9 |
+
+The wall is real — `class-prototype-hot` needs 12 register homes plus 10 global
+homes against a pool of 14 — but the shortfall is **~1.5×, not 5×**, which makes
+it a much more tractable problem than B95 implied.
+
+**And the excess is mostly PERMANENCE, not simultaneous liveness.** Three rules
+pin a value to a whole-region home regardless of how briefly it is live:
+
+```rust
+if first_seen.get(&r) == Some(&false)   // loop-carried live-in
+    || hoisted.contains(&r)             // prologue-materialised constant
+    || read_outside.contains(&r)        // READ AFTER THE REGION
+{ (s, e) }                              // ⇒ permanent home
+```
+
+plus every global unconditionally: `intervals.push((s, e, NumVal::Glob(gi)))`.
+
+`read_outside` is the interesting one, and the comment beside it states exactly
+why it must be conservative today:
+
+> Sharing one is only sound when clobbering the loser's frame slot is invisible
+> … `flush_exit` writes the shared home to EVERY sharer's slot, so a sharer whose
+> value still matters after the region would come back holding an unrelated temp.
+
+**That is the same unsoundness B94 already solved, by a mechanism now landed and
+gated.** Write-through — store each def to `[rbx + dreg(r)]` and skip the
+register in `flush_exit` — makes a shared home safe for a `read_outside`
+register: its slot receives its own value at its own def, before the home is
+reused, and the flush never overwrites it. Two instructions per def, against a
+tier B94 measured at 3.2× slower.
+
+So the remaining item is **not** a general spilling allocator, which is what B95
+concluded from the bad proxy. It is:
+
+1. Generalise B94's write-through from one split receiver to any register that
+   would otherwise need a permanent home for the `read_outside` reason.
+2. Admit read-only live-ins used by `Add` (10 occurrences across three rows) —
+   but backed by a plan-time numeric OBSERVATION rather than blanket admission,
+   since blanket admission was measured slower (suite 3.31× → 3.45×: the int path
+   then accepts string live-ins and entry-bails on every OSR entry). The
+   `ARR_INT_PIN_KIND` sample is the in-repo precedent for "observation as a hint,
+   guard for soundness".
+3. Only then, if pressure still exceeds 14, spill.
+
+**Method note.** The `[pool]` diagnostic added here reports the demand breakdown
+(numeric regs, globals, permanent split by reason, shareable) at the exhaustion
+decline. It prints nothing today, because pool exhaustion sits BEHIND the
+read-only-live-in blocker and only surfaces once that is cleared — which is how
+B95 saw it (under a temporary `Add`-admitting experiment, since removed). It is
+kept deliberately: it is the instrument the next step needs, and this entry
+exists because B95 published a number that was never measured directly.
+
 ### B95 — dense-Array reads on the double tier, and the ladder's LAST rung is register pressure
 
 The double/regalloc tier admitted exactly one element kind:
@@ -1763,6 +1831,10 @@ revealed the terminus:
 
 **`xmm pool exhausted even with home reuse` is the real wall**, and it is a hard
 resource limit, not a gate:
+
+**(B96 CORRECTS THE TABLE BELOW: "distinct VM regs" is a bad proxy. Max
+SIMULTANEOUSLY live is 12/14/16/13, not 40/76/73/70, so the shortfall is ~1.5x
+rather than 5x, and the excess is PERMANENCE rather than liveness.)**
 
 | region | ops | distinct VM regs | globals | homes available |
 |---|---:|---:|---:|---:|
