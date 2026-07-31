@@ -1751,8 +1751,16 @@ byte-identical across pool on/off × `ZIPP_GC_STRESS` on/off and against node):
 `json-large` RETAINS its tree, so almost nothing is swept, the pool stays empty,
 and the row pays the check for no benefit. The targeted fix — skip the 80-byte
 `mem::replace` unless the object is actually recyclable — made BOTH rows worse,
-which no mechanism story explains and which means the two runs disagree about
-the same change by five points. Combined with a suite interval that included
+and the two runs then disagree about the same change by five points.
+
+**One mechanism was proposed and REFUTED rather than left as a story**: that the
+pool retains `Vec` capacity, so `json-large`'s wide objects (54,390 shapes) would
+blow up memory and cost cache locality. Measured peak RSS is **137.1MB with the
+pool against 134.7MB without** — +1.8%, nowhere near enough to explain +2.9% of
+runtime. So the regression is real and its cause is still unknown. Naming that
+honestly matters more than a plausible story: the next attempt should start by
+building the sampling profiler §6 has wanted since B3, because this is the
+second time this session a mechanism could not be settled by reasoning. Combined with a suite interval that included
 zero even in the favourable run, and one row now clearly past §14's +2% bar,
 this is a revert on the rules as written.
 
