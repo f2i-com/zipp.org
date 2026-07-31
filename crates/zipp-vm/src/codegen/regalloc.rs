@@ -500,13 +500,15 @@ pub(crate) fn compile_region_regalloc(
         // MEMORY as well as its home, because `flush_exit` deliberately skips
         // this register and memory is what the interpreter reads on any exit.
         // Two instructions, once per def; the LoadGlobal half already stored.
-        if let Some(sr) = plan.split_recv {
-            if !plan.split_recv_lg.contains(&ip) && writes_reg(&proto.code[ip]) == Some(sr) {
-                let h = xh(&plan, sr);
-                dynasm!(ops
-                    ; movq rax, Rx(h)
-                    ; mov [rbx + dreg(sr)], rax
-                );
+        if let Some(d) = writes_reg(&proto.code[ip]) {
+            let is_split = plan.split_recv == Some(d) && !plan.split_recv_lg.contains(&ip);
+            if is_split || plan.write_through.contains(&d) {
+                if let Home::Xmm(h) = plan.reg_home[&d] {
+                    dynasm!(ops
+                        ; movq rax, Rx(h)
+                        ; mov [rbx + dreg(d)], rax
+                    );
+                }
             }
         }
     }
@@ -528,7 +530,9 @@ pub(crate) fn compile_region_regalloc(
         // The B94 split receiver is written through at each def, so memory is
         // already current; flushing its home here would overwrite the receiver
         // object at any exit taken inside the receiver range.
-        if Some(r) == plan.split_recv {
+        // B97: a shared home may hold ANOTHER register's value by now; the
+        // write-through at each def already put this one's value in its slot.
+        if Some(r) == plan.split_recv || plan.write_through.contains(&r) {
             continue;
         }
         dynasm!(ops ; movq rax, Rx(x) ; mov [rbx + dreg(r)], rax);

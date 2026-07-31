@@ -29,6 +29,24 @@ macro_rules! decline {
 /// 20M-iteration loop: **0.75ns/iter -> 4.15ns/iter**, against node unchanged at
 /// 0.75 either way.
 #[inline]
+/// `ZIPP_NO_WT_SHARE=1` restores the pre-B97/B98 planner: `read_outside`
+/// registers pin a permanent home again, and an `Add` operand no longer counts
+/// as a numeric-required use of a read-only live-in. One switch for both because
+/// neither promotes a region on its own — B97 clears the register-pressure
+/// blocker that only appears once B98 clears the live-in one.
+pub(crate) fn wt_share_enabled() -> bool {
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match ON.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_WT_SHARE").is_none();
+            ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+            v
+        }
+    }
+}
+
 pub(crate) fn double_bitwise_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -65,11 +83,17 @@ pub(crate) fn plan_region_cold(
     end: u32,
     ta_plan: &TaPinPlan,
     admit_bitwise: bool,
-    // B94 live-range splitting. Only the REGALLOC (double) path implements the
-    // three emitter halves — the receiver `LoadGlobal` as a real store, the
-    // write-through at numeric defs, and the flush skip. `region_int` shares this
-    // planner but not those, and panicked looking up a home the plan deliberately
-    // withheld ("no entry found for key"), so the int path passes `false`.
+    // Does the CALLER implement write-through (store each def to `[rbx + dreg(r)]`
+    // and skip that register in its flush)? Only the REGALLOC (double) path does,
+    // and it gates two features that depend on it: B94 live-range splitting and
+    // B97 home-sharing for `read_outside` registers.
+    //
+    // `region_int` shares this planner and implements neither. Admitting B94 there
+    // panicked it ("no entry found for key" — it looks up a home the plan withheld);
+    // admitting B97 there silently returned the WRONG ANSWER, because making a
+    // register shareable also drops its entry load, so its home starts as garbage
+    // and the int flush wrote that garbage into the frame slot. Both were caught by
+    // `hoisted_const_on_untaken_branch`. The int path passes `false`.
     admit_split: bool,
     cold: &FxHashSet<usize>,
 ) -> Option<RegionPlan> {
@@ -142,6 +166,7 @@ pub(crate) fn plan_region_cold(
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
     // B94: at most one recycled receiver register per region (see `plan::RegionPlan`).
     let mut split_recv: Option<u16> = None;
+    let mut write_through: FxHashSet<u16> = FxHashSet::default();
     let mut split_recv_lg: FxHashSet<usize> = FxHashSet::default();
     let mut recv_glob: Option<u32> = None;
     {
@@ -499,7 +524,22 @@ pub(crate) fn plan_region_cold(
     if !ro_live_in.is_empty() {
         for (off, instr) in code[s..=e].iter().enumerate() {
             if cold.contains(&(s + off)) { continue; }
-            let numeric = numeric_operand_uses(instr);
+            // B98: on the DOUBLE path, an `Add` operand counts as a numeric-required
+            // use. `Add` is excluded globally because it is also string concat, so a
+            // string live-in is unremarkable and the entry guard would miss on every
+            // OSR entry — that is the 3.31x -> 3.45x regression recorded above. But
+            // that measurement was of BLANKET admission on the INT path, and its
+            // stated causes were live-ins that are "strings, doubles or objects": a
+            // DOUBLE live-in bails the int path and is perfectly native here, so the
+            // largest of the three does not apply. A string or object still bails,
+            // correctly, via `emit_box_to_home` at entry.
+            let mut numeric = numeric_operand_uses(instr);
+            if !admit_bitwise && wt_share_enabled() {
+                if let Instr::Add { a, b, .. } = *instr {
+                    numeric.push(a);
+                    numeric.push(b);
+                }
+            }
             for u in instr_uses(instr) {
                 if ro_live_in.contains(&u) && !numeric.contains(&u) {
                     decline!("read-only live-in used where a number isn't required"); // 
@@ -868,9 +908,11 @@ pub(crate) fn plan_region_cold(
         // does not imply the register is dead in the enclosing function — that is
         // what made blanket reuse unsound. Same `read_outside` set the dead-code
         // pass uses.
+        // B97: `read_outside` dropped from this list — those registers now share
+        // via write-through instead of pinning a permanent home.
         if first_seen.get(&r) == Some(&false)
             || hoisted.contains(&r)
-            || read_outside.contains(&r)
+            || (!(admit_split && wt_share_enabled()) && read_outside.contains(&r))
         {
             (s, e)
         } else {
@@ -880,11 +922,33 @@ pub(crate) fn plan_region_cold(
     // Registers eligible to SHARE an xmm: not loop-carried, not a hoisted
     // constant, and not read after the region. They need no entry load either —
     // an early exit flushing a stale value into their slot is unobservable.
+    // B97: `read_outside` no longer disqualifies. Such a register may share a home
+    // provided it is WRITTEN THROUGH at every def and skipped by `flush_exit` (see
+    // `RegionPlan::write_through`) — that is what makes clobbering the home
+    // invisible in its frame slot, which is the property the old rule bought by
+    // refusing to share at all.
     let shareable = |r: u16| -> bool {
         first_seen.get(&r) != Some(&false)
             && !hoisted.contains(&r)
-            && !read_outside.contains(&r)
+            && ((admit_split && wt_share_enabled()) || !read_outside.contains(&r))
     };
+
+    // ── B97 write-through set ── every read-after-region register that `shareable`
+    // now admits. This MUST be populated for BOTH allocation branches, not just the
+    // reuse one: making a register shareable also drops it from `live_in_regs` (see
+    // there), so even with a private home it starts as GARBAGE, and a `flush_exit`
+    // that wrote that home would corrupt its slot. That is not hypothetical — it is
+    // exactly what `hoisted_const_on_untaken_branch` catches:
+    //
+    //   let c = 3; for (…) { if (i > 1e9) { c = 7; … } }  return c;
+    //
+    // `c`'s only in-region def never executes, so nothing ever fills its home; with
+    // the flush skipped, its slot correctly keeps the 3 the frame already held.
+    for &r in &reg_order {
+        if admit_split && read_outside.contains(&r) && shareable(r) {
+            write_through.insert(r);
+        }
+    }
 
     // The xmm home pool size. If one-home-per-numeric-value fits, use the simple
     // allocation (distinct home each — best ILP, what loop.js relies on). Only
@@ -1133,6 +1197,7 @@ pub(crate) fn plan_region_cold(
         jump_targets,
         ta_recv_regs,
         split_recv,
+        write_through,
         split_recv_lg,
     })
 }

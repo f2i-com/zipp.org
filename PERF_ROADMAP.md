@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B97/B98 write-through home sharing + Add live-ins (double path)** | **MECHANISM; suite NULL; first DOUBLE regions ever compiled here** | B97 lets a `read_outside` register SHARE an xmm home by generalising B94's write-through (store each def to `[rbx+dreg(r)]`, skip it in the flush) — removing the `xmm pool exhausted` blocker B95 called terminal. B98 admits `Add` operands as numeric-required uses of a read-only live-in **on the double path only**: the 3.31x->3.45x regression that refuted this was BLANKET admission on the INT path, and its stated causes were string/double/object live-ins — a double is native here, so the largest cause does not apply. Together: **class-prototype-hot 3 declines -> 1**, polymorphic-objects 7 -> 3, and DOUBLE regions **0 -> 1 / 0 -> 1 / 0 -> 3**. Suite **-0.16% [-1.87, +1.42]** — null; the promoted regions are COLD, and the hot ones are now blocked by `CallMethod`, a MISSING CAPABILITY (the register tier issues no calls; B78's method inlining is memory-path only) rather than an admission gate. **Introduced a wrong-answer bug** (a shareable reg loses its entry load; an untaken-branch def then flushed a garbage home) caught by the kept `hoisted_const_on_untaken_branch` tests while all 13 benches still said ALL_CORRECT=1. Also: a pre-fix A/B showed sparse-array -3.0% twice; it did NOT reproduce on the fixed build. `ZIPP_NO_WT_SHARE=1` |
 | **B96 B95's register-pressure figure was a bad proxy** | **CORRECTION; the fix is smaller than B95 concluded** | B95 priced the wall as 40/76/73/70 distinct VM regs vs 14 homes. Max SIMULTANEOUSLY live is **12/14/16/13** (8/11/17/15 with ranges split), plus 9-17 permanently-homed globals — a **~1.5x shortfall, not 5x**. And the excess is PERMANENCE, not liveness: `read_outside`, live-in and hoisted regs each pin a whole-region home, and every global does unconditionally. The `read_outside` rule is conservative for exactly the unsoundness **B94 already fixed** (flush_exit writing a shared home into every sharer's slot) — write-through makes sharing safe. So the next step is NOT a general spilling allocator: generalise B94's write-through to `read_outside` regs, admit Add-using read-only live-ins backed by a plan-time numeric OBSERVATION (blanket admission measured 3.31x -> 3.45x), and spill only if pressure still exceeds 14. Adds a `[pool]` demand diagnostic, which prints nothing until the read-only-live-in rung is cleared |
 | **B95 dense-Array reads on the double tier; the ladder ENDS at register pressure** | **MECHANISM (12 declines cleared, 0 promotions); the wall is now NAMED and MEASURED** | The double tier admitted only kind-8 Float64Array elements (`pin_kind = if admit_bitwise {5} else {8}`); a dense ORDINARY Array — what almost all JS indexing touches — declined the whole region. Now admitted with the INT tier's per-access tag guard (`emit_box_to_home`): Int converts, double moves, HOLE/bool/null/heap deopts. Writes still decline (Value::num narrowing is separate). GetIndex declines: polymorphic-objects **3->0**, class-prototype-hot **2->0**, sparse-array 5->2. **Not one region promoted** — third consecutive rung. So the REST of the ladder was priced in one experiment instead of climbed: admitting `Add` operands clears the read-only-live-in blocker and reveals **`xmm pool exhausted even with home reuse`** as terminal. It is a hard limit — **14 homes** against **40 / 76 / 73 / 70 distinct VM regs** plus 10-17 globals in the four regions — and the tier gives one PERMANENT home per value with **NO SPILLING**, so an oversized region declines wholesale to a tier B94 measured at 3.2x slower. Retires the B81/B83/B90 framing AND the B92/B94/B95 ladder: the one remaining item is a real register allocator with spill/reload |
 | **B94 live-range splitting for a recycled receiver** | **MECHANISM ONLY — 3.2x on the shape, ZERO suite regions** | Gives a VM register the bytecode compiler recycled (pinned array at ip37, sum at ip45, counter at ip49) a numeric xmm home while its memory slot stays the receiver's, via write-through at every numeric def + a flush skip — chosen over per-ip flush variants because it makes every exit correct without knowing the path. Delivers the number B93 lacked: an `a[i&1023]` loop goes **98ms -> 31ms (node 16ms), 6.5x -> 1.94x, 99.5% jit-mem -> 100% jit-fast** — so promoting a real array loop is worth **3.2x**. But the trigger needs a GLOBAL receiver and every benchmark loop is inside a function (`TaPinSrc::Reg`), where one slot cannot hold both the array and the number: **0 splits in all ten rows**, decline histogram unchanged. Method note: the first differential passed in 4 modes while the feature NEVER FIRED (IIFE locals emit no LoadGlobal) — a green differential proves nothing until ZIPP_JITLOG shows the mechanism ran. Also fixed a panic from sharing the planner with region_int |
@@ -1712,6 +1713,105 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B97/B98 — the first regions actually reach the register tier, and the hot ones are blocked by `CallMethod`
+
+B96 named two steps and predicted neither would show anything alone. Both were
+built; both did nothing alone; together they compile the first DOUBLE regions
+these benchmarks have ever produced.
+
+**B97 — a `read_outside` register may now SHARE an xmm home.** Three rules pinned
+a value to a permanent whole-region home regardless of how briefly it was live,
+and `read_outside` (read after the region) was the widest. The comment beside it
+stated the hazard exactly:
+
+> `flush_exit` writes the shared home to EVERY sharer's slot, so a sharer whose
+> value still matters after the region would come back holding an unrelated temp.
+
+That is the same unsoundness **B94 already solved**. Write-through — store each
+def to `[rbx + dreg(r)]`, skip the register in `flush_exit` — makes sharing safe:
+each slot receives its own value at its own def, before the home is reused. Two
+instructions per def against a tier B94 measured at 3.2× slower.
+
+**B98 — an `Add` operand counts as a numeric-required use of a read-only live-in,
+on the DOUBLE path only.** `Add` is excluded globally because it is also string
+concat, so a string live-in is unremarkable and the entry guard would miss on
+every OSR entry — the 3.31× → 3.45× regression recorded at `ro_live_in`. But that
+measurement was of BLANKET admission on the INT path, and its stated causes were
+live-ins that are *"strings, doubles or objects"*. **A double live-in bails the
+int path and is perfectly native here**, so the largest of the three does not
+apply. A string or object still bails, correctly, at `emit_box_to_home`.
+
+**Result — DOUBLE regions where there were none:**
+
+| row | DOUBLE regions before | after | remaining declines |
+|---|---:|---:|---|
+| `class-prototype-hot` | 0 | **1** | **1** (was 3) — `CallMethod` |
+| `polymorphic-objects` | 0 | **1** | 3 (was 7) |
+| `typedarray-math` | 0 | **3** | — |
+
+`class-prototype-hot` went from three decline reasons to **one**, and the
+`xmm pool exhausted` blocker B95 called terminal is **gone** — B97 removed it, as
+B96 predicted it would.
+
+**And the time did not move, because the promoted regions are the COLD ones.**
+The row is still 99.6% `jit-mem`: its hot region is one of the three that remain
+on the memory path, blocked by the single surviving `CallMethod` decline. The
+register tier issues no calls at all, so that region cannot promote until method
+inlining — which B78 built, but only for the memory path — is extended to it.
+That is the next item, and it is the first time the blocker has been a *missing
+capability* rather than an admission gate.
+
+
+**A wrong-answer bug this introduced, and what caught it.** Making a register
+`shareable` also drops it from `live_in_regs`, so its home is no longer filled at
+entry. Two existing regression tests failed immediately:
+
+```js
+function f(){ let s=0, c=3; for (let i=0;i<200000;i++){ if (i>1e9) { c=7; s+=c; } s+=i; } return c; }
+```
+
+`c`'s only in-region def sits on a branch that never runs, so nothing ever fills
+its home — and `flush_exit` wrote that garbage home into `c`'s frame slot, so `f()`
+returned garbage instead of 3. Two separate mistakes produced it: `write_through`
+was populated only inside the `reuse` allocation branch (the one-home-per-value
+branch shares nothing, so it looked unnecessary — but the missing ENTRY LOAD
+applies to both), and the change was not gated to the path that implements
+write-through, so `region_int` silently inherited it. B94 hit the same gate and
+merely *panicked*; here it returned a wrong answer.
+
+This is the B9 failure class — plausible, benchmark-invisible, correct-looking —
+and it was caught by a kept regression test rather than by review or by the
+benchmarks, which all still reported `ALL_CORRECT=1` at the time.
+
+**Suite: NULL.** `--ab-env` on one binary, 25 pairs, after the fix
+(`bench/b97_abenv3_2026-07-31.json`):
+
+| row | paired | 95% CI |
+|---|---:|---|
+| `map-set-heavy` | −3.0% | [−10.4, −0.8] |
+| `class-prototype-hot` | −2.7% | [−9.7, +2.1] |
+| `polymorphic-objects-v2` | −2.6% | [−6.5, +2.0] |
+| `parse-large-js` | +3.6% | [−2.3, +10.3] |
+| **geomean** | **−0.16%** | **[−1.87, +1.42]** |
+
+Two pre-fix runs had shown `sparse-array` at −3.0% [−6.6, −1.7] and −2.7%
+[−8.5, −0.1] and I was ready to call that a reproducible target-row win. **On the
+fixed build it is −0.8% [−8.0, +8.4] — it did not reproduce**, and it was measured
+on a binary that returned wrong answers. `map-set-heavy` is the only row excluding
+zero now, on a machine whose absolute times are ~40% above the same benchmarks
+earlier in the session; that is not enough to claim.
+
+So this lands as a **mechanism with an explicitly null suite result**, like B92,
+B94 and B95 before it. What it buys is structural: the `xmm pool exhausted`
+blocker B95 called terminal is gone, `class-prototype-hot` is down to a single
+decline, and the first DOUBLE regions in this suite's history now compile. What it
+does not buy is time, because the promoted regions are cold.
+
+Off-switch `ZIPP_NO_WT_SHARE=1` (both halves — neither is independently
+meaningful). Verified with B94's and B95's differentials, 8 runs across the JIT,
+`ZIPP_JIT_THRESHOLD=1`, `ZIPP_GC_STRESS=1` and the off-switch, byte-identical to
+node; gate green (37 suites / 0 failures, test262 ×3 identical, 13/13 benches).
 
 ### B96 — correcting B95's pressure figure: it is ~22 against 14, not 76, and the excess is PERMANENCE not liveness
 

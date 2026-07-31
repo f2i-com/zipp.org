@@ -108,6 +108,20 @@ pub(crate) struct RegionPlan {
     ///
     /// At most ONE per region; a second declines.
     pub(crate) split_recv: Option<u16>,
+    /// B97. Registers whose home is SHARED (linear-scan reuse) but which are read
+    /// AFTER the region, so a stale flush into their frame slot would be visible.
+    /// They are written THROUGH to `[rbx + dreg(r)]` at every def and skipped by
+    /// `flush_exit`, which is the same trade B94 made for the split receiver:
+    /// memory is authoritative, the home is a read cache.
+    ///
+    /// Before this they were forced to a PERMANENT whole-region home — the rule
+    /// that made `class-prototype-hot` want 12 register homes plus 10 global homes
+    /// against a pool of 14 (B96). The comment at `range()` states the exact
+    /// hazard: "flush_exit writes the shared home to EVERY sharer's slot, so a
+    /// sharer whose value still matters after the region would come back holding
+    /// an unrelated temp." Write-through removes it — each slot receives its own
+    /// value at its own def, before the home is reused.
+    pub(crate) write_through: FxHashSet<u16>,
     /// Region ips of `split_recv`'s RECEIVER `LoadGlobal` (the one reading the
     /// pinned array's global slot). These emit a real memory store and are the
     /// only defs of the register that do NOT fill its numeric home — the same
