@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B86 `SetIndexConcat` appends instead of deopting** | **LANDED — `polymorphic-objects` −3.9%** | The profiler's first catch. That row was **60.5% interpreted with six decline messages** — not rejected, but compiled and then thrown away: `SetIndexConcat` handled only an own-slot HIT, and the dict-churn loop writes sixty NEW keys into a fresh `{}` per iteration, so it deopted every time (**131 deopts**), passed `OSR_DEOPT_LIMIT`, and got the region evicted and blacklisted. New keys now delegate to `set_index_concat` — the interpreter's own function, so semantics are identical by construction — with `CALL_THREW` and the pinned refetch the newly-allocating path requires. **Deopts 131 → 0, interpreted 60.5% → 26.6%**, row **−3.9% [−4.5, −2.9]**, no row past the +2% rule, gate green. Invisible to every tool that existed this morning: B83's own phase decomposition called this row "diffuse, no single term to attack" |
 | **B85 `ZIPP_PROF=1` sampling profiler — §6's item since B3** | **LANDED; it reprioritises B6 vs M4 on its first run** | Phase-tagged sampler (200µs), not a stack sampler — fat LTO would have inlined away most frames a `StackWalk64` wanted, and suspending the engine thread to symbolize is a deadlock hazard. Splitting `interp` from `jit-native` is what made it actionable — the two have OPPOSITE fixes. **Compiled-code-bound: `typedarray-math` 99.7%, `parse-large-js` 91.3%, `markdown-render` 68.6% in native code** (only M4 reaches these). **Interpreter-bound: `polymorphic-objects` 60.5%, `json-large` 42.2% INTERPRETED**, with only 6 and 11 decline messages — so their loops are not rejected, they are never offered, which is a tier-entry lead rather than a codegen-quality one. GC reads 0.8-12.6%, independently corroborating B84's `ZIPP_GCSTATS` numbers. So the dominant substrate item is **M4 (memory-backed register file + per-op NaN-boxing)**, not B6 — `parse-large-js` is 2.49x with 99.2% of its time executing JS, which no allocator or collector fix can reach. Built because B84 had to revert a real −35% win for want of attribution |
 | **B84 GC is 2-12% of the suite — B81 CORRECTED; `ZIPP_GCSTATS=1` added** | **INSTRUMENT LANDED; ObjMap pool measured −35% on construction and REVERTED anyway** | Per-phase collector timing says GC is **12% of `regex-log-scan`, 8% of `json-large`, 5% of `markdown-render`, 2% of `polymorphic-objects`** — their live sets (1.4k-78k) never reach where B81's micro curve bites, so the cost is CONSTRUCTION, not collection. B81's table stands; its conclusion did not. The pool's first null result was also wrong — a 4096 cap against a 65,536 GC threshold serves ~6% of a cycle. Re-capped it is **`{a:1}` 71.0 → 46.5ns, `{a,b,c,d}` 138.5 → 88.5ns (−35%)** — but `polymorphic-objects` −5.7% came with `json-large` +1.6% (which RETAINS its tree, so the pool stays empty), a suite CI including zero, and a targeted fix that made BOTH rows worse. Two runs disagreeing by five points on the same change ⇒ revert per §14 | **B81**, B6 |
 | **B81 the COLLECTOR is 10-50x node — B6.0's precondition met, its guess REFUTED** | **MEASURED; ObjMap recycle pool built and REVERTED as a null result; B6 is now the best-evidenced item in this file** | `{}` 41.0ns vs 3.5ns, `{a:1}` 81.5 vs 2.5, `{a,b,c,d}` **148 vs 3.0 (49x)**, `[]` 23.5 vs 2.5, `s.slice(0,5)` 38.5 vs 4.0 — and the no-allocation control is 1.0ns vs node's 1.5ns, i.e. **zipp is FASTER when it allocates nothing**. Reached independently from `regex-log-scan`'s phase split (matchAll 496 vs 71ms; `exec` = 227ns scan + 169ns result object + ~60ns/capture against node's 40ns total, while the non-capturing literal `test` is **0.53x — zipp wins**) and from the object-literal micro. A 4-property literal has gone 513ns → 148ns since B6.0 was written and is still 49x. An `ObjMap` recycle pool (reset + stash the swept box, capacity retained) measured **ZERO** and was reverted — because `[]` costs 24.5ns while mallocing nothing at all, so the malloc is only ~7ns of an object. The cost that remains is the COLLECTOR: holding a larger live set makes the IDENTICAL allocation loop cost more — 74.5 → 101.5 → 122.5ns at live sets of ~0 / 400k / 1.2M, i.e. **+48ns per allocation from nothing but a bigger heap to mark**, where node goes 2.0 → 7.5 → 9.5. B6.0 asked whether the cost was construction or collection and guessed construction; it is both, and only the collection term scales. `typedarray-math` is the one row this does NOT explain — its DataView loop allocates nothing and is already a fully inlined native load, so that one is M4 | **B6.0**, B1 |
@@ -1701,6 +1702,63 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B86 — the profiler's first catch: a region that compiled, then threw itself away
+
+`polymorphic-objects` reported **60.5% INTERPRETED** with only **six**
+`ZIPP_JITDECLINE` messages. Those two facts together are the whole story: the
+loop was not being REJECTED, so nothing logged — it was being compiled and then
+discarded.
+
+`ZIPP_JITLOG=1` found it in one line, repeated: `region fn0 [130] deopt at ip
+142`, **65 times**, plus 66 at ip 177, then two blacklists. Both ips are
+`SetIndexConcat` — the fused `obj["prop_" + p] = v` — and the emitter's own
+comment said what was wrong without anyone noticing the consequence:
+
+> own writable data-slot HIT in place … a NEW key / exotic / non-Int key deopts
+
+The dict-churn loop builds a **fresh `{}` per outer iteration** and writes sixty
+computed keys into it. Every single write is a new key. So the region deopted
+every iteration, passed `OSR_DEOPT_LIMIT`, was evicted and blacklisted, and the
+loop — along with everything else in it — ran interpreted for the remaining
+29,000 iterations.
+
+**The fix delegates the new-key case to `set_index_concat`**, the exact function
+the interpreter's `Instr::SetIndexConcat` arm calls. That makes the semantics
+identical BY CONSTRUCTION rather than re-derived: extensibility, an inherited
+setter, `__proto__`, canonical-index keys, frozen and sealed receivers, and the
+strict-mode TypeError all keep whatever behaviour that path already has. Because
+it can now allocate (the key `String`, three `Vec` growths) and can frame-call a
+setter, the emitter gained the `CALL_THREW` check — a throw must unwind rather
+than re-execute an op whose setter side effects already ran — and the pinned
+r13/r14 + TypedArray refetch that every other allocating helper gets.
+
+| | before | after |
+|---|---:|---:|
+| deopts | **131** | **0** |
+| interpreted share | **60.5%** | **26.6%** |
+| jit-native share | 36.0% | **69.4%** |
+
+**Suite, `--ab-env` on ONE binary**, 21 pairs, `bench/b86_abenv_2026-07-31.json`,
+`ALL_CORRECT=1`:
+
+| row | paired | 95% CI |
+|---|---:|---|
+| **`polymorphic-objects`** | **−3.9%** | **[−4.5, −2.9]** |
+| `map-set-heavy` | +1.1% | [+0.1, +2.1] |
+| suite geomean | −0.11% | [−0.42, +0.19] |
+
+Target row clears §14's 2-3% bar with an interval excluding zero, and no row
+regresses above the +2% rule. Gate: 37 suites / 0 failures, test262 ×3
+byte-identical. Off-switch `ZIPP_NO_CONCAT_APPEND=1`.
+
+**Worth stating as a method result.** This was invisible to every tool that
+existed before today. The decline log said six lines. The bench said 2.13x. The
+phase decomposition said "dict churn, 2.0x, diffuse, no single term to attack" —
+and that was WRONG, in this file, written earlier today. It took the profiler
+saying *interpreted* to know to look at `ZIPP_JITLOG` at all. A row can be
+slow because its code never compiles, and nothing in the previous toolchain
+could distinguish that from code that compiles badly.
 
 ### B85 — the profiler §6 has wanted since B3, and what it says on its first run: M4, not B6
 

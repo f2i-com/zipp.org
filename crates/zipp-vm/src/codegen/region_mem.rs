@@ -596,11 +596,15 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::SetIndexConcat { obj, name, key, val } => {
-                // `obj["name" + i] = v` — own writable data-slot HIT in place
-                // (scratch key, no alloc, no version bump — the interpreter's
-                // hit arm exactly); a NEW key / exotic / non-Int key deopts.
-                // No alloc and no user code on the hit ⇒ no refetch. `val`
-                // rides the stack as the 5th arg (the set_prop_miss shape).
+                // `obj["name" + i] = v`. An own writable data-slot HIT is
+                // written in place (scratch key, no alloc, no version bump —
+                // the interpreter's hit arm exactly). A NEW key now delegates
+                // to `set_index_concat`, the same function the interpreter's
+                // arm calls, instead of deopting (B86) — so the helper can
+                // ALLOCATE and can run an inherited setter, and both the throw
+                // sentinel and the pinned-pointer refetch below are required.
+                // A non-Int key / exotic receiver still deopts. `val` rides the
+                // stack as the 5th arg (the set_prop_miss shape).
                 let packed: u64 = ((heap.func_id as u64) << 32) | (name as u64);
                 dynasm!(ops
                     ; mov rcx, rdi                       // vm
@@ -613,8 +617,18 @@ pub(crate) fn compile_region_mem(
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
-                    ; je => bail                         // miss/new key → interpreter
+                    ; je => bail                         // exotic/non-Int key → interpreter
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // threw: unwind, do NOT re-execute
                 );
+                // The new-key path allocates and may frame-call an inherited
+                // setter, so the heap version array, the IC table and the
+                // pinned TypedArray snapshots can all have moved.
+                emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::ToNum { dst, a } => {

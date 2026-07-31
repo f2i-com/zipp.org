@@ -1827,6 +1827,24 @@ pub(crate) extern "win64" fn jit_to_concat_key(vm: *mut core::ffi::c_void, v_bit
 /// # Safety
 /// `vm` is a valid `*mut Vm`; all bits are valid rooted Values.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// `ZIPP_NO_CONCAT_APPEND=1` restores the pre-B86 behaviour: a NEW key at a
+/// JIT'd `obj["name" + i] = v` deopts instead of appending. Exists so the change
+/// is A/B-able with `--ab-env` on ONE binary and bisectable without a rebuild.
+#[inline]
+fn concat_append_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CONCAT_APPEND").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 pub(crate) extern "win64" fn jit_set_index_concat(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
@@ -1870,9 +1888,47 @@ pub(crate) extern "win64" fn jit_set_index_concat(
                 crate::codegen::SELF_CALL_DEOPT
             }
         }
-        None => crate::codegen::SELF_CALL_DEOPT,
+        // B86: a NEW key used to deopt here, and that was the whole cost of
+        // `polymorphic-objects`. Its dict-churn loop builds a FRESH `{}` per
+        // outer iteration and writes 60 computed keys into it, so every single
+        // write missed, deopted, and — 65 deopts being past `OSR_DEOPT_LIMIT` —
+        // got the region EVICTED and blacklisted. The profiler caught it: that
+        // row ran **60.5% interpreted** while reporting only six decline
+        // messages, because the loop was not being rejected, it was being
+        // thrown away after compiling.
+        //
+        // Delegating to `set_index_concat` — the exact function the interpreter's
+        // `Instr::SetIndexConcat` arm calls — makes the semantics identical BY
+        // CONSTRUCTION rather than by re-derivation: extensibility, a
+        // prototype-chain setter, `__proto__`, canonical-index keys, frozen and
+        // sealed receivers, and the strict-mode TypeError all keep whatever
+        // behaviour that path already has.
+        //
+        // It can allocate (the key `String`, the three `Vec` growths) and it can
+        // run USER CODE (an inherited setter), so the emitter re-derives the
+        // pinned r13/r14 and the TypedArray snapshots after this call — the same
+        // treatment every other allocating helper gets. A throw becomes
+        // `CALL_THREW` rather than the redo sentinel, because the append may
+        // already have run a setter's side effects and re-executing the op in
+        // the interpreter would run them twice.
+        None if !concat_append_enabled() => crate::codegen::SELF_CALL_DEOPT,
+        None => {
+            let strict = vm.func(func_id as usize).is_strict;
+            let o = Value::from_bits(obj_bits);
+            let v = Value::from_bits(val_bits);
+            // `scratch` is borrowed back before the call: `set_index_concat`
+            // rebuilds the key itself, and leaving the VM's scratch buffer
+            // stolen across a re-entrant call would strand it.
+            vm.idx_key_scratch = std::mem::take(&mut scratch);
+            match vm.set_index_concat(o, name, key, v, strict, func_id) {
+                Ok(()) => 0,
+                Err(t) => vm.jit_thrown_to_sentinel(t),
+            }
+        }
     };
-    vm.idx_key_scratch = scratch;
+    if !scratch.is_empty() || vm.idx_key_scratch.is_empty() {
+        vm.idx_key_scratch = scratch;
+    }
     out
 }
 
