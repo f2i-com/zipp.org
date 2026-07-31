@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B101 the tier programme has a ~15% CEILING** | **COSTING; B94's 3.2x does NOT transfer to real code** | Prices the FINISHED programme (heap ops hosted on the register tier) before building it. Homes in **callee-saved xmm6..15 survive helper calls**, so no spilling is needed and the earlier "spill 12 homes per call" estimate was far too pessimistic; a heap op costs only boxing its operands and unboxing its result. `7 x reads - 10 x heapops`, weighted by each row's mem share: **32 / 22 / 15 / 14 / 12 / 5 / 4%**, geomean **~15%** — **1.79x -> ~1.51x, not parity**. B94's 3.2x micro is ~100% numeric ops; real regions are 10-25% heap ops and (B99) mostly single-use temps. Parity has to attack the NUMBER and COST of heap ops instead: GetProp/SetProp are helper calls (~20-40 instrs) where an inline monomorphic access behind a shape check is 3-4 — the same order as the whole tier merge, and they compose |
 | **B99 register homes IN the memory tier** | **REFUTED BY MEASUREMENT; no code written** | A home saves ~7 instructions per operand read but costs ~7 to FILL, so it breaks even at one use. Counting the biggest region per row, only **6-17 of 34-88** numeric reads land on a multi-use register: net instructions/iteration from promoting the ten best candidates is **0, 0, 0, -28, -14, +42** — five of six rows gain nothing or LOSE. Cause is the bytecode shape (`LoadGlobal t; use t` per operand, so almost everything is a single-use temp), the cost-side view of B93's "LoadGlobal is 29-37% of every mem region". Corrects why the register tier is fast: not caching multi-use values (there are none) but keeping a GLOBAL in one home for the whole region, guarded once. Next probe is therefore LoadGlobal/consumer FUSION — which was then priced the same way and ALSO refuted: only **0-11%** of numeric reads are fusable (0% on map-set-heavy, parse-large-js and markdown-render), because a global must be used ONLY numerically to be homeable and these regions use globals for objects, strings and receivers too. Both local routes into the memory tier are closed; whole-region TYPE SPECIALISATION is the only thing that removes the per-operand check, and the hot regions cannot have it while they contain Call/CallMethod |
 | **B97/B98 write-through home sharing + Add live-ins (double path)** | **MECHANISM; suite NULL; first DOUBLE regions ever compiled here** | B97 lets a `read_outside` register SHARE an xmm home by generalising B94's write-through (store each def to `[rbx+dreg(r)]`, skip it in the flush) — removing the `xmm pool exhausted` blocker B95 called terminal. B98 admits `Add` operands as numeric-required uses of a read-only live-in **on the double path only**: the 3.31x->3.45x regression that refuted this was BLANKET admission on the INT path, and its stated causes were string/double/object live-ins — a double is native here, so the largest cause does not apply. Together: **class-prototype-hot 3 declines -> 1**, polymorphic-objects 7 -> 3, and DOUBLE regions **0 -> 1 / 0 -> 1 / 0 -> 3**. Suite **-0.16% [-1.87, +1.42]** — null; the promoted regions are COLD, and the hot ones are now blocked by `CallMethod`, a MISSING CAPABILITY (the register tier issues no calls; B78's method inlining is memory-path only) rather than an admission gate. **Introduced a wrong-answer bug** (a shareable reg loses its entry load; an untaken-branch def then flushed a garbage home) caught by the kept `hoisted_const_on_untaken_branch` tests while all 13 benches still said ALL_CORRECT=1. Also: a pre-fix A/B showed sparse-array -3.0% twice; it did NOT reproduce on the fixed build. `ZIPP_NO_WT_SHARE=1` |
 | **B96 B95's register-pressure figure was a bad proxy** | **CORRECTION; the fix is smaller than B95 concluded** | B95 priced the wall as 40/76/73/70 distinct VM regs vs 14 homes. Max SIMULTANEOUSLY live is **12/14/16/13** (8/11/17/15 with ranges split), plus 9-17 permanently-homed globals — a **~1.5x shortfall, not 5x**. And the excess is PERMANENCE, not liveness: `read_outside`, live-in and hoisted regs each pin a whole-region home, and every global does unconditionally. The `read_outside` rule is conservative for exactly the unsoundness **B94 already fixed** (flush_exit writing a shared home into every sharer's slot) — write-through makes sharing safe. So the next step is NOT a general spilling allocator: generalise B94's write-through to `read_outside` regs, admit Add-using read-only live-ins backed by a plan-time numeric OBSERVATION (blanket admission measured 3.31x -> 3.45x), and spill only if pressure still exceeds 14. Adds a `[pool]` demand diagnostic, which prints nothing until the read-only-live-in rung is cleared |
@@ -1714,6 +1715,62 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B101 — the whole tier programme has a ceiling of ~15%, and B94's 3.2× does not transfer
+
+Every entry from B92 to B100 has been about getting regions out of the memory
+tier, on the strength of B94's measurement that a promoted array loop runs
+**3.2× faster**. Before building the one remaining capability (heap ops on the
+register tier), it is worth asking what the FINISHED programme is worth. The
+answer is ~15%, and the reason B94's 3.2× does not transfer is worth stating
+plainly.
+
+**Cost model.** The memory tier reads a numeric operand in ~8 instructions and
+runs ~10 per op. On the register tier, values are typed once at entry and read
+with one instruction, so each numeric operand read saves ~7. Homes live in
+**xmm6..15, which are callee-saved under win64** — every helper here is an
+`extern "win64"` Rust function, so a home SURVIVES a helper call and no spilling
+is required, which is why the earlier "spill 12 homes per call site" estimate was
+far too pessimistic. What a heap op does cost is boxing the operands it needs and
+unboxing its result: ~10 instructions.
+
+Applying `7 × numeric_reads − 10 × heap_ops` to the largest region of each row,
+then weighting by how much of the row is actually in the memory tier (B93):
+
+| row | ops | numeric reads | heap ops | net % of region | mem share | net % of ROW |
+|---|---:|---:|---:|---:|---:|---:|
+| `typedarray-math` | 114 | 63 | 3 | 36% | 0.88 | **32%** |
+| `class-prototype-hot` | 71 | 34 | 8 | 22% | 1.00 | **22%** |
+| `polymorphic-objects` | 135 | 63 | 13 | 23% | 0.66 | 15% |
+| `sparse-array` | 132 | 56 | 6 | 25% | 0.57 | 14% |
+| `map-set-heavy` | 241 | 81 | 23 | 14% | 0.85 | 12% |
+| `parse-large-js` | 404 | 88 | 34 | 7% | 0.78 | 5% |
+| `markdown-render` | 211 | 102 | 26 | 22% | 0.18 | 4% |
+
+**Geomean if EVERY memory region were merged into the register tier: ~15%.
+1.79× → ~1.51×.**
+
+**Why B94's 3.2× does not transfer.** That micro is ~100% numeric operations, so
+every instruction saved is on the critical path and nothing is paid back. A real
+benchmark region is 10–25% heap ops, each of which pays boxing at its boundary,
+and B99 showed the numeric ops in between are mostly single-use temps rather than
+long register-resident chains. The tier gap is real and the micro is honest; it
+is simply not a model of these workloads.
+
+**What this changes.** It does not say the tier work is worthless — 15% is a real
+15%, and four of the seven rows are above 12%. It says the programme cannot reach
+parity, and that the remaining capability work (heap ops on the register tier)
+should be costed as a ~15% project, not as a 3.2× one. Anything claiming parity
+has to attack the **number and cost of heap operations themselves**, not which
+tier they run in: `GetProp`/`SetProp` are helper calls today (~20–40 instructions
+each), and inline monomorphic property access behind a shape check is 3–4. On
+`class-prototype-hot` that is 6 prop ops in a 71-op region; on
+`polymorphic-objects`, 7 in 135. That is the same order as the entire tier merge,
+and the two compose.
+
+No code change; this is a costing, and it is recorded because four consecutive
+landed mechanisms (B92, B94, B95, B97/B98) each moved zero suite time and the
+reason was never in any single one of them.
 
 ### B99 — register homes IN the memory tier: refuted before it was built
 
