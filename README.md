@@ -183,27 +183,34 @@ for reasons that have nothing to do with the engine. If an existing clone has it
 on: `git config core.autocrlf false && git rm --cached -r -q . && git reset
 --hard`.
 
-**Performance — cold geomean 1.86× zipp/node (95% CI 1.85×–1.87×)** on the
+**Performance — cold geomean 1.79× zipp/node (95% CI 1.77×–1.80×)** on the
 ten programs in `bench/real/`, 21 counterbalanced paired observations, every
 output byte-identical to Node:
 
-| bench | node | zipp | paired ratio (95% CI) |
+| bench | node | zipp | paired ratio |
 |---|---|---|---|
-| map-set-heavy | 907ms | 818ms | **0.90× [0.86, 0.92]** |
-| class-prototype-hot | 298ms | 382ms | 1.28× [1.27, 1.30] |
-| json-large | 292ms | 483ms | 1.66× [1.64, 1.67] |
-| markdown-render | 282ms | 476ms | 1.68× [1.65, 1.69] |
-| async-promise-chain | 342ms | 617ms | 1.81× [1.80, 1.82] |
-| polymorphic-objects | 330ms | 617ms | 1.88× [1.86, 1.89] |
-| sparse-array | 83ms | 156ms | 1.89× [1.87, 1.90] |
-| parse-large-js | 277ms | 596ms | 2.15× [2.13, 2.18] |
-| typedarray-math | 206ms | 647ms | 3.15× [3.12, 3.17] |
-| regex-log-scan | 469ms | 1709ms | 3.62× [3.62, 3.67] |
+| map-set-heavy | 972ms | 764ms | **0.78×** |
+| class-prototype-hot | 303ms | 391ms | 1.29× |
+| json-large | 304ms | 485ms | 1.59× |
+| sparse-array | 83ms | 137ms | 1.65× |
+| markdown-render | 300ms | 495ms | 1.66× |
+| async-promise-chain | 363ms | 644ms | 1.76× |
+| polymorphic-objects | 336ms | 623ms | 1.87× |
+| parse-large-js | 289ms | 617ms | 2.17× |
+| typedarray-math | 208ms | 655ms | 3.12× |
+| regex-log-scan | 486ms | 1681ms | 3.40× |
 
-Cold total is the primary metric. Zipp starts about 4× faster than Node (7.7ms
-vs 31.3ms — no snapshot to load).
+Cold total is the primary metric. Zipp starts about 4× faster than Node (8.5ms
+vs 31.5ms — no snapshot to load), and is now *faster than Node* on
+`map-set-heavy` by 22%.
 
-This capture is `bench/head_clean_7c760c1.json`, taken from a tree
+The same capture also times three DIAGNOSTIC benchmarks that are deliberately
+outside the ten, because they exist to expose weaknesses the ten cannot see:
+`polymorphic-objects-v2` 3.58×, `sparse-array-v2` 4.86×, `property-ic-shapes`
+5.54×. Quoting a geomean over all thirteen gives 2.23×, which is not comparable
+to any historical figure in this file — the ten are the series.
+
+This capture is `bench/head_clean_2a616f5.json`, taken from a tree
 `zipp --version --json` reports as `dirty: false`, so the numbers and the source
 identity go together. Re-measuring at a later commit gives the same
 ratios but not the same absolute milliseconds, because the box moves.
@@ -244,25 +251,25 @@ repo and moved the suite 0.1%, because none of the ten could see it. Read a
 
 This section has been rewritten four times because measurement refuted what it
 said. `PERF_ROADMAP.md` keeps the numbers and, deliberately, the negative
-results — of the last fourteen probes, twelve were refutations, and four of
-those refuted an earlier entry in that same file.
+results — the large majority of probes in it are refutations, several refuted an
+earlier entry in that same file, and two refuted the file's own instruments.
 
 **Start with the scale, because it disciplines everything else.** Computed from
 the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today (cold total) | 1.86× |
-| `regex-log-scan` at Node parity | **1.64×** |
-| `typedarray-math` at Node parity | **1.66×** |
-| **both of the two worst at Node parity** | **1.46×** |
+| today (cold total) | 1.79× |
+| `regex-log-scan` at Node parity | **1.58×** |
+| `typedarray-math` at Node parity | **1.60×** |
+| **both of the two worst at Node parity** | **1.41×** |
 
 (The *shape* of this arithmetic is what matters and it does not move as the
 headline does: the two worst rows going to parity is worth ~0.4 of geomean, and
 no contained fix reaches that.)
 
 The cold score being below 2× is not general parity: nine rows remain slower and
-the two worst are 3.62× and 3.15×. The contained fixes in `PERF_ROADMAP.md` are
+the two worst are 3.40× and 3.12×. The contained fixes in `PERF_ROADMAP.md` are
 safe substrate, but moving toward 1× still requires stable shape metadata, an
 optimizing CFG/SSA tier, and arena/nursery allocation rather than a stack of
 unmeasured 1–2% tweaks.
@@ -306,13 +313,27 @@ Where the time actually is:
 
 **What is NOT the problem**, each ruled out by measurement:
 
+- *Builtin method dispatch by name.* A jump table was an open plan item whose
+  gain was recorded as "the largest single term in markdown-render". Counting
+  the dispatches that actually reach the generic chain settled it:
+  `parse-large-js` makes **89**, `polymorphic-objects` makes **zero**, and
+  markdown-render's 252,669 are ~2.3% of that row.
+- *Array `push`.* 6.20ns against node's 9.20ns — zipp wins, so the tokenizer's
+  ~14M pushes are not `parse-large-js`'s gap.
+- *The collector.* An allocation micro showed per-object cost rising 74.5 →
+  122.5ns purely from a larger live set, and that was written up as the largest
+  systemic cost. Per-phase GC timing then priced collection at **2–12%** of real
+  rows: their live sets never reach where that curve bites. The claim was wrong
+  and is recorded as wrong.
 - *Property-name interning.* Refuted four independent ways, most recently by
   interning the strings `for-in` hands out — which removes 7 of the ~13
   allocations an 8-key enumeration performs — for **+0.1%**. Counting
   allocations does not locate time in this engine.
-- *A cheaper object layout.* `{}` costs 33.2ns here and **0.5ns** in node, flat
+- *A cheaper object layout.* `{}` costs ~30ns here and **0.5ns** in node, flat
   in property count. V8 is not allocating faster; V8 is not allocating. Escape
-  analysis deletes the object. A cheaper object is still an object.
+  analysis deletes the object. A cheaper object is still an object — an `ObjMap`
+  recycle pool that made construction **35%** cheaper still did not survive the
+  suite and was reverted.
 - *A naively slow compiled tier.* Audited rather than assumed: constant-key
   property reads already use an 8-way inline cache that is call-free on a hit,
   and pinned dense-Array and TypedArray element access, monomorphic method calls
@@ -322,10 +343,43 @@ Where the time actually is:
   3× that did pay) measured **+1.2% slower** — a larger live heap costs more in
   cache misses than the skipped collections save.
 
-The single change with the right shape is hidden classes: a shape-keyed guard
-lifts the existing inline cache off its 8-receiver identity cliff, and the same
-infrastructure gives escape analysis and inline bump allocation. Everything
-above is a symptom of its absence.
+**Hidden classes are still worth building, but an earlier version of this
+section called them "the single change with the right shape", and measurement
+does not support that for these ten rows.** A shape-keyed guard was priced
+against this exact suite at **+0.4%**: no row here is megamorphic by identity
+while monomorphic by shape. `polymorphic-objects` stops at exactly eight
+receivers by construction, and `json-large`'s keys are random enough to blow the
+shape table's cap. The infrastructure still buys escape analysis and inline bump
+allocation, which is why it stays on the list — it is just not what these
+benchmarks are waiting for.
+
+**What they are waiting for is the general tier's code quality.** `ZIPP_PROF=1`
+(a sampling profiler, added after a real −35% construction win had to be
+reverted for want of attribution) puts **four of the ten rows at or above 85% of
+their time inside native compiled code** — `class-prototype-hot` 99.9%,
+`typedarray-math` 99.7%, `parse-large-js` 91.6%, `map-set-heavy` 84.8%. For
+those, tier entry is solved and what remains is what the tier emits. The INT
+tier already keeps values in xmm homes with a copy-elision peephole, and on
+shapes it accepts zipp matches V8 (`s = s + 1.25` over 20M iterations:
+0.45ns/iter against 0.40ns). The MEM tier — where the DataView kernel and most
+of `parse-large-js` run — routes every intermediate through
+`[rbx + dreg(r)]` and re-boxes at each step. Extending register homes to that
+tier is the architectural item, and no peephole substitutes for it.
+
+The three rows that are *not* native-bound each name their own subsystem rather
+than a general defect: `regex-log-scan` its matcher (27% regex-exec, where a
+successful `exec` is 187ns of scan plus 173ns of result object plus 133ns for
+two capture groups, against node's 40ns total), `json-large` its serialiser
+(24% `JSON.stringify`), and `async-promise-chain` its event loop (61%
+interpreted callbacks plus 17% microtask machinery).
+
+Read `interp/untagged` in that profiler as *"no phase tag was active"*, not
+*"the interpreter was running bytecode"* — the distinction cost a wrong
+conclusion before it was documented. Single-argument `JSON.stringify(v)` is
+fused by the compiler into its own opcode and never reaches `call_native`, so a
+tag placed there never fired and a stringify-only workload reported 100%
+`interp`; `json-large` looked 40% interpreted when a quarter of it was
+serialisation.
 
 ## Coverage
 

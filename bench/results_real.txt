@@ -29,3 +29,10 @@ async-promise-chain       305ms    310ms    273ms    590ms        690ms      1.9
 polymorphic-objects       279ms    275ms    249ms    593ms       1374ms      2.13x
 sparse-array               45ms     59ms     44ms    124ms        564ms      2.76x
 DONE
+typedarray-math           172ms    879ms    141ms    687ms       8676ms      3.99x
+regex-log-scan            493ms    599ms    472ms   1733ms       3888ms      3.52x
+class-prototype-hot       313ms    357ms    300ms    436ms       6042ms      1.39x
+async-promise-chain       365ms    394ms    348ms    701ms        798ms      1.92x
+polymorphic-objects       353ms    350ms    316ms    670ms       1497ms      1.90x
+sparse-array               97ms    107ms     98ms    185ms        651ms      1.91x
+DONE
