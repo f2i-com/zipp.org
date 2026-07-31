@@ -943,6 +943,7 @@ impl<'p> Vm<'p> {
         input_v: Value,
         build: bool,
     ) -> Result<Value, Thrown> {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
         // ToString(string) — IDENTITY for a string value (exact WTF-8 content:
         // a lone-surrogate subject keeps its surrogate rather than decaying to
         // U+FFFD, so `/\uD800/` can match it).

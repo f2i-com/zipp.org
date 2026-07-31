@@ -165,6 +165,7 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn string_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::StringOps);
         self.heap.flatten(idx); // materialize a rope receiver before reading it
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // Single-char index methods: read one char directly from the heap with NO

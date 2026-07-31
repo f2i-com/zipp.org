@@ -793,6 +793,7 @@ impl<'p> Vm<'p> {
         val: Value,
         strict: bool,
     ) -> Result<bool, Thrown> {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::PropSlow);
         // ── ordinary data write on a plain object ──
         if obj.is_heap() {
             let oi = obj.heap_index();

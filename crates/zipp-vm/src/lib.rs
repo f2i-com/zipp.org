@@ -42,6 +42,12 @@ pub fn shape_stats() -> (usize, usize, usize) {
     shape::stats()
 }
 
+/// `ZIPP_PROF=1` sampling profiler: `(phase, samples, percent)` sorted by
+/// samples, plus the total sample count. Empty unless the variable was set.
+pub fn prof_stats() -> (Vec<(&'static str, u64, f64)>, u64) {
+    vm::prof_stats()
+}
+
 /// `ZIPP_GCSTATS=1` per-phase collector timing:
 /// `(collections, roots_ms, trace_ms, sweep_ms, retain_ms, avg_slots, avg_live,
 /// total_swept)`. Zeroed unless the variable was set.

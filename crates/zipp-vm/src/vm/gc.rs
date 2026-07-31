@@ -63,6 +63,7 @@ impl Vm<'_> {
     }
 
     fn gc(&mut self) {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Gc);
         let n = self.heap.len();
         let floor = self.gc_floor as usize;
         if floor == 0 || n <= floor {

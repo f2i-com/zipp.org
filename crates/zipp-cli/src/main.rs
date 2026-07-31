@@ -36,6 +36,13 @@ fn main() -> ExitCode {
         let (n, mx, tot) = zipp_vm::shape_stats();
         eprintln!("[shape] nodes={n} max_fanout={mx} edges={tot}");
     }
+    if std::env::var_os("ZIPP_PROF").is_some() {
+        let (rows, total) = zipp_vm::prof_stats();
+        eprintln!("[prof] {total} samples @200us");
+        for (name, n, pct) in &rows {
+            eprintln!("[prof] {n:>8}  {pct:>5.1}%  {name}");
+        }
+    }
     if std::env::var_os("ZIPP_GCSTATS").is_some() {
         let (c, r, t, sw, re, slots, live, swept) = zipp_vm::gc_stats();
         eprintln!(

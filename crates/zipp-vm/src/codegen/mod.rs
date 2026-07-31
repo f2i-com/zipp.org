@@ -1313,6 +1313,7 @@ impl Jit {
     /// `JIT_IC_WAYS` ways each), returning the base global site id. The ways
     /// start empty (`obj_bits == 0` ⇒ always miss on first use).
     pub fn reserve_ic_sites(&mut self, n: usize) -> u32 {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JitCompile);
         let base = (self.ic_table.len() / JIT_IC_WAYS) as u32;
         self.ic_table
             .resize(self.ic_table.len() + n * JIT_IC_WAYS, IcEntry::default());

@@ -655,6 +655,7 @@ impl<'p> Vm<'p> {
     /// over the byte string (structure tokens are ASCII; string content is
     /// flushed as UTF-8 slices). Allocates heap objects/arrays/strings.
     pub(crate) fn json_parse(&mut self, src: &[u8]) -> Result<Value, Thrown> {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
         let mut i = 0;
         json_skip_ws(src, &mut i);
         let v = self.json_parse_value(src, &mut i)?;
@@ -903,6 +904,7 @@ impl<'p> Vm<'p> {
     /// Like [`json_parse`], but also returns a parallel source tree recording the
     /// raw JSON text of every value (for the parse-with-source reviver context).
     pub(crate) fn json_parse_with_src(&mut self, src: &[u8]) -> Result<(Value, JsonSrc), Thrown> {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
         let mut i = 0;
         json_skip_ws(src, &mut i);
         let r = self.json_parse_value_src(src, &mut i)?;

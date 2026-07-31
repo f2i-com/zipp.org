@@ -37,6 +37,7 @@ are in B58.
 | plan M2.3 `regexp_string_iters` → `SlotTable` | **REFUTED, REVERTED (B68)** | built and measured: `regex-log-scan` **+0.1% [−0.7, +1.0]** over 21 pairs — no movement. The step spends ~418ns in `exec`; one SipHash probe beside it is noise. Also perturbed the `map-set-heavy` sentinel to +3.0% with no connecting mechanism |
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
+| **B85 `ZIPP_PROF=1` sampling profiler — §6's item since B3** | **LANDED; it reprioritises B6 vs M4 on its first run** | Phase-tagged sampler (200µs), not a stack sampler — fat LTO would have inlined away most frames a `StackWalk64` wanted, and suspending the engine thread to symbolize is a deadlock hazard. First run: **`interp+jit` is 99.2% of `parse-large-js`, 96.6% of `polymorphic-objects`, 88.7% of `markdown-render`, 78.4% of `json-large`, 50.1% of `regex-log-scan`** — that tag is time RUNNING JAVASCRIPT, not in an engine service. GC reads 0.8-12.6%, independently corroborating B84's `ZIPP_GCSTATS` numbers. So the dominant substrate item is **M4 (memory-backed register file + per-op NaN-boxing)**, not B6 — `parse-large-js` is 2.49x with 99.2% of its time executing JS, which no allocator or collector fix can reach. Built because B84 had to revert a real −35% win for want of attribution |
 | **B84 GC is 2-12% of the suite — B81 CORRECTED; `ZIPP_GCSTATS=1` added** | **INSTRUMENT LANDED; ObjMap pool measured −35% on construction and REVERTED anyway** | Per-phase collector timing says GC is **12% of `regex-log-scan`, 8% of `json-large`, 5% of `markdown-render`, 2% of `polymorphic-objects`** — their live sets (1.4k-78k) never reach where B81's micro curve bites, so the cost is CONSTRUCTION, not collection. B81's table stands; its conclusion did not. The pool's first null result was also wrong — a 4096 cap against a 65,536 GC threshold serves ~6% of a cycle. Re-capped it is **`{a:1}` 71.0 → 46.5ns, `{a,b,c,d}` 138.5 → 88.5ns (−35%)** — but `polymorphic-objects` −5.7% came with `json-large` +1.6% (which RETAINS its tree, so the pool stays empty), a suite CI including zero, and a targeted fix that made BOTH rows worse. Two runs disagreeing by five points on the same change ⇒ revert per §14 | **B81**, B6 |
 | **B81 the COLLECTOR is 10-50x node — B6.0's precondition met, its guess REFUTED** | **MEASURED; ObjMap recycle pool built and REVERTED as a null result; B6 is now the best-evidenced item in this file** | `{}` 41.0ns vs 3.5ns, `{a:1}` 81.5 vs 2.5, `{a,b,c,d}` **148 vs 3.0 (49x)**, `[]` 23.5 vs 2.5, `s.slice(0,5)` 38.5 vs 4.0 — and the no-allocation control is 1.0ns vs node's 1.5ns, i.e. **zipp is FASTER when it allocates nothing**. Reached independently from `regex-log-scan`'s phase split (matchAll 496 vs 71ms; `exec` = 227ns scan + 169ns result object + ~60ns/capture against node's 40ns total, while the non-capturing literal `test` is **0.53x — zipp wins**) and from the object-literal micro. A 4-property literal has gone 513ns → 148ns since B6.0 was written and is still 49x. An `ObjMap` recycle pool (reset + stash the swept box, capacity retained) measured **ZERO** and was reverted — because `[]` costs 24.5ns while mallocing nothing at all, so the malloc is only ~7ns of an object. The cost that remains is the COLLECTOR: holding a larger live set makes the IDENTICAL allocation loop cost more — 74.5 → 101.5 → 122.5ns at live sets of ~0 / 400k / 1.2M, i.e. **+48ns per allocation from nothing but a bigger heap to mark**, where node goes 2.0 → 7.5 → 9.5. B6.0 asked whether the cost was construction or collection and guessed construction; it is both, and only the collection term scales. `typedarray-math` is the one row this does NOT explain — its DataView loop allocates nothing and is already a fully inlined native load, so that one is M4 | **B6.0**, B1 |
 | **B80 sparse enumeration hoists its overlay probe** | **LANDED — `sparse-array` −16.2%, suite −1.41%, THE LARGEST SUITE WIN IN THIS FILE** | `object_enum_own`'s array arm walked `0..dense_len` doing an `array_index_override` HASH PROBE per slot. Strided writes grow the dense vector far past the populated count — measured `dense_len=1,040,001` holding **105** elements for an array with 5,000 keys — so `Object.keys` paid **1.04M hash probes to find 105 elements**: 25ms against node's 0ms, and independent of key count, which is the shape that gave it away. Asked once over the overlay's keys instead; a `defineProperty` on a dense index keeps the per-slot probe. `for…in` 50e6/5k **26ms → 2ms**; the bench phase 42ms → 18ms. Row **−16.2% [−16.9, −14.5]**, suite **−1.41% [−1.90, −1.05]**, both CIs excluding zero, no row regressing outside its CI. Found by phase-timing the SMALLEST bad row, not the largest. Off-switch `ZIPP_NO_ENUM_HOIST=1`; both paths byte-identical on the whole case set |
@@ -1700,6 +1701,55 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B85 — the profiler §6 has wanted since B3, and what it says on its first run: M4, not B6
+
+**Why it finally got built.** §6: *"There is no way to attribute engine time to a
+source construct, which is precisely how the two reverted epics happened. A
+sampling profiler behind `ZIPP_PROF=1` would pay for itself immediately and is a
+prerequisite for honest work on B3/B6."* B84 is that sentence made concrete — an
+`ObjMap` recycle pool measured −35% on object construction, passed the entire
+gate including GC stress and an adversarial field-leak script, and still had to
+be reverted because `json-large` regressed +2.9% for a reason TWO hypotheses
+failed to explain (memory retention was measured and refuted at +1.8% RSS).
+Without attribution, the only honest move was to throw away a real win.
+
+**What it is, and what it deliberately is not.** Not a native stack sampler:
+that means `SuspendThread` + `StackWalk64` + `dbghelp`, a new dependency, a
+deadlock hazard the moment the sampler allocates while the engine holds the
+allocator lock — and it would be reading a fat-LTO binary in which most of the
+frames it wants have been inlined away. Instead the engine publishes a PHASE TAG
+(one relaxed atomic store at a subsystem boundary), a sampler thread reads it
+every 200µs, and the tag histogram is the breakdown. Coarser than stack
+sampling, and it cannot be lied to by inlining, because the boundaries are
+placed by hand rather than recovered from frames. Off, `enter()` is a cached
+`AtomicU8` load and a branch, and no thread is spawned.
+
+**First run, and it reprioritises the roadmap:**
+
+| bench | interp+jit | regex-exec | gc | string-ops | json-parse |
+|---|---:|---:|---:|---:|---:|
+| `parse-large-js` | **99.2%** | — | 0.8% | — | — |
+| `polymorphic-objects` | **96.6%** | — | 3.4% | — | — |
+| `markdown-render` | **88.7%** | — | 7.4% | 3.8% | — |
+| `json-large` | **78.4%** | — | 9.1% | — | 12.4% |
+| `regex-log-scan` | 50.1% | 27.7% | 12.6% | 9.5% | — |
+
+`interp+jit` is the resting tag: time in the dispatch loop or in compiled
+regions, i.e. **running JavaScript rather than sitting in an engine service**.
+It is 50-99% of every row.
+
+**This settles B6 vs M4, and not the way B81 guessed.** B81 concluded the
+collector was the dominant systemic cost; B84 corrected that to 2-12% using
+`ZIPP_GCSTATS`; and the profiler now independently corroborates it (gc 0.8-12.6%,
+matching) while showing where the time actually is. `parse-large-js` is 2.49x
+with **99.2%** of its time executing JS — no allocator, collector or builtin fix
+can touch that row. The dominant item is **M4: the memory-backed register file
+and per-op NaN-boxing**, i.e. CFG/SSA plus a real register allocator. B6 remains
+worth doing and is worth ~12% of the worst row; it is not the headline.
+
+Three claims from this session's own earlier entries are therefore superseded,
+which is exactly what §7 asks for when a measurement contradicts the document.
 
 ### B84 — the collector is 2-12%, not dominant: B81 CORRECTED, and the ObjMap pool reverted twice
 
