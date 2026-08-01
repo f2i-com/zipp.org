@@ -40,6 +40,7 @@ are in B58.
 | **B102 B95 shipped a 19x pathology the benchmarks could not see** | **FIXED; a third sampled pin kind** | B95 admitted dense-Array `GetIndex` to the DOUBLE tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND` — **any** dense array, including one of OBJECTS. The element's dst then takes a numeric home, `live_in_regs` entry-loads it, the load sees the previous iteration's object, and the region `entry_bail`s on EVERY OSR entry, self-evicts, and displaces the memory compile that was working: **124ms -> 2349ms, 19x, running 100% interpreted**. Found from a CONTROL micro that was SLOWER than the thing it controlled for (property reads *removed*: 509ms -> 2047ms). The fix is a THIRD kind, not a narrower one — restricting to `ARR_INT_PIN_KIND` killed the pathology but cost `sparse-array-v2` **+6.2% [+0.9, +13.9]** by excluding arrays of DOUBLES, which the double tier hosts fine. `ARR_NUM_PIN_KIND` samples all-NUMBER over the same bounded 64-head/64-stride walk and sits between the two. Suite A/B vs the unsampled build, 21 pairs: **+0.64% [-1.84, +2.66]** — neutral, with `sparse-array-v2`'s regression gone. **All 13 benches stayed byte-identical and the gate was green through the whole pathology**; two of this session's three real defects (this and B97's flush bug) were invisible to the suite and both surfaced as "a number that cannot be right". `ZIPP_ARR_PIN_LOOSE=1` |
 | **B107 the inline-cache probe was written out four times** | **FACTORED, NEUTRAL; two latent hazards closed** | `GetProp`/`SetProp` in `region_mem.rs` and again in `proto_mem.rs` emitted byte-identical 8-way probes — ~140 lines of dynasm with the entry layout as literal displacements and a literal stride of 64, in four places. They did NOT stay identical: the store path's `and edx, 0x00FF_FFFF`, which masks the hop count out of `slot_nhops`, was once absent from one — a wild WRITE at `vals + nhops*2^24*8`, not a wrong read. Now one `emit_ic_probe`, plus `assert!(size_of::<IcEntry>() == JIT_IC_STRIDE)` (raising `JIT_IC_MAX_HOPS` to 6 would silently make every probe read each way from the middle of the previous one) and a corrected layout comment that was wrong on all three of stride, hop offsets and sentinel. **The dead `jmp` was not dead**: deleting the `jmp => miss` that sat immediately before `=> miss` cost `property-ic-shapes` **+1.4% [+1.1, +1.8]**; restoring it made the emitted stream byte-identical and the row returned to **+0.0% [-0.1, +0.2]**. Five bytes of probe-loop ALIGNMENT, kept and renamed `PROBE_ALIGN_PAD` — which also makes neutrality provable rather than statistical, since the JIT now emits the same bytes it did before. 8 tests drive all four probes through thrash, mid-loop shape change, freeze, delete, a PROP_VIA_IC setter and a Tier-C chain call, identical to node and to the pre-refactor binary in four modes. **Step 1 of the shape-keyed IC; step 2's real cost is that there is NO flat shape array** — a version is one instruction only because `Heap::versions` is index-parallel, while a shape lives inside `ObjMap`. Folding the metadata refresh into `bump_version` makes all 35 sites correct by construction (realloc ⇒ bump is already a soundness invariant), but a descriptor-only change alters a shape WITHOUT bumping — so a shape-keyed hit would read a stale guard. That is why WP-1A is a prerequisite |
 | **B106 the argument-`Vec` work package was mostly already done** | **LANDED, NEUTRAL AS PREDICTED** | Plan WP-1D asks for inline argument buffers on generic call paths; reading the tree first found seven of them already there — `setup_call` copies register-to-register, `try_builtin_method` gathers into `[Value; 8]`, `run_method_inline` into `[Value; 24]`, `super.m()` skips `call_value`, `f.call(...)` slices, callbacks pass stack literals, `arr.push` has its own lane — and B27 had already added `smallvec` once, measured **102 vs 100ns**, and reverted it with the dependency. What was left is `with_argv` at `eval_math`, the namespace-native-as-method arm and its JIT twin, and the bound-call concat (which allocated TWICE). **Predicted flat before measuring**: B104 had just priced an alloc/free pair at ~3ns, and `Math.imul` in a compiled region never reaches `eval_math` — `emit_math_op` emits it natively, so the Vec was on the INTERPRETED path only. Measured with B107: geomean **1.0011x [-0.19%, +0.38%]**. `TailCall` left alone: `try_tail_reuse` truncates `self.regs` before the values are written back |
+| **B112 a cheaper way-0 probe** | **REFUTED, REVERTED — and a 3x bug only wall time saw** | B111 argued that with zero misses on eight rows, the lever is the probe HIT's instruction count. Inlining way 0 (no loop scaffolding) and rewriting the own/chain test as `slot_nhops <= 0x00FF_FFFF` takes a way-0 own hit from **19 instructions to 16**. Suite, 21 pairs, one binary: **0.9986x [-0.51%, +0.33%]** — nothing, with `class-prototype-hot` **+1.0% [+0.4, +2.2]** moving the wrong way outside its interval. Reverted. **The lesson is how the first version failed**: a way-0 CHAIN entry took the `ja` exit and the loop it fell into started at way 1, so that entry was permanently unreachable and every access it should have served called the miss helper — `class-prototype-hot` **+221%**, `polymorphic-objects-v2` +96%, while all 13 benches stayed **byte-identical**, the 8-state IC differential passed in four modes, `ZIPP_JITLOG` was unchanged line for line and `ZIPP_PROF` still said **100.0% jit-mem**. The only instrument that saw it was the wall clock — the fourth time this session (B97, B102, B108). One bisect (restart the loop at way 0) named the cause and refuted two microarchitectural guesses that had already been built and measured to no effect |
 | **B111 the shape-keyed IC is worth ZERO on the retained ten** | **PRICED BEFORE BUILDING; diagnostics-only, geomean 0.00%** | `vm.jit_shape_slot` is already a `(site, shape) -> slot` memo at the top of the miss helper, so its HIT RATE is exactly the fraction of native property misses an emitted shape way would convert to call-free hits — the memo cannot remove the call, a way can. `ZIPP_ICSTATS=1` counts it. **Eight of the ten headline rows take ZERO native GetProp misses and nine take zero SetProp misses**; `class-prototype-hot` takes EIGHT in a whole run. The one headline row with misses cannot use them: `polymorphic-objects` is **0.0% shape-known** over 1.25M misses because two of its eight receivers are an accessor layout and an `Object.create` proto object, which return early and never reach the memo — and which an own-property shape way cannot serve BY CONSTRUCTION. The diagnostics behave as designed: `polymorphic-objects-v2` **100.0% shape-known** (5.0M), `property-ic-shapes` **47.7%** of 45.9M. So Phase 2 moves the headline geomean by **0.00%** — the plan's hedge was right and the number behind it is zero, not "little". Build it as O3's substrate, not for the suite. **The more useful reading**: zero misses means those rows' property access is already call-free, so the lever is making a WAY-0 HIT cheaper (~19 instructions, incl. loop setup and a hop test a monomorphic site never needs) rather than adding a ninth way |
 | **B110 the shape invariant is now checked, and it was wrong in one place** | **PREREQUISITE FOR THE SHAPE-KEYED IC; one real hazard fixed** | An object's recorded shape must always describe its layout, and nothing checked that, because nothing native reads a shape yet. The audit is far smaller than plan WP-1A implies: structural mutation is ALREADY centralized in `heap.rs`, and of the 20 raw in-slot writes outside it, **19 are `vals[i] = v` (shape-NEUTRAL) and exactly one wrote `attrs`**. That one — `eval_prog.rs` hoisting a redeclared `var` onto `globalThis` — bypassed `ObjMap::set_attr_at`, which exists to make a descriptor change a DICT transition and had **zero callers in the tree**, leaving `globalThis` claiming a shape that lied about its own attr bits. Harmless only because `ic_obj_ok` bans `global_this` from every cache: an exclusion list, not an invariant. Fixed, plus `%Array.prototype%.length = n` (removes keys, no bump) and 13 whole-`HeapObj` overwrites in `construct.rs` (frees the old `vals`, no bump) now via `Heap::replace`. `shape::describe` + `ObjMap::verify_shape` + `ZIPP_SHAPE_VERIFY=1` sweep every live object at every collection and PANIC on disagreement. The existing test helper checked key->slot but **not attr bits**, which is exactly where the one raw write sat — a test pins the verifier going red on it. All 13 benches OK; test262 **IDENTICAL (6) across ~96,000 executions** with the verifier on; 344 lib tests. Off it costs one relaxed load per collection |
 | **B109 the first capture this repo can attribute to a commit** | **headline 1.8012x [1.790, 1.812]; `publishable: true`** | `bench/head_clean_e839613.json` — engine clean, equal to workspace HEAD before AND after measurement, binary hash unchanged across the run, Node v24.12.0, 21 counterbalanced pairs, output byte-identical. Diagnostics 4.5981x, all-13 2.2361x, recorded separately by the harness rather than by hand. **The headline did not move**: 1.798x directional -> 1.801x measured. B105 took `async-promise-chain` 1.775x -> **1.68x**, worth ~-0.55% of a ten-row geomean — and Node itself got **6-12% faster on four rows** between the two captures (`map-set-heavy` 972 -> 858ms, `markdown-render` 300 -> 269, `parse-large-js` 289 -> 270, async 363 -> 339). Nothing regressed; the denominator moved, which is precisely why the Node version has to be pinned. Ten rows in a geomean means one row's factor *f* moves the headline by *f*^(1/10), so 1.80x -> 1.0x needs the PRODUCT of ten improvements to be 0.56; both worst rows at exact parity still leaves 1.41x |
@@ -1874,6 +1875,92 @@ because nothing native reads a shape. A shape-keyed hit would read a **stale**
 `guard_shape` and match a receiver whose layout had moved. That is why WP-1A —
 routing every descriptor and structural write through one API that owns the
 version bump — is a prerequisite and not a tidying exercise.
+
+### B112 — a cheaper way-0 probe: REFUTED, after a 3x bug that nothing but wall time saw
+
+B111's closing suggestion was that since eight of the ten headline rows take zero
+native property misses, every property access they make is a probe HIT, and the
+lever is therefore the instruction count of a hit rather than the miss rate. Built,
+measured, refuted.
+
+The probe walked ways in a loop, so a MONOMORPHIC site paid loop scaffolding to
+iterate exactly once, and asked "is this an own entry?" in four instructions.
+Way 0 inlined, plus `nhops == 0` rewritten as `slot_nhops <= 0x00FF_FFFF` (the
+slot is the low 24 bits, the hop count everything above), takes a way-0 own hit
+from **19 instructions to 16**:
+
+```
+mov  rax, [rbx+dreg]        mov  rax, [rbx+dreg]
+lea  r9, [r14+off]          lea  r9, [r14+off]
+mov  r8d, 8                 cmp  rax, [r9]
+cmp  rax, [r9]              jne  slow
+jne  next                   mov  ecx, eax
+mov  ecx, eax               mov  edx, [r13+rcx*4]
+mov  edx, [r13+rcx*4]       cmp  edx, [r9+16]
+cmp  edx, [r9+16]           jne  slow
+jne  next                   cmp  DWORD [r9+20], 0x00FFFFFF
+mov  ecx, [r9+20]           ja   slow0
+shr  ecx, 24                mov  rcx, [r9+8]
+test ecx, ecx               mov  edx, [r9+20]
+jz   hit                    and  edx, 0x00FFFFFF
+mov  rcx, [r9+8]            mov  rax, [rcx+rdx*8]
+mov  edx, [r9+20]           mov  [rbx+dreg], rax
+and  edx, 0x00FFFFFF        jmp  cont
+mov  rax, [rcx+rdx*8]
+mov  [rbx+dreg], rax        16
+jmp  cont
+(+5-byte align pad)
+
+19
+```
+
+**Result: nothing.** 21 pairs, one binary, `ZIPP_NO_IC_FAST0=1` as the other side:
+geomean **0.9986× [−0.51%, +0.33%]**. `property-ic-shapes` −0.9% [−1.3, −0.4] and
+`class-prototype-hot` **+1.0% [+0.4, +2.2]** — a row moving the WRONG way with an
+interval excluding zero, which §14 alone would reject it on. Three instructions
+off the hottest property path in the engine, and the suite cannot tell.
+
+Reverted. `ZIPP_ICSTATS` (B111) stays; the mechanism does not.
+
+**The part worth keeping is how the first version failed.** A way-0 CHAIN entry
+(`nhops > 0`) took the `ja` exit, and the loop it fell into started at **way 1** —
+because way 0 had "already been tested". It had not: only its own-property case
+had. A chain entry in way 0 became permanently unreachable, so every access it
+should have served scanned all eight ways and called the miss helper instead.
+
+| | |
+|---|---:|
+| `class-prototype-hot` | **+221%** (376 → 1209ms) |
+| `polymorphic-objects-v2` | **+96%** |
+| `property-ic-shapes` | +7.2% |
+| output on all 13 benches | **byte-identical** |
+| the 8-state IC differential vs node, 4 modes | **passed** |
+| `ZIPP_JITLOG` decline/compile histogram | **unchanged, line for line** |
+| `ZIPP_PROF` | **100.0% jit-mem** — same tier, same region |
+
+Everything that could have caught it said the code was fine. It was fine — it
+computed the right answers, in the right tier, from the right regions. It was
+just doing it through the miss helper several million times. **The only instrument
+that saw it was the wall clock**, which is the fourth time this session
+(B97, B102, B108, now this) that the sole detector of a real defect was a number
+that could not be right.
+
+The diagnosis took one bisect, not a theory: restarting the loop at way 0 instead
+of way 1 made the regression vanish entirely (+1.4% / −1.0%), which named the
+skipped way as the cause and refuted two microarchitectural guesses (disp32
+addressing, code size) that had already been built and measured to no effect.
+
+The corrected form uses two loop entry points — way 1 when way 0 failed on
+identity or version (it cannot hit in the loop either), way 0 when it failed only
+because it is a chain entry. That is the version measured above at neutral. It is
+still reverted, because neutral is not a reason to carry a second emitted path
+through the hottest loop in the JIT.
+
+**What this leaves.** The retained ten have no property lever left that is about
+the CACHE: not the miss rate (B111: zero misses), and not the hit's instruction
+count (this). What remains is B101's version of the question — reduce the NUMBER
+of heap operations, not their per-op cost — which is the optimizing tier, not the
+inline cache.
 
 ### B111 — the shape-keyed IC is worth ZERO on the retained ten, measured before building it
 
