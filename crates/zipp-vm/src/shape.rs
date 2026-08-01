@@ -286,6 +286,30 @@ pub fn slot_of(shape: u32, key: &str) -> Option<u32> {
     })
 }
 
+/// `(key, attr_bits)` per slot of `shape`, in insertion order.
+///
+/// The authoritative statement of what a shape CLAIMS about an object, used to
+/// check it against what the object actually holds (`ObjMap::verify_shape`).
+/// Walks the transition chain, so it is O(property count) and allocates — a
+/// verifier, never a hot path.
+pub fn describe(shape: u32) -> Vec<(Box<str>, u8)> {
+    if shape == DICT {
+        return Vec::new();
+    }
+    TABLE.with(|t| {
+        let t = t.borrow();
+        let mut out = Vec::new();
+        let mut cur = shape;
+        while cur != EMPTY && cur != DICT {
+            let n = &t.nodes[cur as usize];
+            out.push((n.key.clone(), n.attr_bits));
+            cur = n.parent;
+        }
+        out.reverse();
+        out
+    })
+}
+
 /// Own property names of `shape`, in insertion order. Diagnostics and debug
 /// assertions only — the hot paths read the object's own `keys`.
 #[cfg(test)]

@@ -504,6 +504,40 @@ impl Vm<'_> {
         let _ = free_before;
         gcstats::record(stats, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
         self.heap.note_gc_done(n - free_after);
+        if shape_verify::enabled() {
+            self.verify_all_shapes();
+        }
+    }
+
+    /// Check every live object's shape against its actual layout, panicking on
+    /// the first disagreement. `ZIPP_SHAPE_VERIFY=1`.
+    ///
+    /// A shape is a CLAIM — "my keys are these, in this order, with these
+    /// descriptor bits" — and nothing native reads that claim today, so a stale
+    /// one is invisible: every emitted guard is receiver identity plus a version.
+    /// The moment a probe guards on a shape instead, a stale shape is a call-free
+    /// read of the wrong slot. This is the check that has to exist BEFORE
+    /// anything depends on it, which is why it lands ahead of the shape-keyed IC
+    /// rather than with it.
+    ///
+    /// Runs at every collection so a desync surfaces at the first GC after the
+    /// write that caused it, with the offending key named, rather than as a wrong
+    /// answer much later. Panics rather than reports: a disagreement means the
+    /// engine's own metadata is lying, and continuing past it produces exactly
+    /// the class of bug that is hardest to trace back.
+    pub(crate) fn verify_all_shapes(&self) {
+        let free: std::collections::HashSet<u32> =
+            self.heap.free_indices().iter().copied().collect();
+        for idx in 0..self.heap.len() as u32 {
+            if free.contains(&idx) {
+                continue;
+            }
+            if let HeapObj::Object(m) = self.heap.get(idx) {
+                if let Err(why) = m.verify_shape() {
+                    panic!("shape/layout disagreement on heap slot {idx}: {why}");
+                }
+            }
+        }
     }
 
     /// Push every heap reference held by object `idx` onto the mark stack.
@@ -824,6 +858,29 @@ mod gcstats {
             per(LIVE.load(Ordering::Relaxed)),
             SWEPT.load(Ordering::Relaxed),
         )
+    }
+}
+
+/// `ZIPP_SHAPE_VERIFY=1` — check every live object's shape against its layout at
+/// every collection. See `Vm::verify_all_shapes`.
+///
+/// Off, this costs one relaxed atomic load per collection.
+mod shape_verify {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_SHAPE_VERIFY").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
     }
 }
 

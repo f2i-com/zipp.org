@@ -1105,7 +1105,7 @@ impl<'p> Vm<'p> {
             let tv = self.construct(cval, args)?;
             let tvi = tv.heap_index();
             let cloned = self.heap.get(tvi).clone();
-            *self.heap.get_mut(oidx) = cloned;
+            self.heap.replace(oidx, cloned);
             // Carry over the length-tracking flag (a `new T(rab[, offset])` view with
             // no explicit length follows the resizable buffer): it lives in a side
             // set keyed by heap index, which the clone above does NOT move.
@@ -1126,8 +1126,7 @@ impl<'p> Vm<'p> {
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
                 return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
             }
-            *self.heap.get_mut(oidx) =
-                HeapObj::ArrayBuffer { data: vec![0u8; n].into(), detached: false };
+            self.heap.replace(oidx, HeapObj::ArrayBuffer { data: vec![0u8; n].into(), detached: false });
             if let Some(m) = max {
                 self.ab_max.insert(oidx, m);
             }
@@ -1144,7 +1143,7 @@ impl<'p> Vm<'p> {
             let tv = self.build_data_view(args)?;
             let tvi = tv.heap_index();
             let cloned = self.heap.get(tvi).clone();
-            *self.heap.get_mut(oidx) = cloned;
+            self.heap.replace(oidx, cloned);
             if self.dv_tracking.contains(&tvi) {
                 self.dv_tracking.insert(oidx);
             }
@@ -1167,7 +1166,7 @@ impl<'p> Vm<'p> {
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let tv = self.make_intl(kind as u8, locales, options)?;
                 let cloned = self.heap.get(tv.heap_index()).clone();
-                *self.heap.get_mut(oidx) = cloned;
+                self.heap.replace(oidx, cloned);
                 if sub_proto.is_heap() {
                     self.proto_of.insert(oidx, sub_proto);
                 }
@@ -1185,7 +1184,7 @@ impl<'p> Vm<'p> {
         {
             let tv = self.construct(cval, args)?;
             let cloned = self.heap.get(tv.heap_index()).clone();
-            *self.heap.get_mut(oidx) = cloned;
+            self.heap.replace(oidx, cloned);
             // Carry any named own props the build recorded (e.g. a RegExp's
             // side-table entries) from the temp object to the instance.
             if let Some(m) = self.arr_props.remove(&tv.heap_index()) {
@@ -1209,7 +1208,7 @@ impl<'p> Vm<'p> {
             let tv = self.construct(cval, args)?;
             let tvi = tv.heap_index();
             let cloned = self.heap.get(tvi).clone();
-            *self.heap.get_mut(oidx) = cloned;
+            self.heap.replace(oidx, cloned);
             if let Some(m) = self.fn_props.remove(&tvi) {
                 self.fn_props.insert(oidx, m);
             }
@@ -1243,7 +1242,7 @@ impl<'p> Vm<'p> {
         // on the real variant), then add iterable entries via the instance's
         // adder (honouring a subclass override) — modeled on the Map/Set arms.
         if pidx == self.weakmap_proto && self.weakmap_proto != 0 {
-            *self.heap.get_mut(oidx) = HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() };
+            self.heap.replace(oidx, HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() });
             // Re-branded in place: no stale collection index may key this slot.
             self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
@@ -1256,7 +1255,7 @@ impl<'p> Vm<'p> {
             return Ok(true);
         }
         if pidx == self.weakset_proto && self.weakset_proto != 0 {
-            *self.heap.get_mut(oidx) = HeapObj::WeakSet(Vec::new());
+            self.heap.replace(oidx, HeapObj::WeakSet(Vec::new()));
             // Re-branded in place: no stale collection index may key this slot.
             self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
@@ -1276,7 +1275,7 @@ impl<'p> Vm<'p> {
             // close the iterator either
             // (staging/sm/Map/constructor-iterator-close.js). The builtin `add`
             // still does the SameValueZero dedup.
-            *self.heap.get_mut(oidx) = HeapObj::Set(Vec::new());
+            self.heap.replace(oidx, HeapObj::Set(Vec::new()));
             // The instance slot is re-branded in place: make sure no stale
             // collection index can be keyed by it.
             self.coll_index_invalidate(oidx);
@@ -1296,7 +1295,7 @@ impl<'p> Vm<'p> {
             // Vec<Value> with no back-references, so the clone is safe.
             let tv = self.construct(cval, args)?;
             let cloned = self.heap.get(tv.heap_index()).clone();
-            *self.heap.get_mut(oidx) = cloned;
+            self.heap.replace(oidx, cloned);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
@@ -1305,7 +1304,7 @@ impl<'p> Vm<'p> {
         if pidx == self.map_proto && self.map_proto != 0 {
             // Brand first so the `set` adder operates on a real Map, then add entries
             // via the adder resolved off the instance (honouring a subclass override).
-            *self.heap.get_mut(oidx) = HeapObj::Map { keys: Vec::new(), vals: Vec::new() };
+            self.heap.replace(oidx, HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
             // Re-branded in place: no stale collection index may key this slot.
             self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
@@ -1328,12 +1327,12 @@ impl<'p> Vm<'p> {
                     self.display(a0)
                 )));
             }
-            *self.heap.get_mut(oidx) = HeapObj::Promise {
+            self.heap.replace(oidx, HeapObj::Promise {
                 state: PromiseState::Pending,
                 result: Value::UNDEFINED,
                 reactions: crate::heap::Reactions::None,
                 handled: false,
-            };
+            });
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
@@ -1372,7 +1371,7 @@ impl<'p> Vm<'p> {
             let tv = self.construct(cval, args)?;
             let tvi = tv.heap_index();
             let cloned = self.heap.get(tvi).clone();
-            *self.heap.get_mut(oidx) = cloned;
+            self.heap.replace(oidx, cloned);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }

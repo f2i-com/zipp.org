@@ -484,13 +484,27 @@ impl<'p> Vm<'p> {
                             };
                             if let HeapObj::Object(m) = self.heap.get_mut(gi) {
                                 if let Some(i) = m.pos(&name) {
-                                    if m.attrs[i].configurable {
-                                        m.attrs[i] = attr;
+                                    if m.attr_at(i).configurable {
+                                        // Through `set_attr_at`, not a raw
+                                        // `attrs[i] = attr`: changing descriptor
+                                        // bits in place is a SHAPE change, and
+                                        // `set_attr_at` is the only place that
+                                        // drops the object to DICT for it. The
+                                        // raw write left `globalThis` claiming a
+                                        // shape whose attr bits no longer matched
+                                        // — harmless only because `ic_obj_ok`
+                                        // bans `global_this` from every cache,
+                                        // which is an accident of exclusion
+                                        // rather than an invariant.
+                                        m.set_attr_at(i, attr);
                                     }
-                                    m.vals[i] = v;
+                                    m.set_val_at(i, v);
                                 } else {
                                     m.define(&name, v, attr);
                                 }
+                                // A key add or a descriptor change on the global
+                                // object invalidates any cached slot for it.
+                                self.heap.bump_version(gi);
                                 continue;
                             }
                         }

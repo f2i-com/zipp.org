@@ -426,6 +426,56 @@ impl ObjMap {
         self.shape = crate::shape::DICT;
     }
 
+    /// Check that this object's shape actually describes it, returning the first
+    /// disagreement.
+    ///
+    /// A shape is a claim: "my keys are these, in this order, with these
+    /// descriptor bits". Nothing native reads that claim TODAY, so a stale shape
+    /// is invisible — every guard is receiver identity plus a version. The
+    /// moment an emitted probe guards on a shape instead, a stale one is a hit
+    /// on the wrong slot of the wrong object, silently. This is the check that
+    /// makes the claim testable before anything depends on it.
+    ///
+    /// `DICT` is not checkable and is not meant to be: it is the sentinel for
+    /// "no longer describable by appends", shared by every dictionary object,
+    /// and `shape_guardable()` already refuses it.
+    pub fn verify_shape(&self) -> Result<(), String> {
+        if !self.shape_guardable() {
+            return Ok(());
+        }
+        let claimed = crate::shape::describe(self.shape);
+        if claimed.len() != self.keys.len() {
+            return Err(format!(
+                "shape {} claims {} properties, object holds {}",
+                self.shape,
+                claimed.len(),
+                self.keys.len()
+            ));
+        }
+        for (i, (key, bits)) in claimed.iter().enumerate() {
+            if **key != *self.keys[i] {
+                return Err(format!(
+                    "shape {} slot {} claims key {:?}, object holds {:?}",
+                    self.shape, i, key, self.keys[i]
+                ));
+            }
+            let a = self.attrs[i];
+            let actual = crate::shape::attr_bits(
+                a.writable,
+                a.enumerable,
+                a.configurable,
+                a.accessor,
+            );
+            if *bits != actual {
+                return Err(format!(
+                    "shape {} slot {} ({:?}) claims attr bits {:#04b}, object has {:#04b}",
+                    self.shape, i, key, bits, actual
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// As `shape_pushed`, but called BEFORE the key is moved into the vector
     /// (so the length assertion is off by one and is skipped).
     #[inline]
@@ -2264,6 +2314,24 @@ impl Heap {
         self.gc_requested = false;
     }
 
+    /// Overwrite the whole object at `idx`, bumping its version.
+    ///
+    /// A subclass constructor's `super()` allocates a plain object and then
+    /// REPLACES it in place with the exotic one the base class produces (a Map, a
+    /// Set, a Promise, a cloned Array). That drops the old `ObjMap` and frees its
+    /// `vals` buffer, so any cache holding a `vals_ptr` for this slot is left
+    /// pointing at freed memory — the version bump is what makes it miss.
+    ///
+    /// This has been safe in practice because the replaced object is always one
+    /// allocated moments earlier inside the same `super()` call, which no cache
+    /// has had the chance to see. That is an argument about timing, not an
+    /// invariant, and it is not one a shape-keyed guard should have to make.
+    #[inline]
+    pub fn replace(&mut self, idx: u32, obj: HeapObj) {
+        self.objs[idx as usize] = obj;
+        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+    }
+
     /// Bump object `idx`'s version (call after a key-add reallocates its `vals`).
     ///
     /// The counter is `u32`. A false inline-cache hit would require it to wrap
@@ -2645,6 +2713,103 @@ mod tests {
                 Some(i as u32),
                 "shape puts {k:?} at a different slot than the map does"
             );
+        }
+    }
+
+    /// `verify_shape` must catch the thing `assert_shape_agrees` cannot see.
+    ///
+    /// That helper checks key -> slot agreement, which is what a shape-keyed
+    /// guard needs to read the RIGHT slot. It says nothing about descriptor
+    /// bits — and those are part of a shape's identity, deliberately, because
+    /// two objects whose `x` differs in enumerability do not have interchangeable
+    /// layouts for a descriptor read. A raw `attrs[i] = a` therefore leaves an
+    /// object claiming a shape that lies about it while every key still lands in
+    /// the right place.
+    ///
+    /// That write existed: `eval_prog.rs` did it on `globalThis` while hoisting a
+    /// redeclared `var`. It was harmless only because `ic_obj_ok` bans
+    /// `global_this` from every cache — an accident of exclusion, not an
+    /// invariant, and not one a native shape guard could rely on.
+    #[test]
+    fn a_raw_attribute_write_is_caught_by_verify_shape() {
+        let mut m = ObjMap::new();
+        m.set("a", Value::num(1.0));
+        m.set("b", Value::num(2.0));
+        assert!(m.shape_guardable());
+        assert!(m.verify_shape().is_ok());
+
+        // Every key is still at its own slot, so the key/slot check passes...
+        m.attrs[1].enumerable = false;
+        assert_shape_agrees(&m);
+        // ...and the shape is now lying about slot 1's descriptor.
+        let why = m.verify_shape().expect_err("a changed attr bit must be caught");
+        assert!(why.contains("attr bits"), "unexpected reason: {why}");
+        assert!(why.contains("slot 1"), "reason should name the slot: {why}");
+    }
+
+    /// The same change through `set_attr_at` is sound: it drops the object to
+    /// DICT, which is the honest answer — "this layout is no longer describable
+    /// by a sequence of appends" — and `shape_guardable()` then refuses it.
+    #[test]
+    fn set_attr_at_drops_to_dict_instead_of_lying() {
+        let mut m = ObjMap::new();
+        m.set("a", Value::num(1.0));
+        m.set("b", Value::num(2.0));
+        let before = m.shape();
+
+        let mut a = m.attr_at(1);
+        a.enumerable = false;
+        m.set_attr_at(1, a);
+
+        assert_ne!(m.shape(), before);
+        assert!(!m.shape_guardable(), "a descriptor change must leave DICT");
+        assert!(m.verify_shape().is_ok(), "DICT claims nothing, so it cannot lie");
+    }
+
+    /// A descriptor change that changes NOTHING must not cost the shape: writing
+    /// back identical bits keeps the object guardable.
+    #[test]
+    fn rewriting_identical_attributes_keeps_the_shape() {
+        let mut m = ObjMap::new();
+        m.set("a", Value::num(1.0));
+        let before = m.shape();
+        let a = m.attr_at(0);
+        m.set_attr_at(0, a);
+        assert_eq!(m.shape(), before);
+        assert!(m.shape_guardable());
+        assert!(m.verify_shape().is_ok());
+    }
+
+    /// A value store is shape-NEUTRAL by definition — same keys, same descriptor
+    /// bits, no reallocation. This is why the other 19 raw in-slot writes in the
+    /// tree are not a hazard and were left alone.
+    #[test]
+    fn a_value_store_does_not_touch_the_shape() {
+        let mut m = ObjMap::new();
+        m.set("a", Value::num(1.0));
+        m.set("b", Value::num(2.0));
+        let before = m.shape();
+        m.set_val_at(0, Value::num(99.0));
+        assert_eq!(m.shape(), before);
+        assert!(m.verify_shape().is_ok());
+        assert_eq!(m.val_at(0).as_f64(), 99.0);
+    }
+
+    /// `seal` and `freeze` change every property's descriptor at once, so they
+    /// must leave DICT rather than a shape that claims the old bits.
+    #[test]
+    fn seal_and_freeze_leave_a_shape_that_cannot_lie() {
+        for op in [0u8, 1] {
+            let mut m = ObjMap::new();
+            m.set("a", Value::num(1.0));
+            m.set("b", Value::num(2.0));
+            if op == 0 {
+                m.seal();
+            } else {
+                m.freeze();
+            }
+            assert!(!m.shape_guardable());
+            assert!(m.verify_shape().is_ok());
         }
     }
 

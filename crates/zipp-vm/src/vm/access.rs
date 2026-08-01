@@ -900,6 +900,11 @@ impl<'p> Vm<'p> {
                     m.remove(&k);
                 }
             }
+            // Removing keys shifts every slot after them. `ic_obj_ok` bans
+            // `arr_proto` from every cache, so nothing can currently hold a stale
+            // slot for it — but that is an exclusion list, not an invariant, and
+            // a shape-keyed guard should not have to know about it.
+            self.heap.bump_version(self.arr_proto);
             self.arr_proto_len = n;
             return Ok(true);
         }

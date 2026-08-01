@@ -40,6 +40,7 @@ are in B58.
 | **B102 B95 shipped a 19x pathology the benchmarks could not see** | **FIXED; a third sampled pin kind** | B95 admitted dense-Array `GetIndex` to the DOUBLE tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND` — **any** dense array, including one of OBJECTS. The element's dst then takes a numeric home, `live_in_regs` entry-loads it, the load sees the previous iteration's object, and the region `entry_bail`s on EVERY OSR entry, self-evicts, and displaces the memory compile that was working: **124ms -> 2349ms, 19x, running 100% interpreted**. Found from a CONTROL micro that was SLOWER than the thing it controlled for (property reads *removed*: 509ms -> 2047ms). The fix is a THIRD kind, not a narrower one — restricting to `ARR_INT_PIN_KIND` killed the pathology but cost `sparse-array-v2` **+6.2% [+0.9, +13.9]** by excluding arrays of DOUBLES, which the double tier hosts fine. `ARR_NUM_PIN_KIND` samples all-NUMBER over the same bounded 64-head/64-stride walk and sits between the two. Suite A/B vs the unsampled build, 21 pairs: **+0.64% [-1.84, +2.66]** — neutral, with `sparse-array-v2`'s regression gone. **All 13 benches stayed byte-identical and the gate was green through the whole pathology**; two of this session's three real defects (this and B97's flush bug) were invisible to the suite and both surfaced as "a number that cannot be right". `ZIPP_ARR_PIN_LOOSE=1` |
 | **B107 the inline-cache probe was written out four times** | **FACTORED, NEUTRAL; two latent hazards closed** | `GetProp`/`SetProp` in `region_mem.rs` and again in `proto_mem.rs` emitted byte-identical 8-way probes — ~140 lines of dynasm with the entry layout as literal displacements and a literal stride of 64, in four places. They did NOT stay identical: the store path's `and edx, 0x00FF_FFFF`, which masks the hop count out of `slot_nhops`, was once absent from one — a wild WRITE at `vals + nhops*2^24*8`, not a wrong read. Now one `emit_ic_probe`, plus `assert!(size_of::<IcEntry>() == JIT_IC_STRIDE)` (raising `JIT_IC_MAX_HOPS` to 6 would silently make every probe read each way from the middle of the previous one) and a corrected layout comment that was wrong on all three of stride, hop offsets and sentinel. **The dead `jmp` was not dead**: deleting the `jmp => miss` that sat immediately before `=> miss` cost `property-ic-shapes` **+1.4% [+1.1, +1.8]**; restoring it made the emitted stream byte-identical and the row returned to **+0.0% [-0.1, +0.2]**. Five bytes of probe-loop ALIGNMENT, kept and renamed `PROBE_ALIGN_PAD` — which also makes neutrality provable rather than statistical, since the JIT now emits the same bytes it did before. 8 tests drive all four probes through thrash, mid-loop shape change, freeze, delete, a PROP_VIA_IC setter and a Tier-C chain call, identical to node and to the pre-refactor binary in four modes. **Step 1 of the shape-keyed IC; step 2's real cost is that there is NO flat shape array** — a version is one instruction only because `Heap::versions` is index-parallel, while a shape lives inside `ObjMap`. Folding the metadata refresh into `bump_version` makes all 35 sites correct by construction (realloc ⇒ bump is already a soundness invariant), but a descriptor-only change alters a shape WITHOUT bumping — so a shape-keyed hit would read a stale guard. That is why WP-1A is a prerequisite |
 | **B106 the argument-`Vec` work package was mostly already done** | **LANDED, NEUTRAL AS PREDICTED** | Plan WP-1D asks for inline argument buffers on generic call paths; reading the tree first found seven of them already there — `setup_call` copies register-to-register, `try_builtin_method` gathers into `[Value; 8]`, `run_method_inline` into `[Value; 24]`, `super.m()` skips `call_value`, `f.call(...)` slices, callbacks pass stack literals, `arr.push` has its own lane — and B27 had already added `smallvec` once, measured **102 vs 100ns**, and reverted it with the dependency. What was left is `with_argv` at `eval_math`, the namespace-native-as-method arm and its JIT twin, and the bound-call concat (which allocated TWICE). **Predicted flat before measuring**: B104 had just priced an alloc/free pair at ~3ns, and `Math.imul` in a compiled region never reaches `eval_math` — `emit_math_op` emits it natively, so the Vec was on the INTERPRETED path only. Measured with B107: geomean **1.0011x [-0.19%, +0.38%]**. `TailCall` left alone: `try_tail_reuse` truncates `self.regs` before the values are written back |
+| **B110 the shape invariant is now checked, and it was wrong in one place** | **PREREQUISITE FOR THE SHAPE-KEYED IC; one real hazard fixed** | An object's recorded shape must always describe its layout, and nothing checked that, because nothing native reads a shape yet. The audit is far smaller than plan WP-1A implies: structural mutation is ALREADY centralized in `heap.rs`, and of the 20 raw in-slot writes outside it, **19 are `vals[i] = v` (shape-NEUTRAL) and exactly one wrote `attrs`**. That one — `eval_prog.rs` hoisting a redeclared `var` onto `globalThis` — bypassed `ObjMap::set_attr_at`, which exists to make a descriptor change a DICT transition and had **zero callers in the tree**, leaving `globalThis` claiming a shape that lied about its own attr bits. Harmless only because `ic_obj_ok` bans `global_this` from every cache: an exclusion list, not an invariant. Fixed, plus `%Array.prototype%.length = n` (removes keys, no bump) and 13 whole-`HeapObj` overwrites in `construct.rs` (frees the old `vals`, no bump) now via `Heap::replace`. `shape::describe` + `ObjMap::verify_shape` + `ZIPP_SHAPE_VERIFY=1` sweep every live object at every collection and PANIC on disagreement. The existing test helper checked key->slot but **not attr bits**, which is exactly where the one raw write sat — a test pins the verifier going red on it. All 13 benches OK; test262 **IDENTICAL (6) across ~96,000 executions** with the verifier on; 344 lib tests. Off it costs one relaxed load per collection |
 | **B109 the first capture this repo can attribute to a commit** | **headline 1.8012x [1.790, 1.812]; `publishable: true`** | `bench/head_clean_e839613.json` — engine clean, equal to workspace HEAD before AND after measurement, binary hash unchanged across the run, Node v24.12.0, 21 counterbalanced pairs, output byte-identical. Diagnostics 4.5981x, all-13 2.2361x, recorded separately by the harness rather than by hand. **The headline did not move**: 1.798x directional -> 1.801x measured. B105 took `async-promise-chain` 1.775x -> **1.68x**, worth ~-0.55% of a ten-row geomean — and Node itself got **6-12% faster on four rows** between the two captures (`map-set-heavy` 972 -> 858ms, `markdown-render` 300 -> 269, `parse-large-js` 289 -> 270, async 363 -> 339). Nothing regressed; the denominator moved, which is precisely why the Node version has to be pinned. Ten rows in a geomean means one row's factor *f* moves the headline by *f*^(1/10), so 1.80x -> 1.0x needs the PRODUCT of ten improvements to be 0.56; both worst rows at exact parity still leaves 1.41x |
 | **B108 the gate reported IDENTICAL for code it had never run** | **PROCESS BUG FIXED; one gate result retracted** | `cargo test --workspace --release` builds the LIB and the test harnesses but **not** `target/release/zipp.exe` — nothing under test depends on the CLI bin. `gate.sh` ran `cargo test` and then pointed test262 at whatever binary was on disk, which after a `git stash` cycle for a two-binary A/B was the PRE-change build. It reported `default/nojit/thr1 IDENTICAL (6)` — ~96k executions x3, all green — for code it had never executed, and B104/B105 were pushed on it. Found not by any check but by the next A/B, where two binaries differing only in an argument-buffer change reported `async-promise-chain` **-6.8%**: exactly B105's number, in a comparison where B105 was meant to be on both sides. `gate.sh` now builds first and prints `zipp --version --json`. **This is B103's bug in the correctness gate instead of the performance harness** — the harness had been taught to check its binary's provenance that morning; the gate had not |
 | **B105 a promise's two reaction vectors were two halves of one record** | **LANDED — `async-promise-chain` -6.7%, REPLICATED at -7.6%** | Every registration site supplies BOTH handlers at once with the same `dependent`/`finally`/`is_async` — `.then(f)` gives `f` plus a pass-through rejection, `await` a pair of async resumes — and there are exactly two such sites. Storing them in `fulfill: Vec<Reaction>` and `reject: Vec<Reaction>` made the single-subscriber promise (a chain link, an `await`, every `Promise.all` element) allocate **two** first buffers for two halves of one record. `Reactions::{None, One, Many}` holds it inline: **1,530,004 subscriptions, 1,530,004 inline (100.0%), 0 spilled — 3.06M allocations removed**. Row **604 -> 564ms**; headline geomean **0.9939x [0.988, 0.997]**, largest unrelated mover `sparse-array-v2` +0.8% (a row with no promise in it — the two-binary layout confound B77 documented). **Seven times B104's effect for the same order of allocations**, because the win is the OBJECTS that no longer exist (two Vec headers, 48 of a ~58-byte payload; Promise payload 64 -> 48) rather than the allocator calls B104 saved at ~3ns each. Also removes a real retention leak, inseparably: settlement used to drain only the matching vector and the GC kept tracing the other for the promise's life. Eleven ordering/selection tests + a 39-outcome differential byte-identical to node in four modes on both binaries |
@@ -1872,6 +1873,85 @@ because nothing native reads a shape. A shape-keyed hit would read a **stale**
 `guard_shape` and match a receiver whose layout had moved. That is why WP-1A —
 routing every descriptor and structural write through one API that owns the
 version bump — is a prerequisite and not a tidying exercise.
+
+### B110 — the shape invariant is now checked, and it was wrong in one place
+
+B107 named the prerequisite for a native shape-keyed inline cache: an object's
+recorded shape must always describe its actual layout, and **nothing checks
+that** because nothing native reads a shape yet. A stale shape is invisible
+today and is a call-free read of the wrong slot the moment a probe guards on one.
+
+**The audit is much smaller than plan WP-1A ("centralize object mutation")
+suggests, and the reason matters.** Structural mutation is ALREADY centralized:
+nothing outside `heap.rs` pushes to, removes from, truncates, drains or
+`iter_mut`s `keys`/`vals`/`attrs`. What escaped is IN-SLOT mutation — 20 raw
+writes across 8 files — and of those:
+
+| kind | count | shape effect |
+|---|---:|---|
+| `vals[i] = v` | 19 | **none** — same keys, same descriptor bits, no reallocation |
+| `attrs[i] = a` | **1** | **changes the shape**, and said nothing |
+
+So the hazard is one line. `eval_prog.rs`, hoisting a redeclared `var` onto
+`globalThis`, wrote `m.attrs[i] = attr` directly. `ObjMap::set_attr_at` exists
+precisely to make that a transition — it drops the object to `DICT` when any
+descriptor bit actually changes — and had **zero callers anywhere in the tree**.
+The raw write left `globalThis` claiming a shape that lied about its own
+descriptor bits, harmless only because `ic_obj_ok` bans `global_this` from every
+cache. That is an accident of an exclusion list, not an invariant.
+
+It now goes through `set_attr_at` and is paired with a version bump. Two adjacent
+gaps closed with it: `%Array.prototype%.length = n` removes keys (shifting every
+slot after them) without bumping, and thirteen whole-`HeapObj` overwrites in
+`construct.rs` — a subclass `super()` replacing its plain object with a Map, Set,
+Promise or cloned Array — freed the old `vals` buffer without bumping. Both were
+safe by argument (an exclusion list; "no cache has seen this object yet"), which
+is not the same as safe by construction. `Heap::replace(idx, obj)` now owns the
+second.
+
+**The check.** `shape::describe(shape)` returns what a shape CLAIMS —
+`(key, attr_bits)` per slot — and `ObjMap::verify_shape()` compares it to what
+the object holds. `ZIPP_SHAPE_VERIFY=1` sweeps every live object at every
+collection and **panics** on the first disagreement, naming the slot and the key.
+A desync then surfaces at the first GC after the write that caused it rather than
+as a wrong answer much later.
+
+The distinction from the test helper that already existed is the point.
+`assert_shape_agrees` checks key → slot agreement, which is what a guard needs to
+read the RIGHT slot. It says nothing about descriptor bits — and those are part of
+a shape's identity, deliberately, because two objects whose `x` differs in
+enumerability do not have interchangeable layouts for a descriptor read. **The one
+raw write in the tree was exactly in that blind spot**, and a test that pins the
+verifier catching it is included, because this file's standing rule is that a
+green check proves nothing until it is shown to go red.
+
+**Evidence.**
+
+| run | result |
+|---|---|
+| all 13 benchmarks, verifier on | every one OK |
+| test262, verifier on, ~96,000 executions | **IDENTICAL (6)** — the expected-failures list unchanged |
+| `cargo test --lib` | 344 passed (5 new) |
+| full gate (39 suites + test262 x3) | green |
+| 21-pair suite A/B vs the previous build | geomean **1.0012x [-0.28%, +0.66%]**, every row's interval spanning zero |
+
+Off, the verifier costs one relaxed atomic load per collection. On, it is
+O(live objects) per collection and unusable with `ZIPP_GC_STRESS=1` — the two
+together take longer than the benchmark suite, which is the expected shape for a
+whole-heap invariant sweep and worth saying so nobody assumes the combination was
+run.
+
+**What this does NOT do.** The three vectors are still `pub`, so a future raw
+`attrs[i] = a` is still writable — it is now merely detected rather than
+prevented. Privatising them means converting 164 external `.attrs` uses to
+`attr_at(i)`, a large mechanical diff with no performance content, and the
+verifier catches the same class at a fraction of the cost. Recorded as the
+cheaper option taken deliberately, not as the job being finished.
+
+Next is `ObjMeta`: an index-parallel `(version, guard_shape, vals_ptr)` array
+replacing `Heap::versions`, refreshed inside `bump_version` so all 35 of its call
+sites are correct by construction, with the same whole-heap sweep extended to
+check the metadata against the objects it describes.
 
 ### B109 — the first capture this repo can attribute to a commit
 
