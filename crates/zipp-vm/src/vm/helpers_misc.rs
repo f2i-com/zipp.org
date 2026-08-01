@@ -125,6 +125,77 @@ pub(crate) extern "win64" fn jit_call_method_ic(
     }
 }
 
+/// Guarded intrinsic for the hot
+/// `Object.prototype.hasOwnProperty.call(array, numeric_key)` shape.
+///
+/// Both property reads that lead to the call are proved pristine before the
+/// array probe runs: the method receiver must be the native `hasOwnProperty`
+/// function with no own `call` shadow and the effective prototype must be the
+/// main `%Function.prototype%`, whose own `call` slot must still be the native
+/// `%Function.prototype%.call`. Every miss returns `SELF_CALL_DEOPT` before
+/// coercion, getters, proxy traps, or any other observable effect, so the
+/// emitter can run the unchanged generic CallMethod path.
+///
+/// ABI: rcx=vm, rdx=callable bits, r8=thisArg bits, r9=key bits.
+///
+/// # Safety
+/// `vm` is the live `Vm`; the remaining operands are raw Value bits from the
+/// running frame's register file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_has_own_call(
+    vm: *mut core::ffi::c_void,
+    callable_bits: u64,
+    this_bits: u64,
+    key_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let callable = Value::from_bits(callable_bits);
+    if !callable.is_heap()
+        || !matches!(
+            vm.heap.get(callable.heap_index()),
+            HeapObj::Native(id) if *id == native::PROTO_HAS_OWN
+        )
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+
+    let callable_idx = callable.heap_index();
+    if vm
+        .fn_props
+        .get(&callable_idx)
+        .is_some_and(|m| m.pos("call").is_some())
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if vm
+        .proto_of
+        .get(&callable_idx)
+        .is_some_and(|&p| p != Value::heap(vm.fn_proto))
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+
+    let pristine_call = match vm.heap.get(vm.fn_proto) {
+        HeapObj::Object(m) => m.pos("call").is_some_and(|slot| {
+            !m.attrs[slot].accessor
+                && m.vals[slot].is_heap()
+                && matches!(
+                    vm.heap.get(m.vals[slot].heap_index()),
+                    HeapObj::Native(id) if *id == native::FN_CALL
+                )
+        }),
+        _ => false,
+    };
+    if !pristine_call {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+
+    match vm.has_own_index_fast(Value::from_bits(this_bits), Value::from_bits(key_bits)) {
+        Some(answer) => Value::bool(answer).bits(),
+        None => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper for `s.indexOf(t)` inside a compiled region — a JIT INTRINSIC,
 /// the same shape that already puts `charCodeAt` and `.length` at node parity
 /// while every other string method pays ~47ns of call plumbing (jit_call_method_ic
@@ -529,13 +600,11 @@ pub(crate) extern "win64" fn jit_get_index(
     }
 }
 
-/// Win64 helper for a JIT'd dense-array element write `a[i] = v` (`SetIndex`).
-/// Stores in place when `i < len`, grows the array with `undefined` holes when
-/// `i >= len` (matching JS and the interpreter's set_index). Returns `0` on
-/// success, or `SELF_CALL_DEOPT` for a non-array receiver / negative / fractional
-/// / non-numeric key (the interpreter then applies its no-op fallback). Reads the
-/// live array fresh each call — no cached pointer, so a grow that reallocates is
-/// safe (the region pins only the register file, never array storage).
+/// Win64 helper for a JIT'd computed write `a[i] = v` (`SetIndex`). Dense arrays
+/// and numeric TypedArray writes stay in their narrow fast paths. Ordinary
+/// objects also update an existing writable string-key slot in place. All
+/// unsupported receivers/keys return `SELF_CALL_DEOPT`. Reads the live heap
+/// fresh each call, so no cached pointer survives an Array grow.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
@@ -563,10 +632,9 @@ pub(crate) extern "win64" fn jit_set_index(
     // them), no prototype involvement (an own data property shadows any
     // inherited setter), and no length/index bookkeeping.
     //
-    // Everything else keeps deopting — a NEW key (shape change), an accessor
-    // (runs user code), a non-writable slot (frozen/sealed objects land here,
-    // and strict mode must throw), an uninitialised TDZ slot, the slot-backed
-    // global object, and module / deferred namespaces (live bindings).
+    // Everything else keeps deopting — a new key (shape change), an accessor
+    // (runs user code), a non-writable slot, an uninitialised TDZ slot, the
+    // slot-backed global, and module/deferred namespaces (live bindings).
     if key.is_heap() {
         let oidx = arr.heap_index();
         if !(oidx == vm.global_this && vm.global_this != 0)
@@ -574,25 +642,26 @@ pub(crate) extern "win64" fn jit_set_index(
             && !(!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
             && !vm.arr_props.contains_key(&oidx)
         {
-            let flat = matches!(
-                vm.heap.str_wtf8_cow(key.heap_index()),
-                Some(std::borrow::Cow::Borrowed(_))
-            );
-            if flat {
-                let k = match vm.heap.str_wtf8_cow(key.heap_index()) {
-                    Some(std::borrow::Cow::Borrowed(b)) => std::str::from_utf8(b).ok().map(|x| x.to_string()),
-                    _ => None,
-                };
-                if let Some(k) = k {
-                    if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
-                        if let Some(i) = m.pos(&k) {
+            let mut writable_slot = None;
+            if let Some(std::borrow::Cow::Borrowed(bytes)) =
+                vm.heap.str_wtf8_cow(key.heap_index())
+            {
+                if let Ok(k) = std::str::from_utf8(bytes) {
+                    if let HeapObj::Object(m) = vm.heap.get(oidx) {
+                        if let Some(i) = m.pos(k) {
                             let a = m.attrs[i];
                             if !a.accessor && a.writable && !m.vals[i].is_uninitialized() {
-                                m.vals[i] = Value::from_bits(val_bits);
-                                return 0;
+                                writable_slot = Some(i);
                             }
                         }
                     }
+                }
+            }
+            // End the immutable key/object borrows before updating the slot.
+            if let Some(i) = writable_slot {
+                if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
+                    m.vals[i] = Value::from_bits(val_bits);
+                    return 0;
                 }
             }
         }
@@ -2423,4 +2492,3 @@ pub(crate) fn parse_bigint_str(s: &str) -> Option<crate::vm::bigint::BigVal> {
     };
     Some(if neg { v.neg() } else { v })
 }
-

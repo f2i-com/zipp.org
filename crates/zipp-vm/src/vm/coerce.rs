@@ -1668,6 +1668,16 @@ impl<'p> Vm<'p> {
                 let js = crate::heap::JsStr::from_wtf8(bytes);
                 return Value::heap(self.heap.alloc_js(js));
             }
+            // `typeof` itself returns one of these permanently interned handles.
+            // Reuse the same handle for an equal ordinary literal so the common
+            // unfused `var t = typeof v; t === "number"` shape reaches the
+            // pointer-equality fast path without allocating a second string.
+            if let Some(code) = crate::bytecode::typeof_code(&f.string_constants[si]) {
+                let interned = self.typeof_strs[code as usize];
+                if !interned.is_undefined() {
+                    return interned;
+                }
+            }
             let s = f.string_constants[si].clone();
             return self.alloc_str(s);
         }
@@ -1705,6 +1715,75 @@ pub(crate) fn cmp_i128_f64(x: i128, y: f64) -> Option<std::cmp::Ordering> {
         Ordering::Equal if y > yf => Ordering::Less, // x == floor(y) < y
         ord => ord,
     })
+}
+
+#[cfg(test)]
+mod resolve_const_tests {
+    use super::*;
+
+    fn global_value(vm: &Vm<'_>, program: &Program, name: &str) -> Value {
+        let slot = program
+            .global_names
+            .iter()
+            .position(|candidate| candidate == name)
+            .unwrap_or_else(|| panic!("missing global slot for {name}"));
+        vm.globals[slot]
+    }
+
+    #[test]
+    fn typeof_name_literals_reuse_the_permanent_handles() {
+        let src = r#"
+            var t0 = "number";
+            var t1 = "string";
+            var t2 = "boolean";
+            var t3 = "undefined";
+            var t4 = "object";
+            var t5 = "function";
+            var t6 = "symbol";
+            var t7 = "bigint";
+            var miss0 = "Number";
+            var miss1 = "number ";
+            var lone = "\uD800";
+            var fromEval = "before";
+            eval("fromEval = 'bigint'");
+        "#;
+        let ast = crate::front::parse_script(src).expect("source parses");
+        let program =
+            crate::compile::compile_program(&ast, src).expect("source compiles");
+        assert!(
+            !program.functions[0].wtf8_consts.is_empty(),
+            "the lone-surrogate case must exercise the WTF-8 branch"
+        );
+
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+
+        for (i, name) in crate::bytecode::TYPEOF_NAMES.iter().enumerate() {
+            let literal = global_value(&vm, &program, &format!("t{i}"));
+            assert_eq!(literal, vm.typeof_strs[i], "literal {name:?}");
+            assert_eq!(vm.display(literal), *name);
+        }
+
+        for (binding, text) in [("miss0", "Number"), ("miss1", "number ")] {
+            let literal = global_value(&vm, &program, binding);
+            assert!(
+                vm.typeof_strs.iter().all(|&interned| literal != interned),
+                "non-matching literal {text:?} reused a typeof handle"
+            );
+            assert_eq!(vm.display(literal), text);
+        }
+
+        let lone = global_value(&vm, &program, "lone");
+        assert!(vm.typeof_strs.iter().all(|&interned| lone != interned));
+        match vm.heap.get(lone.heap_index()) {
+            HeapObj::Str(s) => assert_eq!(s.units(), 1),
+            other => panic!("lone-surrogate literal resolved to {other:?}"),
+        }
+
+        // Direct eval functions live in `eval_funcs`, not `program.functions`;
+        // this proves their constants take the same resolve_const path.
+        assert_eq!(global_value(&vm, &program, "fromEval"), vm.typeof_strs[7]);
+    }
 }
 
 #[cfg(test)]

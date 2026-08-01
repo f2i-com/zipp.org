@@ -178,6 +178,10 @@ impl<'p> Vm<'p> {
             return Value::UNDEFINED;
         }
         let idx = obj.heap_index();
+        // Descriptor reflection observes the standard match-result properties
+        // as fully ordinary data properties. Move the compact pristine record
+        // into the general side table before inspecting attributes.
+        self.materialize_regexp_result_prop_for_key(idx, key);
         // Module Namespace exotic [[GetOwnProperty]]: the descriptor's value is
         // the LIVE binding (the ObjMap snapshot may be stale).
         if let Some(slot) = self.module_namespaces.get(&idx).and_then(|m| m.get(key)).copied()
@@ -385,6 +389,11 @@ impl<'p> Vm<'p> {
     /// `Object.getOwnPropertyNames(obj)` — all own string keys (enumerable or not).
     pub(crate) fn object_own_property_names(&mut self, obj: Value) -> Result<Value, Thrown> {
         self.defer_check_all(obj)?;
+        if obj.is_heap() {
+            // Own-key reflection observes ordering and descriptors, so this is
+            // one of the intentionally cold materialisation boundaries.
+            self.materialize_regexp_result_props(obj.heap_index());
+        }
         // A Proxy reports its keys via the ownKeys trap; getOwnPropertyNames keeps
         // the STRING keys.
         if let Some(keys) = self.proxy_own_keys(obj)? {

@@ -236,6 +236,7 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
+        self.materialize_regexp_result_prop_for_key(idx, key);
         // Array: a numeric index honours the FULL descriptor (attributes +
         // accessors), `length` resizes, a named key falls through to the generic
         // arr_props path. A fully-default DATA descriptor lives in the dense Vec

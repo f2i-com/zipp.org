@@ -719,6 +719,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) str_append: usize,
     /// Helper for a generic `obj.m(args…)` via the interpreter's per-site IC.
     pub(crate) call_method_ic: usize,
+    /// Guarded `hasOwnProperty.call(array, numeric_key)` intrinsic.
+    pub(crate) has_own_call: usize,
     /// Helper for a generic `f(args…)` via the interpreter's per-site IC.
     pub(crate) call_ic: usize,
     /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).

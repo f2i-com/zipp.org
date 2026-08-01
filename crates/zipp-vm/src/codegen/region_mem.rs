@@ -5,6 +5,23 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Same-binary A/B switch for the guarded `hasOwnProperty.call` intrinsic.
+/// Read while compiling a region, never on the generated hot path.
+#[inline]
+fn has_own_call_intrinsic_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_HASOWN_CALL_INTRINSIC").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Memory-based region codegen: every op loads operands from the register file
 /// (with a type guard) and stores results back, globals via the pinned base
 /// pointer. Correct and simple; ~4x faster than the interpreter but leaves
@@ -1265,6 +1282,68 @@ pub(crate) fn compile_region_mem(
             }
             Instr::CallMethod { dst, obj, name, arg_base, argc } => {
                 let key = proto.string_constants[name as usize].as_str();
+                // Exact `Object.prototype.hasOwnProperty.call(array, numericKey)`
+                // intrinsic. The helper proves both the `hasOwnProperty`
+                // callable and its inherited `%Function.prototype%.call` slot,
+                // then answers the existing allocation-free array-index probe.
+                // A guard miss is a PURE prefix: fall through to the unchanged
+                // generic CallMethod path rather than bailing/evicting the region.
+                if argc == 2 && key == "call" && has_own_call_intrinsic_enabled() {
+                    let hasown_slow = ops.new_dynamic_label();
+                    let hasown_done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(obj)]
+                        ; mov r8, [rbx + dreg(arg_base)]
+                        ; mov r9, [rbx + dreg(arg_base + 1)]
+                        ; mov rax, QWORD heap.has_own_call as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => hasown_slow
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => hasown_done
+                        ; => hasown_slow
+                    );
+
+                    let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                    let packed_args =
+                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    if let Some(mp) = method_plan.get(&ip) {
+                        emit_inline_method_call(
+                            &mut ops,
+                            ip,
+                            epilogue,
+                            leaf_flag_off,
+                            mp,
+                            obj,
+                            arg_base,
+                            argc,
+                            dst,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                            ta_refetch,
+                        );
+                    } else {
+                        emit_region_call_ic(
+                            &mut ops,
+                            ip,
+                            bail,
+                            epilogue,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            argc,
+                            dst,
+                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                            ta_refetch,
+                        );
+                    }
+                    dynasm!(ops ; => hasown_done);
+                    continue;
+                }
                 // ── `s.indexOf(t)` intrinsic ──
                 // A direct call to the search, skipping the whole builtin call
                 // chain (jit_call_method_ic -> jit_region_call_impl ->

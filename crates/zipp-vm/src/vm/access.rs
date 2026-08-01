@@ -161,6 +161,7 @@ impl<'p> Vm<'p> {
             return Value::bool(true);
         }
         let idx = obj.heap_index();
+        self.materialize_regexp_result_prop_for_key(idx, key);
         // A non-configurable own property cannot be deleted (`delete` yields false).
         if let HeapObj::Object(m) = self.heap.get(idx) {
             if let Some(i) = m.pos(key) {
@@ -545,6 +546,7 @@ impl<'p> Vm<'p> {
                 None => self.ordinary_set_with_proxy_receiver(t2, receiver, key, val, strict),
             };
         }
+        self.materialize_regexp_result_prop_for_key(target.heap_index(), key);
         // With NO observable trap on the receiver's handler (no set / gopd /
         // defineProperty, and the handler isn't itself a proxy), the spec
         // receiver-define sequence is indistinguishable from a direct forward
@@ -952,6 +954,7 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
+        self.materialize_regexp_result_prop_for_key(idx, key);
         // A Module Namespace exotic: [[Set]] ALWAYS returns false — strict
         // assignment TypeError, sloppy no-op, even for the SAME value.
         if self.module_namespaces.contains_key(&idx) {

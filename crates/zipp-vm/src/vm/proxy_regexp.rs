@@ -932,6 +932,83 @@ impl<'p> Vm<'p> {
         self.regexp_exec_impl(re_idx, input_v, true)
     }
 
+    /// Read one of a pristine match-result Array's standard named properties
+    /// without constructing its ordinary `ObjMap` representation.
+    #[inline]
+    pub(crate) fn regexp_result_prop(&self, idx: u32, key: &str) -> Option<Value> {
+        // Reject unrelated Array names before touching the side table. This
+        // helper sits on the generic Array named-read path, so `length` and
+        // method reads must not acquire an extra indexed lookup merely because
+        // some RegExp result exists elsewhere in the VM.
+        let slot = match key {
+            "index" => 0,
+            "input" => 1,
+            "groups" => 2,
+            "indices" => 3,
+            _ => return None,
+        };
+        let p = self.regexp_result_props.get(&idx)?;
+        if slot == 3 && p.values[3] == Value::UNDEFINED {
+            None
+        } else {
+            Some(p.values[slot])
+        }
+    }
+
+    /// Convert a compact pristine match-result record into `arr_props` before
+    /// an operation that can observe or change descriptors, key order,
+    /// deletion, or integrity state.
+    ///
+    /// The defensive merge handles an element overlay installed by an internal
+    /// Array path before materialisation. Standard result names were created
+    /// first, so they are pushed first; a later explicit entry with the same key
+    /// overwrites that slot while retaining its original insertion order.
+    pub(crate) fn materialize_regexp_result_props(&mut self, idx: u32) {
+        if self.regexp_result_props.is_empty() {
+            return;
+        }
+        let Some(p) = self.regexp_result_props.remove(&idx) else {
+            return;
+        };
+        let old = self.arr_props.remove(&idx);
+        let has_indices = p.values[3] != Value::UNDEFINED;
+        let mut m = ObjMap::side_table_with_capacity(
+            3 + has_indices as usize + old.as_ref().map_or(0, ObjMap::len),
+        );
+        m.push_data("index".to_string(), p.values[0]);
+        m.push_data("input".to_string(), p.values[1]);
+        m.push_data("groups".to_string(), p.values[2]);
+        if has_indices {
+            m.push_data("indices".to_string(), p.values[3]);
+        }
+        if let Some(old) = old {
+            for (key, value, attr) in old.iter() {
+                m.define(key, value, attr);
+            }
+            m.class = old.class;
+            m.is_ctor = old.is_ctor;
+            m.is_raw_json = old.is_raw_json;
+            if old.frozen {
+                m.freeze();
+            } else if old.sealed {
+                m.seal();
+            } else {
+                m.extensible = old.extensible;
+            }
+        }
+        self.arr_props.insert(idx, m);
+    }
+
+    /// Promote only when an operation targets one of the compact properties.
+    /// Unrelated additions can coexist in `arr_props`; the eventual full
+    /// materialisation merges them after the earlier-created standard names.
+    #[inline]
+    pub(crate) fn materialize_regexp_result_prop_for_key(&mut self, idx: u32, key: &str) {
+        if matches!(key, "index" | "input" | "groups" | "indices") {
+            self.materialize_regexp_result_props(idx);
+        }
+    }
+
     /// `regexp_exec` with `build = false` for `RegExp.prototype.test`: the
     /// IDENTICAL protocol (lastIndex Get/ToLength + the stateful Sets, in spec
     /// order), but the unobservable match-result materialization (array +
@@ -1220,31 +1297,21 @@ impl<'p> Vm<'p> {
         } else {
             Value::UNDEFINED
         };
-        // index/input/groups (+ indices) are always ABSENT here: `arr_idx` is a
-        // heap slot allocated a few lines above, and GC `retain`s `arr_props`
-        // against the mark bits, so a recycled slot cannot carry a stale entry.
-        // The `is_empty` test keeps that an assertion rather than an assumption
-        // — when it holds, append straight past `define`'s per-key hash probe.
-        let n = 3 + has_indices as usize;
-        let m = self
-            .arr_props
-            .entry(arr_idx)
-            .or_insert_with(|| ObjMap::side_table_with_capacity(n));
-        if m.keys.is_empty() {
-            m.push_data("index".to_string(), index_v);
-            m.push_data("input".to_string(), input_sv);
-            m.push_data("groups".to_string(), groups);
-            if has_indices {
-                m.push_data("indices".to_string(), indices_v);
-            }
-        } else {
-            m.define("index", index_v, attr);
-            m.define("input", input_sv, attr);
-            m.define("groups", groups, attr);
-            if has_indices {
-                m.define("indices", indices_v, attr);
-            }
-        }
+        // `arr_idx` is a fresh heap slot. GC prunes both property tables against
+        // the mark bits before a slot can be recycled, so neither can carry a
+        // stale entry from the previous occupant.
+        // Keep the pristine standard fields in one fixed record: this removes
+        // the per-result ObjMap, three key-string allocations, and three Vec
+        // allocations. Mutation/reflection materialises the exact ordinary
+        // data properties lazily; direct reads and presence checks stay compact.
+        debug_assert!(!self.arr_props.contains_key(&arr_idx));
+        debug_assert!(!self.regexp_result_props.contains_key(&arr_idx));
+        self.regexp_result_props.insert(
+            arr_idx,
+            RegexpResultProps {
+                values: [index_v, input_sv, groups, indices_v],
+            },
+        );
         Ok(Value::heap(arr_idx))
     }
 
@@ -1594,14 +1661,11 @@ impl<'p> Vm<'p> {
             } else {
                 // Was the match EMPTY? Only then does lastIndex need advancing.
                 //
-                // The generic answer is Get(match,"0") + ToString + length, but
-                // `get_index` on the result array takes its slow path: the array
-                // ALWAYS carries an `arr_props` side table (index/input/groups),
-                // so the read formats the key "0" into a fresh String and does a
-                // map lookup — per match, in a matchAll loop. When we built the
-                // array ourselves (real RegExp, pristine `exec`, so no user code
-                // could have replaced element 0 with a getter), read `items[0]`
-                // straight out of the dense store instead.
+                // The generic `get_index` path must still account for arguments
+                // mapping, element overlays, holes, and a custom prototype. When
+                // we built the array ourselves (real RegExp, pristine `exec`, so
+                // no user code could have replaced element 0 with a getter), read
+                // `items[0]` straight out of the dense store instead.
                 let fast0 = pristine_exec.then(|| match self.heap.get(r.heap_index()) {
                     HeapObj::Array(items) => items.first().copied(),
                     _ => None,

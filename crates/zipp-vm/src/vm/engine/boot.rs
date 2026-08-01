@@ -124,6 +124,7 @@ impl<'p> Vm<'p> {
             ctor_field_hint: Vec::new(),
             fn_props: crate::slot_table::SlotTable::default(),
             arr_props: crate::slot_table::SlotTable::default(),
+            regexp_result_props: crate::slot_table::SlotTable::default(),
             ab_max: std::collections::HashMap::new(),
             ta_tracking: std::collections::HashSet::new(),
             async_activations: Vec::new(),

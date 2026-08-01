@@ -108,6 +108,7 @@ impl<'p> Vm<'p> {
                 let b = self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false)?;
                 return Ok(b);
             }
+            self.materialize_regexp_result_prop_for_key(a0.heap_index(), &key);
             // TypedArray [[Set]] (10.4.5.5) step 1, for any canonical numeric
             // key: SameValue(O, Receiver) runs TypedArraySetElement (coerce the
             // value — observable — then bounds-checked write or silent drop) and
@@ -418,6 +419,7 @@ impl<'p> Vm<'p> {
                 Err(e) => Err(e),
             };
         }
+        self.materialize_regexp_result_prop_for_key(ridx, &key);
         if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
             && self.is_canonical_numeric_index(&key)
         {
@@ -3234,6 +3236,7 @@ impl<'p> Vm<'p> {
                 }
                 if o.is_heap() {
                     let idx = o.heap_index();
+                    self.materialize_regexp_result_props(idx);
                     // SetIntegrityLevel on a module namespace: "frozen" first runs
                     // the [[GetOwnProperty]] walk (an uninit export throws), then
                     // defines {writable:false} per export — which the namespace
@@ -3745,6 +3748,7 @@ impl<'p> Vm<'p> {
                     return Ok(Value::bool(b));
                 }
                 let idx = a0.heap_index();
+                self.materialize_regexp_result_props(idx);
                 // An integer-indexed exotic [[PreventExtensions]] RETURNS false
                 // when IsTypedArrayFixedLength is false — it does not throw.
                 // Only `Object.preventExtensions` turns that false into a

@@ -504,6 +504,9 @@ pub struct HeapHelperAddrs {
     /// op in the interpreter), or `CALL_THREW` (exception pending → the region
     /// exits and the interpreter unwinds WITHOUT re-executing the call).
     pub call_method_ic: usize,
+    /// Guarded intrinsic for
+    /// `Object.prototype.hasOwnProperty.call(array, numeric_key)`.
+    pub has_own_call: usize,
     /// Helper for a generic `f(args…)` (`Call`) in a region (same protocol).
     pub call_ic: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
@@ -605,6 +608,7 @@ impl HeapHelperAddrs {
             concat: self.concat,
             str_append: self.str_append,
             call_method_ic: self.call_method_ic,
+            has_own_call: self.has_own_call,
             call_ic: self.call_ic,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,

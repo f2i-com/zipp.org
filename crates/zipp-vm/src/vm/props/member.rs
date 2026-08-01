@@ -1075,6 +1075,12 @@ impl<'p> Vm<'p> {
             }
             return Ok(raw);
         }
+        // A pristine RegExp match result keeps its standard named data
+        // properties in a compact fixed record. They have the ordinary default
+        // attributes, so a direct read needs no descriptor materialisation.
+        if let Some(raw) = self.regexp_result_prop(obj.heap_index(), key) {
+            return Ok(raw);
+        }
         // TypedArray / ArrayBuffer / DataView instance properties.
         if let HeapObj::TypedArray { buffer, kind, byte_offset, .. } = self.heap.get(obj.heap_index()) {
             let (buffer, kind, byte_offset) = (*buffer, *kind, *byte_offset);

@@ -441,6 +441,7 @@ impl<'p> Vm<'p> {
                     // string key, and no element answers it.
                     canonical_index_str(key).is_some_and(|i| i < items.len() && !items[i].is_hole())
                     || self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
+                    || self.regexp_result_prop(obj.heap_index(), key).is_some()
             }
             HeapObj::Str(s) => {
                 key == "length" || canonical_index_str(key).is_some_and(|i| i < s.units())
@@ -577,6 +578,7 @@ impl<'p> Vm<'p> {
                         .get(&obj.heap_index())
                         .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
                         .unwrap_or(false)
+                    || self.regexp_result_prop(obj.heap_index(), key).is_some()
             }
             // A TypedArray: a canonical in-bounds integer index is an own enumerable
             // element; a non-canonical defineProperty'd key lives in arr_props.

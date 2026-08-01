@@ -30,6 +30,11 @@ impl<'p> Vm<'p> {
         // A namespace with a still-uninitialized export throws from the per-key
         // [[GetOwnProperty]] walk (Object.keys/values/entries + for-in).
         self.ns_tdz_check_all(obj)?;
+        if obj.is_heap() {
+            // Enumeration exposes the compact match-result names and their
+            // insertion order; use the ordinary side-table implementation.
+            self.materialize_regexp_result_props(obj.heap_index());
+        }
         // A Proxy enumerates via its ownKeys trap, keeping the STRING keys whose
         // [[GetOwnProperty]] (the gopd trap) reports enumerable.
         if let Some(keys) = self.proxy_own_keys(obj)? {

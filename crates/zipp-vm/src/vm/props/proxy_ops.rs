@@ -158,6 +158,7 @@ impl<'p> Vm<'p> {
                     return Ok(Some(b)); // nested proxy target
                 }
                 let ti = target.heap_index();
+                self.materialize_regexp_result_props(ti);
                 if matches!(self.heap.get(ti), HeapObj::Object(_)) {
                     if let HeapObj::Object(m) = self.heap.get_mut(ti) {
                         m.extensible = false;

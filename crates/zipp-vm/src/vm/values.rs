@@ -208,6 +208,9 @@ impl<'p> Vm<'p> {
                 if self.arr_props.get(&idx).map_or(false, |m| m.pos(k).is_some()) {
                     return true;
                 }
+                if self.regexp_result_prop(idx, &k).is_some() {
+                    return true;
+                }
                 // Inherited: the actual [[Prototype]] (custom via setPrototypeOf),
                 // else Array.prototype (push/map/…) then Object.prototype.
                 let proto = match self.proto_of.get(&idx) {
@@ -961,7 +964,9 @@ impl<'p> Vm<'p> {
                         &kbuf
                     }
                 };
-                k == "length" || self.arr_props.get(&idx).map_or(false, |m| m.pos(k).is_some())
+                k == "length"
+                    || self.arr_props.get(&idx).map_or(false, |m| m.pos(k).is_some())
+                    || self.regexp_result_prop(idx, k).is_some()
             };
             if own {
                 return Ok(true);

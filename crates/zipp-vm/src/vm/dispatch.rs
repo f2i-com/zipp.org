@@ -6972,6 +6972,7 @@ impl<'p> Vm<'p> {
             concat: jit_concat as usize,
             str_append: jit_str_append as usize,
             call_method_ic: jit_call_method_ic as usize,
+            has_own_call: crate::vm::helpers_misc::jit_has_own_call as usize,
             call_ic: jit_call_ic as usize,
             get_prop_slow: jit_get_prop_slow as usize,
             set_prop_slow: jit_set_prop_slow as usize,

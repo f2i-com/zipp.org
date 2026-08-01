@@ -257,6 +257,21 @@ pub(crate) struct RegexpLastLazy {
     pub ranges: [Option<(u32, u32)>; 13],
 }
 
+/// The standard named properties of a pristine RegExp match-result Array.
+///
+/// Keeping these four values in a fixed record avoids three owned key strings
+/// and the `ObjMap`'s three per-object vectors on every successful
+/// `exec`/`matchAll` step. `values[3] == undefined` means the optional `indices`
+/// property is absent (under `/d` its value is always an Array, so that sentinel
+/// is unambiguous). Reads and presence checks use this record directly;
+/// mutation, reflection, and integrity operations materialise ordinary
+/// writable/enumerable/configurable data properties into `arr_props` first.
+#[derive(Clone, Copy)]
+pub(crate) struct RegexpResultProps {
+    /// `index`, `input`, `groups`, and optional `indices`, in creation order.
+    pub values: [Value; 4],
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
@@ -593,6 +608,11 @@ pub struct Vm<'p> {
     /// **79% of it survives when only the table insert is removed** — the cost was
     /// the container, not the properties. See the `slot_table` module note.
     arr_props: crate::slot_table::SlotTable<ObjMap>,
+    /// Compact pristine `RegExpBuiltinExec` result metadata. This is disjoint
+    /// from `arr_props`: the first operation that can change descriptors, key
+    /// order, or extensibility moves the record there. Its Values are GC roots
+    /// while the owning Array is live, just like an `arr_props` entry's values.
+    regexp_result_props: crate::slot_table::SlotTable<RegexpResultProps>,
     /// Resizable ArrayBuffers: heap idx → maxByteLength. Presence marks a buffer
     /// as resizable (a side table avoids changing the ArrayBuffer heap variant).
     ab_max: std::collections::HashMap<u32, usize>,
