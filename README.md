@@ -183,37 +183,57 @@ for reasons that have nothing to do with the engine. If an existing clone has it
 on: `git config core.autocrlf false && git rm --cached -r -q . && git reset
 --hard`.
 
-**Performance — cold geomean 1.79× zipp/node (95% CI 1.77×–1.80×)** on the
-ten programs in `bench/real/`, 21 counterbalanced paired observations, every
-output byte-identical to Node:
+**Performance — cold geomean 1.80× zipp/node (95% CI 1.79×–1.81×)** on the
+ten programs in `bench/real/`, 21 counterbalanced paired observations against
+Node v24.12.0, every output byte-identical to Node:
 
 | bench | node | zipp | paired ratio |
 |---|---|---|---|
-| map-set-heavy | 972ms | 764ms | **0.78×** |
-| class-prototype-hot | 303ms | 391ms | 1.29× |
-| json-large | 304ms | 485ms | 1.59× |
-| sparse-array | 83ms | 137ms | 1.65× |
-| markdown-render | 300ms | 495ms | 1.66× |
-| async-promise-chain | 363ms | 644ms | 1.76× |
-| polymorphic-objects | 336ms | 623ms | 1.87× |
-| parse-large-js | 289ms | 617ms | 2.17× |
-| typedarray-math | 208ms | 655ms | 3.12× |
-| regex-log-scan | 486ms | 1681ms | 3.40× |
+| map-set-heavy | 858ms | 678ms | **0.79×** |
+| class-prototype-hot | 291ms | 377ms | 1.30× |
+| json-large | 276ms | 449ms | 1.60× |
+| async-promise-chain | 339ms | 566ms | 1.68× |
+| sparse-array | 79ms | 131ms | 1.68× |
+| markdown-render | 269ms | 456ms | 1.70× |
+| polymorphic-objects | 323ms | 598ms | 1.86× |
+| parse-large-js | 270ms | 604ms | 2.23× |
+| typedarray-math | 203ms | 633ms | 3.13× |
+| regex-log-scan | 452ms | 1593ms | 3.53× |
 
-Cold total is the primary metric. Zipp starts about 4× faster than Node (8.5ms
-vs 31.5ms — no snapshot to load), and is now *faster than Node* on
-`map-set-heavy` by 22%.
+Cold total is the primary metric. Zipp starts about 3.6× faster than Node (7.9ms
+vs 28.6ms — no snapshot to load), and is *faster than Node* on `map-set-heavy`
+by 21%.
 
 The same capture also times three DIAGNOSTIC benchmarks that are deliberately
 outside the ten, because they exist to expose weaknesses the ten cannot see:
-`polymorphic-objects-v2` 3.58×, `sparse-array-v2` 4.86×, `property-ic-shapes`
-5.54×. Quoting a geomean over all thirteen gives 2.23×, which is not comparable
-to any historical figure in this file — the ten are the series.
+`polymorphic-objects-v2` 3.61×, `sparse-array-v2` 4.86×, `property-ic-shapes`
+5.53×. Their own geomean is 4.60×, and quoting a geomean over all thirteen gives
+2.24×, which is not comparable to any historical figure in this file — the ten
+are the series. The harness now computes and records both, so the split no
+longer depends on anyone remembering to pass `--benches`.
 
-This capture is `bench/head_clean_2a616f5.json`, taken from a tree
-`zipp --version --json` reports as `dirty: false`, so the numbers and the source
-identity go together. Re-measuring at a later commit gives the same
-ratios but not the same absolute milliseconds, because the box moves.
+This capture is `bench/head_clean_e839613.json` and it is the first artifact in
+this repo marked `publishable: true`. That means the harness checked, *before
+measuring*, that the engine reported a build identity, that its tree was not
+dirty, and that its commit equalled the workspace HEAD — and checked again
+afterwards that neither the binary's hash nor its reported source had changed
+mid-run. The artifact carries `workspace_source`, `engine_source_before`,
+`engine_source_after`, both binary hashes, and a sha256 of every benchmark
+program run.
+
+That check exists because the previous capture did not survive it. `README.md`
+used to cite `bench/head_clean_2a616f5.json` as taken from a tree reporting
+`dirty: false`; the artifact records `git_commit: 2a616f5…` alongside an engine
+reporting `commit: cdda4e8…, dirty: true` — the PARENT commit, from a dirty
+tree, in a file named "head_clean". A sweep of all 57 retained artifacts found
+one other disagreement and only two that were ever clean. The old numbers remain
+useful as direction and are not a measurement of any commit (`PERF_ROADMAP.md`
+B103).
+
+Re-measuring at a later commit gives similar ratios but not the same absolute
+milliseconds, because the box and the Node build both move — between these two
+captures Node itself got 6–12% faster on four rows, which moved the ratio
+without anything changing in zipp.
 
 Checking this table is worth doing rather than trusting it: between two earlier
 captures `class-prototype-hot` had silently regressed to **7.99×** and the suite
@@ -259,7 +279,7 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today (cold total) | 1.79× |
+| today (cold total) | 1.80× |
 | `regex-log-scan` at Node parity | **1.58×** |
 | `typedarray-math` at Node parity | **1.60×** |
 | **both of the two worst at Node parity** | **1.41×** |
@@ -269,7 +289,7 @@ headline does: the two worst rows going to parity is worth ~0.4 of geomean, and
 no contained fix reaches that.)
 
 The cold score being below 2× is not general parity: nine rows remain slower and
-the two worst are 3.40× and 3.12×. The contained fixes in `PERF_ROADMAP.md` are
+the two worst are 3.53× and 3.13×. The contained fixes in `PERF_ROADMAP.md` are
 safe substrate, but moving toward 1× still requires stable shape metadata, an
 optimizing CFG/SSA tier, and arena/nursery allocation rather than a stack of
 unmeasured 1–2% tweaks.

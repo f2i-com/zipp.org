@@ -40,6 +40,7 @@ are in B58.
 | **B102 B95 shipped a 19x pathology the benchmarks could not see** | **FIXED; a third sampled pin kind** | B95 admitted dense-Array `GetIndex` to the DOUBLE tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND` — **any** dense array, including one of OBJECTS. The element's dst then takes a numeric home, `live_in_regs` entry-loads it, the load sees the previous iteration's object, and the region `entry_bail`s on EVERY OSR entry, self-evicts, and displaces the memory compile that was working: **124ms -> 2349ms, 19x, running 100% interpreted**. Found from a CONTROL micro that was SLOWER than the thing it controlled for (property reads *removed*: 509ms -> 2047ms). The fix is a THIRD kind, not a narrower one — restricting to `ARR_INT_PIN_KIND` killed the pathology but cost `sparse-array-v2` **+6.2% [+0.9, +13.9]** by excluding arrays of DOUBLES, which the double tier hosts fine. `ARR_NUM_PIN_KIND` samples all-NUMBER over the same bounded 64-head/64-stride walk and sits between the two. Suite A/B vs the unsampled build, 21 pairs: **+0.64% [-1.84, +2.66]** — neutral, with `sparse-array-v2`'s regression gone. **All 13 benches stayed byte-identical and the gate was green through the whole pathology**; two of this session's three real defects (this and B97's flush bug) were invisible to the suite and both surfaced as "a number that cannot be right". `ZIPP_ARR_PIN_LOOSE=1` |
 | **B107 the inline-cache probe was written out four times** | **FACTORED, NEUTRAL; two latent hazards closed** | `GetProp`/`SetProp` in `region_mem.rs` and again in `proto_mem.rs` emitted byte-identical 8-way probes — ~140 lines of dynasm with the entry layout as literal displacements and a literal stride of 64, in four places. They did NOT stay identical: the store path's `and edx, 0x00FF_FFFF`, which masks the hop count out of `slot_nhops`, was once absent from one — a wild WRITE at `vals + nhops*2^24*8`, not a wrong read. Now one `emit_ic_probe`, plus `assert!(size_of::<IcEntry>() == JIT_IC_STRIDE)` (raising `JIT_IC_MAX_HOPS` to 6 would silently make every probe read each way from the middle of the previous one) and a corrected layout comment that was wrong on all three of stride, hop offsets and sentinel. **The dead `jmp` was not dead**: deleting the `jmp => miss` that sat immediately before `=> miss` cost `property-ic-shapes` **+1.4% [+1.1, +1.8]**; restoring it made the emitted stream byte-identical and the row returned to **+0.0% [-0.1, +0.2]**. Five bytes of probe-loop ALIGNMENT, kept and renamed `PROBE_ALIGN_PAD` — which also makes neutrality provable rather than statistical, since the JIT now emits the same bytes it did before. 8 tests drive all four probes through thrash, mid-loop shape change, freeze, delete, a PROP_VIA_IC setter and a Tier-C chain call, identical to node and to the pre-refactor binary in four modes. **Step 1 of the shape-keyed IC; step 2's real cost is that there is NO flat shape array** — a version is one instruction only because `Heap::versions` is index-parallel, while a shape lives inside `ObjMap`. Folding the metadata refresh into `bump_version` makes all 35 sites correct by construction (realloc ⇒ bump is already a soundness invariant), but a descriptor-only change alters a shape WITHOUT bumping — so a shape-keyed hit would read a stale guard. That is why WP-1A is a prerequisite |
 | **B106 the argument-`Vec` work package was mostly already done** | **LANDED, NEUTRAL AS PREDICTED** | Plan WP-1D asks for inline argument buffers on generic call paths; reading the tree first found seven of them already there — `setup_call` copies register-to-register, `try_builtin_method` gathers into `[Value; 8]`, `run_method_inline` into `[Value; 24]`, `super.m()` skips `call_value`, `f.call(...)` slices, callbacks pass stack literals, `arr.push` has its own lane — and B27 had already added `smallvec` once, measured **102 vs 100ns**, and reverted it with the dependency. What was left is `with_argv` at `eval_math`, the namespace-native-as-method arm and its JIT twin, and the bound-call concat (which allocated TWICE). **Predicted flat before measuring**: B104 had just priced an alloc/free pair at ~3ns, and `Math.imul` in a compiled region never reaches `eval_math` — `emit_math_op` emits it natively, so the Vec was on the INTERPRETED path only. Measured with B107: geomean **1.0011x [-0.19%, +0.38%]**. `TailCall` left alone: `try_tail_reuse` truncates `self.regs` before the values are written back |
+| **B109 the first capture this repo can attribute to a commit** | **headline 1.8012x [1.790, 1.812]; `publishable: true`** | `bench/head_clean_e839613.json` — engine clean, equal to workspace HEAD before AND after measurement, binary hash unchanged across the run, Node v24.12.0, 21 counterbalanced pairs, output byte-identical. Diagnostics 4.5981x, all-13 2.2361x, recorded separately by the harness rather than by hand. **The headline did not move**: 1.798x directional -> 1.801x measured. B105 took `async-promise-chain` 1.775x -> **1.68x**, worth ~-0.55% of a ten-row geomean — and Node itself got **6-12% faster on four rows** between the two captures (`map-set-heavy` 972 -> 858ms, `markdown-render` 300 -> 269, `parse-large-js` 289 -> 270, async 363 -> 339). Nothing regressed; the denominator moved, which is precisely why the Node version has to be pinned. Ten rows in a geomean means one row's factor *f* moves the headline by *f*^(1/10), so 1.80x -> 1.0x needs the PRODUCT of ten improvements to be 0.56; both worst rows at exact parity still leaves 1.41x |
 | **B108 the gate reported IDENTICAL for code it had never run** | **PROCESS BUG FIXED; one gate result retracted** | `cargo test --workspace --release` builds the LIB and the test harnesses but **not** `target/release/zipp.exe` — nothing under test depends on the CLI bin. `gate.sh` ran `cargo test` and then pointed test262 at whatever binary was on disk, which after a `git stash` cycle for a two-binary A/B was the PRE-change build. It reported `default/nojit/thr1 IDENTICAL (6)` — ~96k executions x3, all green — for code it had never executed, and B104/B105 were pushed on it. Found not by any check but by the next A/B, where two binaries differing only in an argument-buffer change reported `async-promise-chain` **-6.8%**: exactly B105's number, in a comparison where B105 was meant to be on both sides. `gate.sh` now builds first and prints `zipp --version --json`. **This is B103's bug in the correctness gate instead of the performance harness** — the harness had been taught to check its binary's provenance that morning; the gate had not |
 | **B105 a promise's two reaction vectors were two halves of one record** | **LANDED — `async-promise-chain` -6.7%, REPLICATED at -7.6%** | Every registration site supplies BOTH handlers at once with the same `dependent`/`finally`/`is_async` — `.then(f)` gives `f` plus a pass-through rejection, `await` a pair of async resumes — and there are exactly two such sites. Storing them in `fulfill: Vec<Reaction>` and `reject: Vec<Reaction>` made the single-subscriber promise (a chain link, an `await`, every `Promise.all` element) allocate **two** first buffers for two halves of one record. `Reactions::{None, One, Many}` holds it inline: **1,530,004 subscriptions, 1,530,004 inline (100.0%), 0 spilled — 3.06M allocations removed**. Row **604 -> 564ms**; headline geomean **0.9939x [0.988, 0.997]**, largest unrelated mover `sparse-array-v2` +0.8% (a row with no promise in it — the two-binary layout confound B77 documented). **Seven times B104's effect for the same order of allocations**, because the win is the OBJECTS that no longer exist (two Vec headers, 48 of a ~58-byte payload; Promise payload 64 -> 48) rather than the allocator calls B104 saved at ~3ns each. Also removes a real retention leak, inseparably: settlement used to drain only the matching vector and the GC kept tracing the other for the promise's life. Eleven ordering/selection tests + a 39-outcome differential byte-identical to node in four modes on both binaries |
 | **B104 one malloc + one free per `await`, for a buffer already in hand** | **LANDED, MECHANISM; ~1% and at the drift floor** | Resuming a suspended activation detaches its parked register window with `mem::take` (a move) and memcpys it onto the live file; re-suspending then called `Vec::split_off`, which **allocates a fresh right-sized Vec** while the detached buffer fell out of scope and was freed. Same size, every time — an activation's window is fixed by its `reg_count`. `clear` + `extend_from_slice` keeps the capacity and does the identical memcpy. One `repark_window` now serves all five suspension points (`drive_async`, `drive_async_gen` yield and await, `gen_resume`); the two INITIAL parks keep `split_off` as there is no buffer to recycle at a generator's birth. Mechanism: **1,530,000 re-parks, 100% reused, 0 grew, 26.55M values copied**. Result: `async-promise-chain` **−0.7% [−1.3, +0.2]** over 21 pairs and **−0.9% [−1.3, −0.2]** over 41 — reproducing, second interval excluding zero — but `map-set-heavy` −0.9% and `polymorphic-objects-v2` −1.0% in the same run have no `await` in them, so **it is not distinguishable from the ~1% A/A drift M0.1 measured**. Below §14's bar; landed on the mechanism like B78/B92. Prices a small-class mimalloc alloc/free pair at **~3ns**, which is why removing allocations one site at a time is not a route to parity. `ZIPP_NO_BUF_REUSE=1`, `ZIPP_ASYNCSTATS=1` |
@@ -1871,6 +1872,56 @@ because nothing native reads a shape. A shape-keyed hit would read a **stale**
 `guard_shape` and match a receiver whose layout had moved. That is why WP-1A —
 routing every descriptor and structural write through one API that owns the
 version bump — is a prerequisite and not a tidying exercise.
+
+### B109 — the first capture this repo can attribute to a commit
+
+`bench/head_clean_e839613.json`, `publishable: true`, engine
+`e8396130cb1fa4c8716a6c03537bd94229592c41` clean and equal to the workspace HEAD
+before AND after measurement, binary hash unchanged across the run, Node
+v24.12.0, 21 counterbalanced pairs, every output byte-identical.
+
+| row set | geomean | 95% CI |
+|---|---:|---|
+| **headline (the retained ten)** | **1.8012×** | [1.790, 1.812] |
+| diagnostic (three) | 4.5981× | [4.542, 4.617] |
+| all thirteen | 2.2361× | [2.222, 2.247] |
+
+| bench | node | zipp | ratio |
+|---|---:|---:|---:|
+| map-set-heavy | 858ms | 678ms | **0.79×** |
+| class-prototype-hot | 291ms | 377ms | 1.30× |
+| json-large | 276ms | 449ms | 1.60× |
+| async-promise-chain | 339ms | 566ms | **1.68×** |
+| sparse-array | 79ms | 131ms | 1.68× |
+| markdown-render | 269ms | 456ms | 1.70× |
+| polymorphic-objects | 323ms | 598ms | 1.86× |
+| parse-large-js | 270ms | 604ms | 2.23× |
+| typedarray-math | 203ms | 633ms | 3.13× |
+| regex-log-scan | 452ms | 1593ms | 3.53× |
+
+**The headline did not move, and that is the honest result.** The directional
+figure it replaces was 1.798×; this is 1.801×. B105 took
+`async-promise-chain` from 1.775× to **1.68×**, which is worth about −0.55% of a
+ten-row geomean on its own — and it was cancelled by Node itself getting **6–12%
+faster on four rows** between the two captures (`map-set-heavy` 972 → 858ms,
+`markdown-render` 300 → 269, `parse-large-js` 289 → 270, `async` 363 → 339).
+Nothing in zipp regressed to produce that; the denominator moved.
+
+Which is exactly why §2.5 says to pin the Node version and the executable hash.
+"V8 parity" measured against a moving V8 is a moving target, and this capture is
+the first one in the file that records which V8 it was measured against.
+
+**What one row is worth, concretely.** Ten rows, geometric mean: a row improving
+by factor *f* moves the headline by *f*^(1/10). B105's −5.4% on the async row is
+−0.55% of geomean. To reach 1.0× from 1.80× needs a **44% reduction**, i.e. the
+product of all ten improvements must be 0.56. Nine of ten rows going to Node
+parity leaves the geomean at the tenth's ratio^(1/10) — so there is no
+combination of contained fixes that gets there, and B101 already priced the
+finished tier programme at ~15%.
+
+The two worst rows remain `regex-log-scan` 3.53× and `typedarray-math` 3.13×,
+and taking BOTH to exact parity yields 1.41×, not 1.0×. That arithmetic has been
+in this file since §3 and every capture reconfirms it.
 
 ### B108 — the gate reported IDENTICAL for code it had never run
 
