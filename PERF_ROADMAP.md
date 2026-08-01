@@ -38,6 +38,8 @@ are in B58.
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
 | **B102 B95 shipped a 19x pathology the benchmarks could not see** | **FIXED; a third sampled pin kind** | B95 admitted dense-Array `GetIndex` to the DOUBLE tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND` — **any** dense array, including one of OBJECTS. The element's dst then takes a numeric home, `live_in_regs` entry-loads it, the load sees the previous iteration's object, and the region `entry_bail`s on EVERY OSR entry, self-evicts, and displaces the memory compile that was working: **124ms -> 2349ms, 19x, running 100% interpreted**. Found from a CONTROL micro that was SLOWER than the thing it controlled for (property reads *removed*: 509ms -> 2047ms). The fix is a THIRD kind, not a narrower one — restricting to `ARR_INT_PIN_KIND` killed the pathology but cost `sparse-array-v2` **+6.2% [+0.9, +13.9]** by excluding arrays of DOUBLES, which the double tier hosts fine. `ARR_NUM_PIN_KIND` samples all-NUMBER over the same bounded 64-head/64-stride walk and sits between the two. Suite A/B vs the unsampled build, 21 pairs: **+0.64% [-1.84, +2.66]** — neutral, with `sparse-array-v2`'s regression gone. **All 13 benches stayed byte-identical and the gate was green through the whole pathology**; two of this session's three real defects (this and B97's flush bug) were invisible to the suite and both surfaced as "a number that cannot be right". `ZIPP_ARR_PIN_LOOSE=1` |
+| **B107 the inline-cache probe was written out four times** | **FACTORED, NEUTRAL; two latent hazards closed** | `GetProp`/`SetProp` in `region_mem.rs` and again in `proto_mem.rs` emitted byte-identical 8-way probes — ~140 lines of dynasm with the entry layout as literal displacements and a literal stride of 64, in four places. They did NOT stay identical: the store path's `and edx, 0x00FF_FFFF`, which masks the hop count out of `slot_nhops`, was once absent from one — a wild WRITE at `vals + nhops*2^24*8`, not a wrong read. Now one `emit_ic_probe`, plus `assert!(size_of::<IcEntry>() == JIT_IC_STRIDE)` (raising `JIT_IC_MAX_HOPS` to 6 would silently make every probe read each way from the middle of the previous one) and a corrected layout comment that was wrong on all three of stride, hop offsets and sentinel. **The dead `jmp` was not dead**: deleting the `jmp => miss` that sat immediately before `=> miss` cost `property-ic-shapes` **+1.4% [+1.1, +1.8]**; restoring it made the emitted stream byte-identical and the row returned to **+0.0% [-0.1, +0.2]**. Five bytes of probe-loop ALIGNMENT, kept and renamed `PROBE_ALIGN_PAD` — which also makes neutrality provable rather than statistical, since the JIT now emits the same bytes it did before. 8 tests drive all four probes through thrash, mid-loop shape change, freeze, delete, a PROP_VIA_IC setter and a Tier-C chain call, identical to node and to the pre-refactor binary in four modes. **Step 1 of the shape-keyed IC; step 2's real cost is that there is NO flat shape array** — a version is one instruction only because `Heap::versions` is index-parallel, while a shape lives inside `ObjMap`. Folding the metadata refresh into `bump_version` makes all 35 sites correct by construction (realloc ⇒ bump is already a soundness invariant), but a descriptor-only change alters a shape WITHOUT bumping — so a shape-keyed hit would read a stale guard. That is why WP-1A is a prerequisite |
+| **B106 the argument-`Vec` work package was mostly already done** | **LANDED, NEUTRAL AS PREDICTED** | Plan WP-1D asks for inline argument buffers on generic call paths; reading the tree first found seven of them already there — `setup_call` copies register-to-register, `try_builtin_method` gathers into `[Value; 8]`, `run_method_inline` into `[Value; 24]`, `super.m()` skips `call_value`, `f.call(...)` slices, callbacks pass stack literals, `arr.push` has its own lane — and B27 had already added `smallvec` once, measured **102 vs 100ns**, and reverted it with the dependency. What was left is `with_argv` at `eval_math`, the namespace-native-as-method arm and its JIT twin, and the bound-call concat (which allocated TWICE). **Predicted flat before measuring**: B104 had just priced an alloc/free pair at ~3ns, and `Math.imul` in a compiled region never reaches `eval_math` — `emit_math_op` emits it natively, so the Vec was on the INTERPRETED path only. Measured with B107: geomean **1.0011x [-0.19%, +0.38%]**. `TailCall` left alone: `try_tail_reuse` truncates `self.regs` before the values are written back |
 | **B105 a promise's two reaction vectors were two halves of one record** | **LANDED — `async-promise-chain` -6.7%, REPLICATED at -7.6%** | Every registration site supplies BOTH handlers at once with the same `dependent`/`finally`/`is_async` — `.then(f)` gives `f` plus a pass-through rejection, `await` a pair of async resumes — and there are exactly two such sites. Storing them in `fulfill: Vec<Reaction>` and `reject: Vec<Reaction>` made the single-subscriber promise (a chain link, an `await`, every `Promise.all` element) allocate **two** first buffers for two halves of one record. `Reactions::{None, One, Many}` holds it inline: **1,530,004 subscriptions, 1,530,004 inline (100.0%), 0 spilled — 3.06M allocations removed**. Row **604 -> 564ms**; headline geomean **0.9939x [0.988, 0.997]**, largest unrelated mover `sparse-array-v2` +0.8% (a row with no promise in it — the two-binary layout confound B77 documented). **Seven times B104's effect for the same order of allocations**, because the win is the OBJECTS that no longer exist (two Vec headers, 48 of a ~58-byte payload; Promise payload 64 -> 48) rather than the allocator calls B104 saved at ~3ns each. Also removes a real retention leak, inseparably: settlement used to drain only the matching vector and the GC kept tracing the other for the promise's life. Eleven ordering/selection tests + a 39-outcome differential byte-identical to node in four modes on both binaries |
 | **B104 one malloc + one free per `await`, for a buffer already in hand** | **LANDED, MECHANISM; ~1% and at the drift floor** | Resuming a suspended activation detaches its parked register window with `mem::take` (a move) and memcpys it onto the live file; re-suspending then called `Vec::split_off`, which **allocates a fresh right-sized Vec** while the detached buffer fell out of scope and was freed. Same size, every time — an activation's window is fixed by its `reg_count`. `clear` + `extend_from_slice` keeps the capacity and does the identical memcpy. One `repark_window` now serves all five suspension points (`drive_async`, `drive_async_gen` yield and await, `gen_resume`); the two INITIAL parks keep `split_off` as there is no buffer to recycle at a generator's birth. Mechanism: **1,530,000 re-parks, 100% reused, 0 grew, 26.55M values copied**. Result: `async-promise-chain` **−0.7% [−1.3, +0.2]** over 21 pairs and **−0.9% [−1.3, −0.2]** over 41 — reproducing, second interval excluding zero — but `map-set-heavy` −0.9% and `polymorphic-objects-v2` −1.0% in the same run have no `await` in them, so **it is not distinguishable from the ~1% A/A drift M0.1 measured**. Below §14's bar; landed on the mechanism like B78/B92. Prices a small-class mimalloc alloc/free pair at **~3ns**, which is why removing allocations one site at a time is not a route to parity. `ZIPP_NO_BUF_REUSE=1`, `ZIPP_ASYNCSTATS=1` |
 | **B103 the harness could name a commit it never measured** | **FIXED; provenance gated BEFORE measurement** | `README.md` cites `bench/head_clean_2a616f5.json`; that artifact records `git_commit: 2a616f5` and an engine reporting `cdda4e8 + dirty:true` — the PARENT commit, from a dirty tree, in a file named "head_clean". `bench.py` collected the workspace HEAD and the binary's own build identity from two independent sources, both AFTER measurement and only under `--json`, and never compared them; a sweep of all 57 retained artifacts found a second disagreement and only **two** that were ever clean. A headline capture now fails before the first benchmark runs unless identity is present, the tree is clean, the engine's commit equals HEAD, and neither the binary hash nor the reported source changes between the probes taken before and after the run — overridable only by `--allow-dirty-engine`/`--allow-nonhead-engine`, which set `publishable:false`. An **A/B is never blocked**: it compares two builds that cannot both be HEAD, and the `--ab-env`-on-one-binary idiom reports the same source on both sides by design. Also moves the retained-ten/diagnostic-three split out of `run_real.sh` shell variables and into the harness — a default run globbed all 13 files and printed one geomean about **0.43x high**; artifacts now carry both row sets and both bootstrapped geomeans. 17 new tests (45 total) where provenance had zero |
@@ -1719,6 +1721,149 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B106 — the argument-`Vec` work package was mostly already done
+
+Plan WP-1D asks for an inline argument buffer on the generic call paths. Reading
+the tree first, as this file's §14 requires, most of it was already there:
+
+| already at HEAD | where |
+|---|---|
+| plain user calls never allocated — arguments are copied register-to-register inside the pinned `self.regs` | `setup_call` |
+| builtin methods gather into `[Value; 8]` on the stack, heap only above 8 args | `try_builtin_method` |
+| method inlining uses a `[Value; 24]` stack window | `run_method_inline` |
+| `super.m()` skips `call_value` entirely via its IC | `dispatch.rs` |
+| `f.call(…)` slices `&args[1..]` in both implementations | `builtins.rs`, `natives.rs` |
+| array/string/promise callbacks pass stack array literals | `array_ops.rs`, `string_ops.rs` |
+| `arr.push(x)` has a dedicated fast path that skips the gather | `dispatch.rs` |
+
+And the dependency question was already answered NEGATIVELY: B27 added
+`smallvec` once, measured **102ns vs 100ns — nothing**, and reverted it along
+with the dependency. So this copies the in-repo `[Value; 8]` idiom instead.
+
+What was left is `with_argv`, applied to the sites ranked by how often this suite
+reaches them: `eval_math` (one `Vec` per interpreted `Math.*`, and six of the
+thirteen rows call `Math.imul` per element), the namespace-native-as-method arm
+and its JIT twin (`Object.keys(o)` in an enumerate loop), and the bound-call
+concat, which allocated twice — `bargs.clone()` sizes exactly to the bound args,
+then `extend_from_slice` reallocates.
+
+`Vec` exists on these paths for a borrowck reason, not an oversight:
+`call_value(&mut self, …, args: &[Value])` cannot be handed
+`&self.regs[base + arg_base..]`, because that slice borrows `self` immutably
+across a `&mut self` call. A stack buffer sidesteps it; a `Vm`-owned scratch
+buffer would not, since `call_value` re-enters the interpreter and a single
+shared buffer would be clobbered by the nested call.
+
+**Predicted flat before it was measured, and it is.** B104 had just priced a
+small-class mimalloc alloc/free pair at ~3ns, and `Math.imul` inside a compiled
+region never reaches `eval_math` at all — `emit_math_op` emits it natively, so
+the remaining `Vec` is on the INTERPRETED path only. Measured with B107 in one
+A/B, since neither change is expected to move anything: geomean **1.0011x [-0.19%, +0.38%]**,
+largest mover `json-large` +1.3% [-0.3, +1.9], every interval spanning zero.
+
+Kept for the reason it was written: it removes work on paths that are hot in
+no-JIT and warm-up execution, it costs nothing, and `TailCall`'s unconditional
+gather was deliberately left alone — `try_tail_reuse` truncates `self.regs`
+before the values are written back, which is a rooting hazard a stack buffer
+would need its own argument to clear.
+
+### B107 — the inline-cache probe was written out four times
+
+`GetProp` and `SetProp` each emitted their own 8-way probe in `region_mem.rs`,
+and the same two again in `proto_mem.rs`. Comment-stripped, the four `dynasm`
+streams are byte-identical: ~140 lines of assembly with the entry layout written
+out as literal displacements (`+0`, `+8`, `+16`, `+20`, `+24`) and a literal
+stride of 64, in four places, guarded by no static assertion.
+
+They did not stay identical. The store path's `and edx, 0x00FF_FFFF` — which
+masks the hop count out of `slot_nhops` before indexing — was once **absent** from
+one of them. An unmasked hop count on the read path is a wrong value; on the
+store path it is a write to `vals + nhops*2^24*8`. That is a wild write, and it
+was fixed one file at a time, with a comment in each explaining why the other one
+needed it too.
+
+`emit_ic_probe(ops, IcProbe::Get { dst } | IcProbe::Set { val }, obj, ic_off,
+cont)` is now the only place the layout appears. On a hit it reads or writes
+`vals_ptr[slot]` call-free and jumps to `cont`; when all eight ways miss it falls
+through with `rax` still holding the receiver bits, which is what each caller's
+miss-helper sequence passes in `rdx`. The only structural difference between the
+two kinds — `Get` walks the guarded proto-chain hops, `Set` does not, because the
+miss helper only ever fills OWN ways for a store — is now one `if` instead of two
+divergent copies.
+
+Two latent hazards closed with it:
+
+```rust
+const _: () = assert!(std::mem::size_of::<IcEntry>() == JIT_IC_STRIDE);
+```
+
+Raising `JIT_IC_MAX_HOPS` from 5 to 6 makes `size_of::<IcEntry>()` 72 while
+`JIT_IC_STRIDE` stays 64, and every probe then reads each way's fields from the
+middle of the previous one — silently, with no type error anywhere in the tree.
+One line, checked at compile time, and absent until now.
+
+The region `GetProp` arm also carried a layout note describing a **superseded**
+entry: "stride 40, hops at +24/+32, `u32::MAX` = none". The stride is 64, there
+are five hop pairs spanning +24..+64, and the count lives in `slot_nhops >> 24`.
+All three details were wrong, and the comment sat directly above the code that
+indexes by them. `proto_mem.rs` did not repeat the error, which is itself the
+argument for one emitter.
+
+**The dead `jmp` was not dead.** Both `GetProp` probes emitted a `jmp => miss`
+immediately before `=> miss` — a jump to the following instruction, reachable
+only by falling into it, and the obvious thing to delete while factoring.
+Deleting it cost `property-ic-shapes` **+1.4% [+1.1, +1.8]** over 21 pairs.
+Putting it back made the emitted stream byte-identical to the old build's and the
+row returned to **+0.0% [−0.1, +0.2]** over 31.
+
+Nothing else in this change touches a byte of emitted code, so that 1.4% is
+entirely the ALIGNMENT of the 8-way probe loop — the hottest loop there is in an
+IC-bound workload. Five bytes. It is kept, renamed to what it actually is
+(`PROBE_ALIGN_PAD`), with the measurement beside it.
+
+That also makes the neutrality claim provable rather than statistical: with the
+pad in, the JIT emits the same bytes it did before, so any residual difference
+between the two builds can only come from the Rust binary's own layout — the
+fat-LTO confound B77 documented — and not from the probe.
+
+**No behaviour change is the claim, so it is measured.** `tests/ic_probe_shared.rs`
+drives all four probes through the states that must invalidate a cached way: own
+get/set in a hot region, chain reads at depths 1–3 plus an accessor, seventeen
+same-shape receivers against eight ways (the thrash path), a key added mid-loop,
+a frozen receiver (strict store throws 50,000 times and the slot keeps its
+value), a deleted key shifting slots, a prototype setter routing through
+PROP_VIA_IC and frame-calling user code, and a chain method call that compiles as
+a whole function so `proto_mem.rs`'s copies are the ones under test. Every result
+is identical to node and to the pre-refactor binary under default, `ZIPP_NOJIT=1`,
+`ZIPP_JIT_THRESHOLD=1` and `ZIPP_GC_STRESS=1`.
+
+This is step 1 of the native shape-keyed IC. Step 2 is where the real cost sits,
+and it is not where the plan for it assumed: **there is no flat shape array.**
+The emitter reads a version in one instruction (`mov edx, [r13 + rcx*4]`) only
+because `Heap::versions` is a `Vec<u32>` parallel to `objs` with a stable base.
+An object's shape lives inside its `ObjMap`, reachable only through
+`heap.objs[idx]` — a `Vec<HeapObj>` of 80-byte enums with no guaranteed internal
+layout. A native shape guard therefore needs a new index-parallel array *and its
+maintenance*, which is the actual content of the `ObjMeta` work.
+
+The maintenance is smaller than it looks, and the reason is worth recording. A
+shape-keyed way needs the live `vals_ptr` of whatever receiver matched — it
+cannot bake one, since the whole point is that many receivers share the shape.
+`vals_ptr` changes exactly when `vals` reallocates, and **"vals reallocated" is
+already the thing `bump_version` announces** — the existing IC bakes a
+`vals_ptr` and validates it with the version, so "realloc ⇒ version bump" is an
+invariant the engine already depends on for soundness. Folding the metadata
+refresh into `bump_version` itself makes all 35 call sites correct by
+construction rather than by audit.
+
+What does NOT hold is the shape half: a descriptor-only change (`set_attr_at`,
+which has no callers, and the direct `attrs` writes that bypass it) alters an
+object's shape without necessarily bumping its version. Today that is harmless,
+because nothing native reads a shape. A shape-keyed hit would read a **stale**
+`guard_shape` and match a receiver whose layout had moved. That is why WP-1A —
+routing every descriptor and structural write through one API that owns the
+version bump — is a prerequisite and not a tidying exercise.
 
 ### B105 — a promise's two reaction vectors were two halves of one record
 

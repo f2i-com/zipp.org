@@ -16,8 +16,11 @@ impl<'p> Vm<'p> {
         // Snapshot the argument registers FIRST (a ToNumber coercion below may run a
         // user valueOf that re-enters the VM and pushes registers), then delegate to
         // the shared value-form evaluator, which ToNumber-coerces each argument.
-        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-        self.eval_math_args(op, &args)
+        //
+        // The snapshot used to be a `Vec`, allocated and freed on EVERY fused
+        // `Math.*` -- and four of the thirteen benchmark rows call `Math.imul`
+        // once per element in their mixing functions.
+        self.with_argv(base, arg_base, argc, |vm, args| vm.eval_math_args(op, args))
     }
 
     /// `Math.<op>` reduced to a single f64 result (used by the `MathSpread`

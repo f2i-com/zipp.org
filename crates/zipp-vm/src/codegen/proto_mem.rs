@@ -726,50 +726,14 @@ pub(crate) fn compile_proto_mem(
                 let off = (ic_site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
                 let packed = ((heap.func_id as u64) << 32) | name as u64;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
-                let probe = ops.new_dynamic_label();
-                let next = ops.new_dynamic_label();
-                let hit = ops.new_dynamic_label();
-                let miss = ops.new_dynamic_label();
+                // The probe owns its own internal labels (`probe`/`next`/`hit`/`hop`);
+                // only the two shared with the miss path survive here. `miss` went
+                // with them -- it was reached solely by a `jmp` to the instruction
+                // after it.
                 let via_ic = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
-                let hop = ops.new_dynamic_label();
+                emit_ic_probe(&mut ops, IcProbe::Get { dst }, obj, off, cont);
                 dynasm!(ops
-                    ; mov rax, [rbx + dreg(obj)]          // receiver bits (probe-invariant)
-                    ; lea r9, [r14 + off]                 // way 0 of this site
-                    ; mov r8d, JIT_IC_WAYS as i32
-                    ; => probe
-                    ; cmp rax, [r9]                       // identity (empty 0 never matches)
-                    ; jne => next
-                    ; mov ecx, eax                        // recv heap idx (low 32)
-                    ; mov edx, [r13 + rcx*4]              // live recv version
-                    ; cmp edx, [r9 + 16]
-                    ; jne => next
-                    ; mov ecx, [r9 + 20]
-                    ; shr ecx, 24                         // nhops (0 = own)
-                    ; test ecx, ecx
-                    ; jz => hit
-                    ; lea r10, [r9 + 24]                  // hop cursor
-                    ; => hop
-                    ; mov edx, [r10]                      // hop heap idx
-                    ; mov r11d, [r13 + rdx*4]             // live hop version
-                    ; cmp r11d, [r10 + 4]
-                    ; jne => next
-                    ; add r10, 8
-                    ; dec ecx
-                    ; jnz => hop
-                    ; => hit
-                    ; mov rcx, [r9 + 8]                   // holder vals_ptr
-                    ; mov edx, [r9 + 20]
-                    ; and edx, 0x00FF_FFFF                // slot (low 24)
-                    ; mov rax, [rcx + rdx*8]              // vals[slot] (CALL-FREE)
-                    ; mov [rbx + dreg(dst)], rax
-                    ; jmp => cont
-                    ; => next
-                    ; add r9, JIT_IC_STRIDE as i32
-                    ; dec r8d
-                    ; jnz => probe
-                    ; jmp => miss
-                    ; => miss
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits (rax survives the probe)
                     ; mov r8d, ic_site as i32             // site_idx
@@ -818,33 +782,9 @@ pub(crate) fn compile_proto_mem(
                 let off = (ic_site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
                 let packed = ((heap.func_id as u64) << 32) | name as u64;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
-                let probe = ops.new_dynamic_label();
-                let next = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
+                emit_ic_probe(&mut ops, IcProbe::Set { val }, obj, off, cont);
                 dynasm!(ops
-                    ; mov rax, [rbx + dreg(obj)]          // receiver bits
-                    ; lea r9, [r14 + off]
-                    ; mov r8d, JIT_IC_WAYS as i32
-                    ; => probe
-                    ; cmp rax, [r9]                       // identity
-                    ; jne => next
-                    ; mov ecx, eax                        // recv heap idx
-                    ; mov edx, [r13 + rcx*4]              // live recv version
-                    ; cmp edx, [r9 + 16]
-                    ; jne => next
-                    ; mov rcx, [r9 + 8]                   // vals_ptr
-                    // Mask the hop count out of `slot_nhops` before indexing —
-                    // see the region arm: an unmasked hop count would make this
-                    // a wild STORE, not merely a wrong read.
-                    ; mov edx, [r9 + 20]
-                    ; and edx, 0x00FF_FFFF                // slot (low 24)
-                    ; mov r10, [rbx + dreg(val)]          // val_bits
-                    ; mov [rcx + rdx*8], r10              // vals[slot] = val (CALL-FREE)
-                    ; jmp => cont
-                    ; => next
-                    ; add r9, JIT_IC_STRIDE as i32
-                    ; dec r8d
-                    ; jnz => probe
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits
                     ; mov r8, [rbx + dreg(val)]           // val_bits

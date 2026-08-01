@@ -254,6 +254,40 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// Gather `argc` argument registers and hand them to `f` as a slice, without
+    /// a heap allocation for the common small call.
+    ///
+    /// `call_value(&mut self, ..., args: &[Value])` cannot be passed
+    /// `&self.regs[base + arg_base..]` directly -- that slice borrows `self`
+    /// immutably across a `&mut self` call -- which is why every generic arm
+    /// materialised a `Vec` first. A stack buffer sidesteps the borrow for the
+    /// same reason `try_builtin_method`'s does, with no `Vm`-owned scratch to be
+    /// clobbered by re-entry (`call_value` re-enters the interpreter).
+    ///
+    /// Rooting is unchanged: a local `Vec` was never a GC root either, and in
+    /// every arm the values remain live in the caller's register window.
+    #[inline]
+    pub(crate) fn with_argv<R>(
+        &mut self,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+        f: impl FnOnce(&mut Self, &[Value]) -> R,
+    ) -> R {
+        const INLINE_ARGS: usize = 8;
+        let n = argc as usize;
+        if n <= INLINE_ARGS {
+            let mut buf = [Value::UNDEFINED; INLINE_ARGS];
+            for (i, slot) in buf[..n].iter_mut().enumerate() {
+                *slot = self.get(base, arg_base + i as u16);
+            }
+            f(self, &buf[..n])
+        } else {
+            let buf: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+            f(self, &buf)
+        }
+    }
+
     pub(crate) fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         // An [[IsHTMLDDA]] exotic (`document.all`) is callable: its [[Call]] returns
         // null when called with NO arguments or a first argument that is the empty
@@ -364,7 +398,8 @@ impl<'p> Vm<'p> {
         if callee.is_heap() {
             if let HeapObj::Bound { target, this: bthis, args: bargs } = self.heap.get(callee.heap_index()) {
                 let (t, th) = (*target, *bthis);
-                let mut all = bargs.clone();
+                let mut all = Vec::with_capacity(bargs.len() + args.len());
+                all.extend_from_slice(bargs);
                 all.extend_from_slice(args);
                 return self.call_value(t, th, &all);
             }

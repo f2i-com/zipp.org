@@ -407,9 +407,10 @@ impl<'p> Vm<'p> {
                             if f.is_heap()
                                 && matches!(self.heap.get(f.heap_index()), HeapObj::Native(_))
                             {
-                                let argv: Vec<Value> =
-                                    (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                                return match self.call_value(f, recv, &argv) {
+                                let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                    vm.call_value(f, recv, argv)
+                                });
+                                return match called {
                                     Ok(v) => v.bits(),
                                     Err(t) => self.jit_thrown_to_sentinel(t),
                                 };

@@ -380,6 +380,133 @@ pub(crate) fn emit_dcmp(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, d
 /// helper ran grows `ic_table`). rbx (register file) and r12 (globals) are
 /// pinned to capacity for the VM's lifetime and never need re-deriving.
 /// Clobbers only volatile registers — emit AFTER storing the helper's result.
+/// What a hit does with the cached slot, and where it gets the value.
+#[derive(Clone, Copy)]
+pub(crate) enum IcProbe {
+    /// `dst = recv.name` — walks the guarded proto-chain hops, because a read
+    /// may resolve on a prototype.
+    Get { dst: u16 },
+    /// `recv.name = val` — no hop walk: the miss helper only ever fills OWN ways
+    /// for a store (`IcEntry::own`), since identity plus the receiver's version
+    /// fully guard an own writable data slot.
+    Set { val: u16 },
+}
+
+/// Emit the 8-way inline-cache probe for one `GetProp`/`SetProp` site.
+///
+/// On a full match this reads or writes `vals_ptr[slot]` with **no call** and
+/// jumps to `cont`. When all eight ways miss it FALLS THROUGH with `rax` still
+/// holding the receiver bits, which is what every caller's miss-helper sequence
+/// passes in `rdx`.
+///
+/// Registers: `r14` = IC table base and `r13` = the heap's parallel version
+/// array base, both pinned for the whole native run; `rbx` = the caller's
+/// register window. The probe clobbers `rax` (hit only), `rcx`, `rdx`, `r8d`,
+/// `r9`, `r10` and `r11d`.
+///
+/// SAFETY (`[r13 + idx*4]` is in bounds): the receiver's version is read only
+/// after the identity compare matched a FILLED way, whose `obj_bits` the miss
+/// helper validated as a live heap Object — so `heap_idx < versions.len()`,
+/// which never shrinks. Hop indices were likewise valid heap indices at fill
+/// time. Staleness is harmless for the loads and is caught by the version
+/// compares before any `vals` dereference.
+///
+/// This existed four times — `GetProp` and `SetProp` in `region_mem.rs`, and the
+/// same two again in `proto_mem.rs` — as byte-identical dynasm with the entry
+/// layout written out as literal displacements. They did not stay identical: the
+/// store path's `and edx, 0x00FF_FFFF`, which masks the hop count out of
+/// `slot_nhops`, was once absent from one of them, and an unmasked count there
+/// is a store at `vals + nhops*2^24*8`. A wild write, not a wrong read.
+pub(crate) fn emit_ic_probe(
+    ops: &mut dynasmrt::x64::Assembler,
+    probe_kind: IcProbe,
+    obj: u16,
+    ic_off: i32,
+    cont: dynasmrt::DynamicLabel,
+) {
+    let probe = ops.new_dynamic_label();
+    let next = ops.new_dynamic_label();
+    let hit = ops.new_dynamic_label();
+    let hop = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(obj)]          // receiver bits (probe-invariant)
+        ; lea r9, [r14 + ic_off]              // way 0 of this site
+        ; mov r8d, JIT_IC_WAYS as i32
+        ; => probe
+        ; cmp rax, [r9]                       // identity (empty 0 never matches)
+        ; jne => next
+        ; mov ecx, eax                        // recv heap idx (low 32)
+        ; mov edx, [r13 + rcx*4]              // live recv version
+        ; cmp edx, [r9 + 16]
+        ; jne => next
+    );
+    if matches!(probe_kind, IcProbe::Get { .. }) {
+        dynasm!(ops
+            ; mov ecx, [r9 + 20]
+            ; shr ecx, 24                     // nhops (0 = own)
+            ; test ecx, ecx
+            ; jz => hit
+            ; lea r10, [r9 + 24]              // hop cursor
+            ; => hop
+            ; mov edx, [r10]                  // hop heap idx
+            ; mov r11d, [r13 + rdx*4]         // live hop version
+            ; cmp r11d, [r10 + 4]
+            ; jne => next
+            ; add r10, 8
+            ; dec ecx
+            ; jnz => hop
+        );
+    }
+    dynasm!(ops
+        ; => hit
+        ; mov rcx, [r9 + 8]                   // holder vals_ptr
+        // `slot_nhops` packs the slot in the low 24 bits and the hop count above
+        // it, so masking is part of READING a slot at all.
+        ; mov edx, [r9 + 20]
+        ; and edx, 0x00FF_FFFF                // slot (low 24)
+    );
+    match probe_kind {
+        IcProbe::Get { dst } => dynasm!(ops
+            ; mov rax, [rcx + rdx*8]          // vals[slot] (CALL-FREE)
+            ; mov [rbx + dreg(dst)], rax
+        ),
+        IcProbe::Set { val } => dynasm!(ops
+            ; mov r10, [rbx + dreg(val)]      // val_bits
+            ; mov [rcx + rdx*8], r10          // vals[slot] = val (CALL-FREE)
+        ),
+    }
+    dynasm!(ops
+        ; jmp => cont
+        ; => next
+        ; add r9, JIT_IC_STRIDE as i32
+        ; dec r8d
+        ; jnz => probe
+        // Falls through with rax = receiver bits, for the caller's miss helper.
+    );
+    if PROBE_ALIGN_PAD && matches!(probe_kind, IcProbe::Get { .. }) {
+        // Five bytes of ALIGNMENT PADDING, and it is not free to drop.
+        //
+        // The pre-refactor GetProp probes both emitted a `jmp => miss`
+        // immediately before `=> miss` — a jump to the following instruction,
+        // plainly dead, and the obvious thing to delete while factoring. Doing
+        // that cost `property-ic-shapes` **+1.4% [+1.1, +1.8]** over 21 pairs.
+        // Putting it back made the emitted stream byte-identical to the old
+        // build's and the row returned to **+0.0% [−0.1, +0.2]** over 31.
+        //
+        // Nothing else in the refactor changes a byte of emitted code, so that
+        // 1.4% is entirely the alignment of the 8-way probe loop — the hottest
+        // loop in an IC-bound workload. Kept deliberately, with the measurement,
+        // rather than removed as dead code.
+        let after = ops.new_dynamic_label();
+        dynasm!(ops ; jmp => after ; => after);
+    }
+}
+
+/// See `emit_ic_probe`: five bytes that make the probe loop's alignment match
+/// the pre-refactor build. `false` removes them and costs `property-ic-shapes`
+/// 1.4%.
+const PROBE_ALIGN_PAD: bool = true;
+
 pub(crate) fn emit_refetch_pinned(
     ops: &mut dynasmrt::x64::Assembler,
     versions_base: usize,

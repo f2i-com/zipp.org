@@ -5613,9 +5613,10 @@ impl<'p> Vm<'p> {
                                     | HeapObj::Proxy { .. }
                             ) || (self.fn_proto != 0 && prop.heap_index() == self.fn_proto))
                         {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let r = self.call_value(prop, recv, &argv)?;
+                            let r = self
+                                .with_argv(base, arg_base, argc, |vm, argv| {
+                                    vm.call_value(prop, recv, argv)
+                                })?;
                             self.set(base, dst, r);
                             ip += 1;
                             continue;

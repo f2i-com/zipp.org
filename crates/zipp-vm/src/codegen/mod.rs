@@ -781,6 +781,17 @@ pub struct IcEntry {
     pub hops: [(u32, u32); JIT_IC_MAX_HOPS],
 }
 
+/// The emitter walks ways with `add r9, JIT_IC_STRIDE` and reads fields at
+/// literal displacements, so the constant and the struct MUST agree. Raising
+/// `JIT_IC_MAX_HOPS` from 5 to 6 makes `size_of` 72 while `JIT_IC_STRIDE` stays
+/// 64, and every probe then reads a way's fields from the middle of the previous
+/// one -- silently, with no type error anywhere. One line, checked at compile
+/// time.
+const _: () = assert!(
+    std::mem::size_of::<IcEntry>() == JIT_IC_STRIDE,
+    "IcEntry layout and JIT_IC_STRIDE disagree; the emitted probes index by the constant"
+);
+
 impl IcEntry {
     /// An OWN-property way (receiver == holder; no hop guards). `None` if the
     /// slot doesn't fit the 24-bit packing (never in practice).
