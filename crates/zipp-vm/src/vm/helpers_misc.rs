@@ -1108,6 +1108,92 @@ pub(crate) extern "win64" fn jit_str_append(
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// `ZIPP_ICSTATS=1` — what a native SHAPE-keyed inline-cache way would be worth,
+/// measured before one is emitted.
+///
+/// Every count here is taken inside the miss helper, so it is one native property
+/// access that already paid eight failed 64-byte-strided compares and an
+/// `extern "win64"` call. `shape_known` is the subset where `jit_shape_slot`
+/// already knew the slot from the receiver's LAYOUT — exactly the accesses an
+/// emitted shape way would serve with no call. `shape_new` is a layout this site
+/// had not seen (a shape way would have missed too, and filled). `dict` and
+/// `not_object` can never be shape-guarded at all.
+///
+/// Off, one relaxed atomic load per miss, on a path that already made a call.
+mod icstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static GET_MISS: AtomicU64 = AtomicU64::new(0);
+    static GET_SHAPE_KNOWN: AtomicU64 = AtomicU64::new(0);
+    static GET_SHAPE_NEW: AtomicU64 = AtomicU64::new(0);
+    static GET_DICT: AtomicU64 = AtomicU64::new(0);
+    static SET_MISS: AtomicU64 = AtomicU64::new(0);
+    static SET_GUARDABLE: AtomicU64 = AtomicU64::new(0);
+    static SET_DICT: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    /// One `GetProp` miss. `known` means the `(site, shape)` memo already had the
+    /// slot; `guardable` means the receiver had a non-DICT shape at all.
+    #[inline]
+    pub(super) fn get_miss(guardable: bool, known: bool) {
+        if !enabled() {
+            return;
+        }
+        GET_MISS.fetch_add(1, Ordering::Relaxed);
+        if !guardable {
+            GET_DICT.fetch_add(1, Ordering::Relaxed);
+        } else if known {
+            GET_SHAPE_KNOWN.fetch_add(1, Ordering::Relaxed);
+        } else {
+            GET_SHAPE_NEW.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One `SetProp` miss. There is no memo on the store side (B72 refuted it),
+    /// so this only separates guardable receivers from dictionary ones.
+    #[inline]
+    pub(super) fn set_miss(guardable: bool) {
+        if !enabled() {
+            return;
+        }
+        SET_MISS.fetch_add(1, Ordering::Relaxed);
+        if guardable {
+            SET_GUARDABLE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SET_DICT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(get_miss, get_shape_known, get_shape_new, get_dict, set_miss,
+    /// set_guardable, set_dict)`
+    pub fn dump() -> (u64, u64, u64, u64, u64, u64, u64) {
+        (
+            GET_MISS.load(Ordering::Relaxed),
+            GET_SHAPE_KNOWN.load(Ordering::Relaxed),
+            GET_SHAPE_NEW.load(Ordering::Relaxed),
+            GET_DICT.load(Ordering::Relaxed),
+            SET_MISS.load(Ordering::Relaxed),
+            SET_GUARDABLE.load(Ordering::Relaxed),
+            SET_DICT.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub use icstats::dump as ic_stats;
+
 pub(crate) extern "win64" fn jit_get_prop_miss(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
@@ -1150,6 +1236,13 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     // re-scans the key list to rediscover the same slot.
     if let HeapObj::Object(map) = vm.heap.get(idx) {
         let sh = map.shape();
+        if icstats::enabled() {
+            let guardable = sh != crate::shape::DICT;
+            icstats::get_miss(
+                guardable,
+                guardable && vm.jit_shape_slot.contains_key(&(site_idx, sh)),
+            );
+        }
         if sh != crate::shape::DICT {
             if let Some(&slot) = vm.jit_shape_slot.get(&(site_idx, sh)) {
                 let s = slot as usize;
@@ -1475,6 +1568,10 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         || !vm.ic_obj_ok(idx)
     {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if icstats::enabled() {
+        let guardable = matches!(vm.heap.get(idx), HeapObj::Object(m) if m.shape_guardable());
+        icstats::set_miss(guardable);
     }
     // Pre-checks against a shared borrow (the write below re-borrows mutably).
     let own = match vm.heap.get(idx) {

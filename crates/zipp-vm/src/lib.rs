@@ -66,6 +66,16 @@ pub fn async_stats() -> (u64, u64, u64, u64, u64, u64) {
     vm::async_stats()
 }
 
+/// `ZIPP_ICSTATS=1` native property-cache miss breakdown:
+/// `(get_miss, get_shape_known, get_shape_new, get_dict, set_miss, set_guardable,
+/// set_dict)`. Every count is one native access that already paid eight failed
+/// way compares and a helper call; `get_shape_known` is the subset an emitted
+/// SHAPE-keyed way would have served call-free. Zeroed unless the variable was
+/// set.
+pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
+    vm::ic_stats()
+}
+
 /// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,
 /// most-called first. Empty unless the variable was set. See
 /// `vm::builtins::bstats` for why this exists rather than a reading of

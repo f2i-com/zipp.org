@@ -63,6 +63,18 @@ fn main() -> ExitCode {
             "[async] {subs} promise subscriptions  {subs_in} inline ({spct:.1}%)  {subs_sp} spilled to a Vec"
         );
     }
+    if std::env::var_os("ZIPP_ICSTATS").is_some() {
+        let (gm, gk, gn, gd, sm, sg, sd) = zipp_vm::ic_stats();
+        let pct = |x: u64, t: u64| if t == 0 { 0.0 } else { x as f64 * 100.0 / t as f64 };
+        eprintln!(
+            "[ic] GetProp misses {gm}  shape-known {gk} ({:.1}%)  shape-new {gn} ({:.1}%)  dict {gd} ({:.1}%)",
+            pct(gk, gm), pct(gn, gm), pct(gd, gm)
+        );
+        eprintln!(
+            "[ic] SetProp misses {sm}  guardable {sg} ({:.1}%)  dict {sd} ({:.1}%)",
+            pct(sg, sm), pct(sd, sm)
+        );
+    }
     if bstats {
         let rows = zipp_vm::builtin_stats();
         let total: u64 = rows.iter().map(|(_, _, c)| *c).sum();

@@ -1433,6 +1433,7 @@ pub(crate) mod helpers_num2;
 mod gc;
 pub(crate) use gc::gc_stats;
 pub(crate) use async_runtime::async_stats;
+pub(crate) use helpers_misc::ic_stats;
 pub(crate) mod prof;
 pub(crate) use prof::dump as prof_stats;
 mod ic;
