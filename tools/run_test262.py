@@ -300,6 +300,35 @@ def run_one(args, get_harness, job):
         except OSError: pass
     return (verdict, sig, job)
 
+def report_engine_identity(zipp):
+    """Print WHICH BUILD is about to be conformance-tested, before any test runs.
+
+    `cargo test --workspace --release` builds the library and the test harnesses
+    but NOT `target/release/zipp.exe` -- nothing under test depends on the CLI
+    binary. A gate script that runs `cargo test` and then calls this runner
+    therefore tests whatever binary is on disk, which after a `git stash`/rebuild
+    cycle is the wrong one. That happened on 2026-08-01: three modes, ~96,000
+    executions each, all reported IDENTICAL, for a build that did not contain the
+    change being gated (PERF_ROADMAP B108).
+
+    Nothing here can prevent that -- only building first can. But a run that
+    names its engine's commit and dirty flag makes the mistake visible in the log
+    instead of invisible in a green result.
+    """
+    try:
+        out = subprocess.run([zipp, "--version", "--json"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=10).stdout
+        import json as _json
+        d = _json.loads(out.decode("utf-8", "replace"))
+        print(f"engine: {d.get('source', '?')}  rustc {d.get('rustc', '?')}  "
+              f"jit={d.get('jit')}  profile={d.get('profile')}", flush=True)
+        if d.get("dirty"):
+            print("engine: tree is DIRTY -- the commit above is the parent it was "
+                  "built on, not the code that runs", flush=True)
+    except Exception as exc:
+        print(f"engine: could not read {zipp} --version --json ({exc})", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--t262", required=True)
@@ -315,6 +344,7 @@ def main():
     ap.add_argument("--no-staging", action="store_true",
                     help="skip test/staging (INTERPRETING.md says it should be run; this opts out)")
     a = ap.parse_args()
+    report_engine_identity(a.zipp)
     root = os.path.join(a.t262, a.sub)
     files = []
     for dp, _, fns in os.walk(root):
