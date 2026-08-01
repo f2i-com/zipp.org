@@ -55,12 +55,14 @@ pub fn gc_stats() -> (u64, f64, f64, f64, f64, u64, u64, u64) {
     vm::gc_stats()
 }
 
-/// `ZIPP_ASYNCSTATS=1` activation-window re-park counters:
-/// `(reparks, reused, grew, values_copied)`. A re-park is one suspension of an
-/// async function, async generator or generator; `reused` is the ones that fit
-/// in the buffer the resume detached, which is what WP-1B bought. Zeroed unless
-/// the variable was set.
-pub fn async_stats() -> (u64, u64, u64, u64) {
+/// `ZIPP_ASYNCSTATS=1` async-path counters:
+/// `(reparks, reused, grew, values_copied, subs_inline, subs_spilled)`. A re-park
+/// is one suspension of an async function, async generator or generator, and
+/// `reused` is the ones that fit in the buffer the resume detached (B104). A
+/// `sub` is one promise subscription, and `subs_inline` is the ones held in
+/// `Reactions::One` with no allocation at all (B105). Zeroed unless the variable
+/// was set.
+pub fn async_stats() -> (u64, u64, u64, u64, u64, u64) {
     vm::async_stats()
 }
 

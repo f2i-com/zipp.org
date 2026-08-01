@@ -1343,19 +1343,122 @@ pub enum CombKind {
     AllSettledKeyed,
 }
 
-/// A registered reaction on a pending promise: when it settles, `callback` runs
-/// (as a microtask) and its outcome settles `dependent`. A `callback` of
-/// `undefined` is a pass-through (the value/reason forwards to `dependent`).
+/// One SUBSCRIPTION to a pending promise: both handlers registered together.
+///
+/// When the promise settles, the handler matching the settlement runs as a
+/// microtask and its outcome settles `dependent`. An `undefined` handler is a
+/// pass-through (the value/reason forwards to `dependent` unchanged) -- that is
+/// how the spec's Identity and Thrower defaults are represented here, so they
+/// cost nothing rather than being real function objects.
+///
+/// The two handlers are ONE record because every site that registers them does
+/// so in a pair: `.then(f)` supplies `f` and a pass-through rejection,
+/// `.catch(g)` the reverse, and `await` a pair of async resumes. They used to
+/// live in two parallel `Vec<Reaction>` on the promise, which made the common
+/// single-subscriber case allocate two buffers to store two halves of this.
 #[derive(Clone, Debug)]
-pub struct Reaction {
-    pub callback: Value,
+pub struct ReactionPair {
+    pub on_fulfilled: Value,
+    pub on_rejected: Value,
     pub dependent: u32,
-    /// A `.finally(cb)` reaction: run `callback` (no args) for its side effect,
-    /// then forward the ORIGINAL value/reason (a throw in `callback` overrides).
+    /// A `.finally(cb)` reaction: run the handler (no args) for its side effect,
+    /// then forward the ORIGINAL value/reason (a throw in it overrides).
     pub finally: bool,
-    /// An `await` reaction: `dependent` is the suspended async ACTIVATION's heap
-    /// index, resumed (value or thrown rejection) instead of running a callback.
+    /// An `await` subscription: `dependent` is the suspended async ACTIVATION's
+    /// heap index, resumed (value or thrown rejection) instead of running a
+    /// callback.
     pub is_async: bool,
+}
+
+/// A pending promise's subscriber list.
+///
+/// `One` is the case that matters and it holds the subscription INLINE, with no
+/// heap allocation: a `.then` chain link, an `await`, and every `Promise.all`
+/// element subscribe exactly once. `Many` appears only when the same promise is
+/// subscribed to more than once, and then allocates once rather than twice.
+///
+/// Insertion order is the observable part -- settlement drains in registration
+/// order onto a FIFO microtask queue, which is what fixes promise tick ordering
+/// -- so `push` appends and `One -> Many` keeps the first record first.
+#[derive(Clone, Debug, Default)]
+pub enum Reactions {
+    #[default]
+    None,
+    One(ReactionPair),
+    Many(Vec<ReactionPair>),
+}
+
+impl Reactions {
+    #[inline]
+    pub fn push(&mut self, r: ReactionPair) {
+        match self {
+            Reactions::None => *self = Reactions::One(r),
+            Reactions::One(_) => {
+                let Reactions::One(first) = std::mem::take(self) else {
+                    unreachable!("matched One")
+                };
+                *self = Reactions::Many(vec![first, r]);
+            }
+            Reactions::Many(v) => v.push(r),
+        }
+    }
+
+    /// Borrowed view for tracing. `One` is a one-element slice via
+    /// `slice::from_ref`, so the GC walks all three shapes with one loop.
+    #[inline]
+    pub fn as_slice(&self) -> &[ReactionPair] {
+        match self {
+            Reactions::None => &[],
+            Reactions::One(r) => std::slice::from_ref(r),
+            Reactions::Many(v) => v.as_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Reactions::None)
+    }
+}
+
+/// By-value drain for settlement. Deliberately NOT `into_vec()`: that would
+/// allocate a `Vec` at settle time to replace the allocations this type exists
+/// to remove, turning two allocations per subscription into one per settlement
+/// instead of none.
+pub enum ReactionsIter {
+    Done,
+    One(ReactionPair),
+    Many(std::vec::IntoIter<ReactionPair>),
+}
+
+impl Iterator for ReactionsIter {
+    type Item = ReactionPair;
+
+    #[inline]
+    fn next(&mut self) -> Option<ReactionPair> {
+        match std::mem::replace(self, ReactionsIter::Done) {
+            ReactionsIter::Done => None,
+            ReactionsIter::One(r) => Some(r),
+            ReactionsIter::Many(mut it) => {
+                let next = it.next();
+                *self = ReactionsIter::Many(it);
+                next
+            }
+        }
+    }
+}
+
+impl IntoIterator for Reactions {
+    type Item = ReactionPair;
+    type IntoIter = ReactionsIter;
+
+    #[inline]
+    fn into_iter(self) -> ReactionsIter {
+        match self {
+            Reactions::None => ReactionsIter::Done,
+            Reactions::One(r) => ReactionsIter::One(r),
+            Reactions::Many(v) => ReactionsIter::Many(v.into_iter()),
+        }
+    }
 }
 
 /// Boxed payload of a [`HeapObj::Class`] (see that variant's docs). Kept behind a
@@ -1808,14 +1911,17 @@ pub enum HeapObj {
     /// A plain object.
     Object(Box<ObjMap>),
     /// A JS Promise. `result` holds the fulfillment value / rejection reason
-    /// (undefined while Pending); `fulfill`/`reject` are reactions registered
+    /// (undefined while Pending); `reactions` are the subscriptions registered
     /// while Pending (drained as microtasks on settle). `handled` tracks whether
     /// a rejection handler was attached (for optional unhandled-rejection report).
+    ///
+    /// One list, not two: both handlers of a subscription are registered
+    /// together and settlement picks the matching one, so splitting them across
+    /// two `Vec`s bought nothing and cost two allocations per `.then`.
     Promise {
         state: PromiseState,
         result: Value,
-        fulfill: Vec<Reaction>,
-        reject: Vec<Reaction>,
+        reactions: Reactions,
         handled: bool,
     },
     /// A native `resolve`/`reject` function bound to a promise — the pair handed

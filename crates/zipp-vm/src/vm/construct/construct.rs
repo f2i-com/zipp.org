@@ -1331,8 +1331,7 @@ impl<'p> Vm<'p> {
             *self.heap.get_mut(oidx) = HeapObj::Promise {
                 state: PromiseState::Pending,
                 result: Value::UNDEFINED,
-                fulfill: Vec::new(),
-                reject: Vec::new(),
+                reactions: crate::heap::Reactions::None,
                 handled: false,
             };
             if sub_proto.is_heap() {

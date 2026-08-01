@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, Reaction,
+    PropAttr, PromiseState, ReactionPair, Reactions,
 };
 use crate::value::Value;
 use crate::vm::{cldr_en, dtf_pattern};

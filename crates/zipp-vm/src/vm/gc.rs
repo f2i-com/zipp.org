@@ -595,10 +595,11 @@ impl Vm<'_> {
                 }
             }
             HeapObj::Object(map) => m_objmap!(map),
-            HeapObj::Promise { result, fulfill, reject, .. } => {
+            HeapObj::Promise { result, reactions, .. } => {
                 m_val!(*result);
-                for r in fulfill.iter().chain(reject.iter()) {
-                    m_val!(r.callback);
+                for r in reactions.as_slice() {
+                    m_val!(r.on_fulfilled);
+                    m_val!(r.on_rejected);
                     m_idx!(r.dependent);
                 }
             }

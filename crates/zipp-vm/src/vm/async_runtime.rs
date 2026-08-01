@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, Reaction,
+    PropAttr, PromiseState, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -63,6 +63,25 @@ mod asyncstats {
         VALUES.fetch_add(want as u64, Ordering::Relaxed);
     }
 
+    static SUB_INLINE: AtomicU64 = AtomicU64::new(0);
+    static SUB_SPILLED: AtomicU64 = AtomicU64::new(0);
+
+    /// One promise SUBSCRIPTION. `inline` means it became `Reactions::One` and
+    /// allocated nothing; the old two-`Vec` layout allocated TWICE here
+    /// regardless. Counted at the two registration sites rather than inside
+    /// `Reactions::push` so `heap.rs` stays free of instrumentation.
+    #[inline]
+    pub(super) fn subscribe(inline: bool) {
+        if !enabled() {
+            return;
+        }
+        if inline {
+            SUB_INLINE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SUB_SPILLED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     static REUSE_ON: AtomicU8 = AtomicU8::new(2);
 
     /// `ZIPP_NO_BUF_REUSE=1` restores `Vec::split_off` at every suspension --
@@ -81,13 +100,15 @@ mod asyncstats {
         }
     }
 
-    /// `(reparks, reused, grew, values_copied)`
-    pub fn dump() -> (u64, u64, u64, u64) {
+    /// `(reparks, reused, grew, values_copied, subs_inline, subs_spilled)`
+    pub fn dump() -> (u64, u64, u64, u64, u64, u64) {
         (
             REPARKS.load(Ordering::Relaxed),
             REUSED.load(Ordering::Relaxed),
             GREW.load(Ordering::Relaxed),
             VALUES.load(Ordering::Relaxed),
+            SUB_INLINE.load(Ordering::Relaxed),
+            SUB_SPILLED.load(Ordering::Relaxed),
         )
     }
 }
@@ -527,8 +548,7 @@ impl<'p> Vm<'p> {
         self.heap.alloc(HeapObj::Promise {
             state: PromiseState::Pending,
             result: Value::UNDEFINED,
-            fulfill: Vec::new(),
-            reject: Vec::new(),
+            reactions: Reactions::None,
             handled: false,
         })
     }
@@ -538,17 +558,21 @@ impl<'p> Vm<'p> {
     /// matching reactions as microtasks.
     pub(crate) fn settle(&mut self, p: u32, state: PromiseState, val: Value) {
         let reactions = match self.heap.get_mut(p) {
-            HeapObj::Promise { state: s, result, fulfill, reject, .. } => {
+            HeapObj::Promise { state: s, result, reactions, .. } => {
                 if *s != PromiseState::Pending {
                     return;
                 }
                 *s = state;
                 *result = val;
-                match state {
-                    PromiseState::Fulfilled => std::mem::take(fulfill),
-                    PromiseState::Rejected => std::mem::take(reject),
-                    PromiseState::Pending => return,
+                if state == PromiseState::Pending {
+                    return;
                 }
+                // Both handlers of every subscription leave together. The two
+                // parallel Vecs used to drain only the MATCHING one, so a settled
+                // promise kept its opposite-kind reactions -- and the GC kept
+                // tracing their callbacks and dependents -- for the rest of its
+                // life. One list cannot express that, so it also goes away.
+                std::mem::take(reactions)
             }
             _ => return,
         };
@@ -569,7 +593,10 @@ impl<'p> Vm<'p> {
                     .push_back(Microtask::AsyncResume { activation: r.dependent, input });
             } else {
                 self.microtasks.push_back(Microtask::Reaction {
-                    callback: r.callback,
+                    callback: match kind {
+                        ReactionKind::Fulfill => r.on_fulfilled,
+                        ReactionKind::Reject => r.on_rejected,
+                    },
                     arg: val,
                     dependent: r.dependent,
                     kind,
@@ -790,9 +817,15 @@ impl<'p> Vm<'p> {
         };
         match state {
             PromiseState::Pending => {
-                if let HeapObj::Promise { fulfill, reject, handled, .. } = self.heap.get_mut(p) {
-                    fulfill.push(Reaction { callback: on_f, dependent: dep, finally: false, is_async: false });
-                    reject.push(Reaction { callback: on_r, dependent: dep, finally: false, is_async: false });
+                if let HeapObj::Promise { reactions, handled, .. } = self.heap.get_mut(p) {
+                    asyncstats::subscribe(reactions.is_empty());
+                    reactions.push(ReactionPair {
+                        on_fulfilled: on_f,
+                        on_rejected: on_r,
+                        dependent: dep,
+                        finally: false,
+                        is_async: false,
+                    });
                     if !on_r.is_undefined() {
                         *handled = true;
                     }
@@ -1609,15 +1642,11 @@ impl<'p> Vm<'p> {
         };
         match state {
             PromiseState::Pending => {
-                if let HeapObj::Promise { fulfill, reject, handled, .. } = self.heap.get_mut(p) {
-                    fulfill.push(Reaction {
-                        callback: Value::UNDEFINED,
-                        dependent: activation,
-                        finally: false,
-                        is_async: true,
-                    });
-                    reject.push(Reaction {
-                        callback: Value::UNDEFINED,
+                if let HeapObj::Promise { reactions, handled, .. } = self.heap.get_mut(p) {
+                    asyncstats::subscribe(reactions.is_empty());
+                    reactions.push(ReactionPair {
+                        on_fulfilled: Value::UNDEFINED,
+                        on_rejected: Value::UNDEFINED,
                         dependent: activation,
                         finally: false,
                         is_async: true,

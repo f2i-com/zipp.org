@@ -38,6 +38,7 @@ are in B58.
 | plan M7.1 RegExp fast-path protectors | **PREMISE REFUTED (B68)** | ablating `regexp_exec_fast_ok` to `true` saved ~7% of the exec/test phase (6ms of 209, 22ms of 290). The plan hedged this correctly — "after telemetry proves the fixed gate is material". It is not |
 | plan M2.4 `array_length_nonwritable` → `SlotSet` | **OPEN** | B66 identified it as the real fix for that probe. Note B68 refuted the sibling conversion, so measure before believing this one |
 | **B102 B95 shipped a 19x pathology the benchmarks could not see** | **FIXED; a third sampled pin kind** | B95 admitted dense-Array `GetIndex` to the DOUBLE tier on `is_arr_pin(k)`, which matches `ARR_PIN_KIND` — **any** dense array, including one of OBJECTS. The element's dst then takes a numeric home, `live_in_regs` entry-loads it, the load sees the previous iteration's object, and the region `entry_bail`s on EVERY OSR entry, self-evicts, and displaces the memory compile that was working: **124ms -> 2349ms, 19x, running 100% interpreted**. Found from a CONTROL micro that was SLOWER than the thing it controlled for (property reads *removed*: 509ms -> 2047ms). The fix is a THIRD kind, not a narrower one — restricting to `ARR_INT_PIN_KIND` killed the pathology but cost `sparse-array-v2` **+6.2% [+0.9, +13.9]** by excluding arrays of DOUBLES, which the double tier hosts fine. `ARR_NUM_PIN_KIND` samples all-NUMBER over the same bounded 64-head/64-stride walk and sits between the two. Suite A/B vs the unsampled build, 21 pairs: **+0.64% [-1.84, +2.66]** — neutral, with `sparse-array-v2`'s regression gone. **All 13 benches stayed byte-identical and the gate was green through the whole pathology**; two of this session's three real defects (this and B97's flush bug) were invisible to the suite and both surfaced as "a number that cannot be right". `ZIPP_ARR_PIN_LOOSE=1` |
+| **B105 a promise's two reaction vectors were two halves of one record** | **LANDED — `async-promise-chain` -6.7%, REPLICATED at -7.6%** | Every registration site supplies BOTH handlers at once with the same `dependent`/`finally`/`is_async` — `.then(f)` gives `f` plus a pass-through rejection, `await` a pair of async resumes — and there are exactly two such sites. Storing them in `fulfill: Vec<Reaction>` and `reject: Vec<Reaction>` made the single-subscriber promise (a chain link, an `await`, every `Promise.all` element) allocate **two** first buffers for two halves of one record. `Reactions::{None, One, Many}` holds it inline: **1,530,004 subscriptions, 1,530,004 inline (100.0%), 0 spilled — 3.06M allocations removed**. Row **604 -> 564ms**; headline geomean **0.9939x [0.988, 0.997]**, largest unrelated mover `sparse-array-v2` +0.8% (a row with no promise in it — the two-binary layout confound B77 documented). **Seven times B104's effect for the same order of allocations**, because the win is the OBJECTS that no longer exist (two Vec headers, 48 of a ~58-byte payload; Promise payload 64 -> 48) rather than the allocator calls B104 saved at ~3ns each. Also removes a real retention leak, inseparably: settlement used to drain only the matching vector and the GC kept tracing the other for the promise's life. Eleven ordering/selection tests + a 39-outcome differential byte-identical to node in four modes on both binaries |
 | **B104 one malloc + one free per `await`, for a buffer already in hand** | **LANDED, MECHANISM; ~1% and at the drift floor** | Resuming a suspended activation detaches its parked register window with `mem::take` (a move) and memcpys it onto the live file; re-suspending then called `Vec::split_off`, which **allocates a fresh right-sized Vec** while the detached buffer fell out of scope and was freed. Same size, every time — an activation's window is fixed by its `reg_count`. `clear` + `extend_from_slice` keeps the capacity and does the identical memcpy. One `repark_window` now serves all five suspension points (`drive_async`, `drive_async_gen` yield and await, `gen_resume`); the two INITIAL parks keep `split_off` as there is no buffer to recycle at a generator's birth. Mechanism: **1,530,000 re-parks, 100% reused, 0 grew, 26.55M values copied**. Result: `async-promise-chain` **−0.7% [−1.3, +0.2]** over 21 pairs and **−0.9% [−1.3, −0.2]** over 41 — reproducing, second interval excluding zero — but `map-set-heavy` −0.9% and `polymorphic-objects-v2` −1.0% in the same run have no `await` in them, so **it is not distinguishable from the ~1% A/A drift M0.1 measured**. Below §14's bar; landed on the mechanism like B78/B92. Prices a small-class mimalloc alloc/free pair at **~3ns**, which is why removing allocations one site at a time is not a route to parity. `ZIPP_NO_BUF_REUSE=1`, `ZIPP_ASYNCSTATS=1` |
 | **B103 the harness could name a commit it never measured** | **FIXED; provenance gated BEFORE measurement** | `README.md` cites `bench/head_clean_2a616f5.json`; that artifact records `git_commit: 2a616f5` and an engine reporting `cdda4e8 + dirty:true` — the PARENT commit, from a dirty tree, in a file named "head_clean". `bench.py` collected the workspace HEAD and the binary's own build identity from two independent sources, both AFTER measurement and only under `--json`, and never compared them; a sweep of all 57 retained artifacts found a second disagreement and only **two** that were ever clean. A headline capture now fails before the first benchmark runs unless identity is present, the tree is clean, the engine's commit equals HEAD, and neither the binary hash nor the reported source changes between the probes taken before and after the run — overridable only by `--allow-dirty-engine`/`--allow-nonhead-engine`, which set `publishable:false`. An **A/B is never blocked**: it compares two builds that cannot both be HEAD, and the `--ab-env`-on-one-binary idiom reports the same source on both sides by design. Also moves the retained-ten/diagnostic-three split out of `run_real.sh` shell variables and into the harness — a default run globbed all 13 files and printed one geomean about **0.43x high**; artifacts now carry both row sets and both bootstrapped geomeans. 17 new tests (45 total) where provenance had zero |
 | **B101 the tier programme has a ~15% CEILING** | **COSTING; B94's 3.2x does NOT transfer to real code** | Prices the FINISHED programme (heap ops hosted on the register tier) before building it. Homes in **callee-saved xmm6..15 survive helper calls**, so no spilling is needed and the earlier "spill 12 homes per call" estimate was far too pessimistic; a heap op costs only boxing its operands and unboxing its result. `7 x reads - 10 x heapops`, weighted by each row's mem share: **32 / 22 / 15 / 14 / 12 / 5 / 4%**, geomean **~15%** — **1.79x -> ~1.51x, not parity**. B94's 3.2x micro is ~100% numeric ops; real regions are 10-25% heap ops and (B99) mostly single-use temps. Parity has to attack the NUMBER and COST of heap ops instead: GetProp/SetProp are helper calls (~20-40 instrs) where an inline monomorphic access behind a shape check is 3-4 — the same order as the whole tier merge, and they compose |
@@ -1718,6 +1719,84 @@ Eighth probe refuted this session against two suite wins (B25 GC threshold, B20
 Bitwise into Tier C). The two that worked were both found by MEASURING FIRST —
 timing the GC, logging tier declines. Every probe that started from reading the
 code and reasoning about what ought to be expensive has been wrong.
+
+### B105 — a promise's two reaction vectors were two halves of one record
+
+`async-promise-chain` **604ms → 564ms, −6.7% [−7.7, −6.4]**, replicated at
+**−7.6% [−8.7, −6.9]**. The largest single-row win in this file after B80.
+
+Every site that registers a promise reaction registers BOTH handlers at once,
+with the same `dependent`, the same `finally` and the same `is_async` — they
+differed only in the callback. `.then(f)` supplies `f` and a pass-through
+rejection; `.catch(g)` the reverse; `await` a pair of async resumes. There are
+exactly two such sites (`then_internal`, `settle_subscribe`).
+
+They were stored in `fulfill: Vec<Reaction>` and `reject: Vec<Reaction>`. So the
+single-subscriber promise — a chain link, an `await`, every `Promise.all`
+element, which is nearly all of them — allocated **two** first buffers to hold
+two halves of one record:
+
+```
+[async] 1530004 promise subscriptions  1530004 inline (100.0%)  0 spilled to a Vec
+```
+
+**3,060,008 allocations removed on that row, and not one subscription needed a
+`Vec`.** `Reactions::{None, One(pair), Many(Vec<pair>)}` holds the common case
+inline.
+
+**Why this is 7% when B104's 1.53M removed allocations were ~1%.** Same row, same
+order of magnitude of allocations, seven times the effect — because these are not
+the same cost. B104 recycled a buffer that was already the right size, saving a
+malloc/free pair (~3ns). B105 removes the buffers themselves: two `Vec` headers
+(48 of the Promise payload's ~58 bytes) stop being written per promise, the
+payload drops 64 → 48 bytes, and a settled promise stops carrying two heap
+pointers the collector must trace. The win is **the objects that no longer
+exist**, not the allocator calls. That is the same distinction B81 drew when it
+found `[]` costs 24.5ns while mallocing nothing at all.
+
+**Order is the whole correctness surface**, and merging changes how it is
+represented — from structural (drain the matching vector, leave the other) to a
+field selection per pair. `promise_reaction_pairs.rs` pins the eleven ways that
+can break: the `One → Many` upgrade keeping the first registration first,
+fulfil/reject handlers registered alternately draining in registration order,
+`undefined` handlers forwarding value and reason (the spec's Identity/Thrower
+defaults are not function objects here), `finally` forwarding the original
+completion, subscribing after settlement, a reaction subscribing to its own
+promise mid-drain, `await` on both settlements, the combinators' shared
+dependent, GC over a pending pair's two closures, and a subclass promise built
+from the variant literally in `construct.rs`. A 39-outcome ordering differential
+covering the same ground plus thenables and heavy GC pressure is byte-identical
+to node under default, `ZIPP_NOJIT=1`, `ZIPP_JIT_THRESHOLD=1` and
+`ZIPP_GC_STRESS=1`, on BOTH binaries.
+
+One of those expectations was wrong when written — `finally` that throws prints
+before the two pass-through forwards, not after, because it rejects its dependent
+from inside the tick that ran it. Node prints exactly what zipp prints. The test
+now records why.
+
+**A retention leak went with it, not separably.** Settlement used to `mem::take`
+only the MATCHING vector; the opposite-kind reactions stayed on the promise for
+its whole life and `gc.rs` kept marking their callbacks and dependents. One list
+cannot express "half drained", so merging clears both. That is strictly less
+retention, and it is why this entry does not claim to be only an allocation
+change.
+
+**No suite regression.** 21 pairs, all 13 rows: headline geomean **0.9939×
+[0.988, 0.997]**. The largest unrelated movers are `sparse-array-v2` +0.8%
+[+0.3, +1.3] and `polymorphic-objects-v2` +0.6% [+0.1, +1.6], both under §14's
++2% rule and both in rows containing no promise at all — the two-binary fat-LTO
+layout confound B77 documented. `sparse-array-v2` reproduced at +0.5%
+[+0.1, +0.9] and `json-large` at +0.4% [−1.4, +1.3].
+
+Measured as a two-binary A/B because a data-layout change has no `--ab-env`
+form: keeping both representations alive to switch between would itself be the
+confound.
+
+`Reaction.finally` survives untouched and is currently DEAD — nothing in the tree
+sets it, because `Promise.prototype.finally` went generic through
+FINALLY_THEN/FINALLY_CATCH bound natives. It is kept rather than removed so this
+entry is one mechanism; a fast `.finally` lane that bypasses `then` would want it
+back.
 
 ### B104 — one malloc and one free per `await`, for a buffer already in hand
 
