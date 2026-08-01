@@ -1192,8 +1192,19 @@ mod icstats {
     }
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use icstats::dump as ic_stats;
 
+/// Without the JIT there are no inline caches, so there is nothing to miss and
+/// every counter is zero. Present in every configuration so that the public
+/// `zipp_vm::ic_stats` and the CLI's `ZIPP_ICSTATS` reporting do not have to
+/// know which tiers this build was compiled with.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0, 0)
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_get_prop_miss(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
@@ -1910,23 +1921,10 @@ pub(crate) extern "win64" fn jit_to_concat_key(vm: *mut core::ffi::c_void, v_bit
     }
 }
 
-/// Win64 helper for a region `SetIndexConcat`: the own writable DATA-slot HIT
-/// on a plain object with an Int key, mirroring `jit_get_index_concat` — the
-/// key is formatted into the reused scratch buffer (no allocation), the slot
-/// value is overwritten in place (no shape change, no version bump — exactly
-/// the interpreter's hit arm), and EVERYTHING else deopts: a NEW key (the
-/// append reallocs `vals` and bumps the version — let the interpreter do it),
-/// a non-writable/accessor slot, `__proto__`, an exotic receiver, a non-Int
-/// key. Runs no user code.
-///
-/// `packed = (func_id << 32) | name_idx`; `val` rides the stack as arg 5.
-///
-/// # Safety
-/// `vm` is a valid `*mut Vm`; all bits are valid rooted Values.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 /// `ZIPP_NO_CONCAT_APPEND=1` restores the pre-B86 behaviour: a NEW key at a
 /// JIT'd `obj["name" + i] = v` deopts instead of appending. Exists so the change
 /// is A/B-able with `--ab-env` on ONE binary and bisectable without a rebuild.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn concat_append_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -1942,6 +1940,20 @@ fn concat_append_enabled() -> bool {
     }
 }
 
+/// Win64 helper for a region `SetIndexConcat`: the own writable DATA-slot HIT
+/// on a plain object with an Int key, mirroring `jit_get_index_concat` — the
+/// key is formatted into the reused scratch buffer (no allocation), the slot
+/// value is overwritten in place (no shape change, no version bump — exactly
+/// the interpreter's hit arm), and EVERYTHING else deopts: a NEW key (the
+/// append reallocs `vals` and bumps the version — let the interpreter do it),
+/// a non-writable/accessor slot, `__proto__`, an exotic receiver, a non-Int
+/// key. Runs no user code.
+///
+/// `packed = (func_id << 32) | name_idx`; `val` rides the stack as arg 5.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; all bits are valid rooted Values.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_set_index_concat(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
