@@ -3425,7 +3425,9 @@ impl<'p> Vm<'p> {
                                                 {
                                                     continue; // dedicated helpers
                                                 }
-                                                if *argc == 2
+                                                if (*argc == 2
+                                                    || (*argc == 1
+                                                        && crate::codegen::substring1_intrinsic_enabled()))
                                                     && matches!(
                                                         key,
                                                         Some("substring") | Some("slice")

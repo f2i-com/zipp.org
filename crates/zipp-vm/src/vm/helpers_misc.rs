@@ -233,15 +233,16 @@ pub(crate) extern "win64" fn jit_str_index_of(
     }
 }
 
-/// Win64 helper for `s.substring(a, b)` / `s.slice(a, b)` inside a compiled
-/// region — the same JIT-intrinsic shape as `jit_str_index_of`. `is_slice`
+/// Win64 helper for `s.substring(a[, b])` / `s.slice(a[, b])` inside a compiled
+/// region — the same JIT-intrinsic shape as `jit_str_index_of`. `mode & 1`
 /// selects the two different clamping rules (`slice` counts a negative index
 /// from the end and yields "" when start >= end; `substring` clamps negatives to
-/// 0 and SWAPS a reversed pair).
+/// 0 and SWAPS a reversed pair); `mode & 2` means the end argument is absent and
+/// therefore defaults to the receiver length.
 ///
-/// Restricted to an ASCII flat receiver with two Int arguments, where UTF-16
-/// unit offsets are byte offsets; anything else returns the deopt sentinel and
-/// the interpreter runs the full method at that ip.
+/// Restricted to an ASCII flat receiver with one or two integral Number
+/// arguments, where UTF-16 unit offsets are byte offsets; anything else returns
+/// the deopt sentinel and the interpreter runs the full method at that ip.
 ///
 /// # Safety
 /// `vm` is the live `Vm`; the operands are raw Value bits from the reg file.
@@ -250,17 +251,14 @@ pub(crate) extern "win64" fn jit_str_substring(
     vm: *mut core::ffi::c_void,
     recv_bits: u64,
     packed_args: u64,
-    is_slice: u64,
+    mode: u64,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let r = Value::from_bits(recv_bits);
     if !r.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let (a, b) = (
-        Value::from_bits(unsafe { *(packed_args as *const u64) }),
-        Value::from_bits(unsafe { *((packed_args as *const u64).add(1)) }),
-    );
+    let a = Value::from_bits(unsafe { *(packed_args as *const u64) });
     // Int OR an exactly-integral double. Accepting only Int-tagged values was a
     // deopt storm: the memory path deliberately keeps `Mul` off its integer fast
     // path (hot integer multiplies overflow i32), so an ordinary `s.substring(0,
@@ -276,16 +274,27 @@ pub(crate) extern "win64" fn jit_str_substring(
             None
         }
     };
-    let (Some(ax), Some(bx)) = (as_i64(a), as_i64(b)) else {
+    let Some(ax) = as_i64(a) else {
         return crate::codegen::SELF_CALL_DEOPT;
+    };
+    // Do not even read args[1] for a one-argument call: the bytecode's argument
+    // window only promises `argc` initialized slots.
+    let bx = if mode & 2 != 0 {
+        None
+    } else {
+        let b = Value::from_bits(unsafe { *((packed_args as *const u64).add(1)) });
+        let Some(bx) = as_i64(b) else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        Some(bx)
     };
     vm.heap.flatten(r.heap_index());
     let len = match vm.heap.get(r.heap_index()) {
         crate::heap::HeapObj::Str(js) if js.is_ascii() => js.units() as i64,
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
-    let (mut x, mut y) = (ax, bx);
-    if is_slice != 0 {
+    let (mut x, mut y) = (ax, bx.unwrap_or(len));
+    if mode & 1 != 0 {
         // slice: negative counts from the end, then clamp; empty if start >= end.
         if x < 0 { x += len; }
         if y < 0 { y += len; }

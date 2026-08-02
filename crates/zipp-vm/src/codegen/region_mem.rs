@@ -1353,18 +1353,19 @@ pub(crate) fn compile_region_mem(
                 // helper deopts for anything but ASCII/ASCII, so the interpreter
                 // runs the full method (fromIndex forms, non-ASCII, coercible
                 // arguments, a non-string receiver) at this ip unchanged.
-                // `s.substring(a,b)` / `s.slice(a,b)` intrinsic — same shape as
-                // indexOf below. The two args are read from the contiguous arg
-                // window, so the helper takes a pointer to it rather than four
-                // register operands.
-                if argc == 2 && (key == "substring" || key == "slice") {
+                // `s.substring(a[,b])` / `s.slice(a[,b])` intrinsic — same
+                // shape as indexOf below. Args are read from the contiguous
+                // window; mode bit 1 tells the helper not to read an absent end.
+                let substring_arity_ok = argc == 2
+                    || (argc == 1 && substring1_intrinsic_enabled());
+                if substring_arity_ok && (key == "substring" || key == "slice") {
                     let bail = ops.new_dynamic_label();
-                    let is_slice = (key == "slice") as i32;
+                    let mode = (key == "slice") as i32 | (((argc == 1) as i32) << 1);
                     dynasm!(ops
                         ; mov rcx, rdi                          // vm
                         ; mov rdx, [rbx + dreg(obj)]            // receiver bits
-                        ; lea r8, [rbx + dreg(arg_base)]        // &args[0..2]
-                        ; mov r9d, is_slice
+                        ; lea r8, [rbx + dreg(arg_base)]        // &args[0..argc]
+                        ; mov r9d, mode
                         ; mov rax, QWORD heap.str_substring as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -1372,6 +1373,12 @@ pub(crate) fn compile_region_mem(
                         ; je => bail
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    // A non-empty result allocates a Heap slot, whose parallel
+                    // versions Vec may move. No user code or nested compilation
+                    // runs here, so r14 and TypedArray snapshots stay valid.
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                    }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                     continue;
                 }

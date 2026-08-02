@@ -77,6 +77,24 @@ pub const OSR_DEOPT_LIMIT: u32 = 64;
 /// shape: a short loop inside a function called many times.
 pub const DEOPT_DECAY_RUNS: u32 = 1;
 
+/// Is the one-argument `substring` / `slice` intrinsic enabled? ON by default;
+/// `ZIPP_NO_SUBSTRING1_INTRINSIC=1` restores the generic method-call path for a
+/// same-binary performance comparison. Read only while deciding which native
+/// body to compile, never on the generated hot path.
+pub(crate) fn substring1_intrinsic_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_SUBSTRING1_INTRINSIC").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Sentinel in `bail_ip` meaning the native code completed via `Return` (the
 /// result is in the returned `u64`). Any other value is the ip to resume at.
 pub const NO_BAIL: u32 = u32::MAX;
@@ -547,7 +565,8 @@ pub struct HeapHelperAddrs {
     pub upval_get: usize,
     /// Intrinsic for `s.indexOf(t)` (ASCII/ASCII, 1 arg); deopts otherwise.
     pub str_index_of: usize,
-    /// Intrinsic for `s.substring(a,b)` / `s.slice(a,b)` (ASCII, Int args).
+    /// Intrinsic for `s.substring(a[,b])` / `s.slice(a[,b])` (ASCII,
+    /// integral Number args).
     pub str_substring: usize,
     /// Intrinsic for `Map.get`/`Map.has`/`Set.has` (op selects which).
     pub coll_lookup: usize,

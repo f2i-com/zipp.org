@@ -164,7 +164,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                         | (Some("has"), 1)
                         | (Some("substring"), 2)
                         | (Some("slice"), 2)
-                );
+                ) || (argc == 1
+                    && substring1_intrinsic_enabled()
+                    && matches!(key, Some("substring") | Some("slice")));
                 if !ok {
                     reject!("[tierC-reject] CallMethod {key:?} argc={argc}");
                 }
@@ -821,19 +823,22 @@ pub(crate) fn compile_proto_mem(
             Instr::CallMethod { dst, obj, name, arg_base, argc } => {
                 // The intrinsic set (mem_can_compile gated) — the region path's
                 // dedicated pure win64 helpers, minus its pin fast paths (Tier C
-                // has no pins). Every helper here: receiver + arg bits in,
-                // result bits out, deopt sentinel → bail; none runs user code,
-                // and none moves the versions array (`push` grows the array's
-                // own Vec) → no re-fetch anywhere in this arm.
+                // has no pins). Every helper here takes receiver + arg bits and
+                // returns result bits or the deopt sentinel; none runs user code.
+                // substring/slice does allocate its result and therefore
+                // re-fetches the versions pointer explicitly below.
                 let key = proto.string_constants[name as usize].as_str();
-                if argc == 2 {
-                    // substring/slice: two args read from the contiguous window.
-                    let is_slice = (key == "slice") as i32;
+                let substring_arity_ok = argc == 2
+                    || (argc == 1 && substring1_intrinsic_enabled());
+                if substring_arity_ok && matches!(key, "substring" | "slice") {
+                    // substring/slice: args read from the contiguous window;
+                    // mode bit 1 tells the helper the end argument is absent.
+                    let mode = (key == "slice") as i32 | (((argc == 1) as i32) << 1);
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
-                        ; lea r8, [rbx + dreg(arg_base)]      // &args[0..2]
-                        ; mov r9d, is_slice
+                        ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                        ; mov r9d, mode
                         ; mov rax, QWORD heap.str_substring as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -841,6 +846,12 @@ pub(crate) fn compile_proto_mem(
                         ; je => bail
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    // The result allocation can move the heap versions Vec.
+                    // This helper cannot run user code or compile nested code,
+                    // so only r13 (not r14) needs re-deriving.
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                    }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 } else if matches!(key, "get" | "has") {
                     // Map.get / Map.has / Set.has — the region arm verbatim:
