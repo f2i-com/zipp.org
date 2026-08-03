@@ -183,7 +183,7 @@ for reasons that have nothing to do with the engine. If an existing clone has it
 on: `git config core.autocrlf false && git rm --cached -r -q . && git reset
 --hard`.
 
-**Performance — cold geomean 1.34× zipp/node (95% CI 1.33×–1.35×)** on the
+**Performance — cold geomean 1.33× zipp/node (95% CI 1.32×–1.34×)** on the
 ten programs in `bench/real/`, 21 counterbalanced paired observations against
 Node v24.12.0, every output byte-identical to Node. The measured binary is the
 profile-guided release build (`bash tools/pgo.sh` — adopted after PGO measured
@@ -191,30 +191,31 @@ profile-guided release build (`bash tools/pgo.sh` — adopted after PGO measured
 
 | bench | node | zipp | paired ratio |
 |---|---|---|---|
-| map-set-heavy | 975ms | 637ms | **0.64×** |
-| async-promise-chain | 353ms | 355ms | **1.00×** |
-| json-large | 308ms | 381ms | 1.24× |
-| class-prototype-hot | 306ms | 381ms | 1.24× |
-| sparse-array | 85ms | 112ms | 1.31× |
-| markdown-render | 291ms | 389ms | 1.34× |
-| polymorphic-objects | 335ms | 470ms | 1.40× |
-| parse-large-js | 285ms | 462ms | 1.63× |
-| typedarray-math | 211ms | 407ms | 1.92× |
-| regex-log-scan | 485ms | 1169ms | 2.42× |
+| map-set-heavy | 697ms | 516ms | **0.74×** |
+| async-promise-chain | 339ms | 343ms | **1.01×** |
+| markdown-render | 273ms | 296ms | 1.08× |
+| json-large | 274ms | 321ms | 1.18× |
+| class-prototype-hot | 295ms | 384ms | 1.30× |
+| sparse-array | 79ms | 108ms | 1.38× |
+| polymorphic-objects | 330ms | 458ms | 1.39× |
+| parse-large-js | 271ms | 452ms | 1.66× |
+| typedarray-math | 201ms | 401ms | 1.99× |
+| regex-log-scan | 471ms | 1043ms | 2.20× |
 
-Cold total is the primary metric. Zipp starts about 3.3× faster than Node
-(10.1ms vs 33.0ms — no snapshot to load), is *faster than Node* on
-`map-set-heavy` by 36%, and `async-promise-chain` is at parity.
+Cold total is the primary metric. Zipp starts about 3.4× faster than Node
+(8.8ms vs 29.8ms — no snapshot to load), is *faster than Node* on
+`map-set-heavy` by 26%, `async-promise-chain` is at parity, and
+`markdown-render` is within 8%.
 
 The same capture also times three DIAGNOSTIC benchmarks that are deliberately
 outside the ten, because they exist to expose weaknesses the ten cannot see:
-`polymorphic-objects-v2` 2.51×, `sparse-array-v2` 3.58×, `property-ic-shapes`
-3.81×. Their own geomean is 3.25×, and quoting a geomean over all thirteen gives
+`polymorphic-objects-v2` 2.57×, `sparse-array-v2` 3.62×, `property-ic-shapes`
+3.86×. Their own geomean is 3.30×, and quoting a geomean over all thirteen gives
 1.64×, which is not comparable to any historical figure in this file — the ten
 are the series. The harness now computes and records both, so the split no
 longer depends on anyone remembering to pass `--benches`.
 
-This capture is `bench/head_clean_3e23064_pgo.json`, marked `publishable: true`
+This capture is `bench/head_clean_c88444f_pgo.json`, marked `publishable: true`
 like its predecessors (`bench/head_clean_e839613.json` was the first artifact
 to earn that flag). The flag means the harness checked, *before
 measuring*, that the engine reported a build identity, that its tree was not
@@ -282,9 +283,9 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today (cold total) | 1.34× |
-| `regex-log-scan` at Node parity | **1.22×** |
-| `typedarray-math` at Node parity | **1.25×** |
+| today (cold total) | 1.33× |
+| `regex-log-scan` at Node parity | **1.23×** |
+| `typedarray-math` at Node parity | **1.24×** |
 | **both of the two worst at Node parity** | **1.15×** |
 
 (The *shape* of this arithmetic is what matters and it does not move as the
@@ -292,7 +293,7 @@ headline does: the two worst rows going to parity is worth ~0.2 of geomean, and
 no contained fix reaches that.)
 
 The cold score being below 1.35× is not general parity: eight rows remain slower
-and the two worst are 2.42× and 1.92×. The contained fixes in `PERF_ROADMAP.md` are
+and the two worst are 2.20× and 1.99×. The contained fixes in `PERF_ROADMAP.md` are
 safe substrate, but moving toward 1× still requires stable shape metadata, an
 optimizing CFG/SSA tier, and arena/nursery allocation rather than a stack of
 unmeasured 1–2% tweaks.
