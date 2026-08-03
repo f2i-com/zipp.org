@@ -38,6 +38,11 @@ pub(crate) fn compile_region_mem(
     ta_plan: &TaPinPlan,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
+    // Per-site accessor-arm emission flags (the SITE GATE — indexed by the
+    // local site number, `ic_site - heap.ic_base_idx`); built by
+    // `Jit::register_ic_sites` from the ops that have actually filled an
+    // accessor way. `ZIPP_ACC_ALWAYS_EMIT=1` sets every flag (wave-2's shape).
+    acc_emit: &[bool],
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end, Some(const_strs)) {
@@ -878,10 +883,16 @@ pub(crate) fn compile_region_mem(
                 let cont = ops.new_dynamic_label();
                 // B114: the ACCESSOR way. `Some` gives the probe a dispatch
                 // target for a tagged way hit (the helper call emitted after
-                // the via_ic block); `None` (`ZIPP_NO_ACCESSOR_WAY=1`, which
-                // also disables the fills) emits the prior stream
-                // byte-identically.
-                let acc = accessor_way_enabled().then(|| ops.new_dynamic_label());
+                // the via_ic block); `None` emits the prior stream
+                // byte-identically. SITE-GATED (the B115 follow-up): only a
+                // site whose op has actually filled an accessor way pays the
+                // arms — `acc_emit` carries the per-site decision, and the
+                // fill helper (`Jit::acc_way_fill_ok`) refuses to tag a way
+                // under an arm-less probe (it evicts for a recompile instead).
+                let acc = acc_emit
+                    .get((ic_site - heap.ic_base_idx) as usize)
+                    .is_some_and(|&b| b)
+                    .then(|| ops.new_dynamic_label());
                 // Stage 5: inline a trivial class GETTER for this `o.v` site as a
                 // per-receiver guard tree (a pure prefix). A hit writes `dst` and
                 // jumps to `cont`; all-miss falls through to the IC probe below
@@ -975,7 +986,11 @@ pub(crate) fn compile_region_mem(
                 let cont = ops.new_dynamic_label();
                 // B114: as in the GetProp arm — `Some` adds the accessor-way
                 // dispatch target, `None` keeps the prior byte stream.
-                let acc = accessor_way_enabled().then(|| ops.new_dynamic_label());
+                // SITE-GATED as in the GetProp arm above.
+                let acc = acc_emit
+                    .get((ic_site - heap.ic_base_idx) as usize)
+                    .is_some_and(|&b| b)
+                    .then(|| ops.new_dynamic_label());
                 // Stage 5: inline a trivial class SETTER for this `o.v = x` site as
                 // a per-receiver guard tree (a pure prefix). A hit does the baked
                 // store and jumps to `cont`; all-miss falls through to the IC probe

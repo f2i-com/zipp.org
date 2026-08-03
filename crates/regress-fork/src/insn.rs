@@ -77,6 +77,12 @@ pub enum Insn {
         min_iters: usize,
         max_iters: usize,
         greedy: bool,
+        /// PATCH (see VENDORED.md and possessify.rs): true when the loop's
+        /// character class is provably disjoint from the continuation's
+        /// first-set (or the continuation is Goal), so backtracking into the
+        /// loop can never help and the executor may skip pushing the
+        /// GreedyLoop1Char backtrack entry.
+        possessive: bool,
     },
 
     /// Set the IP to a new value.
@@ -231,4 +237,10 @@ pub struct CompiledRegex {
 
     // Flags controlling matching.
     pub flags: api::Flags,
+
+    // PATCH (see VENDORED.md and possessify.rs): when the pattern's first
+    // consuming atom is a possessive, greedy, unbounded one-char loop, this
+    // is its instruction index. A failed match attempt then proves the whole
+    // maximal run matchless, and the search may resume after it.
+    pub skip_hint_ip: Option<u32>,
 }

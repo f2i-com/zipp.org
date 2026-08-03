@@ -1194,6 +1194,12 @@ pub struct Vm<'p> {
     /// pristine); validated per call by version compares, re-resolved by the
     /// full proof on any guard mismatch.
     promise_pristine_slots: Option<async_runtime::PromisePristineSlots>,
+    /// The prototype/constructor half of `regexp_matchall_fast_ok` resolved
+    /// to slot indices plus the versions guarding them (see
+    /// [`proxy_regexp::MatchallFastSlots`]). `None` until first proven
+    /// pristine (and whenever last proven NOT pristine); validated per call
+    /// by version compares, re-resolved by the full gate on any mismatch.
+    matchall_fast_slots: Option<proxy_regexp::MatchallFastSlots>,
     /// `$262.createRealm()` realm registry. `realms[r]` maps a MAIN-realm intrinsic
     /// prototype heap index to realm `r`'s corresponding prototype (realm 0 = the
     /// main realm, an empty map). `obj_realm` tags a heap index (a realm's
@@ -1458,6 +1464,7 @@ mod helpers_json;
 pub(crate) mod helpers_num2;
 mod gc;
 pub(crate) use gc::gc_stats;
+pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) mod prof;

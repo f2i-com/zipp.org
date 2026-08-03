@@ -55,6 +55,16 @@ pub fn gc_stats() -> (u64, f64, f64, f64, f64, u64, u64, u64) {
     vm::gc_stats()
 }
 
+/// `ZIPP_RXSTATS=1` RegExp match-result representation counters:
+/// `(compact_constructions, materialized)` — how many successful capturing
+/// exec results were built in the compact pristine record and how many were
+/// later materialised into an ordinary `arr_props` `ObjMap` (mutation,
+/// reflection, or `ZIPP_NO_MATCH_VARIANT=1`, which materialises all of them).
+/// Zeroed unless the variable was set.
+pub fn regexp_result_stats() -> (u64, u64) {
+    vm::regexp_result_stats()
+}
+
 /// `ZIPP_ASYNCSTATS=1` async-path counters:
 /// `(reparks, reused, grew, values_copied, subs_inline, subs_spilled)`. A re-park
 /// is one suspension of an async function, async generator or generator, and
@@ -85,6 +95,15 @@ pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
 /// `string_ops.rs`.
 pub fn builtin_stats() -> Vec<(&'static str, String, u64)> {
     vm::builtin_stats()
+}
+
+/// `ZIPP_RXSTATS=1` regex classical-backtrack counters:
+/// `(attempts, greedy 1-char backtrack pushes, retry iterations,
+///   possessive pushes elided, failed-run skips)` — the mechanism evidence
+/// for the auto-possessify pass (`ZIPP_NO_RX_POSSESS=1` turns it off; see
+/// regress-fork's possessify.rs).
+pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
+    regress::rx_stats()
 }
 
 /// Whether this build actually has the native codegen tiers, i.e. the `jit`

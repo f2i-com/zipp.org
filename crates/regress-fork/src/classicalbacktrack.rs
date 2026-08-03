@@ -20,6 +20,69 @@ use crate::util::DebugCheckIndex;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+/// PATCH (see VENDORED.md): `ZIPP_RXSTATS=1` mechanism counters for the
+/// possessify pass — how many match attempts ran, how many GreedyLoop1Char
+/// backtrack entries were pushed vs elided as possessive, how many retry
+/// iterations the pushed entries cost, and how many failed-run skips fired.
+#[cfg(feature = "std")]
+pub(crate) mod rxstats {
+    use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+    pub static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    pub static GREEDY1_PUSHES: AtomicU64 = AtomicU64::new(0);
+    pub static GREEDY1_RETRIES: AtomicU64 = AtomicU64::new(0);
+    pub static POSSESSIVE_ELIDED: AtomicU64 = AtomicU64::new(0);
+    pub static SKIPS: AtomicU64 = AtomicU64::new(0);
+
+    /// Cached read of `ZIPP_RXSTATS`.
+    #[inline(always)]
+    pub fn enabled() -> bool {
+        // 0 = unread; 1 = off; 2 = on.
+        static CACHE: AtomicU8 = AtomicU8::new(0);
+        match CACHE.load(Ordering::Relaxed) {
+            0 => {
+                let v = std::env::var_os("ZIPP_RXSTATS").is_some() as u8;
+                CACHE.store(v + 1, Ordering::Relaxed);
+                v == 1
+            }
+            v => v == 2,
+        }
+    }
+
+    #[inline(always)]
+    pub fn bump(c: &AtomicU64) {
+        if enabled() {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `ZIPP_RXSTATS=1` counters: (attempts, greedy 1-char backtrack pushes,
+/// retry iterations, possessive pushes elided, failed-run skips).
+#[cfg(feature = "std")]
+pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        rxstats::ATTEMPTS.load(Relaxed),
+        rxstats::GREEDY1_PUSHES.load(Relaxed),
+        rxstats::GREEDY1_RETRIES.load(Relaxed),
+        rxstats::POSSESSIVE_ELIDED.load(Relaxed),
+        rxstats::SKIPS.load(Relaxed),
+    )
+}
+
+/// No-op counter bump for no_std builds.
+#[cfg(not(feature = "std"))]
+macro_rules! rxstat {
+    ($name:ident) => {};
+}
+#[cfg(feature = "std")]
+macro_rules! rxstat {
+    ($name:ident) => {
+        rxstats::bump(&rxstats::$name)
+    };
+}
+
 #[derive(Clone, Debug)]
 enum BacktrackInsn<Input: InputIndexer> {
     /// Nothing more to backtrack.
@@ -73,6 +136,11 @@ pub(crate) struct MatchAttempter<'a, Input: InputIndexer> {
     re: &'a CompiledRegex,
     bts: Vec<BacktrackInsn<Input>>,
     s: State<Input::Position>,
+    // PATCH (see possessify.rs): end of the maximal run consumed by the
+    // pattern's first-atom possessive unbounded loop during the current
+    // attempt. When the attempt fails, no match starts inside that run, so
+    // the search may resume here instead of at start+1.
+    skip_hint: Option<Input::Position>,
 }
 
 impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
@@ -84,6 +152,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                 loops: vec![LoopData::new(entry); re.loops as usize],
                 groups: vec![GroupData::new(); re.groups as usize],
             },
+            skip_hint: None,
         }
     }
 
@@ -394,6 +463,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         max: usize,
         ip: IP,
         greedy: bool,
+        possessive: bool,
     ) -> Option<IP> {
         // For non-greedy loops, we can avoid computing the maximum match eagerly.
         // We'll only compute it when we need to set up backtracking.
@@ -426,9 +496,26 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         // Oh no where is the continuation? It's one past the loop body, which is one
         // past the loop. Strap in!
         let continuation = ip + 2;
+        // PATCH (see possessify.rs): a possessive greedy loop's backtrack
+        // entry is provably dead — every retry re-tests a disjoint follow at
+        // a position holding a loop-class character — so skip the push. If
+        // this loop is also the pattern's first atom and unbounded, record
+        // the run end: a failed attempt then proves no match starts inside
+        // the run (the Phase 2 argument), letting the search skip it.
+        if greedy && possessive {
+            if min_pos != max_pos {
+                rxstat!(POSSESSIVE_ELIDED);
+            }
+            if Dir::FORWARD && self.re.skip_hint_ip == Some(ip as u32) {
+                self.skip_hint = Some(max_pos);
+            }
+            *pos = max_pos;
+            return Some(continuation);
+        }
         if min_pos != max_pos {
             // Backtracking is possible.
             let bti = if greedy {
+                rxstat!(GREEDY1_PUSHES);
                 BacktrackInsn::GreedyLoop1Char {
                     continuation,
                     min: min_pos,
@@ -595,6 +682,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         rs_unreachable!("Should always be able to advance since min != max")
                     }
                     *ip = *continuation;
+                    rxstat!(GREEDY1_RETRIES);
                     return true;
                 }
 
@@ -986,10 +1074,11 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         min_iters,
                         max_iters,
                         greedy,
+                        possessive,
                     } => {
-                        if let Some(next_ip) = self
-                            .run_scm_loop(input, dir, &mut pos, min_iters, max_iters, ip, greedy)
-                        {
+                        if let Some(next_ip) = self.run_scm_loop(
+                            input, dir, &mut pos, min_iters, max_iters, ip, greedy, possessive,
+                        ) {
                             ip = next_ip;
                             continue 'nextinsn;
                         } else {
@@ -1077,6 +1166,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
     ) -> Option<Match> {
         let inp = self.input;
         // For anchored regexes, only try matching at the current position
+        rxstat!(ATTEMPTS);
         if let Some(end) = self.matcher.try_at_pos(inp, 0, pos, Forward::new()) {
             // If we matched the empty string, we have to increment.
             if end != pos {
@@ -1107,6 +1197,10 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             if Input::CODE_UNITS_ARE_BYTES {
                 pos = inp.find_bytes(pos, prefix_search)?;
             }
+            // PATCH (see possessify.rs): a fresh attempt must not observe a
+            // hint recorded by an earlier one.
+            self.matcher.skip_hint = None;
+            rxstat!(ATTEMPTS);
             if let Some(end) = self.matcher.try_at_pos(inp, 0, pos, Forward::new()) {
                 // If we matched the empty string, we have to increment.
                 if end != pos {
@@ -1117,7 +1211,16 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                 return Some(self.successful_match(pos, end));
             }
             // Didn't find it at this position, try the next one.
+            // PATCH (see possessify.rs): if the failed attempt proved a whole
+            // run matchless, resume after the run instead.
+            let hint = self.matcher.skip_hint.take();
             pos = inp.next_right_pos(pos)?;
+            if let Some(h) = hint {
+                if h > pos {
+                    rxstat!(SKIPS);
+                    pos = h;
+                }
+            }
         }
     }
 }

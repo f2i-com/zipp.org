@@ -7,6 +7,61 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// The prototype/constructor half of `regexp_matchall_fast_ok`, resolved to
+/// SLOT INDICES (B68 item 2). The full gate re-found `flags`/`exec`/
+/// `constructor`/`@@match` on the ~20-key %RegExp.prototype% plus `@@species`
+/// on %RegExp% with hashed `pos()` scans on EVERY `matchAll()` call; the
+/// slots cannot move without a version bump, so once resolved the warm
+/// re-proof is version compares plus direct slot reads. (The five instance
+/// probes stay uncached — in the pristine case they short-circuit behind a
+/// single `arr_props` miss.)
+///
+/// Guarded exactly like [`super::async_runtime::PromisePristineSlots`]: the
+/// heap's index-parallel `versions` array proves the slot indices still name
+/// their keys (key add/delete, `defineProperty`, `Heap::replace` and GC slot
+/// reuse all bump). What a version does NOT guard — a plain in-place
+/// `vals[i] = v` data write bumps nothing (B67/B110) — is never trusted from
+/// the cache: the accessor bit and the value identity at each slot are
+/// re-read on every call, with each pinned native's own version standing in
+/// for a `heap.get` (only `Heap::replace`/GC reuse can change a `Native`,
+/// and both bump). On any mismatch the full gate re-runs and re-resolves:
+/// conservative fallback, never a wrong answer.
+#[derive(Clone, Copy)]
+pub(crate) struct MatchallFastSlots {
+    /// `heap.versions[regexp_proto]` / `heap.versions[regexp_ctor]` at fill.
+    proto_version: u32,
+    ctor_version: u32,
+    /// `(slot, value heap index, value version)` for the four pinned
+    /// intrinsics: `flags` (accessor) / `exec` / `@@match` on the prototype,
+    /// `@@species` (accessor) on %RegExp%.
+    flags: (u32, u32, u32),
+    exec: (u32, u32, u32),
+    matchsym: (u32, u32, u32),
+    species: (u32, u32, u32),
+    /// `constructor`'s slot — its target is the `regexp_ctor` anchor itself,
+    /// re-compared by identity per call, so nothing else needs pinning.
+    ctor_slot: u32,
+}
+
+/// `ZIPP_NO_FASTOK_MEMO=1` makes `regexp_matchall_fast_ok_cached` run the
+/// original nine-probe gate on every call, bypassing the slot memo entirely —
+/// the rollback switch and one side of a one-binary A/B (`tools/bench.py
+/// --ab-env`). Same idiom as `ZIPP_NO_PROMISE_SLOT_CACHE`.
+#[inline]
+fn fastok_memo_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_FASTOK_MEMO").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// `new Proxy(target, handler)` — both must be objects.
     pub(crate) fn make_proxy(&mut self, target: Value, handler: Value) -> Result<Value, Thrown> {
@@ -228,6 +283,141 @@ impl<'p> Vm<'p> {
             }),
             _ => false,
         }
+    }
+
+    /// `regexp_matchall_fast_ok` answered from the resolved slots when they
+    /// are warm (version compares + slot reads — see [`MatchallFastSlots`]);
+    /// a cold or invalidated memo re-runs the prototype/constructor half of
+    /// the full gate once and re-resolves. The instance half (proto identity,
+    /// own-shadow probes, the ctor anchor) is instance-specific and cheap, so
+    /// it runs uncached per call, read-for-read the gate's opening.
+    pub(crate) fn regexp_matchall_fast_ok_cached(&mut self, re: u32) -> bool {
+        if !fastok_memo_enabled() {
+            return self.regexp_matchall_fast_ok(re);
+        }
+        match self.proto_of.get(&re) {
+            None => {}
+            Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
+            _ => return false,
+        }
+        if self.arr_props.get(&re).is_some_and(|m| {
+            m.pos("flags").is_some()
+                || m.pos("constructor").is_some()
+                || m.pos("exec").is_some()
+                || m.pos("@@matchAll").is_some()
+                || m.pos("@@match").is_some()
+        }) {
+            return false;
+        }
+        if self.regexp_ctor == 0 {
+            return false;
+        }
+        if self.matchall_fast_from_slots() {
+            return true;
+        }
+        // Cold memo, or a guarded version moved: run the shared half of the
+        // full gate and capture the slots for the next call. `None` (not
+        // pristine) leaves every call on the full re-proof — exactly the
+        // pre-memo behavior, and those calls take the observable protocol
+        // anyway.
+        let slots = self.matchall_fast_resolve_slots();
+        self.matchall_fast_slots = slots;
+        slots.is_some()
+    }
+
+    /// Answer the shared pristine question from the resolved slots: `true`
+    /// only when every guard holds. Any mismatch — a moved version, a slot no
+    /// longer naming its key, an in-place overwrite, a flipped accessor bit —
+    /// declines to the full re-proof rather than reasoning about it (unlike
+    /// the promise cache there is no fast `false` here: a DIFFERENT value in
+    /// a slot could still be an equivalent intrinsic identity).
+    #[inline]
+    fn matchall_fast_from_slots(&self) -> bool {
+        let Some(c) = self.matchall_fast_slots else { return false };
+        if self.heap.version_of(self.regexp_proto) != c.proto_version
+            || self.heap.version_of(self.regexp_ctor) != c.ctor_version
+        {
+            return false;
+        }
+        // Belt-and-braces key checks as in the promise cache: the versions
+        // say the layout is unchanged; verify the slots still name their keys
+        // anyway, so an un-bumped structural change could only ever cost a
+        // re-proof, never a wrong answer.
+        let pinned = |m: &ObjMap, key: &str, accessor: bool, (slot, idx, ver): (u32, u32, u32)| {
+            let s = slot as usize;
+            m.keys.get(s).is_some_and(|k| k == key)
+                && m.attrs[s].accessor == accessor
+                && m.vals[s].is_heap()
+                && m.vals[s].heap_index() == idx
+                // The same object, un-replaced since fill proved it the right
+                // `Native` — no `heap.get` needed.
+                && self.heap.version_of(idx) == ver
+        };
+        let m = match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => m,
+            // Unreachable under a matching version (`Heap::replace` bumps).
+            _ => return false,
+        };
+        if !(pinned(m, "flags", true, c.flags)
+            && pinned(m, "exec", false, c.exec)
+            && pinned(m, "@@match", false, c.matchsym))
+        {
+            return false;
+        }
+        let cs = c.ctor_slot as usize;
+        if m.keys.get(cs).map_or(true, |k| k != "constructor")
+            || m.attrs[cs].accessor
+            || !m.vals[cs].is_heap()
+            || m.vals[cs].heap_index() != self.regexp_ctor
+        {
+            return false;
+        }
+        match self.heap.get(self.regexp_ctor) {
+            HeapObj::Object(mc) => pinned(mc, "@@species", true, c.species),
+            _ => false,
+        }
+    }
+
+    /// Run the shared (prototype/constructor) half of the full gate —
+    /// read-for-read the same checks as `regexp_matchall_fast_ok` past its
+    /// instance probes — and, when it holds, capture the slot indices plus
+    /// the version of every object the proof read. `Some` is "pristine, and
+    /// how to re-check it warm"; `None` is "not pristine".
+    fn matchall_fast_resolve_slots(&self) -> Option<MatchallFastSlots> {
+        let pin = |m: &ObjMap, key: &str, accessor: bool, id: u16| {
+            let i = m.pos(key)?;
+            let v = m.vals[i];
+            (m.attrs[i].accessor == accessor
+                && v.is_heap()
+                && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id))
+                .then(|| (i as u32, v.heap_index(), self.heap.version_of(v.heap_index())))
+        };
+        let m = match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => m,
+            _ => return None,
+        };
+        let flags = pin(m, "flags", true, native::REGEXP_GET_FLAGS)?;
+        let exec = pin(m, "exec", false, native::REGEXP_EXEC)?;
+        let matchsym = pin(m, "@@match", false, native::REGEXP_SYM_MATCH)?;
+        let ctor_slot = m.pos("constructor").filter(|&i| {
+            !m.attrs[i].accessor
+                && m.vals[i].is_heap()
+                && m.vals[i].heap_index() == self.regexp_ctor
+        })? as u32;
+        let mc = match self.heap.get(self.regexp_ctor) {
+            HeapObj::Object(mc) => mc,
+            _ => return None,
+        };
+        let species = pin(mc, "@@species", true, native::SPECIES_GET)?;
+        Some(MatchallFastSlots {
+            proto_version: self.heap.version_of(self.regexp_proto),
+            ctor_version: self.heap.version_of(self.regexp_ctor),
+            flags,
+            exec,
+            matchsym,
+            species,
+            ctor_slot,
+        })
     }
 
     /// The heap index if `v` is a RegExp, else None.
@@ -970,6 +1160,7 @@ impl<'p> Vm<'p> {
         let Some(p) = self.regexp_result_props.remove(&idx) else {
             return;
         };
+        rxstats::count_materialized();
         let old = self.arr_props.remove(&idx);
         let has_indices = p.values[3] != Value::UNDEFINED;
         let mut m = ObjMap::side_table_with_capacity(
@@ -1312,6 +1503,12 @@ impl<'p> Vm<'p> {
                 values: [index_v, input_sv, groups, indices_v],
             },
         );
+        rxstats::count_compact();
+        if !match_variant_enabled() {
+            // Off-switch: reproduce the eager representation (an ordinary
+            // `ObjMap` in `arr_props`) so the compact form is A/B-able.
+            self.materialize_regexp_result_props(arr_idx);
+        }
         Ok(Value::heap(arr_idx))
     }
 
@@ -2082,6 +2279,72 @@ pub(crate) fn advance_string_index(units: &[u16], index: usize, unicode: bool) -
         index + 2
     } else {
         index + 1
+    }
+}
+
+/// `ZIPP_NO_MATCH_VARIANT=1` restores the eager `arr_props` `ObjMap` for every
+/// match result: the compact record is built and then immediately materialised,
+/// so the old representation (and its cost) is reproduced exactly. Exists so
+/// the compact form is A/B-able and bisectable on one binary, same as
+/// `ZIPP_NO_ENUM_HOIST`.
+#[inline]
+pub(crate) fn match_variant_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_MATCH_VARIANT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_RXSTATS=1` — how many match results were CONSTRUCTED in the compact
+/// record vs how many were later MATERIALISED into an ordinary `arr_props`
+/// `ObjMap` (by mutation/reflection — or by `ZIPP_NO_MATCH_VARIANT=1`, which
+/// materialises every one at construction). A workload that only reads
+/// `m[i]`/`m.index`/`m.input`/`m.groups` should show near-zero materialisations.
+/// Off, this costs one relaxed atomic load per event.
+pub(crate) mod rxstats {
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static COMPACT: AtomicU64 = AtomicU64::new(0);
+    static MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(crate) fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_RXSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_compact() {
+        if enabled() {
+            COMPACT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_materialized() {
+        if enabled() {
+            MATERIALIZED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(compact_constructions, materialized)`.
+    pub fn dump() -> (u64, u64) {
+        (COMPACT.load(Ordering::Relaxed), MATERIALIZED.load(Ordering::Relaxed))
     }
 }
 

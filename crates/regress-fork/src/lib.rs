@@ -159,6 +159,14 @@ extern crate alloc;
 
 pub use crate::api::*;
 
+/// PATCH (see VENDORED.md): `ZIPP_RXSTATS=1` classical-backtrack counters —
+/// (attempts, greedy 1-char backtrack pushes, retry iterations, possessive
+/// pushes elided, failed-run skips). See possessify.rs for the mechanism.
+#[cfg(feature = "std")]
+pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
+    classicalbacktrack::rx_stats()
+}
+
 #[macro_use]
 mod util;
 
@@ -179,6 +187,7 @@ mod matchers;
 mod optimizer;
 mod parse;
 mod position;
+mod possessify;
 mod scm;
 mod startpredicate;
 mod types;

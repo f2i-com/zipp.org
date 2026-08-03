@@ -401,3 +401,221 @@ fn set_prototype_of_invalidates_a_chain_accessor_way() {
     );
     assert_eq!(out, vec!["100100000"]);
 }
+
+// ─── the B115 follow-up: SITE-GATED accessor-arm emission ───
+//
+// A probe only carries the accessor arms once its op has actually filled an
+// accessor way; a fill attempt under an arm-less probe marks the op, EVICTS
+// the owning compile (parked, not blacklisted) and lets the normal recount →
+// recompile flow rebuild it with the arms. The cases below introduce the
+// accessor AFTER the data-only code compiled, so they drive that exact
+// evict + recompile path. Expectations come from `node -e` at runtime (the
+// `backedge_dense.rs` precedent), and the whole set must also hold under
+// `ZIPP_ACC_ALWAYS_EMIT=1` (wave-2's unconditional emission — the A/B
+// comparator) and `ZIPP_NO_ACCESSOR_WAY=1` — see `zz_gate_modes_agree`.
+
+/// The same program's output from `node -e`, so expectations aren't
+/// hand-computed (node v24 on PATH, as `backedge_dense.rs`).
+fn node_output(src: &str) -> Vec<String> {
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(src)
+        .output()
+        .expect("node v24 on PATH (expected values come from `node -e`)");
+    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout)
+        .expect("node output is UTF-8")
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn assert_matches_node(src: &str) {
+    let ours = run_ok(src);
+    let node = node_output(src);
+    assert_eq!(ours, node, "zipp != node for: {src}");
+}
+
+/// A BRAND-NEW getter appears on the hot receiver AFTER the data-only loop
+/// region compiled (arm-less under the gate). The first fill attempt evicts
+/// the still-running region mid-activation — parked, so the native frame it
+/// evicts keeps executing safely — and every read before and after must
+/// match node.
+#[test]
+fn gate_getter_introduced_after_region_compiled() {
+    assert_matches_node(
+        r#""use strict";
+        var o = { d: 1 };
+        var s = 0;
+        for (var i = 0; i < 200000; i++) {
+            if (i === 100000) Object.defineProperty(o, "g", {
+                get: function () { return this.d + 1; }, configurable: true
+            });
+            var x = o.g;
+            s = (s + o.d + (x === undefined ? 0 : x)) | 0;
+        }
+        console.log(s + ":" + o.g);
+        "#,
+    );
+}
+
+/// The store twin: a data prop the compiled region was WRITING becomes an
+/// accessor mid-loop. The Set site's fill attempt takes the same
+/// mark + evict path; the setter must observe every store from the
+/// redefinition on.
+#[test]
+fn gate_setter_introduced_after_region_compiled() {
+    assert_matches_node(
+        r#""use strict";
+        var o = { d: 0, sink: 0 };
+        for (var i = 0; i < 200000; i++) {
+            if (i === 100000) Object.defineProperty(o, "w", {
+                get: function () { return -1; },
+                set: function (x) { this.sink = (this.sink + x) | 0; },
+                configurable: true
+            });
+            o.w = 1;
+            o.d = (o.d + (o.w === undefined ? 0 : o.w)) | 0;
+        }
+        console.log(o.d + ":" + o.sink + ":" + o.w);
+        "#,
+    );
+}
+
+/// The mechanism case, CHILD half (a no-op unless spawned by
+/// `zz_gate_evicts_once_then_serves_natively` — the env latches force a fresh
+/// process). A data-only function goes hot and compiles with NO accessor
+/// arms; accessors then appear on two of its prop ops; the next fill attempt
+/// evicts the compile, both ops are marked in that same activation, and the
+/// recompile carries exactly their arms — after which the accessor ways serve
+/// hits natively (asserted via `zipp_vm::ic_stats`). Behaviour is asserted
+/// against node as everywhere else.
+#[test]
+fn gate_mechanism_child() {
+    if std::env::var_os("ZIPP_ACC_GATE_CHILD").is_none() {
+        return;
+    }
+    let src = r#""use strict";
+        var o = { d: 1, hidden: 0 };
+        function work(o) {
+            var s = 0;
+            for (var i = 0; i < 5000; i++) {
+                s = (s + o.d) | 0;
+                var x = o.v;
+                if (x !== undefined) s = (s + x) | 0;
+                o.w = i & 7;
+            }
+            return s;
+        }
+        var total = 0;
+        for (var r = 0; r < 30; r++) total = (total + work(o)) | 0;
+        Object.defineProperty(o, "v", {
+            get: function () { return this.hidden; },
+            set: function (x) { this.hidden = x | 0; },
+            enumerable: true, configurable: true
+        });
+        Object.defineProperty(o, "w", {
+            get: function () { return 0; },
+            set: function (x) { this.hidden = (this.hidden + x) | 0; },
+            enumerable: true, configurable: true
+        });
+        for (var r = 0; r < 30; r++) total = (total + work(o)) | 0;
+        console.log(total + ":" + o.hidden);
+        "#;
+    let ours = run_ok(src);
+    assert_eq!(ours, node_output(src), "zipp != node for the mechanism program");
+    // 30 post-accessor calls x 5000 iterations x (1 getter read + 1 setter
+    // write) ≈ 300k accessor dispatches; all but the pre-recompile sliver must
+    // be served by the ACCESSOR WAY (a native probe hit), not the permanent
+    // miss stream. A recompile that never happened leaves these near zero.
+    let (.., get_acc, set_acc) = zipp_vm::ic_stats();
+    assert!(
+        get_acc + set_acc > 50_000,
+        "accessor ways served too few native hits after the recompile: \
+         get_acc={get_acc} set_acc={set_acc}"
+    );
+}
+
+/// The mechanism case, PARENT half: spawn `gate_mechanism_child` in a fresh
+/// process with `ZIPP_JITLOG` + `ZIPP_ICSTATS` (both latch process-wide) and
+/// prove the loop terminates the way the design argues: the data-only compile
+/// is ARM-LESS (`acc_arms=0/`); each of the two accessor ops flips the gate
+/// AT MOST ONCE per installed artifact (Tier C body and/or the OSR region —
+/// so 1..=4 "accessor site gate" lines, and the gate-flip deopt means the ops
+/// flip sequentially, not in one activation); the LAST compile carries both
+/// marked ops' arms (`acc_arms=2/3`); and NOTHING is evicted after it — no
+/// oscillation.
+#[test]
+fn zz_gate_evicts_once_then_serves_natively() {
+    if std::env::var_os("ZIPP_ACC_GATE_CHILD").is_some() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test exe path");
+    let out = std::process::Command::new(&exe)
+        .args(["gate_mechanism_child", "--exact", "--nocapture"])
+        .env("ZIPP_ACC_GATE_CHILD", "1")
+        .env("ZIPP_JITLOG", "1")
+        .env("ZIPP_ICSTATS", "1")
+        // The latches must see the DEFAULT configuration whatever mode the
+        // parent runs under (zz_gate_modes_agree nests this test).
+        .env_remove("ZIPP_NO_ACCESSOR_WAY")
+        .env_remove("ZIPP_ACC_ALWAYS_EMIT")
+        .env_remove("ZIPP_NOJIT")
+        .env_remove("ZIPP_JIT_THRESHOLD")
+        .output()
+        .expect("spawn the test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !stdout.contains("running 0 tests"),
+        "mechanism child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    let evictions = stderr.matches("accessor site gate").count();
+    assert!(
+        (1..=4).contains(&evictions),
+        "expected 1-4 site-gate evictions (2 marked ops x at most 2 installed \
+         artifacts, each flipping at most once), got {evictions}:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("acc_arms=0/"),
+        "the data-only phase should compile with NO accessor arms:\n{stderr}"
+    );
+    let last_evict = stderr.rfind("accessor site gate").unwrap();
+    let last_full = stderr.rfind("acc_arms=2/3").unwrap_or_else(|| {
+        panic!("no recompile carrying both marked ops' arms:\n{stderr}")
+    });
+    assert!(
+        last_full > last_evict,
+        "an eviction happened AFTER the fully-armed recompile (oscillation):\n{stderr}"
+    );
+}
+
+/// Re-run every non-`zz_` case in this file in two more modes, each in its
+/// own child process (the switches latch on first read): the off-switch
+/// `ZIPP_NO_ACCESSOR_WAY=1` (no accessor arms or fills anywhere — pre-B114
+/// behaviour) and `ZIPP_ACC_ALWAYS_EMIT=1` (wave-2's unconditional emission,
+/// the site gate's A/B comparator). Node-identical answers in all modes.
+#[test]
+fn zz_gate_modes_agree() {
+    if std::env::var_os("ZIPP_ACC_GATE_CHILD").is_some() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test exe path");
+    for (key, val) in [("ZIPP_NO_ACCESSOR_WAY", "1"), ("ZIPP_ACC_ALWAYS_EMIT", "1")] {
+        let out = std::process::Command::new(&exe)
+            .args(["--skip", "zz_"])
+            .env(key, val)
+            .output()
+            .expect("spawn the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{key}={val} mode failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !stdout.contains("running 0 tests"),
+            "the --skip zz_ filter matched nothing under {key}={val}:\n{stdout}"
+        );
+    }
+}

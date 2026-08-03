@@ -798,6 +798,7 @@ pub(crate) fn compile_region(
     ta_plan: &TaPinPlan,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
+    acc_emit: &[bool],
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<(JitFn, bool)> {
     // The register/SROA paths decline any region containing a Call/CallMethod, so
@@ -812,7 +813,7 @@ pub(crate) fn compile_region(
     if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot, meter) {
         return Some((f, false));
     }
-    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan, meter)
+    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan, acc_emit, meter)
         .map(|f| (f, true))
 }
 

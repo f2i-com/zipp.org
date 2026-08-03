@@ -269,6 +269,7 @@ impl<'p> Vm<'p> {
             promise_ctor_intrinsic: 0,
             promise_then_intrinsic: 0,
             promise_pristine_slots: None,
+            matchall_fast_slots: None,
             realms: vec![std::collections::HashMap::new()], // realm 0 = main
             obj_realm: std::collections::HashMap::new(),
             realm_ctor_main: std::collections::HashMap::new(),

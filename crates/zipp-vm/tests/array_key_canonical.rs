@@ -10,9 +10,9 @@
 //! `ZIPP_NO_ARRKEY_FAST=1` (the old key_of + parse + to_string / generic
 //! get_prop paths), so BOTH modes must match node exactly.
 //!
-//! NOT covered here: `delete a["05"]` — the delete path mis-parses the
-//! non-canonical key and deletes element 5 instead (a pre-existing bug in the
-//! delete machinery, outside this read-path change).
+//! NOT covered here: `delete a["05"]` — the delete path's canonical routing
+//! has its own battery in `delete_canonical_key.rs` (access.rs `delete_prop`
+//! now decides index-vs-named with the same `canonical_u32_key`).
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");

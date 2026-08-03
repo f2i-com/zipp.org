@@ -313,6 +313,78 @@ pub(crate) fn compile_region_regalloc(
             Instr::Sub { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Sub, &mut lc),
             Instr::Mul { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Mul, &mut lc),
             Instr::Div { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Div, &mut lc),
+            // `%` on the DOUBLE path. B113 named this the blocker that dropped
+            // typedarray-math's fill region ([16,47]) to the memory tier
+            // (`[decline-reason] regalloc-emit-unhandled: Mod`) — same one-op
+            // cliff class as B92's Bitwise. The fast shape is the one the hot
+            // loops actually run (`(x >>> 0) % 100000`): both operands EXACT
+            // integers in their f64 homes, so the remainder is the i64 `idiv`
+            // remainder, and fmod exactness (the true remainder of two f64s is
+            // itself an f64) makes the cvtsi2sd back into the home exact.
+            // Everything else DEOPTs to the interpreter AT this ip — nothing is
+            // written before the deopt, the op is pure, re-execution is sound
+            // and the interpreter computes the real `%` (fractional operands,
+            // NaN/Inf, b == 0 → NaN, b == -1, |x| >= 2^63):
+            //   (1) each operand round-trips cvttsd2si/cvtsi2sd (a non-integral,
+            //       NaN, Inf or >= 2^63 value fails; the INT64_MIN "integer
+            //       indefinite" fails its own round-trip except for a literal
+            //       -2^63, which (3) then rejects);
+            //   (2) b == 0 deopts (JS: NaN);
+            //   (3) b == -1 deopts (the one `idiv` #DE case left after (1)-(2):
+            //       INT64_MIN / -1 overflows; a % -1 is ±0 and rare — the
+            //       interpreter gets the sign right).
+            // A ZERO remainder takes its sign from the ORIGINAL f64 dividend
+            // (still unclobbered in its home — `d` is not written yet), which
+            // covers both `-0.0 % n` (round-trips as integer 0) and `-6 % 3`
+            // (JS: -0). Scratch is rax/rcx/rdx/xmm0 only — r8-r11 are BOOL_GPRS
+            // homes. `ZIPP_NO_DOUBLE_MOD=1` restores the decline for A/B.
+            Instr::Mod { dst, a, b } if double_mod_enabled() => {
+                let (d, ax, bx) = (xh(&plan, dst), xh(&plan, a), xh(&plan, b));
+                copy_clobber(&mut lc, d);
+                let m_bail = ops.new_dynamic_label();
+                let m_zero = ops.new_dynamic_label();
+                let m_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; cvttsd2si rax, Rx(ax)
+                    ; cvtsi2sd xmm0, rax
+                    ; ucomisd xmm0, Rx(ax)
+                    ; jp => m_bail                 // NaN operand (unordered)
+                    ; jne => m_bail                // non-integral / out of i64 range
+                    ; cvttsd2si rcx, Rx(bx)
+                    ; cvtsi2sd xmm0, rcx
+                    ; ucomisd xmm0, Rx(bx)
+                    ; jp => m_bail
+                    ; jne => m_bail
+                    ; test rcx, rcx
+                    ; jz => m_bail                 // b == 0 → NaN in the interpreter
+                    ; cmp rcx, -1
+                    ; je => m_bail                 // idiv #DE guard; a % -1 is ±0
+                    ; cqo
+                    ; idiv rcx                     // remainder → rdx, sign of dividend
+                    ; test rdx, rdx
+                    ; jz => m_zero
+                    // `xorps` first: `cvtsi2sd` merges into the low lane and would
+                    // otherwise carry a false dependency on the home's old contents.
+                    ; xorps Rx(d), Rx(d)
+                    ; cvtsi2sd Rx(d), rdx
+                    ; jmp => m_done
+                    ; => m_zero
+                    // ±0 with the ORIGINAL dividend's sign: isolate its f64 sign bit.
+                    ; movq rax, Rx(ax)
+                    ; mov rcx, QWORD (1u64 << 63) as i64
+                    ; and rax, rcx
+                    ; movq Rx(d), rax
+                    ; jmp => m_done
+                    // Resume at THIS ip: nothing has been written yet (the bail
+                    // precedes the only store to `d`), so every home is still
+                    // consistent and `flush_exit` writes them all back before
+                    // the interpreter re-executes the op with full semantics.
+                    ; => m_bail
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => flush_exit
+                    ; => m_done
+                );
+            }
             Instr::AddInt { dst, a, imm, .. } => {
                 let d = xh(&plan, dst);
                 let ax = xh(&plan, a);

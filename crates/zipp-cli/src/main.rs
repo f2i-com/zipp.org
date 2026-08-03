@@ -51,6 +51,13 @@ fn main() -> ExitCode {
         );
         eprintln!("[gc] avg slots/collection {slots}  avg live {live}  total swept {swept}");
     }
+    if std::env::var_os("ZIPP_RXSTATS").is_some() {
+        let (compact, materialized) = zipp_vm::regexp_result_stats();
+        let pct = if compact == 0 { 0.0 } else { materialized as f64 * 100.0 / compact as f64 };
+        eprintln!(
+            "[rx] {compact} compact match results  {materialized} materialized ({pct:.2}%)"
+        );
+    }
     if std::env::var_os("ZIPP_ASYNCSTATS").is_some() {
         let (reparks, reused, grew, values, subs_in, subs_sp) = zipp_vm::async_stats();
         let pct = if reparks == 0 { 0.0 } else { reused as f64 * 100.0 / reparks as f64 };
@@ -75,6 +82,12 @@ fn main() -> ExitCode {
             pct(sg, sm), pct(sd, sm)
         );
         eprintln!("[ic] accessor-way hits  get {gah}  set {sah}");
+    }
+    if std::env::var_os("ZIPP_RXSTATS").is_some() {
+        let (att, pushes, retries, elided, skips) = zipp_vm::rx_stats();
+        eprintln!(
+            "[rx] attempts {att}  greedy1 pushes {pushes}  retries {retries}  possessive elided {elided}  run skips {skips}"
+        );
     }
     if bstats {
         let rows = zipp_vm::builtin_stats();

@@ -286,6 +286,8 @@ impl Emitter {
                             min_iters: quant.min,
                             max_iters: quant.max.unwrap_or(usize::MAX),
                             greedy: quant.greedy,
+                            // Possibly upgraded by the possessify pass below.
+                            possessive: false,
                         });
                         stack.push(Emitter::Node(loopee));
                     }
@@ -408,10 +410,16 @@ pub fn emit(n: &ir::Regex) -> CompiledRegex {
             group_names: Box::new([]),
             flags: n.flags,
             start_pred: startpredicate::predicate_for_re(n),
+            skip_hint_ip: None,
         },
     };
     emitter.emit_node(&n.node);
     let mut result = emitter.result;
+    // PATCH (see VENDORED.md): auto-possessify one-char greedy loops with a
+    // provably disjoint follow; `ZIPP_NO_RX_POSSESS=1` disables the pass.
+    if crate::possessify::enabled() {
+        crate::possessify::apply(&mut result);
+    }
     // Populate group names, unless all are empty.
     debug_assert!(
         result.group_names.is_empty(),

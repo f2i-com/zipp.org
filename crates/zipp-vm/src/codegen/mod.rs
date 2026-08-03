@@ -871,6 +871,61 @@ pub(crate) fn accessor_way_enabled() -> bool {
     }
 }
 
+/// `ZIPP_ACC_ALWAYS_EMIT=1` restores wave-2's UNCONDITIONAL accessor-arm
+/// emission: every probe carries the accessor arms whenever the way itself is
+/// enabled, exactly as B115 landed it. The default is the SITE GATE — a probe
+/// only carries the arms once its `(func_id, op_ip)` has actually filled an
+/// accessor way (see [`Jit::acc_way_gate`]) — so this switch is the A/B
+/// comparator for the gate, on one binary. Latched like the sibling switches.
+#[inline]
+pub(crate) fn acc_always_emit() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_ACC_ALWAYS_EMIT").is_some() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// What an accessor-resolving miss helper may do at a site — the answer of
+/// [`Jit::acc_way_gate`]. `Fill` = the probe has the arms, fill the way and
+/// return `PROP_VIA_IC` (wave-2's flow). `Slow` = never fill, stay on the
+/// `PROP_VIA_IC` slow path (the way is disabled, or the site is unknown).
+/// `Recompile` = the site-gate just flipped: the owning compile was evicted,
+/// so return `SELF_CALL_DEOPT` — the interpreter re-executes the op and its
+/// back-edge/call counting recompiles the code WITH the accessor arms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AccWayGate {
+    Fill,
+    Slow,
+    Recompile,
+}
+
+/// Per-site emission metadata, parallel to `ic_rot` (one per reserved site).
+/// Written by [`Jit::register_ic_sites`] when the sites are handed to a
+/// compile; read by [`Jit::acc_way_fill_ok`] when a miss helper wants to fill
+/// an ACCESSOR way. `acc_emitted` records whether the probe COMPILED for this
+/// site carries the accessor arms — the fill side must never tag a way that a
+/// tag-blind probe would then data-hit (a Set through `vals_ptr == 0`, or a
+/// Get walking `0x80 | nhops` phantom hops).
+#[derive(Clone, Copy, Default)]
+struct IcSiteMeta {
+    func_id: u32,
+    /// Bytecode ip of the owning `GetProp`/`SetProp` — the STABLE key for the
+    /// accessor-seen set (site ids themselves are fresh on every compile).
+    op_ip: u32,
+    /// Loop-header ip of the owning OSR region, or `u32::MAX` for a Tier C
+    /// whole-function body.
+    region_entry: u32,
+    /// True when this site's probe was emitted WITH the accessor arms.
+    acc_emitted: bool,
+}
+
 impl IcEntry {
     /// An OWN-property way (receiver == holder; no hop guards). `None` if the
     /// slot doesn't fit the 24-bit packing (never in practice).
@@ -1014,6 +1069,20 @@ pub struct Jit {
     ic_table: Vec<IcEntry>,
     /// Round-robin fill cursor per site (parallel to `ic_table` / JIT_IC_WAYS).
     ic_rot: Vec<u8>,
+    /// Per-site emission metadata (parallel to `ic_rot`) — see [`IcSiteMeta`].
+    ic_site_meta: Vec<IcSiteMeta>,
+    /// `(func_id, op_ip)` of every `GetProp`/`SetProp` that has EVER wanted to
+    /// fill an accessor way. Grows monotonically, never shrinks — the
+    /// termination argument for the site gate: once a key is in here, every
+    /// future compile covering that op emits the accessor arms
+    /// (`register_ic_sites`), so the evict-on-fill branch in
+    /// [`Jit::acc_way_fill_ok`] can fire at most once per key.
+    acc_sites: FxHashSet<(u32, u32)>,
+    /// Tier C bodies evicted by the accessor site gate, parked for the same
+    /// reason as `retired`: the fill helper that evicts runs INSIDE the native
+    /// frame being evicted, so dropping the `ExecutableBuffer` would unmap the
+    /// code we return into. Freed when the VM drops.
+    retired_fns: Vec<JitFn>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -1199,14 +1268,17 @@ impl Jit {
                 .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
                 .count();
             let ic_base_idx = self.reserve_ic_sites(n_sites);
+            let acc_emit = self.register_ic_sites(ic_base_idx, func_id, u32::MAX, &proto.code, 0);
             let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
             if let Some(f) =
-                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs, leaf_plan, meter)
+                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs, leaf_plan, &acc_emit, meter)
             {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!(
-                        "[jit] Tier C fn{func_id} compiled (whole-function mem path, leaf_inlines={})",
-                        leaf_plan.len()
+                        "[jit] Tier C fn{func_id} compiled (whole-function mem path, leaf_inlines={}, acc_arms={}/{})",
+                        leaf_plan.len(),
+                        acc_emit.iter().filter(|&&b| b).count(),
+                        acc_emit.len()
                     );
                 }
                 self.compiled.insert(func_id, f);
@@ -1439,12 +1511,23 @@ impl Jit {
             .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
             .count();
         let ic_base_idx = self.reserve_ic_sites(n_sites);
+        let acc_emit = self.register_ic_sites(
+            ic_base_idx,
+            func_id,
+            start,
+            &proto.code[start as usize..=end as usize],
+            start,
+        );
         let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
-        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, meter) {
+        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, &acc_emit, meter) {
             Some((code, is_mem)) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     let tier = if is_mem { "MEM" } else { "DOUBLE" };
-                    eprintln!("[jit] {tier} region fn{func_id} [{start},{end}] compiled");
+                    eprintln!(
+                        "[jit] {tier} region fn{func_id} [{start},{end}] compiled (acc_arms={}/{})",
+                        acc_emit.iter().filter(|&&b| b).count(),
+                        acc_emit.len()
+                    );
                 }
                 self.regions
                     .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: false, is_mem, field_plan: None });
@@ -1530,7 +1613,106 @@ impl Jit {
         self.ic_table
             .resize(self.ic_table.len() + n * JIT_IC_WAYS, IcEntry::default());
         self.ic_rot.resize(self.ic_rot.len() + n, 0);
+        self.ic_site_meta
+            .resize(self.ic_site_meta.len() + n, IcSiteMeta::default());
         base
+    }
+
+    /// Bind the sites just reserved at `base` to their owning ops, and decide
+    /// PER SITE whether its probe gets the accessor arms: only ops that have
+    /// already filled an accessor way (`acc_sites`) pay them, unless
+    /// `ZIPP_ACC_ALWAYS_EMIT=1` restores wave-2's unconditional emission.
+    /// `code` is the exact instruction range the emitter will walk (a region's
+    /// `[start, end]` slice, or the whole body for Tier C) and `code_off` its
+    /// first ip — the k-th `GetProp`/`SetProp` in it uses site `base + k`,
+    /// mirroring the emitters' `ic_site` cursor (proto_mem debug-asserts the
+    /// same count). Returns the per-site emit flags for the emitter.
+    fn register_ic_sites(
+        &mut self,
+        base: u32,
+        func_id: u32,
+        region_entry: u32,
+        code: &[Instr],
+        code_off: u32,
+    ) -> Vec<bool> {
+        let on = accessor_way_enabled();
+        let always = acc_always_emit();
+        let mut flags = Vec::new();
+        for (i, instr) in code.iter().enumerate() {
+            if matches!(instr, Instr::GetProp { .. } | Instr::SetProp { .. }) {
+                let op_ip = code_off + i as u32;
+                let emit = on && (always || self.acc_sites.contains(&(func_id, op_ip)));
+                if let Some(m) = self.ic_site_meta.get_mut(base as usize + flags.len()) {
+                    *m = IcSiteMeta { func_id, op_ip, region_entry, acc_emitted: emit };
+                }
+                flags.push(emit);
+            }
+        }
+        flags
+    }
+
+    /// May the miss helper fill an ACCESSOR way at `site`? [`AccWayGate::Fill`]
+    /// iff the compiled probe there carries the accessor arms (so a tagged way
+    /// will be dispatched, not mis-walked). Otherwise this is the site-gate
+    /// FLIP ([`AccWayGate::Recompile`]): record the op in `acc_sites`, EVICT
+    /// the owning compile — parked, not blacklisted — and tell the caller to
+    /// DEOPT (`SELF_CALL_DEOPT`, not `PROP_VIA_IC`): the evicted code is the
+    /// frame we are being called FROM, and a top-level loop's single OSR
+    /// activation would otherwise ride the parked arm-less code to the loop
+    /// exit and never recompile. Bailing hands the loop back to the
+    /// interpreter, whose back-edge count (reset here) re-trips the compile —
+    /// now WITH the arms, since the op is marked.
+    ///
+    /// TERMINATES: `acc_sites` only grows, and `register_ic_sites` emits the
+    /// arms for every op in it — so after one recompile the op's new site has
+    /// `acc_emitted == true` and the flip can never fire for it again. At most
+    /// one accessor eviction per compiled artifact per marked op, deopts only
+    /// from already-parked (unreachable-from-dispatch) activations — no
+    /// oscillation (arms are never removed while the way is enabled).
+    pub fn acc_way_gate(&mut self, site: u32) -> AccWayGate {
+        if !accessor_way_enabled() {
+            return AccWayGate::Slow;
+        }
+        let Some(&m) = self.ic_site_meta.get(site as usize) else {
+            return AccWayGate::Slow;
+        };
+        if m.acc_emitted {
+            return AccWayGate::Fill;
+        }
+        self.acc_sites.insert((m.func_id, m.op_ip));
+        if m.region_entry == u32::MAX {
+            // Tier C whole-function body: park + reset to cold so the call
+            // counter re-offers it (the blacklist is untouched).
+            if let Some(f) = self.compiled.remove(&m.func_id) {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[jit] Tier C fn{} EVICTED (accessor site gate, ip {})",
+                        m.func_id, m.op_ip
+                    );
+                }
+                self.retired_fns.push(f);
+                self.counts.remove(&m.func_id);
+                self.set_fn_state(m.func_id, FN_COLD);
+                if self.self_cache.is_some_and(|(id, _)| id == m.func_id) {
+                    self.self_cache = None;
+                }
+            }
+        } else {
+            // OSR loop region: park + reset the back-edge counter (the
+            // int-retry eviction's exact recipe, minus the int blacklist).
+            let key = (m.func_id, m.region_entry);
+            if let Some(r) = self.regions.remove(&key) {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[jit] region fn{} [{}] EVICTED (accessor site gate, ip {})",
+                        key.0, key.1, m.op_ip
+                    );
+                }
+                self.retired.push(r);
+                self.region_counts.remove(&key);
+            }
+        }
+        AccWayGate::Recompile
     }
 
     /// Base pointer of the inline-cache table (for a region prologue to pin).

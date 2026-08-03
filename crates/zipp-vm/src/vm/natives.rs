@@ -2331,7 +2331,7 @@ impl<'p> Vm<'p> {
                         self.heap.get(re_idx),
                         HeapObj::RegExp { last_index, .. } if last_index.is_number()
                     );
-                    if li_number && self.regexp_matchall_fast_ok(re_idx) {
+                    if li_number && self.regexp_matchall_fast_ok_cached(re_idx) {
                         let (regex, source, flags, li_raw, twin) = match self.heap.get(re_idx) {
                             HeapObj::RegExp { regex, source, flags, last_index, ascii_twin } => (
                                 regex.clone(),

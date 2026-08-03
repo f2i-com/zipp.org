@@ -7,6 +7,25 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// `ZIPP_NO_MATCHALL_PRISTINE=1` disables the pristine dispatch shortcut for
+/// `String.prototype.matchAll` (the B77 retry), restoring the fully observable
+/// preamble on every call — the rollback switch and one side of a one-binary
+/// A/B (`tools/bench.py --ab-env`). Same idiom as `ZIPP_NO_PROMISE_SLOT_CACHE`.
+#[inline]
+fn matchall_pristine_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_MATCHALL_PRISTINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// IsRegExp(v) (ES 7.2.8): a `@@match` property overrides — when present it is
     /// ToBoolean'd; otherwise true iff `v` is a RegExp exotic. Non-objects are not
@@ -43,6 +62,16 @@ impl<'p> Vm<'p> {
             )));
         }
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        // ── pristine dispatch shortcut (the B77 retry) ──
+        // When every read the preamble below would perform is proven to yield
+        // the intrinsic, the whole sequence reduces to invoking
+        // %RegExp.prototype[Symbol.matchAll]% directly. `None` falls through
+        // to the fully observable protocol.
+        if name == "matchAll" && matchall_pristine_enabled() {
+            if let Some(r) = self.matchall_pristine_dispatch(recv, arg0) {
+                return r;
+            }
+        }
         let sym = match name {
             "replace" | "replaceAll" => "@@replace",
             "split" => "@@split",
@@ -101,6 +130,83 @@ impl<'p> Vm<'p> {
             self.alloc_str(s).heap_index()
         };
         Ok(self.string_method(s_idx, name, args)?.unwrap_or(Value::UNDEFINED))
+    }
+
+    /// The pristine dispatch shortcut for `String.prototype.matchAll` — B77's
+    /// mechanism, retried with different PLACEMENT per its revert note: the
+    /// guards live in this separate `#[inline(never)]` function instead of
+    /// inline in `string_symbol_method`, so the hot ~40 lines get their own
+    /// code address rather than reshaping the caller (B77's target win was
+    /// real twice; the revert was fat-LTO layout collateral on a row with no
+    /// `matchAll` in it).
+    ///
+    /// `Some(result)` when the preamble's every observable step provably
+    /// yields the intrinsic, in which case the whole protocol reduces to
+    /// calling %RegExp.prototype[Symbol.matchAll]% directly:
+    ///
+    ///   * IsRegExp(arg): `Get(arg, @@match)` — no own `@@match`, prototype is
+    ///     exactly %RegExp.prototype%, its `@@match` still the intrinsic DATA
+    ///     property (truthy, so IsRegExp answers true);
+    ///   * `Get(arg, "flags")` + ToString + the `'g'` test —
+    ///     `regexp_pristine_flags` (no own `flags`/flag-name shadow, all eight
+    ///     flag accessors intrinsic — a lying `global` getter declines) plus
+    ///     the `flags` slot itself still the intrinsic accessor, checked here;
+    ///   * `GetMethod(arg, @@matchAll)` — no own `@@matchAll`, the prototype
+    ///     slot still the intrinsic native;
+    ///   * the `call_value` — replaced by a direct native call.
+    ///
+    /// `None` (any guard fails, including a missing `'g'` — the generic path
+    /// re-derives and throws the identical TypeError) falls through to the
+    /// fully observable protocol. Every slot value and accessor bit is re-read
+    /// per call: an in-place `RegExp.prototype.exec = f`-style overwrite bumps
+    /// no version (B67/B110), so nothing here is trusted from a cache.
+    #[inline(never)]
+    fn matchall_pristine_dispatch(
+        &mut self,
+        recv: Value,
+        arg0: Value,
+    ) -> Option<Result<Value, Thrown>> {
+        let re = self.as_regexp(arg0)?;
+        // Own shadows of the two symbols make the preamble observable again.
+        // (`flags` and the eight flag names are re-checked by
+        // `regexp_pristine_flags`, which also pins the [[Prototype]].)
+        if self
+            .arr_props
+            .get(&re)
+            .is_some_and(|m| m.pos("@@match").is_some() || m.pos("@@matchAll").is_some())
+        {
+            return None;
+        }
+        let proto_ok = match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => {
+                let data_native = |k: &str, id: u16| {
+                    m.pos(k).is_some_and(|i| {
+                        !m.attrs[i].accessor
+                            && m.vals[i].is_heap()
+                            && matches!(self.heap.get(m.vals[i].heap_index()),
+                                        HeapObj::Native(n) if *n == id)
+                    })
+                };
+                let flags_ok = m.pos("flags").is_some_and(|i| {
+                    m.attrs[i].accessor
+                        && m.vals[i].is_heap()
+                        && matches!(self.heap.get(m.vals[i].heap_index()),
+                                    HeapObj::Native(n) if *n == native::REGEXP_GET_FLAGS)
+                });
+                flags_ok
+                    && data_native("@@match", native::REGEXP_SYM_MATCH)
+                    && data_native("@@matchAll", native::REGEXP_SYM_MATCHALL)
+            }
+            _ => false,
+        };
+        if !proto_ok {
+            return None;
+        }
+        let flags = self.regexp_pristine_flags(re, arg0)?;
+        if !flags.contains('g') {
+            return None;
+        }
+        Some(self.call_native(native::REGEXP_SYM_MATCHALL, arg0, &[recv]))
     }
 
     /// UTF-16 unit length (JS `.length`) of a flat string by heap index — O(1).
@@ -441,6 +547,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.call_value(matcher, rxv, &[Value::heap(idx)])?))
             }
             "matchAll" => {
+                // ── pristine dispatch shortcut (the B77 retry) ── the
+                // primitive-receiver path (`"s".matchAll(re)`) lands HERE, not
+                // in string_symbol_method; same proof, same fall-through.
+                if matchall_pristine_enabled() {
+                    if let Some(r) = self.matchall_pristine_dispatch(Value::heap(idx), arg0) {
+                        return r.map(Some);
+                    }
+                }
                 let regexp = arg0;
                 let s_val = Value::heap(idx);
                 // Per spec the `@@matchAll` method is only consulted when `regexp`

@@ -1455,7 +1455,18 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // deferred-ns, `ic_obj_ok`) already returned early, exactly as for
             // a data fill.
             Some(s) if map.attrs[s].accessor => {
-                if crate::codegen::accessor_way_enabled() {
+                // Site-gated (the B115 follow-up): `acc_way_gate` says whether
+                // this site's compiled probe carries the accessor arms.
+                // `Recompile` means it does NOT and the gate just flipped —
+                // the owning compile is evicted and we DEOPT (the calling
+                // frame IS the parked arm-less code; a single-activation loop
+                // would otherwise never recompile). Filling under a tag-blind
+                // probe is never an option.
+                let gate = vm.jit.acc_way_gate(site_idx);
+                if gate == crate::codegen::AccWayGate::Recompile {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                if gate == crate::codegen::AccWayGate::Fill {
                     let getter = map.vals[s];
                     // Bake direct dispatch only for a plain user fn without
                     // lexical `this` (an arrow accessor must deopt so
@@ -1515,9 +1526,18 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                     // version down to the holder (shadowing
                                     // adds, holder redefinition/delete and
                                     // setPrototypeOf all bump one of them).
-                                    if crate::codegen::accessor_way_enabled()
-                                        && n_hops < MAX
-                                    {
+                                    // Site-gated: as the own-accessor fill
+                                    // above (a too-deep chain never fills, so
+                                    // it neither marks nor evicts).
+                                    let gate = if n_hops < MAX {
+                                        vm.jit.acc_way_gate(site_idx)
+                                    } else {
+                                        crate::codegen::AccWayGate::Slow
+                                    };
+                                    if gate == crate::codegen::AccWayGate::Recompile {
+                                        return crate::codegen::SELF_CALL_DEOPT;
+                                    }
+                                    if gate == crate::codegen::AccWayGate::Fill {
                                         hops[n_hops] =
                                             (next, vm.heap.version_of(next));
                                         let getter = m2.vals[i];
@@ -1810,7 +1830,12 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             // The setter lives in `attrs[s].setter`, NOT `vals[s]` — B52's
             // documented asymmetry — and the accessor helper re-reads it live.
             Some(s) if map.attrs[s].accessor => {
-                if crate::codegen::accessor_way_enabled() {
+                // Site-gated: see the GetProp miss helper's own-accessor fill.
+                let gate = vm.jit.acc_way_gate(site_idx);
+                if gate == crate::codegen::AccWayGate::Recompile {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                if gate == crate::codegen::AccWayGate::Fill {
                     let setter = map.attrs[s].setter;
                     let baked = vm
                         .ic_plain_fn(setter)

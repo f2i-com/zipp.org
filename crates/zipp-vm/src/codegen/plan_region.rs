@@ -104,6 +104,25 @@ pub(crate) fn double_bitwise_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_DOUBLE_MOD=1` restores the pre-Mod emitter on the DOUBLE path: an
+/// `Instr::Mod` falls through to the emitter's catch-all and the whole region
+/// declines to the memory tier again (the named `regalloc-emit-unhandled: Mod`
+/// decline B113 documented). Cached — read once per process, never on the
+/// generated hot path.
+pub(crate) fn double_mod_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_DOUBLE_MOD").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// `ZIPP_NO_DV_DOUBLE=1` restores the pre-DV planner on the DOUBLE path: a
 /// whitelisted DataView `get*` CallMethod declines the whole region to the
 /// memory tier again (helper call, boxed operands). Cached — read once per

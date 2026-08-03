@@ -227,7 +227,7 @@ impl<'p> Vm<'p> {
         // its own configurable check); without this, `delete obj.x` on such a prop
         // removed it unconditionally, so verifyProperty's deletion probe wrongly
         // reported a non-configurable property as configurable.
-        if key.parse::<usize>().map_or(true, |i| i.to_string() != key) {
+        if canonical_u32_key(key).is_none() {
             if let Some(m) = self.arr_props.get(&idx) {
                 if let Some(p) = m.pos(key) {
                     if !m.attrs[p].configurable {
@@ -342,37 +342,39 @@ impl<'p> Vm<'p> {
         // (defineProperty'd) refuses deletion; otherwise drop the override (if any)
         // and clear the dense slot.
         if let HeapObj::Array(_) = self.heap.get(idx) {
-            if let Ok(i) = key.parse::<usize>() {
-                if i.to_string() == key {
-                    // A sealed/frozen array's existing elements are non-configurable,
-                    // so an in-bounds index can't be deleted (an out-of-range index is
-                    // not an own property and deletes vacuously).
-                    let in_bounds =
-                        matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
-                    if in_bounds
-                        && self.arr_props.get(&idx).map_or(false, |m| m.sealed || m.frozen)
-                    {
+            // Only a CANONICAL array-index key (`"5"`, not `"05"`/`"+5"`/`" 5"`,
+            // and not `"4294967295"` = 2^32-1) addresses an element; anything
+            // else is an ordinary named property (arr_props) below.
+            if let Some(i) = canonical_u32_key(key) {
+                let i = i as usize;
+                // A sealed/frozen array's existing elements are non-configurable,
+                // so an in-bounds index can't be deleted (an out-of-range index is
+                // not an own property and deletes vacuously).
+                let in_bounds =
+                    matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
+                if in_bounds
+                    && self.arr_props.get(&idx).map_or(false, |m| m.sealed || m.frozen)
+                {
+                    return Value::bool(false);
+                }
+                if let Some((a, _)) = self.array_index_override(idx, i) {
+                    if !a.configurable {
                         return Value::bool(false);
                     }
-                    if let Some((a, _)) = self.array_index_override(idx, i) {
-                        if !a.configurable {
-                            return Value::bool(false);
-                        }
-                        if let Some(m) = self.arr_props.get_mut(&idx) {
-                            m.remove(key);
-                        }
+                    if let Some(m) = self.arr_props.get_mut(&idx) {
+                        m.remove(key);
                     }
-                    // A deleted mapped-arguments index severs its alias
-                    // (map.Delete — permanent, even if the index is re-created).
-                    self.args_unmap(idx, i, false);
-                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        if i < items.len() {
-                            items[i] = Value::HOLE;
-                        }
-                    }
-                    self.heap.bump_version(idx);
-                    return Value::bool(true);
                 }
+                // A deleted mapped-arguments index severs its alias
+                // (map.Delete — permanent, even if the index is re-created).
+                self.args_unmap(idx, i, false);
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    if i < items.len() {
+                        items[i] = Value::HOLE;
+                    }
+                }
+                self.heap.bump_version(idx);
+                return Value::bool(true);
             }
         }
         // A callable's defineProperty'd own property (fn_props) may be
@@ -394,9 +396,13 @@ impl<'p> Vm<'p> {
         let removed = match self.heap.get_mut(idx) {
             HeapObj::Object(map) => map.remove(key),
             HeapObj::Array(items) => {
-                if let Ok(i) = key.parse::<usize>() {
-                    if i < items.len() {
-                        items[i] = Value::HOLE;
+                // A CANONICAL index key never reaches here (the index path above
+                // returned) — keep the canonical decider anyway so a non-canonical
+                // spelling (`"05"`, `"+5"`, `"4294967295"`) NEVER punches a hole
+                // in the dense elements; it is a named property in arr_props.
+                if let Some(i) = canonical_u32_key(key) {
+                    if (i as usize) < items.len() {
+                        items[i as usize] = Value::HOLE;
                     }
                     false // array slot stays (a hole); no version bump needed
                 } else {

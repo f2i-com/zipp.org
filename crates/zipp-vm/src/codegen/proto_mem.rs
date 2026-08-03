@@ -205,6 +205,9 @@ pub(crate) fn compile_proto_mem(
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+    // Per-site accessor-arm emission flags (the SITE GATE), indexed by the
+    // local site number — see `compile_region_mem`'s twin parameter.
+    acc_emit: &[bool],
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
@@ -734,8 +737,12 @@ pub(crate) fn compile_proto_mem(
                 // after it.
                 let via_ic = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
-                // B114: accessor-way dispatch target (as the region arm).
-                let acc = accessor_way_enabled().then(|| ops.new_dynamic_label());
+                // B114: accessor-way dispatch target (as the region arm),
+                // SITE-GATED exactly as there.
+                let acc = acc_emit
+                    .get((ic_site - heap.ic_base_idx) as usize)
+                    .is_some_and(|&b| b)
+                    .then(|| ops.new_dynamic_label());
                 emit_ic_probe(&mut ops, IcProbe::Get { dst }, obj, off, cont, acc);
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
@@ -812,8 +819,12 @@ pub(crate) fn compile_proto_mem(
                 let packed = ((heap.func_id as u64) << 32) | name as u64;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let cont = ops.new_dynamic_label();
-                // B114: accessor-way dispatch target (as the region arm).
-                let acc = accessor_way_enabled().then(|| ops.new_dynamic_label());
+                // B114: accessor-way dispatch target (as the region arm),
+                // SITE-GATED exactly as there.
+                let acc = acc_emit
+                    .get((ic_site - heap.ic_base_idx) as usize)
+                    .is_some_and(|&b| b)
+                    .then(|| ops.new_dynamic_label());
                 emit_ic_probe(&mut ops, IcProbe::Set { val }, obj, off, cont, acc);
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
