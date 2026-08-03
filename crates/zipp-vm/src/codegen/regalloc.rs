@@ -24,7 +24,7 @@ pub(crate) fn compile_region_regalloc(
     }
     // The regalloc path uses boxed-double semantics and cannot host Bitwise
     // (int32-lane) ops — they decline to the memory path here.
-    let plan = plan_region(proto, start, end, ta_plan, false, true)?;
+    let plan = plan_region(proto, start, end, ta_plan, false, true, true)?;
     if !plan.split_recvs.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
         let mut srs: Vec<u16> = plan.split_recvs.iter().copied().collect();
         srs.sort_unstable();

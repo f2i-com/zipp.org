@@ -208,6 +208,13 @@ pub(crate) fn compile_region_int_maybe_cold(
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!("[jit] INT decline [{start},{end}]: region_is_int=false");
         }
+        // B74 discipline: a decline count without the disqualifying opcode makes
+        // the next admit candidate a guess. Name every unadmitted ip.
+        if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+            for &ip in &unadmitted {
+                eprintln!("[int-reject] @{ip} {:?}", proto.code[ip]);
+            }
+        }
         return None;
     } else {
         // The cold unit is the BASIC BLOCK, not the instruction. Excluding only
@@ -261,7 +268,23 @@ pub(crate) fn compile_region_int_maybe_cold(
     // The i64 homes carry sign-extended integers, so Bitwise (int32-lane) ops run
     // inline here with no per-op reload/rebox — admit them (admit_bitwise=true), and
     // plan_region's pinned-element handling targets kind-5 (Int32) elements.
-    let plan = match plan_region_cold(proto, start, end, ta_plan, true, false, &cold) {
+    // B94 receiver splitting is admitted here too, but OPT-IN (`ZIPP_INT_SPLIT=1`;
+    // see `int_split_enabled` for the measured refutation that keeps it off by
+    // default): the emitter below write-throughs every numeric def of a split
+    // register BOXED — before any i53 guard, whose exit resumes at ip+1 expecting
+    // the result flushed — and skips it in flush_exit. B97 wt-share stays OFF
+    // (admit_wt_share=false): its shareable/no-entry-load allocation has only ever
+    // been proven against the double emitter.
+    let plan = match plan_region_cold(
+        proto,
+        start,
+        end,
+        ta_plan,
+        true,
+        int_split_enabled(),
+        false,
+        &cold,
+    ) {
         Some(p) => p,
         None => {
             if std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -270,6 +293,13 @@ pub(crate) fn compile_region_int_maybe_cold(
             return None;
         }
     };
+    if !plan.split_recvs.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+        let mut srs: Vec<u16> = plan.split_recvs.iter().copied().collect();
+        srs.sort_unstable();
+        for sr in srs {
+            eprintln!("[jit] INT region [{start},{end}] B94 split receiver r{sr}");
+        }
+    }
     let mut ops = match dynasmrt::x64::Assembler::new() {
         Ok(a) => a,
         Err(_) => {
@@ -423,6 +453,10 @@ pub(crate) fn compile_region_int_maybe_cold(
         // fusion predicate is subtle enough that stating the dependency beats
         // relying on it.
         let prev_flag = flag_cmp.take().filter(|_| !charged);
+        // Set by arms that emit their own B94 write-through BEFORE an i53 guard
+        // (the guard's exit resumes at ip+1 expecting the result flushed); the
+        // generic post-op hook below then skips the duplicate store.
+        let mut wt_pre = false;
         match proto.code[ip] {
             Instr::LoadInt { .. } | Instr::LoadConst { .. } => {
                 emit_int_const(&mut ops, &plan, &proto.code[ip], proto);
@@ -451,6 +485,17 @@ pub(crate) fn compile_region_int_maybe_cold(
             Instr::LoadGlobal { dst, .. } if plan.ta_recv_regs.contains(&dst) => {
                 flag_cmp = prev_flag; // nothing emitted; flags still live
             }
+            // ── B94 split receiver ── this LoadGlobal is the RECEIVER half of a
+            // recycled register. Its i64 home belongs to the register's numeric
+            // half, so the object goes to the memory slot, which every pinned
+            // access reads via the pin's global and which stays authoritative
+            // for this register throughout the region (mirrors the regalloc arm).
+            Instr::LoadGlobal { dst, idx } if plan.split_recv_lg.contains(&ip) => {
+                dynasm!(ops
+                    ; mov rax, [r12 + (idx as i32) * 8]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
             Instr::LoadGlobal { dst, idx } => {
                 let d = xh(&plan, dst);
                 let g = plan.glob_home[&idx];
@@ -477,9 +522,11 @@ pub(crate) fn compile_region_int_maybe_cold(
             }
             Instr::Add { dst, a, b } => {
                 emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, true, &mut lc);
+                wt_pre = true; // emit_ibin write-throughs before its own guard
             }
             Instr::Sub { dst, a, b } => {
                 emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, false, &mut lc);
+                wt_pre = true; // emit_ibin write-throughs before its own guard
             }
             Instr::Mul { dst, a, b } => {
                 let d = xh(&plan, dst);
@@ -523,6 +570,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         ; jmp => flush_exit
                         ; => done
                     );
+                    wt_pre = emit_int_wt(&mut ops, &plan, dst, false) || wt_pre;
                     emit_i53_guard(&mut ops, d, ip, flush_exit);
                 }
             }
@@ -597,6 +645,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         dynasm!(ops ; paddq Rx(d), xmm0);
                     }
                     copy_clobber(&mut lc, d);
+                    wt_pre = emit_int_wt(&mut ops, &plan, dst, false);
                     if !plan.elide_guard.contains(&ip) {
                         emit_i53_guard(&mut ops, d, ip, flush_exit);
                     }
@@ -625,6 +674,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; movdqa Rx(d), xmm0
                 );
                 copy_clobber(&mut lc, d);
+                wt_pre = emit_int_wt(&mut ops, &plan, dst, false);
                 if !plan.elide_guard.contains(&ip) {
                     emit_i53_guard(&mut ops, d, ip, flush_exit);
                 }
@@ -933,6 +983,29 @@ pub(crate) fn compile_region_int_maybe_cold(
                 return None;
             }
         }
+        // ── B94 write-through (INT) ── a numeric def of a split receiver must
+        // reach MEMORY (boxed) as well as its home, because `flush_exit`
+        // deliberately skips the register and memory is what the interpreter
+        // reads on any exit. Arms with an i53 guard already stored (`wt_pre`;
+        // the guard resumes at ip+1 expecting the result flushed), and the
+        // receiver LoadGlobal half stored the object itself.
+        if !wt_pre && !plan.split_recv_lg.contains(&ip) {
+            if let Some(d) = writes_reg(&proto.code[ip]) {
+                // A non-`>>>` Bitwise result and Math.imul are PROVABLY i32
+                // (`>>>` yields a u32 that can exceed i32) — their write-through
+                // is a branchless int-tag instead of the two-compare generic box.
+                let known_i32 = matches!(
+                    proto.code[ip],
+                    Instr::Bitwise { op, .. } if !matches!(op, crate::bytecode::BitwiseOp::Ushr)
+                ) || matches!(
+                    proto.code[ip],
+                    Instr::MathOp { op: MathFn::Imul, argc: 2, .. }
+                );
+                if emit_int_wt(&mut ops, &plan, d, known_i32) {
+                    flag_cmp = None; // the boxing clobbered any fused flags
+                }
+            }
+        }
     }
 
     // ── exit stubs ──
@@ -944,6 +1017,12 @@ pub(crate) fn compile_region_int_maybe_cold(
     // to the reg file / globals, restore, return. [rsi] holds the resume ip.
     dynasm!(ops ; => flush_exit);
     for &(r, x) in &plan.num_regs {
+        // A B94 split receiver is written through (boxed) at each numeric def,
+        // so memory is already current; flushing its home here would overwrite
+        // the receiver object at any exit taken inside the receiver range.
+        if plan.split_recvs.contains(&r) || plan.write_through.contains(&r) {
+            continue;
+        }
         emit_int_box_from_home(&mut ops, x);
         dynasm!(ops ; mov [rbx + dreg(r)], rax);
     }

@@ -14,6 +14,14 @@ pub(crate) const BOOL_TAG: u64 = INT_TAG + (1u64 << 48);
 /// must reference a numeric constant, a single-ASCII-char string, or (MEM path
 /// only — `const_strs` is `Some`) a string constant pre-interned at compile time
 /// whose bits the emitter embeds (`const_strs` maps constant index → bits).
+/// Is the region `IterNext`/finally-bracket admission on? Default ON;
+/// `ZIPP_NO_ITER_REGION=1` restores the decline (the whole for-of region
+/// blacklists and the loop runs interpreted, the pre-change behaviour), so the
+/// mechanism can be A/B'd with `tools/bench.py --ab-env` on ONE binary.
+fn iter_region_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_ITER_REGION").is_none()
+}
+
 pub(crate) fn region_can_compile(
     proto: &FuncProto,
     start: u32,
@@ -241,6 +249,35 @@ pub(crate) fn region_can_compile(
             Instr::HasProp { brand: false, .. } => {}
             Instr::HasProp { brand: true, .. } => {
                 reject!("[decline] HasProp brand-check at region [{start},{end}]");
+            }
+            // `IterNext` with a PRIMED next register — the for-of step — MEM
+            // path via `jit_iter_next`, which serves ONLY the three intrinsic
+            // iterator kinds the interpreter's own fast path steps inline
+            // (%RegExpStringIterator% / live %ArrayIterator% / Map-Set
+            // collection iterators, all behind the pristine `ITER_NEXT`
+            // native check) and deopts everything else BEFORE touching state.
+            // This was `regex-log-scan`'s matchAll-loop blocker: the whole
+            // 450k-step for-of region blacklisted for want of this one op
+            // (plus the Push/PopFinally pair below) and ran interpreted.
+            // An UNPRIMED next (u16::MAX — destructuring sites) keeps
+            // declining: its per-step `Get(it,"next")` is observable.
+            Instr::IterNext { next, .. } => {
+                if !iter_region_enabled() || next == u16::MAX {
+                    reject!("[decline] IterNext at region [{start},{end}]");
+                }
+            }
+            // The for-of close-handler bracket around each iteration. Both
+            // are ONE Vec push/pop on the current frame's handler stack via
+            // helpers that mirror the interpreter arms exactly, keeping the
+            // unwind state identical whichever engine executes the loop body
+            // (a throwing helper exits the region with `pending_throw` set
+            // and the interpreter unwinds using these handlers). `EndFinally`
+            // — the handler BODY's terminator — is not admitted; it lives
+            // outside the loop region.
+            Instr::PushFinally { .. } | Instr::PopFinally => {
+                if !iter_region_enabled() {
+                    reject!("[decline] finally bracket at region [{start},{end}]");
+                }
             }
             Instr::LoadConst { idx, .. } => {
                 // Numeric constants run in the f64 region; a single-ASCII-char
@@ -762,6 +799,14 @@ pub(crate) struct HeapHelpers {
     pub(crate) get_index_concat: usize,
     /// `ForInLive` helper (obj bits, key bits → Bool Value bits).
     pub(crate) forin_live: usize,
+    /// `IterNext` helper (regs base + packed reg numbers → 0 / deopt / threw).
+    pub(crate) iter_next: usize,
+    /// `PushFinally` helper (packed target/kind_reg/val_reg; total).
+    pub(crate) push_finally: usize,
+    /// `PopFinally` helper (no args; total).
+    pub(crate) pop_finally: usize,
+    /// `ToNum` string-operand helper (value bits → number bits / deopt).
+    pub(crate) to_num: usize,
     /// `HasProp` (`in`) helper (key bits, obj bits → Bool Value bits / deopt).
     pub(crate) has_property: usize,
     /// Q4 leaf-inline entry headroom check (`jit_regs_fits`).

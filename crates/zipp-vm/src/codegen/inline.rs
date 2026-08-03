@@ -272,6 +272,7 @@ pub(crate) fn emit_inline_leaf_call(
                 let bail = ops.new_dynamic_label();
                 let as_dbl = ops.new_dynamic_label();
                 let mod_done = ops.new_dynamic_label();
+                let rem_nz = ops.new_dynamic_label();
                 load_num_xmm(ops, rg(a), 0, bail);
                 load_num_xmm(ops, rg(b), 1, bail);
                 dynasm!(ops
@@ -279,6 +280,11 @@ pub(crate) fn emit_inline_leaf_call(
                     ; cvttsd2si rcx, xmm1
                     ; test rcx, rcx
                     ; jz => bail
+                    // idiv #DE guard: i64::MIN % -1 overflows the quotient and
+                    // faults the process. `a % -1` is ±0 and rare — bail and let
+                    // the interpreter get the sign right (the B116 hazard).
+                    ; cmp rcx, -1
+                    ; je => bail
                     ; cvtsi2sd xmm2, rax
                     ; ucomisd xmm2, xmm0
                     ; jp => bail                     // NaN: unordered, `jne` misses
@@ -289,6 +295,16 @@ pub(crate) fn emit_inline_leaf_call(
                     ; jne => bail
                     ; cqo
                     ; idiv rcx
+                    // Zero remainder from a NEGATIVE dividend (incl. -0.0, which
+                    // passes the integer guard: 0.0 == -0.0) is -0 in JS — boxing
+                    // Int(0) loses the sign. xmm0 still holds the original
+                    // dividend; bail and let the interpreter make the double.
+                    ; test rdx, rdx
+                    ; jnz => rem_nz
+                    ; movq rax, xmm0
+                    ; test rax, rax
+                    ; js => bail
+                    ; => rem_nz
                     ; movsxd r8, edx
                     ; cmp r8, rdx
                     ; jne => as_dbl
@@ -747,6 +763,7 @@ pub(crate) fn emit_mi_body(
                 let bail = ops.new_dynamic_label();
                 let as_dbl = ops.new_dynamic_label();
                 let mod_done = ops.new_dynamic_label();
+                let rem_nz = ops.new_dynamic_label();
                 load_num_xmm(ops, rg(a), 0, bail);
                 load_num_xmm(ops, rg(b), 1, bail);
                 dynasm!(ops
@@ -754,6 +771,11 @@ pub(crate) fn emit_mi_body(
                     ; cvttsd2si rcx, xmm1
                     ; test rcx, rcx
                     ; jz => bail
+                    // idiv #DE guard: i64::MIN % -1 overflows the quotient and
+                    // faults the process. `a % -1` is ±0 and rare — bail and let
+                    // the interpreter get the sign right (the B116 hazard).
+                    ; cmp rcx, -1
+                    ; je => bail
                     ; cvtsi2sd xmm2, rax
                     ; ucomisd xmm2, xmm0
                     ; jp => bail                     // NaN: unordered, `jne` misses
@@ -764,6 +786,16 @@ pub(crate) fn emit_mi_body(
                     ; jne => bail
                     ; cqo
                     ; idiv rcx
+                    // Zero remainder from a NEGATIVE dividend (incl. -0.0, which
+                    // passes the integer guard: 0.0 == -0.0) is -0 in JS — boxing
+                    // Int(0) loses the sign. xmm0 still holds the original
+                    // dividend; bail and let the interpreter make the double.
+                    ; test rdx, rdx
+                    ; jnz => rem_nz
+                    ; movq rax, xmm0
+                    ; test rax, rax
+                    ; js => bail
+                    ; => rem_nz
                     ; movsxd r8, edx
                     ; cmp r8, rdx
                     ; jne => as_dbl

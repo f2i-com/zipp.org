@@ -613,6 +613,21 @@ pub struct HeapHelperAddrs {
     /// May allocate transiently (key re-derivation) — GC-guarded internally.
     /// Returns the BOOL Value bits.
     pub forin_live: usize,
+    /// Helper for a region `IterNext` (the for-of step) over the intrinsic
+    /// iterator kinds (%RegExpStringIterator% / live %ArrayIterator% /
+    /// collection iterators behind the pristine ITER_NEXT native). Writes
+    /// value/done straight into the frame window; returns 0 /
+    /// `SELF_CALL_DEOPT` / `CALL_THREW`. ALLOCATES (a match step builds the
+    /// result array) and carries the region loop's GC safe point.
+    pub iter_next: usize,
+    /// Helper for a region `PushFinally` (handler-stack push; total).
+    pub push_finally: usize,
+    /// Helper for a region `PopFinally` (handler-stack pop; total).
+    pub pop_finally: usize,
+    /// Helper for a region `ToNum` whose operand is a primitive string (the
+    /// pure StringToNumber grammar — no user code, no alloc); anything else
+    /// deopts. Bool/null/undefined keep bailing inline as before.
+    pub to_num: usize,
     /// Helper for `HasProp` (the `in` operator, brand=false) over a non-Proxy
     /// chain: read-only `Vm::has_property_jit`. Returns the BOOL Value bits, or
     /// `SELF_CALL_DEOPT` when the op needs user code / a throw (interpreter only).
@@ -681,6 +696,10 @@ impl HeapHelperAddrs {
             str_substring: self.str_substring,
             coll_lookup: self.coll_lookup,
             forin_live: self.forin_live,
+            iter_next: self.iter_next,
+            push_finally: self.push_finally,
+            pop_finally: self.pop_finally,
+            to_num: self.to_num,
             has_property: self.has_property,
             regs_fits: self.regs_fits,
             typeof_str: self.typeof_str,

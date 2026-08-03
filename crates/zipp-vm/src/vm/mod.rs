@@ -40,6 +40,15 @@ const MAX_FRAMES: usize = 100_000;
 /// 1 MiB main-thread stack (Windows) at ~200 B/nesting level.
 const MAX_RUN_LOOP_DEPTH: u32 = 4096;
 
+/// Hard cap on CONSECUTIVE tail-reuse activations (`try_tail_reuse`) with no
+/// intervening frame pop. Proper tail calls run in O(1) frames, so runaway
+/// strict-mode tail recursion (`return f()` forever) never trips MAX_FRAMES —
+/// it would hang. Engines that shipped without PTC (node/V8) throw RangeError
+/// on that shape at ~10k depth; this budget matches that OUTCOME while staying
+/// ~100x above node's tolerance, so legitimate deep-but-terminating tail loops
+/// keep their constant-stack win.
+const MAX_TAIL_REUSE_STREAK: u32 = 1_000_000;
+
 /// Extra global slots reserved past `global_count` as JIT scratch "field globals"
 /// for object scalar-replacement (SROA). A field-promoted region uses pool slots
 /// `[global_count, global_count + n_fields)`; regions reuse the pool (synced per
@@ -509,6 +518,12 @@ pub struct Vm<'p> {
     /// nesting is capped (see MAX_RUN_LOOP_DEPTH) and surfaces as a catchable
     /// RangeError instead.
     run_loop_depth: u32,
+    /// Consecutive `try_tail_reuse` activations since the last frame pop.
+    /// Tail reuse grows neither `frames` nor the native stack, so runaway
+    /// tail recursion is invisible to both depth guards — this streak counter
+    /// is its budget (see MAX_TAIL_REUSE_STREAK). Reset by `pop_frame_with`;
+    /// any terminating tail loop pops eventually and starts fresh.
+    tail_reuse_streak: u32,
     /// RegExp heap idx → EXACT WTF-8 bytes of its [[OriginalSource]], present
     /// ONLY when the pattern holds lone surrogates (the struct's `source:
     /// String` field is the LOSSY view — U+FFFD per surrogate). The `source`
@@ -1477,6 +1492,7 @@ pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use helpers_misc::call_inline_stats;
 pub(crate) use helpers_misc::ic_stats;
+pub(crate) use helpers_misc::iter_region_stats;
 pub(crate) mod prof;
 pub(crate) use prof::dump as prof_stats;
 mod ic;

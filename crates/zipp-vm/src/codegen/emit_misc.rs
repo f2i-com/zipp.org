@@ -24,6 +24,93 @@ fn poly_eq_fast_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_MEM_CMPJUMP=1` disables the memory-path fused compare→branch head
+/// (`emit_fused_cmp_branch_head`), restoring the unfused compare + JumpIf pair
+/// byte-identically. Read once per region compile.
+#[inline]
+pub(crate) fn mem_cmp_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_MEM_CMPJUMP").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Fused compare→branch fast head for the MEMORY path (B118): when a
+/// `Lt/Le/Gt/Ge/Eq/Ne {dst,a,b}` is IMMEDIATELY followed by a
+/// `JumpIfTrue/False{cond: dst}`, two Int-tagged operands compare and branch on
+/// FLAGS — skipping the boxed-bool store→load round trip and the generic
+/// JumpIf's tag dispatch. That serial `setcc → box → store → reload → test`
+/// chain was the dominant per-character cost of the `parse-large-js` tokenize
+/// loop (a charCodeAt scanner is Eq+JumpIf chains over Int char codes).
+///
+/// The boolean is STILL stored to `dst` before branching: a chained `a || b`
+/// condition jumps straight to the JumpIf ip from an earlier arm (so the pair's
+/// second op must stay emitted and reachable — the caller keeps it), and the
+/// deopt contract wants the register file exact at every ip boundary.
+///
+/// Non-Int operands fall through to the UNCHANGED generic compare sequence the
+/// caller emits right after this head (then into the still-emitted JumpIf).
+/// No calls, no bails, no allocation — safe-point schedule unchanged.
+/// Off switch: `ZIPP_NO_MEM_CMPJUMP=1` (`mem_cmp_fuse_enabled`).
+pub(crate) fn emit_fused_cmp_branch_head(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    a: u16,
+    b: u16,
+    cmp: Cmp,
+    if_false: bool,
+    target: dynasmrt::DynamicLabel,
+    fallthrough: dynasmrt::DynamicLabel,
+) {
+    let generic = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(a)]
+        ; mov rcx, [rbx + dreg(b)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => generic                      // a not Int → generic pair
+        ; mov r10, rcx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => generic                      // b not Int → generic pair
+        ; cmp eax, ecx                        // signed i32 payload compare
+    );
+    // setcc preserves flags; the branch below re-tests dl (the `or` boxing the
+    // Bool clobbers flags in between).
+    match cmp {
+        Cmp::Eq => dynasm!(ops ; sete dl),
+        Cmp::Ne => dynasm!(ops ; setne dl),
+        Cmp::Lt => dynasm!(ops ; setl dl),
+        Cmp::Le => dynasm!(ops ; setle dl),
+        Cmp::Gt => dynasm!(ops ; setg dl),
+        Cmp::Ge => dynasm!(ops ; setge dl),
+    }
+    dynasm!(ops
+        ; movzx edx, dl
+        ; mov r10, QWORD BOOL_TAG as i64
+        ; or r10, rdx
+        ; mov [rbx + dreg(dst)], r10          // dst gets the Bool Value regardless
+        ; test dl, dl
+    );
+    if if_false {
+        dynasm!(ops ; jz => target);
+    } else {
+        dynasm!(ops ; jnz => target);
+    }
+    dynasm!(ops
+        ; jmp => fallthrough                  // not taken → skip the JumpIf ip
+        ; => generic
+    );
+}
+
 /// Resolve a jump `target` to a label: an in-region ip uses its own label; an
 /// out-of-region ip gets (or reuses) an exit stub label.
 pub(crate) fn region_target(

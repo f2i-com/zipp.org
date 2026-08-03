@@ -86,6 +86,8 @@ fn main() -> ExitCode {
         eprintln!(
             "[ic] call/apply target inlines  call {cih}  apply {aih}  hasOwn-intrinsic {hoh}"
         );
+        let (ins, ide) = zipp_vm::iter_region_stats();
+        eprintln!("[ic] region iter-next  native steps {ins}  deopts {ide}");
     }
     if std::env::var_os("ZIPP_RXSTATS").is_some() {
         let (att, pushes, retries, elided, skips) = zipp_vm::rx_stats();

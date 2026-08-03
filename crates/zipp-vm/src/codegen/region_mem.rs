@@ -197,6 +197,21 @@ pub(crate) fn compile_region_mem(
     }
     dynasm!(ops ; jmp => lbl(start, &in_region));
 
+    // B118 fused compare→branch: `cmp {dst} ; JumpIfTrue/False{cond: dst}` at
+    // the very next ip fuses (see `emit_fused_cmp_branch_head`). Detection
+    // only — the JumpIf stays emitted (it is a jump target of chained `||`/`&&`
+    // arms). Declined under step metering: the fused branch would skip the
+    // JumpIf block's charge.
+    let cmp_branch_pair = |ip: usize, dst: u16| -> Option<(bool, u32)> {
+        if !mem_cmp_fuse_enabled() || blocks.is_some() || ip + 2 > e {
+            return None;
+        }
+        match proto.code[ip + 1] {
+            Instr::JumpIfFalse { cond, target } if cond == dst => Some((true, target)),
+            Instr::JumpIfTrue { cond, target } if cond == dst => Some((false, target)),
+            _ => None,
+        }
+    };
     // The k-th GetProp/SetProp in the region uses inline-cache site `ic_site`.
     let mut ic_site = heap.ic_base_idx;
     for ip in s..=e {
@@ -341,6 +356,11 @@ pub(crate) fn compile_region_mem(
                     ; cvttsd2si rcx, xmm1            // b → i64
                     ; test rcx, rcx
                     ; jz => bail                     // % 0 → NaN (interp)
+                    // idiv #DE guard: i64::MIN % -1 overflows the quotient and
+                    // faults the process (reachable: a == -(2^63) round-trips the
+                    // integer guard exactly). `a % -1` is ±0 and rare — interp.
+                    ; cmp rcx, -1
+                    ; je => bail
                     ; cvtsi2sd xmm2, rax
                     ; ucomisd xmm2, xmm0
                     // NaN compares UNORDERED (ZF=PF=CF=1), so `jne` does not
@@ -659,10 +679,18 @@ pub(crate) fn compile_region_mem(
             Instr::ToNum { dst, a } => {
                 // `+x`. A number passes through UNCHANGED — note the raw `mov`
                 // rather than a round trip through xmm, which would re-tag an
-                // Int as a double and diverge from the interpreter. Bool / null /
-                // undefined / heap need ToNumber, which can run a user `valueOf`,
-                // so they bail.
+                // Int as a double and diverge from the interpreter. A non-number
+                // routes through `jit_to_num`, which serves a primitive STRING
+                // (the pure StringToNumber grammar — the `+km[2]` capture-sum
+                // idiom that used to bail the whole region per iteration) and
+                // deopts everything else (bool/null/undefined as before, and an
+                // object's ToNumber can run a user `valueOf`). Read-only + pure
+                // ⇒ no refetch, and re-execution on deopt is always sound.
+                // `ZIPP_NO_TONUM_STR=1` restores the plain bail (the pre-change
+                // shape) so the string arm can be A/B'd on ONE binary.
+                let tonum_str = std::env::var_os("ZIPP_NO_TONUM_STR").is_none();
                 let is_num = ops.new_dynamic_label();
+                let tn_done = ops.new_dynamic_label();
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(a)]
                     ; mov r10, rax
@@ -671,9 +699,27 @@ pub(crate) fn compile_region_mem(
                     ; je => is_num                       // Int payload
                     ; sub r10d, (INT_TAG_HI + 1) as i32  // 0x7FFA (bool tag)
                     ; cmp r10d, 3                        // high16 in [0x7FFA,0x7FFD] ⇒ not a number
-                    ; jbe => bail
-                    ; => is_num                          // double falls through here
+                    ; ja => is_num                       // double
+                );
+                if tonum_str {
+                    dynasm!(ops
+                        ; mov rcx, rdi                       // vm
+                        ; mov rdx, rax                       // value bits
+                        ; mov rax, QWORD heap.to_num as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail                         // non-string → interp ToNumber
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => tn_done
+                    );
+                } else {
+                    dynasm!(ops ; jmp => bail);
+                }
+                dynasm!(ops
+                    ; => is_num
                     ; mov [rbx + dreg(dst)], rax
+                    ; => tn_done
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -812,18 +858,42 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::Lt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Lt),
-            Instr::Le { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Le),
-            Instr::Gt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Gt),
-            Instr::Ge { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Ge),
-            // `===` / `!==` are polymorphic: numeric operands compare as f64,
-            // interned single-char strings / Int / Bool / Null / Undefined
-            // compare by bits, non-interned heap operands bail to the interpreter.
-            Instr::Eq { dst, a, b } => {
-                region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, false, heap.strict_eq)
-            }
-            Instr::Ne { dst, a, b } => {
-                region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, true, heap.strict_eq)
+            Instr::Lt { dst, a, b }
+            | Instr::Le { dst, a, b }
+            | Instr::Gt { dst, a, b }
+            | Instr::Ge { dst, a, b }
+            | Instr::Eq { dst, a, b }
+            | Instr::Ne { dst, a, b } => {
+                let cmp = match proto.code[ip] {
+                    Instr::Lt { .. } => Cmp::Lt,
+                    Instr::Le { .. } => Cmp::Le,
+                    Instr::Gt { .. } => Cmp::Gt,
+                    Instr::Ge { .. } => Cmp::Ge,
+                    Instr::Eq { .. } => Cmp::Eq,
+                    _ => Cmp::Ne,
+                };
+                // B118: Int+Int compare feeding the NEXT ip's JumpIf branches on
+                // flags (bool still stored); non-Int falls through to the
+                // unchanged generic sequence below.
+                if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
+                    let t =
+                        region_target(tgt, start, end, &in_region, &mut exit_stubs, &mut ops);
+                    let ft = lbl((ip + 2) as u32, &in_region);
+                    emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft);
+                }
+                match cmp {
+                    // `===` / `!==` are polymorphic: numeric operands compare as
+                    // f64, interned single-char strings / Int / Bool / Null /
+                    // Undefined compare by bits, non-interned heap operands bail
+                    // to the interpreter.
+                    Cmp::Eq => region_poly_eq(
+                        &mut ops, ip, bail, epilogue, dst, a, b, false, heap.strict_eq,
+                    ),
+                    Cmp::Ne => region_poly_eq(
+                        &mut ops, ip, bail, epilogue, dst, a, b, true, heap.strict_eq,
+                    ),
+                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp),
+                }
             }
             Instr::Jump { target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
@@ -1965,6 +2035,69 @@ pub(crate) fn compile_region_mem(
                     emit_refetch_ta(&mut ops, snap, plan);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::IterNext { value_dst, done_dst, iter, idx, next } => {
+                // The for-of step via `jit_iter_next` — serves the intrinsic
+                // iterator kinds only (see the helper); anything else deopts
+                // BEFORE state moves, so the interpreter re-executes this op
+                // with full semantics (a persistent deopt evicts the region,
+                // restoring the interpreted loop). The helper writes value/
+                // done straight into the frame window (two outputs), so only
+                // the status comes back in rax. `idx` (r9) is the dense-Array
+                // positional cursor, advanced by the helper's plain-Array walk
+                // and untouched on the intrinsic-iterator paths — exactly the
+                // interpreter arm's behaviour.
+                //
+                // A match step ALLOCATES (result array + capture slices) and
+                // runs `maybe_gc` (the loop's safe point), so re-derive the
+                // pinned r13/r14 and TypedArray snapshots afterward — the
+                // StrConcat discipline. No user code runs on the served paths.
+                let packed = ((iter as u64) << 48)
+                    | ((next as u64) << 32)
+                    | ((value_dst as u64) << 16)
+                    | done_dst as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, rbx                        // frame register window
+                    ; mov r8, QWORD packed as i64         // iter/next/value/done regs
+                    ; mov r9d, idx as i32                 // dense-Array cursor reg
+                    ; mov rax, QWORD heap.iter_next as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // non-intrinsic → redo in interp
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::PushFinally { target, kind_reg, val_reg } => {
+                // Handler-stack push mirroring the interpreter arm, so the
+                // unwind state stays identical whichever engine runs the loop
+                // body. Total: no deopt, no alloc, no user code, no refetch.
+                let packed =
+                    ((target as u64) << 32) | ((kind_reg as u64) << 16) | val_reg as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, QWORD packed as i64        // target/kind_reg/val_reg
+                    ; mov rax, QWORD heap.push_finally as i64
+                    ; call rax
+                );
+            }
+            Instr::PopFinally => {
+                // The pop half — same contract as PushFinally above.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rax, QWORD heap.pop_finally as i64
+                    ; call rax
+                );
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 // Resume interpreting at this ip so the interpreter performs the

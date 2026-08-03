@@ -1,5 +1,7 @@
 use crate::bytesearch;
-use crate::cursor::{self, Direction};
+use crate::cursor::Direction;
+#[cfg(feature = "utf16")]
+use crate::cursor;
 use crate::matchers::{self, CharProperties};
 #[cfg(feature = "utf16")]
 use crate::position::IndexPosition;

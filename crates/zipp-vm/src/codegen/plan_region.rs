@@ -77,6 +77,42 @@ pub(crate) fn wt_share_enabled() -> bool {
     }
 }
 
+/// B94 receiver splitting on the INT tier — built, proven sound, and
+/// DEFAULT OFF (`ZIPP_INT_SPLIT=1` enables; `ZIPP_NO_INT_SPLIT=1` forces off).
+///
+/// The mechanism: a recycled pinned receiver (`iv[i] = st` with `st` also the
+/// xorshift temp) declined the whole i32 fill region with "pinned receiver reg
+/// not cleanly excludable" — the B94 class the double tier already splits. The
+/// INT emitter write-throughs the split register's defs BOXED (its memory slot
+/// holds Values, not raw i64s; the store runs BEFORE any i53 guard, whose exit
+/// resumes at ip+1 expecting the result flushed) and skips it in flush_exit.
+///
+/// Why it is off: the promotion it unlocks is a measured REGRESSION. On the
+/// typedarray-math i32 fill phase (8M iterations, single-run phase attribution
+/// 2026-08-03) the split INT region runs ~96ms against ~60ms for the MEM tier
+/// it replaces — and disabling the write-through entirely (an unsound
+/// measurement hack) still measured ~100ms, so the cost is the INT tier
+/// itself, not the boxing: every Bitwise op round-trips xmm↔gpr (`movq` in,
+/// op, `movq` out) on the xorshift's SERIAL dependency chain, six times per
+/// iteration, where the MEM tier works the chain in gprs against the register
+/// file. The wave-3 attribution of the fill's +43ms-vs-node to this decline is
+/// therefore refuted: hosting the region on the INT tier as it exists today
+/// makes the phase slower. The real blocker is gpr (not xmm) homes for
+/// bitwise-chain regions, recorded for follow-up. Cached once per process.
+pub(crate) fn int_split_enabled() -> bool {
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match ON.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_INT_SPLIT").is_some()
+                && std::env::var_os("ZIPP_NO_INT_SPLIT").is_none();
+            ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+            v
+        }
+    }
+}
+
 pub(crate) fn arr_pin_loose() -> bool {
     static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
     match ON.load(std::sync::atomic::Ordering::Relaxed) {
@@ -148,8 +184,18 @@ pub(crate) fn plan_region(
     ta_plan: &TaPinPlan,
     admit_bitwise: bool,
     admit_split: bool,
+    admit_wt_share: bool,
 ) -> Option<RegionPlan> {
-    plan_region_cold(proto, start, end, ta_plan, admit_bitwise, admit_split, &FxHashSet::default())
+    plan_region_cold(
+        proto,
+        start,
+        end,
+        ta_plan,
+        admit_bitwise,
+        admit_split,
+        admit_wt_share,
+        &FxHashSet::default(),
+    )
 }
 
 /// `cold`: ips the caller will emit as SIDE EXITS (B9) rather than as native
@@ -157,6 +203,7 @@ pub(crate) fn plan_region(
 /// natively, so they neither define a home's value nor constrain its type, and
 /// letting them into the walks would only make the planner decline a region
 /// whose hot path is perfectly typed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_region_cold(
     proto: &FuncProto,
     start: u32,
@@ -164,14 +211,17 @@ pub(crate) fn plan_region_cold(
     ta_plan: &TaPinPlan,
     admit_bitwise: bool,
     admit_split: bool,
+    admit_wt_share: bool,
     cold: &FxHashSet<usize>,
 ) -> Option<RegionPlan> {
-    match plan_region_cold_inner(proto, start, end, ta_plan, admit_bitwise, admit_split, cold, true)
-    {
+    match plan_region_cold_inner(
+        proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, cold, true,
+    ) {
         PlanOutcome::Plan(p) => Some(*p),
         PlanOutcome::RetryNoHoist => {
             match plan_region_cold_inner(
-                proto, start, end, ta_plan, admit_bitwise, admit_split, cold, false,
+                proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, cold,
+                false,
             ) {
                 PlanOutcome::Plan(p) => Some(*p),
                 _ => None,
@@ -189,17 +239,22 @@ fn plan_region_cold_inner(
     ta_plan: &TaPinPlan,
     admit_bitwise: bool,
     // Does the CALLER implement write-through (store each def to `[rbx + dreg(r)]`
-    // and skip that register in its flush)? Only the REGALLOC (double) path does,
-    // and it gates two features that depend on it: B94 live-range splitting and
-    // B97 home-sharing for `read_outside` registers.
-    //
-    // `region_int` shares this planner and implements neither. Admitting B94 there
-    // panicked it ("no entry found for key" — it looks up a home the plan withheld);
-    // admitting B97 there silently returned the WRONG ANSWER, because making a
-    // register shareable also drops its entry load, so its home starts as garbage
-    // and the int flush wrote that garbage into the frame slot. Both were caught by
-    // `hoisted_const_on_untaken_branch`. The int path passes `false`.
+    // and skip that register in its flush)? These two flags gate the two features
+    // that depend on it: `admit_split` is B94 live-range splitting (a recycled
+    // pinned receiver gets a numeric home while its memory slot stays the
+    // receiver's), `admit_wt_share` is B97 home-sharing for `read_outside`
+    // registers. The REGALLOC (double) path implements both and passes
+    // (true, true). `region_int` shares this planner: it historically implemented
+    // NEITHER — admitting B94 there panicked it ("no entry found for key"), and
+    // admitting B97 there silently returned the WRONG ANSWER (a shareable register
+    // loses its entry load, so its home starts as garbage and the int flush wrote
+    // that garbage into the frame slot; caught by `hoisted_const_on_untaken_branch`).
+    // The INT emitter now carries its own (BOXED) write-through for splits — the
+    // B94 hazard class the typedarray i32 fill declined on — so it passes
+    // admit_split behind `ZIPP_NO_INT_SPLIT`, but still admit_wt_share=false:
+    // B97's shareable/no-entry-load allocation stays double-only.
     admit_split: bool,
+    admit_wt_share: bool,
     cold: &FxHashSet<usize>,
     // See `PlanOutcome::RetryNoHoist`: `false` on the retry pass — no constant
     // is hoisted, so none pins a permanent home.
@@ -1313,7 +1368,7 @@ fn plan_region_cold_inner(
         // via write-through instead of pinning a permanent home.
         if first_seen.get(&r) == Some(&false)
             || hoisted.contains(&r)
-            || (!(admit_split && wt_share_enabled()) && read_outside.contains(&r))
+            || (!(admit_wt_share && wt_share_enabled()) && read_outside.contains(&r))
         {
             (s, e)
         } else {
@@ -1331,7 +1386,7 @@ fn plan_region_cold_inner(
     let shareable = |r: u16| -> bool {
         first_seen.get(&r) != Some(&false)
             && !hoisted.contains(&r)
-            && ((admit_split && wt_share_enabled()) || !read_outside.contains(&r))
+            && ((admit_wt_share && wt_share_enabled()) || !read_outside.contains(&r))
     };
 
     // ── B97 write-through set ── every read-after-region register that `shareable`
@@ -1346,7 +1401,7 @@ fn plan_region_cold_inner(
     // `c`'s only in-region def never executes, so nothing ever fills its home; with
     // the flush skipped, its slot correctly keeps the 3 the frame already held.
     for &r in &reg_order {
-        if admit_split && read_outside.contains(&r) && shareable(r) {
+        if admit_wt_share && read_outside.contains(&r) && shareable(r) {
             write_through.insert(r);
         }
     }

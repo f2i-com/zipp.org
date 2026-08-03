@@ -111,6 +111,7 @@ impl<'p> Vm<'p> {
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,
             run_loop_depth: 0,
+            tail_reuse_streak: 0,
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
             collection_index: rustc_hash::FxHashMap::default(),

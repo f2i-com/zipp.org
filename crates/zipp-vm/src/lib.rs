@@ -99,6 +99,16 @@ pub fn call_inline_stats() -> (u64, u64, u64) {
     vm::call_inline_stats()
 }
 
+/// `ZIPP_ICSTATS=1` region-`IterNext` counters: `(native_steps, deopts)` —
+/// for-of steps a compiled loop region served natively through
+/// `jit_iter_next` (the plain dense-Array walk plus the three intrinsic
+/// iterator kinds), and the steps it declined back to the interpreter.
+/// Zeroed unless the variable was set. `ZIPP_NO_ITER_REGION=1` declines the
+/// ops at region admission and forces both to zero.
+pub fn iter_region_stats() -> (u64, u64) {
+    vm::iter_region_stats()
+}
+
 /// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,
 /// most-called first. Empty unless the variable was set. See
 /// `vm::builtins::bstats` for why this exists rather than a reading of

@@ -6906,6 +6906,15 @@ impl<'p> Vm<'p> {
         let Some((fid, closure)) = plain else {
             return Ok(false);
         };
+        // Tail reuse never grows `frames`, so runaway tail recursion (strict
+        // `return f()` forever) is invisible to MAX_FRAMES — bound the streak
+        // of pop-free reuses instead so it throws the SAME catchable
+        // RangeError node does on this shape, rather than hanging.
+        self.tail_reuse_streak += 1;
+        if self.tail_reuse_streak > MAX_TAIL_REUSE_STREAK {
+            self.tail_reuse_streak = 0;
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
         let (callee_regs, callee_params, rest_reg, arguments_reg, p_strict, p_lex, simple) = {
             let p = self.func(fid as usize);
             if p.is_generator || p.is_async {
@@ -7020,6 +7029,10 @@ impl<'p> Vm<'p> {
             get_index_concat: jit_get_index_concat as usize,
             upval_get: jit_upval_get as usize,
             forin_live: jit_forin_live as usize,
+            iter_next: crate::vm::helpers_misc::jit_iter_next as usize,
+            push_finally: crate::vm::helpers_misc::jit_push_finally as usize,
+            pop_finally: crate::vm::helpers_misc::jit_pop_finally as usize,
+            to_num: crate::vm::helpers_misc::jit_to_num as usize,
             has_property: jit_has_property as usize,
             regs_fits: jit_regs_fits as usize,
             typeof_str: jit_typeof as usize,
@@ -7281,6 +7294,8 @@ impl<'p> Vm<'p> {
             }
         }
         let finished = self.frames.pop().expect("frame underflow");
+        // A real pop proves the tail-reuse streak terminated — reset its budget.
+        self.tail_reuse_streak = 0;
         // Shrink the register file back to the caller's window top.
         self.regs.truncate(finished.base);
         if self.frames.len() == stop_depth {

@@ -2518,6 +2518,280 @@ pub(crate) extern "win64" fn jit_forin_live(
     Value::bool(live).bits()
 }
 
+/// `ZIPP_ICSTATS=1` counters for the region-compiled `IterNext` helper — the
+/// mechanism evidence that a for-of loop region actually stepped its iterator
+/// natively instead of blacklisting the whole region (`ZIPP_NO_ITER_REGION=1`
+/// restores the decline and forces these to zero).
+pub(crate) mod iterstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static NATIVE_STEPS: AtomicU64 = AtomicU64::new(0);
+    static DEOPTS: AtomicU64 = AtomicU64::new(0);
+    static ON: AtomicU8 = AtomicU8::new(2);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    /// One `IterNext` served natively by `jit_iter_next` (any of the three
+    /// intrinsic step paths). (Counted only from the JIT helper; zero without.)
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn native_step() {
+        if enabled() {
+            NATIVE_STEPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One `jit_iter_next` deopt (non-intrinsic iterator / unprimed next).
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn deopt() {
+        if enabled() {
+            DEOPTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(native_steps, deopts)`
+    pub fn dump() -> (u64, u64) {
+        (NATIVE_STEPS.load(Ordering::Relaxed), DEOPTS.load(Ordering::Relaxed))
+    }
+}
+
+pub use iterstats::dump as iter_region_stats;
+
+/// Win64 helper for a region `IterNext` — the for-of step over an iterator the
+/// engine can drive INTRINSICALLY: a %RegExpStringIterator% (`s.matchAll(re)`),
+/// a live %ArrayIterator% (`a.values()`/`keys()`/`entries()`), or a Map/Set/
+/// snapshot collection iterator — exactly the three fast paths the
+/// interpreter's own `IterNext` arm takes when the primed `next` is the
+/// pristine `ITER_NEXT` native (dispatch.rs; the `{value, done}` object an
+/// intrinsic `next` would build is engine-internal, so skipping it is
+/// unobservable there and equally unobservable here) — plus the interpreter
+/// arm's FIRST fast path, the plain dense-Array positional walk (`for (v of
+/// arr)`, where GetIterator left the raw Array in the iter register because
+/// the iterator protocol was pristine). Everything else — a holey array, a
+/// generator, a user `next`, an unprimed (u16::MAX) next register — returns
+/// `SELF_CALL_DEOPT` BEFORE any state is touched, so the
+/// interpreter re-executes the op with full semantics (repeated deopts evict
+/// the region, restoring today's interpreted loop).
+///
+/// `regs` is the region's frame-register window (`rbx`); `packed` carries the
+/// four register numbers. The step is read off `vm` and its results are
+/// written STRAIGHT into the frame window (two outputs cannot ride the single
+/// return register). A throwing step (`lastIndex` setter, a re-entrant
+/// `exec`'s TypeError) routes through `jit_thrown_to_sentinel` → `CALL_THREW`,
+/// so the region unwinds WITHOUT re-running the (stateful, non-idempotent)
+/// step.
+///
+/// SAFE POINT: the step ALLOCATES (match-result array + capture strings) and
+/// this helper is a region loop's only per-iteration call, so it must carry
+/// its own `maybe_gc` — B117's GC-starvation warning is exactly this shape
+/// (450k allocating iterations with no safe point balloon the heap and the
+/// bill appears as locality, invisible to every correctness test). It runs
+/// FIRST, before any Value is copied out of the frame window, so everything
+/// it can collect is still rooted in `vm.regs`.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `regs` points at the current frame's register
+/// window inside `vm.regs` (the region ABI's rcx), and the four packed
+/// register numbers index inside that window.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_iter_next(
+    vm: *mut core::ffi::c_void,
+    regs: *mut u64,
+    packed: u64,
+    idx_reg: u32,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    // The region loop's safe point (see above) — everything live is in
+    // `vm.regs`, which the GC traces.
+    vm.maybe_gc();
+    let iter_reg = ((packed >> 48) & 0xFFFF) as usize;
+    let next_reg = ((packed >> 32) & 0xFFFF) as usize;
+    let value_dst = ((packed >> 16) & 0xFFFF) as usize;
+    let done_dst = (packed & 0xFFFF) as usize;
+    if next_reg == u16::MAX as usize {
+        // Unprimed (destructuring) site: the per-step `Get(it, "next")` is
+        // observable — interpreter only. (Admission already rejects these;
+        // defensive.)
+        iterstats::deopt();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let it = Value::from_bits(unsafe { *regs.add(iter_reg) });
+    if !it.is_heap() {
+        // The interpreter THROWS here ("x is not iterable") — deopt so it does.
+        iterstats::deopt();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // ── plain dense Array positional walk ── the interpreter arm's FIRST fast
+    // path, mirrored check-for-check (virtual length via `array_js_len`,
+    // element overlays, a HOLE → the generic path, i.e. deopt here). On a hit
+    // it advances the `idx` cursor register exactly as the interpreter does;
+    // on exhaustion it writes ONLY done (the interpreter's `Some(None)` arm
+    // leaves value_dst untouched).
+    let it_heap_idx = it.heap_index();
+    if (vm.array_js_len.is_empty() || !vm.array_js_len.contains_key(&it_heap_idx))
+        && !vm.array_elements_overlaid(it_heap_idx)
+    {
+        let idx_reg = idx_reg as usize;
+        let cur = crate::vm::helpers_numeric::array_index(Value::from_bits(unsafe {
+            *regs.add(idx_reg)
+        }))
+        .unwrap_or(0);
+        let hit = match vm.heap.get(it_heap_idx) {
+            HeapObj::Array(items) => match items.get(cur) {
+                Some(v) if !v.is_hole() => Some(Some(*v)),
+                Some(_) => None,    // hole → generic path (interpreter)
+                None => Some(None), // exhausted
+            },
+            _ => None,
+        };
+        match hit {
+            Some(Some(v)) => {
+                unsafe {
+                    *regs.add(value_dst) = v.bits();
+                    *regs.add(done_dst) = Value::bool(false).bits();
+                    *regs.add(idx_reg) = Value::int((cur + 1) as i32).bits();
+                }
+                iterstats::native_step();
+                return 0;
+            }
+            Some(None) => {
+                unsafe {
+                    *regs.add(done_dst) = Value::bool(true).bits();
+                }
+                iterstats::native_step();
+                return 0;
+            }
+            None => {
+                if matches!(vm.heap.get(it_heap_idx), HeapObj::Array(_)) {
+                    // A holey dense array: the element's value comes from the
+                    // prototype chain — interpreter only.
+                    iterstats::deopt();
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+            }
+        }
+    }
+    let next = Value::from_bits(unsafe { *regs.add(next_reg) });
+    // The primed `next` must be the PRISTINE intrinsic — a user `next`
+    // (function or otherwise) runs arbitrary code and builds an observable
+    // result object; the interpreter owns that protocol.
+    if !it.is_heap()
+        || !next.is_heap()
+        || !matches!(vm.heap.get(next.heap_index()),
+                     HeapObj::Native(n) if *n == crate::vm::native::ITER_NEXT)
+    {
+        iterstats::deopt();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let it_idx = it.heap_index();
+    // Same receiver-kind gate as the interpreter fast path (dispatch.rs): the
+    // three step probes below key off identity side tables / Iterator
+    // internals, and each returns `None` WITHOUT mutating when it_idx is not
+    // its kind — so probing in the interpreter's exact order and deopting on
+    // triple-None is state-identical to the interpreter arm.
+    let step = if let Some(s) = vm.regexp_string_iter_step(it_idx) {
+        s
+    } else if let Some(s) = vm.array_iter_step(it_idx) {
+        s
+    } else if let Some(p) = vm.collection_iter_step(it_idx) {
+        Ok(p)
+    } else {
+        // TypedArray-backed (per-step bounds check can throw) and every other
+        // shape stay on the interpreter's general path.
+        iterstats::deopt();
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    match step {
+        Ok((v, d)) => {
+            unsafe {
+                *regs.add(value_dst) = v.bits();
+                *regs.add(done_dst) = Value::bool(d).bits();
+            }
+            iterstats::native_step();
+            0
+        }
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
+/// Win64 helper for a region `ToNum` (`+x`) whose operand is not already a
+/// number: serves a primitive STRING only — `to_number_strict` on a
+/// `Str`/`Cons` runs the pure StringToNumber grammar (no ToPrimitive, no user
+/// code, no VM-heap alloc; the result is `Value::num` bits exactly as the
+/// interpreter arm builds them). Everything else — bool/null/undefined (kept
+/// on the interpreter as before), an object (observable `valueOf`), a BigInt
+/// or Symbol (TypeError) — returns `SELF_CALL_DEOPT`; `ToNum` is read-only so
+/// re-execution is always sound. This is the `+km[2]` idiom: for-of over
+/// `matchAll` summing a numeric capture bailed the whole compiled loop region
+/// on EVERY iteration without it.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `bits` is a valid Value rooted in the caller's
+/// frame registers.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_to_num(vm: *mut core::ffi::c_void, bits: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let v = Value::from_bits(bits);
+    if !v.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if !matches!(vm.heap.get(v.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match vm.to_number_strict(v) {
+        Ok(n) => Value::num(n).bits(),
+        // Unreachable for a Str/Cons operand; defensive.
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
+/// Win64 helper for a region `PushFinally`: push the finally handler frame on
+/// the CURRENT interpreter frame, exactly as the interpreter arm does — so
+/// that when any later helper in the iteration throws (`CALL_THREW` → region
+/// exit → interpreter unwind), the handler stack is in the same state the
+/// interpreted loop would have left it in. `packed` = target<<32 |
+/// kind_reg<<16 | val_reg (all compile-time constants of the op). No alloc on
+/// the VM heap (a Rust Vec push), no user code, total — never deopts.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm` with at least one live frame (a region only runs
+/// inside one).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_push_finally(vm: *mut core::ffi::c_void, packed: u64) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let target = (packed >> 32) as u32;
+    let kind_reg = ((packed >> 16) & 0xFFFF) as u16;
+    let val_reg = (packed & 0xFFFF) as u16;
+    let top = vm.frames.len() - 1;
+    vm.frames[top].handlers.push(Handler::Finally { target, kind_reg, val_reg });
+    0
+}
+
+/// Win64 helper for a region `PopFinally` — the pop half of `jit_push_finally`
+/// (the interpreter arm verbatim). Total, never deopts.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm` with at least one live frame.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_pop_finally(vm: *mut core::ffi::c_void) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let top = vm.frames.len() - 1;
+    vm.frames[top].handlers.pop();
+    0
+}
+
 /// Win64 helper for Tier C `TypeOf` (`typeof v`): `vm.type_of(v)` (a fixed
 /// &'static str) materialised to a heap string; returns its Value bits. The
 /// downstream `=== "number"` compares by CONTENT via `region_poly_eq`'s slow

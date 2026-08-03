@@ -101,6 +101,9 @@ version = "0.16.0"
 [dependencies.memchr]
 version = "2.4.0"
 default-features = false
+# `memmem::Finder::into_owned` (startpredicate.rs) needs memchr's allocator
+# support even in no_std builds; the `std` feature still layers memchr/std on top.
+features = ["alloc"]
 
 [dependencies.regex]
 version = "1.13.1"

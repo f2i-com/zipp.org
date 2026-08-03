@@ -53,8 +53,8 @@ fn deep_recursion_past_native_depth_caps() {
 
 #[test]
 fn runaway_recursion_throws_catchable_rangeerror() {
-    // Sloppy on purpose: strict-mode runaway recursion hangs the BASE
-    // interpreter too (pre-existing, unrelated to the cross-call path).
+    // Sloppy on purpose: this exercises the MAX_FRAMES path. The strict
+    // (tail-reuse) shape is covered by strict_recursion_limit.rs (B117).
     let out = run_ok(
         r#"
         function inf(n) { return inf2(n + 1); }

@@ -167,9 +167,56 @@ pub(crate) fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, i
         dynasm!(ops ; movdqa Rx(d), Rx(ax) ; psubq Rx(d), Rx(bx));
     }
     copy_clobber(lc, d);
+    // A split/write-through dst must reach memory BEFORE the i53 guard: the
+    // guard's exit resumes at ip+1 expecting the result flushed, and flush_exit
+    // deliberately skips these registers (see `emit_int_wt`).
+    emit_int_wt(ops, plan, dst, false);
     if !plan.elide_guard.contains(&ip) {
         emit_i53_guard(ops, d, ip, flush_exit);
     }
+}
+
+/// B94 write-through on the INT tier. A numeric def of a split receiver (or a
+/// write-through register) must reach MEMORY as well as its i64 home, because
+/// the int flush_exit deliberately skips these registers — memory is what the
+/// interpreter reads on ANY exit, including one taken while the register's slot
+/// holds the receiver OBJECT (which a home flush would clobber). Unlike the
+/// double tier's raw `movq` store, the slot holds a boxed Value, so the i64 is
+/// boxed exactly as flush_exit would box it. Emitted right after the def's home
+/// store and BEFORE any i53 guard (whose exit resumes at ip+1 with the result
+/// expected flushed). Scratch: rax/rcx/rdx/xmm0 — never the r8..r11 bool homes.
+/// `known_i32`: the def PROVABLY fits i32 (a non-`>>>` Bitwise result, or
+/// `Math.imul`), so the box is a branchless int-tag — the generic
+/// `emit_int_box_from_home` costs two compares and two branches per def, which
+/// on the xorshift fill (three split defs per iteration) priced the whole INT
+/// region below the MEM tier it replaced.
+/// Returns whether anything was emitted (the caller must then drop any live
+/// compare-flag fusion: the boxing clobbers FLAGS on the generic path).
+pub(crate) fn emit_int_wt(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &RegionPlan,
+    dst: u16,
+    known_i32: bool,
+) -> bool {
+    if !plan.split_recvs.contains(&dst) && !plan.write_through.contains(&dst) {
+        return false;
+    }
+    if let Some(&Home::Xmm(h)) = plan.reg_home.get(&dst) {
+        if known_i32 {
+            dynasm!(ops
+                ; movq rax, Rx(h)
+                ; mov eax, eax                   // zero-extend the i32 payload
+                ; mov rcx, QWORD INT_TAG as i64
+                ; or rax, rcx
+                ; mov [rbx + dreg(dst)], rax
+            );
+        } else {
+            emit_int_box_from_home(ops, h);
+            dynasm!(ops ; mov [rbx + dreg(dst)], rax);
+        }
+        return true;
+    }
+    false
 }
 
 /// Set the integer flags for `home[a] <cmp> home[b]` (SIGNED). Reads `b` from
