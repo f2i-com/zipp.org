@@ -183,7 +183,7 @@ for reasons that have nothing to do with the engine. If an existing clone has it
 on: `git config core.autocrlf false && git rm --cached -r -q . && git reset
 --hard`.
 
-**Performance — cold geomean 1.45× zipp/node (95% CI 1.44×–1.46×)** on the
+**Performance — cold geomean 1.40× zipp/node (95% CI 1.39×–1.41×)** on the
 ten programs in `bench/real/`, 21 counterbalanced paired observations against
 Node v24.12.0, every output byte-identical to Node. The measured binary is the
 profile-guided release build (`bash tools/pgo.sh` — adopted after PGO measured
@@ -191,30 +191,30 @@ profile-guided release build (`bash tools/pgo.sh` — adopted after PGO measured
 
 | bench | node | zipp | paired ratio |
 |---|---|---|---|
-| map-set-heavy | 765ms | 539ms | **0.71×** |
-| async-promise-chain | 342ms | 343ms | **1.01×** |
-| class-prototype-hot | 293ms | 381ms | 1.30× |
-| markdown-render | 273ms | 358ms | 1.31× |
-| json-large | 272ms | 365ms | 1.35× |
-| polymorphic-objects | 326ms | 453ms | 1.39× |
-| sparse-array | 80ms | 111ms | 1.40× |
-| parse-large-js | 269ms | 531ms | 1.98× |
-| typedarray-math | 202ms | 490ms | 2.42× |
-| regex-log-scan | 464ms | 1234ms | 2.67× |
+| map-set-heavy | 906ms | 611ms | **0.67×** |
+| async-promise-chain | 353ms | 349ms | **1.00×** |
+| class-prototype-hot | 299ms | 384ms | 1.29× |
+| json-large | 291ms | 377ms | 1.30× |
+| sparse-array | 82ms | 112ms | 1.35× |
+| markdown-render | 283ms | 385ms | 1.37× |
+| polymorphic-objects | 329ms | 468ms | 1.43× |
+| typedarray-math | 206ms | 402ms | 1.96× |
+| parse-large-js | 277ms | 550ms | 1.97× |
+| regex-log-scan | 494ms | 1210ms | 2.49× |
 
-Cold total is the primary metric. Zipp starts about 3.4× faster than Node (8.6ms
-vs 29.6ms — no snapshot to load), is *faster than Node* on `map-set-heavy` by
-29%, and `async-promise-chain` is at parity.
+Cold total is the primary metric. Zipp starts about 3.3× faster than Node (9.3ms
+vs 31.0ms — no snapshot to load), is *faster than Node* on `map-set-heavy` by
+33%, and `async-promise-chain` is at parity.
 
 The same capture also times three DIAGNOSTIC benchmarks that are deliberately
 outside the ten, because they exist to expose weaknesses the ten cannot see:
-`polymorphic-objects-v2` 2.74×, `sparse-array-v2` 3.69×, `property-ic-shapes`
-4.19×. Their own geomean is 3.48×, and quoting a geomean over all thirteen gives
-1.78×, which is not comparable to any historical figure in this file — the ten
+`polymorphic-objects-v2` 2.69×, `sparse-array-v2` 3.65×, `property-ic-shapes`
+4.17×. Their own geomean is 3.45×, and quoting a geomean over all thirteen gives
+1.72×, which is not comparable to any historical figure in this file — the ten
 are the series. The harness now computes and records both, so the split no
 longer depends on anyone remembering to pass `--benches`.
 
-This capture is `bench/head_clean_5cafcb1_pgo.json`, marked `publishable: true`
+This capture is `bench/head_clean_fe2dbdc_pgo.json`, marked `publishable: true`
 like its predecessors (`bench/head_clean_e839613.json` was the first artifact
 to earn that flag). The flag means the harness checked, *before
 measuring*, that the engine reported a build identity, that its tree was not
@@ -282,17 +282,17 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today (cold total) | 1.45× |
-| `regex-log-scan` at Node parity | **1.32×** |
-| `typedarray-math` at Node parity | **1.33×** |
-| **both of the two worst at Node parity** | **1.20×** |
+| today (cold total) | 1.40× |
+| `regex-log-scan` at Node parity | **1.28×** |
+| `parse-large-js` at Node parity | **1.31×** |
+| **both of the two worst at Node parity** | **1.19×** |
 
 (The *shape* of this arithmetic is what matters and it does not move as the
-headline does: the two worst rows going to parity is worth ~0.25 of geomean, and
+headline does: the two worst rows going to parity is worth ~0.2 of geomean, and
 no contained fix reaches that.)
 
-The cold score being below 1.5× is not general parity: eight rows remain slower
-and the two worst are 2.67× and 2.42×. The contained fixes in `PERF_ROADMAP.md` are
+The cold score being below 1.4× is not general parity: eight rows remain slower
+and the two worst are 2.49× and 1.97×. The contained fixes in `PERF_ROADMAP.md` are
 safe substrate, but moving toward 1× still requires stable shape metadata, an
 optimizing CFG/SSA tier, and arena/nursery allocation rather than a stack of
 unmeasured 1–2% tweaks.
