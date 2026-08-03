@@ -270,7 +270,13 @@ pub(crate) fn compile_region_int_maybe_cold(
             return None;
         }
     };
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = match dynasmrt::x64::Assembler::new() {
+        Ok(a) => a,
+        Err(_) => {
+            decline_emit("int-emit: assembler alloc failed");
+            return None;
+        }
+    };
     let (s, e) = (start as usize, end as usize);
 
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
@@ -914,7 +920,18 @@ pub(crate) fn compile_region_int_maybe_cold(
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
             }
-            _ => return None,
+            // POST-PLAN hole: this region passed admission AND `plan_region`,
+            // but this emitter has no arm for the op. Name the decline through
+            // the planner's [decline-reason] channel — an unnamed fall to a
+            // lower tier corrupts the tier-attribution reading (see the
+            // regalloc emitter's twin arm). Behavior unchanged — still None.
+            _ => {
+                decline_emit(format_args!(
+                    "int-emit-unhandled: {:?}",
+                    proto.code[ip]
+                ));
+                return None;
+            }
         }
     }
 
@@ -944,7 +961,13 @@ pub(crate) fn compile_region_int_maybe_cold(
     dynasm!(ops ; => entry_bail ; mov DWORD [rsi], start as i32);
     emit_region_restore_n(&mut ops, xmm_off, frame);
 
-    let buf = ops.finalize().ok()?;
+    let buf = match ops.finalize() {
+        Ok(b) => b,
+        Err(_) => {
+            decline_emit("int-emit: assembler finalize failed");
+            return None;
+        }
+    };
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }

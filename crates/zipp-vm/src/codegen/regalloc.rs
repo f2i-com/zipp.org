@@ -30,7 +30,13 @@ pub(crate) fn compile_region_regalloc(
             eprintln!("[jit] DOUBLE region [{start},{end}] B94 split receiver r{sr}");
         }
     }
-    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let mut ops = match dynasmrt::x64::Assembler::new() {
+        Ok(a) => a,
+        Err(_) => {
+            decline_emit("regalloc-emit: assembler alloc failed");
+            return None;
+        }
+    };
     let (s, e) = (start as usize, end as usize);
 
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
@@ -494,7 +500,19 @@ pub(crate) fn compile_region_regalloc(
                 );
                 lc = None;
             }
-            _ => return None,
+            // POST-PLAN hole: this region passed `region_can_compile` AND
+            // `plan_region` (which types e.g. `Mod` and `MathOp{Imul,2}` as Num
+            // defs), but this emitter has no arm for the op. The decline must be
+            // NAMED: an unnamed fall to the memory tier makes the ABSENT
+            // [decline-reason] line read as "runs regalloc" under the documented
+            // tier-attribution rule (B32/B53). Behavior unchanged — still None.
+            _ => {
+                decline_emit(format_args!(
+                    "regalloc-emit-unhandled: {:?}",
+                    proto.code[ip]
+                ));
+                return None;
+            }
         }
         // ── B94 write-through ── a numeric def of the split receiver must reach
         // MEMORY as well as its home, because `flush_exit` deliberately skips
@@ -559,7 +577,13 @@ pub(crate) fn compile_region_regalloc(
     );
     emit_region_restore_n(&mut ops, xmm_off, frame);
 
-    let buf = ops.finalize().ok()?;
+    let buf = match ops.finalize() {
+        Ok(b) => b,
+        Err(_) => {
+            decline_emit("regalloc-emit: assembler finalize failed");
+            return None;
+        }
+    };
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }

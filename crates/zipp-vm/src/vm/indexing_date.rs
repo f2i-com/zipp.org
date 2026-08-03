@@ -177,10 +177,18 @@ impl<'p> Vm<'p> {
             HeapObj::Array(_) => {
                 let aidx = obj.heap_index();
                 // Numeric key (incl. an integral double like 1.0 — the JIT region
-                // produces f64 indices): a defineProperty'd special index (accessor
-                // or non-default-attribute data) in arr_props overrides the dense
-                // slot; else direct element access, else undefined.
-                if let Some(i) = array_index(key) {
+                // produces f64 indices), or a canonical numeric-STRING key ("123"
+                // from a for-in snapshot, decided on its bytes in place;
+                // ZIPP_NO_ARRKEY_FAST=1 sends it back through key_of + the
+                // generic get_prop chain): a defineProperty'd special index
+                // (accessor or non-default-attribute data) in arr_props overrides
+                // the dense slot; else direct element access, else undefined.
+                let int_index = match array_index(key) {
+                    Some(i) => Some(i),
+                    None if arrkey_fast_enabled() => self.str_key_array_index(key),
+                    None => None,
+                };
+                if let Some(i) = int_index {
                     // A LIVE-mapped arguments index reads the formal's register
                     // (a still-mapped index is always a plain data property, so
                     // this wins over any attribute-only override).
@@ -205,14 +213,17 @@ impl<'p> Vm<'p> {
                     // Out of range OR a hole → not an own element; [[Get]] continues up
                     // the ACTUAL prototype chain (a setPrototypeOf custom proto can
                     // carry inherited indices/accessors), else %Array.prototype%.
-                    let k = self.key_of(key);
+                    // The walk's key text is the canonical decimal of `i` for BOTH
+                    // key shapes, so spell it from `i` (no key_of allocation).
+                    let mut buf = [0u8; 20];
+                    let k = crate::heap::index_key(&mut buf, i);
                     let proto = match self.proto_of.get(&aidx) {
                         Some(&p) => p,
                         None if self.arr_proto != 0 => Value::heap(self.arr_proto),
                         None => Value::NULL,
                     };
                     if proto.is_heap() {
-                        return self.get_member(proto, &k, obj);
+                        return self.get_member(proto, k, obj);
                     }
                     return Ok(Value::UNDEFINED);
                 }

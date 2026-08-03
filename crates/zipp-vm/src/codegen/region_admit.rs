@@ -398,7 +398,11 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
     let branchy = code.iter().any(|i| {
         matches!(
             i,
-            Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }
+            Instr::Jump { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
         )
     });
     let mut seen_effect = false;
@@ -514,6 +518,19 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
             Instr::Jump { target }
             | Instr::JumpIfFalse { target, .. }
             | Instr::JumpIfTrue { target, .. } => {
+                let t = target as usize;
+                if t <= i || t > term {
+                    return None;
+                }
+            }
+            // A fused compare-and-branch is BOTH a deopt-capable comparison (a
+            // non-numeric operand bails, so it obeys the effect-ordering rule
+            // like `Lt`/`Le` above) and a forward branch (same target rule as
+            // the plain jumps).
+            Instr::JumpIfNotLt { target, .. } | Instr::JumpIfNotLe { target, .. } => {
+                if seen_effect {
+                    return None;
+                }
                 let t = target as usize;
                 if t <= i || t > term {
                     return None;

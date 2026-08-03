@@ -7,6 +7,25 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// `ZIPP_NO_JSON_LEAF_FAST=1` restores the old JSON.stringify leaf emission:
+/// the `into_owned` copy per string leaf, the fresh `String` per number
+/// (`fmt_f64`), and the cloned-key + `pos()` re-lookup object walk. Kept so
+/// each change is A/B-able and bisectable on one binary.
+#[inline]
+fn json_leaf_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_JSON_LEAF_FAST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Evaluate a `Math.<fn>` call over `argc` argument registers (coerced to
     /// numbers). Mirrors JS semantics where they differ from Rust's f64 methods:
@@ -330,6 +349,34 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The same key set as `json_object_keys_fast`, but as map SLOTS — no key
+    /// clone, no later `pos()` re-lookup. The second element is true when every
+    /// selected slot is a PRIMITIVE data property (no accessor, no heap value):
+    /// serializing those (with no replacer) runs NO user code, so the map
+    /// provably cannot mutate mid-walk and the slots stay exact for the whole
+    /// loop. Otherwise the caller must snapshot the key texts before the first
+    /// recursion, exactly like the cloning path.
+    fn json_object_slots_fast(&self, idx: u32) -> Option<(Vec<usize>, bool)> {
+        if idx == self.global_this
+            || self.module_namespaces.contains_key(&idx)
+            || self.deferred_ns_state.contains_key(&idx)
+        {
+            return None;
+        }
+        match self.heap.get(idx) {
+            HeapObj::Object(m) => {
+                let slots: Vec<usize> = spec_key_order(&m.keys)
+                    .into_iter()
+                    .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
+                    .collect();
+                let all_prim =
+                    slots.iter().all(|&i| !m.attrs[i].accessor && !m.vals[i].is_heap());
+                Some((slots, all_prim))
+            }
+            _ => None,
+        }
+    }
+
     /// SerializeJSONProperty, appending straight into a single shared output
     /// buffer instead of building a per-node `String`/`Vec<String>` tree and
     /// joining at every level (the V8 approach). Returns `true` if a value was
@@ -396,7 +443,11 @@ impl<'p> Vm<'p> {
         if v.is_number() {
             let n = v.as_f64();
             if n.is_finite() {
-                out.push_str(&fmt_f64(n));
+                if json_leaf_fast_enabled() {
+                    fmt_f64_into(out, n);
+                } else {
+                    out.push_str(&fmt_f64(n));
+                }
             } else {
                 out.push_str("null");
             }
@@ -411,8 +462,16 @@ impl<'p> Vm<'p> {
             HeapObj::Str(_) | HeapObj::Cons { .. } => {
                 // EXACT bytes: a lone surrogate must emit its \udXXX escape
                 // (well-formed JSON.stringify), not a U+FFFD substitution.
-                let b = self.heap.str_wtf8_cow(idx).unwrap().into_owned();
-                json_quote_wtf8_into(out, &b);
+                // A flat string's Cow is Borrowed — quote straight from it
+                // (`out` is a separate buffer, so the heap borrow is free);
+                // only a rope materializes.
+                if json_leaf_fast_enabled() {
+                    let b = self.heap.str_wtf8_cow(idx).unwrap();
+                    json_quote_wtf8_into(out, &b);
+                } else {
+                    let b = self.heap.str_wtf8_cow(idx).unwrap().into_owned();
+                    json_quote_wtf8_into(out, &b);
+                }
                 return Ok(true);
             }
             HeapObj::Func(_)
@@ -436,7 +495,11 @@ impl<'p> Vm<'p> {
                 let prim = self.to_primitive_number(v)?;
                 let n = self.to_number(prim)?;
                 if n.is_finite() {
-                    out.push_str(&fmt_f64(n));
+                    if json_leaf_fast_enabled() {
+                        fmt_f64_into(out, n);
+                    } else {
+                        out.push_str(&fmt_f64(n));
+                    }
                 } else {
                     out.push_str("null");
                 }
@@ -560,6 +623,147 @@ impl<'p> Vm<'p> {
             }
             out.push(']');
         } else {
+            // FAST PATH (leaf emission): with no allowlist and no function
+            // replacer, walk a plain object's keys as map SLOTS instead of
+            // cloned Strings re-found by `pos()` each iteration. Two tiers:
+            // every value a primitive data property ⇒ nothing in the loop can
+            // run user code, so the map provably never mutates and keys are
+            // quoted straight from the borrow (no clone, no re-lookup, no
+            // version check); otherwise the key texts are snapshotted upfront
+            // (same clones as the old path — a toJSON/getter may delete them
+            // out from under the walk) and only the `pos()` re-lookup is
+            // elided, guarded by the map version (a delete shifts slots and
+            // bumps it). `ZIPP_NO_JSON_LEAF_FAST=1` restores the cloning walk
+            // below.
+            let slot_plan = if json_leaf_fast_enabled()
+                && allowlist.is_none()
+                && !self.is_callable(replacer)
+            {
+                self.json_object_slots_fast(idx)
+            } else {
+                None
+            };
+            if let Some((slots, all_prim)) = slot_plan {
+                let sep = if indent.is_empty() { ":" } else { ": " };
+                out.push('{');
+                let mut any = false;
+                if all_prim {
+                    for &slot in &slots {
+                        // Tentatively write `[,]\n pad "key"sep`, then the
+                        // value; an OMITTED value (undefined) rolls the buffer
+                        // back to before this entry — same as the cloning path.
+                        let mark = out.len();
+                        let val = match self.heap.get(idx) {
+                            HeapObj::Object(m) => {
+                                if any {
+                                    out.push(',');
+                                }
+                                if !indent.is_empty() {
+                                    out.push('\n');
+                                    out.push_str(&pad);
+                                }
+                                json_quote_into(out, &m.keys[slot]);
+                                out.push_str(sep);
+                                m.vals[slot]
+                            }
+                            // Unreachable — only user code changes a heap
+                            // slot's variant and none has run; an omitted
+                            // entry (undefined) is the harmless answer.
+                            _ => Value::UNDEFINED,
+                        };
+                        // The key is unobservable for a primitive value with
+                        // no replacer (no toJSON probe, no replacer call) —
+                        // pass "" like the array path does for primitives.
+                        let wrote = match self.json_value_into(
+                            v, "", val, indent, depth + 1, visited, replacer, allowlist, out,
+                        ) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                visited.pop();
+                                return Err(e);
+                            }
+                        };
+                        if wrote {
+                            any = true;
+                        } else {
+                            out.truncate(mark);
+                        }
+                    }
+                } else {
+                    let v0 = self.heap.version_of(idx);
+                    let keys: Vec<(usize, String)> = match self.heap.get(idx) {
+                        HeapObj::Object(m) => {
+                            slots.iter().map(|&i| (i, m.keys[i].clone())).collect()
+                        }
+                        // Unreachable: unchanged since `json_object_slots_fast`.
+                        _ => Vec::new(),
+                    };
+                    for (slot, k) in &keys {
+                        // Value read at SERIALIZATION time (so a prior key's
+                        // toJSON that mutated this one is observed). While the
+                        // version is unchanged the snapshot slot IS `pos(&k)`;
+                        // after a bump, re-find the key exactly as the cloning
+                        // path always did (accessor / deleted ⇒ `json_get`).
+                        let direct = if self.heap.version_of(idx) == v0 {
+                            match self.heap.get(idx) {
+                                HeapObj::Object(m) if !m.attrs[*slot].accessor => {
+                                    Some(m.vals[*slot])
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            match self.heap.get(idx) {
+                                HeapObj::Object(m) => match m.pos(k) {
+                                    Some(i) if !m.attrs[i].accessor => Some(m.vals[i]),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        };
+                        let val = match direct {
+                            Some(val) => val,
+                            None => match self.json_get(v, k) {
+                                Ok(val) => val,
+                                Err(e) => {
+                                    visited.pop();
+                                    return Err(e);
+                                }
+                            },
+                        };
+                        let mark = out.len();
+                        if any {
+                            out.push(',');
+                        }
+                        if !indent.is_empty() {
+                            out.push('\n');
+                            out.push_str(&pad);
+                        }
+                        json_quote_into(out, k);
+                        out.push_str(sep);
+                        let wrote = match self.json_value_into(
+                            v, k, val, indent, depth + 1, visited, replacer, allowlist, out,
+                        ) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                visited.pop();
+                                return Err(e);
+                            }
+                        };
+                        if wrote {
+                            any = true;
+                        } else {
+                            out.truncate(mark);
+                        }
+                    }
+                }
+                if any && !indent.is_empty() {
+                    out.push('\n');
+                    out.push_str(&pad_close);
+                }
+                out.push('}');
+                visited.pop();
+                return Ok(true);
+            }
             // EnumerableOwnPropertyNames(val) — or the PropertyList, when given.
             // FAST PATH (T0.5/T0.6): a plain object (not global / namespace) yields
             // its enumerable own string keys as a `Vec<String>` straight from the

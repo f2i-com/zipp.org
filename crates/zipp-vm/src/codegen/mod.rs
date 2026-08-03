@@ -870,6 +870,21 @@ pub struct Jit {
     /// Loop headers where the INTEGER path was tried and deoptimised; the next
     /// compile for the key skips int and uses the double path instead.
     region_int_blacklist: FxHashSet<(u32, u32)>,
+    /// Dense per-func mirror of `region_blacklist` membership, indexed
+    /// `[func_id][loop_header_ip]` (1 = permanently blacklisted). The back-edge
+    /// fast path: a permanently-rejected loop pays two array reads per
+    /// iteration here instead of 2 hash probes (`get_region` miss +
+    /// `region_blacklist` hit) — the loop-region sibling of
+    /// `fn_state`/[`FN_DEAD`]. Never cleared: nothing ever removes a key from
+    /// `region_blacklist` (`compile_region` refuses blacklisted keys, and even
+    /// `set_meter` keeps the set), so a set byte cannot go stale. Inner vecs
+    /// grow lazily on first blacklist and are bounded by bytecode length.
+    region_dead: Vec<Vec<u8>>,
+    /// `ZIPP_NO_DENSE_BACKEDGE=1` restores the per-back-edge hash probes that
+    /// `region_dead` short-circuits, so the change is A/B-able and bisectable
+    /// on one binary. Read once in [`Jit::new`] (like `threshold_override`),
+    /// so the back-edge check stays a field compare.
+    dense_backedge: bool,
     /// Inline-cache ways for heap-op JIT sites: site `k` owns the contiguous
     /// entries `[k*JIT_IC_WAYS, (k+1)*JIT_IC_WAYS)`. Grows only at compile time
     /// (never during a native run, EXCEPT through a region call helper — after
@@ -919,6 +934,7 @@ impl Jit {
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|n| *n >= 1)
             .unwrap_or(0);
+        jit.dense_backedge = std::env::var_os("ZIPP_NO_DENSE_BACKEDGE").is_none();
         jit
     }
 
@@ -948,6 +964,11 @@ impl Jit {
         self.compiled.clear();
         self.counts.clear();
         self.region_counts.clear();
+        // `region_dead` is deliberately KEPT: it mirrors `region_blacklist`
+        // membership only (never compiled-ness), and the blacklist survives
+        // this reset too. `fn_state` below cannot stay for the same reason in
+        // reverse — it also encodes FN_COMPILED, which `compiled.clear()`
+        // just invalidated.
         self.fn_state.clear();
         self.self_cache = None;
         self.map_kernels.clear();
@@ -1124,6 +1145,39 @@ impl Jit {
         self.regions.get(&(func_id, entry_ip))
     }
 
+    /// Dense region-state check — the back-edge fast path. `true` iff the loop
+    /// headed at `entry_ip` is permanently blacklisted, so the caller can skip
+    /// `try_run_osr` + `record_region` entirely: `get_region` cannot hit (a
+    /// blacklisted key is never compiled) and `record_region` is a no-op
+    /// `false` for it. The loop-region sibling of the [`FN_DEAD`] check at
+    /// frame entry.
+    #[inline]
+    pub fn region_dead(&self, func_id: u32, entry_ip: u32) -> bool {
+        self.dense_backedge
+            && self
+                .region_dead
+                .get(func_id as usize)
+                .is_some_and(|v| v.get(entry_ip as usize).copied().unwrap_or(0) != 0)
+    }
+
+    /// Mirror a `region_blacklist` insert into the dense side table. Called at
+    /// every site that inserts the key, and ONLY those: [`Jit::blacklist_region`],
+    /// the decline arm of [`Jit::compile_region`], and the no-retry evict arm of
+    /// [`Jit::note_region_resume`]. The retry-evict and `region_defer` paths
+    /// leave the byte 0, so a loop that can still compile keeps counting.
+    fn set_region_dead(&mut self, func_id: u32, entry_ip: u32) {
+        let f = func_id as usize;
+        if self.region_dead.len() <= f {
+            self.region_dead.resize_with(f + 1, Vec::new);
+        }
+        let v = &mut self.region_dead[f];
+        let i = entry_ip as usize;
+        if v.len() <= i {
+            v.resize(i + 1, 0);
+        }
+        v[i] = 1;
+    }
+
     /// Count a back-edge to the loop headed at `entry_ip`. Returns `true` exactly
     /// once, when the count crosses `OSR_THRESHOLD` and the region is neither
     /// compiled nor blacklisted — the caller should then attempt `compile_region`.
@@ -1149,6 +1203,7 @@ impl Jit {
             eprintln!("[jit] region fn{func_id} [{entry_ip}] DECLINED (call-mix gate)");
         }
         self.region_blacklist.insert((func_id, entry_ip));
+        self.set_region_dead(func_id, entry_ip);
     }
 
     /// Undo the threshold trip reported by [`Jit::record_and_should_compile`]:
@@ -1278,6 +1333,7 @@ impl Jit {
                     eprintln!("[jit] region fn{func_id} [{start},{end}] DECLINED (blacklisted)");
                 }
                 self.region_blacklist.insert(key);
+                self.set_region_dead(key.0, key.1);
             }
         }
     }
@@ -1339,6 +1395,7 @@ impl Jit {
                 self.region_counts.remove(&key);
             } else {
                 self.region_blacklist.insert(key);
+                self.set_region_dead(key.0, key.1);
             }
         }
     }

@@ -243,7 +243,7 @@ pub(crate) fn parse_float(s: &str) -> f64 {
 /// `n.to_string() == *k`, which allocated a String for every numeric key just
 /// to re-derive the text it already had -- once per key per enumeration.
 #[inline]
-fn canonical_u32_key(k: &str) -> Option<u32> {
+pub(crate) fn canonical_u32_key(k: &str) -> Option<u32> {
     let b = k.as_bytes();
     if b.is_empty() || b.len() > 10 {
         return None;
@@ -260,6 +260,27 @@ fn canonical_u32_key(k: &str) -> Option<u32> {
         n = n * 10 + (c - b'0') as u64;
     }
     (n < u32::MAX as u64).then_some(n as u32)
+}
+
+/// `ZIPP_NO_ARRKEY_FAST=1` restores the allocating string-key paths on the
+/// array element machinery: the `key_of` + `parse::<u32>` + `to_string`
+/// canonicality re-derivation in `[[HasProperty]]`, and the `key_of` +
+/// generic `get_prop` detour for a canonical numeric-string computed read.
+/// This exists purely so the change is A/B-able and bisectable on one
+/// binary.
+#[inline]
+pub(crate) fn arrkey_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ARRKEY_FAST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
 }
 
 /// Indices into `keys` in spec **OrdinaryOwnPropertyKeys** order: integer-index

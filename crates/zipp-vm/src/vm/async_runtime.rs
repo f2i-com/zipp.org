@@ -115,6 +115,59 @@ mod asyncstats {
 
 pub use asyncstats::dump as async_stats;
 
+/// The pristine-%Promise.prototype% proof, resolved to SLOT INDICES. The full
+/// proof (`promise_proto_pristine_uncached`) re-found `then`/`constructor`/
+/// `@@species` with 2-4 linear `pos()` scans plus 3-4 `heap.get`s on EVERY
+/// `.then` / `await` / `Promise.all` element; the slots cannot move without a
+/// version bump, so once resolved the warm re-proof is version compares plus
+/// direct slot reads.
+///
+/// Guarded by the heap's index-parallel `versions` array — the same
+/// invalidation the JIT inline cache rides: a key add/delete, any
+/// `defineProperty`, a whole-object `Heap::replace`, and GC slot reuse all
+/// bump the owning object's version. What a version does NOT guard (B110's
+/// audit: a plain in-place `vals[i] = v` data write bumps nothing) is never
+/// trusted from the cache — the accessor bit and the value identity at each
+/// slot are re-read on every call. On any guard mismatch the full proof
+/// re-runs and re-resolves the slots: conservative fallback, never a wrong
+/// answer.
+#[derive(Clone, Copy)]
+pub(crate) struct PromisePristineSlots {
+    /// `heap.versions[promise_proto]` when the slots were resolved.
+    proto_version: u32,
+    /// `heap.versions[promise_ctor_intrinsic]` when the slots were resolved.
+    ctor_version: u32,
+    /// Slots of `then` / `constructor` in %Promise.prototype%'s `ObjMap`.
+    then_slot: u32,
+    ctor_slot: u32,
+    /// `@@species` on %Promise%: `(slot, getter heap index, getter slot
+    /// version)` — the getter was proven `Native(SPECIES_GET)` at fill time,
+    /// and its slot version pins that identity (only `Heap::replace`/GC reuse
+    /// can change a `Native`, and both bump). `None` when the key was absent
+    /// at fill time (also pristine; adding it would bump the ctor version).
+    species: Option<(u32, u32, u32)>,
+}
+
+/// `ZIPP_NO_PROMISE_SLOT_CACHE=1` makes `promise_proto_pristine` run the
+/// original full scan on every call, bypassing the slot cache entirely — the
+/// rollback switch and the two sides of a one-binary A/B (`tools/bench.py
+/// --ab-env`, no fat-LTO layout confound). Same idiom as
+/// `ZIPP_NO_PROMISE_PRISTINE` / `ZIPP_NO_ENUM_HOIST`.
+#[inline]
+fn promise_slot_cache_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROMISE_SLOT_CACHE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Park the live register window `[new_base..]` back onto a suspended
     /// activation, REUSING `buf` -- the buffer this resume detached from that
@@ -682,10 +735,38 @@ impl<'p> Vm<'p> {
     /// intrinsic data properties, and %Promise%[@@species] is still the
     /// intrinsic getter — the shared half of the plain-promise fast-lane
     /// gates (instance-independent).
-    pub(crate) fn promise_proto_pristine(&self) -> bool {
+    ///
+    /// Answered from the resolved slots when they are warm (version compares
+    /// + slot reads — see [`PromisePristineSlots`]); a cold or invalidated
+    /// cache re-runs the full scan once and re-resolves. Single-realm by
+    /// construction: both the cache and the full proof only ever describe the
+    /// MAIN realm's `promise_proto`/`promise_ctor_intrinsic` anchors — a
+    /// createRealm/ShadowRealm child's promise carries the child's prototype
+    /// and already fails the callers' instance checks before reaching here.
+    pub(crate) fn promise_proto_pristine(&mut self) -> bool {
         if self.promise_proto == 0 || self.promise_ctor_intrinsic == 0 {
             return false;
         }
+        if !promise_slot_cache_enabled() {
+            return self.promise_proto_pristine_uncached();
+        }
+        if let Some(known) = self.promise_pristine_from_slots() {
+            return known;
+        }
+        // Cold cache, or a guarded version moved: run the full proof and
+        // capture the slots for the next call. `None` (not pristine) leaves
+        // every call on the full proof — exactly the pre-cache behavior, and
+        // those calls take the generic promise paths anyway.
+        let slots = self.promise_pristine_resolve_slots();
+        self.promise_pristine_slots = slots;
+        slots.is_some()
+    }
+
+    /// The original linear proof, kept verbatim: the whole path under
+    /// `ZIPP_NO_PROMISE_SLOT_CACHE=1`, and the re-proof a cold or invalidated
+    /// slot cache falls back to (via `promise_pristine_resolve_slots`, which
+    /// mirrors it read-for-read).
+    fn promise_proto_pristine_uncached(&self) -> bool {
         let proto_ok = match self.heap.get(self.promise_proto) {
             HeapObj::Object(m) => {
                 let intrinsic = |key: &str, target: u32| {
@@ -718,6 +799,132 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Answer the pristine question from the resolved slots: `Some(answer)`
+    /// when the guards hold, `None` when the cache is cold or a guarded
+    /// object's version moved (the caller then re-runs the full proof).
+    ///
+    /// A matching version proves the slot INDICES still name their keys (all
+    /// structural mutation bumps — key add/delete, defineProperty, replace,
+    /// GC reuse). What versions do NOT guard is re-read on every call: an
+    /// in-place `vals[i] = v` data write deliberately bumps nothing
+    /// (access.rs: "no shape change, so no version bump"), so the accessor
+    /// bit and the value identity at each slot are always read fresh —
+    /// `Promise.prototype.then = f` is observed on the very next call.
+    #[inline]
+    fn promise_pristine_from_slots(&self) -> Option<bool> {
+        let c = self.promise_pristine_slots?;
+        if self.heap.version_of(self.promise_proto) != c.proto_version
+            || self.heap.version_of(self.promise_ctor_intrinsic) != c.ctor_version
+        {
+            return None;
+        }
+        let m = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => m,
+            // Unreachable under a matching version (`Heap::replace` bumps) —
+            // decline to the full proof rather than reason about it.
+            _ => return None,
+        };
+        let (ts, cs) = (c.then_slot as usize, c.ctor_slot as usize);
+        // Belt-and-braces: the versions say the layout is unchanged; verify
+        // the slots still name their keys anyway, so an un-bumped structural
+        // change could only ever cost a re-proof, never a wrong answer.
+        if m.keys.get(ts).map_or(true, |k| k != "then")
+            || m.keys.get(cs).map_or(true, |k| k != "constructor")
+        {
+            return None;
+        }
+        if m.attrs[ts].accessor
+            || !m.vals[ts].is_heap()
+            || m.vals[ts].heap_index() != self.promise_then_intrinsic
+            || m.attrs[cs].accessor
+            || !m.vals[cs].is_heap()
+            || m.vals[cs].heap_index() != self.promise_ctor_intrinsic
+        {
+            // The slots provably still name `then`/`constructor`, so this IS
+            // the full proof's answer: an in-place overwrite (or an attr
+            // flip) made the prototype non-pristine. The cache stays — a
+            // later in-place RESTORE of the intrinsic re-answers true.
+            return Some(false);
+        }
+        let mc = match self.heap.get(self.promise_ctor_intrinsic) {
+            HeapObj::Object(mc) => mc,
+            _ => return None,
+        };
+        match c.species {
+            // No `@@species` key at fill time; adding one (assignment can't —
+            // there is no setter to hit — so a define/key-add) bumps the ctor
+            // version, which already mismatched above if it happened.
+            None => Some(true),
+            Some((slot, getter, getter_version)) => {
+                let s = slot as usize;
+                if mc.keys.get(s).map_or(true, |k| k != "@@species") {
+                    return None;
+                }
+                if mc.attrs[s].accessor
+                    && mc.vals[s].is_heap()
+                    && mc.vals[s].heap_index() == getter
+                    && self.heap.version_of(getter) == getter_version
+                {
+                    // The same getter object, un-replaced since fill proved
+                    // it `Native(SPECIES_GET)` — no `heap.get` needed.
+                    Some(true)
+                } else {
+                    // A DIFFERENT value here could still be pristine (any
+                    // other `Native(SPECIES_GET)` identity answers the same
+                    // question), so a mismatch is never a fast `false` —
+                    // re-prove in full and re-resolve.
+                    None
+                }
+            }
+        }
+    }
+
+    /// Run the FULL pristine proof — read-for-read the same checks as
+    /// `promise_proto_pristine_uncached` — and, when it holds, capture the
+    /// slot indices plus the version of every heap object the proof read:
+    /// %Promise.prototype%, %Promise%, and the @@species getter. `Some` is
+    /// "pristine, and how to re-check it warm"; `None` is "not pristine".
+    fn promise_pristine_resolve_slots(&self) -> Option<PromisePristineSlots> {
+        let m = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => m,
+            _ => return None,
+        };
+        let intrinsic_slot = |key: &str, target: u32| {
+            m.pos(key).filter(|&i| {
+                !m.attrs[i].accessor
+                    && m.vals[i].is_heap()
+                    && m.vals[i].heap_index() == target
+            })
+        };
+        let then_slot = intrinsic_slot("then", self.promise_then_intrinsic)?;
+        let ctor_slot = intrinsic_slot("constructor", self.promise_ctor_intrinsic)?;
+        let mc = match self.heap.get(self.promise_ctor_intrinsic) {
+            HeapObj::Object(mc) => mc,
+            _ => return None,
+        };
+        let species = match mc.pos("@@species") {
+            None => None,
+            Some(i) => {
+                let v = mc.vals[i];
+                let pristine = mc.attrs[i].accessor
+                    && v.is_heap()
+                    && matches!(self.heap.get(v.heap_index()),
+                                HeapObj::Native(id) if *id == native::SPECIES_GET);
+                if !pristine {
+                    return None;
+                }
+                Some((i as u32, v.heap_index(), self.heap.version_of(v.heap_index())))
+            }
+        };
+        Some(PromisePristineSlots {
+            proto_version: self.heap.version_of(self.promise_proto),
+            ctor_version: self.heap.version_of(self.promise_ctor_intrinsic),
+            then_slot: then_slot as u32,
+            ctor_slot: ctor_slot as u32,
+            species,
+        })
+    }
+
     /// True when promise `idx` is PLAIN for the TICK-NEUTRAL fast lanes
     /// (PerformPromiseThen's SpeciesConstructor skip, Await's PromiseResolve
     /// pass-through, the Promise.all element lane): a native HeapObj::Promise
@@ -728,7 +935,7 @@ impl<'p> Vm<'p> {
     /// then unobservable and yields the intrinsic. NOTE: unlike the (defunct)
     /// resolve-adoption skip, the fast lanes gated on THIS predicate perform
     /// the same number of ticks as the generic paths.
-    pub(crate) fn promise_plain_unobservable(&self, idx: u32) -> bool {
+    pub(crate) fn promise_plain_unobservable(&mut self, idx: u32) -> bool {
         if !matches!(self.heap.get(idx), HeapObj::Promise { .. }) {
             return false;
         }

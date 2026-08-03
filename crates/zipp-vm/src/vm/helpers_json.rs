@@ -14,13 +14,51 @@ pub(crate) fn json_quote(s: &str) -> String {
     out
 }
 
+/// `ZIPP_NO_JSON_QUOTE_BULK=1` restores the per-code-point quoting loop
+/// (`json_quote_cp` per char) in `json_quote_into`/`json_quote_wtf8_into`,
+/// so the bulk-run path is A/B-able and bisectable on one binary.
+#[inline]
+fn json_quote_bulk_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_JSON_QUOTE_BULK").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// `json_quote` appending into an existing buffer (the stringify fast path —
 /// avoids a fresh String per quoted key/value).
 pub(crate) fn json_quote_into(out: &mut String, s: &str) {
     out.reserve(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        json_quote_cp(out, c as u32);
+    if json_quote_bulk_enabled() {
+        // Bulk-copy maximal clean runs: JSON escapes exactly `"`, `\` and
+        // controls < 0x20 — all ASCII, and an ASCII byte never occurs inside
+        // a multi-byte UTF-8 sequence, so a byte scan finds every escape and
+        // every run boundary lands on a char boundary.
+        let b = s.as_bytes();
+        let (mut run, mut i) = (0usize, 0usize);
+        while i < b.len() {
+            let c = b[i];
+            if c < 0x20 || c == b'"' || c == b'\\' {
+                out.push_str(&s[run..i]);
+                json_quote_cp(out, c as u32);
+                run = i + 1;
+            }
+            i += 1;
+        }
+        out.push_str(&s[run..]);
+    } else {
+        // `ZIPP_NO_JSON_QUOTE_BULK=1`: the old per-code-point loop.
+        for c in s.chars() {
+            json_quote_cp(out, c as u32);
+        }
     }
     out.push('"');
 }
@@ -38,10 +76,54 @@ pub(crate) fn json_quote_wtf8(b: &[u8]) -> String {
 pub(crate) fn json_quote_wtf8_into(out: &mut String, b: &[u8]) {
     out.reserve(b.len() + 2);
     out.push('"');
-    for cp in crate::heap::wtf8_code_points(b) {
-        json_quote_cp(out, cp);
+    if json_quote_bulk_enabled() {
+        // Same bulk-run scan over WTF-8. The only WTF-8 sequences that are
+        // not valid UTF-8 are the 3-byte lone-surrogate encodings
+        // `0xED 0xA0..=0xBF _`, so a run stops there and the surrogate keeps
+        // its exact `\udXXX` escape via `json_quote_cp` — byte-for-byte the
+        // per-code-point path. (`0xED` with a second byte below 0xA0 is
+        // U+D000..U+D7FF — plain text, it stays in the run.)
+        let (mut run, mut i) = (0usize, 0usize);
+        while i < b.len() {
+            let c = b[i];
+            if c < 0x20 || c == b'"' || c == b'\\' {
+                json_quote_run(out, &b[run..i]);
+                json_quote_cp(out, c as u32);
+                i += 1;
+                run = i;
+            } else if c == 0xED && b.get(i + 1).is_some_and(|&n| (0xA0..=0xBF).contains(&n)) {
+                json_quote_run(out, &b[run..i]);
+                let (cp, len) = crate::heap::wtf8_decode(b, i);
+                json_quote_cp(out, cp);
+                i += len;
+                run = i;
+            } else {
+                i += 1;
+            }
+        }
+        json_quote_run(out, &b[run..]);
+    } else {
+        // `ZIPP_NO_JSON_QUOTE_BULK=1`: the old per-code-point loop.
+        for cp in crate::heap::wtf8_code_points(b) {
+            json_quote_cp(out, cp);
+        }
     }
     out.push('"');
+}
+
+/// Append one clean (escape-free) run of WTF-8 bytes. The bulk scanner only
+/// hands this valid UTF-8 (lone-surrogate triples are routed to the escape
+/// path), so the `Err` arm is a defensive exact fallback, not a reachable
+/// path for canonical buffers.
+fn json_quote_run(out: &mut String, seg: &[u8]) {
+    match std::str::from_utf8(seg) {
+        Ok(s) => out.push_str(s),
+        Err(_) => {
+            for cp in crate::heap::wtf8_code_points(seg) {
+                json_quote_cp(out, cp);
+            }
+        }
+    }
 }
 
 /// One code point of JSON string-literal quoting. `cp` may be a lone
@@ -55,9 +137,20 @@ fn json_quote_cp(out: &mut String, cp: u32) {
         0x09 => out.push_str("\\t"),
         0x08 => out.push_str("\\b"),
         0x0C => out.push_str("\\f"),
-        c if c < 0x20 => out.push_str(&format!("\\u{c:04x}")),
-        c if (0xD800..=0xDFFF).contains(&c) => out.push_str(&format!("\\u{c:04x}")),
+        c if c < 0x20 => json_quote_u_escape(out, c),
+        c if (0xD800..=0xDFFF).contains(&c) => json_quote_u_escape(out, c),
         c => out.push(char::from_u32(c).unwrap_or('\u{FFFD}')),
+    }
+}
+
+/// `\uXXXX` with four LOWERCASE hex digits — exactly what the
+/// `format!("\\u{c:04x}")` it replaces printed, minus the String each
+/// escape allocated.
+fn json_quote_u_escape(out: &mut String, c: u32) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push_str("\\u");
+    for sh in [12u32, 8, 4, 0] {
+        out.push(HEX[((c >> sh) & 0xF) as usize] as char);
     }
 }
 

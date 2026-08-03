@@ -38,6 +38,62 @@ impl<'p> Vm<'p> {
         self.has_property_dyn(obj, k)
     }
 
+    /// The key's text viewed IN PLACE: `Some` iff `key` is a flat string
+    /// whose WTF-8 bytes are valid UTF-8 — byte-identical to what `key_of`
+    /// would allocate. A rope / lone-surrogate / Symbol / non-string key is
+    /// `None`; the caller falls back to `key_of`.
+    #[inline]
+    pub(crate) fn flat_key_str(&self, key: Value) -> Option<&str> {
+        if !key.is_heap() {
+            return None;
+        }
+        match self.heap.str_wtf8_cow(key.heap_index()) {
+            Some(std::borrow::Cow::Borrowed(b)) => std::str::from_utf8(b).ok(),
+            _ => None,
+        }
+    }
+
+    /// The array index a STRING key spells in canonical form — `"0"` or
+    /// `[1-9][0-9]{0,9}` valued at most 2^32-2; `"05"`, `"+5"`, `" 5"` and
+    /// `"4294967295"` are ordinary string keys. Decided on the key's bytes
+    /// in place; a rope/surrogate/Symbol key is judged on its `key_of` text
+    /// (which decides identically, and is rare — a for-in snapshot key is a
+    /// flat string). `None` for a non-heap key: a numeric key is the
+    /// caller's `array_index` fast path, and no other primitive's key text
+    /// can spell a canonical index.
+    #[inline]
+    pub(crate) fn str_key_array_index(&self, key: Value) -> Option<usize> {
+        if !key.is_heap() {
+            return None;
+        }
+        match self.flat_key_str(key) {
+            Some(k) => canonical_u32_key(k).map(|n| n as usize),
+            None => canonical_u32_key(&self.key_of(key)).map(|n| n as usize),
+        }
+    }
+
+    /// The canonical integer index `key` addresses on an array: a numeric
+    /// Value (`array_index`), else a canonical numeric string. Replaces the
+    /// `key_of` + `parse::<u32>` + `n.to_string() == k` spelling, which paid
+    /// two String allocations per probe to re-derive text the key already
+    /// carried; the answers are identical by construction.
+    /// `ZIPP_NO_ARRKEY_FAST=1` restores the old spelling so the change is
+    /// A/B-able and bisectable on one binary.
+    #[inline]
+    pub(crate) fn key_array_index(&self, key: Value) -> Option<usize> {
+        if let Some(i) = array_index(key) {
+            return Some(i);
+        }
+        if arrkey_fast_enabled() {
+            return self.str_key_array_index(key);
+        }
+        let k = self.key_of(key);
+        match k.parse::<u32>() {
+            Ok(n) if n != u32::MAX && n.to_string() == k => Some(n as usize),
+            _ => None,
+        }
+    }
+
     pub(crate) fn has_property(&self, obj: Value, key: Value) -> bool {
         if !obj.is_heap() {
             return false;
@@ -104,14 +160,10 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => {
                 let len = items.len();
                 // A canonical integer index: a numeric Value, or a canonical numeric
-                // string ("0", not "01"/"-1").
-                let int_index = array_index(key).or_else(|| {
-                    let k = self.key_of(key);
-                    match k.parse::<u32>() {
-                        Ok(n) if n != u32::MAX && n.to_string() == k => Some(n as usize),
-                        _ => None,
-                    }
-                });
+                // string ("0", not "01"/"-1") — decided on the key's bytes in place
+                // (key_array_index; the old spelling allocated two Strings per probe,
+                // once per key per chain level of the for-in liveness re-check).
+                let int_index = self.key_array_index(key);
                 if let Some(i) = int_index {
                     // An in-range slot is present iff it is not a hole.
                     if i < len && !items[i].is_hole() {
@@ -121,13 +173,11 @@ impl<'p> Vm<'p> {
                     // be overridden (a defineProperty'd index in arr_props) or inherited
                     // from the prototype chain — [[HasProperty]] must keep walking (an
                     // out-of-range `i` was previously reported absent without this check).
-                    // Only materialize the index-key string when there IS an arr_props
-                    // overlay to probe: a packed array with delete-punched holes has none,
-                    // so a hole/OOB `i in arr` skips the per-probe key alloc entirely (the
-                    // hot hole-aware-iteration path) and goes straight to the prototype.
+                    // The overlay is keyed by the canonical decimal string, spelled into
+                    // a stack buffer — never a per-probe String allocation.
                     if let Some(m) = self.arr_props.get(&idx) {
-                        let k = self.key_of(key);
-                        if m.pos(&k).is_some() {
+                        let mut buf = [0u8; 20];
+                        if m.pos(crate::heap::index_key(&mut buf, i)).is_some() {
                             return true;
                         }
                     }
@@ -140,11 +190,22 @@ impl<'p> Vm<'p> {
                     };
                     return proto.is_heap() && self.has_property(proto, key);
                 }
-                let k = self.key_of(key);
+                // A non-index key: `length` is always own; else an arr_props named
+                // prop; else inherited. A flat string key's bytes are viewed in
+                // place — key_of allocated a fresh String per probe, per chain
+                // level (ZIPP_NO_ARRKEY_FAST=1 restores that).
+                let kbuf;
+                let k: &str = match arrkey_fast_enabled().then(|| self.flat_key_str(key)).flatten() {
+                    Some(s) => s,
+                    None => {
+                        kbuf = self.key_of(key);
+                        &kbuf
+                    }
+                };
                 if k == "length" {
                     return true;
                 }
-                if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                if self.arr_props.get(&idx).map_or(false, |m| m.pos(k).is_some()) {
                     return true;
                 }
                 // Inherited: the actual [[Prototype]] (custom via setPrototypeOf),
@@ -839,16 +900,17 @@ impl<'p> Vm<'p> {
             // NUMERIC-key fast path: resolve the index straight off the Value —
             // `key_of` would allocate a fresh key String per probe, which
             // dominated the hot hole-aware `i in arr` iteration. The canonical
-            // string is built only for the (rare) side-table check, and the
-            // answers are identical to the general path below (key_of of a
-            // canonical numeric Value IS i.to_string()).
+            // key is spelled into a stack buffer only for the (rare) side-table
+            // check, and the answers are identical to the general path below
+            // (key_of of a canonical numeric Value IS the decimal of `i`).
             if let Some(i) = array_index(key) {
                 if matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole())
                 {
                     return Ok(true);
                 }
                 if let Some(m) = self.arr_props.get(&idx) {
-                    if m.pos(&i.to_string()).is_some() {
+                    let mut buf = [0u8; 20];
+                    if m.pos(crate::heap::index_key(&mut buf, i)).is_some() {
                         return Ok(true);
                     }
                 }
@@ -880,16 +942,26 @@ impl<'p> Vm<'p> {
                     false => Ok(false),
                 };
             }
-            let k = self.key_of(key);
-            let int_index = match k.parse::<u32>() {
-                Ok(n) if n != u32::MAX && n.to_string() == k => Some(n as usize),
-                _ => None,
-            };
-            let own = if let Some(i) = int_index {
+            // The same canonical-index decision as `has_property`'s Array arm,
+            // on the key's bytes in place (ZIPP_NO_ARRKEY_FAST=1 restores the
+            // key_of + parse + to_string spelling); the key TEXT is needed only
+            // for the named arr_props probe on the non-index side.
+            let own = if let Some(i) = self.key_array_index(key) {
                 matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole())
-                    || self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
+                    || self.arr_props.get(&idx).map_or(false, |m| {
+                        let mut buf = [0u8; 20];
+                        m.pos(crate::heap::index_key(&mut buf, i)).is_some()
+                    })
             } else {
-                k == "length" || self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
+                let kbuf;
+                let k: &str = match arrkey_fast_enabled().then(|| self.flat_key_str(key)).flatten() {
+                    Some(s) => s,
+                    None => {
+                        kbuf = self.key_of(key);
+                        &kbuf
+                    }
+                };
+                k == "length" || self.arr_props.get(&idx).map_or(false, |m| m.pos(k).is_some())
             };
             if own {
                 return Ok(true);

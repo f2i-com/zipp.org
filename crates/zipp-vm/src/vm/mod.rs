@@ -1168,6 +1168,12 @@ pub struct Vm<'p> {
     /// patches — identity anchors for the adoption fast-path check.
     promise_ctor_intrinsic: u32,
     promise_then_intrinsic: u32,
+    /// The pristine-%Promise.prototype% proof resolved to slot indices plus
+    /// the versions guarding them (see [`async_runtime::PromisePristineSlots`]).
+    /// `None` until first proven pristine (and whenever last proven NOT
+    /// pristine); validated per call by version compares, re-resolved by the
+    /// full proof on any guard mismatch.
+    promise_pristine_slots: Option<async_runtime::PromisePristineSlots>,
     /// `$262.createRealm()` realm registry. `realms[r]` maps a MAIN-realm intrinsic
     /// prototype heap index to realm `r`'s corresponding prototype (realm 0 = the
     /// main realm, an empty map). `obj_realm` tags a heap index (a realm's

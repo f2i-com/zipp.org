@@ -535,11 +535,12 @@ pub enum Instr {
 
     /// Fused compare-and-branch: `if !(a < b) goto target`. Keeps the common
     /// loop/recursion guard in one instruction so the boolean never has to be
-    /// materialised into a register. RESERVED: fully handled by the interpreter
-    /// and the JIT, but the compiler does not emit it yet (a planned peephole).
-    #[allow(dead_code)]
+    /// materialised into a register. Emitted for a bare `<`/`<=` branch test
+    /// whose value nothing else consumes (`emit_test_jump`); only `<`/`<=` —
+    /// the op carries no operand-swap flag, so a fused `>`/`>=` would reorder
+    /// the two ToPrimitive coercions. `ZIPP_NO_FUSED_CMPJUMP=1` restores the
+    /// unfused `Lt`/`Le` + `JumpIfFalse` pair.
     JumpIfNotLt { a: Reg, b: Reg, target: u32 },
-    #[allow(dead_code)]
     JumpIfNotLe { a: Reg, b: Reg, target: u32 },
 
     // ── reference types ──

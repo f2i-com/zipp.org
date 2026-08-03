@@ -18,6 +18,21 @@ macro_rules! decline {
     }};
 }
 
+/// Name a POST-PLAN decline through the same `[decline-reason]` channel as
+/// `decline!`. The register-tier emitters can pass `region_can_compile` AND
+/// `plan_region` and still abandon the region mid-emission (an op the planner
+/// types but the emitter has no arm for — e.g. `Mod`, `MathOp` — or an
+/// assembler failure). Without a name the region silently falls to the memory
+/// tier, and the documented log-reading rule ("the regalloc path is the one
+/// with NO [decline-reason] line") then mislabels MEM as REGALLOC. Diagnostic
+/// only — callers decline exactly as before; the env lookup happens once per
+/// declined region-compile, never per iteration.
+pub(crate) fn decline_emit(reason: impl std::fmt::Display) {
+    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+        eprintln!("[decline-reason] {reason}");
+    }
+}
+
 /// Plan register homes for `[start, end]`, or `None` to decline (use mem path).
 /// `ta_plan` (unboxed-region epic): the pinned-TypedArray plan, threaded so a
 /// later increment can admit a pinned-Float64Array element GetIndex/SetIndex as a
@@ -628,7 +643,7 @@ pub(crate) fn plan_region_cold(
             }
             Instr::AddInt { a, .. } | Instr::Neg { a, .. } => {
                 if ty.get(&a) == Some(&VTy::Bool) {
-                    return None;
+                    decline!("numeric op on a bool"); // outside the subset
                 }
             }
             Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => {

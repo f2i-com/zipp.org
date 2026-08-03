@@ -699,7 +699,11 @@ impl<'p> Vm<'p> {
         if inner_body.iter().any(|i| {
             matches!(
                 i,
-                Instr::Jump { .. } | Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. }
+                Instr::Jump { .. }
+                    | Instr::JumpIfFalse { .. }
+                    | Instr::JumpIfTrue { .. }
+                    | Instr::JumpIfNotLt { .. }
+                    | Instr::JumpIfNotLe { .. }
             )
         }) {
             nested_reject("inner-branchy");

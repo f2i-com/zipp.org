@@ -3302,6 +3302,14 @@ impl<'p> Vm<'p> {
                             && self.jit_recurse_depth == 0
                             && (func_id as usize) < self.main_func_count
                             && t < ip
+                            // Dense region-state check first: a permanently
+                            // blacklisted loop pays two array reads per
+                            // back-edge here, not 2 hash probes (`get_region`
+                            // miss + `region_blacklist` hit). Mirrors the
+                            // FN_DEAD check at frame entry — see
+                            // `Jit::region_dead`. `ZIPP_NO_DENSE_BACKEDGE=1`
+                            // restores the old always-probe path.
+                            && !self.jit.region_dead(func_id, t as u32)
                         {
                             if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                 // A region exit with a pending exception (a

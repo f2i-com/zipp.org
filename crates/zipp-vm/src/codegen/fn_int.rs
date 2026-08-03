@@ -207,24 +207,30 @@ pub(crate) fn base_case_returns_arg(proto: &FuncProto) -> Option<(Cmp, i32)> {
         Instr::LoadInt { dst, val } => (dst, val),
         _ => return None,
     };
-    // ip1: compare param (reg 1) against c → t. The reported Cmp is the one whose
-    // TRUE branch selects the base case.
-    let (cmp, t) = match code[1] {
-        Instr::Lt { dst, a: 1, b } if b == c => (Cmp::Lt, dst),
-        Instr::Le { dst, a: 1, b } if b == c => (Cmp::Le, dst),
-        Instr::Gt { dst, a: 1, b } if b == c => (Cmp::Gt, dst),
-        Instr::Ge { dst, a: 1, b } if b == c => (Cmp::Ge, dst),
+    // ip1: compare param (reg 1) against c. Either the unfused pair (compare
+    // → t, then `JumpIfFalse t` at ip2) or the fused `JumpIfNotLt/Le` — both
+    // leave for the recursive body when (param<cmp>K) is FALSE, so the base
+    // case is the FALL-THROUGH either way and they report the same `(cmp, K)`.
+    // The reported Cmp is the one whose TRUE branch selects the base case.
+    let (cmp, t, base_ip) = match code[1] {
+        Instr::Lt { dst, a: 1, b } if b == c => (Cmp::Lt, Some(dst), 3usize),
+        Instr::Le { dst, a: 1, b } if b == c => (Cmp::Le, Some(dst), 3),
+        Instr::Gt { dst, a: 1, b } if b == c => (Cmp::Gt, Some(dst), 3),
+        Instr::Ge { dst, a: 1, b } if b == c => (Cmp::Ge, Some(dst), 3),
+        Instr::JumpIfNotLt { a: 1, b, .. } if b == c => (Cmp::Lt, None, 2),
+        Instr::JumpIfNotLe { a: 1, b, .. } if b == c => (Cmp::Le, None, 2),
         _ => return None,
     };
-    // ip2: JumpIfFalse{t, _} — when (param<cmp>K) is FALSE we leave for the
-    // recursive body, so the base case is the FALL-THROUGH (ip3).
-    match code[2] {
-        Instr::JumpIfFalse { cond, .. } if cond == t => {}
-        _ => return None,
+    // ip2 (unfused shape only): JumpIfFalse{t, _}.
+    if let Some(t) = t {
+        match code[2] {
+            Instr::JumpIfFalse { cond, .. } if cond == t => {}
+            _ => return None,
+        }
     }
-    // Base path from ip3: follow Move/Jump to a Return whose source traces back
+    // Base path: follow Move/Jump to a Return whose source traces back
     // to the param (reg 1). Bounded walk; any other op disqualifies.
-    let mut ip = 3usize;
+    let mut ip = base_ip;
     let mut ret_reg: u16 = 1; // register currently holding the (copied) param
     for _ in 0..8 {
         match code.get(ip)? {

@@ -78,6 +78,25 @@ pub(crate) fn lone_surrogate_markers(units: &[u16]) -> String {
     out
 }
 
+/// `ZIPP_NO_FUSED_CMPJUMP=1` restores the unfused `Lt`/`Le` + `JumpIfFalse`
+/// pair at branch heads (`if`/`while`/`for` tests, the for-in index guard),
+/// where the default emits the fused `JumpIfNotLt`/`JumpIfNotLe`. Read once
+/// per process.
+#[inline]
+pub(crate) fn fused_cmp_jump_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_FUSED_CMPJUMP").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// How a property's value arrives: an ordinary expression (`k: v`, `[k]: v`), or
 /// a method/accessor's own `Function` node (`m(){}`, `get k(){}`). oxc modelled
 /// the second as a `FunctionExpression` in `value`; `ast` names it directly, so
@@ -1428,6 +1447,37 @@ impl<'a> FnCompiler<'a> {
             }
         }
         self.expr(arg)
+    }
+
+    /// Compile a branch TEST and emit the jump taken when it is FALSY,
+    /// returning the jump's ip for `patch_jump`. A test that is a bare
+    /// `a < b` / `a <= b` fuses into `JumpIfNotLt`/`JumpIfNotLe`: the fused
+    /// interpreter arm runs the same `cmp_lt`/`cmp_le` as the unfused pair
+    /// (operand evaluation, coercion order and NaN behaviour identical by
+    /// construction), and the boolean — a freshly allocated temp whose only
+    /// consumer would be this jump — is never materialised. Any other test
+    /// shape (including `>`/`>=`: the fused ops carry no swap flag, and
+    /// swapping operands would reorder the two ToPrimitive coercions) keeps
+    /// the generic `expr` + `JumpIfFalse` pair.
+    pub(crate) fn emit_test_jump(&mut self, test: &ast::Expr) -> R<u32> {
+        if fused_cmp_jump_enabled() {
+            if let ast::Expr::Binary { op, left, right } = test {
+                if matches!(op, ast::BinaryOp::Lt | ast::BinaryOp::LtEq) {
+                    let a = self.expr(left)?;
+                    let b = self.expr(right)?;
+                    let j = self.here();
+                    match op {
+                        ast::BinaryOp::Lt => self.emit(Instr::JumpIfNotLt { a, b, target: 0 }),
+                        _ => self.emit(Instr::JumpIfNotLe { a, b, target: 0 }),
+                    }
+                    return Ok(j);
+                }
+            }
+        }
+        let cond = self.expr(test)?;
+        let j = self.here();
+        self.emit(Instr::JumpIfFalse { cond, target: 0 });
+        Ok(j)
     }
 
     pub(crate) fn binary(

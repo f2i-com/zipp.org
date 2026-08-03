@@ -73,9 +73,7 @@ impl<'a> FnCompiler<'a> {
         // branch yields undefined, not the prior statement's value). No-op outside
         // eval mode.
         self.reset_loop_completion();
-        let cond = self.expr(test)?;
-        let jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond, target: 0 }); // patched
+        let jf = self.emit_test_jump(test)?; // patched
         self.branch_stmt(cons)?;
         if let Some(alt) = alt {
             let jmp = self.here();
@@ -105,9 +103,7 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn while_stmt(&mut self, test: &ast::Expr, body: &ast::Stmt) -> R<()> {
         let top = self.here();
-        let cond = self.expr(test)?;
-        let jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond, target: 0 });
+        let jf = self.emit_test_jump(test)?;
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
         self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
@@ -243,12 +239,7 @@ impl<'a> FnCompiler<'a> {
         self.emit_freshen_cells(&fresh_regs);
         let top = self.here();
         let jf = match test {
-            Some(t) => {
-                let cond = self.expr(t)?;
-                let j = self.here();
-                self.emit(Instr::JumpIfFalse { cond, target: 0 });
-                Some(j)
-            }
+            Some(t) => Some(self.emit_test_jump(t)?),
             None => None,
         };
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
@@ -1415,11 +1406,20 @@ impl<'a> FnCompiler<'a> {
         };
 
         let top = self.here();
-        let cond = self.temp();
-        self.emit(Instr::Lt { dst: cond, a: idx_reg, b: len_reg });
-        let jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond, target: 0 });
-        self.next_reg -= 1;
+        // The `idx < len` guard over the key snapshot: both operands are ints
+        // the compiler owns, so the fused form is the unfused pair minus the
+        // boolean temp.
+        let jf;
+        if exprs::fused_cmp_jump_enabled() {
+            jf = self.here();
+            self.emit(Instr::JumpIfNotLt { a: idx_reg, b: len_reg, target: 0 });
+        } else {
+            let cond = self.temp();
+            self.emit(Instr::Lt { dst: cond, a: idx_reg, b: len_reg });
+            jf = self.here();
+            self.emit(Instr::JumpIfFalse { cond, target: 0 });
+            self.next_reg -= 1;
+        }
 
         let save = self.next_reg;
         // Read the current key into a temp (pattern / assignment target /
@@ -1500,6 +1500,8 @@ impl<'a> FnCompiler<'a> {
             Instr::Jump { target: t }
             | Instr::JumpIfFalse { target: t, .. }
             | Instr::JumpIfTrue { target: t, .. }
+            | Instr::JumpIfNotLt { target: t, .. }
+            | Instr::JumpIfNotLe { target: t, .. }
             | Instr::JumpFinally { target: t, .. } => *t = target,
             _ => panic!("patch_jump on non-jump"),
         }

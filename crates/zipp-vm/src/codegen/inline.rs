@@ -448,6 +448,19 @@ pub(crate) fn emit_inline_leaf_call(
                     dynasm!(ops ; jnz => t);
                 }
             }
+            // ── fused compare-and-branch ── same number guard as the `Lt`/`Le`
+            // dcmp arms below (a non-numeric operand bails, re-running the whole
+            // call), no boolean materialised. Mirrors the region_mem arm.
+            Instr::JumpIfNotLt { a, b, target } => {
+                let bail = ops.new_dynamic_label();
+                let t = blabels[target as usize];
+                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Lt, t);
+            }
+            Instr::JumpIfNotLe { a, b, target } => {
+                let bail = ops.new_dynamic_label();
+                let t = blabels[target as usize];
+                djump_if_not_cmp(ops, call_ip, bail, epilogue, rg(a), rg(b), Cmp::Le, t);
+            }
             // ── dense-array / string element read `a[i]` ── generic win64 helper
             // (read-only, no alloc, no user code → no r13/r14/TA refetch; matches
             // the region GetIndex generic tail). Deopt sentinel → re-run the call.

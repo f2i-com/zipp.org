@@ -5,6 +5,26 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// `ZIPP_NO_CALLVALUE_FLAT=1` restores the sequential exotic-receiver cascade
+/// `call_value` walked in full before reaching the plain-function tail. See
+/// the comment at `call_value`'s fast-path match for why hoisting the
+/// Func/Closure test is sound; this exists purely so the change is A/B-able
+/// and bisectable on one binary.
+#[inline]
+fn callvalue_flat_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CALLVALUE_FLAT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Run the top-level function (id 0) to completion.
     pub fn run(&mut self) -> Result<Value, Thrown> {
@@ -289,6 +309,46 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        // The overwhelmingly common callee — a plain JS function or closure —
+        // is decided by ONE heap-discriminant load. Every exotic receiver the
+        // cascade in `call_value_exotic` distinguishes is keyed either on a
+        // heap variant disjoint from `Func`/`Closure` (Proxy / Wrapped / Bound
+        // / Native / NativeClosure / BoundResolver / CombinatorResolver /
+        // Object), or on a side table whose keys are only ever Object/Native
+        // indices (`is_htmldda`, `realm_fns`, `fn_proto`, `intl_ctors`,
+        // `realm_ctor_main`) — all pinned under the GC floor or explicitly
+        // rooted, so a live Func/Closure index can never collide with one.
+        // Hoisting the Func/Closure test above the whole cascade is therefore
+        // a pure reorder: no arm that could fire for these variants is
+        // skipped. The Rust-side microtask drain (every promise reaction and
+        // ThenableJob) enters here where no inliner can help, so the cascade's
+        // ~8 discriminant loads + a hash probe per plain callback were pure
+        // overhead.
+        if callvalue_flat_enabled() && callee.is_heap() {
+            match self.heap.get(callee.heap_index()) {
+                HeapObj::Func(id) => {
+                    let func_id = *id;
+                    return self.call_value_plain(callee, this, args, func_id, NO_CLOSURE);
+                }
+                HeapObj::Closure { func, .. } => {
+                    let func_id = *func;
+                    let closure = callee.heap_index();
+                    return self.call_value_plain(callee, this, args, func_id, closure);
+                }
+                _ => {}
+            }
+        }
+        self.call_value_exotic(callee, this, args)
+    }
+
+    /// The rare-receiver tail of [`call_value`]: the pre-flattening cascade,
+    /// arm for arm in its original order (some arms are order-dependent —
+    /// `realm_fns` must be probed before the plain `Native` arm because its
+    /// keys ARE `Native` allocations). With `ZIPP_NO_CALLVALUE_FLAT=1` every
+    /// call routes here, which IS the old path verbatim.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn call_value_exotic(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         // An [[IsHTMLDDA]] exotic (`document.all`) is callable: its [[Call]] returns
         // null when called with NO arguments or a first argument that is the empty
         // String, and undefined otherwise (Annex B).
@@ -556,6 +616,23 @@ impl<'p> Vm<'p> {
             }
         }
         let (func_id, closure) = self.resolve_callable_realm(callee)?;
+        self.call_value_plain(callee, this, args, func_id, closure)
+    }
+
+    /// The plain-function tail of [`call_value`]: this-binding, the
+    /// generator/async builds, and the frame push + `run_loop` for an ordinary
+    /// function. `(func_id, closure)` is what `resolve_callable` reports for
+    /// `callee` — the fast path passes it straight off the discriminant match
+    /// instead of resolving twice.
+    #[inline]
+    pub(crate) fn call_value_plain(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+        func_id: u32,
+        closure: u32,
+    ) -> Result<Value, Thrown> {
         let (is_gen, is_async, is_strict) = {
             let p = self.func(func_id as usize);
             (p.is_generator, p.is_async, p.is_strict)

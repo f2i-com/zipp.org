@@ -1110,14 +1110,26 @@ pub(crate) fn to_uint32(n: f64) -> u32 {
 }
 
 pub(crate) fn fmt_f64(n: f64) -> String {
+    let mut out = String::new();
+    fmt_f64_into(&mut out, n);
+    out
+}
+
+/// `fmt_f64` appending into an existing buffer — the JSON.stringify fast path,
+/// which otherwise paid a fresh `String` per serialized number. The allocating
+/// wrapper above stays for every other caller.
+pub(crate) fn fmt_f64_into(out: &mut String, n: f64) {
     if n.is_nan() {
-        return "NaN".into();
+        out.push_str("NaN");
+        return;
     }
     if n.is_infinite() {
-        return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        out.push_str(if n > 0.0 { "Infinity" } else { "-Infinity" });
+        return;
     }
     if n == 0.0 {
-        return "0".into();
+        out.push('0');
+        return;
     }
     let neg = n < 0.0;
     let abs = n.abs();
@@ -1136,11 +1148,29 @@ pub(crate) fn fmt_f64(n: f64) -> String {
         // integers there have gaps, so `as u64` would print excess digits the
         // f64 cannot distinguish (e.g. 4660046610375529984 where JS must say
         // 4660046610375530000).
-        if abs < 9_007_199_254_740_992.0 {
-            let i = abs as u64;
-            return if neg { format!("-{i}") } else { i.to_string() };
+        if neg {
+            out.push('-');
         }
-        return if neg { format!("-{abs}") } else { format!("{abs}") };
+        if abs < 9_007_199_254_740_992.0 {
+            // Digits written backward into a stack buffer (2^53-1 has 16),
+            // then appended in one push — no intermediate String.
+            let mut i = abs as u64;
+            let mut buf = [0u8; 16];
+            let mut p = buf.len();
+            loop {
+                p -= 1;
+                buf[p] = b'0' + (i % 10) as u8;
+                i /= 10;
+                if i == 0 {
+                    break;
+                }
+            }
+            out.push_str(std::str::from_utf8(&buf[p..]).unwrap());
+            return;
+        }
+        use std::fmt::Write;
+        let _ = write!(out, "{abs}");
+        return;
     }
     // General case: ECMAScript Number::toString (7.1.12.1). Extract the shortest
     // round-trip significant digits `s` (k of them) and the decimal point position
@@ -1153,34 +1183,35 @@ pub(crate) fn fmt_f64(n: f64) -> String {
     let s = digits.as_str();
     let k = s.len() as i32;
     let np = e + 1; // decimal-point position (value ≈ 0.s × 10^np)
-    let body = if k <= np && np <= 21 {
+    if neg {
+        out.push('-');
+    }
+    if k <= np && np <= 21 {
         // Integer: all digits, then (np-k) trailing zeros.
-        let mut r = String::from(s);
-        r.extend(std::iter::repeat('0').take((np - k) as usize));
-        r
+        out.push_str(s);
+        out.extend(std::iter::repeat('0').take((np - k) as usize));
     } else if 0 < np && np <= 21 {
         // Point inside the digits.
-        format!("{}.{}", &s[..np as usize], &s[np as usize..])
+        out.push_str(&s[..np as usize]);
+        out.push('.');
+        out.push_str(&s[np as usize..]);
     } else if -6 < np && np <= 0 {
         // Leading "0." then (-np) zeros then the digits.
-        let mut r = String::from("0.");
-        r.extend(std::iter::repeat('0').take((-np) as usize));
-        r.push_str(s);
-        r
+        out.push_str("0.");
+        out.extend(std::iter::repeat('0').take((-np) as usize));
+        out.push_str(s);
     } else {
         // Exponential: first digit, optional ".rest", then e±(np-1).
-        let mut m = String::from(&s[..1]);
+        out.push_str(&s[..1]);
         if k > 1 {
-            m.push('.');
-            m.push_str(&s[1..]);
+            out.push('.');
+            out.push_str(&s[1..]);
         }
         let e2 = np - 1;
-        format!("{m}e{}{}", if e2 >= 0 { '+' } else { '-' }, e2.abs())
-    };
-    if neg {
-        format!("-{body}")
-    } else {
-        body
+        out.push('e');
+        out.push(if e2 >= 0 { '+' } else { '-' });
+        use std::fmt::Write;
+        let _ = write!(out, "{}", e2.abs());
     }
 }
 
