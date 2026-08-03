@@ -183,37 +183,38 @@ for reasons that have nothing to do with the engine. If an existing clone has it
 on: `git config core.autocrlf false && git rm --cached -r -q . && git reset
 --hard`.
 
-**Performance — cold geomean 1.80× zipp/node (95% CI 1.79×–1.81×)** on the
+**Performance — cold geomean 1.75× zipp/node (95% CI 1.74×–1.76×)** on the
 ten programs in `bench/real/`, 21 counterbalanced paired observations against
 Node v24.12.0, every output byte-identical to Node:
 
 | bench | node | zipp | paired ratio |
 |---|---|---|---|
-| map-set-heavy | 858ms | 678ms | **0.79×** |
-| class-prototype-hot | 291ms | 377ms | 1.30× |
-| json-large | 276ms | 449ms | 1.60× |
-| async-promise-chain | 339ms | 566ms | 1.68× |
-| sparse-array | 79ms | 131ms | 1.68× |
-| markdown-render | 269ms | 456ms | 1.70× |
-| polymorphic-objects | 323ms | 598ms | 1.86× |
-| parse-large-js | 270ms | 604ms | 2.23× |
-| typedarray-math | 203ms | 633ms | 3.13× |
-| regex-log-scan | 452ms | 1593ms | 3.53× |
+| map-set-heavy | 820ms | 663ms | **0.82×** |
+| class-prototype-hot | 296ms | 382ms | 1.29× |
+| async-promise-chain | 344ms | 481ms | 1.41× |
+| json-large | 285ms | 435ms | 1.52× |
+| sparse-array | 81ms | 126ms | 1.56× |
+| markdown-render | 274ms | 469ms | 1.69× |
+| polymorphic-objects | 327ms | 595ms | 1.83× |
+| parse-large-js | 273ms | 602ms | 2.20× |
+| typedarray-math | 203ms | 648ms | 3.22× |
+| regex-log-scan | 479ms | 1633ms | 3.43× |
 
-Cold total is the primary metric. Zipp starts about 3.6× faster than Node (7.9ms
-vs 28.6ms — no snapshot to load), and is *faster than Node* on `map-set-heavy`
-by 21%.
+Cold total is the primary metric. Zipp starts about 3.7× faster than Node (8.2ms
+vs 30.1ms — no snapshot to load), and is *faster than Node* on `map-set-heavy`
+by 18%.
 
 The same capture also times three DIAGNOSTIC benchmarks that are deliberately
 outside the ten, because they exist to expose weaknesses the ten cannot see:
-`polymorphic-objects-v2` 3.61×, `sparse-array-v2` 4.86×, `property-ic-shapes`
-5.53×. Their own geomean is 4.60×, and quoting a geomean over all thirteen gives
-2.24×, which is not comparable to any historical figure in this file — the ten
+`polymorphic-objects-v2` 3.36×, `sparse-array-v2` 4.74×, `property-ic-shapes`
+5.11×. Their own geomean is 4.33×, and quoting a geomean over all thirteen gives
+2.16×, which is not comparable to any historical figure in this file — the ten
 are the series. The harness now computes and records both, so the split no
 longer depends on anyone remembering to pass `--benches`.
 
-This capture is `bench/head_clean_e839613.json` and it is the first artifact in
-this repo marked `publishable: true`. That means the harness checked, *before
+This capture is `bench/head_clean_819ab45.json`, marked `publishable: true`
+like its predecessor `bench/head_clean_e839613.json` — the first artifact in
+this repo to earn that flag. The flag means the harness checked, *before
 measuring*, that the engine reported a build identity, that its tree was not
 dirty, and that its commit equalled the workspace HEAD — and checked again
 afterwards that neither the binary's hash nor its reported source had changed
@@ -279,17 +280,17 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today (cold total) | 1.80× |
-| `regex-log-scan` at Node parity | **1.58×** |
-| `typedarray-math` at Node parity | **1.60×** |
-| **both of the two worst at Node parity** | **1.41×** |
+| today (cold total) | 1.75× |
+| `regex-log-scan` at Node parity | **1.55×** |
+| `typedarray-math` at Node parity | **1.56×** |
+| **both of the two worst at Node parity** | **1.38×** |
 
 (The *shape* of this arithmetic is what matters and it does not move as the
 headline does: the two worst rows going to parity is worth ~0.4 of geomean, and
 no contained fix reaches that.)
 
 The cold score being below 2× is not general parity: nine rows remain slower and
-the two worst are 3.53× and 3.13×. The contained fixes in `PERF_ROADMAP.md` are
+the two worst are 3.43× and 3.22×. The contained fixes in `PERF_ROADMAP.md` are
 safe substrate, but moving toward 1× still requires stable shape metadata, an
 optimizing CFG/SSA tier, and arena/nursery allocation rather than a stack of
 unmeasured 1–2% tweaks.
