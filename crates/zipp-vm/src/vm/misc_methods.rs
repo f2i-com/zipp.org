@@ -306,6 +306,7 @@ impl<'p> Vm<'p> {
             } else {
                 rustc_hash::FxHashMap::default()
             };
+            let cross_plan = self.build_cross_call_plan(fid);
             self.jit.compile(
                 fid,
                 proto_ref,
@@ -315,6 +316,7 @@ impl<'p> Vm<'p> {
                 heap_helper_addrs,
                 &const_strs,
                 &leaf_plan,
+                &cross_plan,
             );
         }
         let entry = self.jit.get(fid)?.entry();

@@ -299,6 +299,8 @@ impl<'p> Vm<'p> {
                     } else {
                         rustc_hash::FxHashMap::default()
                     };
+                    // Tier-C cross-call plan (B83) — also built before &mut self.jit.
+                    let cross_plan = self.build_cross_call_plan(func_id);
                     self.jit.compile(
                         func_id,
                         proto_ref,
@@ -308,6 +310,7 @@ impl<'p> Vm<'p> {
                         heap_helper_addrs,
                         &const_strs,
                         &leaf_plan,
+                        &cross_plan,
                     );
                     }
                 }
@@ -3461,6 +3464,22 @@ impl<'p> Vm<'p> {
                                                 {
                                                     continue; // dedicated DataView get* helper
                                                 }
+                                                // B82: `f.call(…)` (0-3 forwarded
+                                                // args) / `f.apply(this[, arr])`
+                                                // sites are served per-call by
+                                                // `try_fn_call_apply_inline` (an
+                                                // inline-eligible user target) or
+                                                // by the `hasOwnProperty.call`
+                                                // intrinsic — the IC stays empty
+                                                // (the resolved `call`/`apply` is
+                                                // a native) but the helper does
+                                                // NOT fall back per iteration.
+                                                if crate::codegen::call_inline_enabled()
+                                                    && ((*argc <= 4 && key == Some("call"))
+                                                        || (*argc <= 2 && key == Some("apply")))
+                                                {
+                                                    continue;
+                                                }
                                             }
                                             Instr::Call { .. } => {}
                                             _ => continue,
@@ -3576,6 +3595,9 @@ impl<'p> Vm<'p> {
                                 // true once per key). Folded into the single gate
                                 // above, which does re-arm. One fewer hand-maintained
                                 // copy of a cross-tier fact is the whole point of B66.
+                                // Tier-C cross-call plan (B83) — the region's Call
+                                // sites get the native→native attempt too.
+                                let cross_plan = self.build_cross_call_plan(func_id);
                                 self.jit.compile_region(
                                     func_id,
                                     proto_ref,
@@ -3591,6 +3613,7 @@ impl<'p> Vm<'p> {
                                     &ta_plan,
                                     &leaf_plan,
                                     &method_plan,
+                                    &cross_plan,
                                 );
                                 if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                     if self.pending_throw.is_some() {
@@ -6976,6 +6999,7 @@ impl<'p> Vm<'p> {
             call_method_ic: jit_call_method_ic as usize,
             has_own_call: crate::vm::helpers_misc::jit_has_own_call as usize,
             call_ic: jit_call_ic as usize,
+            cross_call: crate::vm::helpers_misc::jit_cross_call as usize,
             get_prop_slow: jit_get_prop_slow as usize,
             set_prop_slow: jit_set_prop_slow as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as usize,

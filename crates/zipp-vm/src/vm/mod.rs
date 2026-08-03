@@ -1384,6 +1384,15 @@ pub struct Vm<'p> {
     /// Sound because a FuncProto's code is immutable for the program's life.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     mi_cache: Vec<i32>,
+    /// B82 `%Function.prototype%` SLOT memo for the `f.call`/`f.apply` target
+    /// splice: `(fn_proto version when computed, own "call" slot, own "apply"
+    /// slot)`, `u32::MAX` = no such own key. Slot INDEXES are version-guarded
+    /// (a key add/remove/descriptor change bumps `version_of(fn_proto)`), so
+    /// the memo skips the per-call key scan; the slot's VALUE is re-read on
+    /// every call (an in-place overwrite bumps nothing — the fn-bits re-read
+    /// precedent), so `Function.prototype.call = g` falls back immediately.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    ci_pristine: (u32, u32, u32),
     /// Pinned register-file capacity: `self.regs` is reserved to this at startup
     /// and NEVER allowed to grow past it (every call/recursion site checks),
     /// so the Vec never reallocates while native JIT code holds a raw pointer
@@ -1466,6 +1475,7 @@ mod gc;
 pub(crate) use gc::gc_stats;
 pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
 pub(crate) use async_runtime::async_stats;
+pub(crate) use helpers_misc::call_inline_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) mod prof;
 pub(crate) use prof::dump as prof_stats;

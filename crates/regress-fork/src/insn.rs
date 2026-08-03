@@ -243,4 +243,10 @@ pub struct CompiledRegex {
     // is its instruction index. A failed match attempt then proves the whole
     // maximal run matchless, and the search may resume after it.
     pub skip_hint_ip: Option<u32>,
+
+    // PATCH (see VENDORED.md and rxjit.rs): lazily-compiled native (x86-64)
+    // code for this instruction stream, plus the use counter that triggers
+    // compilation. Cloning a regex starts the twin cold (fresh slot).
+    #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+    pub rxjit: crate::rxjit::JitSlot,
 }

@@ -1133,6 +1133,45 @@ impl<'r, Input: InputIndexer> BacktrackExecutor<'r, Input> {
 }
 
 impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
+    /// PATCH (see rxjit.rs): one top-level forward match attempt — native
+    /// code when this regex has compiled and the input is byte-addressed,
+    /// the interpreter otherwise. Both paths leave identical observable
+    /// state: capture groups in `matcher.s.groups`, `matcher.skip_hint`,
+    /// and the returned end position.
+    #[inline(always)]
+    fn attempt_at(&mut self, pos: Input::Position) -> Option<Input::Position> {
+        let inp = self.input;
+        #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+        if let Some(bytes) = inp.rxjit_bytes() {
+            let re: &CompiledRegex = self.matcher.re;
+            if let Some(code) = re.rxjit.acquire(re) {
+                let origin = inp.left_end();
+                let groups = &mut self.matcher.s.groups;
+                let outcome =
+                    crate::rxjit::run_attempt(code, bytes, inp.pos_to_offset(pos), |g, s, e| {
+                        let gd = groups.mat(g);
+                        gd.start = (s != u64::MAX).then(|| origin + s as usize);
+                        gd.end = (e != u64::MAX).then(|| origin + e as usize);
+                    });
+                let hint = |h: u64| (h != u64::MAX).then(|| origin + h as usize);
+                match outcome {
+                    crate::rxjit::Outcome::Match { end, skip_hint } => {
+                        self.matcher.skip_hint = hint(skip_hint);
+                        return Some(origin + end);
+                    }
+                    crate::rxjit::Outcome::NoMatch { skip_hint } => {
+                        self.matcher.skip_hint = hint(skip_hint);
+                        return None;
+                    }
+                    // Native gave up (backtrack buffer cap); rerun this
+                    // attempt in the interpreter.
+                    crate::rxjit::Outcome::Bail => {}
+                }
+            }
+        }
+        self.matcher.try_at_pos(inp, 0, pos, Forward::new())
+    }
+
     fn successful_match(&mut self, start: Input::Position, end: Input::Position) -> Match {
         // We want to simultaneously map our groups to offsets, and clear the groups.
         // A for loop is the easiest way to do this while satisfying the borrow checker.
@@ -1167,7 +1206,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         let inp = self.input;
         // For anchored regexes, only try matching at the current position
         rxstat!(ATTEMPTS);
-        if let Some(end) = self.matcher.try_at_pos(inp, 0, pos, Forward::new()) {
+        if let Some(end) = self.attempt_at(pos) {
             // If we matched the empty string, we have to increment.
             if end != pos {
                 *next_start = Some(end)
@@ -1201,7 +1240,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             // hint recorded by an earlier one.
             self.matcher.skip_hint = None;
             rxstat!(ATTEMPTS);
-            if let Some(end) = self.matcher.try_at_pos(inp, 0, pos, Forward::new()) {
+            if let Some(end) = self.attempt_at(pos) {
                 // If we matched the empty string, we have to increment.
                 if end != pos {
                     *next_start = Some(end)

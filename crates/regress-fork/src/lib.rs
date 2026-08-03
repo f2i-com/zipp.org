@@ -167,6 +167,28 @@ pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
     classicalbacktrack::rx_stats()
 }
 
+/// PATCH (see VENDORED.md and rxjit.rs): `ZIPP_RXSTATS=1` regex-JIT counters —
+/// (regexes compiled, declined: unsupported insn, declined: limits,
+/// native attempts, interpreter attempts, native bails). Zeros when the
+/// `rx-jit` feature or the x86-64 target is absent.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+pub fn rx_jit_stats() -> (u64, u64, u64, u64, u64, u64) {
+    rxjit::stats()
+}
+#[cfg(not(all(feature = "rx-jit", target_arch = "x86_64")))]
+pub fn rx_jit_stats() -> (u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0)
+}
+
+/// PATCH (test hook, see rxjit.rs): force the regex JIT on (compile on first
+/// attempt) or off, overriding the use-counter policy and the env switch.
+/// For the differential harness only.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __rxjit_force(mode: Option<bool>) {
+    rxjit::force(mode)
+}
+
 #[macro_use]
 mod util;
 
@@ -188,6 +210,8 @@ mod optimizer;
 mod parse;
 mod position;
 mod possessify;
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+mod rxjit;
 mod scm;
 mod startpredicate;
 mod types;

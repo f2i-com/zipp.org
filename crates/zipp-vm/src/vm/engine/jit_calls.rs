@@ -242,6 +242,206 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The Tier C CROSS-CALL fast path (B83), behind the `jit_cross_call` FFI
+    /// helper: a compiled body's `Call` site dispatches a Tier-C-compiled plain
+    /// callee native→native. Mutual recursion (`pExpr → pTerm → pFactor →
+    /// pExpr`) then runs as native calls through this thin helper instead of
+    /// paying `ic_call` + `setup_call` + `frames.push` + a nested `run_loop`
+    /// per hop (~64ns/call measured; the whole `parse-large-js` parse phase).
+    ///
+    /// Resolution: the callee's live Value (read from the caller's register by
+    /// the emitted site) is resolved HERE, each call, straight off the heap
+    /// object — `Func`/`Closure` → func id. Rebinding the global mid-run makes
+    /// the register hold a different Value, which resolves to the new function
+    /// (or deopts) — the same observable behaviour as the interpreter's
+    /// identity-guarded IC.
+    ///
+    /// Eligibility (everything else returns `SELF_CALL_DEOPT`, and the emitted
+    /// site falls through to the unchanged `call_ic` helper, a pure prefix):
+    /// * the resolved function has a live cross entry (Tier-C compiled — which
+    ///   already excludes generators/async and rest/`arguments` bodies, and
+    ///   never bakes a Tier A self-binding assumption);
+    /// * it is not an arrow (`lexical_this` — reg 0 must be the captured
+    ///   `this`, which only `setup_call` rebinds);
+    /// * its direct global routes still validate (the `try_run_jit` entry
+    ///   check, which this path would otherwise skip);
+    /// * the caller's window is the TOP of the live register file (it always
+    ///   is — `setup_call` and this helper both leave `len` at the window end
+    ///   — but a mismatch deopts rather than trusts).
+    ///
+    /// GC: the callee window is exposed by `resize` (zero-filling to
+    /// `undefined`, exactly the interpreter's window init), so `self.regs.len()`
+    /// covers every live native window and the root set stays complete even
+    /// when the callee re-enters the interpreter through its own helpers.
+    /// `self.regs` never reallocates (`regs_would_overflow` guard + pinned
+    /// capacity), so the caller's window pointer stays valid.
+    ///
+    /// Depth: shares `jit_call_depth` / `JIT_REGION_CALL_MAX` with the region
+    /// call helpers (each level is a real Rust/native stack frame); past the
+    /// cap the call deopts to the interpreter's flat frames, which enforce
+    /// MAX_FRAMES → catchable RangeError.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_cross_call_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        args: *const u64,
+        packed: u64,
+        callee_bits: u64,
+    ) -> u64 {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let argc = (packed & 0xFFFF) as usize;
+        let caller_regs = ((packed >> 16) & 0xFFFF) as usize;
+        let cv = Value::from_bits(callee_bits);
+        if !cv.is_heap() {
+            return SELF_CALL_DEOPT;
+        }
+        let (fid, closure) = match self.heap.get(cv.heap_index()) {
+            HeapObj::Func(id) => (*id, NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, cv.heap_index()),
+            _ => return SELF_CALL_DEOPT,
+        };
+        let entry = match self.jit.cross_entry(fid) {
+            Some(e) => e,
+            None => return SELF_CALL_DEOPT,
+        };
+        // The entry checks `try_run_jit` performs and a direct call would skip:
+        // direct global routes can be invalidated by `delete` / defineProperty
+        // on globalThis (Tier C never records a self-binding, so that check is
+        // structurally unnecessary — asserted at install).
+        if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+            return SELF_CALL_DEOPT;
+        }
+        // GC safe point — the frame-transition parity point. The route this
+        // path replaces ran `maybe_gc` in `dispatch_body` on EVERY call's frame
+        // push; without this, a hot loop whose only safe points were its call
+        // transitions defers collection for the loop's whole lifetime and the
+        // heap balloons (regex-log-scan's corpus-gen: 74 collections → 1, avg
+        // live slots 199k → 7.4M, and every subsequent versions/IC access pays
+        // the locality bill — measured +9% on the row, all charged to jit-mem).
+        // Safe here for the same reason it is safe in `dispatch_body`: every
+        // live Value sits in regs[0..len]/globals/frames/side-tables (the
+        // callee Value is still in the caller's register; `args` point into the
+        // caller's window), no native helper is mid-flight, and the collector
+        // is non-moving. The calling region refetches r13/r14 after this
+        // helper, so a versions-array reallocation cannot dangle its pins.
+        // Cost when no collection is due: two field compares.
+        self.maybe_gc();
+        let proto = self.func(fid as usize);
+        if proto.lexical_this {
+            return SELF_CALL_DEOPT; // arrow: needs its captured `this` at reg 0
+        }
+        let reg_count = (proto.reg_count as usize).max(1);
+        let params = proto.param_count as usize;
+        // OrdinaryCallBindThis for a plain `f()` (`this` = undefined): a strict
+        // callee binds undefined; a sloppy one binds its realm's global object.
+        let this_v = if proto.is_strict {
+            Value::UNDEFINED
+        } else if self.global_this != 0 {
+            Value::heap(self.callee_this_global(cv))
+        } else {
+            return SELF_CALL_DEOPT;
+        };
+        // The callee window sits contiguously above the caller's, which must be
+        // the top of the live register file (see the doc note).
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let caller_base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let new_base = caller_base + caller_regs;
+        if new_base != self.regs.len() {
+            return SELF_CALL_DEOPT;
+        }
+        let needed = new_base + reg_count;
+        if self.regs_would_overflow(needed) {
+            let e =
+                self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+            self.pending_throw = Some(e);
+            self.osr_deopt_exempt = true;
+            return CALL_THREW;
+        }
+        // Zero-fill = the interpreter's window init (a body may legally read an
+        // unwritten local as `undefined`), and it keeps `len` spanning the
+        // window so the GC root set stays complete. Capacity is pinned — this
+        // never reallocates.
+        self.regs.resize(needed, Value::UNDEFINED);
+        self.regs[new_base] = this_v;
+        let n = argc.min(params);
+        for i in 0..n {
+            // SAFETY: args points to `argc` valid Value bits (the caller's
+            // staged contiguous arg registers); n ≤ argc.
+            self.regs[new_base + 1 + i] = Value::from_bits(unsafe { *args.add(i) });
+        }
+        self.jit_call_depth += 1;
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(new_base) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        // SAFETY: `entry` is `fid`'s Tier-C win64 code (mmap'd, never moves);
+        // the window has `reg_count` valid slots; vm is valid.
+        let (bits, bail) = {
+            let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+            unsafe {
+                let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+                    core::mem::transmute(entry);
+                let mut b: u32 = crate::codegen::NO_BAIL;
+                let r = f(regs_ptr, &mut b as *mut u32, vm_ptr);
+                (r, b)
+            }
+        };
+        let out = if bail == crate::codegen::NO_BAIL {
+            self.regs.truncate(new_base);
+            bits
+        } else if self.pending_throw.is_some() {
+            // The callee's own (deeper) call threw and its native code
+            // signalled unwind via a bail with the throw pending (the
+            // `try_run_jit` (b) case): unwind, never resume.
+            self.regs.truncate(new_base);
+            self.osr_deopt_exempt = true;
+            CALL_THREW
+        } else {
+            // Guard bail mid-body: finish this activation on the interpreter
+            // over the SAME window via a transient frame (regs stay as the
+            // native code left them; ip = the recorded resume point).
+            if self.frames.len() >= MAX_FRAMES {
+                let e = self
+                    .alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+                self.pending_throw = Some(e);
+                self.regs.truncate(new_base);
+                self.jit_call_depth -= 1;
+                self.osr_deopt_exempt = true;
+                return CALL_THREW;
+            }
+            let arg_win = unsafe { args.offset_from(regs_base) } as u32;
+            let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+            self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win, argc: argc as u16, is_eval: false,
+                func: fid,
+                base: new_base,
+                ip: bail as usize,
+                ret_dst: 0,
+                closure,
+                handlers: Vec::new(),
+                new_target,
+                callee: cv,
+            });
+            let stop = self.frames.len() - 1;
+            match self.run_loop(stop) {
+                Ok(v) => {
+                    self.regs.truncate(new_base);
+                    v.bits()
+                }
+                Err(_) => {
+                    // pending_throw is set; the native chain unwinds and the
+                    // enclosing interpreter dispatches it to a handler.
+                    self.osr_deopt_exempt = true;
+                    CALL_THREW
+                }
+            }
+        };
+        self.jit_call_depth -= 1;
+        out
+    }
+
     /// The implementation behind the region call helpers `jit_call_method_ic` /
     /// `jit_call_ic` (`is_method` selects which). A compiled OSR region reached
     /// a `CallMethod`/`Call` op: consult the SAME per-site inline cache the
@@ -325,6 +525,26 @@ impl<'p> Vm<'p> {
                 None => {
                     if jit_call_log() {
                         eprintln!("[call] METHOD MISS fn{func_id}@{ip} key={key}");
+                    }
+                    // B82: a `f.call(…)`/`f.apply(…)` site whose receiver is a
+                    // plain user function and whose `call`/`apply` resolves to
+                    // the PRISTINE `%Function.prototype%` native — splice the
+                    // TARGET call off-frame (the this/args shuffle done here,
+                    // the body run by the method inliner's evaluator), skipping
+                    // `call_value`'s frames.push + nested run_loop. Every guard
+                    // is re-checked per call, so a monkey-patched `.call`, an
+                    // own `f.call` shadow, a swapped [[Prototype]], or a bound/
+                    // exotic target declines to the unchanged fallback below.
+                    if matches!(key, "call" | "apply") {
+                        if let Some(bits) = self.try_fn_call_apply_inline(
+                            recv,
+                            key == "apply",
+                            base,
+                            arg_base,
+                            argc,
+                        ) {
+                            return bits;
+                        }
                     }
                     // Builtin fallback: the EXACT paths the interpreter runs
                     // next for this op (`try_builtin_method`, then a
@@ -421,6 +641,160 @@ impl<'p> Vm<'p> {
             }
         }
         crate::codegen::SELF_CALL_DEOPT
+    }
+
+    /// B82: inline the TARGET of `f.call(…)` / `f.apply(…)` at a region
+    /// `CallMethod` site. `recv` is the `f` — the method RECEIVER, which is the
+    /// underlying callable. Returns the result bits (or `CALL_THREW`) when the
+    /// splice served the call, `None` to fall through to the unchanged generic
+    /// fallback (`try_builtin_method` → the `call`/`apply` arm → `call_value`).
+    ///
+    /// GUARD SET (all re-checked per call — nothing is baked into machine code,
+    /// so no invalidation protocol is needed):
+    /// * `f` is a plain user function (`ic_plain_fn`: Func/Closure, not
+    ///   generator/async — a Bound / native / class receiver declines) and not
+    ///   an arrow (`lexical_this` — its captured `this` needs `setup_call`'s
+    ///   rebinding).
+    /// * No own `f.call`/`f.apply` shadow (`fn_props`), `f`'s [[Prototype]] is
+    ///   the main `%Function.prototype%` (`proto_of` override declines), and
+    ///   that prototype's own `call`/`apply` slot is still the pristine
+    ///   `FN_CALL`/`FN_APPLY` native data property — the same three-step proof
+    ///   `jit_has_own_call` uses. A monkey-patched `.call` therefore falls back
+    ///   mid-loop with no compiled-code invalidation.
+    /// * Realm gate mirroring `dispatch_builtin_method_inner`'s call/apply arm:
+    ///   a createRealm-child function resolves these through its OWN realm's
+    ///   prototype copies — decline.
+    /// * OrdinaryCallBindThis is applied UP FRONT: a SLOPPY target with a
+    ///   nullish or primitive `thisArg` needs the global substitution / boxing
+    ///   — decline to the frame call rather than replicate it (a strict target
+    ///   receives `thisArg` exactly as passed, so `return this` off-frame is
+    ///   byte-identical).
+    /// * `.apply`'s argArray must be nullish or a PLAIN dense Array (no
+    ///   `arr_props` overlay, no virtual `array_js_len` length, no
+    ///   `Array.prototype` index pollution, no holes, ≤ 32 elements) — anything
+    ///   where CreateListFromArrayLike could observe a getter/trap/coercion
+    ///   declines BEFORE any effect.
+    /// * The target body itself is admitted by the SAME pass-1 whitelist the
+    ///   method inliner uses (`method_body_inlinable`), and pass 2 declines on
+    ///   any per-execution surprise before any side effect — so the fallback
+    ///   frame call never double-runs anything.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn try_fn_call_apply_inline(
+        &mut self,
+        recv: Value,
+        is_apply: bool,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<u64> {
+        if !crate::codegen::call_inline_enabled() {
+            return None;
+        }
+        // Arity subset: `.call` with 0-3 forwarded args, `.apply(this[, arr])`.
+        if if is_apply { argc > 2 } else { argc > 4 } {
+            return None;
+        }
+        let (fid, _closure) = self.ic_plain_fn(recv)?;
+        if self.func(fid as usize).lexical_this {
+            return None;
+        }
+        if !self.realm_global_objs.is_empty() && self.get_function_realm(recv) != 0 {
+            return None;
+        }
+        let idx = recv.heap_index();
+        let name = if is_apply { "apply" } else { "call" };
+        if self.fn_props.get(&idx).is_some_and(|m| m.pos(name).is_some()) {
+            return None;
+        }
+        if self.proto_of.get(&idx).is_some_and(|&p| p != Value::heap(self.fn_proto)) {
+            return None;
+        }
+        // Pristine `%Function.prototype%.call`/`.apply`: the own SLOT index is
+        // memoized behind the object's version (a key add/remove/descriptor
+        // change bumps it); the slot VALUE is re-read every call, because an
+        // in-place overwrite (`Function.prototype.call = g`) bumps nothing —
+        // the fn-bits re-read precedent.
+        let fp_ver = self.heap.version_of(self.fn_proto);
+        if self.ci_pristine.0 != fp_ver {
+            self.ci_pristine = match self.heap.get(self.fn_proto) {
+                HeapObj::Object(m) => (
+                    fp_ver,
+                    m.pos("call").map_or(u32::MAX, |s| s as u32),
+                    m.pos("apply").map_or(u32::MAX, |s| s as u32),
+                ),
+                _ => (fp_ver, u32::MAX, u32::MAX),
+            };
+        }
+        let slot = if is_apply { self.ci_pristine.2 } else { self.ci_pristine.1 };
+        if slot == u32::MAX {
+            return None;
+        }
+        let want = if is_apply { crate::vm::native::FN_APPLY } else { crate::vm::native::FN_CALL };
+        let pristine = match self.heap.get(self.fn_proto) {
+            HeapObj::Object(m) => {
+                let s = slot as usize;
+                !m.attrs[s].accessor
+                    && m.vals[s].is_heap()
+                    && matches!(
+                        self.heap.get(m.vals[s].heap_index()),
+                        HeapObj::Native(id) if *id == want
+                    )
+            }
+            _ => false,
+        };
+        if !pristine {
+            return None;
+        }
+        // OrdinaryCallBindThis, applied before the body runs: strict targets
+        // take `thisArg` raw; sloppy targets with a nullish/primitive `thisArg`
+        // decline (global substitution / boxing stays on the frame call).
+        let this_v = if argc >= 1 { self.get(base, arg_base) } else { Value::UNDEFINED };
+        if !self.func(fid as usize).is_strict
+            && (this_v.is_nullish() || !self.is_object_value(this_v))
+        {
+            return None;
+        }
+        if !is_apply {
+            // Forwarded args are contiguous at `arg_base + 1` — the method
+            // inliner's caller-window entry reads them in place.
+            let bits =
+                self.try_method_inline(fid, this_v, base, arg_base + 1, argc.saturating_sub(1))?;
+            crate::vm::helpers_misc::callstats::inline_hit(false);
+            return Some(bits);
+        }
+        // `.apply`: materialize the forwarded args from the argArray.
+        let arr = if argc >= 2 { self.get(base, arg_base + 1) } else { Value::UNDEFINED };
+        let mut buf = [Value::UNDEFINED; Self::MI_MAX_REGS];
+        let nargs = if arr.is_nullish() {
+            0
+        } else {
+            if !arr.is_heap() || self.array_proto_has_index {
+                return None;
+            }
+            let aidx = arr.heap_index();
+            if !self.arr_props.is_empty() && self.arr_props.get(&aidx).is_some() {
+                return None;
+            }
+            if !self.array_js_len.is_empty() && self.array_js_len.get(&aidx).is_some() {
+                return None;
+            }
+            match self.heap.get(aidx) {
+                HeapObj::Array(items) => {
+                    // A HOLE element would take CreateListFromArrayLike through
+                    // a proto-chain Get; ≤ 32 keeps the per-call scan bounded.
+                    if items.len() > 32 || items.iter().any(|v| v.is_hole()) {
+                        return None;
+                    }
+                    let n = items.len().min(Self::MI_MAX_REGS);
+                    buf[..n].copy_from_slice(&items[..n]);
+                    n
+                }
+                _ => return None,
+            }
+        };
+        let bits = self.try_call_inline_argv(fid, this_v, &buf[..nargs])?;
+        crate::vm::helpers_misc::callstats::inline_hit(true);
+        Some(bits)
     }
 
     /// Materialize a `Thrown` from a region-helper-run operation exactly like

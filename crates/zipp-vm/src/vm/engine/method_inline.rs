@@ -65,6 +65,33 @@ impl<'p> Vm<'p> {
         out
     }
 
+    /// `try_method_inline` with the arguments in a SLICE instead of the caller's
+    /// register window — the `f.apply(thisArg, [a, b])` entry (B82), where the
+    /// forwarded args live in a heap Array rather than contiguous caller regs.
+    /// `regs[0]` is bound to `this_v` EXACTLY as given; the caller is
+    /// responsible for having already applied (or declined on)
+    /// OrdinaryCallBindThis. Same result contract as `try_method_inline`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn try_call_inline_argv(
+        &mut self,
+        fid: u32,
+        this_v: Value,
+        args: &[Value],
+    ) -> Option<u64> {
+        let body_len = self.method_body_inlinable(fid)?;
+        let p = self.func(fid as usize);
+        let mut regs = [Value::UNDEFINED; Self::MI_MAX_REGS];
+        regs[0] = this_v;
+        let n = args.len().min(p.param_count as usize);
+        regs[1..1 + n].copy_from_slice(&args[..n]);
+        let out = self.run_mi_ops(fid, this_v, &mut regs, body_len, 0);
+        #[cfg(feature = "instrument")]
+        if out.is_some() {
+            self.charge_steps(body_len as i64);
+        }
+        out
+    }
+
     /// Pass 1 of method inlining: is `fid`'s body a straight-line prefix of ops
     /// the off-frame evaluator implements, ending at the FIRST `Return`/
     /// `ReturnUndefined`? Returns the body length (ops up to and incl. that
@@ -201,23 +228,41 @@ impl<'p> Vm<'p> {
         body_len: usize,
         depth: u32,
     ) -> Option<u64> {
-        use crate::bytecode::Instr as I;
-        use crate::vm::helpers_misc::BigOp;
-        let p = self.func(fid as usize);
         // Local register window on the STACK — NO heap allocation per call (the
         // frame-call path it replaces reuses the pinned reg file; an allocation
         // here would be far slower than the frame call it elides). `reg_count`
         // is bounded ≤ MI_MAX_REGS in pass 1. this in reg 0, positional args in
-        // 1.., the rest undefined (mirrors setup_call's zero-fill). `code`/
-        // `constants`/`string_constants` are `&'p` — they outlive `&mut self`.
-        let code: &'p [Instr] = &p.code;
-        let consts = &p.constants;
+        // 1.., the rest undefined (mirrors setup_call's zero-fill).
+        let p = self.func(fid as usize);
         let mut regs = [Value::UNDEFINED; Self::MI_MAX_REGS];
         regs[0] = recv;
         let nargs = (argc as usize).min(p.param_count as usize);
         for i in 0..nargs {
             regs[1 + i] = self.get(caller_base, arg_base + i as u16);
         }
+        self.run_mi_ops(fid, recv, &mut regs, body_len, depth)
+    }
+
+    /// The op-evaluation core behind `run_method_inline` /
+    /// `try_call_inline_argv`: execute the validated trivial body of `fid` over
+    /// an ALREADY-BOUND register window (`regs[0]` = the effective `this`,
+    /// formals in `1..`). Same three-state result as `run_method_inline`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn run_mi_ops(
+        &mut self,
+        fid: u32,
+        recv: Value,
+        regs: &mut [Value],
+        body_len: usize,
+        depth: u32,
+    ) -> Option<u64> {
+        use crate::bytecode::Instr as I;
+        use crate::vm::helpers_misc::BigOp;
+        let p = self.func(fid as usize);
+        // `code`/`constants`/`string_constants` are `&'p` — they outlive
+        // `&mut self`.
+        let code: &'p [Instr] = &p.code;
+        let consts = &p.constants;
         // Helper: numeric fast paths matching the interpreter ops EXACTLY; a
         // non-numeric operand declines (None) so no observable coercion runs.
         for (body_ip, instr) in code[..body_len].iter().enumerate() {

@@ -95,6 +95,24 @@ pub(crate) fn substring1_intrinsic_enabled() -> bool {
     }
 }
 
+/// Same-binary A/B switch for the B82 `f.call(…)`/`f.apply(…)` target splice
+/// (`try_fn_call_apply_inline`). Read by the region-call helper per call and by
+/// the call-mix admission gate; never on generated code's hot path.
+#[allow(dead_code)]
+pub(crate) fn call_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CALL_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Sentinel in `bail_ip` meaning the native code completed via `Return` (the
 /// result is in the returned `u64`). Any other value is the ip to resume at.
 pub const NO_BAIL: u32 = u32::MAX;
@@ -527,6 +545,13 @@ pub struct HeapHelperAddrs {
     pub has_own_call: usize,
     /// Helper for a generic `f(args…)` (`Call`) in a region (same protocol).
     pub call_ic: usize,
+    /// Helper for the Tier C CROSS-CALL fast path (B83): a `Call` site whose
+    /// live callee is itself a Tier-C-compiled plain function is dispatched
+    /// native→native through this helper — no `ic_call` probe, no `setup_call`
+    /// frame push, no nested `run_loop` on the clean path. Returns the result
+    /// bits, `SELF_CALL_DEOPT` (not eligible — the emitted site falls through
+    /// to the unchanged `call_ic` helper, a pure prefix), or `CALL_THREW`.
+    pub cross_call: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
     /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
@@ -635,6 +660,7 @@ impl HeapHelperAddrs {
             call_method_ic: self.call_method_ic,
             has_own_call: self.has_own_call,
             call_ic: self.call_ic,
+            cross_call: self.cross_call,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
             get_prop_acc: self.get_prop_acc,
@@ -1091,6 +1117,14 @@ pub struct Jit {
     /// function's mmap'd `ExecutableBuffer`, which never moves, and a function's
     /// entry is immutable once compiled.
     self_cache: Option<(u32, *const u8)>,
+    /// Dense per-func_id native entry for the Tier C CROSS-CALL fast path
+    /// (B83): non-null iff the function is currently Tier-C compiled and
+    /// cross-callable (plain body, no self-binding assumption — Tier C never
+    /// bakes one). Grown on demand; cleared on eviction and on `set_meter`.
+    /// Entries point into mmap'd `ExecutableBuffer`s, which never move (and
+    /// evicted buffers are PARKED in `retired_fns`, so even a stale pointer
+    /// read racing an eviction within one helper call targets live code).
+    cross_entries: Vec<*const u8>,
     /// Compiled fused `map` kernels, keyed by callback `func_id`. `None` =
     /// tried and ineligible (so we don't recompile every `map` call). Keyed by
     /// `func_id` alone: a given callback proto has fixed param_count/body.
@@ -1161,6 +1195,7 @@ impl Jit {
         // just invalidated.
         self.fn_state.clear();
         self.self_cache = None;
+        self.cross_entries.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
@@ -1206,6 +1241,30 @@ impl Jit {
         *c == self.fn_threshold()
     }
 
+    /// Native entry for the cross-call fast path, or `None` if `func_id` is not
+    /// currently Tier-C compiled (see `cross_entries`).
+    #[inline]
+    pub fn cross_entry(&self, func_id: u32) -> Option<*const u8> {
+        match self.cross_entries.get(func_id as usize) {
+            Some(p) if !p.is_null() => Some(*p),
+            _ => None,
+        }
+    }
+
+    fn set_cross_entry(&mut self, func_id: u32, entry: *const u8) {
+        let i = func_id as usize;
+        if self.cross_entries.len() <= i {
+            self.cross_entries.resize(i + 1, std::ptr::null());
+        }
+        self.cross_entries[i] = entry;
+    }
+
+    fn clear_cross_entry(&mut self, func_id: u32) {
+        if let Some(p) = self.cross_entries.get_mut(func_id as usize) {
+            *p = std::ptr::null();
+        }
+    }
+
     /// Dense tier state of `func_id` — the frame-entry fast path.
     #[inline]
     pub fn fn_state(&self, func_id: u32) -> u8 {
@@ -1236,6 +1295,11 @@ impl Jit {
         // Tier-C leaf-inline plan for this whole function (built by the caller from
         // the live ICs; empty = no inlining, e.g. when ZIPP_NO_TIERC_LEAF is set).
         leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+        // Tier-C cross-call plan (B83): the `Call` ips whose live interpreter IC
+        // names a plain user-function callee — those sites get the native
+        // cross-call attempt with the unchanged `call_ic` helper as fallback.
+        // Empty = no cross-call emission (e.g. ZIPP_NO_CROSSCALL).
+        cross_plan: &FxHashSet<usize>,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -1271,7 +1335,7 @@ impl Jit {
             let acc_emit = self.register_ic_sites(ic_base_idx, func_id, u32::MAX, &proto.code, 0);
             let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
             if let Some(f) =
-                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs, leaf_plan, &acc_emit, meter)
+                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs, leaf_plan, cross_plan, &acc_emit, meter)
             {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!(
@@ -1281,8 +1345,15 @@ impl Jit {
                         acc_emit.len()
                     );
                 }
+                // Cross-call entry (B83): a Tier C body never bakes a
+                // self-binding assumption and Tier C rejects generators/async/
+                // rest/`arguments`, so its entry is safe to dispatch to from
+                // another compiled function's Call site.
+                debug_assert!(f.self_binding().is_none());
+                let entry = f.entry();
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
+                self.set_cross_entry(func_id, entry);
                 return;
             }
         }
@@ -1442,6 +1513,7 @@ impl Jit {
         ta_plan: &TaPinPlan,
         leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
         method_plan: &FxHashMap<usize, MethodInlinePlan>,
+        cross_plan: &FxHashSet<usize>,
     ) {
         let key = (func_id, start);
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
@@ -1519,7 +1591,7 @@ impl Jit {
             start,
         );
         let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
-        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, &acc_emit, meter) {
+        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, cross_plan, &acc_emit, meter) {
             Some((code, is_mem)) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     let tier = if is_mem { "MEM" } else { "DOUBLE" };
@@ -1693,6 +1765,7 @@ impl Jit {
                 self.retired_fns.push(f);
                 self.counts.remove(&m.func_id);
                 self.set_fn_state(m.func_id, FN_COLD);
+                self.clear_cross_entry(m.func_id);
                 if self.self_cache.is_some_and(|(id, _)| id == m.func_id) {
                     self.self_cache = None;
                 }

@@ -205,6 +205,9 @@ pub(crate) fn compile_proto_mem(
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+    // Tier-C cross-call plan (B83): `Call` ips that get the native→native
+    // cross-call attempt (fallback: the unchanged `call_ic` helper).
+    cross_plan: &FxHashSet<usize>,
     // Per-site accessor-arm emission flags (the SITE GATE), indexed by the
     // local site number — see `compile_region_mem`'s twin parameter.
     acc_emit: &[bool],
@@ -984,6 +987,50 @@ pub(crate) fn compile_proto_mem(
                 // the next GetProp probe / leaf version guard reads a moved table).
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args = ((callee as u64) << 16) | arg_base as u64;
+                // ── B83 cross-call fast path ── a Call site whose live IC named
+                // a plain user-function callee first tries the native→native
+                // cross-call helper: it re-resolves the LIVE callee Value (read
+                // from the register here, so a rebound global misses), and runs
+                // a Tier-C-compiled callee directly over the contiguous window
+                // above this frame — no `ic_call` probe, no `setup_call`, no
+                // frame push, no nested `run_loop`. `SELF_CALL_DEOPT` (callee
+                // not/never Tier-C, arrow, depth cap, stale global routes) falls
+                // through to the unchanged `call_ic` helper — a pure prefix.
+                // `CALL_THREW` bails so the interpreter unwinds (never re-runs).
+                // Skipped when the site is leaf-inlined (strictly cheaper).
+                let cross = cross_plan.contains(&ip) && leaf_plan.get(&ip).is_none();
+                let cross_done = ops.new_dynamic_label();
+                if cross {
+                    let packed_cross: u64 =
+                        (argc as u64) | ((proto.reg_count.max(1) as u64) << 16);
+                    let cross_fallback = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, rbx                        // caller window base
+                        ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                        ; mov r9, QWORD packed_cross as i64   // (caller_regs<<16)|argc
+                        ; mov rax, [rbx + dreg(callee)]
+                        ; mov [rsp + 32], rax                 // 5th arg: callee bits
+                        ; mov rax, QWORD heap.cross_call as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => cross_fallback                // not eligible → call_ic
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // threw → exit; unwind
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // The callee ran user code (alloc / nested compile possible):
+                    // re-derive the pinned r13/r14, exactly as after call_ic.
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(&mut ops, vb, Some(icb));
+                    }
+                    dynasm!(ops
+                        ; jmp => cross_done
+                        ; => cross_fallback
+                    );
+                }
                 // Q4 leaf-call inlining: a monomorphic plain-leaf callee is inlined
                 // with an identity guard; a guard miss / tight headroom falls through
                 // to the SAME helper (a pure prefix). Tier C has no TA pins → no
@@ -1026,6 +1073,9 @@ pub(crate) fn compile_proto_mem(
                         refetch,
                         None,
                     );
+                }
+                if cross {
+                    dynasm!(ops ; => cross_done);
                 }
             }
             Instr::StrAppendInPlace { dst, a, b } => {

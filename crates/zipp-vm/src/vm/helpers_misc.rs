@@ -125,6 +125,37 @@ pub(crate) extern "win64" fn jit_call_method_ic(
     }
 }
 
+/// Win64 helper for the Tier C CROSS-CALL fast path (B83): a compiled body's
+/// `Call` site whose live callee is itself a Tier-C-compiled plain function is
+/// dispatched native→native — no `ic_call` probe, no `setup_call` frame push,
+/// no nested `run_loop` on the clean path (see `jit_cross_call_impl`). Returns
+/// the result bits, `SELF_CALL_DEOPT` (not eligible — the emitted site falls
+/// through to the unchanged `call_ic` helper), or `CALL_THREW`. ABI: rcx=vm,
+/// rdx=caller window base (rbx), r8=&args[0] (the staged contiguous args),
+/// r9=(caller_reg_count<<16)|argc, 5th stack arg = the callee's Value bits.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `caller_base_ptr` is the running frame's window
+/// base within `vm.regs` (pinned buffer); `args` points to `argc` valid Values.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_cross_call(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    args: *const u64,
+    packed: u64,
+    callee_bits: u64,
+) -> u64 {
+    // Catch Rust panics at the FFI boundary (UB to unwind across `extern`).
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_cross_call_impl(caller_base_ptr, args, packed, callee_bits)
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Guarded intrinsic for the hot
 /// `Object.prototype.hasOwnProperty.call(array, numeric_key)` shape.
 ///
@@ -191,7 +222,10 @@ pub(crate) extern "win64" fn jit_has_own_call(
     }
 
     match vm.has_own_index_fast(Value::from_bits(this_bits), Value::from_bits(key_bits)) {
-        Some(answer) => Value::bool(answer).bits(),
+        Some(answer) => {
+            callstats::hasown_hit();
+            Value::bool(answer).bits()
+        }
         None => crate::codegen::SELF_CALL_DEOPT,
     }
 }
@@ -1348,6 +1382,71 @@ mod icstats {
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use icstats::dump as ic_stats;
+
+/// `ZIPP_ICSTATS=1` — B82 call/apply splice counters. `call`/`apply` count the
+/// region-call helper serving a `f.call(…)`/`f.apply(…)` TARGET off-frame
+/// (`try_fn_call_apply_inline`); `hasown` counts the older guarded
+/// `hasOwnProperty.call(array, key)` intrinsic answering without any call
+/// machinery (`jit_has_own_call` — the sparse-array phase's shape). Off, one
+/// relaxed atomic load on paths that already made a helper call.
+pub(crate) mod callstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static CALL_HIT: AtomicU64 = AtomicU64::new(0);
+    static APPLY_HIT: AtomicU64 = AtomicU64::new(0);
+    static HASOWN_HIT: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    /// One off-frame `f.call(…)` / `f.apply(…)` target splice served.
+    /// (Counted only from JIT helpers; unused — and zero — without the JIT.)
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn inline_hit(is_apply: bool) {
+        if !enabled() {
+            return;
+        }
+        if is_apply {
+            APPLY_HIT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            CALL_HIT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One `hasOwnProperty.call(array, key)` intrinsic hit.
+    /// (Counted only from JIT helpers; unused — and zero — without the JIT.)
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn hasown_hit() {
+        if !enabled() {
+            return;
+        }
+        HASOWN_HIT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(call_hits, apply_hits, hasown_intrinsic_hits)`
+    pub fn dump() -> (u64, u64, u64) {
+        (
+            CALL_HIT.load(Ordering::Relaxed),
+            APPLY_HIT.load(Ordering::Relaxed),
+            HASOWN_HIT.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub use callstats::dump as call_inline_stats;
 
 /// Without the JIT there are no inline caches, so there is nothing to miss and
 /// every counter is zero. Present in every configuration so that the public

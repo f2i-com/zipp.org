@@ -723,6 +723,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) has_own_call: usize,
     /// Helper for a generic `f(args…)` via the interpreter's per-site IC.
     pub(crate) call_ic: usize,
+    /// Tier C native→native cross-call fast path (B83); falls back to `call_ic`.
+    pub(crate) cross_call: usize,
     /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).
     pub(crate) get_prop_slow: usize,
     /// `PROP_VIA_IC` continuation for SetProp.
@@ -798,6 +800,7 @@ pub(crate) fn compile_region(
     ta_plan: &TaPinPlan,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
+    cross_plan: &FxHashSet<usize>,
     acc_emit: &[bool],
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<(JitFn, bool)> {
@@ -813,7 +816,7 @@ pub(crate) fn compile_region(
     if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot, meter) {
         return Some((f, false));
     }
-    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan, acc_emit, meter)
+    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan, cross_plan, acc_emit, meter)
         .map(|f| (f, true))
 }
 

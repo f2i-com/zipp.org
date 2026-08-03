@@ -411,6 +411,8 @@ pub fn emit(n: &ir::Regex) -> CompiledRegex {
             flags: n.flags,
             start_pred: startpredicate::predicate_for_re(n),
             skip_hint_ip: None,
+            #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+            rxjit: Default::default(),
         },
     };
     emitter.emit_node(&n.node);

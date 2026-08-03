@@ -82,11 +82,19 @@ fn main() -> ExitCode {
             pct(sg, sm), pct(sd, sm)
         );
         eprintln!("[ic] accessor-way hits  get {gah}  set {sah}");
+        let (cih, aih, hoh) = zipp_vm::call_inline_stats();
+        eprintln!(
+            "[ic] call/apply target inlines  call {cih}  apply {aih}  hasOwn-intrinsic {hoh}"
+        );
     }
     if std::env::var_os("ZIPP_RXSTATS").is_some() {
         let (att, pushes, retries, elided, skips) = zipp_vm::rx_stats();
         eprintln!(
             "[rx] attempts {att}  greedy1 pushes {pushes}  retries {retries}  possessive elided {elided}  run skips {skips}"
+        );
+        let (jc, jdu, jdl, jn, jf, jb) = zipp_vm::rx_jit_stats();
+        eprintln!(
+            "[rx] jit compiled {jc}  declined unsupported {jdu}  declined limits {jdl}  native attempts {jn}  interp attempts {jf}  bails {jb}"
         );
     }
     if bstats {

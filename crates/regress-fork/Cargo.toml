@@ -37,6 +37,10 @@ default = [
 ]
 index-positions = []
 pattern = []
+# PATCH (see VENDORED.md and src/rxjit.rs): native x86-64 compilation of the
+# classical backtracker's bytecode via dynasm. Only compiles code on x86-64
+# (other targets keep the interpreter); `ZIPP_NO_RX_JIT=1` disables at runtime.
+rx-jit = ["std", "dep:dynasm", "dep:dynasmrt"]
 prohibit-unsafe = []
 std = ["memchr/std"]
 linear-ascii = ["std", "dep:regex"]
@@ -68,6 +72,11 @@ name = "linear_feature_gate"
 path = "tests/linear_feature_gate.rs"
 
 [[test]]
+name = "rxjit_differential"
+path = "tests/rxjit_differential.rs"
+required-features = ["rx-jit"]
+
+[[test]]
 name = "replacement_tests"
 path = "tests/replacement_tests.rs"
 
@@ -77,6 +86,14 @@ path = "tests/syntax_error_tests.rs"
 
 
 
+
+[dependencies.dynasm]
+workspace = true
+optional = true
+
+[dependencies.dynasmrt]
+workspace = true
+optional = true
 
 [dependencies.hashbrown]
 version = "0.16.0"

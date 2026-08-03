@@ -159,6 +159,46 @@ impl<'p> Vm<'p> {
         self.dispatch_builtin_method(recv, name, args)
     }
 
+    /// Is a `recv.call(…)` / `recv.apply(…)` name-dispatch sound — i.e. would a
+    /// real Get on `recv` resolve `name` to the pristine `%Function.prototype%`
+    /// native? Requires: an ORDINARY callable (Func/Closure/Native/Bound — a
+    /// Class's statics and a Proxy's get trap must resolve generically), no own
+    /// `fn_props` shadow, `[[Prototype]]` still the main `%Function.prototype%`,
+    /// and that prototype's own slot still the `FN_CALL`/`FN_APPLY` native data
+    /// property. Pure reads — a `false` sends the caller to the generic
+    /// get_prop + call_value tail, which observes whatever is really installed.
+    pub(crate) fn fn_call_apply_pristine(&self, recv: Value, name: &str) -> bool {
+        use crate::vm::native::{FN_APPLY, FN_CALL};
+        if !recv.is_heap() {
+            return false;
+        }
+        let idx = recv.heap_index();
+        if !matches!(
+            self.heap.get(idx),
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) | HeapObj::Bound { .. }
+        ) {
+            return false;
+        }
+        if self.fn_props.get(&idx).is_some_and(|m| m.pos(name).is_some()) {
+            return false;
+        }
+        if self.proto_of.get(&idx).is_some_and(|&p| p != Value::heap(self.fn_proto)) {
+            return false;
+        }
+        let want = if name == "apply" { FN_APPLY } else { FN_CALL };
+        match self.heap.get(self.fn_proto) {
+            HeapObj::Object(m) => m.pos(name).is_some_and(|slot| {
+                !m.attrs[slot].accessor
+                    && m.vals[slot].is_heap()
+                    && matches!(
+                        self.heap.get(m.vals[slot].heap_index()),
+                        HeapObj::Native(id) if *id == want
+                    )
+            }),
+            _ => false,
+        }
+    }
+
     /// Dispatch a builtin method on `recv` with an already-materialized args
     /// slice. Shared by `try_builtin_method` (args gathered from registers) and
     /// the spread method-call path (args taken from an array). `Ok(None)` means
@@ -279,12 +319,19 @@ impl<'p> Vm<'p> {
             && !(!self.realm_global_objs.is_empty() && self.get_function_realm(recv) != 0)
         {
             match name {
-                "call" => {
+                // `call`/`apply` are name-dispatched here, which is only sound
+                // while the resolution a real Get would produce IS the pristine
+                // `%Function.prototype%` native. An own `f.call = g` shadow, a
+                // swapped [[Prototype]], a patched prototype slot, or an exotic
+                // callable (Class statics, Proxy get traps) must resolve through
+                // the generic get_prop + call_value tail below instead — B82's
+                // fallback contract (`Ok(None)` here reaches that tail).
+                "call" if self.fn_call_apply_pristine(recv, name) => {
                     let this = args.first().copied().unwrap_or(Value::UNDEFINED);
                     let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
                     return Ok(Some(self.call_value(recv, this, rest)?));
                 }
-                "apply" => {
+                "apply" if self.fn_call_apply_pristine(recv, name) => {
                     let this = args.first().copied().unwrap_or(Value::UNDEFINED);
                     let arr = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                     // argArray null/undefined -> no args; else CreateListFromArrayLike

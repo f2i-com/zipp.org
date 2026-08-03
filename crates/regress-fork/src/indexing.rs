@@ -57,6 +57,15 @@ where
     /// This is true for ASCII and UTF8, but not for UCS2 or UTF16.
     const CODE_UNITS_ARE_BYTES: bool;
 
+    /// PATCH (see rxjit.rs): the raw bytes when this input is byte-addressed
+    /// with ASCII element semantics (`AsciiInput`) — the only input type the
+    /// native regex code path may run over. Default: none.
+    #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+    #[inline(always)]
+    fn rxjit_bytes(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// \return whether we are using unicode for case-folding.
     fn unicode(&self) -> bool;
 
@@ -641,6 +650,14 @@ impl<'a> InputIndexer for AsciiInput<'a> {
     type Element = u8;
     type CharProps = matchers::ASCIICharProperties;
     const CODE_UNITS_ARE_BYTES: bool = true;
+
+    /// PATCH (see rxjit.rs): AsciiInput is the byte-addressed input the
+    /// native code path understands.
+    #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+    #[inline(always)]
+    fn rxjit_bytes(&self) -> Option<&[u8]> {
+        Some(self.input)
+    }
 
     #[inline(always)]
     fn unicode(&self) -> bool {

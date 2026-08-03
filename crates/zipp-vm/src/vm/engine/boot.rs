@@ -332,6 +332,10 @@ impl<'p> Vm<'p> {
             jit_const_strings: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_cache: Vec::new(),
+            // The sentinel version never equals a live object's, so the first
+            // use recomputes against the real `%Function.prototype%`.
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            ci_pristine: (u32::MAX, u32::MAX, u32::MAX),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

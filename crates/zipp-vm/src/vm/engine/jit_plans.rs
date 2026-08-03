@@ -281,6 +281,41 @@ impl<'p> Vm<'p> {
     /// loop has executed `OSR_THRESHOLD` times by OSR-compile, so a hot
     /// monomorphic call already has its `Callee` way filled. A polymorphic /
     /// unfilled site simply isn't inlined.
+    /// Tier C cross-call plan (B83): the `Call` ips worth emitting the native
+    /// cross-call attempt at. The emitted attempt is CORRECT at any Call site
+    /// (the helper re-resolves the live callee Value every call and deopts for
+    /// anything but a Tier-C-compiled plain function); the plan exists only to
+    /// avoid planting a useless extra helper round trip at sites whose live IC
+    /// says the callee is a native/bound/exotic (or is still unfilled). Off
+    /// switch: `ZIPP_NO_CROSSCALL=1` (empty plan ⇒ byte-identical Tier C code).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_cross_call_plan(&self, func_id: u32) -> rustc_hash::FxHashSet<usize> {
+        let mut plan = rustc_hash::FxHashSet::default();
+        if std::env::var_os("ZIPP_NO_CROSSCALL").is_some() {
+            return plan;
+        }
+        let caller = self.func(func_id as usize);
+        for (ip, instr) in caller.code.iter().enumerate() {
+            let Instr::Call { .. } = instr else { continue };
+            // A filled plain-user-function way (mono) is the signal; the
+            // helper's own resolution is what correctness rests on.
+            let Some((_bits, _ver, fid, _closure)) = self.ic_call_mono(func_id, ip) else {
+                continue;
+            };
+            let callee = self.func(fid as usize);
+            if callee.is_generator
+                || callee.is_async
+                || callee.lexical_this
+                || callee.rest_reg.is_some()
+                || callee.arguments_reg.is_some()
+            {
+                continue; // could never hold a cross entry / needs setup_call
+            }
+            plan.insert(ip);
+        }
+        plan
+    }
+
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_leaf_inline_plan(
         &self,

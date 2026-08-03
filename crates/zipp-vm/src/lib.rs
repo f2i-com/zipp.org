@@ -89,6 +89,16 @@ pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     vm::ic_stats()
 }
 
+/// `ZIPP_ICSTATS=1` B82 call/apply splice counters:
+/// `(call_hits, apply_hits, hasown_intrinsic_hits)` — off-frame
+/// `f.call(…)`/`f.apply(…)` target inlines served by the region-call helper,
+/// plus hits of the guarded `hasOwnProperty.call(array, key)` intrinsic.
+/// Zeroed unless the variable was set. `ZIPP_NO_CALL_INLINE=1` forces the
+/// first two to zero.
+pub fn call_inline_stats() -> (u64, u64, u64) {
+    vm::call_inline_stats()
+}
+
 /// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,
 /// most-called first. Empty unless the variable was set. See
 /// `vm::builtins::bstats` for why this exists rather than a reading of
@@ -104,6 +114,15 @@ pub fn builtin_stats() -> Vec<(&'static str, String, u64)> {
 /// regress-fork's possessify.rs).
 pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
     regress::rx_stats()
+}
+
+/// `ZIPP_RXSTATS=1` regex-JIT counters: `(regexes compiled, declined:
+/// unsupported insn, declined: limits, native attempts, interpreter attempts
+/// on byte inputs, native bails)` — zeros when the fork's `rx-jit` feature or
+/// the x86-64 target is absent. `ZIPP_NO_RX_JIT=1` turns the tier off; see
+/// regress-fork's rxjit.rs.
+pub fn rx_jit_stats() -> (u64, u64, u64, u64, u64, u64) {
+    regress::rx_jit_stats()
 }
 
 /// Whether this build actually has the native codegen tiers, i.e. the `jit`

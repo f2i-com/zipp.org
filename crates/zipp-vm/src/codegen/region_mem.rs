@@ -38,6 +38,9 @@ pub(crate) fn compile_region_mem(
     ta_plan: &TaPinPlan,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
+    // Tier-C cross-call plan (B83): `Call` ips that get the native→native
+    // cross-call attempt (fallback: the unchanged `call_ic` helper).
+    cross_plan: &FxHashSet<usize>,
     // Per-site accessor-arm emission flags (the SITE GATE — indexed by the
     // local site number, `ic_site - heap.ic_base_idx`); built by
     // `Jit::register_ic_sites` from the ops that have actually filled an
@@ -1783,6 +1786,48 @@ pub(crate) fn compile_region_mem(
                 // call helper. Packing: r9 = (callee<<16) | arg_base.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let packed_args = ((callee as u64) << 16) | arg_base as u64;
+                // ── B83 cross-call fast path ── as in Tier C's Call arm
+                // (proto_mem.rs): a Tier-C-compiled plain callee is dispatched
+                // native→native; anything else falls through to the unchanged
+                // helper. The region runs over the WHOLE function's frame, so
+                // the caller window size is `proto.reg_count` — the same
+                // contiguity invariant `setup_call` maintains.
+                let cross = cross_plan.contains(&ip) && leaf_plan.get(&ip).is_none();
+                let cross_done = ops.new_dynamic_label();
+                if cross {
+                    let packed_cross: u64 =
+                        (argc as u64) | ((proto.reg_count.max(1) as u64) << 16);
+                    let cross_fallback = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, rbx                        // caller window base
+                        ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                        ; mov r9, QWORD packed_cross as i64   // (caller_regs<<16)|argc
+                        ; mov rax, [rbx + dreg(callee)]
+                        ; mov [rsp + 32], rax                 // 5th arg: callee bits
+                        ; mov rax, QWORD heap.cross_call as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => cross_fallback                // not eligible → call_ic
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // threw → exit; unwind
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // The callee ran user code: re-derive the pinned r13/r14 and
+                    // the TypedArray snapshots, exactly as after call_ic.
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                    }
+                    if let Some((snap, plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, plan);
+                    }
+                    dynasm!(ops
+                        ; jmp => cross_done
+                        ; => cross_fallback
+                    );
+                }
                 // Q4 leaf-call inlining: a monomorphic plain-leaf callee at this
                 // site is inlined with an identity guard; a guard miss / tight
                 // headroom falls through to the SAME helper below (a pure prefix).
@@ -1824,6 +1869,9 @@ pub(crate) fn compile_region_mem(
                         refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                         ta_refetch,
                     );
+                }
+                if cross {
+                    dynasm!(ops ; => cross_done);
                 }
             }
             Instr::StrConcat { dst, a, b } => {
