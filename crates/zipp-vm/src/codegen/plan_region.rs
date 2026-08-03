@@ -14,8 +14,23 @@ macro_rules! decline {
         if std::env::var_os("ZIPP_JITDECLINE").is_some() {
             eprintln!("[decline-reason] {}", $reason);
         }
-        return None;
+        return PlanOutcome::Decline;
     }};
+}
+
+/// Inner-planner outcome: a plan, a definitive decline, or "the xmm pool
+/// overflowed but constant hoisting held permanent homes — worth one retry
+/// with hoisting off". Hoisting a loop-invariant constant saves a per-iteration
+/// materialise (~2 ops), but it pins a home for the WHOLE region; when that is
+/// the difference between compiling on a register tier and declining to the
+/// memory tier (B94 priced that tier gap at 3.2x), the constant goes back in
+/// the body. The retry is silent — a `[decline-reason]` only prints if the
+/// retry ALSO fails, so the documented log-reading rule (regalloc = the compile
+/// with no decline line) still holds.
+enum PlanOutcome {
+    Plan(Box<RegionPlan>),
+    RetryNoHoist,
+    Decline,
 }
 
 /// Name a POST-PLAN decline through the same `[decline-reason]` channel as
@@ -89,6 +104,24 @@ pub(crate) fn double_bitwise_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_DV_DOUBLE=1` restores the pre-DV planner on the DOUBLE path: a
+/// whitelisted DataView `get*` CallMethod declines the whole region to the
+/// memory tier again (helper call, boxed operands). Cached — read once per
+/// process, never on the generated hot path.
+pub(crate) fn dv_double_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_DV_DOUBLE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 pub(crate) fn plan_region(
     proto: &FuncProto,
     start: u32,
@@ -111,6 +144,31 @@ pub(crate) fn plan_region_cold(
     end: u32,
     ta_plan: &TaPinPlan,
     admit_bitwise: bool,
+    admit_split: bool,
+    cold: &FxHashSet<usize>,
+) -> Option<RegionPlan> {
+    match plan_region_cold_inner(proto, start, end, ta_plan, admit_bitwise, admit_split, cold, true)
+    {
+        PlanOutcome::Plan(p) => Some(*p),
+        PlanOutcome::RetryNoHoist => {
+            match plan_region_cold_inner(
+                proto, start, end, ta_plan, admit_bitwise, admit_split, cold, false,
+            ) {
+                PlanOutcome::Plan(p) => Some(*p),
+                _ => None,
+            }
+        }
+        PlanOutcome::Decline => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_region_cold_inner(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+    admit_bitwise: bool,
     // Does the CALLER implement write-through (store each def to `[rbx + dreg(r)]`
     // and skip that register in its flush)? Only the REGALLOC (double) path does,
     // and it gates two features that depend on it: B94 live-range splitting and
@@ -124,7 +182,10 @@ pub(crate) fn plan_region_cold(
     // `hoisted_const_on_untaken_branch`. The int path passes `false`.
     admit_split: bool,
     cold: &FxHashSet<usize>,
-) -> Option<RegionPlan> {
+    // See `PlanOutcome::RetryNoHoist`: `false` on the retry pass — no constant
+    // is hoisted, so none pins a permanent home.
+    allow_hoist: bool,
+) -> PlanOutcome {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
     // ── unboxed-region epic: pinned TypedArray element access ──
@@ -165,7 +226,9 @@ pub(crate) fn plan_region_cold(
             //
             // Staleness cannot bite here the way it can on the memory path: the
             // snapshot's `base` goes stale on any Vec growth, and a regalloc region
-            // contains no Call/CallMethod and (by the line above) no SetIndex, so
+            // contains no Call, no CallMethod other than a pinned-DV get* (inline
+            // machine code — no user code, no allocation, cannot detach/resize a
+            // buffer or grow a Vec) and (by the line above) no SetIndex, so
             // nothing in it can grow the array or trigger a GC.
             //
             // B102 FIX: `ARR_INT_PIN_KIND`, not `is_arr_pin`. The latter also
@@ -209,12 +272,39 @@ pub(crate) fn plan_region_cold(
                 .get(&ip)
                 .map_or(false, |&j| ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND)
     };
+    // A pinned DataView `get*` CallMethod (kind DV_PIN_KIND), DOUBLE path only.
+    // The INT tier keeps declining these (B22/B32): a getUint32 result ranges
+    // through 2^32-1 (feeding `>>>`/`&` past i32) and the float kinds cannot
+    // inhabit an i64 home at all — while an f64 home holds every whitelisted
+    // kind EXACTLY (a u32 <= 2^32-1 is exact in a double; getFloat32/64 are
+    // native). The receiver is read via the pin snapshot, never the register,
+    // so its reg is excluded from typing/homing exactly like a pinned-element
+    // receiver. `ZIPP_NO_DV_DOUBLE=1` restores the decline for A/B.
+    let pinned_dv = |ip: usize| -> bool {
+        !admit_bitwise
+            && dv_double_enabled()
+            && ta_plan
+                .access
+                .get(&ip)
+                .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND)
+            && matches!(code[ip], Instr::CallMethod { name, argc, .. }
+                if (argc == 1 || argc == 2)
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| dv_get_kind(k).is_some()))
+    };
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
-    // B94: at most one recycled receiver register per region (see `plan::RegionPlan`).
-    let mut split_recv: Option<u16> = None;
+    // B94 recycled receivers (see `plan::RegionPlan::split_recvs`). At most one
+    // whose pinned accesses are ELEMENT ops; a receiver whose pinned accesses
+    // are all DV `get*` CallMethods is exempt from that limit — each split is
+    // proven and written through independently.
+    let mut split_recvs: FxHashSet<u16> = FxHashSet::default();
+    let mut non_dv_split_used = false;
     let mut write_through: FxHashSet<u16> = FxHashSet::default();
     let mut split_recv_lg: FxHashSet<usize> = FxHashSet::default();
     let mut recv_glob: Option<u32> = None;
+    let mut split_all_dv = false;
     {
         // Candidate receiver regs: the `obj` of every pinned index op, and the
         // `obj` of every pinned-STRING charCodeAt/length access.
@@ -226,7 +316,7 @@ pub(crate) fn plan_region_cold(
                     recv.insert(obj);
                 }
             }
-            if pinned_str(s + off) || pinned_arr_len(s + off) {
+            if pinned_str(s + off) || pinned_arr_len(s + off) || pinned_dv(s + off) {
                 if let Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. } = *instr {
                     recv.insert(obj);
                 }
@@ -269,7 +359,7 @@ pub(crate) fn plan_region_cold(
                         Some(obj)
                     }
                     Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
-                        if pinned_str(s + off) || pinned_arr_len(s + off) =>
+                        if pinned_str(s + off) || pinned_arr_len(s + off) || pinned_dv(s + off) =>
                     {
                         Some(obj)
                     }
@@ -304,7 +394,7 @@ pub(crate) fn plan_region_cold(
                 let clean_param = def_n.get(&r).is_none() && !used_elsewhere.contains(&r);
                 if clean_global || clean_param {
                     ta_recv_regs.insert(r);
-                } else if admit_split && split_recv.is_none() && def_lg.contains(&r) && {
+                } else if admit_split && def_lg.contains(&r) && {
                     // Every pinned access with THIS receiver must read its
                     // identity from a global slot, and all from the SAME one.
                     // A `TaPinSrc::Reg` pin reads `[rbx + dreg(r)]`, which the
@@ -312,14 +402,30 @@ pub(crate) fn plan_region_cold(
                     // is not separable and declines below.
                     let mut g0: Option<u32> = None;
                     let mut ok = true;
+                    let mut all_dv = true;
                     for (off, i) in code[s..=e].iter().enumerate() {
-                        if cold.contains(&(s + off)) || !pinned_elem(s + off) {
+                        if cold.contains(&(s + off)) {
                             continue;
                         }
-                        if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *i {
+                        // A pinned-DV CallMethod's receiver splits on the same
+                        // terms as a pinned element access: the emitted code
+                        // reads identity from the pin's GLOBAL, never the reg.
+                        let pin_obj = match *i {
+                            Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. }
+                                if pinned_elem(s + off) =>
+                            {
+                                Some((obj, false))
+                            }
+                            Instr::CallMethod { obj, .. } if pinned_dv(s + off) => {
+                                Some((obj, true))
+                            }
+                            _ => None,
+                        };
+                        if let Some((obj, is_dv)) = pin_obj {
                             if obj != r {
                                 continue;
                             }
+                            all_dv &= is_dv;
                             match ta_plan.access.get(&(s + off)).map(|&j| ta_plan.pins[j as usize].src) {
                                 Some(TaPinSrc::Global(g)) if g0.is_none() || g0 == Some(g) => g0 = Some(g),
                                 _ => ok = false,
@@ -329,7 +435,12 @@ pub(crate) fn plan_region_cold(
                     if let Some(g) = g0.filter(|_| ok) {
                         recv_glob = Some(g);
                     }
-                    ok && g0.is_some()
+                    split_all_dv = all_dv;
+                    // The single-split budget applies to ELEMENT-pinned
+                    // receivers only (B94's exercised case); DV-pinned
+                    // receivers split independently — the DV swizzle loop
+                    // recycles two of them, and a one-split rule declined it.
+                    ok && g0.is_some() && (all_dv || !non_dv_split_used)
                 } {
                     // ── B94 live-range splitting ── the bytecode compiler RECYCLED
                     // this register: pinned receiver over one range, arithmetic temp
@@ -353,7 +464,7 @@ pub(crate) fn plan_region_cold(
                                 Some(obj)
                             }
                             Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
-                                if pinned_str(ip) || pinned_arr_len(ip) =>
+                                if pinned_str(ip) || pinned_arr_len(ip) || pinned_dv(ip) =>
                             {
                                 Some(obj)
                             }
@@ -366,21 +477,188 @@ pub(crate) fn plan_region_cold(
                             code, s, e, r, cold, &recv_lg_ips, &recv_use_at,
                         )
                     {
-                        split_recv = Some(r);
-                        split_recv_lg = recv_lg_ips;
+                        split_recvs.insert(r);
+                        split_recv_lg.extend(recv_lg_ips);
+                        if !split_all_dv {
+                            non_dv_split_used = true;
+                        }
                     } else {
                         decline!("split receiver: home not provably live at a use");
                     }
                 } else {
                     // A receiver register reused for other (numeric) values can't be
                     // cleanly excluded under the non-SSA register model → memory path.
-                    // (B94 handles the single-split case above; a SECOND split in the
-                    // same region would need more than the emitter's two flush blocks.)
+                    // (B94 handles element-pinned splits one at a time above; a SECOND
+                    // element split in the same region has never been exercised, so it
+                    // still declines. DV-pinned splits are exempt from that budget.)
                     decline!("pinned receiver reg not cleanly excludable");
                 }
             }
         }
     }
+    let jump_targets = region_jump_targets(code, s, e);
+    // Registers read anywhere OUTSIDE `[s, e]` in the enclosing function. Used
+    // by the DV flag-fusion veto here, and by the dead-code / home-sharing
+    // passes below (same conservative set, computed once).
+    let read_outside: FxHashSet<u16> = code
+        .iter()
+        .enumerate()
+        .filter(|(ip, _)| *ip < s || *ip > e)
+        .flat_map(|(_, instr)| instr_uses(instr))
+        .collect();
+
+    // ── DV endian-flag fusion ── see `RegionPlan::dv_flag_elide`. The bytecode
+    // for `dv.getUint32(o, le === 1)` writes the Eq straight into the arg
+    // window, and the compiler then RECYCLES that window register as a numeric
+    // temp — a Bool def and a Num def on one register, which is a type
+    // conflict under the one-type-per-register model and declined the whole
+    // swizzle region. Eliding the Eq (the call computes ToBoolean(a === b)
+    // inline from the operands' f64 homes) removes the Bool def; the fuse is
+    // admitted only when the Eq's Bool is provably dead past the call:
+    //   * the Eq is IMMEDIATELY before the call and writes `arg_base + 1`;
+    //   * a later non-compare def `m` of the register kills the value, with NO
+    //     use of the register in `(call, m]`, NO branch/Return in `(eq, m)`
+    //     (so the region cannot be left while the elided Bool is live — a
+    //     flush would write the numeric home over the semantic Bool), and NO
+    //     in-region jump target in `(eq, m]` (control cannot enter between
+    //     the Eq and its kill, natively or in the interpreter);
+    //   * every op in `(call, m)` is a PURE-NUMERIC one that cannot throw on
+    //     the numeric state the flush reproduces (no CallMethod / index op /
+    //     MathOp inside the window). With no branch, no throw and no jump
+    //     target, the only way out of the window is a deopt that resumes IN
+    //     it — and the interpreter then runs straight through `m`, rewriting
+    //     the register before any use anywhere (in or out of the region) can
+    //     see the numeric home the flush wrote where the Bool would have
+    //     been. That is what makes a register READ OUTSIDE the region safe
+    //     to fuse: the taint provably dies inside every execution;
+    //   * no def of the register other than elided Eqs is a compare (so the
+    //     register types Num from its remaining defs).
+    // On any deopt the fused access resumes AT the Eq ip: the interpreter
+    // recomputes the flag into the frame slot, then re-runs the call — the
+    // re-executed window is exactly the pure Eq, whose operands' homes were
+    // flushed with the values the Eq would have read (nothing sits between).
+    let mut dv_flag_elide: FxHashSet<usize> = FxHashSet::default();
+    let mut dv_flag_fuse: FxHashMap<usize, (u16, u16)> = FxHashMap::default();
+    {
+        // Candidates: (call ip, eq ip, flag reg, a, b).
+        let mut cand: Vec<(usize, usize, u16, u16, u16)> = Vec::new();
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            let ip = s + off;
+            if cold.contains(&ip) || ip == s || !pinned_dv(ip) {
+                continue;
+            }
+            if let Instr::CallMethod { arg_base, argc: 2, name, .. } = *instr {
+                let size = proto
+                    .string_constants
+                    .get(name as usize)
+                    .and_then(|k| dv_get_kind(k))
+                    .map_or(0u8, |k| [1u8, 1, 1, 2, 2, 4, 4, 4, 8][k as usize]);
+                if size <= 1 {
+                    continue; // single-byte kinds never read the flag
+                }
+                if let Instr::Eq { dst, a, b } = code[ip - 1] {
+                    if dst == arg_base + 1 && !cold.contains(&(ip - 1)) {
+                        cand.push((ip, ip - 1, dst, a, b));
+                    }
+                }
+            }
+        }
+        // Validate to a fixpoint: dropping a candidate restores its Eq as a
+        // real (Bool) def, which can invalidate another candidate's analysis
+        // of the same register.
+        loop {
+            let elide: FxHashSet<usize> = cand.iter().map(|&(_, eip, ..)| eip).collect();
+            let mut drop_at: Option<usize> = None;
+            for (k, &(cip, eip, f, _a, _b)) in cand.iter().enumerate() {
+                // Non-elided defs of f, and the first one after the call (m).
+                let mut m: Option<usize> = None;
+                let mut other_def = false;
+                let mut def_is_cmp = false;
+                for (off2, i2) in code[s..=e].iter().enumerate() {
+                    let ip2 = s + off2;
+                    if cold.contains(&ip2) || elide.contains(&ip2) {
+                        continue;
+                    }
+                    if writes_reg(i2) == Some(f) {
+                        other_def = true;
+                        if matches!(
+                            i2,
+                            Instr::Lt { .. }
+                                | Instr::Le { .. }
+                                | Instr::Gt { .. }
+                                | Instr::Ge { .. }
+                                | Instr::Eq { .. }
+                                | Instr::Ne { .. }
+                        ) {
+                            def_is_cmp = true;
+                        }
+                        if ip2 > cip && m.is_none() {
+                            m = Some(ip2);
+                        }
+                    }
+                }
+                let m = match (other_def, def_is_cmp, m) {
+                    (true, false, Some(m)) => m,
+                    _ => {
+                        drop_at = Some(k);
+                        break;
+                    }
+                };
+                // No use of f between the call and its kill (the kill's own
+                // operands included — they read the pre-def value).
+                let tainted_use = (cip + 1..=m).any(|ip2| {
+                    !cold.contains(&ip2) && instr_uses(&code[ip2]).contains(&f)
+                });
+                // No way out of `(eq, m)` while the Bool is live, and no way
+                // in: no branch, no jump target, and only PURE-NUMERIC ops
+                // that cannot throw on the numeric state a deopt flush
+                // reproduces (a DV call in the window could raise RangeError
+                // mid-taint; an index op could observe the heap).
+                let window_op_bad = (cip + 1..m).any(|ip2| {
+                    !matches!(
+                        code[ip2],
+                        Instr::LoadInt { .. }
+                            | Instr::LoadConst { .. }
+                            | Instr::Move { .. }
+                            | Instr::LoadGlobal { .. }
+                            | Instr::StoreGlobal { .. }
+                            | Instr::StoreGlobalStrict { .. }
+                            | Instr::StoreGlobalResolved { .. }
+                            | Instr::Add { .. }
+                            | Instr::Sub { .. }
+                            | Instr::Mul { .. }
+                            | Instr::Div { .. }
+                            | Instr::Mod { .. }
+                            | Instr::AddInt { .. }
+                            | Instr::Neg { .. }
+                            | Instr::Bitwise { .. }
+                            | Instr::Lt { .. }
+                            | Instr::Le { .. }
+                            | Instr::Gt { .. }
+                            | Instr::Ge { .. }
+                            | Instr::Eq { .. }
+                            | Instr::Ne { .. }
+                    )
+                });
+                let target_in_window = jump_targets.iter().any(|&t| t > eip && t <= m);
+                if tainted_use || window_op_bad || target_in_window {
+                    drop_at = Some(k);
+                    break;
+                }
+            }
+            match drop_at {
+                Some(k) => {
+                    cand.remove(k);
+                }
+                None => break,
+            }
+        }
+        for &(cip, eip, _f, a, b) in &cand {
+            dv_flag_elide.insert(eip);
+            dv_flag_fuse.insert(cip, (a, b));
+        }
+    }
+
     let mut ty: FxHashMap<u16, VTy> = FxHashMap::default();
     let mut first_seen: FxHashMap<u16, bool> = FxHashMap::default(); // reg → was first occurrence a def?
     let mut glob_first_read: FxHashMap<u32, bool> = FxHashMap::default(); // slot → first touch was a read?
@@ -416,9 +694,13 @@ pub(crate) fn plan_region_cold(
             Instr::Call { .. } => decline!("Call"),
             // A pinned-STRING charCodeAt is admitted on the int path (inlines to a
             // byte load, runs no user code, allocates nothing — the no-call
-            // invariant that keeps BOOL_GPRS alive holds). Any other method call,
-            // or a charCodeAt whose receiver isn't pinned, declines.
-            Instr::CallMethod { .. } if !pinned_str(s + off) => decline!("CallMethod (receiver not a pinned string)"),
+            // invariant that keeps BOOL_GPRS alive holds), and a pinned-DataView
+            // `get*` on the double path (same properties: a guarded byte load, no
+            // user code, no allocation). Any other method call, or an access whose
+            // receiver isn't pinned, declines.
+            Instr::CallMethod { .. } if !pinned_str(s + off) && !pinned_dv(s + off) => {
+                decline!("CallMethod (receiver not a pinned string/DataView)")
+            }
             // A Bitwise op declines UNLESS the caller (the INT path) admits it: its
             // i64 homes hold sign-extended integers, so the low 32 bits ARE ToInt32
             // and the op runs inline with no reload/rebox. The regalloc/double path
@@ -461,8 +743,12 @@ pub(crate) fn plan_region_cold(
             | Instr::Eq { dst, .. }
             | Instr::Ne { dst, .. } => (Some(dst), VTy::Bool),
             // Pinned-STRING charCodeAt → a small int (0..65535); pinned-STRING
-            // length → the snapshot units; both land in a Num i64 home.
-            Instr::CallMethod { dst, .. } if pinned_str(s + off) => (Some(dst), VTy::Num),
+            // length → the snapshot units; both land in a Num i64 home. A
+            // pinned-DV `get*` result is a Num too: every whitelisted kind is
+            // exact in an f64 home (u32 <= 2^32-1; the float kinds native).
+            Instr::CallMethod { dst, .. } if pinned_str(s + off) || pinned_dv(s + off) => {
+                (Some(dst), VTy::Num)
+            }
             Instr::GetProp { dst, .. } if pinned_str(s + off) => (Some(dst), VTy::Num),
             // `Math.imul` → a signed i32 (Num). BLOCKER FIX: without this the carried
             // fnv1a accumulator (written ONLY by Imul) is never typed → the
@@ -495,7 +781,10 @@ pub(crate) fn plan_region_cold(
         // A TA-receiver reg is NOT typed/homed (sourced via the pin); skip its def.
         // A B94 SPLIT receiver keeps its numeric home, but its `LoadGlobal` def is
         // the RECEIVER half — typing that as Num would home an object.
-        let is_split_recv_load = split_recv_lg.contains(&(s + off));
+        // A DV-flag-fused Eq's def is ELIDED (the call computes the flag inline),
+        // so its Bool must not type the register — the remaining defs are Num.
+        let is_split_recv_load =
+            split_recv_lg.contains(&(s + off)) || dv_flag_elide.contains(&(s + off));
         if let Some(d) = def.filter(|d| !ta_recv_regs.contains(d) && !is_split_recv_load) {
             // Move's dst type follows its src; default Num is corrected here.
             let t = if let Instr::Move { src, .. } = *instr {
@@ -617,6 +906,33 @@ pub(crate) fn plan_region_cold(
                 decline!("pinned index operand is not numeric");
             }
         }
+        // A pinned-DV get* reads its pos from an f64 home (cvttsd2si) and — for
+        // the multi-byte kinds with an explicit flag — its littleEndian either
+        // INLINE (a fused adjacent Eq: ToBoolean(a === b) from two Num homes)
+        // or from a Bool gpr home (a 0/1, where `test` IS ToBoolean). Any
+        // other operand shape declines: a Num-typed flag would need an
+        // observable-equivalent ToBoolean the emitter doesn't implement, and
+        // the single-byte kinds ignore the argument entirely (as the
+        // interpreter does).
+        if pinned_dv(s + off) {
+            if let Instr::CallMethod { arg_base, argc, name, .. } = *instr {
+                if ty.get(&arg_base) != Some(&VTy::Num) {
+                    decline!("pinned DV pos operand is not numeric");
+                }
+                let size = proto
+                    .string_constants
+                    .get(name as usize)
+                    .and_then(|k| dv_get_kind(k))
+                    .map_or(0u8, |k| [1u8, 1, 1, 2, 2, 4, 4, 4, 8][k as usize]);
+                if argc == 2
+                    && size > 1
+                    && !dv_flag_fuse.contains_key(&(s + off))
+                    && ty.get(&(arg_base + 1)) != Some(&VTy::Bool)
+                {
+                    decline!("pinned DV endian flag is not a Bool");
+                }
+            }
+        }
     }
 
     // Validate operand type requirements now that types are known.
@@ -686,6 +1002,18 @@ pub(crate) fn plan_region_cold(
             used.insert(u);
         }
     }
+    // A pinned-DV get* is NOT a pure value op: an out-of-range pos throws
+    // RangeError. Keep its dst out of `dead` — the emitter skips a dead-dst op
+    // entirely, which would skip the throw (and leave the dst with no home for
+    // the arm that does emit).
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
+        if let Instr::CallMethod { dst, .. } = *instr {
+            if pinned_dv(s + off) {
+                used.insert(dst);
+            }
+        }
+    }
     // ── pinned-STRING / Math.imul operand liveness ── instr_uses + writes_reg are
     // BLIND to CallMethod and MathOp operands/dsts (verified: both hit their `_`
     // arm). So the charCodeAt index reg, the Imul operand regs, and the charCodeAt/
@@ -708,6 +1036,16 @@ pub(crate) fn plan_region_cold(
                 str_imul_touch.push((ip, arg_base, false));
                 str_imul_touch.push((ip, arg_base + 1, false));
                 str_imul_touch.push((ip, dst, true)); // imul result (def)
+            }
+            // A DV-flag-FUSED call reads the elided Eq's operands AT THE CALL
+            // ip (the inline ToBoolean(a === b) compare) — extend their live
+            // ranges to the call so the home-reuse allocator cannot free
+            // either home one ip early.
+            Instr::CallMethod { .. } => {
+                if let Some(&(a, b)) = dv_flag_fuse.get(&ip) {
+                    str_imul_touch.push((ip, a, false));
+                    str_imul_touch.push((ip, b, false));
+                }
             }
             _ => {}
         }
@@ -738,13 +1076,8 @@ pub(crate) fn plan_region_cold(
     //
     // There is no live-out analysis in codegen, so require the register to be
     // untouched by the REST OF THE FUNCTION as well. Conservative (a reg read
-    // anywhere outside `[s, e]` is kept) and cheap — one scan of the proto.
-    let read_outside: FxHashSet<u16> = code
-        .iter()
-        .enumerate()
-        .filter(|(ip, _)| *ip < s || *ip > e)
-        .flat_map(|(_, instr)| instr_uses(instr))
-        .collect();
+    // anywhere outside `[s, e]` is kept) and cheap — `read_outside`, computed
+    // once above (the DV flag-fusion veto shares it).
     let dead: FxHashSet<u16> = reg_order
         .iter()
         .copied()
@@ -762,7 +1095,11 @@ pub(crate) fn plan_region_cold(
         // (so the flush writes it over the register's real value) and the body op
         // is elided (so reads inside the region see the constant too). Require
         // the def to run on every pass. See `runs_every_iteration`.
-        if def_count.get(&r) == Some(&1)
+        // `allow_hoist == false` is the pool-pressure retry: every constant
+        // stays a body op with a short live range instead of pinning a
+        // permanent home (see `PlanOutcome::RetryNoHoist`).
+        if allow_hoist
+            && def_count.get(&r) == Some(&1)
             && first_seen.get(&r) == Some(&true)
             && used.contains(&r)
             && runs_every_iteration(code, s, e, ip)
@@ -828,7 +1165,6 @@ pub(crate) fn plan_region_cold(
     // back-edge, runs zero body iterations, and flushes anyway. Re-enabling this
     // needs per-exit flush sets driven by a must-def dataflow (see PERF_ROADMAP).
     const UNIFY_HOMES: bool = false;
-    let jump_targets = region_jump_targets(code, s, e);
     let (glob_alias, move_alias) = if UNIFY_HOMES {
         let g =
             unify_homes_with_globals(code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets);
@@ -1046,6 +1382,14 @@ pub(crate) fn plan_region_cold(
             let x = match alloc.alloc(a, b) {
                 Some(x) => x,
                 None => {
+                    // Hoisted constants pinned permanent homes; give them back
+                    // and try once more before declining the whole region.
+                    // Gated on the same switch as the DV admission so
+                    // `ZIPP_NO_DV_DOUBLE=1` restores the pre-wave planner
+                    // byte-for-byte on EVERY region, not just the DV ones.
+                    if allow_hoist && !hoisted.is_empty() && dv_double_enabled() {
+                        return PlanOutcome::RetryNoHoist;
+                    }
                     if std::env::var_os("ZIPP_JITDECLINE").is_some() {
                         let nregs = reg_order.iter().filter(|r| ty[r] == VTy::Num).count();
                         let perm = reg_order.iter().filter(|r| ty[r] == VTy::Num && !shareable(**r)).count();
@@ -1088,6 +1432,10 @@ pub(crate) fn plan_region_cold(
             next_xmm += 1;
         }
         first_free_xmm = next_xmm;
+        // (No RetryNoHoist here: this branch runs only when one-home-per-value
+        // FITS the pool — `reuse` is false — so it cannot overflow by pressure
+        // that un-hoisting would relieve; the two declines above are the
+        // n_numeric miscount guard, unchanged.)
     }
     // Bools (both modes): gpr homes; a live-in bool is unsupported.
     let mut next_bool = 0usize;
@@ -1193,7 +1541,7 @@ pub(crate) fn plan_region_cold(
                 // would hand `emit_box_to_home` a non-number and `entry_bail` on
                 // every single OSR entry. Its home is filled by its own numeric
                 // def, and `split_home_invalid` covers every exit before that.
-                if !hoisted.contains(&r) && !shareable(r) && Some(r) != split_recv {
+                if !hoisted.contains(&r) && !shareable(r) && !split_recvs.contains(&r) {
                     live_in_regs.push((r, x));
                 }
             }
@@ -1224,7 +1572,7 @@ pub(crate) fn plan_region_cold(
         live_in_globs.push((gi, x));
     }
 
-    Some(RegionPlan {
+    PlanOutcome::Plan(Box::new(RegionPlan {
         reg_home,
         glob_home,
         live_in_regs,
@@ -1242,10 +1590,12 @@ pub(crate) fn plan_region_cold(
         gpr_const,
         jump_targets,
         ta_recv_regs,
-        split_recv,
+        split_recvs,
         write_through,
         split_recv_lg,
-    })
+        dv_flag_elide,
+        dv_flag_fuse,
+    }))
 }
 
 /// Does the instruction at `d` run on EVERY pass through region `[s, e]`?

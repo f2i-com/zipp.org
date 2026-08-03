@@ -68,11 +68,14 @@ pub fn async_stats() -> (u64, u64, u64, u64, u64, u64) {
 
 /// `ZIPP_ICSTATS=1` native property-cache miss breakdown:
 /// `(get_miss, get_shape_known, get_shape_new, get_dict, set_miss, set_guardable,
-/// set_dict)`. Every count is one native access that already paid eight failed
-/// way compares and a helper call; `get_shape_known` is the subset an emitted
-/// SHAPE-keyed way would have served call-free. Zeroed unless the variable was
-/// set.
-pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
+/// set_dict, get_acc_hit, set_acc_hit)`. Every miss count is one native access
+/// that already paid eight failed way compares and a helper call;
+/// `get_shape_known` is the subset an emitted SHAPE-keyed way would have served
+/// call-free. `get_acc_hit`/`set_acc_hit` count B114 ACCESSOR-way hits — probe
+/// matches that dispatched an accessor directly instead of taking a permanent
+/// miss (`ZIPP_NO_ACCESSOR_WAY=1` forces them to zero and restores the misses).
+/// Zeroed unless the variable was set.
+pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     vm::ic_stats()
 }
 

@@ -25,8 +25,10 @@ pub(crate) fn compile_region_regalloc(
     // The regalloc path uses boxed-double semantics and cannot host Bitwise
     // (int32-lane) ops — they decline to the memory path here.
     let plan = plan_region(proto, start, end, ta_plan, false, true)?;
-    if let Some(sr) = plan.split_recv {
-        if std::env::var_os("ZIPP_JITLOG").is_some() {
+    if !plan.split_recvs.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+        let mut srs: Vec<u16> = plan.split_recvs.iter().copied().collect();
+        srs.sort_unstable();
+        for sr in srs {
             eprintln!("[jit] DOUBLE region [{start},{end}] B94 split receiver r{sr}");
         }
     }
@@ -154,6 +156,14 @@ pub(crate) fn compile_region_regalloc(
             if plan.hoisted.contains(&dst) {
                 continue;
             }
+        }
+        // A DV-flag-fused Eq emits NOTHING here: the adjacent pinned-DV call
+        // computes ToBoolean(a === b) inline from the operands' homes, and its
+        // deopt resumes AT this ip so the interpreter recomputes the flag into
+        // the frame slot before re-running the call. Like a hoisted constant,
+        // flags and the copy tracker survive (no instruction is emitted).
+        if plan.dv_flag_elide.contains(&ip) {
+            continue;
         }
         // Dead-code elimination: skip a pure op whose result is never read (see
         // plan_region `dead`). Sound — every regalloc-region op is side-effect-free.
@@ -500,6 +510,190 @@ pub(crate) fn compile_region_regalloc(
                 );
                 lc = None;
             }
+            // ── pinned-DataView get* read ── dv.getUint32(pos[, le]) → an inline
+            // byte load, UNBOXED into the dst f64 home. `plan_region` admits a
+            // CallMethod on this path ONLY as a pinned-DV get* (`pinned_dv`), with
+            // pos typed Num and any read flag typed Bool, so this is the only
+            // CallMethod shape that reaches the emitter. Guards mirror the
+            // pinned-Float64Array GetIndex arm above — any miss DEOPTs to the
+            // interpreter AT this ip, and the access is all-or-nothing (nothing is
+            // written before the deopt), so re-execution is sound and the
+            // interpreter's re-run raises whatever the miss stands for (the
+            // RangeError for an OOB pos, the TypeError for a detached buffer):
+            //   (1) receiver identity vs the prologue snapshot (a detached /
+            //       shrunk-resizable / non-DataView receiver snapshots {0,0,0});
+            //   (2) integral pos via the cvttsd2si round-trip (fractional/NaN pos
+            //       deopts — the interpreter runs the ToIndex truncation);
+            //   (3) signed bounds: pos < 0 or pos > byteLength - size deopts.
+            // The result lands directly in the f64 home: an int kind converts
+            // (exact — a u32 <= 2^32-1), a float kind moves but CANONICALISES NaN,
+            // because raw bytes flushed from a home as Value bits could otherwise
+            // alias a NaN-box tag. Scratch stays rax/rcx/rdx/xmm0: r8-r11 are
+            // BOOL_GPRS homes (the endian flags live there).
+            Instr::CallMethod { dst, arg_base, argc, name, .. } => {
+                let kindid = match proto
+                    .string_constants
+                    .get(name as usize)
+                    .and_then(|k| dv_get_kind(k))
+                {
+                    Some(k) => k,
+                    None => {
+                        decline_emit(format_args!(
+                            "regalloc-emit-unhandled: {:?}",
+                            proto.code[ip]
+                        ));
+                        return None;
+                    }
+                };
+                let j = match ta_plan.access.get(&ip) {
+                    Some(&j) if ta_plan.pins[j as usize].kind == DV_PIN_KIND => j as usize,
+                    _ => {
+                        decline_emit("regalloc-emit: DV CallMethod without a DataView pin");
+                        return None;
+                    }
+                };
+                let off = ta_base + 32 * j as i32;
+                let size = [1i32, 1, 1, 2, 2, 4, 4, 4, 8][kindid as usize];
+                let d = xh(&plan, dst);
+                let px = xh(&plan, arg_base);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rax, [rsp + off]            // receiver vs snapshot obj_bits
+                    ; jne => deopt
+                    ; cvttsd2si rcx, Rx(px)           // pos = trunc(pos home)
+                    ; cvtsi2sd xmm0, rcx
+                    ; ucomisd xmm0, Rx(px)
+                    ; jne => deopt                    // non-integral pos
+                    ; jp => deopt                     // NaN pos
+                    ; test rcx, rcx
+                    ; js => deopt                     // negative → RangeError
+                    ; mov rdx, [rsp + off + 16]       // byteLength
+                    ; sub rdx, size
+                    ; cmp rcx, rdx                    // signed: pos > byteLength-size
+                    ; jg => deopt                     //  (incl. byteLength < size)
+                    ; mov rdx, [rsp + off + 8]        // pinned base (data + byteOffset)
+                );
+                let le_big = ops.new_dynamic_label();
+                let loaded = ops.new_dynamic_label();
+                if size > 1 {
+                    if let Some(&(fa, fb)) = plan.dv_flag_fuse.get(&ip) {
+                        // Fused adjacent Eq: the flag is ToBoolean(a === b)
+                        // over two Num homes. NaN (parity) or unequal → false
+                        // → big-endian — exactly emit_dcmp's Eq (sete + setnp).
+                        let (ax, bx) = (xh(&plan, fa), xh(&plan, fb));
+                        dynasm!(ops
+                            ; ucomisd Rx(ax), Rx(bx)
+                            ; jp => le_big
+                            ; jne => le_big
+                        );
+                    } else if argc == 2 {
+                        // The flag is a Bool gpr home holding 0/1 — `test` IS
+                        // ToBoolean here, exactly as on the INT tier (B22).
+                        let lg = gh(&plan, arg_base + 1);
+                        dynasm!(ops ; test Rq(lg), Rq(lg) ; jz => le_big);
+                    } else {
+                        // Absent flag = undefined = big-endian.
+                        dynasm!(ops ; jmp => le_big);
+                    }
+                }
+                // ── little-endian load ── ints land in eax, floats in xmm0.
+                match kindid {
+                    0 => dynasm!(ops ; movsx eax, BYTE [rdx + rcx]),
+                    1 => dynasm!(ops ; movzx eax, BYTE [rdx + rcx]),
+                    3 => dynasm!(ops ; movsx eax, WORD [rdx + rcx]),
+                    4 => dynasm!(ops ; movzx eax, WORD [rdx + rcx]),
+                    5 | 6 => dynasm!(ops ; mov eax, [rdx + rcx]),
+                    7 => dynasm!(ops ; movss xmm0, [rdx + rcx] ; cvtss2sd xmm0, xmm0),
+                    _ => dynasm!(ops ; movsd xmm0, [rdx + rcx]),
+                }
+                if size > 1 {
+                    dynasm!(ops ; jmp => loaded ; => le_big);
+                    // ── big-endian load (byte-swapped) ──
+                    match kindid {
+                        3 => dynasm!(ops
+                            ; movzx eax, WORD [rdx + rcx]
+                            ; rol ax, 8
+                            ; movsx eax, ax
+                        ),
+                        4 => dynasm!(ops
+                            ; movzx eax, WORD [rdx + rcx]
+                            ; rol ax, 8
+                        ),
+                        5 | 6 => dynasm!(ops
+                            ; mov eax, [rdx + rcx]
+                            ; bswap eax
+                        ),
+                        7 => dynasm!(ops
+                            ; mov eax, [rdx + rcx]
+                            ; bswap eax
+                            ; movd xmm0, eax
+                            ; cvtss2sd xmm0, xmm0
+                        ),
+                        _ => dynasm!(ops
+                            ; mov rax, [rdx + rcx]
+                            ; bswap rax
+                            ; movq xmm0, rax
+                        ),
+                    }
+                    dynasm!(ops ; => loaded);
+                }
+                // ── land in the dst home ── `xorps` first: `cvtsi2sd` merges into
+                // the low lane and would otherwise carry a false dependency on the
+                // home's old contents (same idiom as the Bitwise arm above).
+                match kindid {
+                    // Uint32: the 32-bit load/bswap zero-extended eax into rax;
+                    // the 64-bit convert is exact for every u32.
+                    6 => dynasm!(ops
+                        ; xorps Rx(d), Rx(d)
+                        ; cvtsi2sd Rx(d), rax
+                    ),
+                    7 | 8 => {
+                        // A loaded NaN keeps its payload through f64 arithmetic,
+                        // and the exit flush writes home bits verbatim as a
+                        // Value — so a payload aliasing a NaN-box tag would
+                        // forge a tagged value. Canonicalise, exactly as the
+                        // MEM tier's emit_box_f64_canon does.
+                        let canon = ops.new_dynamic_label();
+                        let fdone = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; ucomisd xmm0, xmm0
+                            ; jp => canon                 // NaN → canonical QNAN
+                            ; movapd Rx(d), xmm0
+                            ; jmp => fdone
+                            ; => canon
+                            ; mov rax, QWORD QNAN_BITS as i64
+                            ; movq Rx(d), rax
+                            ; => fdone
+                        );
+                    }
+                    // Int8/Uint8/Int16/Uint16/Int32: a signed i32 in eax.
+                    _ => dynasm!(ops
+                        ; xorps Rx(d), Rx(d)
+                        ; cvtsi2sd Rx(d), eax
+                    ),
+                }
+                // A FUSED access resumes at the ELIDED Eq (ip-1): the
+                // interpreter recomputes the flag into the frame slot — which
+                // native code never writes — then re-runs the call. The
+                // re-executed window is exactly the pure Eq, whose operands'
+                // homes were flushed holding the values it would have read.
+                let resume_ip =
+                    if plan.dv_flag_fuse.contains_key(&ip) { ip - 1 } else { ip };
+                dynasm!(ops
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], resume_ip as i32
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
             // POST-PLAN hole: this region passed `region_can_compile` AND
             // `plan_region` (which types e.g. `Mod` and `MathOp{Imul,2}` as Num
             // defs), but this emitter has no arm for the op. The decline must be
@@ -519,7 +713,7 @@ pub(crate) fn compile_region_regalloc(
         // this register and memory is what the interpreter reads on any exit.
         // Two instructions, once per def; the LoadGlobal half already stored.
         if let Some(d) = writes_reg(&proto.code[ip]) {
-            let is_split = plan.split_recv == Some(d) && !plan.split_recv_lg.contains(&ip);
+            let is_split = plan.split_recvs.contains(&d) && !plan.split_recv_lg.contains(&ip);
             if is_split || plan.write_through.contains(&d) {
                 if let Home::Xmm(h) = plan.reg_home[&d] {
                     dynasm!(ops
@@ -550,7 +744,7 @@ pub(crate) fn compile_region_regalloc(
         // object at any exit taken inside the receiver range.
         // B97: a shared home may hold ANOTHER register's value by now; the
         // write-through at each def already put this one's value in its slot.
-        if Some(r) == plan.split_recv || plan.write_through.contains(&r) {
+        if plan.split_recvs.contains(&r) || plan.write_through.contains(&r) {
             continue;
         }
         dynasm!(ops ; movq rax, Rx(x) ; mov [rbx + dreg(r)], rax);

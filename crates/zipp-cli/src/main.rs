@@ -64,7 +64,7 @@ fn main() -> ExitCode {
         );
     }
     if std::env::var_os("ZIPP_ICSTATS").is_some() {
-        let (gm, gk, gn, gd, sm, sg, sd) = zipp_vm::ic_stats();
+        let (gm, gk, gn, gd, sm, sg, sd, gah, sah) = zipp_vm::ic_stats();
         let pct = |x: u64, t: u64| if t == 0 { 0.0 } else { x as f64 * 100.0 / t as f64 };
         eprintln!(
             "[ic] GetProp misses {gm}  shape-known {gk} ({:.1}%)  shape-new {gn} ({:.1}%)  dict {gd} ({:.1}%)",
@@ -74,6 +74,7 @@ fn main() -> ExitCode {
             "[ic] SetProp misses {sm}  guardable {sg} ({:.1}%)  dict {sd} ({:.1}%)",
             pct(sg, sm), pct(sd, sm)
         );
+        eprintln!("[ic] accessor-way hits  get {gah}  set {sah}");
     }
     if bstats {
         let rows = zipp_vm::builtin_stats();

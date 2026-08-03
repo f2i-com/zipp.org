@@ -471,6 +471,61 @@ pub(crate) extern "win64" fn jit_set_prop_slow(
     }
 }
 
+/// Win64 helper: an ACCESSOR-way HIT for a region `GetProp` (B114). The probe
+/// matched a way tagged `IC_ACC_TAG` — receiver identity, receiver version and
+/// every hop version are live — so the resolution is KNOWN to be an accessor:
+/// dispatch the getter directly, skipping `jit_get_prop_miss`'s 8-way-miss +
+/// rediscovery round trip. `entry` (5th argument, on the stack) is the matched
+/// way's address inside `vm.jit.ic_table`. Returns the value bits,
+/// `SELF_CALL_DEOPT`, or `CALL_THREW`; the calling region re-derives r13/r14
+/// afterwards (user code may have run). Other args as [`jit_get_prop_slow`].
+///
+/// # Safety
+/// As [`jit_call_method_ic`]; `entry` points at a live `IcEntry` of
+/// `vm.jit.ic_table` (the probe's way cursor).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_get_prop_acc(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed2: u64,
+    entry: *const crate::codegen::IcEntry,
+) -> u64 {
+    icstats::acc_hit(false);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_prop_acc_impl(caller_base_ptr, packed_fip, packed2, entry, false)
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// The `SetProp` sibling of [`jit_get_prop_acc`] (setter dispatch; returns 0
+/// when the store completed). r9 = (name<<32)|(obj_reg<<16)|val_reg.
+///
+/// # Safety
+/// As [`jit_get_prop_acc`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_set_prop_acc(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed2: u64,
+    entry: *const crate::codegen::IcEntry,
+) -> u64 {
+    icstats::acc_hit(true);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_prop_acc_impl(caller_base_ptr, packed_fip, packed2, entry, true)
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `GetProp`. The native
 /// fast path (identity + version check, direct `vals[slot]` read) only calls this
 /// when its cache misses. Looks up `obj.<key>`, and on the fast-path-eligible case
@@ -1209,6 +1264,8 @@ mod icstats {
     static SET_MISS: AtomicU64 = AtomicU64::new(0);
     static SET_GUARDABLE: AtomicU64 = AtomicU64::new(0);
     static SET_DICT: AtomicU64 = AtomicU64::new(0);
+    static GET_ACC_HIT: AtomicU64 = AtomicU64::new(0);
+    static SET_ACC_HIT: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub(super) fn enabled() -> bool {
@@ -1255,9 +1312,26 @@ mod icstats {
         }
     }
 
+    /// One ACCESSOR-way hit (B114): a probe matched an accessor-tagged way and
+    /// dispatched straight to the accessor helper — an access that, pre-B114,
+    /// was a permanent native miss (8 failed compares + `jit_get_prop_miss` +
+    /// `PROP_VIA_IC` + `jit_get_prop_slow`). Counted in the accessor helpers,
+    /// which have already been called — same cost posture as `get_miss`.
+    #[inline]
+    pub(super) fn acc_hit(is_set: bool) {
+        if !enabled() {
+            return;
+        }
+        if is_set {
+            SET_ACC_HIT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            GET_ACC_HIT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// `(get_miss, get_shape_known, get_shape_new, get_dict, set_miss,
-    /// set_guardable, set_dict)`
-    pub fn dump() -> (u64, u64, u64, u64, u64, u64, u64) {
+    /// set_guardable, set_dict, get_acc_hit, set_acc_hit)`
+    pub fn dump() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
         (
             GET_MISS.load(Ordering::Relaxed),
             GET_SHAPE_KNOWN.load(Ordering::Relaxed),
@@ -1266,6 +1340,8 @@ mod icstats {
             SET_MISS.load(Ordering::Relaxed),
             SET_GUARDABLE.load(Ordering::Relaxed),
             SET_DICT.load(Ordering::Relaxed),
+            GET_ACC_HIT.load(Ordering::Relaxed),
+            SET_ACC_HIT.load(Ordering::Relaxed),
         )
     }
 }
@@ -1278,8 +1354,8 @@ pub use icstats::dump as ic_stats;
 /// `zipp_vm::ic_stats` and the CLI's `ZIPP_ICSTATS` reporting do not have to
 /// know which tiers this build was compiled with.
 #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
-pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64) {
-    (0, 0, 0, 0, 0, 0, 0)
+pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    (0, 0, 0, 0, 0, 0, 0, 0, 0)
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1369,8 +1445,38 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     let (val, vals_ptr, slot) = match vm.heap.get(idx) {
         HeapObj::Object(map) => match map.pos(key) {
             // An accessor slot stores the GETTER, not a data value — route to
-            // the interpreter-IC slow helper, which frame-calls it.
-            Some(s) if map.attrs[s].accessor => return crate::codegen::PROP_VIA_IC,
+            // the interpreter-IC slow helper, which frame-calls it. B114: fill
+            // an ACCESSOR way first, so this receiver's next access dispatches
+            // there straight from the probe instead of missing all eight ways
+            // and rediscovering the accessor here forever (polymorphic-objects'
+            // permanent 1.25M-miss stream, B111). Guards: identity + receiver
+            // version — a redefinition (accessor→data), delete, freeze or proto
+            // change bumps it. The cacheability conditions above (private name,
+            // deferred-ns, `ic_obj_ok`) already returned early, exactly as for
+            // a data fill.
+            Some(s) if map.attrs[s].accessor => {
+                if crate::codegen::accessor_way_enabled() {
+                    let getter = map.vals[s];
+                    // Bake direct dispatch only for a plain user fn without
+                    // lexical `this` (an arrow accessor must deopt so
+                    // `setup_call` rebinds — see jit_prop_slow_impl); the
+                    // helper re-validates the baked fn against the live slot.
+                    let baked = vm
+                        .ic_plain_fn(getter)
+                        .filter(|&(fid, _)| !vm.func(fid as usize).lexical_this)
+                        .map(|(fid, closure)| (getter.bits(), fid, closure));
+                    if let Some(e) = crate::codegen::IcEntry::accessor(
+                        obj_bits,
+                        vm.heap.version_of(idx),
+                        s as u32,
+                        &[],
+                        baked,
+                    ) {
+                        vm.jit.set_ic(site_idx, e);
+                    }
+                }
+                return crate::codegen::PROP_VIA_IC;
+            }
             Some(s) => (map.vals[s], map.vals.as_ptr() as u64, s as u32),
             // Missing own key: a CLASS instance resolves methods/getters on
             // its class chain — the interpreter-IC slow helper serves those
@@ -1402,7 +1508,39 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                             if let Some(i) = m2.pos(key) {
                                 if m2.attrs[i].accessor {
                                     // Inherited getter: frame-called by the
-                                    // interpreter-IC slow helper.
+                                    // interpreter-IC slow helper. B114: fill an
+                                    // ACCESSOR way under the same guards a
+                                    // chain-DATA hit would take — receiver
+                                    // identity + receiver version + every hop's
+                                    // version down to the holder (shadowing
+                                    // adds, holder redefinition/delete and
+                                    // setPrototypeOf all bump one of them).
+                                    if crate::codegen::accessor_way_enabled()
+                                        && n_hops < MAX
+                                    {
+                                        hops[n_hops] =
+                                            (next, vm.heap.version_of(next));
+                                        let getter = m2.vals[i];
+                                        let baked = vm
+                                            .ic_plain_fn(getter)
+                                            .filter(|&(fid, _)| {
+                                                !vm.func(fid as usize).lexical_this
+                                            })
+                                            .map(|(fid, closure)| {
+                                                (getter.bits(), fid, closure)
+                                            });
+                                        if let Some(e) =
+                                            crate::codegen::IcEntry::accessor(
+                                                obj_bits,
+                                                vm.heap.version_of(idx),
+                                                i as u32,
+                                                &hops[..=n_hops],
+                                                baked,
+                                            )
+                                        {
+                                            vm.jit.set_ic(site_idx, e);
+                                        }
+                                    }
                                     return crate::codegen::PROP_VIA_IC;
                                 }
                                 let v = m2.vals[i];
@@ -1666,8 +1804,30 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     let own = match vm.heap.get(idx) {
         HeapObj::Object(map) => match map.pos(key) {
             // An accessor's SETTER must run (user code) — the interpreter-IC
-            // slow helper frame-calls it.
-            Some(s) if map.attrs[s].accessor => return crate::codegen::PROP_VIA_IC,
+            // slow helper frame-calls it. B114: fill an OWN accessor way first
+            // (identity + version, like every Set way — the probe walks no
+            // hops for a store, so inherited setters stay on PROP_VIA_IC).
+            // The setter lives in `attrs[s].setter`, NOT `vals[s]` — B52's
+            // documented asymmetry — and the accessor helper re-reads it live.
+            Some(s) if map.attrs[s].accessor => {
+                if crate::codegen::accessor_way_enabled() {
+                    let setter = map.attrs[s].setter;
+                    let baked = vm
+                        .ic_plain_fn(setter)
+                        .filter(|&(fid, _)| !vm.func(fid as usize).lexical_this)
+                        .map(|(fid, closure)| (setter.bits(), fid, closure));
+                    if let Some(e) = crate::codegen::IcEntry::accessor(
+                        obj_bits,
+                        vm.heap.version_of(idx),
+                        s as u32,
+                        &[],
+                        baked,
+                    ) {
+                        vm.jit.set_ic(site_idx, e);
+                    }
+                }
+                return crate::codegen::PROP_VIA_IC;
+            }
             // A non-writable own data prop: sloppy no-op / strict throw —
             // the interpreter applies the right one.
             Some(s) if !map.attrs[s].writable => return crate::codegen::SELF_CALL_DEOPT,

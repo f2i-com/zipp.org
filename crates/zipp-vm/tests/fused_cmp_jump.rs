@@ -166,6 +166,63 @@ fn for_in_still_visits_every_key() {
     assert_eq!(out, ["a,b,c"]);
 }
 
+// ── MEM-tier fused guards ── each loop body carries a `%` (Mod is a
+// regalloc-emit-unhandled op, so the OSR region falls to the MEM tier — the
+// B113 typedarray-math shape) and runs 3000 iterations, far past the OSR
+// threshold. The guard is the fused `JumpIfNotLt`, exercised over doubles
+// (native in the MEM arm), strings, and mixed number/string (both bail to the
+// interpreter's full coercion — from the OLD pair, the fused form, and the
+// pair-shape MEM lowering alike). Expectations executed in node v24; the file
+// also passes with `ZIPP_MEM_FUSED_DJUMP=1`, `ZIPP_NO_FUSED_CMPJUMP=1` and
+// `ZIPP_NOJIT=1`, byte-identical.
+
+#[test]
+fn mem_tier_fused_guard_over_doubles() {
+    let out = run_ok(
+        r#"
+        var s = 0;
+        for (var i = 0.5; i < 3000; i++) { s = s + (i % 7); }
+        console.log(s, i);
+        "#,
+    );
+    assert_eq!(out, ["10494 3000.5"]);
+}
+
+#[test]
+fn mem_tier_fused_guard_over_strings() {
+    // Both guard operands are strings → code-unit comparison ("0999" < "3000"
+    // lexicographically tracks the numeric order here because the keys are
+    // zero-padded to equal length).
+    let out = run_ok(
+        r#"
+        var i = 0;
+        var s = 0;
+        var key = "0000";
+        while (key < "3000") {
+            s = s + (i % 7);
+            i = i + 1;
+            key = ("0000" + i).slice(-4);
+        }
+        console.log(i, s, key);
+        "#,
+    );
+    assert_eq!(out, ["3000 8994 3000"]);
+}
+
+#[test]
+fn mem_tier_fused_guard_mixed_number_string() {
+    // One non-string side → ToNumber on both: `i < "3000"` is `i < 3000`.
+    let out = run_ok(
+        r#"
+        var i = 0;
+        var s = "";
+        while (i < "3000") { s = s + (i % 7); i = i + 1; }
+        console.log(i, s.length, s.slice(0, 10), s.slice(-10));
+        "#,
+    );
+    assert_eq!(out, ["3000 3000 0123456012 1234560123"]);
+}
+
 #[test]
 fn comparison_used_as_a_value_stays_correct() {
     // The result register is OBSERVED (stored, pushed, compared), so these

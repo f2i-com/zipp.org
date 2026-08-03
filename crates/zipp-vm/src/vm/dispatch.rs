@@ -6978,6 +6978,8 @@ impl<'p> Vm<'p> {
             call_ic: jit_call_ic as usize,
             get_prop_slow: jit_get_prop_slow as usize,
             set_prop_slow: jit_set_prop_slow as usize,
+            get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as usize,
+            set_prop_acc: crate::vm::helpers_misc::jit_set_prop_acc as usize,
             strict_eq: jit_strict_eq as usize,
             truthy: jit_truthy as usize,
             ta_snapshot: jit_ta_snapshot as usize,

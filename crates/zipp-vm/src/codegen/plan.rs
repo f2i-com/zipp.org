@@ -106,8 +106,16 @@ pub(crate) struct RegionPlan {
     /// rather than target, and cannot recover the source for a jump that leaves
     /// the region.
     ///
-    /// At most ONE per region; a second declines.
-    pub(crate) split_recv: Option<u16>,
+    /// Every member is independently proven by `split_home_provably_safe` and
+    /// independently written through, so the set form is the same mechanism
+    /// per register. Admission is still conservative: at most ONE split whose
+    /// pinned accesses are element ops (B94's original case), because that is
+    /// all that has ever been exercised there — but a receiver whose pinned
+    /// accesses are all DataView `get*` CallMethods does not count against
+    /// that limit (the DV swizzle loop recycles TWO receiver registers, one
+    /// with the loop arithmetic and one with an Eq flag constant, and a
+    /// one-split rule declined the whole region).
+    pub(crate) split_recvs: FxHashSet<u16>,
     /// B97. Registers whose home is SHARED (linear-scan reuse) but which are read
     /// AFTER the region, so a stale flush into their frame slot would be visible.
     /// They are written THROUGH to `[rbx + dreg(r)]` at every def and skipped by
@@ -122,11 +130,28 @@ pub(crate) struct RegionPlan {
     /// an unrelated temp." Write-through removes it — each slot receives its own
     /// value at its own def, before the home is reused.
     pub(crate) write_through: FxHashSet<u16>,
-    /// Region ips of `split_recv`'s RECEIVER `LoadGlobal` (the one reading the
+    /// Region ips of every split receiver's RECEIVER `LoadGlobal` (the one reading the
     /// pinned array's global slot). These emit a real memory store and are the
     /// only defs of the register that do NOT fill its numeric home — the same
     /// register is also loaded from other globals, and those are numeric defs.
     pub(crate) split_recv_lg: FxHashSet<usize>,
+    /// DV endian-flag fusion: region ips of `Eq` ops ELIDED because their dst
+    /// exists only to feed the immediately following pinned-DV `get*` call's
+    /// littleEndian flag, while the SAME register is recycled as a numeric
+    /// temp later in the body (`le === 1` written into the arg window, then
+    /// the window reg reused by the `bsum` adds). Without the fusion that is
+    /// a Bool def and a Num def on one register — a type conflict that
+    /// declined the whole DV swizzle region. The call computes
+    /// ToBoolean(a === b) inline from the two Num homes instead, and its
+    /// deopt resumes AT the Eq ip so the interpreter recomputes the flag into
+    /// the frame slot before re-running the call (the one-op re-execution
+    /// window is pure). Guarded by `plan_region`'s fuse scan: the Eq must be
+    /// adjacent, its Bool must be provably dead past the call (killed by a
+    /// non-compare def before any use, branch or jump target intervenes, and
+    /// the register never read outside the region).
+    pub(crate) dv_flag_elide: FxHashSet<usize>,
+    /// Pinned-DV call ip → the elided `Eq`'s `(a, b)` operand registers.
+    pub(crate) dv_flag_fuse: FxHashMap<usize, (u16, u16)>,
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops

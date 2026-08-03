@@ -178,6 +178,132 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The ACCESSOR-way continuation (B114), behind `jit_get_prop_acc` /
+    /// `jit_set_prop_acc`: a region probe matched an accessor-tagged way —
+    /// receiver identity + receiver version (+ every hop version) all live —
+    /// so the site's resolution for this receiver is KNOWN to be an accessor.
+    ///
+    /// With BAKED dispatch fields the way names the accessor fn directly: the
+    /// helper re-reads the LIVE fn from the guarded holder slot and compares
+    /// it to the baked bits (the B78-style value guard — swapping a getter or
+    /// setter on an EXISTING accessor via `__defineGetter__` / an object-
+    /// literal accessor merge writes `vals[slot]` / `attrs[slot].setter` with
+    /// NO version bump), then serves it through the same ladder as
+    /// `jit_prop_slow_impl`'s accessor arm: `accessor_fast_*` off-frame, the
+    /// method-inline evaluator, then a real frame call. Skipping the
+    /// `lexical_this` re-check is sound because a bits match names the SAME
+    /// function object, and lexical-`this` fns are never baked at fill.
+    ///
+    /// Anything else — unbaked way, stale baked fn, exotic state — falls back
+    /// to `jit_prop_slow_impl`, the EXACT route `PROP_VIA_IC` takes today, so
+    /// behaviour is identical minus the miss-helper hop.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_prop_acc_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed2: u64,
+        entry: *const crate::codegen::IcEntry,
+        is_set: bool,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        // Copy the way out FIRST: a frame call below can trigger a nested
+        // region compile, and `reserve_ic_sites` GROWS `ic_table` — relocating
+        // the element this pointer names (the emitted caller re-derives r14
+        // for the same reason).
+        // SAFETY: `entry` is the probe's way cursor — a live element of
+        // `self.jit.ic_table` at call time.
+        let e = unsafe { *entry };
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        if let Some(bits) = self.jit_prop_acc_baked(&e, caller_base_ptr, packed_fip, packed2, is_set)
+        {
+            return bits;
+        }
+        self.jit_prop_slow_impl(caller_base_ptr, packed_fip, packed2, is_set)
+    }
+
+    /// The baked arm of [`Vm::jit_prop_acc_impl`]: `Some(bits)` when the live
+    /// accessor fn matched the baked one and was dispatched; `None` falls back
+    /// to the full interpreter-IC continuation.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_prop_acc_baked(
+        &mut self,
+        e: &crate::codegen::IcEntry,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed2: u64,
+        is_set: bool,
+    ) -> Option<u64> {
+        use crate::codegen::{CALL_THREW, IC_ACC_BAKED, SELF_CALL_DEOPT};
+        if e.slot_nhops & IC_ACC_BAKED == 0 || !self.deferred_ns_state.is_empty() {
+            return None;
+        }
+        let recv_idx = Value::from_bits(e.obj_bits).heap_index();
+        // `ic_obj_ok` can only change for a slot the heap reused (which bumps
+        // the version the probe just checked) — re-checked for parity with the
+        // interpreter-IC hit path, not because a way can outlive it.
+        if !self.ic_obj_ok(recv_idx) {
+            return None;
+        }
+        let nh = ((e.slot_nhops >> 24) & 0x3F) as usize;
+        let holder = if nh == 0 { recv_idx } else { e.hops[nh - 1].0 };
+        let slot = (e.slot_nhops & 0x00FF_FFFF) as usize;
+        // Live re-read from the guarded holder. The version guards prove the
+        // slot still names the key it was filled for (any key add/remove/
+        // redefine bumps — the same invariant every native data hit rests on);
+        // the descriptor and fn value are re-read because the accessor-merge
+        // write path mutates them WITHOUT a bump.
+        let live = {
+            let m = match self.heap.get(holder) {
+                HeapObj::Object(m) if !m.is_ctor => m,
+                _ => return None,
+            };
+            if slot >= m.vals.len() || !m.attrs[slot].accessor {
+                return None;
+            }
+            if is_set { m.attrs[slot].setter } else { m.vals[slot] }
+        };
+        if live.bits() != ((e.hops[3].0 as u64) | ((e.hops[3].1 as u64) << 32)) {
+            return None; // swapped without a bump → full re-resolution
+        }
+        let (fid, closure) = e.hops[4];
+        let ip = (packed_fip as u32) as usize;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        if is_set {
+            let obj_reg = ((packed2 >> 16) & 0xFFFF) as u16;
+            let val_reg = (packed2 & 0xFFFF) as u16;
+            let recv = self.get(base, obj_reg);
+            let val = self.get(base, val_reg);
+            // Same ladder as jit_prop_slow_impl's SetAct::Setter arm.
+            if let Some(r) = self.accessor_fast_set(fid, recv, val) {
+                return Some(r);
+            }
+            match self.try_method_inline(fid, recv, base, val_reg, 1) {
+                Some(CALL_THREW) | Some(SELF_CALL_DEOPT) => return Some(CALL_THREW),
+                Some(_) => return Some(0), // served — setter return discarded
+                None => {}
+            }
+            let r = self.jit_frame_call(fid, closure, recv, base, val_reg, 1, ip, live);
+            Some(if r == CALL_THREW || r == SELF_CALL_DEOPT { r } else { 0 })
+        } else {
+            let obj_reg = (packed2 & 0xFFFF) as u16;
+            let recv = self.get(base, obj_reg);
+            // Same ladder as jit_prop_slow_impl's GetAct::Accessor arm.
+            if let Some(bits) = self.accessor_fast_get(fid, recv) {
+                return Some(bits);
+            }
+            if let Some(bits) = self.try_method_inline(fid, recv, base, 0, 0) {
+                return Some(bits);
+            }
+            Some(self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, live))
+        }
+    }
+
     /// Reserve enough register-file capacity that a full JIT self-recursion
     /// never reallocates `self.regs` (which would dangle native window
     /// pointers). Called before entering the top-level run.

@@ -492,9 +492,10 @@ impl<'p> Vm<'p> {
 
     /// Re-resolve a freshly-read callable Value to a PLAIN (non-generator,
     /// non-async) user function. `None` for natives/bound/generators/… —
-    /// the caller falls back to the slow path.
+    /// the caller falls back to the slow path. (Also used by the JIT prop-miss
+    /// helpers to pre-screen a bakeable accessor fn for a B114 ACCESSOR way.)
     #[inline]
-    fn ic_plain_fn(&self, v: Value) -> Option<(u32, u32)> {
+    pub(crate) fn ic_plain_fn(&self, v: Value) -> Option<(u32, u32)> {
         if !v.is_heap() {
             return None;
         }

@@ -734,7 +734,9 @@ pub(crate) fn compile_proto_mem(
                 // after it.
                 let via_ic = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
-                emit_ic_probe(&mut ops, IcProbe::Get { dst }, obj, off, cont);
+                // B114: accessor-way dispatch target (as the region arm).
+                let acc = accessor_way_enabled().then(|| ops.new_dynamic_label());
+                emit_ic_probe(&mut ops, IcProbe::Get { dst }, obj, off, cont, acc);
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits (rax survives the probe)
@@ -767,6 +769,31 @@ pub(crate) fn compile_proto_mem(
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
                 );
+                if let Some(acc) = acc {
+                    // ── accessor-WAY hit (B114): r9 = the matched way; the
+                    // helper dispatches the getter directly (region arm, minus
+                    // the TA refetch Tier C doesn't have).
+                    let join = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; jmp => join
+                        ; => acc
+                        ; mov [rsp + 32], r9                  // 5th arg: way ptr
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, rbx                        // caller window base
+                        ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                        ; mov r9, QWORD (((name as u64) << 32) | obj as u64) as i64
+                        ; mov rax, QWORD heap.get_prop_acc as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                        ; => join
+                    );
+                }
                 // The miss/slow helpers may have allocated (versions Vec) or
                 // frame-called a getter (nested compile) — re-derive r13/r14.
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
@@ -785,7 +812,9 @@ pub(crate) fn compile_proto_mem(
                 let packed = ((heap.func_id as u64) << 32) | name as u64;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let cont = ops.new_dynamic_label();
-                emit_ic_probe(&mut ops, IcProbe::Set { val }, obj, off, cont);
+                // B114: accessor-way dispatch target (as the region arm).
+                let acc = accessor_way_enabled().then(|| ops.new_dynamic_label());
+                emit_ic_probe(&mut ops, IcProbe::Set { val }, obj, off, cont, acc);
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits
@@ -815,6 +844,28 @@ pub(crate) fn compile_proto_mem(
                     ; cmp rax, r10
                     ; je => bail
                 );
+                if let Some(acc) = acc {
+                    // ── accessor-WAY hit (B114): direct setter dispatch.
+                    let join = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; jmp => join
+                        ; => acc
+                        ; mov [rsp + 32], r9                  // 5th arg: way ptr
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, rbx                        // caller window base
+                        ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                        ; mov r9, QWORD (((name as u64) << 32) | ((obj as u64) << 16) | val as u64) as i64
+                        ; mov rax, QWORD heap.set_prop_acc as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; => join
+                    );
+                }
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 dynasm!(ops ; => cont);
                 emit_region_bail(&mut ops, ip, bail, epilogue);

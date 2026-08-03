@@ -727,6 +727,10 @@ pub(crate) struct HeapHelpers {
     pub(crate) get_prop_slow: usize,
     /// `PROP_VIA_IC` continuation for SetProp.
     pub(crate) set_prop_slow: usize,
+    /// ACCESSOR-way hit dispatch for GetProp (B114; way ptr as 5th arg).
+    pub(crate) get_prop_acc: usize,
+    /// ACCESSOR-way hit dispatch for SetProp (B114).
+    pub(crate) set_prop_acc: usize,
     /// Full `===` for non-interned heap operands (read-only, 0/1).
     pub(crate) strict_eq: usize,
     /// Full truthiness for non-Int/Bool conditions (read-only, 0/1).

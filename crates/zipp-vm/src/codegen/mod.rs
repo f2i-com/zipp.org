@@ -533,6 +533,12 @@ pub struct HeapHelperAddrs {
     pub get_prop_slow: usize,
     /// The `SetProp` sibling of `get_prop_slow` (setter frame call; 0 = done).
     pub set_prop_slow: usize,
+    /// Helper for a `GetProp` ACCESSOR-way hit (B114): dispatches the getter
+    /// directly from the matched way (5th arg = the way's address), skipping
+    /// the miss helper. Same return protocol as `get_prop_slow`.
+    pub get_prop_acc: usize,
+    /// The `SetProp` sibling of `get_prop_acc` (setter dispatch; 0 = done).
+    pub set_prop_acc: usize,
     /// Helper for a region `===`/`!==` whose operands are non-interned heap
     /// values: full `strict_eq` (read-only; returns 0/1, never deopts).
     pub strict_eq: usize,
@@ -631,6 +637,8 @@ impl HeapHelperAddrs {
             call_ic: self.call_ic,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
+            get_prop_acc: self.get_prop_acc,
+            set_prop_acc: self.set_prop_acc,
             strict_eq: self.strict_eq,
             truthy: self.truthy,
             ta_snapshot: self.ta_snapshot,
@@ -794,6 +802,13 @@ pub const JIT_IC_MAX_HOPS: usize = 5;
 /// version bump). `obj_bits == 0` means empty (no real object Value is 0).
 /// `slot` is packed into 24 bits (an ObjMap with 16M+ keys is unreachable —
 /// fills exceeding it are skipped defensively).
+///
+/// The `slot_nhops` byte above the slot is a TAG byte, not just a hop count:
+/// bit 31 ([`IC_ACC_TAG`]) marks an ACCESSOR way and bit 30 ([`IC_ACC_BAKED`])
+/// marks baked dispatch fields, so the hop count proper is `(slot_nhops >> 24)
+/// & 0x3F` (values 0..=[`JIT_IC_MAX_HOPS`]). Data entries never set the tag
+/// bits, which is what keeps the probe's own-data hit test (`tag byte == 0`)
+/// a single compare.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct IcEntry {
@@ -814,6 +829,47 @@ const _: () = assert!(
     std::mem::size_of::<IcEntry>() == JIT_IC_STRIDE,
     "IcEntry layout and JIT_IC_STRIDE disagree; the emitted probes index by the constant"
 );
+
+/// Bit 31 of [`IcEntry::slot_nhops`]: the way is an ACCESSOR resolution. A hit
+/// dispatches to the accessor helper (`jit_get_prop_acc` / `jit_set_prop_acc`)
+/// instead of reading/writing `vals_ptr[slot]` — `vals_ptr` is 0 and is never
+/// dereferenced natively. Guards are the SAME as a data way of the same shape:
+/// receiver identity + receiver version, plus every hop version for a chain
+/// accessor (B111 keeps accessors on identity/version guards on purpose — a
+/// receiver's own shape does not identify its prototype or its descriptors).
+pub const IC_ACC_TAG: u32 = 1 << 31;
+/// Bit 30 of [`IcEntry::slot_nhops`]: the accessor way carries BAKED dispatch
+/// fields — `hops[3]` holds the accessor fn's Value bits (lo, hi) and `hops[4]`
+/// holds its resolved `(fid, closure)`. Only set when the chain leaves those
+/// pairs free (`nhops <= 3`) and the fn is a plain user function without
+/// lexical `this`. The helper re-reads the LIVE fn from the guarded holder slot
+/// and compares it to the baked bits before trusting `(fid, closure)` — the
+/// B78-style value guard, required because swapping a getter/setter on an
+/// EXISTING accessor (`__defineGetter__` / object-literal accessor merge)
+/// writes `vals[slot]` / `attrs[slot].setter` with NO version bump.
+pub const IC_ACC_BAKED: u32 = 1 << 30;
+
+/// `ZIPP_NO_ACCESSOR_WAY=1` disables the ACCESSOR inline-cache way (B114):
+/// probes emit the pre-B114 byte stream and the miss helpers early-return on
+/// accessor resolutions without filling, exactly as before. One cached read for
+/// the process, SHARED by the emitters (probe shape) and the miss helpers
+/// (fills) — both sides seeing the same value is a soundness requirement, not a
+/// convenience: an accessor-tagged entry under a tag-blind probe would be
+/// data-hit by the store path (a write through `vals_ptr == 0`).
+#[inline]
+pub(crate) fn accessor_way_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ACCESSOR_WAY").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
 
 impl IcEntry {
     /// An OWN-property way (receiver == holder; no hop guards). `None` if the
@@ -850,6 +906,48 @@ impl IcEntry {
             vals_ptr,
             version,
             slot_nhops: slot | ((hops.len() as u32) << 24),
+            hops: h,
+        })
+    }
+
+    /// An ACCESSOR way (B114): the site's resolution for this receiver is a
+    /// getter/setter at `slot` of the holder (the receiver itself when `hops`
+    /// is empty, else the last hop). A probe hit dispatches to the accessor
+    /// helper — skipping the miss helper's rediscovery walk — under the same
+    /// identity + version (+ hop versions) guards as the equivalent data way.
+    /// `baked = (fn_bits, fid, closure)` bakes direct dispatch for a plain
+    /// non-lexical-`this` user fn (dropped when the hop pairs it would occupy
+    /// are in use); the helper re-validates it against the live slot.
+    pub fn accessor(
+        obj_bits: u64,
+        version: u32,
+        slot: u32,
+        hops: &[(u32, u32)],
+        baked: Option<(u64, u32, u32)>,
+    ) -> Option<IcEntry> {
+        if slot > 0x00FF_FFFF || hops.len() > JIT_IC_MAX_HOPS {
+            return None;
+        }
+        let mut h = [(0u32, 0u32); JIT_IC_MAX_HOPS];
+        h[..hops.len()].copy_from_slice(hops);
+        let mut tag = IC_ACC_TAG | ((hops.len() as u32) << 24);
+        if let Some((fn_bits, fid, closure)) = baked {
+            // hops[3]/hops[4] double as the baked fields — only when the
+            // guarded chain leaves them free.
+            if hops.len() <= 3 {
+                h[3] = (fn_bits as u32, (fn_bits >> 32) as u32);
+                h[4] = (fid, closure);
+                tag |= IC_ACC_BAKED;
+            }
+        }
+        Some(IcEntry {
+            obj_bits,
+            // Never dereferenced: an accessor hit calls the helper, and the
+            // probe's tag test keeps the data hit (which would read/write
+            // through this) unreachable for a tagged way.
+            vals_ptr: 0,
+            version,
+            slot_nhops: slot | tag,
             hops: h,
         })
     }

@@ -399,6 +399,16 @@ pub(crate) enum IcProbe {
 /// holding the receiver bits, which is what every caller's miss-helper sequence
 /// passes in `rdx`.
 ///
+/// `acc` (B114) is the dispatch target for an ACCESSOR-tagged way
+/// (`IC_ACC_TAG` in `slot_nhops`): the probe branches there once the way's
+/// identity + version (+ every hop version) guards matched, with `r9` still
+/// pointing at the matched way — the caller's accessor sequence passes it to
+/// the accessor helper as the 5th argument. `None` (the `ZIPP_NO_ACCESSOR_WAY`
+/// switch, which also disables the fills) emits the pre-B114 stream
+/// byte-identically. With `Some`, the own-DATA hit path is instruction-
+/// identical to before — the tag tests sit on the chain-walk arm (Get) and
+/// between the guards and the store (Set) only.
+///
 /// Registers: `r14` = IC table base and `r13` = the heap's parallel version
 /// array base, both pinned for the whole native run; `rbx` = the caller's
 /// register window. The probe clobbers `rax` (hit only), `rcx`, `rdx`, `r8d`,
@@ -423,6 +433,7 @@ pub(crate) fn emit_ic_probe(
     obj: u16,
     ic_off: i32,
     cont: dynasmrt::DynamicLabel,
+    acc: Option<dynasmrt::DynamicLabel>,
 ) {
     let probe = ops.new_dynamic_label();
     let next = ops.new_dynamic_label();
@@ -443,9 +454,21 @@ pub(crate) fn emit_ic_probe(
     if matches!(probe_kind, IcProbe::Get { .. }) {
         dynasm!(ops
             ; mov ecx, [r9 + 20]
-            ; shr ecx, 24                     // nhops (0 = own)
+            ; shr ecx, 24                     // tag byte: 0 = own data
             ; test ecx, ecx
             ; jz => hit
+        );
+        if let Some(acc) = acc {
+            // ACCESSOR ways share the hop walk with chain data: strip the tag
+            // bits (31 accessor, 30 baked) to get the true hop count, and take
+            // the accessor arm for a tagged 0-hop way (an own accessor). The
+            // own-data hit above is instruction-identical with or without this.
+            dynasm!(ops
+                ; and ecx, 0x3F               // hop count (tag bits stripped)
+                ; jz => acc                   // tagged + 0 hops: own accessor
+            );
+        }
+        dynasm!(ops
             ; lea r10, [r9 + 24]              // hop cursor
             ; => hop
             ; mov edx, [r10]                  // hop heap idx
@@ -455,6 +478,22 @@ pub(crate) fn emit_ic_probe(
             ; add r10, 8
             ; dec ecx
             ; jnz => hop
+        );
+        if let Some(acc) = acc {
+            // Every hop version matched — a tagged way is a CHAIN accessor.
+            dynasm!(ops
+                ; test DWORD [r9 + 20], 0x8000_0000u32 as i32
+                ; jnz => acc
+            );
+        }
+    } else if let Some(acc) = acc {
+        // Set entries are own data or own ACCESSOR only (the miss helper never
+        // fills chain ways for a store), so one tag test decides. Without it an
+        // accessor-tagged way would be DATA-hit — a write through the entry's
+        // null `vals_ptr`.
+        dynasm!(ops
+            ; test DWORD [r9 + 20], 0x8000_0000u32 as i32
+            ; jnz => acc
         );
     }
     dynasm!(ops
