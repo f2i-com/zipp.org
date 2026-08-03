@@ -2187,6 +2187,20 @@ pub struct Heap {
     /// Live-count at which the next collection is requested (grown adaptively after
     /// each GC to amortise; never below `GC_MIN_THRESHOLD`).
     gc_threshold: usize,
+    /// B6 generational ORACLE (`ZIPP_GCSTATS=1` only; empty and never touched
+    /// otherwise). Per-slot birth epoch, parallel to `objs`: a slot is "young"
+    /// iff it was allocated since the last collection (`born[idx] == epoch`).
+    /// Stats-only bookkeeping — never consulted by the collector's decisions.
+    born: Vec<u32>,
+    /// Current allocation epoch (bumped once per completed collection).
+    epoch: u32,
+    /// Allocations in the current epoch (== distinct young slots: the free list
+    /// is only refilled at a GC, so no slot is handed out twice per epoch).
+    allocs_epoch: u64,
+    /// Latched `ZIPP_GCSTATS` presence (read once at construction) — the single
+    /// gate on every oracle field above. `false` = the default build's behavior,
+    /// bit for bit.
+    oracle: bool,
 }
 
 /// Smallest live-object count that triggers a collection — below this the heap is
@@ -2237,7 +2251,20 @@ impl Heap {
         objs.push(HeapObj::Str(JsStr::new(String::new())));
         versions.push(0);
         let live = objs.len();
-        Heap { objs, versions, free: Vec::new(), live, gc_requested: false, gc_threshold: GC_MIN_THRESHOLD }
+        let oracle = std::env::var_os("ZIPP_GCSTATS").is_some();
+        let born = if oracle { vec![0; objs.len()] } else { Vec::new() };
+        Heap {
+            objs,
+            versions,
+            free: Vec::new(),
+            live,
+            gc_requested: false,
+            gc_threshold: GC_MIN_THRESHOLD,
+            born,
+            epoch: 0,
+            allocs_epoch: 0,
+            oracle,
+        }
     }
 
     #[inline]
@@ -2251,12 +2278,46 @@ impl Heap {
         if let Some(idx) = self.free.pop() {
             self.objs[idx as usize] = obj;
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            if self.oracle {
+                self.born[idx as usize] = self.epoch;
+                self.allocs_epoch += 1;
+            }
             return idx;
         }
         let idx = self.objs.len() as u32;
         self.objs.push(obj);
         self.versions.push(0);
+        if self.oracle {
+            self.born.push(self.epoch);
+            self.allocs_epoch += 1;
+        }
         idx
+    }
+
+    /// Whether the B6 generational oracle is latched on (`ZIPP_GCSTATS=1`).
+    #[inline]
+    pub fn oracle_on(&self) -> bool {
+        self.oracle
+    }
+
+    /// Oracle only: was slot `idx` allocated since the last collection?
+    /// Callers must gate on [`Heap::oracle_on`] (`born` is empty otherwise).
+    #[inline]
+    pub fn oracle_young(&self, idx: u32) -> bool {
+        self.born[idx as usize] == self.epoch
+    }
+
+    /// Oracle only: allocations in the current epoch (== young slot count).
+    #[inline]
+    pub fn oracle_allocs(&self) -> u64 {
+        self.allocs_epoch
+    }
+
+    /// Oracle only: a collection completed — everything surviving is now old.
+    #[inline]
+    pub fn oracle_next_epoch(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.allocs_epoch = 0;
     }
 
     /// Total slot count (live + free + pinned). Sweeps iterate `0..len`.
@@ -2655,9 +2716,56 @@ impl Heap {
 
     #[inline]
     pub fn cell_set(&mut self, idx: u32, v: Value) {
+        // B6 oracle: a captured-variable write is edge source 3 of
+        // NURSERY_DESIGN.md §1 (CellSet/CellSetChecked/UpvalSet all land here).
+        if self.oracle && v.is_heap() && !self.oracle_young(idx) && self.oracle_young(v.heap_index())
+        {
+            gcoracle::hit(gcoracle::CELL_SET);
+        }
         if let HeapObj::Cell(slot) = self.get_mut(idx) {
             *slot = v;
         }
+    }
+}
+
+/// B6 generational-ORACLE store counters (`ZIPP_GCSTATS=1` only): how many
+/// stores at each helper chokepoint of NURSERY_DESIGN.md §1 would have been an
+/// old→young edge — i.e. would have entered a remembered set had the nursery
+/// existed. The tax NUMERATOR of the design study's kill rule; zero behavior.
+pub(crate) mod gcoracle {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) const SET_PROP: usize = 0;
+    pub(crate) const SET_INDEX: usize = 1;
+    pub(crate) const JIT_SET_PROP: usize = 2;
+    pub(crate) const JIT_SET_INDEX: usize = 3;
+    pub(crate) const CELL_SET: usize = 4;
+    pub(crate) const PROMISE_SETTLE: usize = 5;
+    pub(crate) const PROMISE_REACT: usize = 6;
+    pub(crate) const DEFINE_PROP: usize = 7;
+    pub(crate) const COLL_INSERT: usize = 8;
+
+    const NAMES: [&str; 9] = [
+        "set_prop",
+        "set_index",
+        "jit_set_prop",
+        "jit_set_index",
+        "cell_set",
+        "promise_settle",
+        "promise_react",
+        "define_prop",
+        "coll_insert",
+    ];
+    static COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+    #[inline]
+    pub(crate) fn hit(site: usize) {
+        COUNTS[site].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(site name, would-be old→young store count)` per chokepoint.
+    pub fn dump() -> Vec<(&'static str, u64)> {
+        NAMES.iter().zip(&COUNTS).map(|(&n, c)| (n, c.load(Ordering::Relaxed))).collect()
     }
 }
 

@@ -610,6 +610,9 @@ impl<'p> Vm<'p> {
     /// covers double-resolve / resolve-then-reject / race losers), scheduling its
     /// matching reactions as microtasks.
     pub(crate) fn settle(&mut self, p: u32, state: PromiseState, val: Value) {
+        // B6 oracle: NURSERY_DESIGN.md §1 case 5 — resolving an old promise
+        // with a young value.
+        self.oracle_store(crate::heap::gcoracle::PROMISE_SETTLE, p, val);
         let reactions = match self.heap.get_mut(p) {
             HeapObj::Promise { state: s, result, reactions, .. } => {
                 if *s != PromiseState::Pending {
@@ -1018,6 +1021,11 @@ impl<'p> Vm<'p> {
     /// and of internal promise adoption.
     pub(crate) fn then_internal(&mut self, p: u32, on_f: Value, on_r: Value, into: Option<u32>) -> u32 {
         let dep = into.unwrap_or_else(|| self.alloc_promise());
+        // B6 oracle: NURSERY_DESIGN.md §1 case 5 — `.then` on an old promise
+        // with young callbacks / dependent.
+        self.oracle_store(crate::heap::gcoracle::PROMISE_REACT, p, on_f);
+        self.oracle_store(crate::heap::gcoracle::PROMISE_REACT, p, on_r);
+        self.oracle_store(crate::heap::gcoracle::PROMISE_REACT, p, Value::heap(dep));
         let (state, result) = match self.heap.get(p) {
             HeapObj::Promise { state, result, .. } => (*state, *result),
             _ => return dep,
@@ -1837,6 +1845,9 @@ impl<'p> Vm<'p> {
     /// the await point. If `p` is already settled, schedule the resume as a
     /// microtask (so `await` always yields to the queue, per spec).
     pub(crate) fn settle_subscribe(&mut self, p: u32, activation: u32) {
+        // B6 oracle: §1 case 5's await form — an old promise gaining a young
+        // suspended activation as its reaction.
+        self.oracle_store(crate::heap::gcoracle::PROMISE_REACT, p, Value::heap(activation));
         let (state, result) = match self.heap.get(p) {
             HeapObj::Promise { state, result, .. } => (*state, *result),
             _ => {

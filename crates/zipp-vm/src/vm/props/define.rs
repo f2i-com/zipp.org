@@ -688,6 +688,9 @@ impl<'p> Vm<'p> {
         };
         let (attr, stored) = self
             .merge_property_descriptor(key, existing, extensible, value, get, set, d_wr, d_en, d_cf)?;
+        // B6 oracle: NURSERY_DESIGN.md §1 case 1's define route (Object/Class/
+        // sidecar targets all store `stored` under holder `idx`).
+        self.oracle_store(crate::heap::gcoracle::DEFINE_PROP, idx, stored);
         match target {
             0 => {
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {

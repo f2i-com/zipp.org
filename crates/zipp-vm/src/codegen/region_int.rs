@@ -300,6 +300,26 @@ pub(crate) fn compile_region_int_maybe_cold(
             eprintln!("[jit] INT region [{start},{end}] B94 split receiver r{sr}");
         }
     }
+    // ── GPR-home sub-mode (B118) ── bitwise/imul chains pay 3 xmm↔gpr
+    // transfers per op on the xmm-home emitter below; when the region is inside
+    // the bounded scope of `region_int_gpr` (no cold blocks, no split/wt/DV
+    // plan features, live set fits the GPR pool), emit with GPR homes instead.
+    // A None here (out of scope) falls through to the xmm emitter unchanged.
+    // Off-switch: ZIPP_NO_GPR_HOMES=1.
+    if cold.is_empty() && gpr_homes_enabled() {
+        if let Some(f) = compile_region_int_gpr(
+            proto,
+            start,
+            end,
+            globals_base_helper,
+            ta_plan,
+            ta_snapshot,
+            &plan,
+            meter,
+        ) {
+            return Some(f);
+        }
+    }
     let mut ops = match dynasmrt::x64::Assembler::new() {
         Ok(a) => a,
         Err(_) => {

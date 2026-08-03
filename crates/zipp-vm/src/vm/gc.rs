@@ -62,6 +62,30 @@ impl Vm<'_> {
         }
     }
 
+    /// B6 oracle (`ZIPP_GCSTATS=1`): count a would-be old→young store — the
+    /// write barrier NURSERY_DESIGN.md §1 would emit at chokepoint `site`
+    /// (`crate::heap::gcoracle::*`) firing into a remembered set. Stats only;
+    /// off, this is one latched bool load per store site.
+    #[inline]
+    pub(crate) fn oracle_store(&self, site: usize, holder: u32, val: Value) {
+        if self.heap.oracle_on()
+            && val.is_heap()
+            && !self.heap.oracle_young(holder)
+            && self.heap.oracle_young(val.heap_index())
+        {
+            crate::heap::gcoracle::hit(site);
+        }
+    }
+
+    /// [`Vm::oracle_store`] for a holder still in `Value` form (primitives are
+    /// no one's old generation — skipped).
+    #[inline]
+    pub(crate) fn oracle_store_v(&self, site: usize, holder: Value, val: Value) {
+        if holder.is_heap() {
+            self.oracle_store(site, holder.heap_index(), val);
+        }
+    }
+
     fn gc(&mut self) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Gc);
         let n = self.heap.len();
@@ -424,17 +448,81 @@ impl Vm<'_> {
 
         let t_roots = gcstats::now(stats);
         // --- Trace ---------------------------------------------------------
-        while let Some(idx) = stack.pop() {
-            self.trace_edges(idx, &mut marks, &mut stack, n);
+        // B6 oracle (stats only): attribute marking work to the generation of
+        // the object it was done FROM. Work units = 1 per object visited plus 1
+        // per newly-marked edge pushed; the old share is the exact part a
+        // young-only minor trace (old objects treated as pre-marked) would skip.
+        let (mut trace_young, mut trace_old) = (0u64, 0u64);
+        let oracle = stats && self.heap.oracle_on();
+        if oracle {
+            while let Some(idx) = stack.pop() {
+                let before = stack.len();
+                self.trace_edges(idx, &mut marks, &mut stack, n);
+                let work = (stack.len() - before) as u64 + 1;
+                if self.heap.oracle_young(idx) {
+                    trace_young += work;
+                } else {
+                    trace_old += work;
+                }
+            }
+        } else {
+            while let Some(idx) = stack.pop() {
+                self.trace_edges(idx, &mut marks, &mut stack, n);
+            }
         }
         let t_trace = gcstats::now(stats);
 
         // --- Sweep + prune -------------------------------------------------
         let mut swept = 0usize;
-        for i in floor..n {
-            if !marks[i] {
-                self.heap.free_slot(i as u32);
-                swept += 1;
+        if oracle {
+            // B6 oracle: split the swept walk by generation. `alloc_log`-style
+            // young slot count comes from the walk itself (free tombstones read
+            // old — they were freed at a previous collection, so their stale
+            // `born` predates the current epoch); a young-only sweep would walk
+            // exactly `walk_young` of the `n - floor` slots walked today.
+            let allocs = self.heap.oracle_allocs();
+            let (mut marked_young, mut marked_old) = (0u64, 0u64);
+            let (mut swept_young, mut swept_old) = (0u64, 0u64);
+            let mut walk_young = 0u64;
+            for i in floor..n {
+                let young = self.heap.oracle_young(i as u32);
+                if young {
+                    walk_young += 1;
+                }
+                if !marks[i] {
+                    self.heap.free_slot(i as u32);
+                    swept += 1;
+                    if young {
+                        swept_young += 1;
+                    } else {
+                        swept_old += 1;
+                    }
+                } else if young {
+                    marked_young += 1;
+                } else {
+                    marked_old += 1;
+                }
+            }
+            // Pre-existing free tombstones were force-marked above and are not
+            // live old objects — take them back out of the marked-old count.
+            marked_old -= free_before as u64;
+            gcstats::record_gen(
+                marked_young,
+                marked_old,
+                swept_young,
+                swept_old,
+                walk_young,
+                (n - floor) as u64,
+                allocs,
+                trace_young,
+                trace_old,
+            );
+        } else {
+            for i in floor..n {
+                if !marks[i] {
+                    self.heap.free_slot(i as u32);
+                    swept += 1;
+                }
             }
         }
         let t_sweep = gcstats::now(stats);
@@ -509,9 +597,12 @@ impl Vm<'_> {
         self.realm_globals.retain(|&k, _| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
-        let _ = free_before;
         gcstats::record(stats, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
         self.heap.note_gc_done(n - free_after);
+        if self.heap.oracle_on() {
+            // B6 oracle: this collection is now "the last GC" — survivors age out.
+            self.heap.oracle_next_epoch();
+        }
         if shape_verify::enabled() {
             self.verify_all_shapes();
         }
@@ -804,6 +895,17 @@ mod gcstats {
     static SLOTS: AtomicU64 = AtomicU64::new(0);
     static LIVE: AtomicU64 = AtomicU64::new(0);
     static SWEPT: AtomicU64 = AtomicU64::new(0);
+    // B6 generational-oracle splits (NURSERY_DESIGN.md §6): young = allocated
+    // since the previous collection. Summed over all collections.
+    static MARKED_YOUNG: AtomicU64 = AtomicU64::new(0);
+    static MARKED_OLD: AtomicU64 = AtomicU64::new(0);
+    static SWEPT_YOUNG: AtomicU64 = AtomicU64::new(0);
+    static SWEPT_OLD: AtomicU64 = AtomicU64::new(0);
+    static WALK_YOUNG: AtomicU64 = AtomicU64::new(0);
+    static WALK_TOTAL: AtomicU64 = AtomicU64::new(0);
+    static ALLOCED: AtomicU64 = AtomicU64::new(0);
+    static TRACE_YOUNG: AtomicU64 = AtomicU64::new(0);
+    static TRACE_OLD: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub(super) fn enabled() -> bool {
@@ -851,6 +953,48 @@ mod gcstats {
         SWEPT.fetch_add(swept as u64, Ordering::Relaxed);
     }
 
+    /// B6 oracle: record one collection's generational split. Only called with
+    /// the flag latched on, so no `on` gate here.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_gen(
+        marked_young: u64,
+        marked_old: u64,
+        swept_young: u64,
+        swept_old: u64,
+        walk_young: u64,
+        walk_total: u64,
+        alloced: u64,
+        trace_young: u64,
+        trace_old: u64,
+    ) {
+        MARKED_YOUNG.fetch_add(marked_young, Ordering::Relaxed);
+        MARKED_OLD.fetch_add(marked_old, Ordering::Relaxed);
+        SWEPT_YOUNG.fetch_add(swept_young, Ordering::Relaxed);
+        SWEPT_OLD.fetch_add(swept_old, Ordering::Relaxed);
+        WALK_YOUNG.fetch_add(walk_young, Ordering::Relaxed);
+        WALK_TOTAL.fetch_add(walk_total, Ordering::Relaxed);
+        ALLOCED.fetch_add(alloced, Ordering::Relaxed);
+        TRACE_YOUNG.fetch_add(trace_young, Ordering::Relaxed);
+        TRACE_OLD.fetch_add(trace_old, Ordering::Relaxed);
+    }
+
+    /// B6 oracle totals: `(marked_young, marked_old, swept_young, swept_old,
+    /// walk_young, walk_total, alloced, trace_young, trace_old)`.
+    pub fn dump_gen() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+        let g = |x: &AtomicU64| x.load(Ordering::Relaxed);
+        (
+            g(&MARKED_YOUNG),
+            g(&MARKED_OLD),
+            g(&SWEPT_YOUNG),
+            g(&SWEPT_OLD),
+            g(&WALK_YOUNG),
+            g(&WALK_TOTAL),
+            g(&ALLOCED),
+            g(&TRACE_YOUNG),
+            g(&TRACE_OLD),
+        )
+    }
+
     /// `(collections, roots_ms, trace_ms, sweep_ms, retain_ms, avg_slots, avg_live, total_swept)`
     pub fn dump() -> (u64, f64, f64, f64, f64, u64, u64, u64) {
         let c = COLLECTIONS.load(Ordering::Relaxed);
@@ -893,3 +1037,4 @@ mod shape_verify {
 }
 
 pub use gcstats::dump as gc_stats;
+pub use gcstats::dump_gen as gc_gen_stats;

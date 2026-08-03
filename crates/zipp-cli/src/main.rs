@@ -50,13 +50,40 @@ fn main() -> ExitCode {
             r + t + sw + re
         );
         eprintln!("[gc] avg slots/collection {slots}  avg live {live}  total swept {swept}");
+        // B6 generational-oracle report (NURSERY_DESIGN.md §6): young =
+        // allocated since the previous collection; old-attributable = the part
+        // of trace+sweep a young-only minor GC would NOT have to do.
+        let (my, mo, sy, so, wy, wt, alloced, ty, to) = zipp_vm::gc_gen_stats();
+        if wt > 0 {
+            let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
+            let survival = pct(my, alloced);
+            let trace_old_share = pct(to, ty + to);
+            let sweep_old_share = pct(wt - wy, wt);
+            let old_ms = t * trace_old_share / 100.0 + sw * sweep_old_share / 100.0;
+            eprintln!(
+                "[gc-gen] marked young {my} old {mo}  swept young {sy} old {so}  young survival {survival:.1}% (of {alloced} allocs)"
+            );
+            eprintln!(
+                "[gc-gen] trace work young {ty} old {to} (old {trace_old_share:.1}%)  sweep walk young {wy} of {wt} (old {sweep_old_share:.1}%)  old-attributable trace+sweep {old_ms:.1}ms"
+            );
+            let sites = zipp_vm::gc_oracle_stats();
+            let total: u64 = sites.iter().map(|(_, c)| c).sum();
+            let mut line = format!("[gc-gen] old->young stores {total}");
+            for (name, count) in sites {
+                if count > 0 {
+                    line.push_str(&format!("  {name}={count}"));
+                }
+            }
+            eprintln!("{line}");
+        }
     }
     if std::env::var_os("ZIPP_RXSTATS").is_some() {
-        let (compact, materialized) = zipp_vm::regexp_result_stats();
+        let (compact, materialized, fused, fallback) = zipp_vm::regexp_result_stats();
         let pct = if compact == 0 { 0.0 } else { materialized as f64 * 100.0 / compact as f64 };
         eprintln!(
             "[rx] {compact} compact match results  {materialized} materialized ({pct:.2}%)"
         );
+        eprintln!("[rx] matchAll steps: {fused} fused  {fallback} eligible-fallback");
     }
     if std::env::var_os("ZIPP_ASYNCSTATS").is_some() {
         let (reparks, reused, grew, values, subs_in, subs_sp) = zipp_vm::async_stats();

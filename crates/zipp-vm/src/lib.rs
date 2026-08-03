@@ -55,13 +55,31 @@ pub fn gc_stats() -> (u64, f64, f64, f64, f64, u64, u64, u64) {
     vm::gc_stats()
 }
 
+/// `ZIPP_GCSTATS=1` B6 generational-ORACLE splits, summed over all collections:
+/// `(marked_young, marked_old, swept_young, swept_old, walk_young, walk_total,
+/// alloced, trace_work_young, trace_work_old)` where "young" = allocated since
+/// the previous collection and trace work = objects visited + edges pushed,
+/// attributed to the generation traced FROM. Zeroed unless the variable was set.
+pub fn gc_gen_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    vm::gc_gen_stats()
+}
+
+/// `ZIPP_GCSTATS=1` B6 oracle would-be old→young store counts per helper
+/// chokepoint (NURSERY_DESIGN.md §1): `(site, count)`. Zeroed unless set.
+pub fn gc_oracle_stats() -> Vec<(&'static str, u64)> {
+    heap::gcoracle::dump()
+}
+
 /// `ZIPP_RXSTATS=1` RegExp match-result representation counters:
-/// `(compact_constructions, materialized)` — how many successful capturing
-/// exec results were built in the compact pristine record and how many were
-/// later materialised into an ordinary `arr_props` `ObjMap` (mutation,
-/// reflection, or `ZIPP_NO_MATCH_VARIANT=1`, which materialises all of them).
+/// `(compact_constructions, materialized, matchall_steps_fused,
+/// matchall_steps_fallback)` — how many successful capturing exec results
+/// were built in the compact pristine record, how many were later
+/// materialised into an ordinary `arr_props` `ObjMap` (mutation, reflection,
+/// or `ZIPP_NO_MATCH_VARIANT=1`, which materialises all of them), how many
+/// %RegExpStringIterator% steps the fused pristine step served (B118), and
+/// how many fused-eligible steps fell back to the full observable protocol.
 /// Zeroed unless the variable was set.
-pub fn regexp_result_stats() -> (u64, u64) {
+pub fn regexp_result_stats() -> (u64, u64, u64, u64) {
     vm::regexp_result_stats()
 }
 

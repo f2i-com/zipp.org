@@ -313,6 +313,24 @@ pub(crate) fn compile_proto_mem(
     // A one can, so it needs the same charge. See codegen::meter.
     let blocks = crate::codegen::meter::block_map(meter, &proto.code, 0, n - 1);
     let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
+    // B118 fused compare→branch (the region rule, Tier-C shape): `cmp {dst} ;
+    // JumpIfTrue/False{cond: dst}` at the very next ip fuses (see
+    // `emit_fused_cmp_branch_head`). Detection only — the JumpIf stays emitted
+    // (it is a jump target of chained `||`/`&&` arms). Declined under step
+    // metering, exactly as the region path: the fused branch would skip the
+    // JumpIf block's charge. All targets are in-function here, so the taken
+    // edge is `labels[target]` and the fallthrough is `labels[ip + 2]` — no
+    // exit stubs.
+    let cmp_branch_pair = |ip: usize, dst: u16| -> Option<(bool, u32)> {
+        if !mem_cmp_fuse_enabled() || blocks.is_some() || ip + 1 >= n {
+            return None;
+        }
+        match proto.code[ip + 1] {
+            Instr::JumpIfFalse { cond, target } if cond == dst => Some((true, target)),
+            Instr::JumpIfTrue { cond, target } if cond == dst => Some((false, target)),
+            _ => None,
+        }
+    };
     for ip in 0..n {
         dynasm!(ops ; => labels[ip]);
         if let Some((m, bl)) = blocks.as_ref() {
@@ -564,15 +582,37 @@ pub(crate) fn compile_proto_mem(
                 dynasm!(ops ; => done_a);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::Lt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Lt),
-            Instr::Le { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Le),
-            Instr::Gt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Gt),
-            Instr::Ge { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Ge),
-            Instr::Eq { dst, a, b } => {
-                region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, false, heap.strict_eq)
-            }
-            Instr::Ne { dst, a, b } => {
-                region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, true, heap.strict_eq)
+            Instr::Lt { dst, a, b }
+            | Instr::Le { dst, a, b }
+            | Instr::Gt { dst, a, b }
+            | Instr::Ge { dst, a, b }
+            | Instr::Eq { dst, a, b }
+            | Instr::Ne { dst, a, b } => {
+                let cmp = match proto.code[ip] {
+                    Instr::Lt { .. } => Cmp::Lt,
+                    Instr::Le { .. } => Cmp::Le,
+                    Instr::Gt { .. } => Cmp::Gt,
+                    Instr::Ge { .. } => Cmp::Ge,
+                    Instr::Eq { .. } => Cmp::Eq,
+                    _ => Cmp::Ne,
+                };
+                // B118: Int+Int compare feeding the NEXT ip's JumpIf branches on
+                // flags (bool still stored); non-Int falls through to the
+                // unchanged generic sequence below.
+                if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
+                    let t = labels[tgt as usize];
+                    let ft = labels[ip + 2];
+                    emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft);
+                }
+                match cmp {
+                    Cmp::Eq => region_poly_eq(
+                        &mut ops, ip, bail, epilogue, dst, a, b, false, heap.strict_eq,
+                    ),
+                    Cmp::Ne => region_poly_eq(
+                        &mut ops, ip, bail, epilogue, dst, a, b, true, heap.strict_eq,
+                    ),
+                    _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp),
+                }
             }
             Instr::Jump { target } => {
                 dynasm!(ops ; jmp => labels[target as usize]);

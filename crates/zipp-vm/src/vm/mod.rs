@@ -481,8 +481,11 @@ pub struct Vm<'p> {
     /// node's 3.
     for_in_barren: rustc_hash::FxHashMap<u32, u32>,
     /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index:
-    /// (matcher regexp heap idx, subject string, flag bits — bit0 global, bit1
-    /// fullUnicode (`u`/`v`, captured at creation per CreateRegExpStringIterator),
+    /// (matcher regexp heap idx, subject string, flag bits — the `ITFB_*`
+    /// layout in `proxy_regexp`: bit0 global, bit1 fullUnicode (`u`/`v`,
+    /// captured at creation per CreateRegExpStringIterator), bit2 fused-step
+    /// eligible (B118 — pristine-clone matcher over a flat-ASCII subject),
+    /// bit3 sticky, bit4 hasIndices,
     /// done latch). Its `next()` drives RegExpExec (honouring a user `exec`) one
     /// match at a time, rather than matchAll eagerly collecting every match up
     /// front.
@@ -1488,6 +1491,7 @@ mod helpers_json;
 pub(crate) mod helpers_num2;
 mod gc;
 pub(crate) use gc::gc_stats;
+pub(crate) use gc::gc_gen_stats;
 pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use helpers_misc::call_inline_stats;

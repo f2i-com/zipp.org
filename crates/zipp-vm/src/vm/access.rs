@@ -802,6 +802,9 @@ impl<'p> Vm<'p> {
         strict: bool,
     ) -> Result<bool, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::PropSlow);
+        // B6 oracle: NURSERY_DESIGN.md §1 case 1 (interp SetProp, incl. the
+        // fn_props/arr_props sidecar routes below — same holder, same value).
+        self.oracle_store_v(crate::heap::gcoracle::SET_PROP, obj, val);
         // ── ordinary data write on a plain object ──
         if obj.is_heap() {
             let oi = obj.heap_index();

@@ -62,6 +62,38 @@ fn fastok_memo_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_MATCHALL_STEP=1` disables the fused %RegExpStringIterator% STEP
+/// (B118): every step runs the full observable protocol re-proof again — the
+/// rollback switch and one side of a one-binary A/B, same idiom as
+/// `ZIPP_NO_FASTOK_MEMO`.
+#[inline]
+fn matchall_step_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_MATCHALL_STEP").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Flag-bit layout of the `regexp_string_iters` record's `u8` (computed ONCE
+/// at iterator creation): `global`/`fullUnicode` are what
+/// CreateRegExpStringIterator captures per spec; the rest exist so the fused
+/// step (B118) never re-derives them from the matcher's flags string.
+/// `ITFB_FUSED` is only set by the pristine-clone creation arm, whose matcher
+/// is ENGINE-INTERNAL (no user reference can ever exist), over a flat-ASCII
+/// subject with a numeric `lastIndex`.
+pub(crate) const ITFB_GLOBAL: u8 = 1 << 0;
+pub(crate) const ITFB_UNICODE: u8 = 1 << 1;
+pub(crate) const ITFB_FUSED: u8 = 1 << 2;
+pub(crate) const ITFB_STICKY: u8 = 1 << 3;
+pub(crate) const ITFB_INDICES: u8 = 1 << 4;
+
 impl<'p> Vm<'p> {
     /// `new Proxy(target, handler)` — both must be objects.
     pub(crate) fn make_proxy(&mut self, target: Value, handler: Value) -> Result<Value, Thrown> {
@@ -1211,6 +1243,24 @@ impl<'p> Vm<'p> {
         input_v: Value,
         build: bool,
     ) -> Result<Value, Thrown> {
+        self.regexp_exec_impl_prebits(re_idx, input_v, build, None)
+    }
+
+    /// `regexp_exec_impl` with the four flag-derived bits pre-decoded
+    /// (`ITFB_*` layout). Callers passing `Some` must guarantee the bits still
+    /// describe [[OriginalFlags]] at match time — which only holds when
+    /// `lastIndex` is a plain number (no `valueOf` re-entry can `compile()`
+    /// new flags between the ToLength and the flags read) and the regex's
+    /// flags cannot have changed since the bits were captured. The fused
+    /// matchAll step's matcher qualifies: it is engine-internal, so no user
+    /// reference exists to `compile()` it.
+    fn regexp_exec_impl_prebits(
+        &mut self,
+        re_idx: u32,
+        input_v: Value,
+        build: bool,
+        prebits: Option<u8>,
+    ) -> Result<Value, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
         // ToString(string) — IDENTITY for a string value (exact WTF-8 content:
         // a lone-surrogate subject keeps its surrogate rather than decaying to
@@ -1239,18 +1289,32 @@ impl<'p> Vm<'p> {
         // recompile that added `g` never updated lastIndex and one that dropped
         // `y` still clobbered it.
         let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
-        let (global, sticky, has_indices, unicode) = match self.heap.get(re_idx) {
-            HeapObj::RegExp { flags, .. } => (
-                flags.contains('g'),
-                flags.contains('y'),
-                flags.contains('d'),
-                flags.contains('u') || flags.contains('v'),
-            ),
-            _ => {
-                return Err(Thrown(
-                    "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
-                ))
+        let (global, sticky, has_indices, unicode) = match prebits {
+            // Pre-decoded at iterator creation (B118): `lastIndex` was a
+            // number (checked by the caller), so no user code ran above and
+            // the flags are what they were when the bits were captured.
+            Some(b) => {
+                debug_assert!(li_v.is_number());
+                (
+                    b & ITFB_GLOBAL != 0,
+                    b & ITFB_STICKY != 0,
+                    b & ITFB_INDICES != 0,
+                    b & ITFB_UNICODE != 0,
+                )
             }
+            None => match self.heap.get(re_idx) {
+                HeapObj::RegExp { flags, .. } => (
+                    flags.contains('g'),
+                    flags.contains('y'),
+                    flags.contains('d'),
+                    flags.contains('u') || flags.contains('v'),
+                ),
+                _ => {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
+                    ))
+                }
+            },
         };
         let stateful = global || sticky;
         // Step 9: a non-global, non-sticky regex always searches from 0.
@@ -1374,11 +1438,20 @@ impl<'p> Vm<'p> {
                 ranges[4 + i] =
                     m.captures.get(i).and_then(|c| c.clone()).map(|r| (r.start as u32, r.end as u32));
             }
-            self.regexp_last.clear();
-            self.regexp_last.push(input_val);
-            // Placeholders the getter never returns: `regexp_last_lazy` being
-            // `Some` is what routes slots >= 1 through materialisation first.
-            self.regexp_last.resize(14, Value::UNDEFINED);
+            // `regexp_last_lazy` being `Some` is what routes slots >= 1
+            // through materialisation first, so the 13 tail slots are
+            // placeholders the getter never returns — when the record is
+            // already 14 wide only slot 0 needs storing (B118: the per-step
+            // clear+resize wrote 14 slots per successful exec; any stale tail
+            // value is overwritten by `regexp_last_materialise` before a
+            // getter can see it, and is at worst a 13-value GC root).
+            if self.regexp_last.len() == 14 {
+                self.regexp_last[0] = input_val;
+            } else {
+                self.regexp_last.clear();
+                self.regexp_last.push(input_val);
+                self.regexp_last.resize(14, Value::UNDEFINED);
+            }
             self.regexp_last_lazy = Some(RegexpLastLazy { subj: input_val, subj_idx: s_idx, ranges });
         } else {
             // A non-ASCII subject cannot defer: the slices read the locally-decoded
@@ -1827,7 +1900,88 @@ impl<'p> Vm<'p> {
         it_idx: u32,
     ) -> Option<Result<(Value, bool), Thrown>> {
         let &(regexp, string, fbits, done) = self.regexp_string_iters.get(&it_idx)?;
+        if fbits & ITFB_FUSED != 0 && !done && matchall_step_enabled() {
+            if let Some(r) = self.regexp_string_iter_step_fused(it_idx, regexp, string, fbits) {
+                return Some(r);
+            }
+        }
         Some(self.regexp_string_iter_step_inner(it_idx, regexp, string, fbits, done))
+    }
+
+    /// The fused pristine matchAll STEP (B118). Reaching here requires the
+    /// `ITFB_FUSED` bit, which only the pristine-clone creation arm sets: the
+    /// matcher is an ENGINE-INTERNAL clone no user reference exists to (so
+    /// its own shape, prototype link, flags and `lastIndex` writability were
+    /// proven once, at creation, and cannot change), and the subject is a
+    /// flat-ASCII string (immutable, so the bit stays true).
+    ///
+    /// What CAN change mid-iteration is the shared %RegExp.prototype% — a
+    /// replaced `exec` must be honoured per STEP. That is exactly the memo
+    /// `matchall_fast_from_slots` version-guards (its `exec` pin re-reads the
+    /// slot's value identity every call, which is what catches the
+    /// no-version-bump in-place `RegExp.prototype.exec = f` write — B67).
+    /// Any mismatch returns `None` and the caller runs the full observable
+    /// step; a stale memo is refreshed by the next `matchAll()` call, never
+    /// here (a per-step re-resolve would put the nine-probe gate back on the
+    /// hot path for permanently-polluted programs).
+    ///
+    /// With the guards holding, the step is: one RegExpBuiltinExec with the
+    /// flag bits pre-decoded from the iterator record (no per-step
+    /// `flags.contains` scans, no exec-protocol re-derivation), the dense
+    /// element-0 empty-match probe, and the +1 AdvanceStringIndex an ASCII
+    /// subject admits (no surrogate pairs to skip).
+    fn regexp_string_iter_step_fused(
+        &mut self,
+        it_idx: u32,
+        regexp: u32,
+        string: Value,
+        fbits: u8,
+    ) -> Option<Result<(Value, bool), Thrown>> {
+        if !self.matchall_fast_from_slots() {
+            rxstats::count_step_full();
+            return None;
+        }
+        // The matcher's `lastIndex` only ever holds the numbers this path and
+        // the builtin exec write, but the bit costs nothing to re-check and
+        // turns "engine invariant" into "guard".
+        match self.heap.get(regexp) {
+            HeapObj::RegExp { last_index, .. } if last_index.is_number() => {}
+            _ => {
+                rxstats::count_step_full();
+                return None;
+            }
+        }
+        let r = match self.regexp_exec_impl_prebits(regexp, string, true, Some(fbits)) {
+            Ok(r) => r,
+            Err(t) => return Some(Err(t)),
+        };
+        rxstats::count_step_fused();
+        if r == Value::NULL {
+            if let Some(e) = self.regexp_string_iters.get_mut(&it_idx) {
+                e.3 = true;
+            }
+            return Some(Ok((Value::UNDEFINED, true)));
+        }
+        // Empty match ⇒ AdvanceStringIndex. Element 0 is the string the
+        // builtin exec just built (pristine builder, dense store, no user
+        // code ran since) — read it directly.
+        let empty = match self.heap.get(r.heap_index()) {
+            HeapObj::Array(items) => matches!(
+                items.first(),
+                Some(v) if v.is_heap() && self.heap.str_units(v.heap_index()) == Some(0)
+            ),
+            _ => false,
+        };
+        if empty {
+            // `lastIndex` was just written by the exec above (a number, ==
+            // the match end); ASCII subject ⇒ the advance is exactly +1.
+            let cur = match self.heap.get(regexp) {
+                HeapObj::RegExp { last_index, .. } => last_index.as_f64().max(0.0) as usize,
+                _ => 0,
+            };
+            self.set_regexp_last_index(regexp, cur + 1);
+        }
+        Some(Ok((r, false)))
     }
 
     fn regexp_string_iter_step_inner(
@@ -1850,7 +2004,14 @@ impl<'p> Vm<'p> {
             // every step rather than cached on the iterator.
             let pristine_exec = matches!(self.heap.get(regexp), HeapObj::RegExp { .. })
                 && self.regexp_exec_fast_ok(regexp);
-            let r = self.regexp_exec_abstract(regexp, string)?;
+            // `regexp_exec_abstract` opens by re-proving exactly
+            // `pristine_exec` to pick the builtin — when it already holds,
+            // call the builtin directly instead of proving it twice.
+            let r = if pristine_exec {
+                self.regexp_exec(regexp, string)?
+            } else {
+                self.regexp_exec_abstract(regexp, string)?
+            };
             if r == Value::NULL {
                 (Value::UNDEFINED, true, true)
             } else if !global {
@@ -2314,6 +2475,8 @@ pub(crate) mod rxstats {
     static ON: AtomicU8 = AtomicU8::new(2);
     static COMPACT: AtomicU64 = AtomicU64::new(0);
     static MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+    static STEP_FUSED: AtomicU64 = AtomicU64::new(0);
+    static STEP_FULL: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub(crate) fn enabled() -> bool {
@@ -2342,9 +2505,33 @@ pub(crate) mod rxstats {
         }
     }
 
-    /// `(compact_constructions, materialized)`.
-    pub fn dump() -> (u64, u64) {
-        (COMPACT.load(Ordering::Relaxed), MATERIALIZED.load(Ordering::Relaxed))
+    /// A %RegExpStringIterator% step served by the fused pristine path
+    /// (B118): flag bits from the iterator record, no per-step protocol
+    /// re-proof beyond the version-guarded slot memo.
+    #[inline]
+    pub(crate) fn count_step_fused() {
+        if enabled() {
+            STEP_FUSED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A fused-ELIGIBLE step that fell back to the full observable protocol
+    /// (memo cold/invalidated, or a guard declined).
+    #[inline]
+    pub(crate) fn count_step_full() {
+        if enabled() {
+            STEP_FULL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(compact_constructions, materialized, steps_fused, steps_fallback)`.
+    pub fn dump() -> (u64, u64, u64, u64) {
+        (
+            COMPACT.load(Ordering::Relaxed),
+            MATERIALIZED.load(Ordering::Relaxed),
+            STEP_FUSED.load(Ordering::Relaxed),
+            STEP_FULL.load(Ordering::Relaxed),
+        )
     }
 }
 

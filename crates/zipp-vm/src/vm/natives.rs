@@ -2351,6 +2351,29 @@ impl<'p> Vm<'p> {
                         };
                         let global = flags.contains('g');
                         let full_unicode = flags.contains('u') || flags.contains('v');
+                        // Fused-step eligibility (B118), decided ONCE here: this
+                        // arm's matcher is an engine-internal clone (no user
+                        // reference can ever exist to `compile()` it or shadow
+                        // its own props), so the flag bits below stay true for
+                        // the iterator's whole life. The subject must be a
+                        // flat-ASCII string — immutable, so that bit holds too
+                        // — which is what makes the per-step empty-match
+                        // advance exactly +1. `global` gates it because only
+                        // the global step loop is fused.
+                        use crate::vm::proxy_regexp::{
+                            ITFB_FUSED, ITFB_INDICES, ITFB_STICKY,
+                        };
+                        let mut extra_bits = 0u8;
+                        if global && s_val.is_heap() {
+                            self.heap.flatten(s_val.heap_index());
+                            if matches!(self.heap.get(s_val.heap_index()),
+                                        HeapObj::Str(js) if js.is_ascii())
+                            {
+                                extra_bits = ITFB_FUSED
+                                    | if flags.contains('y') { ITFB_STICKY } else { 0 }
+                                    | if flags.contains('d') { ITFB_INDICES } else { 0 };
+                            }
+                        }
                         // The matcher is a SEPARATE object: the iterator advances
                         // its lastIndex independently of the source regex.
                         // Carry the byte-optimized twin over. It is derived from
@@ -2387,7 +2410,8 @@ impl<'p> Vm<'p> {
                             proto,
                             live: None,
                         });
-                        let fbits = (global as u8) | ((full_unicode as u8) << 1);
+                        let fbits =
+                            (global as u8) | ((full_unicode as u8) << 1) | extra_bits;
                         self.regexp_string_iters.insert(it, (matcher_idx, s_val, fbits, false));
                         return Ok(Value::heap(it));
                     }

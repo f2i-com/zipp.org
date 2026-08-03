@@ -721,6 +721,9 @@ pub(crate) extern "win64" fn jit_set_index(
     // SAFETY: exclusive view; the running region holds no conflicting borrow and
     // pins only the register file (not the array's Vec, which may reallocate).
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // B6 oracle: NURSERY_DESIGN.md §1 case 2, the JIT helper route (the region
+    // inline element store makes no call; estimated from the ZIPP_NOJIT delta).
+    vm.oracle_store(crate::heap::gcoracle::JIT_SET_INDEX, arr.heap_index(), Value::from_bits(val_bits));
     // ── plain-object computed write: `o[k] = v` overwriting an EXISTING own
     // writable data slot ────────────────────────────────────────────────────
     // Deliberately narrower than the read arm. Only an in-place value store on a
@@ -1899,6 +1902,9 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // living in `vm.eval_funcs` past `main_func_count`, and indexing the program's
     // table directly is an out-of-bounds panic the moment such a function gets hot
     // and takes a `SetProp` miss. The get side was fixed; this one was missed.
+    // B6 oracle: NURSERY_DESIGN.md §1 case 1, the JIT miss route (IC-hit stores
+    // make no call and are estimated from the ZIPP_NOJIT delta).
+    vm.oracle_store(crate::heap::gcoracle::JIT_SET_PROP, idx, Value::from_bits(val_bits));
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Keys with exotic write interception (the inherited `__proto__` setter,
     // restricted names, private names, canonical-index-ish keys) and exotic

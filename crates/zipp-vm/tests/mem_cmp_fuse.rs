@@ -189,6 +189,115 @@ fn cmpfuse_parity_branch_exits_region() {
     );
 }
 
+/// W6 Tier-C shape: a hot LOOP-FREE function whose whole body is compare
+/// chains (the recursive-descent parser's `tokIs`/`pFactor` shape — B118's
+/// recorded follow-up). The function is fn-compiled on the whole-function mem
+/// path (no loop, so OSR never sees it), where the same fused head now runs;
+/// chained `===`/`||` arms enter each JumpIf ip from earlier arms, so the bool
+/// store must survive fusion here exactly as in a region.
+#[test]
+fn cmpfuse_parity_tierc_classifier_function() {
+    assert_matches_node(TIERC_CLASSIFIER_SRC);
+}
+
+/// The Tier-C classifier program, shared with the JITLOG child probe below.
+/// The `charCodeAt` keeps the function OFF the INT tier (`fn_int::can_compile`
+/// rejects CallMethod) so it lands on the whole-function MEM path.
+const TIERC_CLASSIFIER_SRC: &str = r#"
+    "use strict";
+    function classify(s, i) {
+      var c = s.charCodeAt(i);
+      if (c === 32 || c === 10 || c === 9 || c === 13) return 0;
+      if (c >= 48 && c <= 57) return 1;
+      if (c >= 97 && c <= 122) return 2;
+      if (c >= 65 && c <= 90) return 3;
+      if (c === 95 || c === 36) return 4;
+      return 5;
+    }
+    var src = "";
+    for (var r = 0; r < 120; r++) src += "var ab = cd + 12;\n  // note\n x.y = 's';\t";
+    var counts = [0, 0, 0, 0, 0, 0];
+    for (var p = 0; p < 8; p++) {
+      for (var i = 0; i < src.length; i++) counts[classify(src, i)]++;
+    }
+    console.log(counts.join(","));
+"#;
+
+/// Tier-C shape with the compare RESULT reused after its branch inside the
+/// function body (`var t = a === b; if (t) ...; sum += t ? 2 : 1`), plus
+/// relational chains over mixed Int/double/string arguments — the fused head's
+/// non-Int miss lane and the mandatory bool store, in a fn-compiled body.
+#[test]
+fn cmpfuse_parity_tierc_bool_reuse_mixed_args() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        function score(a, b, tag) {
+          // The charCodeAt keeps score() off the INT tier (CallMethod is
+          // rejected there) so it fn-compiles on the MEM path (Tier C).
+          var t = a === b;
+          if (tag.charCodeAt(0) === 122) return -1;
+          var s = 0;
+          if (t) s += 16;
+          s += t ? 2 : 1;
+          if (a < b) s += 4;
+          if (a >= b) s += 8;
+          if (a !== b) s += 32;
+          return s;
+        }
+        var vals = [1, 2, 1.5, 2.0, NaN, "a", "b", -2147483648, 2147483647, 0];
+        var h = 0, log = [];
+        for (var r = 0; r < 25000; r++) {
+          var s = score(vals[r % vals.length], vals[(r * 7 + 3) % vals.length], "q");
+          h = (h * 31 + s) | 0;
+          if (r < 20) log.push(s);
+        }
+        console.log(h + " " + log.join(","));
+        "#,
+    );
+}
+
+/// CHILD half of the Tier-C verification: runs the classifier program in-process
+/// so the parent (`zz_tierc_classifier_compiles_tier_c`) can read its JITLOG.
+/// Runs as an ordinary parity test in a normal invocation.
+#[test]
+fn tierc_jitlog_child_probe() {
+    assert_matches_node(TIERC_CLASSIFIER_SRC);
+}
+
+/// PARENT half: spawn the probe with `ZIPP_JITLOG=1` (latches process-wide) and
+/// prove the classifier really lands on TIER C — a `[jit] Tier C fn… compiled
+/// (whole-function mem path…)` line — not merely an OSR region of the driver
+/// loop. This is what makes the two `cmpfuse_parity_tierc_` cases evidence
+/// about `compile_proto_mem`'s fused head rather than the region's.
+#[test]
+fn zz_tierc_classifier_compiles_tier_c() {
+    if std::env::var_os("ZIPP_TIERC_CHILD").is_some() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test exe path");
+    let out = std::process::Command::new(&exe)
+        .args(["tierc_jitlog_child_probe", "--exact", "--nocapture"])
+        .env("ZIPP_TIERC_CHILD", "1")
+        .env("ZIPP_JITLOG", "1")
+        .env_remove("ZIPP_NOJIT")
+        .env_remove("ZIPP_JIT_THRESHOLD")
+        .env_remove("ZIPP_NO_FNJIT_MEM")
+        .env_remove("ZIPP_NO_MEM_CMPJUMP")
+        .output()
+        .expect("spawn the test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && !stdout.contains("running 0 tests"),
+        "Tier-C probe child failed:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Tier C fn") && stderr.contains("whole-function mem path"),
+        "classifier did not compile on Tier C (whole-function mem path):\n{stderr}"
+    );
+}
+
 /// Re-run every `cmpfuse_parity_` case in three more modes, each in its own
 /// child process (the env latch is read once per process): the off-switch, the
 /// pure interpreter, and threshold-1. The same node-derived assertions passing

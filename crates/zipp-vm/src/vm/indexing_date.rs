@@ -359,6 +359,8 @@ impl<'p> Vm<'p> {
         val: Value,
         strict: bool,
     ) -> Result<(), Thrown> {
+        // B6 oracle: NURSERY_DESIGN.md §1 case 2 (interp SetIndex).
+        self.oracle_store_v(crate::heap::gcoracle::SET_INDEX, obj, val);
         if !obj.is_heap() {
             if obj.is_nullish() {
                 return Err(Thrown("TypeError: cannot set property of non-object".into()));
