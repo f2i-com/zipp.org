@@ -288,6 +288,64 @@ pub(crate) fn compile_region_int_maybe_cold(
     ) {
         Some(p) => p,
         None => {
+            // ── W8: B94 split receivers on GPR homes ── with the split OFF by
+            // default (`int_split_enabled`'s xmm-cost refutation) a recycled
+            // pinned receiver (`iv[i] = st` with `st` also the xorshift temp)
+            // fails the plan outright and the region falls to MEM. That
+            // refutation priced the split on the XMM emitter — every Bitwise
+            // op round-tripping xmm↔gpr on the serial chain — and named GPR
+            // homes as the real fix. Now that they exist (B119), retry the
+            // split plan ONLY into the GPR emitter: engaged → the region hosts
+            // there; declined for ANY reason → fall to MEM exactly as before.
+            // The xmm emitter still never sees a split plan unless
+            // `ZIPP_INT_SPLIT=1`. Off-switch: `ZIPP_NO_GPR_SPLIT=1`.
+            if !int_split_enabled() && gpr_split_enabled() && gpr_homes_enabled() && cold.is_empty()
+            {
+                if let Some(p2) =
+                    plan_region_cold(proto, start, end, ta_plan, true, true, false, false, &cold)
+                {
+                    if !p2.split_recvs.is_empty() {
+                        match compile_region_int_gpr(
+                            proto,
+                            start,
+                            end,
+                            globals_base_helper,
+                            ta_plan,
+                            ta_snapshot,
+                            &p2,
+                            meter,
+                        ) {
+                            GprAttempt::Emitted(f) => return Some(f),
+                            // Same B119 relief valve as the main flow: one
+                            // shared-home re-plan when only the pool overflowed.
+                            GprAttempt::PoolOverflow if gpr_nest_enabled() => {
+                                if let Some(shared) = plan_region_cold(
+                                    proto, start, end, ta_plan, true, true, false, true, &cold,
+                                ) {
+                                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                                        eprintln!(
+                                            "[jit] INT-GPR nest retry [{start},{end}]: shared-home re-plan"
+                                        );
+                                    }
+                                    if let GprAttempt::Emitted(f) = compile_region_int_gpr(
+                                        proto,
+                                        start,
+                                        end,
+                                        globals_base_helper,
+                                        ta_plan,
+                                        ta_snapshot,
+                                        &shared,
+                                        meter,
+                                    ) {
+                                        return Some(f);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             if std::env::var_os("ZIPP_JITLOG").is_some() {
                 eprintln!("[jit] INT decline [{start},{end}]: plan_region=None");
             }

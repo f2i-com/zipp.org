@@ -8,14 +8,25 @@
 //!
 //! Every `gprhome_parity_*` case asserts byte-identical output against
 //! `node -e` at DEFAULT settings (the mode ON). The final test re-runs the set
-//! in four more modes in child processes: `ZIPP_NO_GPR_HOMES=1` (the xmm-home
-//! emitter — the off-switch must be a pure fallback), `ZIPP_JIT_THRESHOLD=1`
-//! (compile everything immediately), `ZIPP_GC_STRESS=1` (every flushed home
-//! must box to a traceable Value at every exit), and `ZIPP_NOJIT=1` (pure
-//! interpreter). The shapes lean on the B97 lesson: a lost entry load or a
-//! garbage home flush is a wrong ANSWER only an exit-heavy shape can see, so
-//! the cases exercise break/return/throw exits, mid-loop deopts (a value going
-//! non-int, an i32 `<<` result crossing tags), and defs on untaken branches.
+//! in five more modes in child processes: `ZIPP_NO_GPR_HOMES=1` (the xmm-home
+//! emitter — the off-switch must be a pure fallback), `ZIPP_NO_GPR_LAZYSX=1`
+//! (W8 deferred sign-extension off — immediate canonicalization must be a
+//! pure fallback too), `ZIPP_JIT_THRESHOLD=1` (compile everything
+//! immediately), `ZIPP_GC_STRESS=1` (every flushed home must box to a
+//! traceable Value at every exit), and `ZIPP_NOJIT=1` (pure interpreter). The
+//! shapes lean on the B97 lesson: a lost entry load or a garbage home flush is
+//! a wrong ANSWER only an exit-heavy shape can see, so the cases exercise
+//! break/return/throw exits, mid-loop deopts (a value going non-int, an i32
+//! `<<` result crossing tags), and defs on untaken branches.
+//!
+//! The W8 (`gprhome_parity_imul_wrap…` onward) cases target the deferred
+//! sign-extension invariant specifically: a LAZY home holds the zero-extended
+//! low-32 form between defs, so every path that READS it as an i64 — array
+//! index, compare, 64-bit add, `%`, unary minus, exit flush, deopt flush —
+//! must observe the re-canonicalized value. Engagement of the GPR emitter
+//! (not the xmm fallback) for these shapes was verified via ZIPP_JITLOG
+//! (`… GPR homes engaged (N homes, 2 lazy-sx)` on every loop except `wide`,
+//! which deliberately overflows the pool).
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
@@ -247,14 +258,170 @@ fn gprhome_parity_negatives_and_mod() {
     );
 }
 
+/// W8 lazy-sx: imul wrap at every i32 edge through the 3-operand/in-place
+/// forms, and xor/or/and with negative operands on a LAZY accumulator (its
+/// home holds the zero-extended form between defs — every printed value went
+/// through an exit fix-up movsxd).
+#[test]
+fn gprhome_parity_imul_wrap_and_negative_bitwise() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        function f(n) {
+          var h = -1, p = 1, q = 0;
+          for (var i = 0; i < n; i++) {
+            h = Math.imul(h ^ (i - 512), -2147483648 + i); // sign-bit products
+            p = Math.imul(p, 16777619);                    // wraps through 2^31 repeatedly
+            q = (q & -7) | (h & 0x80000001);               // and/or with negatives
+            q = q ^ (p | 0);
+          }
+          return h + "," + p + "," + q;
+        }
+        console.log(f(50), f(3000));
+        console.log(Math.imul(-2147483648, -2147483648), Math.imul(2147483647, 2147483647));
+        console.log(Math.imul(65536, 65536), Math.imul(-65536, 65535) | 0);
+        "#,
+    );
+}
+
+/// W8 mixed consumers: a lazy bitwise result feeding the i64-consuming arms.
+/// Two loops sized to FIT the GPR pool (the one-function version counted 11
+/// homes > 8 and fell back to xmm, exercising nothing): `idx` feeds a lazy
+/// `&`-result to pinned SetIndex/GetIndex as the INDEX and to a 64-bit add;
+/// `cmpadd` feeds one to a COMPARE, an add chain and a shift COUNT. Each use
+/// re-canonicalizes and must read the same number node reads. (A third,
+/// pool-overflowing mix with `%` and unary minus keeps the xmm-fallback
+/// parity honest.)
+#[test]
+fn gprhome_parity_lazy_value_mixed_consumers() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        var N = 256;
+        var a = new Int32Array(N);
+        function idx(n) {
+          var s = 0;
+          for (var i = 0; i < n; i++) {
+            var k = (i * 31) & (N - 1);   // lazy: index + add consumers
+            a[k] = k ^ i;
+            s = (s + a[(k >>> 1) & (N - 1)] + k) | 0;
+          }
+          return s;
+        }
+        function cmpadd(n) {
+          var s = 0, m = 0;
+          for (var i = 0; i < n; i++) {
+            var k = (i * 7) ^ (i & 63);   // lazy: compare/add/shift-count consumers
+            if ((k ^ 3) < ((s & 1023) | 1)) m = (m + k) | 0;
+            s = (s + k + (m << (k & 3))) | 0;
+          }
+          return s + "," + m;
+        }
+        function wide(n) {
+          var s = 0, m = 0, r = 0;
+          for (var i = 0; i < n; i++) {
+            var k = (i * 31) & (N - 1);
+            a[k] = k ^ i;
+            m = a[(k >>> 1) & (N - 1)];
+            if ((k ^ 3) < (m | 1)) s = s + k;
+            s = (s + (k | 0) + m) | 0;
+            r = (r + (k % 7) + (-(k | 1) | 0) + (m << (k & 3))) | 0;
+          }
+          return s + "," + m + "," + r;
+        }
+        console.log(idx(64), idx(5000));
+        console.log(cmpadd(64), cmpadd(5000));
+        console.log(wide(64), wide(5000));
+        "#,
+    );
+}
+
+/// W8 strict entry: a LAZY accumulator whose live-in value arrives OUTSIDE
+/// i32 (an integral double). The strict entry guard must bail to the
+/// interpreter — which applies real ToInt32 — rather than admit the wide
+/// value into an i32-invariant home; the answers must stay node-identical
+/// (mixed with iterations where the value is a plain i32 again, so the
+/// region still runs).
+#[test]
+fn gprhome_parity_strict_entry_wide_livein() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        function f(n, seed) {
+          var h = seed;                    // 2^32+5 on the second call
+          for (var i = 0; i < n; i++) {
+            h = (h ^ i) | 0;               // lazy home: strict entry required
+            h = Math.imul(h, 31);
+          }
+          return h;
+        }
+        console.log(f(1000, 1), f(1000, 4294967301), f(3, 4294967301));
+        // A >>> result crossing i32 range keeps its home NON-lazy (u32 exit box).
+        function g(n) {
+          var u = 0, t = 0;
+          for (var i = 0; i < n; i++) {
+            u = (i * 2654435761) >>> 0;    // up to 4294967295
+            t = (t + (u & 255)) | 0;
+          }
+          return u + "," + t;
+        }
+        console.log(g(700));
+        "#,
+    );
+}
+
+/// W8 deopt exits with a lazy accumulator LIVE: a pinned element going
+/// non-int mid-loop (GetIndex deopt), an index going out of bounds
+/// (charCodeAt-shaped deopt via a[k]), and an i53 guard failure — each exit
+/// funnels through the flush fix-ups, so the boxed values must be exact.
+#[test]
+fn gprhome_parity_deopt_exits_with_lazy_accumulator() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        function viaElementDeopt(n) {
+          var arr = [];
+          for (var i = 0; i < n; i++) arr.push(i);
+          arr[600] = 0.5;                  // double element -> GetIndex deopt
+          var h = 0x811c9dc5;
+          for (var j = 0; j < n; j++) {
+            h = Math.imul(h ^ arr[j], 16777619);
+          }
+          return h >>> 0;
+        }
+        function viaOob(s, n) {
+          var h = 7;
+          for (var i = 0; i < n; i++) {
+            h = Math.imul(h ^ s.charCodeAt(i & 1023), 31); // in range
+            if (i === 800) h = Math.imul(h ^ s.charCodeAt(5000), 31); // NaN -> deopt
+          }
+          return h | 0;
+        }
+        function viaGuard(n) {
+          var h = 1, s = 1;
+          for (var i = 0; i < n; i++) {
+            h = (h ^ i) | 0;               // lazy
+            s = s * 3;                     // i53 guard eventually fails
+          }
+          return h + "," + s;
+        }
+        var str = "";
+        for (var i = 0; i < 1024; i++) str += String.fromCharCode(32 + (i % 90));
+        console.log(viaElementDeopt(2000), viaOob(str, 2000), viaGuard(200));
+        "#,
+    );
+}
+
 /// Everything above must answer identically in every mode. The parity tests
 /// re-run in child processes; their node-derived assertions passing in all
-/// modes IS the parity check.
+/// modes IS the parity check. `ZIPP_NO_GPR_LAZYSX=1` pins the W8 off-switch:
+/// immediate canonicalization must be a pure fallback.
 #[test]
 fn all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 4] = [
+    let modes: [&[(&str, &str)]; 5] = [
         &[("ZIPP_NO_GPR_HOMES", "1")],
+        &[("ZIPP_NO_GPR_LAZYSX", "1")],
         &[("ZIPP_JIT_THRESHOLD", "1")],
         &[("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_NOJIT", "1")],

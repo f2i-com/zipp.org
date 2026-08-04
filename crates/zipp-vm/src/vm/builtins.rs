@@ -1947,6 +1947,10 @@ impl<'p> Vm<'p> {
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let pos = self.coll_find(idx, key);
                 let mut pushed = None;
+                // Nursery barrier for the VALUE (both arms): the insert's
+                // `coll_index_insert` barriers the key, but a young value can
+                // ride an old (or non-heap) key.
+                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => vals[i] = val, // update in place, keep position
@@ -1972,6 +1976,8 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let mut pushed = None;
+                // Nursery barrier for the VALUE (see the `set` arm).
+                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
                     pushed = Some(keys.len());
                     keys.push(key);
@@ -2000,6 +2006,8 @@ impl<'p> Vm<'p> {
                 let val = self.call_value(cb, Value::UNDEFINED, &[key])?;
                 let pos = self.coll_find(idx, key);
                 let mut pushed = None;
+                // Nursery barrier for the VALUE (see the `set` arm).
+                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => vals[i] = val,
@@ -2123,6 +2131,8 @@ impl<'p> Vm<'p> {
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let pos = self.coll_find(idx, a0);
                 let mut pushed = None;
+                // Nursery barrier for the VALUE (the insert barriers the key).
+                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => vals[i] = val,
@@ -2162,6 +2172,8 @@ impl<'p> Vm<'p> {
                 };
                 let pos = self.coll_find(idx, a0);
                 let mut pushed = None;
+                // Nursery barrier for the VALUE (the insert barriers the key).
+                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => vals[i] = val,
@@ -2267,6 +2279,8 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if token != Value::UNDEFINED {
+                    // Nursery barrier: a young token pushed into an old registry.
+                    self.heap.write_barrier_val(idx, token);
                     if let HeapObj::FinalizationRegistry { tokens, .. } = self.heap.get_mut(idx) {
                         tokens.push(token);
                     }

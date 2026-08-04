@@ -1437,6 +1437,12 @@ impl<'p> Vm<'p> {
                     Instr::ArrayAppend { arr, val, spread } => {
                         let aidx = self.get(base, arr).heap_index();
                         let vv = self.get(base, val);
+                        // Nursery barrier (holder-grain): the literal under
+                        // construction is normally young, but a spread arm can
+                        // run user code (an iterator), whose safe points can
+                        // promote it mid-build — every later append is then an
+                        // old→young store. Old holder ⇒ one card per epoch.
+                        self.heap.write_barrier(aidx);
                         if spread {
                             // Spreading a LIVE-mapped arguments object: refresh
                             // its dense slots from the formals first (the array
@@ -2151,6 +2157,10 @@ impl<'p> Vm<'p> {
                         // non-callable @@toPrimitive surfaces at definition (not at the
                         // first `new`), and the resolved key is reused per instance.
                         let k = self.coerce_index_key(kv)?;
+                        // Nursery barrier: the key coercion above can run user
+                        // code (@@toPrimitive), whose safe points can promote
+                        // the class mid-definition.
+                        self.heap.write_barrier_val(cv.heap_index(), k);
                         if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
                             c.computed_field_keys.push(k);
                         }
@@ -3559,6 +3569,32 @@ impl<'p> Vm<'p> {
                                     region_end as u32,
                                     base,
                                 );
+                                // Nursery: a baked trivial-setter arm stores
+                                // `this.<field>` CALL-FREE (`emit_mi_body`'s
+                                // SetProp{obj:0} — `mov [vals_ptr+slot*8]`),
+                                // so no barrier ever sees it. Register every
+                                // storing arm's receiver as a persistent
+                                // minor-trace root instead (same rule as the
+                                // SetProp IC data-way fill).
+                                if self.heap.nursery_on() {
+                                    for plan in method_plan.values() {
+                                        for shape in &plan.shapes {
+                                            let stores = shape.body.iter().any(|op| {
+                                                matches!(
+                                                    op,
+                                                    crate::bytecode::Instr::SetProp { obj: 0, .. }
+                                                        | crate::bytecode::Instr::SuperSet { .. }
+                                                )
+                                            });
+                                            if stores {
+                                                let v = crate::value::Value::from_bits(shape.recv_bits);
+                                                if v.is_heap() {
+                                                    self.heap.register_scan_root(v.heap_index());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 let proto: *const crate::bytecode::FuncProto =
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
@@ -5569,6 +5605,9 @@ impl<'p> Vm<'p> {
                                 && self.array_js_len.contains_key(&recv.heap_index()))
                         {
                             let v = self.get(base, arg_base);
+                            // Nursery barrier: the interpreter's inline
+                            // `arr.push(v)` lane (B119's retained-array idiom).
+                            self.heap.write_barrier_val(recv.heap_index(), v);
                             let len = if let HeapObj::Array(items) =
                                 self.heap.get_mut(recv.heap_index())
                             {

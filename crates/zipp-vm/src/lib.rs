@@ -70,10 +70,12 @@ pub fn gc_oracle_stats() -> Vec<(&'static str, u64)> {
     heap::gcoracle::dump()
 }
 
-/// Stage-1 nursery split: `(minors, majors, minor_ms, major_ms, swept_young,
-/// floated_swept, float_peak, peak_slots)`. The counts and peaks update in
-/// every mode (they cost a few relaxed atomics per collection); the ms and
-/// floated-swept fields are 0 unless `ZIPP_GCSTATS=1`.
+/// Nursery split: `(minors, majors, minor_ms, major_ms, swept_young,
+/// floated_swept, dirty_peak, peak_slots)` — `dirty_peak` is the largest
+/// dirty-holder set (remembered set + persistent scan roots) a single minor
+/// re-traced. The counts and peaks update in every mode (they cost a few
+/// relaxed atomics per collection); the ms and floated-swept fields are 0
+/// unless `ZIPP_GCSTATS=1`.
 pub fn gc_nursery_stats() -> (u64, u64, f64, f64, u64, u64, u64, u64) {
     vm::gc_nursery_stats()
 }

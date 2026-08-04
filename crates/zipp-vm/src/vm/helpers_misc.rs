@@ -721,9 +721,13 @@ pub(crate) extern "win64" fn jit_set_index(
     // SAFETY: exclusive view; the running region holds no conflicting borrow and
     // pins only the register file (not the array's Vec, which may reallocate).
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    // B6 oracle: NURSERY_DESIGN.md §1 case 2, the JIT helper route (the region
-    // inline element store makes no call; estimated from the ZIPP_NOJIT delta).
-    vm.oracle_store(crate::heap::gcoracle::JIT_SET_INDEX, arr.heap_index(), Value::from_bits(val_bits));
+    // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 2, the JIT
+    // element-store route. There is NO inline region element store for a
+    // dense Array (`region_mem.rs` deliberately routes every Array SetIndex
+    // through this helper — growth/holes/length exotica), and pinned
+    // TypedArray inline stores are numbers only, so this call IS the barrier
+    // for JIT'd `a[i] = v`.
+    vm.store_barrier(crate::heap::gcoracle::JIT_SET_INDEX, arr.heap_index(), Value::from_bits(val_bits));
     // ── plain-object computed write: `o[k] = v` overwriting an EXISTING own
     // writable data slot ────────────────────────────────────────────────────
     // Deliberately narrower than the read arm. Only an in-place value store on a
@@ -1175,6 +1179,10 @@ pub(crate) extern "win64" fn jit_array_push(
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    // Nursery barrier: `arr.push(youngObj)` on a retained array is B119's
+    // dominant old→young idiom — the dedicated push lane must barrier like
+    // the `jit_set_index` lane does.
+    vm.heap.write_barrier_val(arr.heap_index(), Value::from_bits(val_bits));
     match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
             items.push(Value::from_bits(val_bits));
@@ -1965,9 +1973,10 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // living in `vm.eval_funcs` past `main_func_count`, and indexing the program's
     // table directly is an out-of-bounds panic the moment such a function gets hot
     // and takes a `SetProp` miss. The get side was fixed; this one was missed.
-    // B6 oracle: NURSERY_DESIGN.md §1 case 1, the JIT miss route (IC-hit stores
-    // make no call and are estimated from the ZIPP_NOJIT delta).
-    vm.oracle_store(crate::heap::gcoracle::JIT_SET_PROP, idx, Value::from_bits(val_bits));
+    // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1, the JIT miss
+    // route. IC-HIT stores make no call — that is what `register_scan_root`
+    // at the fill below is for.
+    vm.store_barrier(crate::heap::gcoracle::JIT_SET_PROP, idx, Value::from_bits(val_bits));
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Keys with exotic write interception (the inherited `__proto__` setter,
     // restricted names, private names, canonical-index-ish keys) and exotic
@@ -2112,6 +2121,12 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // skips hop checks; chain setters/non-writables deopted above).
     if let Some(e) = crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot) {
         vm.jit.set_ic(site_idx, e);
+        // Nursery: this way's HITS store into `idx` with NO call (the probe's
+        // `mov [vals+slot*8], val`), so no barrier can ever see them.
+        // Register the receiver as a persistent minor-trace root instead —
+        // its edges are re-scanned at every minor for as long as the slot
+        // lives (the way itself dies with the slot's version on free/reuse).
+        vm.heap.register_scan_root(idx);
     }
     0
 }
@@ -2421,6 +2436,9 @@ pub(crate) extern "win64" fn jit_set_index_concat(
     };
     let out = match hit {
         Some(i) => {
+            // Nursery barrier: an in-place store into a possibly-old holder
+            // (the miss arm delegates to `set_index_concat`, which barriers).
+            vm.heap.write_barrier_val(oidx, Value::from_bits(val_bits));
             if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
                 m.vals[i] = Value::from_bits(val_bits);
                 0

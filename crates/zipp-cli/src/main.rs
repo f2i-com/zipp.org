@@ -50,13 +50,14 @@ fn main() -> ExitCode {
             r + t + sw + re
         );
         eprintln!("[gc] avg slots/collection {slots}  avg live {live}  total swept {swept}");
-        // Stage-1 nursery split: minors sweep only the alloc log; "floated" is
-        // old garbage a minor left in place (peak, and how much the majors
-        // then reclaimed).
-        let (minors, majors, mn_ms, mj_ms, swept_young, floated_swept, float_peak, peak) =
+        // Nursery split: minors trace young-only and sweep only the alloc
+        // log; "dirty peak" is the largest remset+scan-root set one minor
+        // re-traced; "swept-at-major" is floated old garbage the majors
+        // then reclaimed.
+        let (minors, majors, mn_ms, mj_ms, swept_young, floated_swept, dirty_peak, peak) =
             zipp_vm::gc_nursery_stats();
         eprintln!(
-            "[gc-nursery] minors {minors} ({mn_ms:.1}ms)  majors {majors} ({mj_ms:.1}ms)  swept-young {swept_young}  floated peak {float_peak} swept-at-major {floated_swept}  peak slots {peak}"
+            "[gc-nursery] minors {minors} ({mn_ms:.1}ms)  majors {majors} ({mj_ms:.1}ms)  swept-young {swept_young}  dirty peak {dirty_peak} swept-at-major {floated_swept}  peak slots {peak}"
         );
         // B6 generational-oracle report (NURSERY_DESIGN.md §6): young =
         // allocated since the previous collection; old-attributable = the part

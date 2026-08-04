@@ -2211,27 +2211,69 @@ pub struct Heap {
     /// unless the nursery is latched on.
     young: Vec<u32>,
     /// Latched PRESENCE of `ZIPP_NURSERY=1` (read once at construction) — the
-    /// single gate on the young log and the minor/major decision. OPT-IN:
-    /// stage 1 default-on was REFUTED by per-row ablation (B120 —
-    /// async +3.6%, polymorphic +3.1%, markdown +2.1%, CIs excluding zero,
-    /// against json −1.5%): a minor still pays the FULL mark, and on churn
-    /// rows it reclaims nothing a major would not, while float-inflated
-    /// thresholds schedule MORE marks. Stage 3 (remset + young-only trace)
-    /// changes those economics; re-price the default there. `false` is the
-    /// pre-nursery collector exactly: every collection is a major, and
-    /// `alloc` never touches `young`.
+    /// single gate on the young log, the generation bytes, the write barrier
+    /// and the minor/major decision. OPT-IN: stage 1 default-on was REFUTED
+    /// by per-row ablation (B120 — async +3.6%, polymorphic +3.1%, markdown
+    /// +2.1%, CIs excluding zero, against json −1.5%): a stage-1 minor still
+    /// paid the FULL mark. Stage 3 (this remset + the young-only trace in
+    /// `vm/gc.rs`) is what changes those economics; the default is re-priced
+    /// at the suite gate, not here. `false` is the pre-nursery collector
+    /// exactly: every collection is a major, and `alloc` never touches
+    /// `young`/`gen`.
     nursery: bool,
+    /// Stage-3 generation byte per slot, parallel to `objs` (EMPTY unless the
+    /// nursery is latched — every reader is gated on `self.nursery`). Low two
+    /// bits are the state (`GEN_YOUNG`/`GEN_OLD`/`GEN_DIRTY`), `GEN_SCAN` is
+    /// the sticky "call-free store target" bit (see [`Heap::register_scan_root`]).
+    /// Kept in lockstep by `alloc`; a freed slot is stamped `GEN_OLD` so
+    /// `gen == GEN_YOUNG ⇔ the slot is in the young log` is a real invariant.
+    gen: Vec<u8>,
+    /// Stage-3 remembered set: OLD holders that received a young store since
+    /// the last collection (holder-grain — NURSERY_DESIGN.md §1's dirty-object
+    /// form; deduped by the `GEN_DIRTY` state so each holder appears once).
+    /// A minor re-traces every entry's full edge list; drained and reset to
+    /// `GEN_OLD` by [`Heap::remset_reset`] at the end of each minor.
+    remset: Vec<u32>,
+    /// Stage-3 PERSISTENT trace roots: receivers a JIT cache can store into
+    /// with NO helper call (a filled SetProp data way; a baked method-inline
+    /// trivial-setter arm). Those stores can never run a barrier, so their
+    /// targets' edges are re-scanned at EVERY minor instead — sound because
+    /// the set of such receivers is exactly what the fill sites registered.
+    /// Deduped by `GEN_SCAN`; an entry self-expires when its slot is recycled
+    /// (`alloc` stamps `GEN_YOUNG`, clearing the bit; the minor prune drops it).
+    scan_roots: Vec<u32>,
     /// Post-collection live count recorded by the last MAJOR. A major frees
     /// every unreachable slot, so this is the honest "true live" anchor the
-    /// float budget is measured against (a post-MINOR count would include the
-    /// floated garbage it is supposed to bound).
+    /// major schedule is measured against (a post-MINOR count includes floated
+    /// old garbage, which must not compound the threshold — B120's named fix).
     live_at_major: usize,
+    /// Occupied-slot count that latches the next collection into a MAJOR:
+    /// the PRE-NURSERY schedule (`GC_GROWTH * live_at_major`, floored). A
+    /// minor that ends with the heap still at or above this point has proven
+    /// the growth is NOT young garbage — it is survivors plus floats (old
+    /// garbage a young-only sweep can never reclaim) — so the next collection
+    /// majors, i.e. floats are reclaimed within one young budget of where
+    /// today's collector would have collected anyway. That bounds them
+    /// without measuring them (a young-only trace cannot).
+    major_at: usize,
+    /// Latched by [`Heap::note_minor_done`] when the post-minor occupied
+    /// count crossed `major_at`: the next collection runs as a major.
+    major_due: bool,
     /// Minor collections since the last major (the scheduling backstop).
     minors_since_major: u32,
-    /// Latched by a minor whose float census crossed the budget: the next
-    /// collection runs as a major. See [`Heap::note_minor_done`].
-    major_due: bool,
 }
+
+/// Stage-3 generation states (low two bits of a `Heap::gen` byte).
+/// `GEN_YOUNG`: allocated since the last collection (in the young log).
+const GEN_YOUNG: u8 = 0;
+/// `GEN_OLD`: survived a collection, not in the remembered set.
+const GEN_OLD: u8 = 1;
+/// `GEN_DIRTY`: old AND in the remembered set (the dedup bit of the barrier).
+const GEN_DIRTY: u8 = 2;
+/// Mask selecting the state bits out of a `Heap::gen` byte.
+const GEN_STATE: u8 = 0b11;
+/// Sticky "registered in `Heap::scan_roots`" bit (call-free store target).
+const GEN_SCAN: u8 = 0b100;
 
 /// Smallest live-object count that triggers a collection — below this the heap is
 /// trivially small and collecting would be pure overhead.
@@ -2260,22 +2302,27 @@ pub const GC_MIN_THRESHOLD: usize = 1 << 16;
 /// already grown still collects on the same schedule it did.
 const GC_GROWTH: usize = 3;
 
-/// Stage-1 nursery scheduling (NURSERY_DESIGN.md §6, step 2 — the barrier-free
-/// minor). A minor marks FULLY but sweeps only the young log, so an
-/// unreachable OLD object is not freed — it FLOATS, occupying its slot until a
-/// major runs. Floating is sound (the slot is never reused, so no stale state
-/// can surface — the cost is slots, not correctness), but it must be bounded:
-/// each minor measures the float mass EXACTLY (the full mark makes liveness
-/// exact) and latches a major once floats exceed the live count at the last
-/// major, floored here so small heaps don't major-thrash. Bound: the heap
-/// carries at most ~1x true live in floated garbage plus one epoch of lag —
-/// a small constant on today's peak, paid only by workloads that produce
-/// old garbage (B119's oracle: young survival is 0.1-29% on every row, so
-/// the common case floats almost nothing).
-const NURSERY_FLOAT_BUDGET_FLOOR: usize = GC_MIN_THRESHOLD;
+/// Stage-3 nursery scheduling (NURSERY_DESIGN.md §2): allocations between
+/// MINOR collections. A minor's cost is O(young live + roots + remset), not
+/// O(heap), so it can afford to run far more often than a major — this is the
+/// slot-recycling cadence §2 argues is the design's locality upside. 64k is
+/// the top of the design doc's 16-64k window and equals `GC_MIN_THRESHOLD`,
+/// so the FIRST collection fires exactly where today's collector fires.
+///
+/// An unreachable OLD object is not freed by a minor — it FLOATS, occupying
+/// its slot until a major. With the young-only trace the float mass can no
+/// longer be measured exactly (old liveness is unknown at a minor), so the
+/// stage-1 float census is replaced by `Heap::major_at`: the occupied count
+/// grows through floats toward the PRE-nursery collection threshold, at which
+/// point a major runs — i.e. majors happen no later than every collection
+/// would have happened without the nursery, and the threshold is computed
+/// from the last major's TRUE live count, never from a float-inflated
+/// occupied count (B120's float-discount fix: churn rows stop compounding
+/// the schedule off garbage they merely failed to sweep).
+const NURSERY_YOUNG_BUDGET: usize = 1 << 16;
 
-/// Backstop: run a major at least every 64th collection even if the float
-/// census never crosses the budget, so major-only hygiene (the
+/// Backstop: run a major at least every 64th collection even if the occupied
+/// count never crosses `major_at`, so major-only hygiene (the
 /// `brand_private_names` recompute, reclaiming table capacity) is never
 /// deferred forever.
 const NURSERY_MAX_MINORS: u32 = 64;
@@ -2309,6 +2356,10 @@ impl Heap {
         let live = objs.len();
         let oracle = std::env::var_os("ZIPP_GCSTATS").is_some();
         let born = if oracle { vec![0; objs.len()] } else { Vec::new() };
+        let nursery = std::env::var_os("ZIPP_NURSERY").is_some()
+            && std::env::var_os("ZIPP_NO_NURSERY").is_none();
+        // The pre-interned prefix is pinned and immutable — OLD from birth.
+        let gen = if nursery { vec![GEN_OLD; objs.len()] } else { Vec::new() };
         Heap {
             objs,
             versions,
@@ -2321,11 +2372,14 @@ impl Heap {
             allocs_epoch: 0,
             oracle,
             young: Vec::new(),
-            nursery: std::env::var_os("ZIPP_NURSERY").is_some()
-                && std::env::var_os("ZIPP_NO_NURSERY").is_none(),
+            nursery,
+            gen,
+            remset: Vec::new(),
+            scan_roots: Vec::new(),
             live_at_major: live,
-            minors_since_major: 0,
+            major_at: GC_MIN_THRESHOLD,
             major_due: false,
+            minors_since_major: 0,
         }
     }
 
@@ -2342,6 +2396,9 @@ impl Heap {
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
             if self.nursery {
                 self.young.push(idx);
+                // Clears every bit: a recycled slot sheds the dead occupant's
+                // remset/scan state (the scan_roots prune keys off this).
+                self.gen[idx as usize] = GEN_YOUNG;
             }
             if self.oracle {
                 self.born[idx as usize] = self.epoch;
@@ -2354,6 +2411,7 @@ impl Heap {
         self.versions.push(0);
         if self.nursery {
             self.young.push(idx);
+            self.gen.push(GEN_YOUNG);
         }
         if self.oracle {
             self.born.push(self.epoch);
@@ -2394,19 +2452,24 @@ impl Heap {
         self.nursery
     }
 
-    /// Test-only: force the nursery latch, so the unit tests below hold in a
-    /// suite run under `ZIPP_NO_NURSERY=1` too.
+    /// Test-only: force the nursery latch (materialising the generation
+    /// bytes), so the unit tests below hold in a suite run under
+    /// `ZIPP_NO_NURSERY=1` too.
     #[cfg(test)]
     pub(crate) fn set_nursery(&mut self, on: bool) {
         self.nursery = on;
+        if on && self.gen.len() != self.objs.len() {
+            self.gen = vec![GEN_OLD; self.objs.len()];
+        }
     }
 
-    /// Whether the collection about to run may be a MINOR (full mark, but
-    /// sweep only the young log, leaving unreachable OLD objects floating).
-    /// A MAJOR runs instead when: the nursery is off; a previous minor's
-    /// float census latched one; or the backstop streak runs out. Under
+    /// Whether the collection about to run may be a MINOR (young-only trace,
+    /// sweep only the young log, unreachable OLD objects float). A MAJOR runs
+    /// instead when: the nursery is off; the previous minor left the heap at
+    /// or above `major_at` (growth the young sweep could not reclaim —
+    /// survivors and floats); or the backstop streak runs out. Under
     /// `ZIPP_GC_STRESS` the streak cap drops to 3 so a collection at every
-    /// safe point exercises both sweep paths densely, not minors alone.
+    /// safe point exercises both paths densely, not minors alone.
     #[inline]
     pub fn minor_due(&self, stress: bool) -> bool {
         let cap = if stress { NURSERY_STRESS_MINORS } else { NURSERY_MAX_MINORS };
@@ -2419,19 +2482,23 @@ impl Heap {
         &self.young
     }
 
-    /// Drop everything logged so far (called from `set_gc_floor`: the boot
-    /// allocations are pinned forever, so the first minor should not walk
-    /// them just to find them marked).
+    /// Promote everything logged so far and drop the log (called from
+    /// `set_gc_floor`: the boot allocations are pinned forever, so they are
+    /// OLD from the floor on and the first minor never walks them).
     pub fn young_reset(&mut self) {
+        for &i in &self.young {
+            self.gen[i as usize] = GEN_OLD;
+        }
         self.young.clear();
     }
 
-    /// Stage-1 MINOR sweep: walk ONLY the young log, freeing the unmarked
-    /// entries — `free_slot` exactly as the major does (tombstone + version
-    /// bump + free list), so every stale inline cache misses identically.
-    /// Each freed slot is appended to `freed` (the caller's side-table prune
-    /// set). The log is then cleared (capacity kept); survivors become old by
-    /// simply no longer being logged.
+    /// MINOR sweep: walk ONLY the young log, freeing the unmarked entries —
+    /// `free_slot` exactly as the major does (tombstone + version bump + free
+    /// list), so every stale inline cache misses identically. Survivors are
+    /// PROMOTED (`GEN_OLD`, keeping a sticky scan bit) — promotion is a
+    /// bookkeeping byte, never a copy (NURSERY_DESIGN.md §0). Each freed slot
+    /// is appended to `freed` (the caller's side-table prune set). The log is
+    /// then cleared (capacity kept).
     ///
     /// No double-free is possible: a young slot is never already on the free
     /// list here, because the free list is refilled only by sweeps and a
@@ -2442,11 +2509,106 @@ impl Heap {
             if !marks[idx as usize] {
                 self.free_slot(idx);
                 freed.push(idx);
+            } else {
+                let g = &mut self.gen[idx as usize];
+                *g = (*g & !GEN_STATE) | GEN_OLD;
             }
         }
         log.clear();
         self.young = log;
         freed.len()
+    }
+
+    // ── stage-3 write barrier + remembered set ─────────────────────────────
+
+    /// Holder-grain write barrier (the design doc's dirty-object/card form):
+    /// `holder` was just stored into; if it is OLD and clean, remember it —
+    /// the next minor re-traces its full edge list. One latched bool + one
+    /// byte compare when the store is not the holder's first this epoch.
+    /// Used where the stored value is not at hand (batch mutators, reg
+    /// re-parks, `Heap::replace`); the value-tested form below is the hot-path
+    /// spelling.
+    #[inline]
+    pub fn write_barrier(&mut self, holder: u32) {
+        if self.nursery && self.gen[holder as usize] & GEN_STATE == GEN_OLD {
+            self.dirty(holder);
+        }
+    }
+
+    /// Value-tested write barrier: enter `holder` into the remembered set only
+    /// when it is OLD-clean AND `v` is a YOUNG heap value — the exact
+    /// old→young edge condition (NURSERY_DESIGN.md §1). Everything else is
+    /// filtered in at most three compares; the common repeat-store exits on
+    /// the first (the holder is already `GEN_DIRTY`).
+    #[inline]
+    pub fn write_barrier_val(&mut self, holder: u32, v: Value) {
+        if self.nursery
+            && self.gen[holder as usize] & GEN_STATE == GEN_OLD
+            && v.is_heap()
+            && self.gen[v.heap_index() as usize] & GEN_STATE == GEN_YOUNG
+        {
+            self.dirty(holder);
+        }
+    }
+
+    #[inline]
+    fn dirty(&mut self, holder: u32) {
+        let g = &mut self.gen[holder as usize];
+        *g = (*g & !GEN_STATE) | GEN_DIRTY;
+        self.remset.push(holder);
+    }
+
+    /// Register `holder` as a PERSISTENT minor-trace root: a JIT cache was
+    /// just filled (or a plan baked) that can store into it CALL-FREE, so no
+    /// barrier will ever see those stores. Every minor re-scans its edges
+    /// instead. Sticky until the slot is recycled (`alloc` clears the bit and
+    /// the minor prune drops the entry); bounded by the number of distinct
+    /// receivers ever filled into a Set-capable way, which the 8-way IC and
+    /// the ≤8-arm method-inline plans keep small in practice.
+    #[inline]
+    pub fn register_scan_root(&mut self, holder: u32) {
+        if self.nursery && self.gen[holder as usize] & GEN_SCAN == 0 {
+            self.gen[holder as usize] |= GEN_SCAN;
+            self.scan_roots.push(holder);
+        }
+    }
+
+    /// The old holders a minor must re-trace: the remembered set (this
+    /// epoch's barrier hits) plus the persistent scan roots, pruned of
+    /// recycled slots. Returned as a snapshot so the caller can trace while
+    /// borrowing the heap.
+    pub fn dirty_for_trace(&mut self) -> Vec<u32> {
+        let gen = &self.gen;
+        self.scan_roots.retain(|&i| gen[i as usize] & GEN_SCAN != 0);
+        let mut out = Vec::with_capacity(self.remset.len() + self.scan_roots.len());
+        out.extend_from_slice(&self.remset);
+        // A holder can be in both (dirtied while also registered): tracing an
+        // edge list twice is harmless (the second scan pushes nothing new),
+        // so no dedup pass is spent here.
+        out.extend_from_slice(&self.scan_roots);
+        out
+    }
+
+    /// End-of-minor: every remembered holder goes back to OLD-clean (its
+    /// young referents were just promoted, so its edges are old→old now) and
+    /// the set drains. The scan roots persist by design.
+    pub fn remset_reset(&mut self) {
+        let remset = std::mem::take(&mut self.remset);
+        for &h in &remset {
+            let g = &mut self.gen[h as usize];
+            *g = (*g & !GEN_STATE) | GEN_OLD;
+        }
+        let mut remset = remset;
+        remset.clear();
+        self.remset = remset;
+    }
+
+    /// A minor needs `marks[i] == true` for every NON-YOUNG slot (old objects
+    /// are boundary nodes presumed live; free tombstones are `GEN_OLD` by
+    /// `free_slot`), so the shared root walk and the unchanged `trace_edges`
+    /// push — and therefore trace — ONLY young objects.
+    pub fn gen_nonyoung_marks(&self) -> Vec<bool> {
+        self.gen.iter().map(|&g| g & GEN_STATE != GEN_YOUNG).collect()
     }
 
     /// Total slot count (live + free + pinned). Sweeps iterate `0..len`.
@@ -2481,6 +2643,11 @@ impl Heap {
     pub fn free_slot(&mut self, idx: u32) {
         self.objs[idx as usize] = HeapObj::Date(f64::NAN);
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        if self.nursery {
+            // Tombstones read OLD: `gen == GEN_YOUNG ⇔ in the young log`
+            // stays exact, so a minor's boundary marks cover free slots too.
+            self.gen[idx as usize] = GEN_OLD;
+        }
         self.free.push(idx);
     }
 
@@ -2498,36 +2665,56 @@ impl Heap {
     #[inline]
     pub fn note_gc_done(&mut self, live: usize) {
         self.live = live;
-        self.gc_threshold = (live.saturating_mul(GC_GROWTH))
+        // A MAJOR completed: nothing unreachable survived it, so `live` is
+        // the TRUE live count — the anchor both schedules grow from. Floats
+        // never enter this math (B120's float-discount fix): a minor reports
+        // an occupied count, but the major threshold is only ever recomputed
+        // here, from a count with zero floated garbage in it.
+        self.major_at = (live.saturating_mul(GC_GROWTH))
             .max(GC_MIN_THRESHOLD)
             .max(self.objs.len() / 2);
+        self.gc_threshold = if self.nursery {
+            // Next collection: a minor, one young budget from now (whether it
+            // stays a minor is `note_minor_done`'s post-sweep decision).
+            live.saturating_add(NURSERY_YOUNG_BUDGET)
+        } else {
+            self.major_at
+        };
         self.gc_requested = false;
-        // A MAJOR completed: nothing unreachable survived it, so `live` is
-        // the true live count the next float budget is measured against.
         self.live_at_major = live;
         self.minors_since_major = 0;
         self.major_due = false;
+        if self.nursery {
+            // Every survivor of a major is OLD (and the remembered set is
+            // stale — its young referents were just promoted or swept).
+            for g in &mut self.gen {
+                *g = (*g & !GEN_STATE) | GEN_OLD;
+            }
+            self.remset.clear();
+        }
         self.young.clear();
     }
 
-    /// [`Heap::note_gc_done`]'s MINOR twin. `live` is the OCCUPIED slot count
-    /// (reachable + floated — floats hold slots, so they must drive the next
-    /// collection's schedule exactly like live objects do); `floated` is the
-    /// exact unreachable-but-unswept count the minor's full mark measured.
-    /// The threshold math is the major's, unchanged; the float budget is what
-    /// keeps a minor-only diet from ballooning the heap: one crossing latches
-    /// the next collection into a major.
+    /// [`Heap::note_gc_done`]'s MINOR twin. `live` is the post-sweep OCCUPIED
+    /// slot count (reachable + floated). The young-only trace cannot measure
+    /// floats, so the major decision is made from what the minor could NOT
+    /// reclaim: an occupied count still at/above the pre-nursery collection
+    /// point (`major_at`) is survivors + floats, and the next collection
+    /// majors. Pure-churn heaps stay below it and run minors indefinitely
+    /// (the backstop aside); float/survivor growth reaches a major within
+    /// one young budget of where today's collector would have collected.
     #[inline]
-    pub fn note_minor_done(&mut self, live: usize, floated: usize) {
+    pub fn note_minor_done(&mut self, live: usize) {
         self.live = live;
-        self.gc_threshold = (live.saturating_mul(GC_GROWTH))
-            .max(GC_MIN_THRESHOLD)
-            .max(self.objs.len() / 2);
-        self.gc_requested = false;
-        self.minors_since_major += 1;
-        if floated > self.live_at_major.max(NURSERY_FLOAT_BUDGET_FLOOR) {
+        // Refresh the sweep-amortisation floor: the slot vector may have
+        // grown since the last major, and a major sweep walks all of it.
+        self.major_at = self.major_at.max(self.objs.len() / 2);
+        if live >= self.major_at {
             self.major_due = true;
         }
+        self.gc_threshold = live.saturating_add(NURSERY_YOUNG_BUDGET);
+        self.gc_requested = false;
+        self.minors_since_major += 1;
         self.young.clear();
     }
 
@@ -2545,6 +2732,11 @@ impl Heap {
     /// invariant, and it is not one a shape-keyed guard should have to make.
     #[inline]
     pub fn replace(&mut self, idx: u32, obj: HeapObj) {
+        // Nursery barrier (NURSERY_DESIGN.md §1 case 8): the incoming object
+        // may hold young references; if the SLOT is old, its whole edge list
+        // is re-traced at the next minor (holder-grain — the value set is a
+        // full HeapObj, not a single Value).
+        self.write_barrier(idx);
         self.objs[idx as usize] = obj;
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
     }
@@ -2872,8 +3064,10 @@ impl Heap {
 
     #[inline]
     pub fn cell_set(&mut self, idx: u32, v: Value) {
-        // B6 oracle: a captured-variable write is edge source 3 of
-        // NURSERY_DESIGN.md §1 (CellSet/CellSetChecked/UpvalSet all land here).
+        // Nursery barrier + B6 oracle: a captured-variable write is edge
+        // source 3 of NURSERY_DESIGN.md §1 (CellSet/CellSetChecked/UpvalSet
+        // all land here — the JIT's `jit_cell_set`/`jit_upval_set` too).
+        self.write_barrier_val(idx, v);
         if self.oracle && v.is_heap() && !self.oracle_young(idx) && self.oracle_young(v.heap_index())
         {
             gcoracle::hit(gcoracle::CELL_SET);
@@ -3259,6 +3453,91 @@ mod tests {
         assert_eq!(h.version_of(d), vb.wrapping_add(2));
         assert_eq!(h.young_log(), &[d]);
         assert!(h.free_indices().is_empty());
+    }
+
+    /// The stage-3 barrier state machine, pinned at the unit level: only an
+    /// OLD-CLEAN holder with a YOUNG heap value enters the remembered set;
+    /// the DIRTY state dedups repeat stores; a minor's `remset_reset` returns
+    /// holders to clean so the next epoch's first store re-remembers them.
+    #[test]
+    fn a_write_barrier_remembers_old_holders_of_young_values_exactly_once() {
+        let mut h = Heap::new();
+        h.set_nursery(true); // hold even in a suite run under ZIPP_NO_NURSERY=1
+        let holder = h.alloc(HeapObj::Cell(Value::UNDEFINED));
+        // Promote: survive a "collection" (everything marked).
+        let marks = vec![true; h.len()];
+        let mut freed = Vec::new();
+        h.sweep_young(&marks, &mut freed);
+        assert!(freed.is_empty());
+
+        let young = h.alloc(HeapObj::Str(JsStr::new("yy".into())));
+        // young holder / young value: no entry.
+        h.write_barrier_val(young, Value::heap(young));
+        assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());
+        // old holder / non-heap value: no entry.
+        h.write_barrier_val(holder, Value::int(7));
+        assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());
+        // old holder / OLD value (the interned prefix is old): no entry.
+        h.write_barrier_val(holder, Value::heap(INTERN_EMPTY));
+        assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());
+        // old holder / young value: remembered — exactly once across repeats.
+        h.write_barrier_val(holder, Value::heap(young));
+        h.write_barrier_val(holder, Value::heap(young));
+        h.write_barrier(holder); // the card form dedups against the same state
+        assert_eq!(h.dirty_for_trace(), vec![holder]);
+
+        // End of minor: the holder returns to clean; a fresh young store in
+        // the next epoch re-remembers it.
+        let marks = vec![true; h.len()];
+        h.sweep_young(&marks, &mut freed);
+        h.remset_reset();
+        assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());
+        let young2 = h.alloc(HeapObj::Str(JsStr::new("zz".into())));
+        h.write_barrier_val(holder, Value::heap(young2));
+        assert_eq!(h.dirty_for_trace(), vec![holder]);
+    }
+
+    /// Persistent scan roots (call-free JIT store targets): registered once,
+    /// surviving `remset_reset`, deduped against the remembered set only by
+    /// harmless double-tracing, and self-expiring when the slot is recycled.
+    #[test]
+    fn a_scan_root_persists_across_minors_and_expires_with_its_slot() {
+        let mut h = Heap::new();
+        h.set_nursery(true);
+        let holder = h.alloc(HeapObj::Cell(Value::UNDEFINED));
+        h.register_scan_root(holder);
+        h.register_scan_root(holder); // sticky bit dedups
+        assert_eq!(h.dirty_for_trace(), vec![holder]);
+        h.remset_reset();
+        assert_eq!(h.dirty_for_trace(), vec![holder], "scan roots persist");
+
+        // Free the slot (as a sweep would) and let alloc recycle it: the
+        // recycled occupant must NOT inherit the registration.
+        h.free_slot(holder);
+        let reused = h.alloc(HeapObj::Str(JsStr::new("rr".into())));
+        assert_eq!(reused, holder, "the freed slot is reused first");
+        assert_eq!(h.dirty_for_trace(), Vec::<u32>::new(), "registration expired");
+    }
+
+    /// The stage-3 schedule: a minor that leaves the heap at/above the
+    /// pre-nursery collection point (`major_at`) latches the next collection
+    /// into a major; one that reclaims below it keeps minoring.
+    #[test]
+    fn a_minor_that_cannot_shrink_the_heap_latches_a_major() {
+        let mut h = Heap::new();
+        h.set_nursery(true);
+        assert!(h.minor_due(false), "fresh heap: minors first");
+        // Post-minor occupancy below major_at: keep minoring.
+        h.note_minor_done(1000);
+        assert!(h.minor_due(false));
+        // Post-minor occupancy at/above major_at (GC_MIN_THRESHOLD here —
+        // no major has run yet): the young sweep failed to shrink the heap,
+        // so the next collection must be a major.
+        h.note_minor_done(GC_MIN_THRESHOLD);
+        assert!(!h.minor_due(false));
+        // The major resets the anchor from its TRUE live count.
+        h.note_gc_done(2000);
+        assert!(h.minor_due(false));
     }
 }
 

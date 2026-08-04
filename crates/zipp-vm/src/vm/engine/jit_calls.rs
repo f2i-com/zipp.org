@@ -937,6 +937,10 @@ impl<'p> Vm<'p> {
         } else {
             val
         };
+        // Nursery barrier: the off-frame trivial-setter store bypasses every
+        // barriered helper (this is the single Rust chokepoint for it — the
+        // method-inline evaluator's `mi_super_set` commits through here too).
+        self.heap.write_barrier_val(idx, stored);
         // Re-borrow mutably and verify the field is an own writable data slot.
         match self.heap.get_mut(idx) {
             HeapObj::Object(m) if !m.is_ctor => {

@@ -6,10 +6,12 @@
 //! slot stays the receiver's, with every numeric def written through BOXED
 //! and the flush skipping it.
 //!
-//! The mechanism is OPT-IN (`ZIPP_INT_SPLIT=1`; default off — see
-//! `int_split_enabled` in plan_region.rs for the measured refutation).
+//! The XMM-emitter mechanism is OPT-IN (`ZIPP_INT_SPLIT=1`; default off — see
+//! `int_split_enabled` in plan_region.rs for the measured refutation). Since
+//! W8, DEFAULT settings route a split plan into the GPR-home emitter instead
+//! (see `int_gpr_split.rs`), so the default runs below exercise that path.
 //! Every `isplit_parity_*` case asserts byte-identical output against
-//! `node -e` at DEFAULT settings (split off — the MEM-tier decline path);
+//! `node -e` at DEFAULT settings;
 //! the final test re-runs the set in four more modes in child processes:
 //! `ZIPP_INT_SPLIT=1` (the mechanism ON, default thresholds),
 //! `ZIPP_INT_SPLIT=1` + `ZIPP_JIT_THRESHOLD=1` (ON, compile everything

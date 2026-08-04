@@ -359,8 +359,9 @@ impl<'p> Vm<'p> {
         val: Value,
         strict: bool,
     ) -> Result<(), Thrown> {
-        // B6 oracle: NURSERY_DESIGN.md §1 case 2 (interp SetIndex).
-        self.oracle_store_v(crate::heap::gcoracle::SET_INDEX, obj, val);
+        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 2 (interp
+        // SetIndex — every downstream route stores `val` under this holder).
+        self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, obj, val);
         if !obj.is_heap() {
             if obj.is_nullish() {
                 return Err(Thrown("TypeError: cannot set property of non-object".into()));
@@ -720,6 +721,9 @@ impl<'p> Vm<'p> {
                     _ => (None, false),
                 };
                 if let Some(i) = hit {
+                    // Nursery barrier: in-place store outside `set_index`'s
+                    // barriered entry (the slow path below re-enters it).
+                    self.heap.write_barrier_val(idx, val);
                     if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                         m.vals[i] = val;
                         self.idx_key_scratch = scratch;
@@ -728,6 +732,7 @@ impl<'p> Vm<'p> {
                 }
                 if add {
                     let ks = scratch.clone(); // the unavoidable owned ObjMap key
+                    self.heap.write_barrier_val(idx, val);
                     if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                         m.push_data(ks, val);
                         self.heap.bump_version(idx); // key add reallocs vals (IC)

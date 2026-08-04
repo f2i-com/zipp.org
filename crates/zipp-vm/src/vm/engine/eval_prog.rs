@@ -461,6 +461,9 @@ impl<'p> Vm<'p> {
                     if let Some(name) = self.global_slot_name(slot as u32) {
                         if eval_prog.eval_dynamic_names.iter().any(|n| *n == name) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);
+                            // Nursery barrier: a fresh (young) function bound
+                            // into a possibly-old EvalScope.
+                            self.heap.write_barrier_val(sc, v);
                             if let HeapObj::EvalScope(m) = self.heap.get_mut(sc) {
                                 m.insert(name, v);
                             }

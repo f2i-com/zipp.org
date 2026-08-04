@@ -340,6 +340,13 @@ impl<'p> Vm<'p> {
                     // of holes); `length` comes from the virtual side table.
                     let sparse_target =
                         i >= crate::vm::MAX_DENSE_ARRAY_LEN && i >= dense_len && !args_past;
+                    // Nursery barrier: this array-index arm returns before the
+                    // generic define route's barrier below; both its stores
+                    // (the dense element and an arr_props override's
+                    // value/setter) hang off holder `idx` — holder-grain card
+                    // (defineProperty is rare; the sidecar is also
+                    // root-rescanned every minor).
+                    self.heap.write_barrier(idx);
                     if is_default_data && !args_past && !sparse_target {
                         // Lives in the dense Vec; drop any stale special override.
                         if let Some(m) = self.arr_props.get_mut(&idx) {
@@ -688,9 +695,13 @@ impl<'p> Vm<'p> {
         };
         let (attr, stored) = self
             .merge_property_descriptor(key, existing, extensible, value, get, set, d_wr, d_en, d_cf)?;
-        // B6 oracle: NURSERY_DESIGN.md §1 case 1's define route (Object/Class/
-        // sidecar targets all store `stored` under holder `idx`).
-        self.oracle_store(crate::heap::gcoracle::DEFINE_PROP, idx, stored);
+        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1's define
+        // route (Object/Class/sidecar targets all store `stored` under holder
+        // `idx`; the sidecars are additionally root-rescanned every minor).
+        // An accessor define also stores the SETTER half in `attrs[i].setter`
+        // — barrier it too (the trace scans setters).
+        self.store_barrier(crate::heap::gcoracle::DEFINE_PROP, idx, stored);
+        self.heap.write_barrier_val(idx, attr.setter);
         match target {
             0 => {
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {

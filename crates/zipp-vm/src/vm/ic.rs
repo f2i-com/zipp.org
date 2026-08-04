@@ -994,6 +994,10 @@ impl<'p> Vm<'p> {
     fn ic_apply_set(&mut self, p: SetPlan, val: Value) -> SetAct {
         match p {
             SetPlan::WriteOwn { idx, slot } => {
+                // Nursery barrier: the interpreter IC's direct own-data store
+                // bypasses `set_prop` (whose entry barrier covers every slow
+                // route), so it carries its own.
+                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                     m.vals[slot as usize] = val;
                 }

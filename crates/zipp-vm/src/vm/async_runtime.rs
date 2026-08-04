@@ -525,6 +525,9 @@ impl<'p> Vm<'p> {
             if esc != u32::MAX {
                 self.closure_eval_scope.insert(idx, esc);
             }
+            // Nursery barrier: the re-parked window may hold young values and
+            // the generator may be old (holder-grain — the window is a batch).
+            self.heap.write_barrier(idx);
             if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
                 *state = GenState::Suspended(yield_ip);
                 *regs = back;
@@ -610,9 +613,9 @@ impl<'p> Vm<'p> {
     /// covers double-resolve / resolve-then-reject / race losers), scheduling its
     /// matching reactions as microtasks.
     pub(crate) fn settle(&mut self, p: u32, state: PromiseState, val: Value) {
-        // B6 oracle: NURSERY_DESIGN.md §1 case 5 — resolving an old promise
-        // with a young value.
-        self.oracle_store(crate::heap::gcoracle::PROMISE_SETTLE, p, val);
+        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 —
+        // resolving an old promise with a young value.
+        self.store_barrier(crate::heap::gcoracle::PROMISE_SETTLE, p, val);
         let reactions = match self.heap.get_mut(p) {
             HeapObj::Promise { state: s, result, reactions, .. } => {
                 if *s != PromiseState::Pending {
@@ -1021,11 +1024,11 @@ impl<'p> Vm<'p> {
     /// and of internal promise adoption.
     pub(crate) fn then_internal(&mut self, p: u32, on_f: Value, on_r: Value, into: Option<u32>) -> u32 {
         let dep = into.unwrap_or_else(|| self.alloc_promise());
-        // B6 oracle: NURSERY_DESIGN.md §1 case 5 — `.then` on an old promise
-        // with young callbacks / dependent.
-        self.oracle_store(crate::heap::gcoracle::PROMISE_REACT, p, on_f);
-        self.oracle_store(crate::heap::gcoracle::PROMISE_REACT, p, on_r);
-        self.oracle_store(crate::heap::gcoracle::PROMISE_REACT, p, Value::heap(dep));
+        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 — `.then`
+        // on an old promise with young callbacks / dependent.
+        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, on_f);
+        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, on_r);
+        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, Value::heap(dep));
         let (state, result) = match self.heap.get(p) {
             HeapObj::Promise { state, result, .. } => (*state, *result),
             _ => return dep,
@@ -1414,6 +1417,10 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let p = self.alloc_promise();
+        // Nursery barrier: the request (arg + fresh promise) enters an
+        // async generator that may have survived a collection. Holder-grain:
+        // `p` is always young here, so the card fires on any old holder.
+        self.heap.write_barrier(idx);
         match self.heap.get_mut(idx) {
             HeapObj::AsyncGenerator(g) => {
                 g.queue.push(crate::heap::AsyncGenRequest { kind, arg: arg0, promise: p })
@@ -1755,6 +1762,8 @@ impl<'p> Vm<'p> {
             let handlers = std::mem::take(&mut self.pending_yield_handlers);
             self.pending_yield_eval_scope = u32::MAX;
             let back = self.repark_window(saved, new_base);
+            // Nursery barrier: re-parked window into a possibly-old holder.
+            self.heap.write_barrier(idx);
             let front = match self.heap.get_mut(idx) {
                 HeapObj::AsyncGenerator(g) => {
                     g.state = GenState::Suspended(yield_ip);
@@ -1777,6 +1786,8 @@ impl<'p> Vm<'p> {
         // Awaited → park and subscribe; the front promise stays pending.
         if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
             let back = self.repark_window(saved, new_base);
+            // Nursery barrier: re-parked window into a possibly-old holder.
+            self.heap.write_barrier(idx);
             if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
                 g.state = GenState::Suspended(await_ip);
                 g.regs = back;
@@ -1845,9 +1856,9 @@ impl<'p> Vm<'p> {
     /// the await point. If `p` is already settled, schedule the resume as a
     /// microtask (so `await` always yields to the queue, per spec).
     pub(crate) fn settle_subscribe(&mut self, p: u32, activation: u32) {
-        // B6 oracle: §1 case 5's await form — an old promise gaining a young
-        // suspended activation as its reaction.
-        self.oracle_store(crate::heap::gcoracle::PROMISE_REACT, p, Value::heap(activation));
+        // Nursery barrier + B6 oracle: §1 case 5's await form — an old promise
+        // gaining a young suspended activation as its reaction.
+        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, Value::heap(activation));
         let (state, result) = match self.heap.get(p) {
             HeapObj::Promise { state, result, .. } => (*state, *result),
             _ => {
@@ -2424,6 +2435,9 @@ impl<'p> Vm<'p> {
                 } else {
                     value
                 };
+                // Nursery barrier: a combinator pending across a collection is
+                // old; the settled value / record it stores may be young.
+                self.heap.write_barrier_val(comb, stored);
                 if let HeapObj::Combinator(__c) = self.heap.get_mut(comb) {
                     let crate::heap::CombinatorData { results, remaining, .. } = &mut **__c;
                     results[index as usize] = stored;
@@ -2582,6 +2596,8 @@ impl<'p> Vm<'p> {
         // Suspended again at an await?
         if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
             let back = self.repark_window(saved, new_base);
+            // Nursery barrier: re-parked window into a possibly-old holder.
+            self.heap.write_barrier(idx);
             if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
                 a.state = GenState::Suspended(await_ip);
                 a.regs = back;

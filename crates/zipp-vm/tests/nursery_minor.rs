@@ -1,31 +1,41 @@
-//! Stage-1 nursery (the barrier-free minor GC) — churn against retained
-//! graphs, held identical across every collector mode.
+//! Stage-3 nursery (remembered set + young-only minor trace) — churn against
+//! retained graphs, held identical across every collector mode.
 //!
-//! A minor marks FULLY (all roots, all edges — no remembered set, no write
-//! barrier anywhere) and sweeps ONLY the slots allocated since the previous
-//! collection, so the one thing that can go wrong is bookkeeping around what
-//! the young sweep freed: a side-table entry surviving its freed key (a
-//! recycled slot inheriting state), a survivor swept, or floated old garbage
-//! accumulating without bound. Each test below aims at one of those:
+//! A minor traces ONLY young objects (old objects are boundary nodes presumed
+//! live; the write barrier's remembered set supplies their young referents)
+//! and sweeps only the slots allocated since the previous collection. So the
+//! things that can go wrong are: an old→young store site the barrier does not
+//! cover (a live young object invisible to the minor trace — SWEPT ALIVE,
+//! i.e. silent corruption), a side-table entry surviving its freed key, a
+//! survivor swept, or floated old garbage accumulating without bound. Each
+//! test aims at one, per edge idiom of NURSERY_DESIGN.md §1:
 //!
-//!   * the two old→young idioms B119's oracle measured as the ONLY ones the
-//!     suite produces — young values pushed into a retained array (227k,
-//!     `jit_set_index`) and young entries into an old Map (133k,
-//!     `coll_insert`) — must survive minors because the full mark sees them;
+//!   * the two old→young idioms B119's oracle measured as dominant — young
+//!     values pushed into a retained array (227k, `jit_set_index`/push lanes)
+//!     and young entries into an old Map (133k, `coll_insert`) — plus
+//!     property overwrites, captured-cell writes, Map VALUE updates, async
+//!     reaction edges and suspended-window re-parks, must all enter the
+//!     remembered set and survive minors;
 //!   * slot reuse after a minor must never serve a stale inline cache
 //!     (versions bump on free — also pinned at the unit level in `heap.rs`);
 //!   * side tables keyed by freed young slots (`arr_props` named array
 //!     properties, `collection_index`) must drop their entries;
-//!   * sustained OLD-garbage production must stay bounded: the float census
-//!     latches a major, or the heap balloons (`peak slots` asserts it).
+//!   * sustained OLD-garbage production must stay bounded: a minor that
+//!     cannot shrink the heap below the pre-nursery collection point latches
+//!     a major (`peak slots` asserts it).
 //!
 //! `all_modes_answer_identically` re-runs the `nursery_parity_` set in child
 //! processes (the env latches are read once per process) under
 //! `ZIPP_NO_NURSERY=1` (majors only — the exact pre-nursery collector),
 //! `ZIPP_GC_STRESS=1` (a collection at EVERY safe point, alternating three
-//! minors to a major), both combined, `ZIPP_SHAPE_VERIFY=1` + stress, the
-//! GCSTATS oracle, and `ZIPP_NOJIT=1`. Every assertion is mode-independent
-//! arithmetic, so agreeing in all modes IS the parity check.
+//! minors to a major), both combined, `ZIPP_SHAPE_VERIFY=1` + stress,
+//! `ZIPP_NURSERY_VERIFY=1` (the full mark re-run beside EVERY minor,
+//! panicking on any young object the young-only trace missed — the direct
+//! executable form of the completeness argument in `vm/gc.rs`), verify +
+//! stress, the GCSTATS oracle, and `ZIPP_NOJIT=1` (the cross-check that the
+//! interpreter-only store population hits the same barriers the JIT helpers
+//! do). Every assertion is mode-independent arithmetic, so agreeing in all
+//! modes IS the parity check.
 
 fn run_ok(src: &str) -> Vec<String> {
     // Stage 1 is OPT-IN (B120): this binary exists to exercise minors, so it
@@ -201,18 +211,206 @@ fn nursery_parity_collection_churn_keeps_live_collections_exact() {
     assert_eq!(out[0], format!("1000:500:{last0}:true"));
 }
 
-/// Re-run every `nursery_parity_` case in six more modes, each in its own
+/// Remset battery — §1 case 1: an OLD object's existing field overwritten to
+/// point at a NEW young object (the in-place data store: no key add, no
+/// version bump, the exact write the stage-3 barrier exists for). The holders
+/// are hot enough that the JIT's SetProp IC fills for them, so the same run
+/// also exercises the call-free-way scan-root registration: after the fill,
+/// stores to those receivers make NO helper call, and only the persistent
+/// scan root keeps their young referents alive across minors.
+#[test]
+fn nursery_parity_old_field_overwrite_reaches_young() {
+    let n = scaled(300_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        var holders = [];
+        for (var h = 0; h < 8; h++) holders.push({{ f: null, id: h }});
+        function w(o, v) {{ o.f = v; }}
+        for (var i = 0; i < N; i++) {{
+          w(holders[i & 7], {{ v: i }});
+          var g = {{ a: i }}; // young garbage driving collections
+          if (g.a === -1) console.log("unreachable");
+        }}
+        var s = 0;
+        for (var h2 = 0; h2 < 8; h2++) s += holders[h2].f.v;
+        console.log(s);
+        "#
+    ));
+    // holder h & 7 last written at the largest i < N with i & 7 == h.
+    let last: u64 = (0..8u64).map(|h| (n as u64 - 8) + ((h + 8 - (n as u64 & 7)) % 8)).sum();
+    assert_eq!(out[0], format!("{last}"));
+}
+
+/// Remset battery — §1 case 3: an OLD captured cell REASSIGNED to a fresh
+/// young object every iteration (`Heap::cell_set`'s barrier; the JIT routes
+/// CellSet/UpvalSet through the same helper). The cell itself goes old after
+/// the first collection; every later write is an old→young edge.
+#[test]
+fn nursery_parity_old_cell_reassigned_to_young() {
+    let n = scaled(250_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        function mk() {{
+          var state = {{ v: -1 }};
+          return {{
+            set: function (i) {{ state = {{ v: i }}; }},
+            get: function () {{ return state.v; }},
+          }};
+        }}
+        var c = mk();
+        for (var i = 0; i < N; i++) {{
+          c.set(i);
+          var g = [i]; // young garbage driving collections
+          if (g.length !== 1) console.log("unreachable");
+        }}
+        console.log(c.get());
+        "#
+    ));
+    assert_eq!(out[0], format!("{}", n - 1));
+}
+
+/// Remset battery — §1 cases 5/6: async reaction edges and suspended-window
+/// re-parks. Old pending promises gain young reactions (`.then` on a promise
+/// created before the churn), an async activation suspends across the churn
+/// (its re-parked window holds young objects), and the resolves deliver young
+/// values through old promises.
+#[test]
+fn nursery_parity_async_reactions_and_reparks_span_minors() {
+    let n = scaled(200_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        var resolveLate;
+        var late = new Promise(function (res) {{ resolveLate = res; }});
+        async function driver() {{
+          var local = {{ tag: "kept-across-await" }}; // parked in the window
+          var got = await late;
+          return got.v + ":" + local.tag;
+        }}
+        var done = driver();
+        for (var i = 0; i < N; i++) {{
+          var g = {{ a: i, b: [i] }}; // young garbage driving collections
+          if (g.a === -1) console.log("unreachable");
+        }}
+        // `late` and the suspended activation are OLD now; the resolution
+        // value and the .then callback are young.
+        resolveLate({{ v: 42 }});
+        done.then(function (s) {{ console.log(s); }});
+        "#
+    ));
+    assert_eq!(out[0], "42:kept-across-await");
+}
+
+/// Remset battery — a plain GENERATOR's re-parked register window: the
+/// generator goes old while suspended; each resume writes a window holding
+/// fresh young objects back into it (the `repark_window` card), and the
+/// young values must survive the minors that run between `next()` calls.
+#[test]
+fn nursery_parity_generator_windows_span_minors() {
+    let n = scaled(120_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        function* gen() {{
+          var kept = {{ sum: 0 }}; // lives in the parked window between resumes
+          while (true) {{
+            var got = yield kept.sum;
+            kept = {{ sum: kept.sum + got.d }}; // fresh young object each resume
+          }}
+        }}
+        var g = gen();
+        g.next();
+        var out = 0;
+        for (var i = 0; i < N; i++) {{
+          if ((i % 1000) === 0) out = g.next({{ d: 1 }}).value;
+          var junk = {{ j: i }};
+          if (junk.j < 0) console.log("unreachable");
+        }}
+        console.log(out + ":" + g.next({{ d: 5 }}).value);
+        "#
+    ));
+    let resumes = n.div_ceil(1000); // i % 1000 == 0 resumes
+    assert_eq!(out[0], format!("{}:{}", resumes, resumes + 5));
+}
+
+/// Remset battery — Map VALUE update in place (`m.set(existingKey, young)`
+/// with a NON-heap key, so the insert-path key barrier never fires and only
+/// the value barrier in the `set` arm covers the edge), plus `getOrInsert`.
+#[test]
+fn nursery_parity_old_map_value_updates_reach_young() {
+    let n = scaled(200_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        var m = new Map();
+        for (var k = 0; k < 64; k++) m.set(k, null);
+        for (var i = 0; i < N; i++) {{
+          m.set(i & 63, {{ v: i }}); // int key: update-in-place after round 1
+          var g = {{ a: i }};
+          if (g.a === -1) console.log("unreachable");
+        }}
+        var s = 0;
+        for (var k2 = 0; k2 < 64; k2++) s += m.get(k2).v;
+        console.log(m.size + ":" + s);
+        "#
+    ));
+    let s: u64 = (0..64u64).map(|k| (n as u64 - 64) + ((k + 64 - (n as u64 & 63)) % 64)).sum();
+    assert_eq!(out[0], format!("64:{s}"));
+}
+
+/// Remset battery — trivial class SETTERS: the method-inline planner bakes a
+/// call-free `this.<field> = v` store for hot receivers, which only the
+/// persistent scan-root registration covers once the receivers are old.
+#[test]
+fn nursery_parity_trivial_setter_stores_reach_young() {
+    let n = scaled(250_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        class Box {{
+          constructor() {{ this._v = null; }}
+          set v(x) {{ this._v = x; }}
+          get v() {{ return this._v; }}
+        }}
+        var boxes = [new Box(), new Box(), new Box(), new Box()];
+        for (var i = 0; i < N; i++) {{
+          boxes[i & 3].v = {{ n: i }};
+          var g = {{ a: i }};
+          if (g.a === -1) console.log("unreachable");
+        }}
+        var s = 0;
+        for (var b = 0; b < 4; b++) s += boxes[b].v.n;
+        console.log(s);
+        "#
+    ));
+    let s: u64 = (0..4u64).map(|b| (n as u64 - 4) + ((b + 4 - (n as u64 & 3)) % 4)).sum();
+    assert_eq!(out[0], format!("{s}"));
+}
+
+/// Re-run every `nursery_parity_` case in eight more modes, each in its own
 /// child process (the env latches are read once per process). The same
 /// arithmetic assertions passing in all modes IS the parity check; a swept
-/// survivor or stale side-table entry fails the child loudly.
+/// survivor or stale side-table entry fails the child loudly, and the
+/// `ZIPP_NURSERY_VERIFY` rows turn any missed write barrier into a panic
+/// NAMING the slot at the very minor where the hole opened.
 #[test]
 fn all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 6] = [
+    let modes: [&[(&str, &str)]; 8] = [
         &[("ZIPP_NO_NURSERY", "1")],
         &[("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_NO_NURSERY", "1"), ("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_SHAPE_VERIFY", "1"), ("ZIPP_GC_STRESS", "1")],
+        &[("ZIPP_NURSERY_VERIFY", "1")],
+        &[("ZIPP_NURSERY_VERIFY", "1"), ("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_GCSTATS", "1")],
         &[("ZIPP_NOJIT", "1")],
     ];
@@ -249,10 +447,11 @@ fn all_modes_answer_identically() {
 /// allocated early in a round survive the collections that fire while the
 /// round keeps building (they are reachable through `big`), so by the time
 /// the round is dropped they are OLD, and a young-only sweep can never
-/// reclaim them. Without the float-census major trigger they would pile up
-/// round after round while the threshold compounds off them (~3x per epoch);
-/// `peak slots` staying under the bound plus `majors >= 1` is the direct
-/// proof the trigger fires and the floated garbage is reclaimed.
+/// reclaim them. Without the post-minor major latch (`Heap::major_at`: a
+/// minor that leaves the heap at/above the pre-nursery collection point
+/// majors next) they would pile up round after round; `peak slots` staying
+/// under the bound plus `majors >= 1` is the direct proof the latch fires
+/// and the floated garbage is reclaimed.
 #[test]
 #[ignore = "spawned by sustained_old_garbage_keeps_the_heap_bounded with a clean env"]
 fn probe_bounded_heap_under_sustained_old_garbage() {

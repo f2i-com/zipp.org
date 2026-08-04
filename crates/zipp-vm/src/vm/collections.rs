@@ -345,10 +345,14 @@ impl<'p> Vm<'p> {
     /// while the collection has no index (it is built lazily by `coll_find`,
     /// which every insertion path calls first).
     pub(crate) fn coll_index_insert(&mut self, idx: u32, key: Value, pos: usize) {
-        // B6 oracle: NURSERY_DESIGN.md §1 case 6 — Map/Set/WeakMap/WeakSet
-        // insert on an old collection (key-grain; a Map's VALUE rides the same
-        // insert and is not double-counted).
-        self.oracle_store(crate::heap::gcoracle::COLL_INSERT, idx, key);
+        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 6 —
+        // Map/Set/WeakMap/WeakSet insert on an old collection. Every insert
+        // path calls this right after its push (no safe point in between, so
+        // the age cannot change between store and barrier). Key-grain here;
+        // a Map's VALUE rides the same insert — the holder-grain remset entry
+        // re-traces keys AND vals, and the value-update arms in `builtins.rs`
+        // carry their own barrier.
+        self.store_barrier(crate::heap::gcoracle::COLL_INSERT, idx, key);
         if key.is_heap() {
             self.heap.flatten(key.heap_index()); // usually a no-op: coll_find ran first
         }

@@ -16,18 +16,39 @@
 //!   3. Collection only happens at a dispatch-loop safe point with `gc_lock == 0`,
 //!      so no native built-in is holding an un-rooted `Vec<Value>` working set.
 //!
-//! Two collection kinds since the stage-1 nursery (NURSERY_DESIGN.md §6,
-//! step 2 — `ZIPP_NO_NURSERY=1` restores majors-only exactly):
+//! Two collection kinds since the nursery (NURSERY_DESIGN.md §§1-2;
+//! `ZIPP_NO_NURSERY=1` restores majors-only exactly):
 //!   * MAJOR — the historical collection, unchanged: full mark, sweep
 //!     `floor..len`, whole-table side-table retains.
-//!   * MINOR — the SAME full mark (every root, every edge — so `marks` is
-//!     exact liveness, no remembered set exists and no write barrier exists
-//!     anywhere), but the sweep walks only the alloc log (slots allocated
-//!     since the last collection) and side-table pruning touches only the
-//!     slots that sweep actually freed. An unreachable OLD object is left in
-//!     place as FLOATED garbage: sound by construction (its slot is neither
-//!     freed nor reused, so no stale state can ever surface), and bounded by
-//!     the float census in `Heap::note_minor_done`, which schedules majors.
+//!   * MINOR (stage 3) — a YOUNG-ONLY trace: `marks` starts as "every
+//!     non-young slot is presumed live" (old objects are boundary nodes), the
+//!     shared root walk and the unchanged `trace_edges` therefore push only
+//!     young objects, and the remembered set supplies the young referents of
+//!     old holders. The sweep walks only the alloc log; side-table pruning
+//!     touches only the slots the sweep freed. An unreachable OLD object
+//!     floats until a major, and majors run on the PRE-nursery schedule
+//!     (`Heap::major_at`), so floats are bounded by construction.
+//!
+//! MINOR COMPLETENESS (why `roots ∪ remset` finds every live young object):
+//! a young object Y is live iff some path of edges reaches it from a root.
+//! Walk that path backwards from Y to the first OLD node H (if none exists,
+//! the whole path is young and the young trace finds Y from the root
+//! directly). H's edge on the path points at a young object Y', and every
+//! object H can reference was allocated BEFORE the edge to it was written —
+//! so that edge was STORED after Y' was born, i.e. within the current epoch
+//! (Y' young ⇒ born after the last collection). H is old at minor time, and
+//! ages only change AT collections, which only run at safe points: H was
+//! already old when the store ran (H old now means H survived the last
+//! collection, so it was old for the whole epoch). Therefore the store was
+//! an old-holder/young-value store, and every such store runs a write
+//! barrier (`Heap::write_barrier[_val]` at the enumerated VM chokepoints) or
+//! targets a registered scan root (`Heap::register_scan_root` — receivers
+//! JIT caches store into call-free), or lands in a VM side table, which the
+//! root walk re-scans wholesale each minor. So H is in the dirty set, its
+//! edges are re-traced, Y' is found, and the (young) path suffix Y'→…→Y is
+//! traced normally. `tests/nursery_minor.rs` pins this per edge idiom, and
+//! `ZIPP_NURSERY_VERIFY=1` re-runs the FULL mark beside every minor and
+//! panics on the first young object the minor trace missed.
 
 use super::{Microtask, Resume, Vm};
 use crate::heap::{GenState, HeapObj};
@@ -78,12 +99,15 @@ impl Vm<'_> {
         }
     }
 
-    /// B6 oracle (`ZIPP_GCSTATS=1`): count a would-be old→young store — the
-    /// write barrier NURSERY_DESIGN.md §1 would emit at chokepoint `site`
-    /// (`crate::heap::gcoracle::*`) firing into a remembered set. Stats only;
-    /// off, this is one latched bool load per store site.
+    /// Stage-3 write barrier + B6 oracle, one latched call per store
+    /// chokepoint (NURSERY_DESIGN.md §1). With the nursery on, an old-holder/
+    /// young-value store enters `holder` into the remembered set (holder-
+    /// grain, deduped by the generation byte); with `ZIPP_GCSTATS=1` the
+    /// same condition is counted per site. Both latches off — the default —
+    /// this is two predicted bool loads.
     #[inline]
-    pub(crate) fn oracle_store(&self, site: usize, holder: u32, val: Value) {
+    pub(crate) fn store_barrier(&mut self, site: usize, holder: u32, val: Value) {
+        self.heap.write_barrier_val(holder, val);
         if self.heap.oracle_on()
             && val.is_heap()
             && !self.heap.oracle_young(holder)
@@ -93,12 +117,12 @@ impl Vm<'_> {
         }
     }
 
-    /// [`Vm::oracle_store`] for a holder still in `Value` form (primitives are
-    /// no one's old generation — skipped).
+    /// [`Vm::store_barrier`] for a holder still in `Value` form (primitives
+    /// are no one's old generation — skipped).
     #[inline]
-    pub(crate) fn oracle_store_v(&self, site: usize, holder: Value, val: Value) {
+    pub(crate) fn store_barrier_v(&mut self, site: usize, holder: Value, val: Value) {
         if holder.is_heap() {
-            self.oracle_store(site, holder.heap_index(), val);
+            self.store_barrier(site, holder.heap_index(), val);
         }
     }
 
@@ -110,9 +134,13 @@ impl Vm<'_> {
             self.heap.note_gc_done(n);
             return;
         }
-        // Minor or major? Decided up front (the mark below is identical for
-        // both); `Heap::minor_due` holds the whole policy.
-        let minor = self.heap.minor_due(self.gc_stress);
+        // Minor or major? `Heap::minor_due` holds the whole policy. The minor
+        // is its own routine (young-only trace, young-only sweep) so the
+        // major body below stays exactly the historical collector.
+        if self.heap.minor_due(self.gc_stress) {
+            self.gc_minor(n);
+            return;
+        }
         // `ZIPP_GCSTATS=1`: per-phase timing, printed at exit. B81 measured the
         // per-allocation cost rising 74.5 -> 122.5ns purely from a larger live
         // set, which says the collector dominates — but NOT which phase of it.
@@ -129,8 +157,20 @@ impl Vm<'_> {
             marks[idx as usize] = true;
         }
         let free_before = self.heap.free_indices().len();
+        self.mark_roots(&mut marks, &mut stack, n);
+        self.gc_major_tail(n, floor, free_before, marks, stack, stats, t_start);
+    }
 
-        // --- Roots ---------------------------------------------------------
+    /// Enumerate the COMPLETE root set into `marks`/`stack` — shared verbatim
+    /// by the major, the minor and the `ZIPP_NURSERY_VERIFY` full-mark check,
+    /// so the three can never drift. For a minor every OLD slot arrives
+    /// pre-marked (`Heap::gen_nonyoung_marks`), so this identical enumeration
+    /// pushes — and the trace then walks — only YOUNG objects; old side-table
+    /// holders and pinned built-ins are boundary nodes whose young referents
+    /// the remembered set supplies (see the module doc's completeness
+    /// argument).
+    fn mark_roots(&mut self, marks: &mut Vec<bool>, stack: &mut Vec<u32>, n: usize) {
+        let floor = self.gc_floor as usize;
         // Pinned built-ins: marked AND traced (a built-in proto may hold a user
         // object, e.g. `Array.prototype.foo = userObj`).
         for i in 0..floor {
@@ -464,7 +504,21 @@ impl Vm<'_> {
             live
         });
         self.async_activations = acts;
+    }
 
+    /// The MAJOR collection's trace + sweep + retain — the historical
+    /// collector, unchanged (the root walk was shared out into `mark_roots`).
+    #[allow(clippy::too_many_arguments)]
+    fn gc_major_tail(
+        &mut self,
+        n: usize,
+        floor: usize,
+        free_before: usize,
+        mut marks: Vec<bool>,
+        mut stack: Vec<u32>,
+        stats: bool,
+        t_start: Option<std::time::Instant>,
+    ) {
         let t_roots = gcstats::now(stats);
         // --- Trace ---------------------------------------------------------
         // B6 oracle (stats only): attribute marking work to the generation of
@@ -493,24 +547,7 @@ impl Vm<'_> {
 
         // --- Sweep + prune -------------------------------------------------
         let mut swept = 0usize;
-        let mut freed: Vec<u32> = Vec::new();
-        let mut floated = 0usize;
-        if minor {
-            // Stage-1 BARRIER-FREE MINOR: sweep only the young log; skip the
-            // `floor..n` walk entirely. `marks` is exact (full mark above),
-            // so everything unmarked is truly garbage — the young part is
-            // freed now, the old part floats until the major the census
-            // below schedules.
-            swept = self.heap.sweep_young(&marks, &mut freed);
-            // Float census, exact: occupied slots the mark proved dead but
-            // the young-only sweep left in place. `marks` counts the pinned
-            // prefix and the force-marked free tombstones; subtracting the
-            // tombstones leaves reachable-or-pinned, and occupied minus THAT
-            // is the floated mass.
-            let marked = marks.iter().filter(|&&m| m).count();
-            let occupied = n - self.heap.free_indices().len();
-            floated = occupied - (marked - free_before);
-        } else if oracle {
+        if oracle {
             // B6 oracle: split the swept walk by generation. `alloc_log`-style
             // young slot count comes from the walk itself (free tombstones read
             // old — they were freed at a previous collection, so their stale
@@ -562,22 +599,6 @@ impl Vm<'_> {
             }
         }
         let t_sweep = gcstats::now(stats);
-        if minor {
-            // A minor prunes only what it FREED (see `prune_freed`); the
-            // whole-table retains below are the major's.
-            self.prune_freed(&freed);
-            let free_after = self.heap.free_indices().len();
-            gcstats::record(stats, minor, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
-            gcstats::record_minor(swept as u64, floated as u64, n);
-            self.heap.note_minor_done(n - free_after, floated);
-            if self.heap.oracle_on() {
-                self.heap.oracle_next_epoch();
-            }
-            if shape_verify::enabled() {
-                self.verify_all_shapes();
-            }
-            return;
-        }
         // Drop side-table entries whose keyed object was reclaimed.
         self.proto_of.retain(|&k, _| marks[k as usize]);
         // Derived-ctor `this` state: a thrown-off constructor leaves these
@@ -649,7 +670,7 @@ impl Vm<'_> {
         self.realm_globals.retain(|&k, _| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
-        gcstats::record(stats, minor, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
+        gcstats::record(stats, false, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
         // Floated-swept estimate (stats only): what this major freed that was
         // NOT allocated in the current epoch — i.e. garbage the minors before
         // it had already been unable to reclaim. Read before `note_gc_done`
@@ -669,6 +690,93 @@ impl Vm<'_> {
         }
         if shape_verify::enabled() {
             self.verify_all_shapes();
+        }
+    }
+
+    /// Stage-3 MINOR collection (NURSERY_DESIGN.md §§1-2): minor liveness =
+    /// reachable-from(roots ∪ dirty old holders) ∩ young. Old objects are
+    /// BOUNDARY nodes — pre-marked from the generation bytes, presumed live,
+    /// never traced; the remembered set (this epoch's write-barrier hits) and
+    /// the persistent scan roots (call-free JIT store targets) supply their
+    /// young referents, and the VM side tables are re-scanned wholesale by
+    /// the shared `mark_roots`. Cost is O(roots + young live + dirty edge
+    /// lists), independent of the old heap — the term the stage-1 full mark
+    /// still paid on every minor (B120's refutation), and the whole
+    /// economics flip of stage 3: regex-log-scan's ~128ms/run of 95.8%-old
+    /// trace work simply stops happening at minors.
+    fn gc_minor(&mut self, n: usize) {
+        let stats = gcstats::enabled();
+        let t_start = gcstats::now(stats);
+        // Every non-young slot (old, pinned prefix, free tombstone) is
+        // presumed live: the shared root walk and the unchanged `trace_edges`
+        // push only unmarked — i.e. YOUNG — objects from here on.
+        let mut marks = self.heap.gen_nonyoung_marks();
+        let mut stack: Vec<u32> = Vec::with_capacity(1024);
+        self.mark_roots(&mut marks, &mut stack, n);
+        let t_roots = gcstats::now(stats);
+        // Dirty OLD holders: scan their edge lists — the one thing an old
+        // object contributes to young liveness. `trace_edges` on a marked
+        // holder pushes its unmarked (young) referents and nothing else, so
+        // a holder appearing twice (remset ∩ scan roots) costs a re-scan,
+        // never re-tracing.
+        let dirty = self.heap.dirty_for_trace();
+        for &h in &dirty {
+            self.trace_edges(h, &mut marks, &mut stack, n);
+        }
+        while let Some(idx) = stack.pop() {
+            self.trace_edges(idx, &mut marks, &mut stack, n);
+        }
+        let t_trace = gcstats::now(stats);
+        if nursery_verify::enabled() {
+            // Before the sweep, while the young log is intact.
+            self.verify_minor_marks(&marks, n);
+        }
+        let mut freed: Vec<u32> = Vec::new();
+        let swept = self.heap.sweep_young(&marks, &mut freed);
+        let t_sweep = gcstats::now(stats);
+        // A minor prunes only what it FREED (see `prune_freed`); the
+        // whole-table retains are the major's.
+        self.prune_freed(&freed);
+        // Dirty holders' young referents were just promoted: their edges are
+        // old→old now, so they go back to clean (the scan roots persist).
+        self.heap.remset_reset();
+        let free_after = self.heap.free_indices().len();
+        gcstats::record(stats, true, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
+        gcstats::record_minor(swept as u64, dirty.len() as u64, n);
+        self.heap.note_minor_done(n - free_after);
+        if self.heap.oracle_on() {
+            self.heap.oracle_next_epoch();
+        }
+        if shape_verify::enabled() {
+            self.verify_all_shapes();
+        }
+    }
+
+    /// `ZIPP_NURSERY_VERIFY=1`: run the FULL mark beside a minor's young-only
+    /// trace and panic on the first live young object the minor missed — a
+    /// write-barrier hole caught AT the collection where it opened, with the
+    /// slot named, instead of surfacing as silent corruption arbitrarily
+    /// later (the failure mode NURSERY_DESIGN.md names as this design's
+    /// biggest risk). Test/stress use only: it doubles the mark.
+    fn verify_minor_marks(&mut self, minor_marks: &[bool], n: usize) {
+        let mut marks = vec![false; n];
+        for &idx in self.heap.free_indices() {
+            marks[idx as usize] = true;
+        }
+        let mut stack: Vec<u32> = Vec::with_capacity(1024);
+        self.mark_roots(&mut marks, &mut stack, n);
+        while let Some(idx) = stack.pop() {
+            self.trace_edges(idx, &mut marks, &mut stack, n);
+        }
+        for &y in self.heap.young_log() {
+            if marks[y as usize] && !minor_marks[y as usize] {
+                panic!(
+                    "nursery write-barrier hole: young slot {y} ({:?}) is live under \
+                     the full mark but the minor trace missed it — an old→young \
+                     store site is not barriered",
+                    std::mem::discriminant(self.heap.get(y))
+                );
+            }
         }
     }
 
@@ -1115,16 +1223,21 @@ mod gcstats {
     static ALLOCED: AtomicU64 = AtomicU64::new(0);
     static TRACE_YOUNG: AtomicU64 = AtomicU64::new(0);
     static TRACE_OLD: AtomicU64 = AtomicU64::new(0);
-    // Stage-1 nursery split. The counters/peaks update UNCONDITIONALLY — a
-    // handful of relaxed atomics per COLLECTION (collections are rare; this
-    // is nothing next to the mark), which lets the bounded-heap tests read
-    // them without env plumbing. The ns/floated-swept pieces ride the
+    // Nursery split. The counters/peaks update UNCONDITIONALLY — a handful
+    // of relaxed atomics per COLLECTION (collections are rare; this is
+    // nothing next to the mark), which lets the bounded-heap tests read them
+    // without env plumbing. The ns/floated-swept pieces ride the
     // `ZIPP_GCSTATS` gate like every other timing.
     static MINORS: AtomicU64 = AtomicU64::new(0);
     static MAJORS: AtomicU64 = AtomicU64::new(0);
     static PEAK_SLOTS: AtomicU64 = AtomicU64::new(0);
     static MINOR_SWEPT: AtomicU64 = AtomicU64::new(0);
-    static FLOAT_PEAK: AtomicU64 = AtomicU64::new(0);
+    // Stage 3: peak dirty-holder count a single minor re-traced (remset +
+    // persistent scan roots) — the remembered set's size, i.e. the barrier's
+    // cost denominator. (Stage 1 recorded the float census here; a
+    // young-only trace cannot measure floats, and `Heap::major_at` bounds
+    // them instead.)
+    static DIRTY_PEAK: AtomicU64 = AtomicU64::new(0);
     static FLOATED_SWEPT: AtomicU64 = AtomicU64::new(0);
     static NS_MINOR: AtomicU64 = AtomicU64::new(0);
     static NS_MAJOR: AtomicU64 = AtomicU64::new(0);
@@ -1179,10 +1292,11 @@ mod gcstats {
     }
 
     /// Unconditional per-MINOR accounting (see the statics' comment).
-    pub(super) fn record_minor(swept_young: u64, floated: u64, slots: usize) {
+    /// `dirty` = old holders whose edge lists this minor re-traced.
+    pub(super) fn record_minor(swept_young: u64, dirty: u64, slots: usize) {
         MINORS.fetch_add(1, Ordering::Relaxed);
         MINOR_SWEPT.fetch_add(swept_young, Ordering::Relaxed);
-        FLOAT_PEAK.fetch_max(floated, Ordering::Relaxed);
+        DIRTY_PEAK.fetch_max(dirty, Ordering::Relaxed);
         PEAK_SLOTS.fetch_max(slots as u64, Ordering::Relaxed);
     }
 
@@ -1194,9 +1308,9 @@ mod gcstats {
         PEAK_SLOTS.fetch_max(slots as u64, Ordering::Relaxed);
     }
 
-    /// Stage-1 nursery totals: `(minors, majors, minor_ms, major_ms,
-    /// swept_young, floated_swept, float_peak, peak_slots)`. The ms and
-    /// floated-swept fields are 0 unless `ZIPP_GCSTATS=1`.
+    /// Nursery totals: `(minors, majors, minor_ms, major_ms, swept_young,
+    /// floated_swept, dirty_peak, peak_slots)`. The ms and floated-swept
+    /// fields are 0 unless `ZIPP_GCSTATS=1`.
     pub fn dump_nursery() -> (u64, u64, f64, f64, u64, u64, u64, u64) {
         let g = |x: &AtomicU64| x.load(Ordering::Relaxed);
         let ms = |x: u64| x as f64 / 1.0e6;
@@ -1207,7 +1321,7 @@ mod gcstats {
             ms(g(&NS_MAJOR)),
             g(&MINOR_SWEPT),
             g(&FLOATED_SWEPT),
-            g(&FLOAT_PEAK),
+            g(&DIRTY_PEAK),
             g(&PEAK_SLOTS),
         )
     }
@@ -1288,6 +1402,30 @@ mod shape_verify {
             1 => true,
             _ => {
                 let v = std::env::var_os("ZIPP_SHAPE_VERIFY").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+}
+
+/// `ZIPP_NURSERY_VERIFY=1` — run the FULL mark beside every minor and panic
+/// on the first live young object the young-only trace missed (a write-
+/// barrier hole). See `Vm::verify_minor_marks`.
+///
+/// Off, this costs one relaxed atomic load per minor.
+mod nursery_verify {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_NURSERY_VERIFY").is_some() as u8;
                 ON.store(v, Ordering::Relaxed);
                 v == 1
             }

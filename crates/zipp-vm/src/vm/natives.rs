@@ -3498,6 +3498,10 @@ impl<'p> Vm<'p> {
                         }
                         match finder.find(&self.heap, &keys, key) {
                             Some(pos) => {
+                                // Nursery barrier: the callback runs user code
+                                // between iterations, so a group array built
+                                // earlier in THIS call can already be old.
+                                self.heap.write_barrier_val(vals[pos].heap_index(), item);
                                 if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index()) {
                                     a.push(item);
                                 }

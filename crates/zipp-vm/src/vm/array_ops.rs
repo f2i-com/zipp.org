@@ -1733,6 +1733,12 @@ impl<'p> Vm<'p> {
         }
         match name {
             "push" => {
+                // Nursery barrier: B119's dominant idiom — young values pushed
+                // into a retained array (value-tested per arg, so number-only
+                // pushes never dirty a large old array).
+                for &a in args {
+                    self.heap.write_barrier_val(idx, a);
+                }
                 let mut last = Value::UNDEFINED;
                 if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                     for a in args {
@@ -1758,6 +1764,10 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::UNDEFINED))
             }
             "unshift" => {
+                // Nursery barrier (see `push`).
+                for &a in args {
+                    self.heap.write_barrier_val(idx, a);
+                }
                 // Prepend all args (preserving order) and return the new length.
                 let len = if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                     for (i, &v) in args.iter().enumerate() {
@@ -2065,6 +2075,8 @@ impl<'p> Vm<'p> {
                 };
                 let start = norm_index(s0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
                 let end = norm_index(e0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
+                // Nursery barrier: one value, any number of slots.
+                self.heap.write_barrier_val(idx, val);
                 if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                     let n = items.len() as i32; // re-clamp (a coercion valueOf may have resized)
                     for i in start..end.min(n) {
@@ -2519,6 +2531,10 @@ impl<'p> Vm<'p> {
                 // getter, and the species constructor, must observe the array as it
                 // was BEFORE the splice (they ran after it, seeing the new length).
                 let species_target = self.array_species_create(Value::heap(idx), del)?;
+                // Nursery barrier for the inserted values.
+                for &v in &insert {
+                    self.heap.write_barrier_val(idx, v);
+                }
                 let removed: Vec<Value> = match self.heap.get_mut(idx) {
                     // Re-clamp to the current length (a coercion valueOf, or the
                     // species constructor just called, may have resized).

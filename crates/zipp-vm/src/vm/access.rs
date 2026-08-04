@@ -802,9 +802,11 @@ impl<'p> Vm<'p> {
         strict: bool,
     ) -> Result<bool, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::PropSlow);
-        // B6 oracle: NURSERY_DESIGN.md §1 case 1 (interp SetProp, incl. the
-        // fn_props/arr_props sidecar routes below — same holder, same value).
-        self.oracle_store_v(crate::heap::gcoracle::SET_PROP, obj, val);
+        // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1 (interp
+        // SetProp, incl. the fn_props/arr_props sidecar routes below — same
+        // holder, same value; the sidecars are additionally root-rescanned
+        // at every minor).
+        self.store_barrier_v(crate::heap::gcoracle::SET_PROP, obj, val);
         // ── ordinary data write on a plain object ──
         if obj.is_heap() {
             let oi = obj.heap_index();
@@ -1732,6 +1734,9 @@ impl<'p> Vm<'p> {
             return;
         }
         let idx = obj.heap_index();
+        // Nursery barrier: the literal is normally young, but `__defineGetter__`
+        // routes here too, and the accessor-merge write is in-place (no bump).
+        self.heap.write_barrier_val(idx, func);
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
             if let Some(i) = m.pos(key) {
                 if m.attrs[i].accessor {

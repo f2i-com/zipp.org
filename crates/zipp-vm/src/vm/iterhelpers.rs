@@ -888,6 +888,9 @@ impl<'p> Vm<'p> {
         }
     }
     fn ih_set_inner(&mut self, idx: u32, v: Value) {
+        // Nursery barrier: flatMap's current inner iterator is the one
+        // IterHelper field mutated after creation.
+        self.heap.write_barrier_val(idx, v);
         if let HeapObj::IterHelper { inner, .. } = self.heap.get_mut(idx) {
             *inner = v;
         }

@@ -614,6 +614,8 @@ impl<'p> Vm<'p> {
         }) else {
             return false;
         };
+        // Nursery barrier: an EvalScope is a mutable heap object like a Cell.
+        self.heap.write_barrier_val(target, v);
         if let HeapObj::EvalScope(m) = self.heap.get_mut(target) {
             if let Some(slot) = m.get_mut(&name) {
                 *slot = v;
@@ -1498,6 +1500,9 @@ impl<'p> Vm<'p> {
         let slot = base + 1 + i;
         let cur = self.regs[slot];
         if cur.is_heap() {
+            // Nursery barrier: a mapped-arguments write through a captured
+            // CELL bypasses `Heap::cell_set` (which carries the usual one).
+            self.heap.write_barrier_val(cur.heap_index(), val);
             if let HeapObj::Cell(inner) = self.heap.get_mut(cur.heap_index()) {
                 *inner = val;
                 return true;
@@ -1520,6 +1525,9 @@ impl<'p> Vm<'p> {
             }
         }
         if let Some(v) = cur {
+            // Nursery barrier: the flushed formal may be young; the arguments
+            // object may be old.
+            self.heap.write_barrier_val(idx, v);
             if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                 if i < items.len() {
                     items[i] = v;
@@ -1539,6 +1547,8 @@ impl<'p> Vm<'p> {
         };
         for i in 0..count {
             if let Some(v) = self.args_mapped_get(idx, i) {
+                // Nursery barrier (see `args_unmap`).
+                self.heap.write_barrier_val(idx, v);
                 if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                     if i < items.len() {
                         items[i] = v;
