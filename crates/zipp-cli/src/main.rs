@@ -50,6 +50,14 @@ fn main() -> ExitCode {
             r + t + sw + re
         );
         eprintln!("[gc] avg slots/collection {slots}  avg live {live}  total swept {swept}");
+        // Stage-1 nursery split: minors sweep only the alloc log; "floated" is
+        // old garbage a minor left in place (peak, and how much the majors
+        // then reclaimed).
+        let (minors, majors, mn_ms, mj_ms, swept_young, floated_swept, float_peak, peak) =
+            zipp_vm::gc_nursery_stats();
+        eprintln!(
+            "[gc-nursery] minors {minors} ({mn_ms:.1}ms)  majors {majors} ({mj_ms:.1}ms)  swept-young {swept_young}  floated peak {float_peak} swept-at-major {floated_swept}  peak slots {peak}"
+        );
         // B6 generational-oracle report (NURSERY_DESIGN.md §6): young =
         // allocated since the previous collection; old-attributable = the part
         // of trace+sweep a young-only minor GC would NOT have to do.
@@ -115,6 +123,8 @@ fn main() -> ExitCode {
         );
         let (ins, ide) = zipp_vm::iter_region_stats();
         eprintln!("[ic] region iter-next  native steps {ins}  deopts {ide}");
+        let (cff, cfl) = zipp_vm::cross_fill_stats();
+        eprintln!("[ic] cross-call window fills  fast {cff}  full {cfl}");
     }
     if std::env::var_os("ZIPP_RXSTATS").is_some() {
         let (att, pushes, retries, elided, skips) = zipp_vm::rx_stats();

@@ -2201,6 +2201,36 @@ pub struct Heap {
     /// gate on every oracle field above. `false` = the default build's behavior,
     /// bit for bit.
     oracle: bool,
+    /// Stage-1 nursery alloc log (NURSERY_DESIGN.md §6, step 2): the slots
+    /// allocated since the last collection, in allocation order — what a MINOR
+    /// collection sweeps INSTEAD of walking `floor..len`. One `Vec` push per
+    /// allocation (~1ns amortized against B104's 23-148ns alloc/free; the
+    /// per-collection `clear` keeps capacity, so steady state never
+    /// reallocates). Entries are distinct: the free list is refilled only at a
+    /// collection, so no slot is handed out twice in one epoch. Never pushed
+    /// unless the nursery is latched on.
+    young: Vec<u32>,
+    /// Latched PRESENCE of `ZIPP_NURSERY=1` (read once at construction) — the
+    /// single gate on the young log and the minor/major decision. OPT-IN:
+    /// stage 1 default-on was REFUTED by per-row ablation (B120 —
+    /// async +3.6%, polymorphic +3.1%, markdown +2.1%, CIs excluding zero,
+    /// against json −1.5%): a minor still pays the FULL mark, and on churn
+    /// rows it reclaims nothing a major would not, while float-inflated
+    /// thresholds schedule MORE marks. Stage 3 (remset + young-only trace)
+    /// changes those economics; re-price the default there. `false` is the
+    /// pre-nursery collector exactly: every collection is a major, and
+    /// `alloc` never touches `young`.
+    nursery: bool,
+    /// Post-collection live count recorded by the last MAJOR. A major frees
+    /// every unreachable slot, so this is the honest "true live" anchor the
+    /// float budget is measured against (a post-MINOR count would include the
+    /// floated garbage it is supposed to bound).
+    live_at_major: usize,
+    /// Minor collections since the last major (the scheduling backstop).
+    minors_since_major: u32,
+    /// Latched by a minor whose float census crossed the budget: the next
+    /// collection runs as a major. See [`Heap::note_minor_done`].
+    major_due: bool,
 }
 
 /// Smallest live-object count that triggers a collection — below this the heap is
@@ -2229,6 +2259,32 @@ pub const GC_MIN_THRESHOLD: usize = 1 << 16;
 /// bytes each). The `objs.len() / 2` floor below is unchanged, so a heap that has
 /// already grown still collects on the same schedule it did.
 const GC_GROWTH: usize = 3;
+
+/// Stage-1 nursery scheduling (NURSERY_DESIGN.md §6, step 2 — the barrier-free
+/// minor). A minor marks FULLY but sweeps only the young log, so an
+/// unreachable OLD object is not freed — it FLOATS, occupying its slot until a
+/// major runs. Floating is sound (the slot is never reused, so no stale state
+/// can surface — the cost is slots, not correctness), but it must be bounded:
+/// each minor measures the float mass EXACTLY (the full mark makes liveness
+/// exact) and latches a major once floats exceed the live count at the last
+/// major, floored here so small heaps don't major-thrash. Bound: the heap
+/// carries at most ~1x true live in floated garbage plus one epoch of lag —
+/// a small constant on today's peak, paid only by workloads that produce
+/// old garbage (B119's oracle: young survival is 0.1-29% on every row, so
+/// the common case floats almost nothing).
+const NURSERY_FLOAT_BUDGET_FLOOR: usize = GC_MIN_THRESHOLD;
+
+/// Backstop: run a major at least every 64th collection even if the float
+/// census never crosses the budget, so major-only hygiene (the
+/// `brand_private_names` recompute, reclaiming table capacity) is never
+/// deferred forever.
+const NURSERY_MAX_MINORS: u32 = 64;
+
+/// Under `ZIPP_GC_STRESS=1` a collection runs at EVERY safe point; capping the
+/// streak at 3 makes stress alternate minor,minor,minor,major so BOTH sweep
+/// paths — and their interleavings over the same slots — are densely
+/// exercised, instead of stress degenerating into minors alone.
+const NURSERY_STRESS_MINORS: u32 = 3;
 
 impl Default for Heap {
     fn default() -> Self {
@@ -2264,6 +2320,12 @@ impl Heap {
             epoch: 0,
             allocs_epoch: 0,
             oracle,
+            young: Vec::new(),
+            nursery: std::env::var_os("ZIPP_NURSERY").is_some()
+                && std::env::var_os("ZIPP_NO_NURSERY").is_none(),
+            live_at_major: live,
+            minors_since_major: 0,
+            major_due: false,
         }
     }
 
@@ -2278,6 +2340,9 @@ impl Heap {
         if let Some(idx) = self.free.pop() {
             self.objs[idx as usize] = obj;
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            if self.nursery {
+                self.young.push(idx);
+            }
             if self.oracle {
                 self.born[idx as usize] = self.epoch;
                 self.allocs_epoch += 1;
@@ -2287,6 +2352,9 @@ impl Heap {
         let idx = self.objs.len() as u32;
         self.objs.push(obj);
         self.versions.push(0);
+        if self.nursery {
+            self.young.push(idx);
+        }
         if self.oracle {
             self.born.push(self.epoch);
             self.allocs_epoch += 1;
@@ -2318,6 +2386,67 @@ impl Heap {
     pub fn oracle_next_epoch(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.allocs_epoch = 0;
+    }
+
+    /// Whether the stage-1 nursery is latched on (`ZIPP_NO_NURSERY` unset).
+    #[inline]
+    pub fn nursery_on(&self) -> bool {
+        self.nursery
+    }
+
+    /// Test-only: force the nursery latch, so the unit tests below hold in a
+    /// suite run under `ZIPP_NO_NURSERY=1` too.
+    #[cfg(test)]
+    pub(crate) fn set_nursery(&mut self, on: bool) {
+        self.nursery = on;
+    }
+
+    /// Whether the collection about to run may be a MINOR (full mark, but
+    /// sweep only the young log, leaving unreachable OLD objects floating).
+    /// A MAJOR runs instead when: the nursery is off; a previous minor's
+    /// float census latched one; or the backstop streak runs out. Under
+    /// `ZIPP_GC_STRESS` the streak cap drops to 3 so a collection at every
+    /// safe point exercises both sweep paths densely, not minors alone.
+    #[inline]
+    pub fn minor_due(&self, stress: bool) -> bool {
+        let cap = if stress { NURSERY_STRESS_MINORS } else { NURSERY_MAX_MINORS };
+        self.nursery && !self.major_due && self.minors_since_major < cap
+    }
+
+    /// The slots allocated since the last collection (the minor sweep set).
+    #[inline]
+    pub fn young_log(&self) -> &[u32] {
+        &self.young
+    }
+
+    /// Drop everything logged so far (called from `set_gc_floor`: the boot
+    /// allocations are pinned forever, so the first minor should not walk
+    /// them just to find them marked).
+    pub fn young_reset(&mut self) {
+        self.young.clear();
+    }
+
+    /// Stage-1 MINOR sweep: walk ONLY the young log, freeing the unmarked
+    /// entries — `free_slot` exactly as the major does (tombstone + version
+    /// bump + free list), so every stale inline cache misses identically.
+    /// Each freed slot is appended to `freed` (the caller's side-table prune
+    /// set). The log is then cleared (capacity kept); survivors become old by
+    /// simply no longer being logged.
+    ///
+    /// No double-free is possible: a young slot is never already on the free
+    /// list here, because the free list is refilled only by sweeps and a
+    /// freed slot re-enters the log only when `alloc` hands it out again.
+    pub fn sweep_young(&mut self, marks: &[bool], freed: &mut Vec<u32>) -> usize {
+        let mut log = std::mem::take(&mut self.young);
+        for &idx in &log {
+            if !marks[idx as usize] {
+                self.free_slot(idx);
+                freed.push(idx);
+            }
+        }
+        log.clear();
+        self.young = log;
+        freed.len()
     }
 
     /// Total slot count (live + free + pinned). Sweeps iterate `0..len`.
@@ -2373,6 +2502,33 @@ impl Heap {
             .max(GC_MIN_THRESHOLD)
             .max(self.objs.len() / 2);
         self.gc_requested = false;
+        // A MAJOR completed: nothing unreachable survived it, so `live` is
+        // the true live count the next float budget is measured against.
+        self.live_at_major = live;
+        self.minors_since_major = 0;
+        self.major_due = false;
+        self.young.clear();
+    }
+
+    /// [`Heap::note_gc_done`]'s MINOR twin. `live` is the OCCUPIED slot count
+    /// (reachable + floated — floats hold slots, so they must drive the next
+    /// collection's schedule exactly like live objects do); `floated` is the
+    /// exact unreachable-but-unswept count the minor's full mark measured.
+    /// The threshold math is the major's, unchanged; the float budget is what
+    /// keeps a minor-only diet from ballooning the heap: one crossing latches
+    /// the next collection into a major.
+    #[inline]
+    pub fn note_minor_done(&mut self, live: usize, floated: usize) {
+        self.live = live;
+        self.gc_threshold = (live.saturating_mul(GC_GROWTH))
+            .max(GC_MIN_THRESHOLD)
+            .max(self.objs.len() / 2);
+        self.gc_requested = false;
+        self.minors_since_major += 1;
+        if floated > self.live_at_major.max(NURSERY_FLOAT_BUDGET_FLOOR) {
+            self.major_due = true;
+        }
+        self.young.clear();
     }
 
     /// Overwrite the whole object at `idx`, bumping its version.
@@ -3066,6 +3222,43 @@ mod tests {
             m.set(&format!("k{i}"), Value::num(i as f64));
             assert_map_consistent(&m);
         }
+    }
+
+    /// The stage-1 minor sweep's free invariants, pinned at the unit level:
+    /// only UNMARKED YOUNG slots are freed; each freed slot's version is
+    /// bumped (a stale inline cache for the dead occupant must miss on
+    /// reuse); freed slots land on the free list and `alloc` hands them back
+    /// out — re-entering the (cleared, capacity-kept) young log.
+    #[test]
+    fn a_minor_sweep_frees_unmarked_young_bumps_versions_and_recycles() {
+        let mut h = Heap::new();
+        h.set_nursery(true); // hold even in a suite run under ZIPP_NO_NURSERY=1
+        let a = h.alloc(HeapObj::Str(JsStr::new("aa".into())));
+        let b = h.alloc(HeapObj::Str(JsStr::new("bb".into())));
+        let c = h.alloc(HeapObj::Str(JsStr::new("cc".into())));
+        assert_eq!(h.young_log(), &[a, b, c]);
+        let (va, vb, vc) = (h.version_of(a), h.version_of(b), h.version_of(c));
+
+        // Mark everything except `b` (the pinned interned prefix included,
+        // exactly as the collector's root pass would).
+        let mut marks = vec![true; h.len()];
+        marks[b as usize] = false;
+        let mut freed = Vec::new();
+        let swept = h.sweep_young(&marks, &mut freed);
+        assert_eq!((swept, freed.as_slice()), (1, &[b][..]), "only the unmarked young slot");
+        assert_eq!(h.free_indices(), &[b], "the freed slot is on the free list");
+        assert_eq!(h.version_of(b), vb.wrapping_add(1), "free must bump the version");
+        assert_eq!(h.version_of(a), va, "a marked slot's version is untouched");
+        assert_eq!(h.version_of(c), vc, "a marked slot's version is untouched");
+        assert!(h.young_log().is_empty(), "survivors age out of the log");
+
+        // Reuse: the recycled slot comes back from the free list, bumps the
+        // version AGAIN, and is young in the new epoch.
+        let d = h.alloc(HeapObj::Str(JsStr::new("dd".into())));
+        assert_eq!(d, b, "the minor's freed slot is reused first");
+        assert_eq!(h.version_of(d), vb.wrapping_add(2));
+        assert_eq!(h.young_log(), &[d]);
+        assert!(h.free_indices().is_empty());
     }
 }
 

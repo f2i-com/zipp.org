@@ -20,7 +20,11 @@
 //! Scope is bounded aggressively (see [`gpr_home_map`]): no cold blocks, no
 //! B94 splits / B97 write-through / DV fusion, at least one Bitwise/imul op
 //! (else the xmm form is already optimal), and the live set must fit the pool.
-//! Anything outside falls back to the xmm emitter unchanged.
+//! Anything outside falls back to the xmm emitter unchanged — except a pool
+//! OVERFLOW, which first earns one re-plan with forced home sharing (B119:
+//! the enclosing region of a loop nest carries the inner loop's counters and
+//! temps, most of which never overlap; sharing fits it so the OUTER region
+//! goes GPR instead of shadowing an engaged GPR inner on xmm homes).
 //!
 //! Correctness model is IDENTICAL to the xmm tier: sign-extended i64 homes,
 //! entry guards on every live-in, i53 guards on add/sub/mul (unless proven
@@ -47,6 +51,36 @@ pub(crate) fn gpr_homes_enabled() -> bool {
     }
 }
 
+/// Kill switch: `ZIPP_NO_GPR_NEST=1` disables ONLY the B119 shared-home
+/// re-plan after a [`GprAttempt::PoolOverflow`] (see `compile_region_int`) —
+/// a region that fits the pool one-home-per-value still engages, restoring
+/// wave-6 behavior byte-for-byte. `ZIPP_NO_GPR_HOMES=1` kills the whole
+/// sub-mode, retry included.
+pub(crate) fn gpr_nest_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_GPR_NEST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// `compile_region_int_gpr`'s result. `PoolOverflow` is the one decline worth
+/// acting on: every OTHER gate passed and only the live set didn't fit, so the
+/// caller can re-plan with forced home sharing (B119 — the nested-loop
+/// residual: an enclosing region carries the inner loop's counters and temps
+/// too) and try once more. Every other decline is final for this region shape.
+pub(crate) enum GprAttempt {
+    Emitted(JitFn),
+    PoolOverflow,
+    OutOfScope,
+}
+
 /// An operand as this emitter reads it: a GPR home, or a hoisted-constant
 /// immediate (always i32 — `LoadInt`'s payload and `LoadConst`-Int's payload
 /// both are, which is what makes every imm form below encodable).
@@ -56,8 +90,10 @@ enum Src {
     I(i32),
 }
 
-/// The home map and the hoisted-constant table, or `None` when the region is
-/// outside this mode's bounded scope.
+/// The home map and the hoisted-constant table, or the decline reason when
+/// the region is outside this mode's bounded scope (`Err(true)` = the live set
+/// alone overflowed the pool — the retryable case; `Err(false)` = any other
+/// gate failed).
 ///
 /// Pool (hand-out order): r15 and rbp — pushed by this emitter's own prologue —
 /// then whichever of the BOOL_GPRS (r8..r11) the plan left free (this emitter
@@ -78,7 +114,7 @@ fn gpr_home_map(
     s: usize,
     e: usize,
     metered: bool,
-) -> Option<(FxHashMap<u8, u8>, FxHashMap<u16, i32>, bool)> {
+) -> Result<(FxHashMap<u8, u8>, FxHashMap<u16, i32>, bool), bool> {
     // Out of scope: any plan feature whose write-through/flush interplay was
     // only ever proven against the other emitters.
     if !plan.split_recvs.is_empty()
@@ -87,7 +123,7 @@ fn gpr_home_map(
         || !plan.dv_flag_elide.is_empty()
         || !plan.dv_flag_fuse.is_empty()
     {
-        return None;
+        return Err(false);
     }
     // Engage only where the mode pays: at least one op that would round-trip
     // xmm↔gpr on the xmm tier.
@@ -95,7 +131,7 @@ fn gpr_home_map(
         matches!(i, Instr::Bitwise { .. } | Instr::MathOp { op: MathFn::Imul, argc: 2, .. })
     });
     if !pays {
-        return None;
+        return Err(false);
     }
     // Hoisted constants: reg → i32 value (from the hoist ips' own opcodes).
     let mut hoist_c: FxHashMap<u16, i32> = FxHashMap::default();
@@ -108,7 +144,7 @@ fn gpr_home_map(
                 // region admission guaranteed the constant is Int-tagged.
                 hoist_c.insert(dst, proto.constants[idx as usize].bits() as u32 as i32);
             }
-            _ => return None, // not a shape this emitter hoists
+            _ => return Err(false), // not a shape this emitter hoists
         }
     }
     // Homes that need a GPR: every home some NON-hoisted reg or a global uses.
@@ -174,9 +210,9 @@ fn gpr_home_map(
                 pool.len()
             );
         }
-        return None;
+        return Err(true); // the retryable decline — see `GprAttempt::PoolOverflow`
     }
-    Some((used.into_iter().zip(pool).collect(), hoist_c, inline_guards))
+    Ok((used.into_iter().zip(pool).collect(), hoist_c, inline_guards))
 }
 
 /// Entry load into a GPR home: the Value bits are in `rax`. Same admission as
@@ -302,9 +338,9 @@ fn emit_src64(ops: &mut dynasmrt::x64::Assembler, s: Src, scratch: u8) {
 }
 
 /// GPR-home INT region codegen. Same plan, same guards, same exits as
-/// `compile_region_int` — only the home register file differs. Returns `None`
-/// (caller falls back to the xmm emitter) when the region is out of this
-/// mode's scope.
+/// `compile_region_int` — only the home register file differs. A non-`Emitted`
+/// result sends the caller back to the xmm emitter, except `PoolOverflow`,
+/// which invites one shared-home re-plan first (B119).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_region_int_gpr(
     proto: &FuncProto,
@@ -315,9 +351,13 @@ pub(crate) fn compile_region_int_gpr(
     ta_snapshot: usize,
     plan: &RegionPlan,
     meter: Option<crate::codegen::meter::Meter>,
-) -> Option<JitFn> {
+) -> GprAttempt {
     let (s, e) = (start as usize, end as usize);
-    let (map, hoist_c, inline_guards) = gpr_home_map(proto, plan, s, e, meter.is_some())?;
+    let (map, hoist_c, inline_guards) = match gpr_home_map(proto, plan, s, e, meter.is_some()) {
+        Ok(m) => m,
+        Err(true) => return GprAttempt::PoolOverflow,
+        Err(false) => return GprAttempt::OutOfScope,
+    };
     // GPR home of raw xmm-index `x` / dst register `r` (dsts are never
     // hoisted-const, so their home is always mapped).
     let gx = |x: u8| map[&x];
@@ -337,7 +377,7 @@ pub(crate) fn compile_region_int_gpr(
         Ok(a) => a,
         Err(_) => {
             decline_emit("int-gpr-emit: assembler alloc failed");
-            return None;
+            return GprAttempt::OutOfScope;
         }
     };
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
@@ -395,6 +435,16 @@ pub(crate) fn compile_region_int_gpr(
             ; call rax
         );
     }
+    // ── W7 hoisted pin identity guards ── same contract as the xmm tier: one
+    // snapshot-validity check per hoisted pin replaces the per-access source
+    // load + compare (the snapshot was just taken FROM the source, and the
+    // region provably cannot change either — see `hoistable_pins`). A miss
+    // takes `entry_bail`. Runs BEFORE any home is loaded, so no state to keep.
+    for j in 0..ta_plan.pins.len() {
+        if plan.hoist_pins.contains(&(j as u8)) {
+            dynasm!(ops ; cmp QWORD [rsp + ta_base + 32 * j as i32], 0 ; je => entry_bail);
+        }
+    }
     // Live-in loads (globals, regs, then bools — same order and same guards as
     // the xmm tier; the bool loader's rdx scratch never aliases a home).
     for &(gi, x) in &plan.live_in_globs {
@@ -419,6 +469,17 @@ pub(crate) fn compile_region_int_gpr(
             }
         }
     }
+    // ── W7 hoisted pinned-STRING lengths ── identity entry-guarded above and
+    // region-invariant, so the snapshot `units` fills the dst home once; the
+    // body op is skipped. The dst is never a hoisted CONSTANT, so its home is
+    // always mapped.
+    for &hip in &plan.hoist_len_ips {
+        if let Instr::GetProp { dst, .. } = proto.code[hip] {
+            let j = ta_plan.access[&hip] as usize;
+            let h = g(dst);
+            dynasm!(ops ; mov Rq(h), [rsp + ta_base + 32 * j as i32 + 16]);
+        }
+    }
     // (No addint_imm_home / gpr_const fills: immediates encode directly here.)
     dynasm!(ops ; jmp => lbl(start, &in_region));
 
@@ -431,6 +492,11 @@ pub(crate) fn compile_region_int_gpr(
             if plan.hoisted.contains(&dst) {
                 continue;
             }
+        }
+        // A W7-hoisted pinned-STRING length was prologue-filled — skip the
+        // body op (nothing emitted, so flags survive like a hoisted const).
+        if plan.hoist_len_ips.contains(&ip) {
+            continue;
         }
         if let Some(d) = writes_reg(&proto.code[ip]) {
             if plan.dead.contains(&d) {
@@ -748,14 +814,18 @@ pub(crate) fn compile_region_int_gpr(
                 let d = g(dst);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: identity hoisted to the entry guard for a hoisted pin;
+                // only the semantic bounds/tag guards remain per access.
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]           // receiver vs snapshot obj_bits
+                        ; jne => deopt
+                    );
                 }
-                dynasm!(ops
-                    ; cmp rax, [rsp + off]               // receiver vs snapshot obj_bits
-                    ; jne => deopt
-                );
                 emit_src64(&mut ops, src(key), 1);       // rcx = index (i64, integral)
                 dynasm!(ops
                     ; cmp rcx, [rsp + off + 16]          // unsigned: i < len (catches <0)
@@ -792,14 +862,17 @@ pub(crate) fn compile_region_int_gpr(
                 let off = ta_base + 32 * j as i32;
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]
+                        ; jne => deopt
+                    );
                 }
-                dynasm!(ops
-                    ; cmp rax, [rsp + off]
-                    ; jne => deopt
-                );
                 emit_src64(&mut ops, src(key), 1);       // rcx = index
                 dynasm!(ops
                     ; cmp rcx, [rsp + off + 16]
@@ -864,14 +937,17 @@ pub(crate) fn compile_region_int_gpr(
                 let d = g(dst);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]           // receiver identity vs snapshot
+                        ; jne => deopt
+                    );
                 }
-                dynasm!(ops
-                    ; cmp rax, [rsp + off]               // receiver identity vs snapshot
-                    ; jne => deopt
-                );
                 emit_src64(&mut ops, src(arg_base), 1);  // rcx = index
                 dynasm!(ops
                     ; cmp rcx, [rsp + off + 16]          // unsigned: i < units
@@ -897,25 +973,33 @@ pub(crate) fn compile_region_int_gpr(
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
                 let d = g(dst);
-                let deopt = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: a hoisted pin's length read collapses to a bare snapshot
+                // load (identity entry-guarded; length region-invariant). The
+                // fully hoisted STRING case never reaches here (body op
+                // skipped); this is the multi-def / on-a-branch / Array residue.
+                if plan.hoist_pins.contains(&(j as u8)) {
+                    dynasm!(ops ; mov Rq(d), [rsp + off + 16]);
+                } else {
+                    let deopt = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]           // receiver identity vs snapshot
+                        ; jne => deopt
+                        ; mov rax, [rsp + off + 16]      // units / len
+                        ; mov Rq(d), rax
+                        ; jmp => done
+                        ; => deopt
+                    );
+                    emit_store_ip(&mut ops, ip_slot, ip as i32);
+                    dynasm!(ops
+                        ; jmp => flush_exit
+                        ; => done
+                    );
                 }
-                dynasm!(ops
-                    ; cmp rax, [rsp + off]               // receiver identity vs snapshot
-                    ; jne => deopt
-                    ; mov rax, [rsp + off + 16]          // units / len
-                    ; mov Rq(d), rax
-                    ; jmp => done
-                    ; => deopt
-                );
-                emit_store_ip(&mut ops, ip_slot, ip as i32);
-                dynasm!(ops
-                    ; jmp => flush_exit
-                    ; => done
-                );
             }
             // ── Math.imul ── low 32 of the product, sign-extended (see xmm arm).
             Instr::MathOp { dst, arg_base, op: MathFn::Imul, argc: 2, .. } => {
@@ -937,7 +1021,7 @@ pub(crate) fn compile_region_int_gpr(
             // POST-PLAN hole — same contract as the xmm emitter's twin arm.
             _ => {
                 decline_emit(format_args!("int-gpr-emit-unhandled: {:?}", proto.code[ip]));
-                return None;
+                return GprAttempt::OutOfScope;
             }
         }
     }
@@ -985,11 +1069,22 @@ pub(crate) fn compile_region_int_gpr(
         Ok(b) => b,
         Err(_) => {
             decline_emit("int-gpr-emit: assembler finalize failed");
-            return None;
+            return GprAttempt::OutOfScope;
         }
     };
+    // W7 attribution: code-byte length with pins, so the hoist's size delta is
+    // one grep away (run again under ZIPP_NO_GUARD_HOIST=1 and diff the line).
+    if !ta_plan.pins.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] INT-GPR region [{start},{end}] guard-hoist pins={}/{} len-fills={} code={}b",
+            plan.hoist_pins.len(),
+            ta_plan.pins.len(),
+            plan.hoist_len_ips.len(),
+            buf.len()
+        );
+    }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    GprAttempt::Emitted(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }
 
 /// Compare flags for the GPR/immediate operand forms (SIGNED, i64 — an i32

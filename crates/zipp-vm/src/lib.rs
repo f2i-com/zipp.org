@@ -70,6 +70,14 @@ pub fn gc_oracle_stats() -> Vec<(&'static str, u64)> {
     heap::gcoracle::dump()
 }
 
+/// Stage-1 nursery split: `(minors, majors, minor_ms, major_ms, swept_young,
+/// floated_swept, float_peak, peak_slots)`. The counts and peaks update in
+/// every mode (they cost a few relaxed atomics per collection); the ms and
+/// floated-swept fields are 0 unless `ZIPP_GCSTATS=1`.
+pub fn gc_nursery_stats() -> (u64, u64, f64, f64, u64, u64, u64, u64) {
+    vm::gc_nursery_stats()
+}
+
 /// `ZIPP_RXSTATS=1` RegExp match-result representation counters:
 /// `(compact_constructions, materialized, matchall_steps_fused,
 /// matchall_steps_fallback)` — how many successful capturing exec results
@@ -125,6 +133,15 @@ pub fn call_inline_stats() -> (u64, u64, u64) {
 /// ops at region admission and forces both to zero.
 pub fn iter_region_stats() -> (u64, u64) {
     vm::iter_region_stats()
+}
+
+/// `ZIPP_ICSTATS=1` W7 cross-call window-fill counters:
+/// `(fast_fills, full_fills)` — callee windows exposed via `set_len` under the
+/// register-file high-water mark with only the may-read-before-write registers
+/// re-zeroed, vs. full zero-filling `resize`s. Zeroed unless the variable was
+/// set. `ZIPP_NO_CROSSCALL2=1` forces every fill onto the full path.
+pub fn cross_fill_stats() -> (u64, u64) {
+    vm::cross_fill_stats()
 }
 
 /// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,

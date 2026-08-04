@@ -1392,6 +1392,62 @@ pub use icstats::dump as ic_stats;
 /// `hasOwnProperty.call(array, key)` intrinsic answering without any call
 /// machinery (`jit_has_own_call` — the sparse-array phase's shape). Off, one
 /// relaxed atomic load on paths that already made a helper call.
+/// `ZIPP_ICSTATS=1` — W7 cross-call window-fill counters: `fill_fast` counts
+/// callee windows exposed via `set_len` under the high-water mark with only
+/// the may-read-before-write registers re-zeroed (the `cross_uninit_mask`
+/// lever engaging); `fill_full` counts full zero-filling `resize`s (new
+/// ground, analysis declined, or `ZIPP_NO_CROSSCALL2=1`). Off, one relaxed
+/// atomic load on a path that already made an FFI helper call.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) mod crossstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static FILL_FAST: AtomicU64 = AtomicU64::new(0);
+    static FILL_FULL: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => init(),
+        }
+    }
+
+    #[cold]
+    fn init() -> bool {
+        let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+        ON.store(v, Ordering::Relaxed);
+        v == 1
+    }
+
+    /// One cross-call callee window served by the W7 fast fill (`set_len` +
+    /// mask zeroing) instead of a full `resize`.
+    #[inline]
+    pub(crate) fn fill_fast() {
+        if enabled() {
+            FILL_FAST.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One cross-call callee window zero-filled in full.
+    #[inline]
+    pub(crate) fn fill_full() {
+        if enabled() {
+            FILL_FULL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(fast_fills, full_fills)`
+    pub fn dump() -> (u64, u64) {
+        (FILL_FAST.load(Ordering::Relaxed), FILL_FULL.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub use crossstats::dump as cross_fill_stats;
+
 pub(crate) mod callstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
@@ -1458,6 +1514,13 @@ pub use callstats::dump as call_inline_stats;
 #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
 pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     (0, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+/// Without the JIT there are no cross-call windows to fill (same contract as
+/// the `ic_stats` stub above).
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+pub fn cross_fill_stats() -> (u64, u64) {
+    (0, 0)
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

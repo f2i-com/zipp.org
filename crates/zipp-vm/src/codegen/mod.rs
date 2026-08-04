@@ -725,6 +725,16 @@ fn fnjit_mem_enabled() -> bool {
     std::env::var_os("ZIPP_NO_FNJIT_MEM").is_none()
 }
 
+/// Same-binary A/B switch for the W7 cross-call residual trim (the window-fill
+/// fast path): `ZIPP_NO_CROSSCALL2=1` pins every installed cross entry's
+/// uninit mask to `u64::MAX`, so the helper zero-fills the whole callee window
+/// per call exactly as before W7. Read once per `Jit::compile` (compiles are
+/// rare relative to execution) — zero per-call cost either way.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn crosscall2_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_CROSSCALL2").is_none()
+}
+
 /// One compiled native function plus the buffer backing it.
 pub struct JitFn {
     _buf: ExecutableBuffer,
@@ -1143,7 +1153,12 @@ pub struct Jit {
     /// Entries point into mmap'd `ExecutableBuffer`s, which never move (and
     /// evicted buffers are PARKED in `retired_fns`, so even a stale pointer
     /// read racing an eviction within one helper call targets live code).
-    cross_entries: Vec<*const u8>,
+    /// The second element is the W7 may-read-before-write register mask
+    /// (`cross_uninit_mask`): the ONLY callee-window registers the cross-call
+    /// helper must zero when it reuses an already-initialized window;
+    /// `u64::MAX` = analysis declined (or `ZIPP_NO_CROSSCALL2`) → full
+    /// zero-fill on every call, the pre-W7 behaviour.
+    cross_entries: Vec<(*const u8, u64)>,
     /// Compiled fused `map` kernels, keyed by callback `func_id`. `None` =
     /// tried and ineligible (so we don't recompile every `map` call). Keyed by
     /// `func_id` alone: a given callback proto has fixed param_count/body.
@@ -1260,27 +1275,28 @@ impl Jit {
         *c == self.fn_threshold()
     }
 
-    /// Native entry for the cross-call fast path, or `None` if `func_id` is not
-    /// currently Tier-C compiled (see `cross_entries`).
+    /// Native entry + W7 window-fill mask for the cross-call fast path, or
+    /// `None` if `func_id` is not currently Tier-C compiled (see
+    /// `cross_entries`).
     #[inline]
-    pub fn cross_entry(&self, func_id: u32) -> Option<*const u8> {
+    pub fn cross_entry(&self, func_id: u32) -> Option<(*const u8, u64)> {
         match self.cross_entries.get(func_id as usize) {
-            Some(p) if !p.is_null() => Some(*p),
+            Some(&(p, mask)) if !p.is_null() => Some((p, mask)),
             _ => None,
         }
     }
 
-    fn set_cross_entry(&mut self, func_id: u32, entry: *const u8) {
+    fn set_cross_entry(&mut self, func_id: u32, entry: *const u8, uninit_mask: u64) {
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
-            self.cross_entries.resize(i + 1, std::ptr::null());
+            self.cross_entries.resize(i + 1, (std::ptr::null(), u64::MAX));
         }
-        self.cross_entries[i] = entry;
+        self.cross_entries[i] = (entry, uninit_mask);
     }
 
     fn clear_cross_entry(&mut self, func_id: u32) {
         if let Some(p) = self.cross_entries.get_mut(func_id as usize) {
-            *p = std::ptr::null();
+            *p = (std::ptr::null(), u64::MAX);
         }
     }
 
@@ -1370,9 +1386,19 @@ impl Jit {
                 // another compiled function's Call site.
                 debug_assert!(f.self_binding().is_none());
                 let entry = f.entry();
+                // W7 window-fill mask: which registers a cross call must zero
+                // when reusing an already-initialized window. Computed ONCE per
+                // compile; `ZIPP_NO_CROSSCALL2` pins it to `u64::MAX`, forcing
+                // the full zero-filling `resize` on every call (the pre-W7
+                // behaviour, the lever's off-switch).
+                let uninit_mask = if crosscall2_enabled() {
+                    cross_uninit_mask(proto)
+                } else {
+                    u64::MAX
+                };
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
-                self.set_cross_entry(func_id, entry);
+                self.set_cross_entry(func_id, entry, uninit_mask);
                 return;
             }
         }

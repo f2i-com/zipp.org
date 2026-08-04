@@ -190,6 +190,200 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
     ok
 }
 
+/// W7: the callee-window registers a Tier-C body may READ BEFORE WRITING, as a
+/// u64 bitmask (bit r = register r), or `u64::MAX` when the analysis declines
+/// (reg_count > 64, or an op outside the closed Tier-C admission set). The
+/// cross-call helper zeroes exactly these slots (plus missing arguments) when
+/// it reuses an already-initialized window via `set_len` instead of the
+/// zero-filling `resize`; every other register is proven DEF-BEFORE-USE on
+/// every path from entry, so the stale bits it transiently holds are
+/// unobservable. That proof carries to the interpreter too: Tier C is the
+/// memory tier — every def stores to the window before the next op — so a
+/// mid-body bail resumes with exactly the defs the bytecode executed, and the
+/// remaining path from the resume ip is one of the paths the dataflow covered.
+/// (GC-completeness is argued separately at the fill site: exposed slots hold
+/// valid, possibly stale, `Value`s — never uninitialized bytes.)
+///
+/// The dataflow is a forward MUST-DEFINED analysis over the bytecode CFG:
+/// state = bitset of definitely-written regs; meet = AND at joins; top = `!0`
+/// for not-yet-reached ips; entry state = {reg 0 (`this`)} ∪ {1..=param_count}
+/// (the helper zeroes missing arguments per call, making the param assumption
+/// true for short calls). Iterated to fixpoint (states only lose bits —
+/// terminates), then every operand READ whose bit is unset in its in-state
+/// marks the register. The op set is CLOSED: `mem_can_compile` admits no
+/// try/catch handler op, so a Tier-C body has NO in-frame exception edges, and
+/// any op this table doesn't recognize declines the whole analysis. USES must
+/// be exact (a missed use could leave a readable stale slot unzeroed); DEFS
+/// may be under-approximated (only costs precision).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn cross_uninit_mask(proto: &FuncProto) -> u64 {
+    const DECLINE: u64 = u64::MAX;
+    let code = &proto.code;
+    let n = code.len();
+    let regs = (proto.reg_count as usize).max(1);
+    let params = proto.param_count as usize;
+    if n == 0 || regs > 64 || 1 + params >= 64 {
+        return DECLINE;
+    }
+    // Per-op (uses, def). `None` (an unlisted op) declines the analysis.
+    fn ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
+        use smallvec::Uses;
+        let u0 = || Uses::new();
+        let u1 = |a: u16| Uses::one(a);
+        let u2 = |a: u16, b: u16| Uses::two(a, b);
+        Some(match *i {
+            Instr::LoadConst { dst, .. }
+            | Instr::LoadInt { dst, .. }
+            | Instr::LoadUndefined { dst }
+            | Instr::LoadNull { dst }
+            | Instr::LoadBool { dst, .. }
+            | Instr::LoadGlobal { dst, .. } => (u0(), Some(dst)),
+            Instr::Move { dst, src } => (u1(src), Some(dst)),
+            Instr::StoreGlobal { src, .. }
+            | Instr::StoreGlobalStrict { src, .. }
+            | Instr::StoreGlobalResolved { src, .. } => (u1(src), None),
+            Instr::Add { dst, a, b }
+            | Instr::Sub { dst, a, b }
+            | Instr::Mul { dst, a, b }
+            | Instr::Div { dst, a, b }
+            | Instr::Bitwise { dst, a, b, .. }
+            | Instr::StrAppendInPlace { dst, a, b }
+            | Instr::Lt { dst, a, b }
+            | Instr::Le { dst, a, b }
+            | Instr::Gt { dst, a, b }
+            | Instr::Ge { dst, a, b }
+            | Instr::Eq { dst, a, b }
+            | Instr::Ne { dst, a, b } => (u2(a, b), Some(dst)),
+            Instr::AddInt { dst, a, .. } => (u1(a), Some(dst)),
+            Instr::Not { dst, a }
+            | Instr::TypeOf { dst, a }
+            | Instr::TypeOfIs { dst, a, .. }
+            | Instr::IsArray { dst, a } => (u1(a), Some(dst)),
+            Instr::LenOf { dst, obj } | Instr::ForInKeys { dst, obj } => (u1(obj), Some(dst)),
+            Instr::ForInLive { dst, obj, key } => (u2(obj, key), Some(dst)),
+            Instr::GetIndex { dst, obj, key } => (u2(obj, key), Some(dst)),
+            Instr::GetProp { dst, obj, .. } => (u1(obj), Some(dst)),
+            Instr::SetProp { obj, val, .. } => (u2(obj, val), None),
+            Instr::MathOp { dst, arg_base, argc, .. } => {
+                (Uses::range(arg_base, argc), Some(dst))
+            }
+            Instr::Call { dst, callee, arg_base, argc } => {
+                (Uses::range(arg_base, argc).plus(callee), Some(dst))
+            }
+            Instr::CallMethod { dst, obj, arg_base, argc, .. } => {
+                (Uses::range(arg_base, argc).plus(obj), Some(dst))
+            }
+            Instr::Jump { .. } | Instr::ReturnUndefined => (u0(), None),
+            Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => (u1(cond), None),
+            Instr::JumpIfNotLt { a, b, .. } | Instr::JumpIfNotLe { a, b, .. } => (u2(a, b), None),
+            Instr::Return { src } => (u1(src), None),
+            _ => return None,
+        })
+    }
+    /// A tiny inline use-list (compile-time only; avoids per-op Vec churn).
+    mod smallvec {
+        pub(super) struct Uses {
+            regs: [u16; 3],
+            len: u8,
+            /// Contiguous extra range `[base, base+count)` (call/math args).
+            range: (u16, u16),
+        }
+        impl Uses {
+            pub(super) fn new() -> Uses {
+                Uses { regs: [0; 3], len: 0, range: (0, 0) }
+            }
+            pub(super) fn one(a: u16) -> Uses {
+                Uses { regs: [a, 0, 0], len: 1, range: (0, 0) }
+            }
+            pub(super) fn two(a: u16, b: u16) -> Uses {
+                Uses { regs: [a, b, 0], len: 2, range: (0, 0) }
+            }
+            pub(super) fn range(base: u16, count: u16) -> Uses {
+                Uses { regs: [0; 3], len: 0, range: (base, count) }
+            }
+            pub(super) fn plus(mut self, r: u16) -> Uses {
+                self.regs[self.len as usize] = r;
+                self.len += 1;
+                self
+            }
+            pub(super) fn for_each(&self, mut f: impl FnMut(u16)) {
+                for k in 0..self.len as usize {
+                    f(self.regs[k]);
+                }
+                for r in self.range.0..self.range.0 + self.range.1 {
+                    f(r);
+                }
+            }
+        }
+    }
+    // Pass 1: use/def per ip (decline on any unlisted op or out-of-range reg).
+    let mut uses: Vec<smallvec::Uses> = Vec::with_capacity(n);
+    let mut defs: Vec<Option<u16>> = Vec::with_capacity(n);
+    for i in code.iter() {
+        let Some((u, d)) = ud(i) else { return DECLINE };
+        let mut bad = false;
+        u.for_each(|r| bad |= r as usize >= 64);
+        if bad || d.is_some_and(|r| r as usize >= 64) {
+            return DECLINE; // defensive: reg_count said ≤ 64
+        }
+        uses.push(u);
+        defs.push(d);
+    }
+    // Pass 2: fixpoint. `in_state[ip]` = regs definitely written on EVERY path
+    // from entry to ip; `!0` = unreached (top).
+    let entry_state: u64 = (1u64 << (1 + params)) - 1;
+    let mut in_state = vec![u64::MAX; n];
+    in_state[0] = entry_state;
+    loop {
+        let mut changed = false;
+        for ip in 0..n {
+            let s = in_state[ip];
+            if s == u64::MAX {
+                continue; // not (yet) reached
+            }
+            let out = s | defs[ip].map_or(0, |d| 1u64 << d);
+            let (s1, s2) = match code[ip] {
+                Instr::Jump { target } => (Some(target as usize), None),
+                Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::JumpIfNotLt { target, .. }
+                | Instr::JumpIfNotLe { target, .. } => {
+                    (Some(ip + 1), Some(target as usize))
+                }
+                Instr::Return { .. } | Instr::ReturnUndefined => (None, None),
+                _ => (Some(ip + 1), None),
+            };
+            for t in [s1, s2].into_iter().flatten() {
+                // `t == n` = falling off the end (ReturnUndefined) — no state.
+                if t < n {
+                    let m = in_state[t] & out;
+                    if m != in_state[t] {
+                        in_state[t] = m;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Pass 3: any READ of a not-definitely-written reg marks it.
+    let mut mask = 0u64;
+    for ip in 0..n {
+        let s = in_state[ip];
+        if s == u64::MAX {
+            continue; // unreachable code never reads anything
+        }
+        uses[ip].for_each(|r| {
+            if s & (1u64 << r) == 0 {
+                mask |= 1u64 << r;
+            }
+        });
+    }
+    mask
+}
+
 /// Compile the WHOLE body of `proto` to native code via the memory-path op
 /// emitters (Tier C). `globals_base_helper` pins r12 = `vm.globals` base;
 /// `heap` carries the win64 helper addresses (get_index/char_code_at/call_ic/

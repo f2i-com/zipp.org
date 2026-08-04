@@ -152,6 +152,32 @@ pub(crate) struct RegionPlan {
     pub(crate) dv_flag_elide: FxHashSet<usize>,
     /// Pinned-DV call ip → the elided `Eq`'s `(a, b)` operand registers.
     pub(crate) dv_flag_fuse: FxHashMap<usize, (u16, u16)>,
+    /// W7 guard hoisting: pin slots whose per-access IDENTITY compare is
+    /// hoisted to REGION ENTRY. Sound only because `hoistable_pins` proved the
+    /// region cannot invalidate the pin between entry and any access: the
+    /// pin's SOURCE (global slot / frame register) has no in-region write, and
+    /// every region op is on the closed no-user-code whitelist (nothing can
+    /// run user code, allocate, GC, detach/resize a buffer or grow a Vec —
+    /// which are the only ways identity, base or length can change). The
+    /// snapshot is taken FROM the source in the same prologue, so
+    /// `source == obj_bits` holds at entry by construction and the one check
+    /// left is snapshot VALIDITY (`obj_bits != 0`); a miss takes `entry_bail`
+    /// exactly like a failed live-in guard (no flush, resume at the header,
+    /// counts as a deopt → chronic misses evict to the memory tier, whose
+    /// per-access guards are untouched). Every OSR re-entry re-snapshots and
+    /// re-checks, so a receiver reassigned BETWEEN entries revalidates by
+    /// construction. Empty under `ZIPP_NO_GUARD_HOIST=1` (per-access guards
+    /// restored byte-identically).
+    pub(crate) hoist_pins: FxHashSet<u8>,
+    /// W7: region ips of pinned-STRING `.length` GetProps hoisted to a
+    /// prologue fill (sorted). Strings are immutable, so once the pin's
+    /// identity is entry-guarded (`hoist_pins` holds its slot — a
+    /// precondition) the snapshot `units` IS `str.length` for the whole run:
+    /// the dst home is filled once from the snapshot and the body op is
+    /// skipped, exactly like a hoisted constant (same single-def /
+    /// def-first / runs-every-iteration conditions; the dst joins `hoisted`
+    /// so it keeps a permanent home and no entry load).
+    pub(crate) hoist_len_ips: Vec<usize>,
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops

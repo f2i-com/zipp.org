@@ -115,15 +115,23 @@ pub(crate) fn enabled() -> bool {
     match ON.load(Ordering::Relaxed) {
         0 => false,
         1 => true,
-        _ => {
-            let v = std::env::var_os("ZIPP_PROF").is_some() as u8;
-            ON.store(v, Ordering::Relaxed);
-            if v == 1 {
-                start();
-            }
-            v == 1
-        }
+        _ => init(),
     }
+}
+
+/// One-time env latch, OUTLINED: `enabled()` sits on per-call JIT hot paths
+/// (every cross-call helper takes a phase guard), and inlining the env read +
+/// sampler spawn into every caller bloated exactly those paths — the W7
+/// census priced the guard at ~1-2ns/call of the ~19ns cross-call residual,
+/// most of it recovered by keeping the hot side to one load + compare.
+#[cold]
+fn init() -> bool {
+    let v = std::env::var_os("ZIPP_PROF").is_some() as u8;
+    ON.store(v, Ordering::Relaxed);
+    if v == 1 {
+        start();
+    }
+    v == 1
 }
 
 /// Launch the sampler thread once. It is a daemon: the process exits without

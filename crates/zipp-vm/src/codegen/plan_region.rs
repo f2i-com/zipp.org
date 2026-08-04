@@ -177,6 +177,173 @@ pub(crate) fn dv_double_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_GUARD_HOIST=1` disables W7 pinned-guard hoisting: `hoist_pins` /
+/// `hoist_len_ips` stay empty, so every pinned access re-emits its per-access
+/// identity compare and the length GetProp stays a body op — the pre-wave
+/// emission, byte-identical. Cached once per process, never on the hot path.
+pub(crate) fn guard_hoist_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_GUARD_HOIST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// W7: the pin slots whose per-access identity guard can be hoisted to region
+/// entry. This is the WHOLE soundness argument, stated as a predicate — the
+/// emitters consume the answer and add no reasoning of their own.
+///
+/// A pinned access is guarded today by (1) `source value == snapshot.obj_bits`
+/// and (2) bounds against the snapshot `len`. The snapshot is taken FROM the
+/// source in the same prologue, so (1) holds at entry trivially; it can only
+/// go false at a LATER access if something between entry and that access
+/// changes the source or the object. Hoisting is therefore sound exactly when
+/// the region provably contains nothing that can:
+///
+///   * write the pin's source — a `StoreGlobal*` to its global slot, or any
+///     reg-def of its frame register (checked per pin below, with the
+///     emitter-grade `writes_reg` cover, NOT the pin builder's hint cover:
+///     the builder's misses are safe there only BECAUSE of the per-access
+///     re-check this predicate removes);
+///   * run user code, allocate, or GC — the only ways a pinned object's
+///     identity/base/length can change: detach is an explicit user call
+///     (`transfer()`), resizable ArrayBuffers resize only via user calls,
+///     dense-Array Vecs grow only via stores/calls, and this engine's GC
+///     runs only at safepoints inside helpers (heap indices never move
+///     regardless). Enforced by the closed WHITELIST scan: every region op
+///     must be one the register tiers emit inline with no path into user
+///     code. The list mirrors the union of the three register-tier emitters'
+///     arms — the B115 DV window analysis discipline, region-wide. Any op
+///     outside it (Call, unpinned CallMethod/GetProp/index ops, HasProp,
+///     IterNext, StrConcat, MathOp other than Imul, …) refuses hoisting for
+///     the WHOLE region. Cross-calls and the wave-4 `maybe_gc` safepoint live
+///     on the MEM tier, whose ops (Call/helper CallMethod/SetProp) are all
+///     outside the whitelist — such regions never hoist.
+///
+/// What remains per access is the semantic part only: bounds (the index
+/// varies) and value-tag guards. The bounds LIMIT itself is loop-invariant
+/// under this predicate (nothing can detach/resize/grow), which is what makes
+/// `hoist_len_ips` sound for immutable strings.
+///
+/// A hoisted pin whose snapshot DECLINED ({0,0,0}: receiver no longer a live
+/// view of the pinned kind) fails the entry check and `entry_bail`s — the
+/// same contract as a failed live-in type guard, and strictly tighter than
+/// the per-access compare it replaces (which a 0-bits source value could
+/// alias; the bounds check `len == 0` covered element ops, but a pinned
+/// `.length` read had no bounds to save it).
+fn hoistable_pins(
+    proto: &FuncProto,
+    s: usize,
+    e: usize,
+    ta_plan: &TaPinPlan,
+    cold: &FxHashSet<usize>,
+) -> FxHashSet<u8> {
+    let mut out: FxHashSet<u8> = FxHashSet::default();
+    // Cold ips are emitted as side exits by a mode that is OFF (B9) — but the
+    // predicate must not assume that stays true. A cold block's ops never ran
+    // through this whitelist, so refuse outright.
+    if !guard_hoist_enabled() || !cold.is_empty() || ta_plan.pins.is_empty() {
+        return out;
+    }
+    let code = &proto.code;
+    let pin_kind_at =
+        |ip: usize| -> Option<u8> { ta_plan.access.get(&ip).map(|&j| ta_plan.pins[j as usize].kind) };
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        let ip = s + off;
+        let ok = match *instr {
+            // Pure value/control ops the register tiers emit inline. None can
+            // reach user code, allocate or GC.
+            Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::Move { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Bitwise { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::Return { .. }
+            | Instr::ReturnUndefined
+            | Instr::ToPropKey { .. } => true,
+            // `Math.imul` is a native `imul` on every tier that admits it.
+            Instr::MathOp { op: MathFn::Imul, argc: 2, .. } => true,
+            // A PINNED element read is an inline load (TA raw element or a
+            // tag-guarded dense-Array Value) — reads grow nothing.
+            Instr::GetIndex { .. } => pin_kind_at(ip).is_some(),
+            // A PINNED element write is admitted only for a real TypedArray
+            // kind: the store lands in a fixed buffer and can never grow or
+            // realloc it. A dense-Array store (which CAN grow the Vec) is not
+            // a TA kind and refuses here — as it already declines the
+            // register tiers.
+            Instr::SetIndex { .. } => pin_kind_at(ip).is_some_and(|k| k < 9),
+            // A pinned `.length` read (string units / dense-Array len).
+            Instr::GetProp { .. } => {
+                matches!(pin_kind_at(ip), Some(STR_PIN_KIND) | Some(ARR_INT_PIN_KIND))
+            }
+            // A pinned `charCodeAt` (direct byte load) or DV `get*` (inline
+            // guarded byte load) — no user code, no allocation, cannot
+            // detach/resize. Any OTHER CallMethod can run arbitrary user code
+            // (incl. `transfer()` / `resize()`) and refuses the whole region.
+            Instr::CallMethod { .. } => {
+                matches!(pin_kind_at(ip), Some(STR_PIN_KIND) | Some(DV_PIN_KIND))
+            }
+            _ => false,
+        };
+        if !ok {
+            return out;
+        }
+    }
+    // Per-pin: the source must have no in-region write. `writes_reg` (the
+    // emitter-grade cover: CallMethod/MathOp/GetProp/GetIndex dsts included)
+    // is total over the whitelist above, so "no def found" is a proof here,
+    // not a hint.
+    for (j, pin) in ta_plan.pins.iter().enumerate() {
+        let has_access = ta_plan
+            .access
+            .iter()
+            .any(|(&ip, &jj)| jj as usize == j && ip >= s && ip <= e);
+        if !has_access {
+            continue; // no in-region access — an entry guard would only cost
+        }
+        let stable = match pin.src {
+            TaPinSrc::Global(g) => !code[s..=e].iter().any(|i| {
+                matches!(*i,
+                    Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. } if idx == g)
+            }),
+            TaPinSrc::Reg(r) => !code[s..=e].iter().any(|i| writes_reg(i) == Some(r)),
+        };
+        if stable {
+            out.insert(j as u8);
+        }
+    }
+    out
+}
+
 pub(crate) fn plan_region(
     proto: &FuncProto,
     start: u32,
@@ -194,6 +361,7 @@ pub(crate) fn plan_region(
         admit_bitwise,
         admit_split,
         admit_wt_share,
+        false,
         &FxHashSet::default(),
     )
 }
@@ -203,6 +371,14 @@ pub(crate) fn plan_region(
 /// natively, so they neither define a home's value nor constrain its type, and
 /// letting them into the walks would only make the planner decline a region
 /// whose hot path is perfectly typed.
+///
+/// `share_homes`: force the linear-scan home-reuse allocation even when
+/// one-home-per-value would fit the xmm pool (B119). The GPR emitter's pool is
+/// far smaller than the 14 xmm homes, so `region_int` re-plans with this set
+/// after a GPR pool overflow: `shareable` temps then collapse onto a few homes
+/// and an ENCLOSING region of a loop nest (which carries the inner loop's
+/// counters and temps too) can fit the GPR pool. Same soundness argument as
+/// the >POOL case below — only `shareable` registers ever share.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_region_cold(
     proto: &FuncProto,
@@ -212,16 +388,18 @@ pub(crate) fn plan_region_cold(
     admit_bitwise: bool,
     admit_split: bool,
     admit_wt_share: bool,
+    share_homes: bool,
     cold: &FxHashSet<usize>,
 ) -> Option<RegionPlan> {
     match plan_region_cold_inner(
-        proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, cold, true,
+        proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, share_homes,
+        cold, true,
     ) {
         PlanOutcome::Plan(p) => Some(*p),
         PlanOutcome::RetryNoHoist => {
             match plan_region_cold_inner(
-                proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, cold,
-                false,
+                proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share,
+                share_homes, cold, false,
             ) {
                 PlanOutcome::Plan(p) => Some(*p),
                 _ => None,
@@ -255,6 +433,9 @@ fn plan_region_cold_inner(
     // B97's shareable/no-entry-load allocation stays double-only.
     admit_split: bool,
     admit_wt_share: bool,
+    // Force home reuse below the xmm-pool overflow point — see
+    // `plan_region_cold`'s doc (B119: refitting a region to the GPR pool).
+    share_homes: bool,
     cold: &FxHashSet<usize>,
     // See `PlanOutcome::RetryNoHoist`: `false` on the retry pass — no constant
     // is hoisted, so none pins a permanent home.
@@ -1184,6 +1365,42 @@ fn plan_region_cold_inner(
     }
     hoist_ips.sort_unstable();
 
+    // ── W7 pinned-guard hoisting ── which pins can drop their per-access
+    // identity compare for one entry check (see `hoistable_pins` for the full
+    // predicate), and which pinned-STRING `.length` reads can then leave the
+    // body entirely. A hoisted length behaves exactly like a hoisted constant
+    // (prologue fill, permanent home, no entry load, body op skipped), so it
+    // reuses the `hoisted` machinery under the same conditions — including
+    // `allow_hoist`, so the pool-pressure retry releases its home too.
+    let hoist_pins = hoistable_pins(proto, s, e, ta_plan, cold);
+    let mut hoist_len_ips: Vec<usize> = Vec::new();
+    if allow_hoist && !hoist_pins.is_empty() {
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            let ip = s + off;
+            let Instr::GetProp { dst, .. } = *instr else { continue };
+            let Some(&j) = ta_plan.access.get(&ip) else { continue };
+            // STRINGS only: immutable, so length is a constant once identity
+            // holds (entry-guarded — `hoist_pins` membership is the
+            // precondition). A dense-Array length is also region-stable under
+            // the predicate, but its GetProp dst is not typed as a def today
+            // (it rides the ro_live_in path), so it fails `first_seen` below
+            // and keeps its per-iteration read.
+            if !hoist_pins.contains(&j) || ta_plan.pins[j as usize].kind != STR_PIN_KIND {
+                continue;
+            }
+            if def_count.get(&dst) == Some(&1)
+                && first_seen.get(&dst) == Some(&true)
+                && used.contains(&dst)
+                && !dead.contains(&dst)
+                && runs_every_iteration(code, s, e, ip)
+            {
+                hoist_len_ips.push(ip);
+                hoisted.insert(dst);
+            }
+        }
+        hoist_len_ips.sort_unstable();
+    }
+
     // Exact values of single-def integer-constant regs (hoisted or not): used by
     // the analysis entry state, the Mul strength reduction and the gpr mirrors.
     let mut const_vals: FxHashMap<u16, i64> = FxHashMap::default();
@@ -1430,7 +1647,10 @@ fn plan_region_cold_inner(
     // failure mode and keeps what reuse is for — letting a loop with more live
     // numeric values than the 14-home pool reach the register tiers at all,
     // instead of declining to the memory path.
-    let reuse = n_numeric > POOL;
+    // `share_homes` (B119) forces reuse below the overflow point: the caller is
+    // refitting this region to the GPR emitter's much smaller pool, where the
+    // ILP cost of sharing is not the trade — staying on xmm homes is.
+    let reuse = share_homes || n_numeric > POOL;
 
     // ── allocate xmm/gpr homes ──
     let mut reg_home: FxHashMap<u16, Home> = FxHashMap::default();
@@ -1669,6 +1889,8 @@ fn plan_region_cold_inner(
         split_recv_lg,
         dv_flag_elide,
         dv_flag_fuse,
+        hoist_pins,
+        hoist_len_ips,
     }))
 }
 

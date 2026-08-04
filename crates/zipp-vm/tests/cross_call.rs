@@ -7,8 +7,13 @@
 //!
 //! Every expectation below was executed in node (v24) as a script and diffs
 //! byte-identical. The whole file must also pass with `ZIPP_NO_CROSSCALL=1`
-//! (empty cross plan ⇒ the unchanged `call_ic` helper at every site) and with
-//! `ZIPP_NOJIT=1` — the CI-side way to prove the three routes agree.
+//! (empty cross plan ⇒ the unchanged `call_ic` helper at every site), with
+//! `ZIPP_NO_CROSSCALL2=1` (the W7 window-fill fast path off ⇒ every callee
+//! window fully zero-filled, the pre-W7 helper), with `ZIPP_NOJIT=1`, and
+//! under `ZIPP_GC_STRESS=1` (a collection at every safe point — the W7
+//! `set_len` fill is GC-load-bearing: every exposed slot must hold a valid
+//! `Value`, so the stress mode sweeps the stale windows the fast fill leaves
+//! behind) — the CI-side way to prove the routes agree.
 //!
 //! Iteration counts are chosen to cross the fn-JIT threshold with margin, so
 //! the callers and callees are Tier-C compiled while the loop is still
@@ -155,6 +160,82 @@ fn arity_mismatch_and_hoisted_undefined_locals() {
         "#,
     );
     assert_eq!(out, ["arity:4:undefined|4:5", "hoist:undefinedundefined"]); // node v24
+}
+
+#[test]
+fn stale_window_uninit_locals_read_undefined() {
+    // W7 window-fill catcher: `x` is written at ODD depths only, and the top
+    // call alternates 4/5, so a given callee WINDOW alternates between "x
+    // written" and "x never written" across iterations. Once the register
+    // file's high-water mark is reached, the fast fill exposes the previous
+    // iteration's window WITHOUT zeroing — `x` (may-read-before-write) must
+    // still read `undefined`, i.e. the `cross_uninit_mask` analysis must have
+    // flagged it. An unsound skip returns the previous iteration's value.
+    let out = run_ok(
+        r#"
+        "use strict";
+        function wA(n) { var x; if ((n & 1) === 1) x = n + 1000; return "" + x + "|" + wB(n); }
+        function wB(n) { if (n <= 0) return "E"; return wA(n - 1); }
+        var accA = "";
+        for (var i = 0; i < 60000; i++) { var r = wA(4 + (i & 1)); if (i < 2 || i > 59997) accA += r + ";"; }
+        console.log("stale:" + accA);
+        "#,
+    );
+    assert_eq!(
+        out,
+        ["stale:undefined|1003|undefined|1001|undefined|E;1005|undefined|1003|undefined|1001|undefined|E;undefined|1003|undefined|1001|undefined|E;1005|undefined|1003|undefined|1001|undefined|E;"]
+    ); // node v24
+}
+
+#[test]
+fn gc_heavy_callees_allocate_over_stale_windows() {
+    // The zero-fill change is GC-LOAD-BEARING: every Add here allocates a
+    // rope in a Tier-C cross-called callee while the caller windows above the
+    // truncation point hold STALE bytes from previous iterations. Under
+    // `ZIPP_GC_STRESS=1` every safe point collects and scans those windows —
+    // valid-but-stale `Value`s are retention-conservative and safe; anything
+    // else corrupts. The conditional `t` also alternates written/unwritten at
+    // the same window depth (the mask must catch it while allocation churns).
+    let out = run_ok(
+        r#"
+        "use strict";
+        function sA(n, s) { var t; if ((n & 1) === 0) t = "A" + n; return sB(n - 1, s + (t ? t : "_")); }
+        function sB(n, s) { if (n <= 0) return s; return sA(n - 1, s + n); }
+        var h = 0, first = "", last = "";
+        for (var i = 0; i < 60000; i++) {
+          var r2 = sA(6 + (i & 1), "s");
+          h = (h * 31 + r2.length) | 0;
+          if (i === 0) first = r2;
+          if (i === 59999) last = r2;
+        }
+        console.log("gcstale:" + first + "/" + last + "/" + h);
+        "#,
+    );
+    assert_eq!(out, ["gcstale:sA65A43A21A0/s_6_4_2_/228481856"]); // node v24
+}
+
+#[test]
+fn alternating_arity_missing_args_stay_undefined() {
+    // Missing-argument catcher for the W7 fast fill: the same call SITE (and
+    // the same reused window) alternates argc 3 / argc 2, so parameter `c`
+    // holds a stale `7` from the previous iteration when the short call
+    // arrives. The dataflow assumes params are entry-defined — the helper's
+    // per-call `[1+n, 1+params)` zeroing is what makes that true; skipping it
+    // would print the stale 7.
+    let out = run_ok(
+        r#"
+        "use strict";
+        function mA(a, b, c) { return "" + a + b + c + mB(a); }
+        function mB(n) { if (n <= 0) return "!"; return mA(n - 1, n); }
+        var accC = "";
+        for (var i = 0; i < 60000; i++) { var r3 = (i & 1) ? mA(2, 3, 7) : mA(2, 3); if (i > 59997) accC += r3 + ";"; }
+        console.log("arity2:" + accC);
+        "#,
+    );
+    assert_eq!(
+        out,
+        ["arity2:23undefined12undefined01undefined!;23712undefined01undefined!;"]
+    ); // node v24
 }
 
 #[test]

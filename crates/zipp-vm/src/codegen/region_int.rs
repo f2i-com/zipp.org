@@ -283,6 +283,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         true,
         int_split_enabled(),
         false,
+        false,
         &cold,
     ) {
         Some(p) => p,
@@ -304,10 +305,10 @@ pub(crate) fn compile_region_int_maybe_cold(
     // transfers per op on the xmm-home emitter below; when the region is inside
     // the bounded scope of `region_int_gpr` (no cold blocks, no split/wt/DV
     // plan features, live set fits the GPR pool), emit with GPR homes instead.
-    // A None here (out of scope) falls through to the xmm emitter unchanged.
+    // An out-of-scope decline falls through to the xmm emitter unchanged.
     // Off-switch: ZIPP_NO_GPR_HOMES=1.
     if cold.is_empty() && gpr_homes_enabled() {
-        if let Some(f) = compile_region_int_gpr(
+        match compile_region_int_gpr(
             proto,
             start,
             end,
@@ -317,7 +318,50 @@ pub(crate) fn compile_region_int_maybe_cold(
             &plan,
             meter,
         ) {
-            return Some(f);
+            GprAttempt::Emitted(f) => return Some(f),
+            // ── B119 nested-loop residual ── the ENCLOSING region of a loop
+            // nest carries the inner loop's counters and temps too, so
+            // one-home-per-value overflows the small GPR pool even though most
+            // of those homes never overlap (the nested xorshift outer counted
+            // 13 homes against 8 gprs while the inner fit with 8). Re-plan
+            // with forced home sharing — the same proven linear-scan reuse
+            // that already serves >14-home xmm regions — and try once more:
+            // this is what lets the OUTER region itself go GPR instead of
+            // compiling on xmm homes and shadowing the engaged GPR inner
+            // (OSR enters the outer back-edge once it compiles, so whichever
+            // tier hosts the outer hosts the whole nest). The xmm fallback
+            // below keeps the ORIGINAL distinct-homes plan either way.
+            // Off-switch: ZIPP_NO_GPR_NEST=1 (retry only).
+            GprAttempt::PoolOverflow if gpr_nest_enabled() => {
+                if let Some(shared) = plan_region_cold(
+                    proto,
+                    start,
+                    end,
+                    ta_plan,
+                    true,
+                    int_split_enabled(),
+                    false,
+                    true,
+                    &cold,
+                ) {
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!("[jit] INT-GPR nest retry [{start},{end}]: shared-home re-plan");
+                    }
+                    if let GprAttempt::Emitted(f) = compile_region_int_gpr(
+                        proto,
+                        start,
+                        end,
+                        globals_base_helper,
+                        ta_plan,
+                        ta_snapshot,
+                        &shared,
+                        meter,
+                    ) {
+                        return Some(f);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     let mut ops = match dynasmrt::x64::Assembler::new() {
@@ -393,6 +437,18 @@ pub(crate) fn compile_region_int_maybe_cold(
             ; call rax
         );
     }
+    // ── W7 hoisted pin identity guards ── one check per hoisted pin, HERE,
+    // instead of a source-load+compare at every access. The snapshot was just
+    // taken FROM the source, so `source == obj_bits` holds by construction and
+    // the region provably cannot change either (see `hoistable_pins`); the one
+    // thing left to check is snapshot VALIDITY — a declined snapshot is
+    // {0,0,0}. A miss takes `entry_bail` like any failed entry guard: no
+    // flush, resume at the header, counts as a deopt (chronic → evict).
+    for j in 0..ta_plan.pins.len() {
+        if plan.hoist_pins.contains(&(j as u8)) {
+            dynasm!(ops ; cmp QWORD [rsp + ta_base + 32 * j as i32], 0 ; je => entry_bail);
+        }
+    }
     // Live-in globals/regs into i64 homes: an Int-tagged Value sign-extends, an
     // integral double in [-2^53, 2^53] converts, anything else takes entry_bail.
     for &(gi, x) in &plan.live_in_globs {
@@ -426,6 +482,20 @@ pub(crate) fn compile_region_int_maybe_cold(
             dynasm!(ops ; mov Rq(g), QWORD v);
         }
     }
+    // ── W7 hoisted pinned-STRING lengths ── the pin's identity is entry-
+    // guarded above and the region cannot change it, so the snapshot `units`
+    // IS `str.length` for the whole run: fill the dst home once; the body op
+    // is skipped (exactly like a hoisted constant).
+    for &hip in &plan.hoist_len_ips {
+        if let Instr::GetProp { dst, .. } = proto.code[hip] {
+            let j = ta_plan.access[&hip] as usize;
+            let d = xh(&plan, dst);
+            dynasm!(ops
+                ; mov rax, [rsp + ta_base + 32 * j as i32 + 16]
+                ; movq Rx(d), rax
+            );
+        }
+    }
     dynasm!(ops ; jmp => lbl(start, &in_region));
 
     // ── body ──
@@ -455,6 +525,12 @@ pub(crate) fn compile_region_int_maybe_cold(
             if plan.hoisted.contains(&dst) {
                 continue;
             }
+        }
+        // A W7-hoisted pinned-STRING length: the prologue filled its home from
+        // the snapshot once. Like a hoisted constant, nothing is emitted, so
+        // flags and the copy tracker survive.
+        if plan.hoist_len_ips.contains(&ip) {
+            continue;
         }
         // Dead-code elimination: skip a pure value op whose result is never read
         // (a `dead` reg — see plan_region). All int-region ops are side-effect-free
@@ -797,13 +873,20 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let kx = xh(&plan, key);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: a hoisted pin's identity was checked ONCE at entry and
+                // the region provably cannot change it — only the semantic
+                // bounds/tag guards remain per access (see `hoistable_pins`).
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]           // receiver vs snapshot obj_bits
+                        ; jne => deopt
+                    );
                 }
                 dynasm!(ops
-                    ; cmp rax, [rsp + off]               // receiver vs snapshot obj_bits
-                    ; jne => deopt
                     ; movq rcx, Rx(kx)                   // index (i64 home, integral)
                     ; cmp rcx, [rsp + off + 16]          // unsigned: i < len (catches <0)
                     ; jae => deopt
@@ -850,13 +933,18 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let vx = xh(&plan, val);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]
+                        ; jne => deopt
+                    );
                 }
                 dynasm!(ops
-                    ; cmp rax, [rsp + off]
-                    ; jne => deopt
                     ; movq rcx, Rx(kx)
                     ; cmp rcx, [rsp + off + 16]
                     ; jae => deopt
@@ -912,13 +1000,18 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let kx = xh(&plan, arg_base);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]           // receiver identity vs snapshot
+                        ; jne => deopt
+                    );
                 }
                 dynasm!(ops
-                    ; cmp rax, [rsp + off]               // receiver identity vs snapshot
-                    ; jne => deopt
                     ; movq rcx, Rx(kx)                   // index (i64 home, integral)
                     ; cmp rcx, [rsp + off + 16]          // unsigned: i < units (catches <0/OOB)
                     ; jae => deopt                       // OOB → deopt (interp yields NaN)
@@ -949,23 +1042,36 @@ pub(crate) fn compile_region_int_maybe_cold(
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
                 let d = xh(&plan, dst);
-                let deopt = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: for a hoisted pin the identity is entry-guarded and the
+                // length cannot change in-region, so this collapses to a bare
+                // snapshot read — no guard, no deopt path. (A fully hoisted
+                // STRING length never even reaches here — `hoist_len_ips`
+                // skipped the op; this is the multi-def / on-a-branch / Array
+                // length residue.)
+                if plan.hoist_pins.contains(&(j as u8)) {
+                    dynasm!(ops
+                        ; mov rax, [rsp + off + 16]      // units / len
+                        ; movq Rx(d), rax
+                    );
+                } else {
+                    let deopt = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]           // receiver identity vs snapshot
+                        ; jne => deopt
+                        ; mov rax, [rsp + off + 16]      // units == str.length
+                        ; movq Rx(d), rax
+                        ; jmp => done
+                        ; => deopt
+                        ; mov DWORD [rsi], ip as i32
+                        ; jmp => flush_exit
+                        ; => done
+                    );
                 }
-                dynasm!(ops
-                    ; cmp rax, [rsp + off]               // receiver identity vs snapshot
-                    ; jne => deopt
-                    ; mov rax, [rsp + off + 16]          // units == str.length
-                    ; movq Rx(d), rax
-                    ; jmp => done
-                    ; => deopt
-                    ; mov DWORD [rsi], ip as i32
-                    ; jmp => flush_exit
-                    ; => done
-                );
                 copy_clobber(&mut lc, d);
                 lc = None;
             }
@@ -1067,6 +1173,17 @@ pub(crate) fn compile_region_int_maybe_cold(
             return None;
         }
     };
+    // W7 attribution: code-byte length with pins, so the hoist's size delta is
+    // one grep away (run again under ZIPP_NO_GUARD_HOIST=1 and diff the line).
+    if !ta_plan.pins.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] INT region [{start},{end}] guard-hoist pins={}/{} len-fills={} code={}b",
+            plan.hoist_pins.len(),
+            ta_plan.pins.len(),
+            plan.hoist_len_ips.len(),
+            buf.len()
+        );
+    }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }

@@ -269,10 +269,14 @@ impl<'p> Vm<'p> {
     ///   is — `setup_call` and this helper both leave `len` at the window end
     ///   — but a mismatch deopts rather than trusts).
     ///
-    /// GC: the callee window is exposed by `resize` (zero-filling to
-    /// `undefined`, exactly the interpreter's window init), so `self.regs.len()`
-    /// covers every live native window and the root set stays complete even
-    /// when the callee re-enters the interpreter through its own helpers.
+    /// GC: the callee window is exposed under `self.regs.len()` BEFORE the
+    /// callee runs (zero-filling resize on new ground; `set_len` over the
+    /// already-initialized high-water region on the W7 fast fill, with the
+    /// may-read-before-write registers explicitly re-zeroed — see the fill
+    /// comment in the body), so `len` covers every live native window and the
+    /// root set stays complete even when the callee re-enters the interpreter
+    /// through its own helpers. Every exposed slot always holds a valid
+    /// `Value` (stale at worst — retention-conservative, never forged bits).
     /// `self.regs` never reallocates (`regs_would_overflow` guard + pinned
     /// capacity), so the caller's window pointer stays valid.
     ///
@@ -304,7 +308,7 @@ impl<'p> Vm<'p> {
             HeapObj::Closure { func, .. } => (*func, cv.heap_index()),
             _ => return SELF_CALL_DEOPT,
         };
-        let entry = match self.jit.cross_entry(fid) {
+        let (entry, uninit_mask) = match self.jit.cross_entry(fid) {
             Some(e) => e,
             None => return SELF_CALL_DEOPT,
         };
@@ -362,13 +366,54 @@ impl<'p> Vm<'p> {
             self.osr_deopt_exempt = true;
             return CALL_THREW;
         }
-        // Zero-fill = the interpreter's window init (a body may legally read an
-        // unwritten local as `undefined`), and it keeps `len` spanning the
-        // window so the GC root set stays complete. Capacity is pinned — this
-        // never reallocates.
-        self.regs.resize(needed, Value::UNDEFINED);
-        self.regs[new_base] = this_v;
+        // Window init. The interpreter zero-fills the whole window (a body may
+        // legally read an unwritten local as `undefined`); re-zeroing all
+        // `reg_count` slots per call measured ~2.7ns of the ~19ns cross-call
+        // residual (W7 census). When the window lies UNDER the high-water mark
+        // (`regs_hw` — every slot below it was zero-initialized once and has
+        // only ever been overwritten with live `Value`s since), expose it with
+        // `set_len` and zero ONLY what the callee can observe as uninitialized:
+        //   * `uninit_mask` — the compile-time may-read-before-write register
+        //     set (`cross_uninit_mask`, a must-def dataflow over the CLOSED
+        //     Tier-C op set; `u64::MAX` = analysis declined → full fill). Every
+        //     other register is proven def-before-use on every path from entry,
+        //     and Tier C stores every def to the window (memory tier), so an
+        //     interpreter resume after a mid-body bail sees the same defs.
+        //   * missing arguments `[1+n, 1+params)` — the dataflow assumes params
+        //     are entry-defined; short calls must make that true.
+        // GC-COMPLETENESS (the B117 argument, unchanged): `len` spans the
+        // window BEFORE the callee runs, and every exposed slot holds a valid
+        // (possibly stale) `Value` — the root set stays complete, merely
+        // over-approximate, exactly like the `jit_self_call_impl` precedent.
+        // The safe point above ran at `len == new_base`, so no stale slot is
+        // ever scanned before this call's own `this`/args land.
         let n = argc.min(params);
+        if uninit_mask != u64::MAX && needed <= self.regs_hw {
+            // SAFETY: needed ≤ regs_hw ≤ capacity; [0..regs_hw] was initialized
+            // by an earlier resize and the buffer is pinned, so these slots are
+            // live, valid `Value`s.
+            unsafe { self.regs.set_len(needed) };
+            let mut m = uninit_mask;
+            while m != 0 {
+                let r = m.trailing_zeros() as usize;
+                self.regs[new_base + r] = Value::UNDEFINED;
+                m &= m - 1;
+            }
+            for r in (1 + n)..(1 + params) {
+                self.regs[new_base + r] = Value::UNDEFINED;
+            }
+            crate::vm::helpers_misc::crossstats::fill_fast();
+        } else {
+            // Full zero-fill: new ground past the high-water mark, or the
+            // analysis declined (`ZIPP_NO_CROSSCALL2` forces this arm — the
+            // mask is pinned to `u64::MAX` at install time).
+            self.regs.resize(needed, Value::UNDEFINED);
+            if needed > self.regs_hw {
+                self.regs_hw = needed;
+            }
+            crate::vm::helpers_misc::crossstats::fill_full();
+        }
+        self.regs[new_base] = this_v;
         for i in 0..n {
             // SAFETY: args points to `argc` valid Value bits (the caller's
             // staged contiguous arg registers); n ≤ argc.

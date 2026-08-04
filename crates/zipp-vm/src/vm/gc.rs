@@ -15,6 +15,19 @@
 //!      safe point) turns any such miss into an immediate corpus/test262 failure.
 //!   3. Collection only happens at a dispatch-loop safe point with `gc_lock == 0`,
 //!      so no native built-in is holding an un-rooted `Vec<Value>` working set.
+//!
+//! Two collection kinds since the stage-1 nursery (NURSERY_DESIGN.md §6,
+//! step 2 — `ZIPP_NO_NURSERY=1` restores majors-only exactly):
+//!   * MAJOR — the historical collection, unchanged: full mark, sweep
+//!     `floor..len`, whole-table side-table retains.
+//!   * MINOR — the SAME full mark (every root, every edge — so `marks` is
+//!     exact liveness, no remembered set exists and no write barrier exists
+//!     anywhere), but the sweep walks only the alloc log (slots allocated
+//!     since the last collection) and side-table pruning touches only the
+//!     slots that sweep actually freed. An unreachable OLD object is left in
+//!     place as FLOATED garbage: sound by construction (its slot is neither
+//!     freed nor reused, so no stale state can ever surface), and bounded by
+//!     the float census in `Heap::note_minor_done`, which schedules majors.
 
 use super::{Microtask, Resume, Vm};
 use crate::heap::{GenState, HeapObj};
@@ -42,6 +55,9 @@ impl Vm<'_> {
     /// Pin everything allocated so far (called once, after setup + hoisting).
     pub(crate) fn set_gc_floor(&mut self) {
         self.gc_floor = self.heap.len() as u32;
+        // The boot allocations just pinned are also all over the young log;
+        // drop them so the first minor doesn't walk them to find them marked.
+        self.heap.young_reset();
     }
 
     /// Suspend GC for the returned guard's scope (see [`GcGuard`]).
@@ -94,6 +110,9 @@ impl Vm<'_> {
             self.heap.note_gc_done(n);
             return;
         }
+        // Minor or major? Decided up front (the mark below is identical for
+        // both); `Heap::minor_due` holds the whole policy.
+        let minor = self.heap.minor_due(self.gc_stress);
         // `ZIPP_GCSTATS=1`: per-phase timing, printed at exit. B81 measured the
         // per-allocation cost rising 74.5 -> 122.5ns purely from a larger live
         // set, which says the collector dominates — but NOT which phase of it.
@@ -474,7 +493,24 @@ impl Vm<'_> {
 
         // --- Sweep + prune -------------------------------------------------
         let mut swept = 0usize;
-        if oracle {
+        let mut freed: Vec<u32> = Vec::new();
+        let mut floated = 0usize;
+        if minor {
+            // Stage-1 BARRIER-FREE MINOR: sweep only the young log; skip the
+            // `floor..n` walk entirely. `marks` is exact (full mark above),
+            // so everything unmarked is truly garbage — the young part is
+            // freed now, the old part floats until the major the census
+            // below schedules.
+            swept = self.heap.sweep_young(&marks, &mut freed);
+            // Float census, exact: occupied slots the mark proved dead but
+            // the young-only sweep left in place. `marks` counts the pinned
+            // prefix and the force-marked free tombstones; subtracting the
+            // tombstones leaves reachable-or-pinned, and occupied minus THAT
+            // is the floated mass.
+            let marked = marks.iter().filter(|&&m| m).count();
+            let occupied = n - self.heap.free_indices().len();
+            floated = occupied - (marked - free_before);
+        } else if oracle {
             // B6 oracle: split the swept walk by generation. `alloc_log`-style
             // young slot count comes from the walk itself (free tombstones read
             // old — they were freed at a previous collection, so their stale
@@ -526,6 +562,22 @@ impl Vm<'_> {
             }
         }
         let t_sweep = gcstats::now(stats);
+        if minor {
+            // A minor prunes only what it FREED (see `prune_freed`); the
+            // whole-table retains below are the major's.
+            self.prune_freed(&freed);
+            let free_after = self.heap.free_indices().len();
+            gcstats::record(stats, minor, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
+            gcstats::record_minor(swept as u64, floated as u64, n);
+            self.heap.note_minor_done(n - free_after, floated);
+            if self.heap.oracle_on() {
+                self.heap.oracle_next_epoch();
+            }
+            if shape_verify::enabled() {
+                self.verify_all_shapes();
+            }
+            return;
+        }
         // Drop side-table entries whose keyed object was reclaimed.
         self.proto_of.retain(|&k, _| marks[k as usize]);
         // Derived-ctor `this` state: a thrown-off constructor leaves these
@@ -597,7 +649,19 @@ impl Vm<'_> {
         self.realm_globals.retain(|&k, _| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
-        gcstats::record(stats, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
+        gcstats::record(stats, minor, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
+        // Floated-swept estimate (stats only): what this major freed that was
+        // NOT allocated in the current epoch — i.e. garbage the minors before
+        // it had already been unable to reclaim. Read before `note_gc_done`
+        // clears the young log.
+        let swept_floated = if stats && self.heap.nursery_on() {
+            let swept_young =
+                self.heap.young_log().iter().filter(|&&i| !marks[i as usize]).count();
+            (swept - swept_young) as u64
+        } else {
+            0
+        };
+        gcstats::record_major(swept_floated, n);
         self.heap.note_gc_done(n - free_after);
         if self.heap.oracle_on() {
             // B6 oracle: this collection is now "the last GC" — survivors age out.
@@ -606,6 +670,151 @@ impl Vm<'_> {
         if shape_verify::enabled() {
             self.verify_all_shapes();
         }
+    }
+
+    /// Minor-collection side-table prune: drop entries keyed by a slot FREED
+    /// BY THIS MINOR — the only pruning a minor needs. The major's whole-table
+    /// `retain` passes exist so a slot returned to the free list never
+    /// resurfaces with a dead occupant's state (a recycled slot inheriting a
+    /// TDZ mark, a frozen length, a brand). A minor frees only unmarked YOUNG
+    /// slots, so: an entry keyed by a live object must stay (identical to the
+    /// major — `marks` is exact), and an entry keyed by floated garbage
+    /// CANNOT need pruning here, because its slot was not freed, cannot be
+    /// reused before some major frees it, and that major prunes it through
+    /// the unchanged retain path.
+    ///
+    /// Cost shape: each table pays `min(table, freed)` instead of the major's
+    /// unconditional whole-table walk — scan whichever side is smaller. The
+    /// std tables compare `capacity()` because their `retain` walks bucket
+    /// capacity (which never shrinks after a burst); `SlotTable::retain`
+    /// walks live entries, so those compare `len()`.
+    fn prune_freed(&mut self, freed: &[u32]) {
+        if freed.is_empty() {
+            return;
+        }
+        let mut freed_bits = vec![false; self.heap.len()];
+        for &i in freed {
+            freed_bits[i as usize] = true;
+        }
+        // Slot-keyed std HashMap: per-slot removes, unless the table's own
+        // walk is cheaper.
+        macro_rules! prune_map {
+            ($t:expr) => {
+                if !$t.is_empty() {
+                    if $t.capacity() <= freed.len() {
+                        $t.retain(|&k, _| !freed_bits[k as usize]);
+                    } else {
+                        for i in freed {
+                            $t.remove(i);
+                        }
+                    }
+                }
+            };
+        }
+        // Same, for slot-keyed std HashSet (one-argument retain closure).
+        macro_rules! prune_set {
+            ($t:expr) => {
+                if !$t.is_empty() {
+                    if $t.capacity() <= freed.len() {
+                        $t.retain(|&k| !freed_bits[k as usize]);
+                    } else {
+                        for i in freed {
+                            $t.remove(i);
+                        }
+                    }
+                }
+            };
+        }
+        // Same, for `SlotTable` (dense retain walk, O(1) removes).
+        macro_rules! prune_slots {
+            ($t:expr) => {
+                if !$t.is_empty() {
+                    if $t.len() <= freed.len() {
+                        $t.retain(|&k, _| !freed_bits[k as usize]);
+                    } else {
+                        for i in freed {
+                            $t.remove(i);
+                        }
+                    }
+                }
+            };
+        }
+        // One entry per retain in the major block above, same order, so the
+        // two lists can be diffed against each other. A table missing here
+        // would hand a recycled slot its dead occupant's state.
+        prune_slots!(self.proto_of);
+        prune_set!(self.this_tdz);
+        prune_set!(self.super_called);
+        prune_map!(self.super_this);
+        prune_map!(self.prototypes);
+        prune_slots!(self.fn_props);
+        prune_slots!(self.arr_props);
+        prune_slots!(self.regexp_result_props);
+        prune_map!(self.zdt_tz);
+        prune_map!(self.temporal_cal);
+        // Tuple-keyed — cannot be removed by slot alone; the set holds at
+        // most a few deleted name/length intrinsics, so scan it.
+        if !self.deleted_callable_intrinsics.is_empty() {
+            self.deleted_callable_intrinsics.retain(|&(k, _)| !freed_bits[k as usize]);
+        }
+        prune_set!(self.array_length_nonwritable);
+        prune_slots!(self.array_js_len);
+        prune_map!(self.ab_max);
+        prune_set!(self.ta_tracking);
+        prune_set!(self.dv_tracking);
+        prune_map!(self.regexp_string_iters);
+        let brand_entries = self.method_brand.len() + self.instance_brand.len();
+        prune_map!(self.method_brand);
+        prune_map!(self.instance_brand);
+        // Keyed by brand id, pruned on its VALUE (the owning class slot).
+        if !self.brand_owner.is_empty() {
+            self.brand_owner.retain(|_, &mut c| !freed_bits[c as usize]);
+        }
+        prune_map!(self.closure_eval_scope);
+        prune_map!(self.eval_scope_parent);
+        prune_map!(self.shadow_fn_realm);
+        prune_map!(self.private_fields);
+        // The declared-name recompute (the major runs it whenever the table
+        // is non-empty) only shrinks when its source maps did; when no brand
+        // entry died this minor it is the identity and is skipped. Deferring it further is safe regardless:
+        // brand ids are minted from a monotone counter (`next_private_brand`)
+        // and never recycled, so a stale record can never be misread — it is
+        // memory, reclaimed at the next recompute.
+        if !self.brand_private_names.is_empty()
+            && self.method_brand.len() + self.instance_brand.len() != brand_entries
+        {
+            let mut live_brands: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for bs in self.method_brand.values() {
+                live_brands.extend(bs.iter().copied());
+            }
+            for bs in self.instance_brand.values() {
+                live_brands.extend(bs.iter().copied());
+            }
+            self.brand_private_names.retain(|b, _| live_brands.contains(b));
+        }
+        prune_set!(self.shared_buffers);
+        prune_set!(self.immutable_buffers);
+        prune_set!(self.error_data);
+        prune_slots!(self.arguments_objs);
+        // Dies with EITHER endpoint: the generator (key) or its arguments
+        // object (value).
+        if !self.gen_args_obj.is_empty() {
+            self.gen_args_obj
+                .retain(|&k, &mut v| !freed_bits[k as usize] && !freed_bits[v as usize]);
+        }
+        prune_set!(self.fn_name_cells);
+        prune_set!(self.const_cells);
+        prune_map!(self.gen_callee);
+        prune_set!(self.module_body_results);
+        prune_map!(self.module_namespaces);
+        prune_map!(self.closure_home);
+        prune_map!(self.closure_new_target);
+        prune_map!(self.dispose_stacks);
+        prune_map!(self.regexp_exact_source);
+        prune_map!(self.collection_index);
+        prune_set!(self.async_stacks);
+        prune_set!(self.shadow_realms);
+        prune_map!(self.realm_globals);
     }
 
     /// Check every live object's shape against its actual layout, panicking on
@@ -906,6 +1115,19 @@ mod gcstats {
     static ALLOCED: AtomicU64 = AtomicU64::new(0);
     static TRACE_YOUNG: AtomicU64 = AtomicU64::new(0);
     static TRACE_OLD: AtomicU64 = AtomicU64::new(0);
+    // Stage-1 nursery split. The counters/peaks update UNCONDITIONALLY — a
+    // handful of relaxed atomics per COLLECTION (collections are rare; this
+    // is nothing next to the mark), which lets the bounded-heap tests read
+    // them without env plumbing. The ns/floated-swept pieces ride the
+    // `ZIPP_GCSTATS` gate like every other timing.
+    static MINORS: AtomicU64 = AtomicU64::new(0);
+    static MAJORS: AtomicU64 = AtomicU64::new(0);
+    static PEAK_SLOTS: AtomicU64 = AtomicU64::new(0);
+    static MINOR_SWEPT: AtomicU64 = AtomicU64::new(0);
+    static FLOAT_PEAK: AtomicU64 = AtomicU64::new(0);
+    static FLOATED_SWEPT: AtomicU64 = AtomicU64::new(0);
+    static NS_MINOR: AtomicU64 = AtomicU64::new(0);
+    static NS_MAJOR: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub(super) fn enabled() -> bool {
@@ -928,6 +1150,7 @@ mod gcstats {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         on: bool,
+        minor: bool,
         slots: usize,
         live: usize,
         swept: usize,
@@ -948,9 +1171,45 @@ mod gcstats {
         NS_TRACE.fetch_add((c - b).as_nanos() as u64, Ordering::Relaxed);
         NS_SWEEP.fetch_add((d - c).as_nanos() as u64, Ordering::Relaxed);
         NS_RETAIN.fetch_add((end - d).as_nanos() as u64, Ordering::Relaxed);
+        let kind = if minor { &NS_MINOR } else { &NS_MAJOR };
+        kind.fetch_add((end - a).as_nanos() as u64, Ordering::Relaxed);
         SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
         LIVE.fetch_add(live as u64, Ordering::Relaxed);
         SWEPT.fetch_add(swept as u64, Ordering::Relaxed);
+    }
+
+    /// Unconditional per-MINOR accounting (see the statics' comment).
+    pub(super) fn record_minor(swept_young: u64, floated: u64, slots: usize) {
+        MINORS.fetch_add(1, Ordering::Relaxed);
+        MINOR_SWEPT.fetch_add(swept_young, Ordering::Relaxed);
+        FLOAT_PEAK.fetch_max(floated, Ordering::Relaxed);
+        PEAK_SLOTS.fetch_max(slots as u64, Ordering::Relaxed);
+    }
+
+    /// Unconditional per-MAJOR accounting (`floated_swept` is stats-gated by
+    /// the caller — computing it costs a young-log walk).
+    pub(super) fn record_major(floated_swept: u64, slots: usize) {
+        MAJORS.fetch_add(1, Ordering::Relaxed);
+        FLOATED_SWEPT.fetch_add(floated_swept, Ordering::Relaxed);
+        PEAK_SLOTS.fetch_max(slots as u64, Ordering::Relaxed);
+    }
+
+    /// Stage-1 nursery totals: `(minors, majors, minor_ms, major_ms,
+    /// swept_young, floated_swept, float_peak, peak_slots)`. The ms and
+    /// floated-swept fields are 0 unless `ZIPP_GCSTATS=1`.
+    pub fn dump_nursery() -> (u64, u64, f64, f64, u64, u64, u64, u64) {
+        let g = |x: &AtomicU64| x.load(Ordering::Relaxed);
+        let ms = |x: u64| x as f64 / 1.0e6;
+        (
+            g(&MINORS),
+            g(&MAJORS),
+            ms(g(&NS_MINOR)),
+            ms(g(&NS_MAJOR)),
+            g(&MINOR_SWEPT),
+            g(&FLOATED_SWEPT),
+            g(&FLOAT_PEAK),
+            g(&PEAK_SLOTS),
+        )
     }
 
     /// B6 oracle: record one collection's generational split. Only called with
@@ -1038,3 +1297,4 @@ mod shape_verify {
 
 pub use gcstats::dump as gc_stats;
 pub use gcstats::dump_gen as gc_gen_stats;
+pub use gcstats::dump_nursery as gc_nursery_stats;

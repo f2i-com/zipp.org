@@ -107,6 +107,17 @@ pub(crate) fn compile_region_regalloc(
             ; call rax
         );
     }
+    // ── W7 hoisted pin identity guards ── one snapshot-validity check per
+    // hoisted pin replaces the per-access source load + compare: the snapshot
+    // was just taken FROM the source, and `hoistable_pins` proved the region
+    // cannot write the source nor run anything that could detach/resize/grow
+    // the pinned object. A miss takes `entry_bail` exactly like a failed
+    // live-in type guard (no flush, resume at the header, counts as a deopt).
+    for j in 0..ta_plan.pins.len() {
+        if plan.hoist_pins.contains(&(j as u8)) {
+            dynasm!(ops ; cmp QWORD [rsp + ta_base + 32 * j as i32], 0 ; je => entry_bail);
+        }
+    }
     // Load live-in globals (guarded) and live-in registers (guarded).
     for &(gi, x) in &plan.live_in_globs {
         dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]);
@@ -510,13 +521,20 @@ pub(crate) fn compile_region_regalloc(
                 let kx = xh(&plan, key);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: a hoisted pin's identity was checked ONCE at entry and
+                // the region provably cannot change it — only the semantic
+                // index/bounds/tag guards remain per access.
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]        // receiver vs snapshot obj_bits
+                        ; jne => deopt
+                    );
                 }
                 dynasm!(ops
-                    ; cmp rax, [rsp + off]            // receiver vs snapshot obj_bits
-                    ; jne => deopt
                     ; cvttsd2si rcx, Rx(kx)           // index = trunc(key home)
                     ; cvtsi2sd xmm0, rcx
                     ; ucomisd xmm0, Rx(kx)
@@ -558,13 +576,18 @@ pub(crate) fn compile_region_regalloc(
                 let vx = xh(&plan, val);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]
+                        ; jne => deopt
+                    );
                 }
                 dynasm!(ops
-                    ; cmp rax, [rsp + off]
-                    ; jne => deopt
                     ; cvttsd2si rcx, Rx(kx)
                     ; cvtsi2sd xmm0, rcx
                     ; ucomisd xmm0, Rx(kx)
@@ -630,13 +653,20 @@ pub(crate) fn compile_region_regalloc(
                 let px = xh(&plan, arg_base);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
-                match ta_plan.pins[j].src {
-                    TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
-                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                // W7: identity hoisted to entry for a hoisted pin (see the
+                // GetIndex arm); the pos/bounds guards — the RangeError
+                // semantics — stay per access.
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]        // receiver vs snapshot obj_bits
+                        ; jne => deopt
+                    );
                 }
                 dynasm!(ops
-                    ; cmp rax, [rsp + off]            // receiver vs snapshot obj_bits
-                    ; jne => deopt
                     ; cvttsd2si rcx, Rx(px)           // pos = trunc(pos home)
                     ; cvtsi2sd xmm0, rcx
                     ; ucomisd xmm0, Rx(px)
@@ -850,6 +880,16 @@ pub(crate) fn compile_region_regalloc(
             return None;
         }
     };
+    // W7 attribution: code-byte length with pins, so the hoist's size delta is
+    // one grep away (run again under ZIPP_NO_GUARD_HOIST=1 and diff the line).
+    if !ta_plan.pins.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] DOUBLE region [{start},{end}] guard-hoist pins={}/{} code={}b",
+            plan.hoist_pins.len(),
+            ta_plan.pins.len(),
+            buf.len()
+        );
+    }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }
