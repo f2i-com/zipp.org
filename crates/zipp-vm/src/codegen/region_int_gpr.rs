@@ -69,6 +69,23 @@ pub(crate) fn gpr_homes_enabled() -> bool {
     }
 }
 
+/// Kill switch: `ZIPP_NO_DV_GPR=1` disables the W9 DataView-on-GPR-homes
+/// hosting (the `region_int` DV retry and this emitter's DV arms). The region
+/// then falls to the DOUBLE tier's B115 DV arm exactly as before the wave.
+pub(crate) fn dv_gpr_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_DV_GPR").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Kill switch: `ZIPP_NO_GPR_NEST=1` disables ONLY the B119 shared-home
 /// re-plan after a [`GprAttempt::PoolOverflow`] (see `compile_region_int`) —
 /// a region that fits the pool one-home-per-value still engages, restoring
@@ -181,11 +198,18 @@ fn gpr_home_map(
     // Out of scope: any plan feature whose write-through/flush interplay was
     // only ever proven against the other emitters. B94 split receivers are in
     // scope since W8 (per-def write-through mirrored from the xmm INT emitter;
-    // `ZIPP_NO_GPR_SPLIT=1` restores the refusal); B97 write-through sharing
-    // and DV flag fusion stay out.
-    if !plan.write_through.is_empty()
+    // `ZIPP_NO_GPR_SPLIT=1` restores the refusal). W9 brings DV flag fusion
+    // (the DV arm emits the fused compare on integer homes) and B97
+    // write-through sharing (every def site now write-throughs — the generic
+    // hook plus explicit calls in the writes_reg-blind CallMethod/MathOp/DV
+    // arms; flush and lazy_sx already treated `write_through` like splits) IN
+    // scope, both only under `dv_gpr_enabled()`: the `region_int` DV retry is
+    // the only INT caller that plans with either, so `ZIPP_NO_DV_GPR=1`
+    // restores the exact pre-W9 surface.
+    if ((!plan.write_through.is_empty()
         || !plan.dv_flag_elide.is_empty()
-        || !plan.dv_flag_fuse.is_empty()
+        || !plan.dv_flag_fuse.is_empty())
+        && !dv_gpr_enabled())
         || (!gpr_split_enabled()
             && (!plan.split_recvs.is_empty() || !plan.split_recv_lg.is_empty()))
     {
@@ -388,6 +412,9 @@ fn lazy_sx_sets(
         if plan.hoist_len_ips.contains(&ip) {
             continue; // prologue-filled above; body op skipped
         }
+        if plan.dv_flag_elide.contains(&ip) {
+            continue; // W9: elided Eq — the DV arm emits the compare inline
+        }
         match proto.code[ip] {
             // i32 payloads by region admission (body op or prologue fill).
             Instr::LoadInt { .. } | Instr::LoadConst { .. } => {}
@@ -460,7 +487,26 @@ fn lazy_sx_sets(
             }
             // Pinned element reads sign-extend an i32 (Int payload / i32
             // element); pinned charCodeAt zero-extends a byte. Both i32.
-            Instr::GetIndex { .. } | Instr::CallMethod { .. } => {}
+            Instr::GetIndex { .. } => {}
+            // W9: DV get* kinds 0-5 land in i32 range (census-neutral, like
+            // charCodeAt); a getUint32 (kind 6) ranges to 2^32-1 and is NOT
+            // i32-provable — its home is WIDE, or a consumer's lazy movsxd
+            // would sign-mangle values > i32::MAX. charCodeAt maps to no DV
+            // kind and stays neutral.
+            Instr::CallMethod { dst, name, .. } => {
+                if proto
+                    .string_constants
+                    .get(name as usize)
+                    .and_then(|k| dv_get_kind(k))
+                    == Some(6)
+                {
+                    if let Some(&Home::Xmm(dx)) = plan.reg_home.get(&dst) {
+                        if let Some(&dh) = map.get(&dx) {
+                            wide.insert(dh);
+                        }
+                    }
+                }
+            }
             // Anything else that writes a numeric home is WIDE: Add/Sub/Mul/
             // Mod/Neg (i53 results), pinned lengths, and any op this emitter
             // does not know (it would decline the region at emission anyway).
@@ -902,6 +948,11 @@ pub(crate) fn compile_region_int_gpr(
         // A W7-hoisted pinned-STRING length was prologue-filled — skip the
         // body op (nothing emitted, so flags survive like a hoisted const).
         if plan.hoist_len_ips.contains(&ip) {
+            continue;
+        }
+        // W9: a DV-flag-fused Eq is ELIDED — the DV arm at ip+1 emits the
+        // compare inline (nothing emitted here, so flags survive).
+        if plan.dv_flag_elide.contains(&ip) {
             continue;
         }
         if let Some(d) = writes_reg(&proto.code[ip]) {
@@ -1457,6 +1508,154 @@ pub(crate) fn compile_region_int_gpr(
                     ; jmp => flush_exit
                     ; => done
                 );
+                // W9: writes_reg is blind to CallMethod, so the generic
+                // write-through hook below never fires for this def — emit it
+                // explicitly (a membership no-op unless dst is a split or
+                // W9-wt-shared register). 0..255 is provably i32.
+                emit_int_wt_gpr(&mut ops, plan, &map, dst, true);
+            }
+            // ── W9: pinned-DataView get* on GPR homes ── the B115 DOUBLE arm's
+            // guard set MINUS the integral-pos cvttsd2si round-trip (every home
+            // here is an integral i64 by the tier's own invariant — the priced
+            // saving) and MINUS the cvtsi2sd landing (the load lands directly
+            // in the dst home, 64-bit canonical). Int-lane kinds only — the
+            // planner declines 7/8 on this path. All-or-nothing: nothing is
+            // written before the deopt, so re-execution is sound and the
+            // interpreter raises whatever the miss stands for (RangeError for
+            // OOB pos, TypeError for a detached buffer — a detached/shrunk/
+            // non-DV receiver snapshots {0,0,0} and misses identity). Scratch:
+            // rax/rcx/rdx only (r8-r11 may be Bool or numeric homes).
+            Instr::CallMethod { dst, arg_base, argc, name, .. }
+                if ta_plan
+                    .access
+                    .get(&ip)
+                    .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND) =>
+            {
+                let kindid = match proto
+                    .string_constants
+                    .get(name as usize)
+                    .and_then(|k| dv_get_kind(k))
+                {
+                    Some(k) if k <= 6 => k,
+                    _ => {
+                        decline_emit(format_args!(
+                            "int-gpr-emit-unhandled: {:?}",
+                            proto.code[ip]
+                        ));
+                        return GprAttempt::OutOfScope;
+                    }
+                };
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let size = [1i32, 1, 1, 2, 2, 4, 4, 4, 8][kindid as usize];
+                let d = g(dst);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]           // receiver identity vs snapshot
+                        ; jne => deopt
+                    );
+                }
+                emit_src64_canon(&mut ops, src(arg_base), 1, &lazy); // rcx = pos, canonical i64
+                dynasm!(ops
+                    ; test rcx, rcx
+                    ; js => deopt                        // negative → RangeError (interp)
+                    ; mov rdx, [rsp + off + 16]          // byteLength
+                    ; sub rdx, size
+                    ; cmp rcx, rdx                       // signed: pos > byteLength - size
+                    ; jg => deopt                        //  (incl. byteLength < size)
+                    ; mov rdx, [rsp + off + 8]           // pinned base (data + byteOffset)
+                );
+                let le_big = ops.new_dynamic_label();
+                let loaded = ops.new_dynamic_label();
+                if size > 1 {
+                    if let Some(&(fa, fb)) = plan.dv_flag_fuse.get(&ip) {
+                        // Fused adjacent Eq on INTEGER homes: a canonical
+                        // signed compare — no NaN case, so no `jp` (the DOUBLE
+                        // arm's ucomisd needs one; integer homes cannot hold
+                        // NaN). Unequal → false → big-endian. Scratches only
+                        // rax (immediate forms) — rcx/rdx stay live.
+                        emit_icmp_flags_gpr(&mut ops, src(fa), src(fb), &lazy);
+                        dynasm!(ops ; jne => le_big);
+                    } else if argc == 2 {
+                        // The flag is a Bool gpr home holding 0/1 — `test` IS
+                        // ToBoolean here, exactly as on the DOUBLE tier (B22).
+                        let lg = gh(plan, arg_base + 1);
+                        dynasm!(ops ; test Rq(lg), Rq(lg) ; jz => le_big);
+                    } else {
+                        // Absent flag = undefined = big-endian.
+                        dynasm!(ops ; jmp => le_big);
+                    }
+                }
+                // ── little-endian load ── directly into the dst home, 64-bit
+                // canonical: movsx/movsxd sign-extend the signed kinds; a
+                // 32-bit-register write zero-extends the unsigned ones (zext ==
+                // canonical for u8/u16/u32 — all within ±2^53, exit boxing
+                // picks Int vs double).
+                match kindid {
+                    0 => dynasm!(ops ; movsx Rq(d), BYTE [rdx + rcx]),
+                    1 => dynasm!(ops ; movzx Rd(d), BYTE [rdx + rcx]),
+                    3 => dynasm!(ops ; movsx Rq(d), WORD [rdx + rcx]),
+                    4 => dynasm!(ops ; movzx Rd(d), WORD [rdx + rcx]),
+                    5 => dynasm!(ops ; movsxd Rq(d), DWORD [rdx + rcx]),
+                    _ => dynasm!(ops ; mov Rd(d), DWORD [rdx + rcx]), // 6: u32
+                }
+                if size > 1 {
+                    dynasm!(ops ; jmp => loaded ; => le_big);
+                    // ── big-endian load (byte-swapped) ── staged through eax
+                    // for the 16-bit rol, direct for the 32-bit bswap. The
+                    // final write is always a 64-bit-canonical form.
+                    match kindid {
+                        3 => dynasm!(ops
+                            ; movzx eax, WORD [rdx + rcx]
+                            ; rol ax, 8
+                            ; movsx Rq(d), ax
+                        ),
+                        4 => dynasm!(ops
+                            ; movzx eax, WORD [rdx + rcx]
+                            ; rol ax, 8
+                            ; movzx Rd(d), ax
+                        ),
+                        5 => dynasm!(ops
+                            ; mov eax, [rdx + rcx]
+                            ; bswap eax
+                            ; movsxd Rq(d), eax
+                        ),
+                        _ => dynasm!(ops
+                            ; mov Rd(d), [rdx + rcx]
+                            ; bswap Rd(d)                // 32-bit op: zero-extends
+                        ),
+                    }
+                    dynasm!(ops ; => loaded);
+                }
+                // A FUSED access resumes at the ELIDED Eq (ip-1): the
+                // interpreter recomputes the flag into the frame slot — which
+                // native code never writes — then re-runs the call. flush_exit
+                // canonicalizes lazy operand homes first, so the re-executed
+                // Eq reads the values it would have read.
+                let resume_ip =
+                    if plan.dv_flag_fuse.contains_key(&ip) { ip - 1 } else { ip };
+                dynasm!(ops
+                    ; jmp => done
+                    ; => deopt
+                );
+                emit_store_ip(&mut ops, ip_slot, resume_ip as i32);
+                dynasm!(ops
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                // A DV dst can be a split receiver's numeric half, and
+                // writes_reg is blind to CallMethod so the generic post-op
+                // write-through hook never fires — emit it explicitly (a
+                // membership no-op otherwise). Kinds 0-5 are provably i32;
+                // kind 6 (u32) takes the generic box.
+                emit_int_wt_gpr(&mut ops, plan, &map, dst, kindid <= 5);
             }
             // ── pinned length ── str.length / arr.length from the snapshot.
             Instr::GetProp { dst, .. }
@@ -1523,6 +1722,10 @@ pub(crate) fn compile_region_int_gpr(
                 if !folded && !lazy.contains(&d) {
                     dynasm!(ops ; movsxd Rq(d), Rd(d));
                 }
+                // W9: writes_reg is blind to MathOp, so the generic hook never
+                // fires for an Imul def — write through explicitly (membership
+                // no-op otherwise). An imul result is ToInt32 — provably i32.
+                emit_int_wt_gpr(&mut ops, plan, &map, dst, true);
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 emit_store_ip(&mut ops, ip_slot, ip as i32);

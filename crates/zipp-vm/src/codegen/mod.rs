@@ -725,6 +725,30 @@ fn fnjit_mem_enabled() -> bool {
     std::env::var_os("ZIPP_NO_FNJIT_MEM").is_none()
 }
 
+/// W9 tier-selection yield (B121's "Tier C SHADOWS the region tier"): while a
+/// function owns a LIVE register-homed loop region (SROA/INT/DOUBLE — anything
+/// but MEM, whose per-op code equals Tier C's by construction, B107), the
+/// whole-function offer is DECLINED and an already-installed Tier C body is
+/// EVICTED when such a region lands. The interpreter's back-edge then keeps
+/// entering the region (fn-scoped fnv1a: 10.6 → 3.2 ns/iter measured) instead
+/// of Tier C's mem-homed loop shadowing it forever — Tier C's back-edge is a
+/// bare `jmp` that never checks for a region. Memoized: the decline check runs
+/// once per CALL of a shadowed function. `ZIPP_NO_TIERC_YIELD=1` restores the
+/// old behaviour.
+fn tierc_yield_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_YIELD").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Same-binary A/B switch for the W7 cross-call residual trim (the window-fill
 /// fast path): `ZIPP_NO_CROSSCALL2=1` pins every installed cross entry's
 /// uninit mask to `u64::MAX`, so the helper zero-fills the whole callee window
@@ -1179,6 +1203,16 @@ pub struct Jit {
     /// Parked regions are freed only when the VM drops. Bounded: each loop key
     /// evicts at most twice (int retry, then blacklist).
     retired: Vec<Region>,
+    /// W9: per-func count of LIVE register-homed regions (`!is_mem` — SROA,
+    /// INT/GPR, DOUBLE). Non-zero declines the Tier C offer for that func
+    /// (see [`tierc_yield_enabled`]). Maintained at every `regions`
+    /// insert/remove/drain — see `note_reg_region_installed`/`_removed`; a
+    /// missed decrement would silently suppress Tier C forever, so both
+    /// helpers debug-assert against a recount.
+    fn_reg_region: Vec<u32>,
+    /// Funcs whose yield-decline was already logged (JITLOG only — keeps the
+    /// per-call decline from spamming one line per call).
+    yield_logged: FxHashSet<u32>,
 }
 
 impl Jit {
@@ -1219,6 +1253,9 @@ impl Jit {
     pub fn set_meter(&mut self, m: meter::Meter) {
         self.meter = Some(m);
         self.retired.extend(self.regions.drain().map(|(_, r)| r));
+        // No regions remain live, so the W9 per-func region census resets too
+        // — a stale count would suppress Tier C for a metered VM forever.
+        self.fn_reg_region.clear();
         self.compiled.clear();
         self.counts.clear();
         self.region_counts.clear();
@@ -1487,6 +1524,108 @@ impl Jit {
         v[i] = 1;
     }
 
+    /// W9: `true` iff `func_id` owns at least one LIVE register-homed region.
+    /// One dense array read — safe on the per-call decline path.
+    #[inline]
+    pub fn has_reg_region(&self, func_id: u32) -> bool {
+        self.fn_reg_region
+            .get(func_id as usize)
+            .copied()
+            .unwrap_or(0)
+            != 0
+    }
+
+    /// W9: should the whole-function offer for `func_id` be declined because a
+    /// live register-homed region already serves its hot loop? Called on every
+    /// threshold trip of a shadowed function (the trip recurs via
+    /// [`Jit::compile_defer`]), so it is one memoized-switch read plus one
+    /// dense array read. The caller must `compile_defer` on `true` — declining
+    /// without re-arming permanently disarms the offer (B65).
+    #[inline]
+    pub fn should_yield_to_region(&mut self, func_id: u32) -> bool {
+        let y = tierc_yield_enabled() && self.has_reg_region(func_id);
+        if y
+            && std::env::var_os("ZIPP_JITLOG").is_some()
+            && self.yield_logged.insert(func_id)
+        {
+            eprintln!("[jit] Tier C fn{func_id} DECLINED (yield: live reg-homed region)");
+        }
+        y
+    }
+
+    /// W9 accounting: a region was just installed for `func_id`.
+    fn note_reg_region_installed(&mut self, func_id: u32, is_mem: bool) {
+        if is_mem {
+            return;
+        }
+        let i = func_id as usize;
+        if self.fn_reg_region.len() <= i {
+            self.fn_reg_region.resize(i + 1, 0);
+        }
+        self.fn_reg_region[i] += 1;
+        debug_assert_eq!(
+            self.fn_reg_region[i] as usize,
+            self.regions
+                .iter()
+                .filter(|(&(f, _), r)| f == func_id && !r.is_mem)
+                .count()
+        );
+    }
+
+    /// W9 accounting: `r` was just removed from `regions` for `func_id`.
+    fn note_reg_region_removed(&mut self, func_id: u32, r: &Region) {
+        if r.is_mem {
+            return;
+        }
+        if let Some(c) = self.fn_reg_region.get_mut(func_id as usize) {
+            debug_assert!(*c > 0);
+            *c = c.saturating_sub(1);
+        }
+        debug_assert_eq!(
+            self.fn_reg_region
+                .get(func_id as usize)
+                .copied()
+                .unwrap_or(0) as usize,
+            self.regions
+                .iter()
+                .filter(|(&(f, _), rr)| f == func_id && !rr.is_mem)
+                .count()
+        );
+    }
+
+    /// W9: a register-homed region just landed for `func_id` — if a Tier C
+    /// body is installed, evict it (park + reset to cold, the `acc_way_gate`
+    /// recipe) so the interpreter's back-edge can enter the region on
+    /// subsequent calls. Tier A bodies (a baked `self_binding`) keep their
+    /// code: their shape is recursion, not the shadowed loop. No deopt
+    /// sentinel is needed: this runs from an interpreted activation (the
+    /// region compile is only reachable from the interpreter's back-edge), so
+    /// at worst a stale outer native activation finishes on parked code once.
+    fn yield_tier_c_to_region(&mut self, func_id: u32) {
+        if !tierc_yield_enabled() {
+            return;
+        }
+        let is_tier_c = self
+            .compiled
+            .get(&func_id)
+            .is_some_and(|f| f.self_binding().is_none());
+        if !is_tier_c {
+            return;
+        }
+        if let Some(f) = self.compiled.remove(&func_id) {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!("[jit] Tier C fn{func_id} EVICTED (yield: reg-homed region landed)");
+            }
+            self.retired_fns.push(f);
+            self.counts.remove(&func_id);
+            self.set_fn_state(func_id, FN_COLD);
+            self.clear_cross_entry(func_id);
+            if self.self_cache.is_some_and(|(id, _)| id == func_id) {
+                self.self_cache = None;
+            }
+        }
+    }
+
     /// Count a back-edge to the loop headed at `entry_ip`. Returns `true` exactly
     /// once, when the count crosses `OSR_THRESHOLD` and the region is neither
     /// compiled nor blacklisted — the caller should then attempt `compile_region`.
@@ -1600,6 +1739,8 @@ impl Jit {
                             key,
                             Region { code, start, end, deopts: 0, ok_runs: 0, is_int, is_mem: false, field_plan: Some(plan) },
                         );
+                        self.note_reg_region_installed(func_id, false);
+                        self.yield_tier_c_to_region(func_id);
                         return;
                     }
                 }
@@ -1618,6 +1759,8 @@ impl Jit {
                 }
                 self.regions
                     .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, is_mem: false, field_plan: None });
+                self.note_reg_region_installed(func_id, false);
+                self.yield_tier_c_to_region(func_id);
                 return;
             }
         }
@@ -1648,6 +1791,10 @@ impl Jit {
                 }
                 self.regions
                     .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: false, is_mem, field_plan: None });
+                self.note_reg_region_installed(func_id, is_mem);
+                if !is_mem {
+                    self.yield_tier_c_to_region(func_id);
+                }
             }
             None => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -1706,6 +1853,7 @@ impl Jit {
             // running (a call helper re-entered the interpreter, which looped
             // back into the region and deopted it) — see `retired`.
             if let Some(r) = self.regions.remove(&key) {
+                self.note_reg_region_removed(key.0, &r);
                 self.retired.push(r);
             }
             if retry {
@@ -1826,6 +1974,7 @@ impl Jit {
                         key.0, key.1, m.op_ip
                     );
                 }
+                self.note_reg_region_removed(key.0, &r);
                 self.retired.push(r);
                 self.region_counts.remove(&key);
             }

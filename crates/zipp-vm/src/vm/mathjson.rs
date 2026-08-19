@@ -863,6 +863,20 @@ impl<'p> Vm<'p> {
     /// flushed as UTF-8 slices). Allocates heap objects/arrays/strings.
     pub(crate) fn json_parse(&mut self, src: &[u8]) -> Result<Value, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
+        // W9 static pretenure (NURSERY_DESIGN.md §4): the parsed tree is the
+        // measured pretenure case (B119's oracle: json-large's 48% old-trace
+        // share with ~zero old→young stores), so the whole builder allocates
+        // OLD. No user code runs inside this scope (the reviver path,
+        // `internalize_json`, is deliberately OUTSIDE it), so no GC-visible
+        // young value can be created and missed here. Manual begin/end pair —
+        // the error path must unwind the depth too.
+        self.heap.pretenure_begin();
+        let r = self.json_parse_scoped(src);
+        self.heap.pretenure_end();
+        r
+    }
+
+    fn json_parse_scoped(&mut self, src: &[u8]) -> Result<Value, Thrown> {
         let mut i = 0;
         json_skip_ws(src, &mut i);
         let v = self.json_parse_value(src, &mut i)?;
@@ -1112,6 +1126,15 @@ impl<'p> Vm<'p> {
     /// raw JSON text of every value (for the parse-with-source reviver context).
     pub(crate) fn json_parse_with_src(&mut self, src: &[u8]) -> Result<(Value, JsonSrc), Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JsonParse);
+        // W9 static pretenure — same scope as `json_parse`; the reviver runs
+        // later, outside this call, so its results stay young.
+        self.heap.pretenure_begin();
+        let r = self.json_parse_with_src_scoped(src);
+        self.heap.pretenure_end();
+        r
+    }
+
+    fn json_parse_with_src_scoped(&mut self, src: &[u8]) -> Result<(Value, JsonSrc), Thrown> {
         let mut i = 0;
         json_skip_ws(src, &mut i);
         let r = self.json_parse_value_src(src, &mut i)?;

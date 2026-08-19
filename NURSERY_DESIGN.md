@@ -222,6 +222,19 @@ minor at every safe point AND a major every N minors; `ZIPP_SHAPE_VERIFY` runs o
 4. Pretenuring: static (JSON.parse/parser) first, site-sampled dynamic after —
    gated specifically on json-large/markdown not regressing in stage 3.
 
+**Outcome (W9, B122): DEFAULT-ON.** Stage 4's static half landed (JSON.parse's
+tree and String.split's parts, a `pretenure_begin/end` depth on `Heap`), and the
+young-budget sweep this doc ordered ("swept empirically") INVERTED §2's window
+guess: 16384 beat the 64k default by −1.94% [−2.57, −0.34] with larger budgets
+monotonically worse — frequent cheap minors keep the recycled-slot window
+cache-hot, the same crossover the GC_GROWTH sweep found for majors. With both,
+the default retrial measured net **−0.70% [−0.99, −0.48]** (regex −6.3/−7.1%,
+json −4.3/−4.4%, markdown −1.3/−2.1%, replicated) against two named sub-2%
+trades (async +1.1/+1.2%, map-set +1.8/+1.9%), and the default flipped —
+`ZIPP_NO_NURSERY=1` is now the opt-OUT. §2's prediction that churn rows want a
+LARGER budget is recorded as refuted; async is the one row that behaves as
+predicted (its knee is below 16k: 8192 measured +7.6% on it).
+
 Biggest risk: an unenumerated old→young store (the §1 table claims completeness
 against trace_edges' arm list, but §1 case 6's "a dozen VM sites" is where the audit
 lives or dies), surfacing as rare corruption. Mitigation is the stress mode in both

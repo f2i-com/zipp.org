@@ -2210,16 +2210,21 @@ pub struct Heap {
     /// collection, so no slot is handed out twice in one epoch. Never pushed
     /// unless the nursery is latched on.
     young: Vec<u32>,
-    /// Latched PRESENCE of `ZIPP_NURSERY=1` (read once at construction) — the
+    /// Latched ABSENCE of `ZIPP_NO_NURSERY` (read once at construction) — the
     /// single gate on the young log, the generation bytes, the write barrier
-    /// and the minor/major decision. OPT-IN: stage 1 default-on was REFUTED
-    /// by per-row ablation (B120 — async +3.6%, polymorphic +3.1%, markdown
-    /// +2.1%, CIs excluding zero, against json −1.5%): a stage-1 minor still
-    /// paid the FULL mark. Stage 3 (this remset + the young-only trace in
-    /// `vm/gc.rs`) is what changes those economics; the default is re-priced
-    /// at the suite gate, not here. `false` is the pre-nursery collector
-    /// exactly: every collection is a major, and `alloc` never touches
-    /// `young`/`gen`.
+    /// and the minor/major decision. DEFAULT-ON since W9 (B122): with the
+    /// 16k young budget and static pretenure, the one-binary 21-pair retrial
+    /// measured net **−0.70% [−0.99, −0.48]** and its 5-row replication
+    /// −2.15% [−3.07, −1.35] — regex −6.3/−7.1%, json −4.3/−4.4%, markdown
+    /// −1.3/−2.1% both times, against two named sub-2% trades (async
+    /// +1.1/+1.2%, map-set +1.8/+1.9%, §14's B113/B115 footing). The two
+    /// prior refutations stand as history: stage 1's default was refuted at
+    /// B120 (a minor still paid the full mark) and stage 3's at B121 (64k
+    /// budget, no pretenure — markdown +6.2%); the budget sweep and the
+    /// pretenured builders are what changed the economics. `ZIPP_NURSERY=1`
+    /// is accepted as a no-op for compatibility with wave 7-8 scripts.
+    /// `ZIPP_NO_NURSERY=1` is the pre-nursery collector exactly: every
+    /// collection is a major, and `alloc` never touches `young`/`gen`.
     nursery: bool,
     /// Stage-3 generation byte per slot, parallel to `objs` (EMPTY unless the
     /// nursery is latched — every reader is gated on `self.nursery`). Low two
@@ -2261,6 +2266,21 @@ pub struct Heap {
     major_due: bool,
     /// Minor collections since the last major (the scheduling backstop).
     minors_since_major: u32,
+    /// W9: allocations between minor collections. [`NURSERY_YOUNG_BUDGET`]
+    /// unless `ZIPP_NURSERY_YOUNG_BUDGET=<n>` overrides it (latched once at
+    /// construction; values below 1024 are ignored as certainly-wrong). Only
+    /// read under `self.nursery`, so the default build is bit-identical.
+    young_budget: usize,
+    /// W9 static-pretenure depth (NURSERY_DESIGN.md §4): while non-zero,
+    /// `alloc` stamps new slots OLD-clean and skips the young log — used by
+    /// the builtin builders whose output is measured to survive minors
+    /// wholesale (JSON.parse's tree, String.prototype.split's parts). A depth,
+    /// not a bool: scopes nest. Stays 0 (and the mechanism inert) under
+    /// `ZIPP_NO_PRETENURE=1` or when the nursery is dark.
+    pretenure: u32,
+    /// Latched absence of `ZIPP_NO_PRETENURE` — the escape hatch that keeps
+    /// the nursery trial one-binary.
+    pretenure_on: bool,
 }
 
 /// Stage-3 generation states (low two bits of a `Heap::gen` byte).
@@ -2305,9 +2325,20 @@ const GC_GROWTH: usize = 3;
 /// Stage-3 nursery scheduling (NURSERY_DESIGN.md §2): allocations between
 /// MINOR collections. A minor's cost is O(young live + roots + remset), not
 /// O(heap), so it can afford to run far more often than a major — this is the
-/// slot-recycling cadence §2 argues is the design's locality upside. 64k is
-/// the top of the design doc's 16-64k window and equals `GC_MIN_THRESHOLD`,
-/// so the FIRST collection fires exactly where today's collector fires.
+/// slot-recycling cadence §2 argues is the design's locality upside.
+///
+/// 16k, by measurement — the W9 sweep executed §2's own "swept empirically"
+/// instruction and INVERTED its "larger budget spares churn rows" guess:
+/// against the previous 64k default (nursery on both sides, six affected
+/// rows), 16384 measured **−1.94% [−2.57, −0.34]** (markdown −6.1%,
+/// polymorphic −4.2%, json −2.9%, regex −2.6%) while 131072 was +1.31% and
+/// 262144 +3.64% — smaller-and-cheaper minors keep the recycled slot window
+/// hot, the same cache-locality crossover the GC_GROWTH sweep above found for
+/// majors. 8192 overshoots: async +7.6% (its reaction records die young but
+/// not THAT young). async/map-set prefer fewer minors at every point — the
+/// flip's named trades. `ZIPP_NURSERY_YOUNG_BUDGET=<n>` overrides for
+/// sweeps. `GC_MIN_THRESHOLD` still gates the FIRST collection, so startup
+/// is unchanged.
 ///
 /// An unreachable OLD object is not freed by a minor — it FLOATS, occupying
 /// its slot until a major. With the young-only trace the float mass can no
@@ -2319,7 +2350,7 @@ const GC_GROWTH: usize = 3;
 /// from the last major's TRUE live count, never from a float-inflated
 /// occupied count (B120's float-discount fix: churn rows stop compounding
 /// the schedule off garbage they merely failed to sweep).
-const NURSERY_YOUNG_BUDGET: usize = 1 << 16;
+const NURSERY_YOUNG_BUDGET: usize = 1 << 14;
 
 /// Backstop: run a major at least every 64th collection even if the occupied
 /// count never crosses `major_at`, so major-only hygiene (the
@@ -2356,10 +2387,17 @@ impl Heap {
         let live = objs.len();
         let oracle = std::env::var_os("ZIPP_GCSTATS").is_some();
         let born = if oracle { vec![0; objs.len()] } else { Vec::new() };
-        let nursery = std::env::var_os("ZIPP_NURSERY").is_some()
-            && std::env::var_os("ZIPP_NO_NURSERY").is_none();
+        // Default-on since W9 (B122) — see the `nursery` field doc. The
+        // ZIPP_NURSERY opt-in from waves 7-8 is subsumed (harmless if set).
+        let nursery = std::env::var_os("ZIPP_NO_NURSERY").is_none();
         // The pre-interned prefix is pinned and immutable — OLD from birth.
         let gen = if nursery { vec![GEN_OLD; objs.len()] } else { Vec::new() };
+        let young_budget = std::env::var("ZIPP_NURSERY_YOUNG_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v >= 1024)
+            .unwrap_or(NURSERY_YOUNG_BUDGET);
+        let pretenure_on = std::env::var_os("ZIPP_NO_PRETENURE").is_none();
         Heap {
             objs,
             versions,
@@ -2380,6 +2418,33 @@ impl Heap {
             major_at: GC_MIN_THRESHOLD,
             major_due: false,
             minors_since_major: 0,
+            young_budget,
+            pretenure: 0,
+            pretenure_on,
+        }
+    }
+
+    /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
+    /// matching [`Heap::pretenure_end`], every allocation is stamped OLD-clean
+    /// and skipped from the young log. Callers must pair begin/end on every
+    /// path OUT of the scope including errors: a leaked depth silently turns
+    /// the whole remaining run old-space. The wrong-guess cost is a float
+    /// until the next major, never a copy, which is what licenses scoping
+    /// whole builders. Inert unless the nursery is latched on (`alloc` only
+    /// reads the depth under `self.nursery`).
+    #[inline]
+    pub fn pretenure_begin(&mut self) {
+        if self.pretenure_on {
+            self.pretenure += 1;
+        }
+    }
+
+    /// W9: leave a static-pretenure scope. See [`Heap::pretenure_begin`].
+    #[inline]
+    pub fn pretenure_end(&mut self) {
+        if self.pretenure_on {
+            debug_assert!(self.pretenure > 0, "unbalanced pretenure_end");
+            self.pretenure = self.pretenure.saturating_sub(1);
         }
     }
 
@@ -2395,13 +2460,24 @@ impl Heap {
             self.objs[idx as usize] = obj;
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
             if self.nursery {
-                self.young.push(idx);
-                // Clears every bit: a recycled slot sheds the dead occupant's
-                // remset/scan state (the scan_roots prune keys off this).
-                self.gen[idx as usize] = GEN_YOUNG;
+                if self.pretenure == 0 {
+                    self.young.push(idx);
+                    // Clears every bit: a recycled slot sheds the dead occupant's
+                    // remset/scan state (the scan_roots prune keys off this).
+                    self.gen[idx as usize] = GEN_YOUNG;
+                } else {
+                    // W9 static pretenure: OLD-clean, not logged — the minor
+                    // never sees it; `gen == GEN_YOUNG ⇔ in the young log`
+                    // holds by both halves being false. Clears GEN_SCAN too,
+                    // same as the young stamp.
+                    self.gen[idx as usize] = GEN_OLD;
+                }
             }
             if self.oracle {
-                self.born[idx as usize] = self.epoch;
+                // A pretenured slot is stamped one epoch back so the oracle's
+                // survival tables don't misread it as surviving young.
+                self.born[idx as usize] =
+                    if self.pretenure == 0 { self.epoch } else { self.epoch.saturating_sub(1) };
                 self.allocs_epoch += 1;
             }
             return idx;
@@ -2410,11 +2486,16 @@ impl Heap {
         self.objs.push(obj);
         self.versions.push(0);
         if self.nursery {
-            self.young.push(idx);
-            self.gen.push(GEN_YOUNG);
+            if self.pretenure == 0 {
+                self.young.push(idx);
+                self.gen.push(GEN_YOUNG);
+            } else {
+                self.gen.push(GEN_OLD);
+            }
         }
         if self.oracle {
-            self.born.push(self.epoch);
+            self.born
+                .push(if self.pretenure == 0 { self.epoch } else { self.epoch.saturating_sub(1) });
             self.allocs_epoch += 1;
         }
         idx
@@ -2676,7 +2757,7 @@ impl Heap {
         self.gc_threshold = if self.nursery {
             // Next collection: a minor, one young budget from now (whether it
             // stays a minor is `note_minor_done`'s post-sweep decision).
-            live.saturating_add(NURSERY_YOUNG_BUDGET)
+            live.saturating_add(self.young_budget)
         } else {
             self.major_at
         };
@@ -2712,7 +2793,7 @@ impl Heap {
         if live >= self.major_at {
             self.major_due = true;
         }
-        self.gc_threshold = live.saturating_add(NURSERY_YOUNG_BUDGET);
+        self.gc_threshold = live.saturating_add(self.young_budget);
         self.gc_requested = false;
         self.minors_since_major += 1;
         self.young.clear();

@@ -18,7 +18,7 @@ pub(crate) const TWO_POW_54: i64 = 18_014_398_509_481_984;
 /// IS allowed, via integer `idiv`), and every `LoadConst` must be an Int-tagged
 /// constant (a double constant would be misread as i64).
 pub(crate) fn region_is_int(proto: &FuncProto, start: u32, end: u32, ta_plan: &TaPinPlan) -> bool {
-    int_unadmitted_ips(proto, start, end, ta_plan).is_some_and(|v| v.is_empty())
+    int_unadmitted_ips(proto, start, end, ta_plan, false).is_some_and(|v| v.is_empty())
 }
 
 /// The ips in `[start, end]` the INT emitter has no arm for, or `None` when the
@@ -35,6 +35,11 @@ pub(crate) fn int_unadmitted_ips(
     start: u32,
     end: u32,
     ta_plan: &TaPinPlan,
+    // W9: also admit pinned-DataView get* CallMethods (int-lane kinds <= 6).
+    // `true` only on `compile_region_int_maybe_cold`'s DV retry, whose plan is
+    // routed exclusively into the GPR emitter — the xmm INT emitter has no DV
+    // arm and must never see a plan this widening produced (B119 contract).
+    admit_dv: bool,
 ) -> Option<Vec<usize>> {
     if !region_can_compile(proto, start, end, None) {
         return None;
@@ -54,6 +59,22 @@ pub(crate) fn int_unadmitted_ips(
     // `for (i<str.length) h=imul(h^str.charCodeAt(i),C)` loop run unboxed.
     let pinned_str = |ip: usize| -> bool {
         ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
+    };
+    // W9: a pinned-DataView get* of an INT-LANE kind (<= 6 — never a float,
+    // which cannot inhabit an i64 home). Only under `admit_dv` (the GPR-routed
+    // retry); the strict pass keeps declining these to the DOUBLE tier.
+    let pinned_dv_int = |ip: usize| -> bool {
+        admit_dv
+            && ta_plan
+                .access
+                .get(&ip)
+                .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND)
+            && matches!(proto.code[ip], Instr::CallMethod { name, argc, .. }
+                if (argc == 1 || argc == 2)
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| dv_get_kind(k).is_some_and(|kid| kid <= 6)))
     };
     // A dense Array observed all-Int (kind 252): `arr[i]` loads the element and
     // unboxes it into an i64 home under a per-access tag guard. READS only —
@@ -111,6 +132,8 @@ pub(crate) fn int_unadmitted_ips(
                 if pinned_int_arr(s + off)
                     && proto.string_constants.get(name as usize).is_some_and(|k| k == "length") => {}
             Instr::CallMethod { .. } if pinned_str(s + off) => {}
+            // W9: pinned-DV get* (int-lane kinds) under the GPR-routed retry.
+            Instr::CallMethod { .. } if pinned_dv_int(s + off) => {}
             // `Math.imul(a, b)` — a 2-arg int32 multiply (ToInt32 of the low 32 of
             // the product); the int path emits a native `imul eax, ecx`.
             Instr::MathOp { op: MathFn::Imul, argc: 2, .. } => {}
@@ -201,10 +224,73 @@ pub(crate) fn compile_region_int_maybe_cold(
     cold_exit: bool,
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
-    let unadmitted = int_unadmitted_ips(proto, start, end, ta_plan)?;
+    let unadmitted = int_unadmitted_ips(proto, start, end, ta_plan, false)?;
     let cold: FxHashSet<usize> = if unadmitted.is_empty() {
         FxHashSet::default()
     } else if !cold_exit {
+        // ── W9: the DV retry ── when EVERY unadmitted ip is a pinned-DV get*
+        // the GPR emitter can host (int-lane kinds — re-checked by running the
+        // admission again with `admit_dv`), re-plan with DV admission and
+        // route the result EXCLUSIVELY into the GPR emitter: the xmm INT
+        // emitter has no DV arm and must never see the widened plan (B119
+        // fallback contract). admit_split=true — the swizzle loop recycles its
+        // receivers (B22's r96), and split-DV receivers are budget-exempt
+        // (B115). Any decline falls to the DOUBLE tier's DV arm exactly as
+        // today. Off-switch: ZIPP_NO_DV_GPR=1.
+        if gpr_homes_enabled()
+            && dv_gpr_enabled()
+            && int_unadmitted_ips(proto, start, end, ta_plan, true).is_some_and(|v| v.is_empty())
+        {
+            let empty: FxHashSet<usize> = FxHashSet::default();
+            // admit_wt_share=true: the DV swizzle regions carry ~20
+            // read_outside registers (outer-phase temps), each pinning a
+            // permanent home — without B97 sharing the plan declines on pool
+            // exhaustion before any emitter runs. The GPR emitter's
+            // write-through is def-complete since W9 (see `gpr_home_map`).
+            if let Some(p) = plan_region_cold(
+                proto, start, end, ta_plan, true, true, true, false, &empty, true,
+            ) {
+                match compile_region_int_gpr(
+                    proto,
+                    start,
+                    end,
+                    globals_base_helper,
+                    ta_plan,
+                    ta_snapshot,
+                    &p,
+                    meter,
+                ) {
+                    GprAttempt::Emitted(f) => return Some(f),
+                    // The B119 relief valve: one shared-home re-plan when only
+                    // the pool overflowed (the 43-op swizzle region against an
+                    // 8-10 GPR pool is exactly the case it exists for).
+                    GprAttempt::PoolOverflow if gpr_nest_enabled() => {
+                        if let Some(shared) = plan_region_cold(
+                            proto, start, end, ta_plan, true, true, true, true, &empty, true,
+                        ) {
+                            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                                eprintln!(
+                                    "[jit] INT-GPR DV retry [{start},{end}]: shared-home re-plan"
+                                );
+                            }
+                            if let GprAttempt::Emitted(f) = compile_region_int_gpr(
+                                proto,
+                                start,
+                                end,
+                                globals_base_helper,
+                                ta_plan,
+                                ta_snapshot,
+                                &shared,
+                                meter,
+                            ) {
+                                return Some(f);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!("[jit] INT decline [{start},{end}]: region_is_int=false");
         }
@@ -285,6 +371,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         false,
         false,
         &cold,
+        false,
     ) {
         Some(p) => p,
         None => {
@@ -302,7 +389,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             if !int_split_enabled() && gpr_split_enabled() && gpr_homes_enabled() && cold.is_empty()
             {
                 if let Some(p2) =
-                    plan_region_cold(proto, start, end, ta_plan, true, true, false, false, &cold)
+                    plan_region_cold(proto, start, end, ta_plan, true, true, false, false, &cold, false)
                 {
                     if !p2.split_recvs.is_empty() {
                         match compile_region_int_gpr(
@@ -321,6 +408,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                             GprAttempt::PoolOverflow if gpr_nest_enabled() => {
                                 if let Some(shared) = plan_region_cold(
                                     proto, start, end, ta_plan, true, true, false, true, &cold,
+                                    false,
                                 ) {
                                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                                         eprintln!(
@@ -401,6 +489,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     false,
                     true,
                     &cold,
+                    false,
                 ) {
                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                         eprintln!("[jit] INT-GPR nest retry [{start},{end}]: shared-home re-plan");

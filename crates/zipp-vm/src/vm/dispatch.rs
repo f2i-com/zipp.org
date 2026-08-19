@@ -238,6 +238,15 @@ impl<'p> Vm<'p> {
                     // (a): resume the interpreter at the recorded ip.
                     ip = bail as usize;
                 } else if self.jit.record_and_should_compile(func_id) {
+                    // W9: a live register-homed region already serves this
+                    // function's hot loop; a Tier C body would shadow it with
+                    // mem-homed loop code forever (its back-edge is a bare
+                    // `jmp` — no OSR check). Decline BEFORE any plan building
+                    // so the recurring trip costs one dense read, and defer so
+                    // the offer re-trips if the region is later evicted.
+                    if self.jit.should_yield_to_region(func_id) {
+                        self.jit.compile_defer(func_id);
+                    } else {
                     let proto: *const crate::bytecode::FuncProto =
                         self.func(func_id as usize);
                     // SAFETY: program functions are immutable during execution.
@@ -312,6 +321,7 @@ impl<'p> Vm<'p> {
                         &leaf_plan,
                         &cross_plan,
                     );
+                    }
                     }
                 }
             }

@@ -363,6 +363,7 @@ pub(crate) fn plan_region(
         admit_wt_share,
         false,
         &FxHashSet::default(),
+        false,
     )
 }
 
@@ -390,16 +391,21 @@ pub(crate) fn plan_region_cold(
     admit_wt_share: bool,
     share_homes: bool,
     cold: &FxHashSet<usize>,
+    // W9: admit pinned-DV get* on the BITWISE (INT) path too — int-lane kinds
+    // only, routed exclusively into the GPR emitter by `region_int`'s DV
+    // retry. `false` keeps every existing caller's plan byte-identical (the
+    // predicate below is unchanged when `!admit_bitwise`).
+    admit_dv: bool,
 ) -> Option<RegionPlan> {
     match plan_region_cold_inner(
         proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, share_homes,
-        cold, true,
+        cold, true, admit_dv,
     ) {
         PlanOutcome::Plan(p) => Some(*p),
         PlanOutcome::RetryNoHoist => {
             match plan_region_cold_inner(
                 proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share,
-                share_homes, cold, false,
+                share_homes, cold, false, admit_dv,
             ) {
                 PlanOutcome::Plan(p) => Some(*p),
                 _ => None,
@@ -440,6 +446,8 @@ fn plan_region_cold_inner(
     // See `PlanOutcome::RetryNoHoist`: `false` on the retry pass — no constant
     // is hoisted, so none pins a permanent home.
     allow_hoist: bool,
+    // W9 — see `plan_region_cold`.
+    admit_dv: bool,
 ) -> PlanOutcome {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
@@ -536,8 +544,12 @@ fn plan_region_cold_inner(
     // so its reg is excluded from typing/homing exactly like a pinned-element
     // receiver. `ZIPP_NO_DV_DOUBLE=1` restores the decline for A/B.
     let pinned_dv = |ip: usize| -> bool {
-        !admit_bitwise
-            && dv_double_enabled()
+        // W9: the INT path (admit_bitwise) admits DV get* too, INT-LANE KINDS
+        // ONLY (<= 6 — a float result cannot inhabit an i64 home; a u32 can,
+        // the ±2^53 discipline boxes it exactly). Routed exclusively into the
+        // GPR emitter by `region_int`'s DV retry (`admit_dv` is false on every
+        // other caller, keeping their plans byte-identical).
+        ((!admit_bitwise && dv_double_enabled()) || (admit_bitwise && admit_dv))
             && ta_plan
                 .access
                 .get(&ip)
@@ -547,7 +559,8 @@ fn plan_region_cold_inner(
                     && proto
                         .string_constants
                         .get(name as usize)
-                        .is_some_and(|k| dv_get_kind(k).is_some()))
+                        .is_some_and(|k| dv_get_kind(k)
+                            .is_some_and(|kid| !admit_bitwise || kid <= 6)))
     };
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
     // B94 recycled receivers (see `plan::RegionPlan::split_recvs`). At most one
@@ -1296,10 +1309,20 @@ fn plan_region_cold_inner(
             // ip (the inline ToBoolean(a === b) compare) — extend their live
             // ranges to the call so the home-reuse allocator cannot free
             // either home one ip early.
-            Instr::CallMethod { .. } => {
+            Instr::CallMethod { dst, arg_base, .. } => {
                 if let Some(&(a, b)) = dv_flag_fuse.get(&ip) {
                     str_imul_touch.push((ip, a, false));
                     str_imul_touch.push((ip, b, false));
+                }
+                // W9: on the INT path a pinned-DV get*'s pos operand and result
+                // def are otherwise invisible (instr_uses/writes_reg are blind
+                // to CallMethod), and the GPR route leans on the share_homes
+                // re-plan where an untouched range frees a home one ip early.
+                // Gated on admit_bitwise so DOUBLE planning stays byte-identical
+                // (its RetryNoHoist-only allocation never exercised these).
+                if admit_bitwise && pinned_dv(ip) {
+                    str_imul_touch.push((ip, arg_base, false)); // pos (use)
+                    str_imul_touch.push((ip, dst, true)); // result (def)
                 }
             }
             _ => {}

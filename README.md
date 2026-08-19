@@ -632,6 +632,7 @@ diff <(sort fails.txt) \
      <(tr -d '\r' < tools/test262-expected-failures.txt | sort)      # REG=0
 ZIPP_NOJIT=1 python tools/run_test262.py …             # and again, interpreter only
 ZIPP_JIT_THRESHOLD=1 python tools/run_test262.py …     # and again, JIT forced on
+ZIPP_NO_NURSERY=1 python tools/run_test262.py …        # and again, majors-only GC
 python tools/bench.py --reps 15                        # ALL_CORRECT=1
 python tools/bench.py --reps 15 --readme               # + the tables above
 ```
@@ -640,9 +641,12 @@ On Windows the test262 runner needs `PYTHONUTF8=1` — a failing test can print 
 non-ASCII character, and the default console codec kills the whole run with a
 `UnicodeEncodeError` after it has already done the work.
 
-All three passes must produce IDENTICAL failure sets. They currently do, exactly,
+All four passes must produce IDENTICAL failure sets. They currently do, exactly,
 which is worth re-checking rather than assuming: it is the cheapest evidence that
-a JIT change did not silently alter semantics.
+a JIT change did not silently alter semantics. The fourth pass exists because the
+default collector is generational since wave 9 — a minor GC that missed a write
+barrier would corrupt exactly the kind of long-lived graph test262 never builds,
+so the majors-only sweep is the cross-check that the two collectors agree.
 
 The third pass is the one people skip and should not. `ZIPP_JIT_THRESHOLD=<n>`
 overrides both the function and loop compile thresholds, because **the default
@@ -668,8 +672,12 @@ cargo build --target wasm32-unknown-unknown -p zipp-vm --no-default-features
 ```
 
 `ZIPP_NOJIT=1` disables native codegen (it is **presence**-checked, so
-`ZIPP_NOJIT=0` also disables it — unset it for a JIT run); `ZIPP_GC_STRESS=1`
-collects on every allocation; `ZIPP_JITLOG=1` reports tier decisions, deopts and
+`ZIPP_NOJIT=0` also disables it — unset it for a JIT run); `ZIPP_NO_NURSERY=1`
+reverts to the majors-only collector (the generational nursery is default-on
+since wave 9; `ZIPP_NURSERY_YOUNG_BUDGET=<n>` tunes the minor cadence, and
+`ZIPP_NURSERY_VERIFY=1` re-runs the full mark beside every minor and panics
+naming any slot the young-only trace missed); `ZIPP_GC_STRESS=1` collects on
+every allocation; `ZIPP_JITLOG=1` reports tier decisions, deopts and
 evictions; `ZIPP_JITDECLINE=1` names which planner check rejected a region.
 
 Any change touching the JIT must produce identical output both ways —

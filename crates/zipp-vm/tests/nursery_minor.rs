@@ -395,6 +395,71 @@ fn nursery_parity_trivial_setter_stores_reach_young() {
     assert_eq!(out[0], format!("{s}"));
 }
 
+/// W9 static pretenure, idiom: `JSON.parse`'s tree allocates OLD-clean
+/// (skipping the young log), then user code stores YOUNG values into the
+/// pretenured holders across many minors. Every such store is an old→young
+/// edge from the very first write — if any store path into the parsed tree
+/// missed its barrier, the young value would be swept alive; the
+/// `ZIPP_NURSERY_VERIFY` mode children turn that into a panic naming the
+/// slot. The final sums are mode-independent arithmetic.
+#[test]
+fn nursery_parity_pretenured_json_tree_mutates_young() {
+    let n = scaled(150_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        var parts = [];
+        for (var b = 0; b < 512; b++) parts.push('{{"id":' + b + ',"tag":"t' + b + '"}}');
+        var tree = JSON.parse("[" + parts.join(",") + "]"); // pretenured OLD wholesale
+        for (var i = 0; i < N; i++) {{
+          tree[i & 511].fresh = {{ v: i }};    // young value into a pretenured object
+          tree[(i + 7) & 511].tag = "y" + i;  // young string into a pretenured object
+          var g = {{ a: i, b: [i] }};          // young garbage driving minors
+          if (g.a === -1) console.log("unreachable");
+        }}
+        var vsum = 0, ok = true;
+        for (var j = 0; j < 512; j++) {{
+          if (tree[j].id !== j) {{ ok = false; break; }}
+          if (tree[j].fresh) vsum += tree[j].fresh.v;
+        }}
+        console.log(ok + ":" + vsum);
+        "#
+    ));
+    // The last 512 iterations each leave tree[i & 511].fresh = {v: i}.
+    let vsum: u64 = ((n as u64 - 512)..n as u64).sum();
+    assert_eq!(out[0], format!("true:{vsum}"));
+}
+
+/// W9 static pretenure, idiom: `String.prototype.split`'s parts array
+/// allocates OLD-clean, then young objects are stored into it by index (the
+/// B119 idiom-1 lane, `jit_set_index`). A missed barrier on the pretenured
+/// array sweeps the young elements alive; VERIFY-mode children prove
+/// coverage, and the sum is mode-independent.
+#[test]
+fn nursery_parity_pretenured_split_array_receives_young() {
+    let n = scaled(150_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        var s = "";
+        for (var b = 0; b < 256; b++) s += (b ? "," : "") + "w" + b;
+        var arr = s.split(","); // parts + array pretenured OLD
+        for (var i = 0; i < N; i++) {{
+          arr[i & 255] = {{ v: i }};        // young object into the pretenured array
+          var g = [i, i + 1];               // young garbage driving minors
+          if (g.length !== 2) console.log("unreachable");
+        }}
+        var vsum = 0;
+        for (var j = 0; j < 256; j++) vsum += arr[j].v;
+        console.log(arr.length + ":" + vsum);
+        "#
+    ));
+    let vsum: u64 = ((n as u64 - 256)..n as u64).sum();
+    assert_eq!(out[0], format!("256:{vsum}"));
+}
+
 /// Re-run every `nursery_parity_` case in eight more modes, each in its own
 /// child process (the env latches are read once per process). The same
 /// arithmetic assertions passing in all modes IS the parity check; a swept

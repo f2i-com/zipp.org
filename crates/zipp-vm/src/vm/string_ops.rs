@@ -661,45 +661,62 @@ impl<'p> Vm<'p> {
                     }
                     _ => usize::MAX,
                 };
-                let parts: Vec<Value> = if args.is_empty() || arg0 == Value::UNDEFINED {
+                // ToString(separator) — runs a user toString (propagating a
+                // throw) and rejects a Symbol; after ToUint32(limit) and before
+                // the lim==0 early-out, matching the spec ordering. Hoisted
+                // ABOVE the pretenure scope below so no user code (and no `?`)
+                // runs inside it.
+                let sep_or = if args.is_empty() || arg0 == Value::UNDEFINED {
+                    None
+                } else {
+                    Some(self.to_js_string(arg0)?)
+                };
+                // W9 static pretenure (NURSERY_DESIGN.md §4): split's parts and
+                // result array are the markdown/regex rows' retained "builder"
+                // output — measured to survive minors wholesale, so they
+                // allocate OLD. Purely internal from here down: nothing throws
+                // and no user code runs, so the begin/end pair is airtight.
+                self.heap.pretenure_begin();
+                let parts: Vec<Value> = match &sep_or {
                     // No separator → the whole string as a single element (lim 0
                     // → []). The receiver itself — exact, strings are immutable.
-                    if lim == 0 { Vec::new() } else { vec![Value::heap(idx)] }
-                } else {
-                    // ToString(separator) — runs a user toString (propagating a
-                    // throw) and rejects a Symbol; after ToUint32(limit) and before
-                    // the lim==0 early-out, matching the spec ordering.
-                    let sep = self.to_js_string(arg0)?;
-                    if lim == 0 {
-                        Vec::new()
-                    } else if sep.is_empty() {
-                        // Split into 1-UNIT pieces (spec: code units). An astral
-                        // scalar's halves are REAL lone-surrogate strings.
-                        let units: Vec<u16> = js_recv.units_iter().take(lim).collect();
-                        units.into_iter().map(|u| self.str_from_unit(u)).collect()
-                    } else {
-                        // Byte offsets in the lossy view match the exact bytes, so
-                        // each part slices `js_recv`'s WTF-8 exactly.
-                        let ranges: Vec<(usize, usize)> = s
-                            .split(&sep)
-                            .take(lim)
-                            .map(|p| {
-                                let off = p.as_ptr() as usize - s.as_ptr() as usize;
-                                (off, off + p.len())
-                            })
-                            .collect();
-                        ranges
-                            .into_iter()
-                            .map(|(a, b)| {
-                                let js = crate::heap::JsStr::from_wtf8(
-                                    js_recv.as_bytes()[a..b].to_vec(),
-                                );
-                                Value::heap(self.heap.alloc_js(js))
-                            })
-                            .collect()
+                    None => {
+                        if lim == 0 { Vec::new() } else { vec![Value::heap(idx)] }
+                    }
+                    Some(sep) => {
+                        if lim == 0 {
+                            Vec::new()
+                        } else if sep.is_empty() {
+                            // Split into 1-UNIT pieces (spec: code units). An astral
+                            // scalar's halves are REAL lone-surrogate strings.
+                            let units: Vec<u16> = js_recv.units_iter().take(lim).collect();
+                            units.into_iter().map(|u| self.str_from_unit(u)).collect()
+                        } else {
+                            // Byte offsets in the lossy view match the exact bytes, so
+                            // each part slices `js_recv`'s WTF-8 exactly.
+                            let ranges: Vec<(usize, usize)> = s
+                                .split(sep.as_str())
+                                .take(lim)
+                                .map(|p| {
+                                    let off = p.as_ptr() as usize - s.as_ptr() as usize;
+                                    (off, off + p.len())
+                                })
+                                .collect();
+                            ranges
+                                .into_iter()
+                                .map(|(a, b)| {
+                                    let js = crate::heap::JsStr::from_wtf8(
+                                        js_recv.as_bytes()[a..b].to_vec(),
+                                    );
+                                    Value::heap(self.heap.alloc_js(js))
+                                })
+                                .collect()
+                        }
                     }
                 };
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(parts)))))
+                let arr = Value::heap(self.heap.alloc(HeapObj::Array(parts)));
+                self.heap.pretenure_end();
+                Ok(Some(arr))
             }
             // ECMAScript TrimString whitespace = Unicode White_Space + U+FEFF
             // (ZWNBSP/BOM), which Rust's char::is_whitespace excludes. The trim
