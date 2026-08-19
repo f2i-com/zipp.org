@@ -183,7 +183,7 @@ for reasons that have nothing to do with the engine. If an existing clone has it
 on: `git config core.autocrlf false && git rm --cached -r -q . && git reset
 --hard`.
 
-**Performance — cold geomean 1.21× zipp/node (95% CI 1.20×–1.22×)** on the
+**Performance — cold geomean 1.25× zipp/node (95% CI 1.25×–1.26×)** on the
 ten programs in `bench/real/`, 21 counterbalanced paired observations against
 Node v24.12.0, every output byte-identical to Node. The measured binary is the
 profile-guided release build (`bash tools/pgo.sh` — adopted after PGO measured
@@ -191,32 +191,32 @@ profile-guided release build (`bash tools/pgo.sh` — adopted after PGO measured
 
 | bench | node | zipp | paired ratio |
 |---|---|---|---|
-| map-set-heavy | 1278ms | 831ms | **0.66×** |
-| markdown-render | 367ms | 359ms | **0.99×** |
-| async-promise-chain | 425ms | 434ms | 1.02× |
-| json-large | 361ms | 384ms | 1.08× |
-| class-prototype-hot | 310ms | 391ms | 1.26× |
-| sparse-array | 93ms | 127ms | 1.33× |
-| parse-large-js | 363ms | 486ms | 1.34× |
-| polymorphic-objects | 356ms | 500ms | 1.39× |
-| typedarray-math | 239ms | 369ms | 1.56× |
-| regex-log-scan | 604ms | 1164ms | 1.95× |
+| map-set-heavy | 1020ms | 652ms | **0.67×** |
+| async-promise-chain | 365ms | 357ms | **0.98×** |
+| markdown-render | 299ms | 319ms | 1.04× |
+| json-large | 317ms | 343ms | 1.09× |
+| class-prototype-hot | 300ms | 383ms | 1.28× |
+| sparse-array | 86ms | 116ms | 1.38× |
+| polymorphic-objects | 336ms | 472ms | 1.42× |
+| parse-large-js | 290ms | 457ms | 1.58× |
+| typedarray-math | 210ms | 342ms | 1.64× |
+| regex-log-scan | 497ms | 987ms | 2.00× |
 
-Cold total is the primary metric. Zipp starts about 3.1× faster than Node
-(12.6ms vs 39.6ms — no snapshot to load), is *faster than Node* on
-`map-set-heavy` by 34% and now on `markdown-render` too (0.99×, the wave-9
-generational nursery's doing), and `async-promise-chain` is within 2%.
-`regex-log-scan` is under 2× for the first time in this file's history.
+Cold total is the primary metric. Zipp starts about 3.4× faster than Node
+(9.9ms vs 33.4ms — no snapshot to load) and is now *faster than Node* on TWO
+rows: `map-set-heavy` by 33% and `async-promise-chain` (0.98× [0.97, 0.99] —
+the wave-9 generational nursery plus wave-10's cheaper minors), with
+`markdown-render` within 4%.
 
 The same capture also times three DIAGNOSTIC benchmarks that are deliberately
 outside the ten, because they exist to expose weaknesses the ten cannot see:
-`polymorphic-objects-v2` 2.42×, `sparse-array-v2` 3.64×, `property-ic-shapes`
-3.74×. Their own geomean is 3.21×, and quoting a geomean over all thirteen gives
-1.52×, which is not comparable to any historical figure in this file — the ten
+`polymorphic-objects-v2` 2.50×, `sparse-array-v2` 3.67×, `property-ic-shapes`
+3.83×. Their own geomean is 3.28×, and quoting a geomean over all thirteen gives
+1.57×, which is not comparable to any historical figure in this file — the ten
 are the series. The harness now computes and records both, so the split no
 longer depends on anyone remembering to pass `--benches`.
 
-This capture is `bench/head_clean_74d03d2_pgo.json`, marked `publishable: true`
+This capture is `bench/head_clean_f71f01c_pgo.json`, marked `publishable: true`
 like its predecessors (`bench/head_clean_e839613.json` was the first artifact
 to earn that flag). The flag means the harness checked, *before
 measuring*, that the engine reported a build identity, that its tree was not
@@ -236,15 +236,17 @@ useful as direction and are not a measurement of any commit (`PERF_ROADMAP.md`
 B103).
 
 Re-measuring at a later commit gives similar ratios but not the same absolute
-milliseconds, because the box and the Node build both move — between the wave-7
-and wave-8 captures Node itself got 6–12% faster on four rows, and between the
-wave-8 and wave-9 captures the box ran BOTH engines 10–20% slower in absolute
-terms (every pair is measured interleaved, so the paired ratios stay honest for
-the session). Read the wave-to-wave headline with that split in mind: wave 9's
-own attributable delta is its one-binary bundle, −0.5% [−0.8, −0.1] over the
-ten plus the nursery retrial's −0.7% [−1.0, −0.5] — the remainder of
-1.283 → 1.212 is capture-to-capture drift of the box and Node, in zipp's
-favour this time as it was against it last time.
+milliseconds, because the box and the Node build both move. The wave-9 capture
+(1.2117×) is the cautionary tale: its box ran both engines 10–20% slower in
+absolute terms, which flattered the ratio; at the wave-10 capture Node's
+absolute times returned to the wave-8 baseline and the headline read 1.2547×.
+Neither jump is an engine change. The comparison that means something is
+same-conditions capture to same-conditions capture — wave 8's 1.2832× to wave
+10's 1.2547×, −2.2% across two waves — against the waves' own one-binary
+attributable sum (wave 9: bundle −0.5% plus the nursery retrial's −0.7%;
+wave 10: bundle −0.05% with async −2.4%), which agrees to within the drift
+floor. The per-wave `--ab-env` bundles, not the vs-node captures, are the
+attribution instrument; the captures are the score.
 
 Checking this table is worth doing rather than trusting it: between two earlier
 captures `class-prototype-hot` had silently regressed to **7.99×** and the suite
@@ -290,23 +292,24 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today (cold total) | 1.21× |
-| `regex-log-scan` at Node parity | **1.13×** |
-| `typedarray-math` at Node parity | **1.16×** |
-| **both of the two worst at Node parity** | **1.08×** |
+| today (cold total) | 1.25× |
+| `regex-log-scan` at Node parity | **1.17×** |
+| `typedarray-math` at Node parity | **1.19×** |
+| **both of the two worst at Node parity** | **1.11×** |
 
 (The *shape* of this arithmetic is what matters and it does not move as the
-headline does: the two worst rows going to parity is worth ~0.13 of geomean,
+headline does: the two worst rows going to parity is worth ~0.14 of geomean,
 and no contained fix reaches that.)
 
-The cold score being below 1.25× is not general parity: eight rows remain
-slower and the two worst are 1.95× and 1.56×. The contained fixes in
+The cold score being near 1.25× is not general parity: eight rows remain
+slower and the two worst are 2.00× and 1.64×. The contained fixes in
 `PERF_ROADMAP.md` are safe substrate, and one of the three architectural items
 has now landed — the generational nursery is the DEFAULT collector since wave
-9 (B122: net −0.7% with regex/json/markdown taking 2–7% row wins against two
-named sub-2% trades). Moving toward 1× still requires the other two: stable
-shape metadata and an optimizing CFG/SSA tier, rather than a stack of
-unmeasured 1–2% tweaks.
+9 (B122), and wave 10 rebuilt its internals (value-grain remembered set, a
+cached minor mark vector, a survival-adaptive young budget — B123) to the
+point where the remaining GC cost is mostly the churn-proportional sweep.
+Moving toward 1× still requires the other two: stable shape metadata and an
+optimizing CFG/SSA tier, rather than a stack of unmeasured 1–2% tweaks.
 
 **One number explains most of the rest: the general (boxed) JIT tier costs
 ~3.5ns per op.** A property read measured at 21ns is not a 21ns read — it is a
