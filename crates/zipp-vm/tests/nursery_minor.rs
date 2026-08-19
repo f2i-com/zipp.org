@@ -711,7 +711,16 @@ fn probe_bounded_heap_under_sustained_old_garbage() {
         var big = null;
         for (var r = 0; r < 9; r++) {
           big = [];
-          for (var i = 0; i < 200000; i++) big.push({ r: r, i: i });
+          for (var i = 0; i < 200000; i++) {
+            big.push({ r: r, i: i });
+            // Explicit young garbage so `swept_young > 0` holds by
+            // construction rather than by GC-schedule accident: W11's concat
+            // fusion changed the row's allocation count and the incidental
+            // young strings this probe used to rely on stopped landing in a
+            // minor's window.
+            var g = { t: i };
+            if (g.t < 0) console.log(g.t);
+          }
           console.log(r + ":" + big.length);
         }
         "#,

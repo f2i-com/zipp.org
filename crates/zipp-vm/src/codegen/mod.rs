@@ -331,6 +331,17 @@ pub struct LeafInlinePlan {
     /// that must hold for the spliced body to be the right one. See
     /// `callee_leaf_ok_one_call`.
     pub nested: FxHashMap<usize, NestedGuard>,
+    /// W11 (B124): may-read-before-write over the body — the ONLY local regs
+    /// the splice must zero-fill per execution (`splice_uninit_mask`; bit r =
+    /// callee reg r). `u64::MAX` = fill everything (the pre-W11 behaviour,
+    /// pinned by `ZIPP_NO_SPLICE_FILL=1` or any unmodelled body op). tokIs'
+    /// 19-stores-per-execution fill measured ~25-30ms of parse-large-js.
+    pub uninit_mask: u64,
+    /// W11 (B124): bit i set ⇒ callee param i is ALIASED to the caller's
+    /// `arg_base+i` slot instead of copied — sound because the plan proved no
+    /// body op writes callee reg `1+i` (fail-closed: unknown defs ⇒ 0) and
+    /// the site passes at least i+1 args. `0` under `ZIPP_NO_SPLICE_ALIAS=1`.
+    pub alias_params: u64,
 }
 
 /// Identity guard for a nested inline. Same `(bits, version)` tuple the outer
@@ -735,6 +746,39 @@ fn fnjit_mem_enabled() -> bool {
 /// bare `jmp` that never checks for a region. Memoized: the decline check runs
 /// once per CALL of a shadowed function. `ZIPP_NO_TIERC_YIELD=1` restores the
 /// old behaviour.
+/// W11 (B124): masked splice zero-fill — `ZIPP_NO_SPLICE_FILL=1` pins every
+/// leaf-inline plan's `uninit_mask` to `u64::MAX` (the full per-execution
+/// local fill, byte-identical to pre-W11 emission).
+pub(crate) fn splice_fill_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPLICE_FILL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W11 (B124): splice arg aliasing — `ZIPP_NO_SPLICE_ALIAS=1` pins
+/// `alias_params` to 0 (params always copied, byte-identical to pre-W11).
+pub(crate) fn splice_alias_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPLICE_ALIAS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 fn tierc_yield_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
@@ -2064,6 +2108,7 @@ mod proto_mem;
 mod emit_misc;
 
 pub(crate) use fn_int::*;
+pub(crate) use proto_mem::{splice_body_defs, splice_uninit_mask};
 pub(crate) use self_call::*;
 pub(crate) use kernels::*;
 pub(crate) use region_admit::*;

@@ -750,7 +750,10 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
         // StrConcat/StrAppendInPlace are `Add` with a JIT routing hint; they are
         // the same operator and the post-check decides whether the row's values
         // actually satisfy addition.
-        Add { dst, a, b } | StrConcat { dst, a, b } | StrAppendInPlace { dst, a, b } => (
+        Add { dst, a, b }
+        | StrConcat { dst, a, b }
+        | StrAppendInPlace { dst, a, b }
+        | StrConcatChain { dst, a, b } => (
             op::ADD,
             Claim::Arith(op::ADD),
             Some(a),

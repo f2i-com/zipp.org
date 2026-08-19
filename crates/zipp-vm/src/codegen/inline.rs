@@ -155,6 +155,14 @@ pub(crate) fn emit_inline_leaf_call(
     let n = argc.min(plan.param_count);
     for i in 0..plan.param_count {
         if i < n {
+            // W11 (B124): an ALIASED param's reads are remapped straight to
+            // the caller's arg slot (see `rg`), so no copy is staged. Sound
+            // because the plan proved no body op writes the param, the arg
+            // slot is private to the caller frame during the splice, and a
+            // mid-body bail re-runs the whole call reading the intact args.
+            if (plan.alias_params >> i) & 1 == 1 {
+                continue;
+            }
             dynasm!(ops
                 ; mov rax, [rbx + dreg(arg_base + i)]
                 ; mov [rbx + dreg(w + 1 + i)], rax
@@ -171,20 +179,41 @@ pub(crate) fn emit_inline_leaf_call(
     // leaf body may read a local before writing it (e.g. `var x; return a + x;`
     // reads the uninitialized `x`); without this, that read would pick up a
     // STALE Value left in the carved scratch window by a prior call's expansion.
+    // W11 (B124): only the regs the body can actually read-before-write need
+    // the store (`plan.uninit_mask` — a may-read-before-write union over all
+    // paths, `splice_uninit_mask`); tokIs' 19-store fill per 2.89M executions
+    // measured ~25-30ms of parse-large-js. `u64::MAX` = the full pre-W11 fill.
     {
         let undef = Value::UNDEFINED.bits() as i64;
         let first_local = 1 + plan.param_count; // reg index past `this` + params
-        if first_local < plan.callee_reg_count {
+        let locals_mask: u64 = if first_local < 64 {
+            plan.uninit_mask >> first_local
+        } else {
+            0
+        };
+        if first_local < plan.callee_reg_count && locals_mask != 0 {
             dynasm!(ops ; mov rax, QWORD undef);
             for r in first_local..plan.callee_reg_count {
-                dynasm!(ops ; mov [rbx + dreg(w + r)], rax);
+                if (plan.uninit_mask >> r) & 1 == 1 {
+                    dynasm!(ops ; mov [rbx + dreg(w + r)], rax);
+                }
             }
         }
     }
     // ── inline the body over the scratch window ── every register `r` maps to
-    // `w + r`. Each op that can bail uses a FRESH bail label whose block resumes
-    // the interpreter at the CALL IP (so the whole call re-runs cleanly).
-    let rg = |r: u16| w + r; // scratch-window register mapping
+    // `w + r` — EXCEPT a W11-aliased param, which maps to the caller's own
+    // `arg_base + i` slot (read-only by the alias proof). Each op that can
+    // bail uses a FRESH bail label whose block resumes the interpreter at the
+    // CALL IP (so the whole call re-runs cleanly).
+    let alias = plan.alias_params;
+    let pc = plan.param_count;
+    let rg = move |r: u16| -> u16 {
+        if r >= 1 && r <= pc && (alias >> (r - 1)) & 1 == 1 {
+            arg_base + (r - 1)
+        } else {
+            w + r
+        }
+    };
     // One label per body ip (plus a fall-off sink at `body.len()`), so FORWARD
     // in-body branches (`callee_leaf_ok` admits only `> i && <= term`) re-base to
     // `blabels[target]`. Body index == callee ip (the body is the contiguous

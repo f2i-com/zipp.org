@@ -1259,6 +1259,38 @@ pub(crate) extern "win64" fn jit_concat(
     }
 }
 
+/// `dst = a + b` for one `StrConcatChain` link (W11 B124) in a MEM region or a
+/// Tier-C body: `Vm::add_values_chain` — the in-place chain append when `a` is
+/// the chain's fresh flat-Str accumulator, the full pairwise `+` otherwise.
+/// The SAME entry the interpreter arm calls, so results are byte-identical.
+///
+/// Unlike `jit_str_append` this helper CAN run user code (an object RHS's
+/// `valueOf`/`toString`/`@@toPrimitive` via the `add_values` fallback), so a
+/// throw must NEVER become the "redo" sentinel (`SELF_CALL_DEOPT`) — the
+/// interpreter would re-execute the op and re-run those side effects. Err is
+/// materialized into `pending_throw` and returned as `CALL_THREW`, so the
+/// region exits and the interpreter UNWINDS (the half-built accumulator is a
+/// dead temp register the collector reclaims).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_concat_chain(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+) -> u64 {
+    let a = Value::from_bits(a_bits);
+    let b = Value::from_bits(b_bits);
+    // SAFETY: exclusive view to mutate/allocate the string; the running region
+    // holds no conflicting borrow (reg file / globals base only).
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.add_values_chain(a, b) {
+        Ok(v) => v.bits(),
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
 /// `dst = a + b` for the OSR region's `StrAppendInPlace` op: appends into `a`'s
 /// buffer in place when uniquely owned (see `str_append_inplace`). Deopts
 /// (SELF_CALL_DEOPT) when the appended value needs real ToPrimitive — a user

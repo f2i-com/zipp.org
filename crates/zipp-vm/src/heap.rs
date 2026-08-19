@@ -1122,6 +1122,15 @@ impl JsStr {
     /// JSON.parse, slicing, rope flattening). The buffer must be valid,
     /// CANONICAL WTF-8 — every producer in the engine builds it through
     /// `wtf8_push`/`wtf8_push_cp`/`slice_units`, which maintain that.
+    /// W11 (B124): construct from bytes the CALLER proves are ASCII — skips
+    /// `from_wtf8`'s linear rescan. The one caller class is a slice of a
+    /// known-ascii subject (a slice of ascii is ascii by construction);
+    /// regex-log-scan takes ~1.8M such slices per run.
+    pub fn from_ascii(bytes: Vec<u8>) -> JsStr {
+        debug_assert!(bytes.is_ascii(), "from_ascii: caller's ascii proof failed");
+        JsStr { units: bytes.len(), bytes, ascii: true, wellformed: true }
+    }
+
     pub fn from_wtf8(bytes: Vec<u8>) -> JsStr {
         if bytes.is_ascii() {
             return JsStr { units: bytes.len(), bytes, ascii: true, wellformed: true };

@@ -66,6 +66,7 @@ pub(crate) fn instr_touches(i: &Instr, r: Reg) -> bool {
         | Instr::Mod { dst, a, b }
         | Instr::StrConcat { dst, a, b }
         | Instr::StrAppendInPlace { dst, a, b }
+        | Instr::StrConcatChain { dst, a, b }
         | Instr::Lt { dst, a, b }
         | Instr::Le { dst, a, b }
         | Instr::Gt { dst, a, b }
@@ -94,6 +95,10 @@ pub(crate) fn is_simple_loop_op(i: &Instr) -> bool {
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. }
             | Instr::Add { .. }
+            // W11 (B124) fused chain link — the same operator as `Add` (whose
+            // presence here predates it); a fused chain in the body must not
+            // bar the surrounding accumulator loop's rewrite.
+            | Instr::StrConcatChain { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
             | Instr::Div { .. }
@@ -240,6 +245,7 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
         | Instr::Mod { a, b, .. }
         | Instr::StrConcat { a, b, .. }
         | Instr::StrAppendInPlace { a, b, .. }
+        | Instr::StrConcatChain { a, b, .. }
         | Instr::Bitwise { a, b, .. }
         | Instr::Lt { a, b, .. }
         | Instr::Le { a, b, .. }
@@ -303,6 +309,7 @@ pub(crate) fn accum_touches(i: &Instr, r: Reg) -> bool {
         | Instr::Mod { dst, .. }
         | Instr::StrConcat { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
+        | Instr::StrConcatChain { dst, .. }
         | Instr::Bitwise { dst, .. }
         | Instr::Lt { dst, .. }
         | Instr::Le { dst, .. }
@@ -370,6 +377,7 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
         | Instr::Mod { dst, .. }
         | Instr::StrConcat { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
+        | Instr::StrConcatChain { dst, .. }
         | Instr::Bitwise { dst, .. }
         | Instr::Lt { dst, .. }
         | Instr::Le { dst, .. }

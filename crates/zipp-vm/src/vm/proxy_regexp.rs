@@ -81,6 +81,28 @@ fn matchall_step_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_SLIM_EXEC=1` disables the B124 slim per-call exec: the fused
+/// matchAll step goes back through the full `regexp_exec_impl_prebits`
+/// protocol (duplicate lastIndex read + ToInteger, per-step flatten/is_ascii/
+/// str_units heap.gets, per-step twin probe, result-array empty-match probe),
+/// and the pristine exec's flag decode goes back to the four `contains`
+/// scans. The rollback switch and one side of a one-binary A/B
+/// (`tools/bench.py --ab-env`), same idiom as `ZIPP_NO_MATCHALL_STEP`.
+#[inline]
+fn slim_exec_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_SLIM_EXEC").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Flag-bit layout of the `regexp_string_iters` record's `u8` (computed ONCE
 /// at iterator creation): `global`/`fullUnicode` are what
 /// CreateRegExpStringIterator captures per spec; the rest exist so the fused
@@ -1303,12 +1325,32 @@ impl<'p> Vm<'p> {
                 )
             }
             None => match self.heap.get(re_idx) {
-                HeapObj::RegExp { flags, .. } => (
-                    flags.contains('g'),
-                    flags.contains('y'),
-                    flags.contains('d'),
-                    flags.contains('u') || flags.contains('v'),
-                ),
+                HeapObj::RegExp { flags, .. } => {
+                    if slim_exec_enabled() {
+                        // B124: one pass over the ≤8-byte flag string instead
+                        // of four `contains` scans. Same heap.get, same spec
+                        // position (AFTER ToLength — a `lastIndex.valueOf`
+                        // may `compile()`, and this reads what it left).
+                        let (mut g, mut y, mut d, mut u) = (false, false, false, false);
+                        for b in flags.bytes() {
+                            match b {
+                                b'g' => g = true,
+                                b'y' => y = true,
+                                b'd' => d = true,
+                                b'u' | b'v' => u = true,
+                                _ => {}
+                            }
+                        }
+                        (g, y, d, u)
+                    } else {
+                        (
+                            flags.contains('g'),
+                            flags.contains('y'),
+                            flags.contains('d'),
+                            flags.contains('u') || flags.contains('v'),
+                        )
+                    }
+                }
                 _ => {
                     return Err(Thrown(
                         "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
@@ -1324,11 +1366,35 @@ impl<'p> Vm<'p> {
         // `lastIndex` is already a unit index engine-wide, so it is the
         // search start with no conversion either way.
         let s_idx = input_val.heap_index();
-        self.heap.flatten(s_idx);
-        let is_ascii = matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii());
+        // B124: ONE subject heap.get serves the flat-check, the ascii bit and
+        // (for the ascii case, where units == bytes) the unit length, instead
+        // of an unconditional `flatten` (its own get + tag check) plus a
+        // second `str_units` get. `flatten` now runs only when the get
+        // actually sees a rope — Cons→Str is irreversible, so the re-read
+        // after it is a `Str` by construction. `ZIPP_NO_SLIM_EXEC=1` restores
+        // the split reads; both compute identical values on every input.
+        let (is_ascii, ascii_units) = if slim_exec_enabled() {
+            match self.heap.get(s_idx) {
+                HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
+                _ => {
+                    self.heap.flatten(s_idx);
+                    match self.heap.get(s_idx) {
+                        HeapObj::Str(js) => (js.is_ascii(), js.as_bytes().len()),
+                        _ => (false, 0),
+                    }
+                }
+            }
+        } else {
+            self.heap.flatten(s_idx);
+            (matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii()), 0)
+        };
         let u16s: Vec<u16> = if is_ascii { Vec::new() } else { self.value_units(input_val) };
         let subj_units = if is_ascii {
-            self.heap.str_units(s_idx).unwrap_or(0)
+            if slim_exec_enabled() {
+                ascii_units
+            } else {
+                self.heap.str_units(s_idx).unwrap_or(0)
+            }
         } else {
             u16s.len()
         };
@@ -1585,6 +1651,296 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(arr_idx))
     }
 
+    /// The SLIM per-call exec for the fused matchAll step (B124): the same
+    /// RegExpBuiltinExec `regexp_exec_impl_prebits` performs, minus every
+    /// protocol step the `ITFB_FUSED` creation proof already paid for. What
+    /// is elided, and why each elision is sound:
+    ///
+    ///  - ToString(subject): the iterator record's subject IS a string Value
+    ///    (identity conversion — nothing to do).
+    ///  - the lastIndex re-read + ToInteger: the caller just read the slot
+    ///    for its `is_number` guard and passes the Value through; the inline
+    ///    truncation below is exactly `to_integer_or_zero` on the numeric
+    ///    domain (and only engine-written numbers ever reach this slot).
+    ///  - the per-step flag decode: `fbits` was captured at creation and the
+    ///    matcher is engine-internal — no user reference exists to
+    ///    `compile()` new flags (the `Some(prebits)` soundness argument).
+    ///  - flatten + `is_ascii` + `str_units` heap.gets: `ITFB_FUSED` encodes
+    ///    "flat-ASCII subject", proven at creation and stable for the
+    ///    record's life (strings are immutable, Cons→Str flattening is
+    ///    irreversible, heap slots don't move); the unit length IS the byte
+    ///    length of the one subject borrow the matcher needs anyway.
+    ///  - the per-step `ensure_regexp_ascii_twin` probe: the twin field is
+    ///    monotonic (only ever set, never cleared — clearing needs a user
+    ///    `compile()`, impossible here), so the matcher heap.get the search
+    ///    performs anyway doubles as the twin check; the build runs at most
+    ///    once, cold, then every later step sees `Some`.
+    ///  - `regexp_write_last_index`'s `arr_props` probe: the engine-internal
+    ///    matcher can never gain a `lastIndex` attribute entry or a freeze
+    ///    marker (both need a user reference), so the throwing form is
+    ///    unreachable — the heap slot is written directly (debug-asserted).
+    ///    The write-through itself is REQUIRED even though no user reads the
+    ///    matcher: a mid-iteration `RegExp.prototype.exec` swap fails the
+    ///    per-step memo and the fallback resumes from this heap slot.
+    ///  - the caller's result-array empty-match probe: the search knew
+    ///    `mstart == mend`; it is returned instead of re-derived from
+    ///    element 0.
+    ///
+    /// The Annex-B statics deferral and the result build are VERBATIM the
+    /// shared impl's — per-step statics stay observable (`RegExp.$1` after a
+    /// matchAll iteration) and the result array is byte-identical. The
+    /// `prof::enter` mark and the `gc_lock_guard` are kept (~2ns each; the
+    /// guard's removal is a separate ablation — it is provably safe today
+    /// but a landmine if a future edit re-enters the interpreter here).
+    ///
+    /// Nothing in here can throw (the two throwing steps of the full impl —
+    /// ToLength on an object and the non-writable lastIndex Set — are the
+    /// elided ones), so the return is a plain pair: `(NULL, None)` for no
+    /// match, else the result array plus `Some(match end)` iff the match was
+    /// EMPTY — the caller's AdvanceStringIndex trigger.
+    fn regexp_exec_fused_slim(
+        &mut self,
+        re_idx: u32,
+        input_val: Value,
+        fbits: u8,
+        li_v: Value,
+    ) -> (Value, Option<usize>) {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
+        // The result pieces below live in Rust locals — hold GC off until we
+        // return, exactly as the shared impl does.
+        let _gc = self.gc_lock_guard();
+        debug_assert!(li_v.is_number(), "the fused-step guard admits numbers only");
+        // ToLength on an engine-written number: truncate toward zero, floor
+        // at 0, cap 2^53-1 — `to_integer_or_zero` + clamp without the
+        // observable-valueOf valve (unreachable for a number).
+        let li = {
+            let d = li_v.as_f64().trunc();
+            let d = if d.is_nan() { 0.0 } else { d };
+            d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize
+        };
+        let global = fbits & ITFB_GLOBAL != 0;
+        let sticky = fbits & ITFB_STICKY != 0;
+        let has_indices = fbits & ITFB_INDICES != 0;
+        let stateful = global || sticky;
+        // Step 9: a non-global, non-sticky regex always searches from 0
+        // (unreachable today — ITFB_FUSED implies `g` — but kept parallel).
+        let start = if stateful { li } else { 0 };
+        let s_idx = input_val.heap_index();
+        // The matcher fetch the search needs anyway doubles as the twin
+        // probe; `built_twin` bounds the cold build at one attempt so a
+        // (impossible today) non-RegExp slot cannot loop.
+        let mut built_twin = false;
+        let (found, subj_units) = loop {
+            let subj: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => {
+                    debug_assert!(js.is_ascii(), "ITFB_FUSED encodes a flat-ASCII subject");
+                    js.as_str_wf()
+                }
+                _ => "",
+            };
+            // ASCII: the unit length IS the byte length — no `str_units` get.
+            let subj_units = subj.len();
+            if start > subj_units {
+                break (None, subj_units);
+            }
+            match self.heap.get(re_idx) {
+                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => {
+                    break (twin.find_from_ascii(subj, start).next(), subj_units);
+                }
+                // Twin compile failed once: the base program is byte-safe too.
+                HeapObj::RegExp { ascii_twin: Some(None), regex, .. } => {
+                    break (regex.find_from_ascii(subj, start).next(), subj_units);
+                }
+                HeapObj::RegExp { ascii_twin: None, .. } if !built_twin => {}
+                HeapObj::RegExp { regex, .. } => {
+                    break (regex.find_from_ascii(subj, start).next(), subj_units);
+                }
+                _ => break (None, subj_units),
+            }
+            // Cold, at most once per matcher: build (or record the failure
+            // of) the byte-optimized twin, then re-enter with it in place —
+            // `ascii_twin` is monotonic, so the next pass takes a `Some` arm.
+            built_twin = true;
+            self.ensure_regexp_ascii_twin(re_idx);
+        };
+        // Sticky: the match must begin exactly at the search start.
+        let found = found.filter(|m| !(sticky && m.start() != start));
+        let m = match found {
+            Some(m) => m,
+            None => {
+                if stateful {
+                    // Set(R,"lastIndex",0,true) — the direct form of
+                    // `regexp_write_last_index`'s fast path (see the doc
+                    // above for why the slow form is unreachable).
+                    debug_assert!(self.arr_props.get(&re_idx).is_none());
+                    if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(re_idx) {
+                        *last_index = Value::int(0);
+                    }
+                }
+                return (Value::NULL, None);
+            }
+        };
+        let (mstart, mend) = (m.start(), m.end());
+        if stateful {
+            // Set(R,"lastIndex",e,true) — spec step 15, BEFORE the result
+            // construction; direct write, same argument as above.
+            debug_assert!(self.arr_props.get(&re_idx).is_none());
+            if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(re_idx) {
+                *last_index = Value::num(mend as f64);
+            }
+        }
+        // Annex-B legacy statics: refreshed by EVERY successful
+        // RegExpBuiltinExec, fused steps included — `RegExp.$1`/`lastMatch`
+        // after a matchAll iteration are observable global state. VERBATIM
+        // the shared impl's ASCII deferral arm (the subject here is always
+        // ASCII); the length bound keeps the `as u32` casts exact.
+        if subj_units <= u32::MAX as usize {
+            let mut ranges: [Option<(u32, u32)>; 13] = [None; 13];
+            ranges[0] = Some((mstart as u32, mend as u32));
+            ranges[1] = m
+                .captures
+                .iter()
+                .rev()
+                .find_map(|c| c.clone())
+                .map(|r| (r.start as u32, r.end as u32));
+            ranges[2] = Some((0, mstart as u32));
+            ranges[3] = Some((mend as u32, subj_units as u32));
+            for i in 0..9 {
+                ranges[4 + i] =
+                    m.captures.get(i).and_then(|c| c.clone()).map(|r| (r.start as u32, r.end as u32));
+            }
+            if self.regexp_last.len() == 14 {
+                self.regexp_last[0] = input_val;
+            } else {
+                self.regexp_last.clear();
+                self.regexp_last.push(input_val);
+                self.regexp_last.resize(14, Value::UNDEFINED);
+            }
+            self.regexp_last_lazy =
+                Some(RegexpLastLazy { subj: input_val, subj_idx: s_idx, ranges });
+        } else {
+            // A >4GB flat subject cannot defer through u32 ranges: the shared
+            // impl's eager arm, specialised to its ASCII half.
+            let empty = self.alloc_str(String::new());
+            let mut rec = Vec::with_capacity(14);
+            rec.push(input_val);
+            let whole_units = self.ascii_slice_value(s_idx, mstart..mend);
+            rec.push(whole_units);
+            rec.push(match m.captures.iter().rev().find_map(|c| c.clone()) {
+                Some(r) => self.ascii_slice_value(s_idx, r),
+                None => empty,
+            });
+            rec.push(self.ascii_slice_value(s_idx, 0..mstart));
+            rec.push(self.ascii_slice_value(s_idx, mend..subj_units));
+            for i in 0..9 {
+                rec.push(match m.captures.get(i).and_then(|c| c.clone()) {
+                    Some(r) => self.ascii_slice_value(s_idx, r),
+                    None => empty,
+                });
+            }
+            self.regexp_last = rec;
+            self.regexp_last_lazy = None;
+        }
+        // The result build — VERBATIM the shared impl's, with `mk` collapsed
+        // to its ASCII arm (the subject is proven ASCII).
+        let whole = self.ascii_slice_value(s_idx, mstart..mend);
+        let mut elems = Vec::with_capacity(1 + m.captures.len());
+        elems.push(whole);
+        for cap in &m.captures {
+            let v = match cap {
+                Some(r) => self.ascii_slice_value(s_idx, r.clone()),
+                None => Value::UNDEFINED,
+            };
+            elems.push(v);
+        }
+        let named: Vec<(String, Option<std::ops::Range<usize>>)> =
+            m.named_groups().map(|(n, r)| (n.to_string(), r)).collect();
+        let groups = if named.is_empty() {
+            Value::UNDEFINED
+        } else {
+            let mut gm = ObjMap::with_capacity(named.len());
+            for (name, r) in &named {
+                let v = match r {
+                    Some(r) => self.ascii_slice_value(s_idx, r.clone()),
+                    None => Value::UNDEFINED,
+                };
+                gm.set(name, v);
+            }
+            let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
+            // The groups object is OrdinaryObjectCreate(null) — no prototype.
+            self.proto_of.insert(gidx, Value::NULL);
+            Value::heap(gidx)
+        };
+        let arr_idx = self.heap.alloc(HeapObj::Array(elems));
+        let index_v = Value::num(mstart as f64);
+        // index/input/groups are real own data properties of the result array
+        // (writable, enumerable, configurable) so reflection sees them.
+        let attr = PropAttr {
+            writable: true,
+            enumerable: true,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        // `/d` (hasIndices): an `indices` array of [start,end] unit ranges for
+        // the whole match + each capture group, with `.groups` for named groups.
+        let indices_v = if has_indices {
+            let mk = |vm: &mut Self, r: &std::ops::Range<usize>| -> Value {
+                let s = Value::num(r.start as f64);
+                let e = Value::num(r.end as f64);
+                Value::heap(vm.heap.alloc(HeapObj::Array(vec![s, e])))
+            };
+            let mut idx_elems = vec![mk(self, &(mstart..mend))];
+            for cap in &m.captures {
+                idx_elems.push(match cap {
+                    Some(r) => mk(self, r),
+                    None => Value::UNDEFINED,
+                });
+            }
+            let idx_groups = if named.is_empty() {
+                Value::UNDEFINED
+            } else {
+                let mut gm = ObjMap::new();
+                for (name, r) in &named {
+                    let v = match r {
+                        Some(r) => mk(self, r),
+                        None => Value::UNDEFINED,
+                    };
+                    gm.set(name, v);
+                }
+                let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
+                self.proto_of.insert(gidx, Value::NULL);
+                Value::heap(gidx)
+            };
+            let indices_arr = self.heap.alloc(HeapObj::Array(idx_elems));
+            self.arr_props.entry(indices_arr).or_insert_with(ObjMap::new_side_table).define(
+                "groups",
+                idx_groups,
+                attr,
+            );
+            Value::heap(indices_arr)
+        } else {
+            Value::UNDEFINED
+        };
+        // Fresh slot; both side tables are pruned against the mark bits
+        // before a slot can be recycled (same argument as the shared impl).
+        debug_assert!(!self.arr_props.contains_key(&arr_idx));
+        debug_assert!(!self.regexp_result_props.contains_key(&arr_idx));
+        self.regexp_result_props.insert(
+            arr_idx,
+            RegexpResultProps {
+                values: [index_v, input_val, groups, indices_v],
+            },
+        );
+        rxstats::count_compact();
+        if !match_variant_enabled() {
+            // Off-switch: reproduce the eager representation (an ordinary
+            // `ObjMap` in `arr_props`) so the compact form is A/B-able.
+            self.materialize_regexp_result_props(arr_idx);
+        }
+        (Value::heap(arr_idx), (mstart == mend).then_some(mend))
+    }
+
     /// Allocate the string for a byte-range slice of the (all-ASCII, flat)
     /// subject string at `s_idx` — for ASCII, byte offsets are unit offsets.
     /// Materialise the deferred Annex B legacy statics (slots 2..=13 — lastParen,
@@ -1625,11 +1981,33 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn ascii_slice_value(&mut self, s_idx: u32, r: std::ops::Range<usize>) -> Value {
-        let bytes: Vec<u8> = match self.heap.get(s_idx) {
-            HeapObj::Str(js) => js.as_bytes()[r].to_vec(),
-            _ => Vec::new(),
+        // W11 (B124): a slice of a KNOWN-ASCII subject is ascii by
+        // construction — `from_ascii` skips `from_wtf8`'s linear rescan
+        // (~1.8M slices/run on regex-log-scan). Non-ascii subjects keep the
+        // full canonicalizing path.
+        fn ascii_slice_fast() -> bool {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static STATE: AtomicU8 = AtomicU8::new(0);
+            match STATE.load(Ordering::Relaxed) {
+                1 => true,
+                2 => false,
+                _ => {
+                    let on = std::env::var_os("ZIPP_NO_ASCII_SLICE_FAST").is_none();
+                    STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                    on
+                }
+            }
+        }
+        let (bytes, subject_ascii): (Vec<u8>, bool) = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => (js.as_bytes()[r].to_vec(), js.is_ascii() && ascii_slice_fast()),
+            _ => (Vec::new(), false),
         };
-        Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(bytes)))
+        let js = if subject_ascii {
+            crate::heap::JsStr::from_ascii(bytes)
+        } else {
+            crate::heap::JsStr::from_wtf8(bytes)
+        };
+        Value::heap(self.heap.alloc_js(js))
     }
 
     /// `Set(R, "lastIndex", v, true)` on a real RegExp. Fast path writes the
@@ -1943,14 +2321,51 @@ impl<'p> Vm<'p> {
         }
         // The matcher's `lastIndex` only ever holds the numbers this path and
         // the builtin exec write, but the bit costs nothing to re-check and
-        // turns "engine invariant" into "guard".
-        match self.heap.get(regexp) {
-            HeapObj::RegExp { last_index, .. } if last_index.is_number() => {}
+        // turns "engine invariant" into "guard". The Value is EXTRACTED here
+        // (B124): the slim entry takes it as a parameter instead of paying a
+        // second heap.get + ToInteger for the identical slot.
+        let li_v = match self.heap.get(regexp) {
+            HeapObj::RegExp { last_index, .. } if last_index.is_number() => *last_index,
             _ => {
                 rxstats::count_step_full();
                 return None;
             }
+        };
+        if slim_exec_enabled() {
+            // B124 slim entry: one infallible call returns the result array
+            // plus the empty-match fact the probe below re-derived from the
+            // just-built array's element 0.
+            let (r, empty_end) = self.regexp_exec_fused_slim(regexp, string, fbits, li_v);
+            rxstats::count_step_fused();
+            if r == Value::NULL {
+                if let Some(e) = self.regexp_string_iters.get_mut(&it_idx) {
+                    e.3 = true;
+                }
+                return Some(Ok((Value::UNDEFINED, true)));
+            }
+            // The old path probed the just-built array's element 0 for
+            // emptiness; the fold to the returned flag is observation-free
+            // ONLY because element 0 is exactly subject[mstart..mend] — the
+            // assertion anchors that equivalence.
+            debug_assert_eq!(
+                empty_end.is_some(),
+                match self.heap.get(r.heap_index()) {
+                    HeapObj::Array(items) => matches!(
+                        items.first(),
+                        Some(v) if v.is_heap() && self.heap.str_units(v.heap_index()) == Some(0)
+                    ),
+                    _ => false,
+                },
+                "slim empty-match flag must agree with the element-0 probe"
+            );
+            if let Some(end) = empty_end {
+                // `lastIndex` was just written by the exec (== the match
+                // end); ASCII subject ⇒ the advance is exactly +1.
+                self.set_regexp_last_index(regexp, end + 1);
+            }
+            return Some(Ok((r, false)));
         }
+        // ZIPP_NO_SLIM_EXEC=1: the pre-B124 step, byte-for-byte.
         let r = match self.regexp_exec_impl_prebits(regexp, string, true, Some(fbits)) {
             Ok(r) => r,
             Err(t) => return Some(Err(t)),

@@ -1974,6 +1974,41 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::StrConcatChain { dst, a, b } => {
+                // W11 (B124) fused chain link: `dst = a + b` via the win64
+                // `jit_concat_chain` helper (in-place growth of the chain's
+                // fresh flat-Str accumulator, full pairwise `+` otherwise —
+                // the same `Vm::add_values_chain` the interpreter arm calls).
+                // The helper ALLOCATES and, unlike `jit_concat`'s expected
+                // targets, CAN run user code (an object RHS's ToPrimitive via
+                // the `add_values` fallback) — so refetch r13 AND r14 (and
+                // the TA snapshots) after the call. A throw comes back as
+                // CALL_THREW (pending_throw set) → bail = UNWIND, never a
+                // redo (the user side effects must not run twice); the
+                // helper never returns SELF_CALL_DEOPT, the check is kept
+                // for uniformity with its siblings.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // acc bits
+                    ; mov r8, [rbx + dreg(b)]             // leaf bits
+                    ; mov rax, QWORD crate::vm::jit_concat_chain as usize as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::StaticFn { dst, op, arg_base, argc: _ } => {
                 // Bounded set (admission gated argc == 1). PromiseResolve
                 // ALLOCATES ⇒ the StrConcat discipline: re-derive r13 (and the

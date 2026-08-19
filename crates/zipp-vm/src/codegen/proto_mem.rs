@@ -113,7 +113,13 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // it previously compiled. Same helper protocol as the region arm;
             // allocates (grows the heap) ⇒ the emitter refetches r13/r14 when
             // the function pins them.
-            | Instr::StrAppendInPlace { .. } => {}
+            | Instr::StrAppendInPlace { .. }
+            // W11 (B124) fused chain link — same helper protocol as the two
+            // ops above (`jit_concat_chain`). Tier C NEEDS it: the fusion
+            // plants chains INSIDE function bodies Tier C compiles today
+            // (markdown-render's span()/block builders), so rejecting the op
+            // would un-compile them — the exact B56 regression mode.
+            | Instr::StrConcatChain { .. } => {}
             // NOT admitted here, though the emitters exist below and the REGION
             // path (Tier B) has carried them since B10.3: `CellGet`/`UpvalGet`/
             // `CellSet`/`UpvalSet`. Admitting them MEASURED SLOWER — see B50.
@@ -217,16 +223,97 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
 /// may be under-approximated (only costs precision).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn cross_uninit_mask(proto: &FuncProto) -> u64 {
+    // Delegates to the shared fixpoint with the CROSS ud table verbatim —
+    // W11 (B124) extracted the core so the leaf-splice fill could reuse the
+    // same may-read-before-write analysis with its own op table
+    // (`splice_uninit_mask`); the cross path's masks are bit-identical to
+    // the pre-refactor form (cross_call.rs pins this).
+    uninit_mask_over(
+        &proto.code,
+        (proto.reg_count as usize).max(1),
+        proto.param_count as usize,
+        cross_ud,
+    )
+}
+
+/// W11 (B124): the leaf-SPLICE variant of the mask, over the plan's (possibly
+/// nested-flattened) body. Differences from the cross table, each justified:
+/// `Call` is a guard MARKER in a flat body (uses the callee reg only, defines
+/// NOTHING — the dst is defined by the trailing `Move` `splice_nested_leaf`
+/// inserts, and claiming the def here would be unsound if a layout ever put a
+/// read between them); `Mod`/`Neg`/`UpvalGet` are ordinary defs the cross
+/// table simply never needed; `UpvalSet` uses its src at its position (sound
+/// for the deferred buffered commit because admission only allows it in
+/// branch-free bodies). Unknown ops decline to full fill, as ever.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn splice_uninit_mask(code: &[Instr], reg_count: usize, param_count: usize) -> u64 {
+    fn ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
+        use smallvec::Uses;
+        Some(match *i {
+            Instr::Call { callee, .. } => (Uses::one(callee), None),
+            Instr::Mod { dst, a, b } => (Uses::two(a, b), Some(dst)),
+            Instr::Neg { dst, a } => (Uses::one(a), Some(dst)),
+            Instr::UpvalGet { dst, .. } => (Uses::new(), Some(dst)),
+            Instr::UpvalSet { src, .. } => (Uses::one(src), None),
+            _ => return cross_ud(i),
+        })
+    }
+    uninit_mask_over(code, reg_count, param_count, ud)
+}
+
+/// W11 (B124): the set of callee regs any body op DEFINES, for the arg-alias
+/// proof (a param never defined may alias the caller's arg slot). `None` on
+/// any op the splice table does not model — fail-closed, aliasing declines.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn splice_body_defs(code: &[Instr]) -> Option<u64> {
+    fn ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
+        use smallvec::Uses;
+        Some(match *i {
+            Instr::Call { callee, .. } => (Uses::one(callee), None),
+            Instr::Mod { dst, a, b } => (Uses::two(a, b), Some(dst)),
+            Instr::Neg { dst, a } => (Uses::one(a), Some(dst)),
+            Instr::UpvalGet { dst, .. } => (Uses::new(), Some(dst)),
+            Instr::UpvalSet { src, .. } => (Uses::one(src), None),
+            _ => return cross_ud(i),
+        })
+    }
+    let mut defs = 0u64;
+    for i in code {
+        let (_, d) = ud(i)?;
+        if let Some(d) = d {
+            if d as usize >= 64 {
+                return None;
+            }
+            defs |= 1u64 << d;
+        }
+    }
+    Some(defs)
+}
+
+/// The shared may-read-before-write fixpoint (see `cross_uninit_mask`'s doc
+/// for the contract: USES exact, DEFS may under-approximate, unknown op ⇒
+/// `u64::MAX` ⇒ full fill). `ud` supplies the per-op use/def table.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn uninit_mask_over(
+    code: &[Instr],
+    regs: usize,
+    params: usize,
+    ud: fn(&Instr) -> Option<(smallvec::Uses, Option<u16>)>,
+) -> u64 {
     const DECLINE: u64 = u64::MAX;
-    let code = &proto.code;
     let n = code.len();
-    let regs = (proto.reg_count as usize).max(1);
-    let params = proto.param_count as usize;
     if n == 0 || regs > 64 || 1 + params >= 64 {
         return DECLINE;
     }
-    // Per-op (uses, def). `None` (an unlisted op) declines the analysis.
-    fn ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
+    let _ = regs;
+    do_mask_passes(code, params, ud)
+}
+
+/// The CROSS ud table — verbatim from the pre-W11 `cross_uninit_mask` (see
+/// its doc for why USES must be exact and unlisted ops decline).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
+    {
         use smallvec::Uses;
         let u0 = || Uses::new();
         let u1 = |a: u16| Uses::one(a);
@@ -280,8 +367,11 @@ pub(crate) fn cross_uninit_mask(proto: &FuncProto) -> u64 {
             _ => return None,
         })
     }
-    /// A tiny inline use-list (compile-time only; avoids per-op Vec churn).
-    mod smallvec {
+}
+
+/// A tiny inline use-list (compile-time only; avoids per-op Vec churn).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod smallvec {
         pub(super) struct Uses {
             regs: [u16; 3],
             len: u8,
@@ -315,7 +405,17 @@ pub(crate) fn cross_uninit_mask(proto: &FuncProto) -> u64 {
                 }
             }
         }
-    }
+}
+
+/// Passes 1-3 of the mask analysis (see `cross_uninit_mask`'s doc).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn do_mask_passes(
+    code: &[Instr],
+    params: usize,
+    ud: fn(&Instr) -> Option<(smallvec::Uses, Option<u16>)>,
+) -> u64 {
+    const DECLINE: u64 = u64::MAX;
+    let n = code.len();
     // Pass 1: use/def per ip (decline on any unlisted op or out-of-range reg).
     let mut uses: Vec<smallvec::Uses> = Vec::with_capacity(n);
     let mut defs: Vec<Option<u16>> = Vec::with_capacity(n);
@@ -1327,6 +1427,34 @@ pub(crate) fn compile_proto_mem(
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail                          // needs ToPrimitive → interp
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::StrConcatChain { dst, a, b } => {
+                // W11 (B124) fused chain link (`jit_concat_chain` →
+                // `Vm::add_values_chain`, the interpreter's own entry).
+                // Allocates ⇒ refetch r13/r14 when pinned. CAN run user code
+                // (object RHS ToPrimitive via the `add_values` fallback), so
+                // a throw returns CALL_THREW (pending_throw materialized) →
+                // bail = UNWIND, never a redo that would re-run the side
+                // effects. SELF_CALL_DEOPT is never returned by this helper;
+                // the check is kept for uniformity with its siblings.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // acc bits
+                    ; mov r8, [rbx + dreg(b)]             // leaf bits
+                    ; mov rax, QWORD crate::vm::jit_concat_chain as usize as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // threw → unwind, NOT redo
                     ; mov [rbx + dreg(dst)], rax
                 );
                 if let Some((vb, icb)) = refetch {

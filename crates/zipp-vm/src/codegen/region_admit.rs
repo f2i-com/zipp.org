@@ -114,6 +114,11 @@ pub(crate) fn region_can_compile(
             // int/regalloc paths don't list them, so they decline → mem path).
             | Instr::StrConcat { .. }
             | Instr::StrAppendInPlace { .. }
+            // W11 (B124) fused chain link — MEM path via `jit_concat_chain`
+            // (same decline-to-mem shape as the two ops above). LOAD-BEARING:
+            // without this the fused gen-loop regions (regex-log-scan) would
+            // DECLINE outright and the whole row regresses.
+            | Instr::StrConcatChain { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
             // Method calls — handled by the MEMORY path. `arr.push(x)` /

@@ -162,6 +162,7 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::DeleteIndexConcat { dst, .. }
         | Instr::StrConcat { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
+        | Instr::StrConcatChain { dst, .. }
         | Instr::Bitwise { dst, .. }
         | Instr::Call { dst, .. }
         // MathOp and CallMethod DEFINE their dst. They used to fall through the

@@ -87,6 +87,7 @@ impl<'p> Vm<'p> {
                 | Instr::HasProp { dst, .. }
                 | Instr::StrConcat { dst, .. }
                 | Instr::StrAppendInPlace { dst, .. }
+                | Instr::StrConcatChain { dst, .. }
                 | Instr::Call { dst, .. }
                 | Instr::CallMethod { dst, .. } => dst,
                 _ => return false,
@@ -510,6 +511,50 @@ impl<'p> Vm<'p> {
             }
             upvals.extend(nested_upvals);
             consts.extend(nested_consts);
+            // W11 (B124): the may-read-before-write fill mask over the FINAL
+            // (possibly nested-flattened) body — the emitter zero-fills only
+            // these locals per execution. u64::MAX (switch off / unmodelled
+            // op) keeps the full fill, byte-identical to pre-W11.
+            let uninit_mask = if crate::codegen::splice_fill_enabled() {
+                crate::codegen::splice_uninit_mask(
+                    &body,
+                    (callee.reg_count + extra_regs) as usize,
+                    callee.param_count as usize,
+                )
+            } else {
+                u64::MAX
+            };
+            // W11 (B124): params provably never written by any body op may
+            // ALIAS the caller's arg slots (no copy). Fail-closed on unknown
+            // defs; belt-and-braces: decline if a nested guard's callee reg
+            // could itself be a param (the remap would misroute its read).
+            let alias_params = if crate::codegen::splice_alias_enabled() {
+                match crate::codegen::splice_body_defs(&body) {
+                    Some(defs)
+                        if nested.values().all(|g| g.callee_reg > callee.param_count) =>
+                    {
+                        let mut m = 0u64;
+                        let n_alias =
+                            (argc.min(callee.param_count) as u64).min(63);
+                        for i in 0..n_alias {
+                            if defs & (1u64 << (1 + i)) == 0 {
+                                m |= 1u64 << i;
+                            }
+                        }
+                        m
+                    }
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            if log {
+                // W11 mechanism proof: the fill mask must come out ~0 on the
+                // hot bodies (tokIs/mix) or the cut silently no-ops.
+                eprintln!(
+                    "[leaf] fn{func_id}@{ip} splice-lite uninit_mask={uninit_mask:#x} alias_params={alias_params:#x}"
+                );
+            }
             plan.insert(
                 ip,
                 LeafInlinePlan {
@@ -527,6 +572,8 @@ impl<'p> Vm<'p> {
                     cell_set: crate::vm::helpers_misc::jit_cell_set as usize,
                     prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as usize,
                     callee_fid: fid,
+                    uninit_mask,
+                    alias_params,
                 },
             );
         }

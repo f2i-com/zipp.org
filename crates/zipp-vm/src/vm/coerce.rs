@@ -673,6 +673,36 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `acc + b` for one link of a W11 (B124) fused concat chain
+    /// (`StrConcatChain`): result EQUALS `add_values(acc, b)` — the `+`
+    /// operator — for every operand pair; the only difference is HOW a string
+    /// result is built. The accumulator walks a state machine:
+    ///
+    /// * `acc` is a non-interned flat `Str` (the builder — always the fresh,
+    ///   dead result of the previous link, per the emitter's licence on the
+    ///   `StrConcatChain` variant) → `str_append_inplace` grows the buffer in
+    ///   place. Its purity gate refuses any RHS needing user code or special
+    ///   `+` rules (object/Symbol/BigInt — all heap non-strings) BEFORE any
+    ///   mutation, and those fall through to the full `add_values`.
+    /// * `acc` is a primitive (a numeric/BigInt prefix — `1+2+'x'`), a rope
+    ///   (`Cons` — the chain went large, keep O(1) rope links), or interned →
+    ///   plain `add_values`, which owns every coercion/TypeError/asymptotics
+    ///   rule. Semantics identity is inherited, not re-implemented.
+    ///
+    /// Shared verbatim by the interpreter arm, `jit_concat_chain` (MEM
+    /// region) and Tier C — interpreter-vs-JIT byte identity by construction.
+    pub(crate) fn add_values_chain(&mut self, acc: Value, b: Value) -> Result<Value, Thrown> {
+        if acc.is_heap()
+            && acc.heap_index() > crate::heap::INTERN_EMPTY
+            && matches!(self.heap.get(acc.heap_index()), HeapObj::Str(_))
+        {
+            if let Some(r) = self.str_append_inplace(acc, b) {
+                return Ok(r);
+            }
+        }
+        self.add_values(acc, b)
+    }
+
     /// `acc + val` as a string append that MUTATES `acc`'s buffer in place when
     /// `acc` is a uniquely-owned, non-interned flat string (`Str` at a user heap
     /// index). Otherwise — `acc` is the interned `""`/single-char (first append),
@@ -710,6 +740,47 @@ impl<'p> Vm<'p> {
                     js.push_ascii(b'0' + n as u8);
                     return Some(acc);
                 }
+            }
+            // W11 (B124): any other int — write its exact decimal form (the
+            // same `fmt_i32_buf` digits the `add_values` string+int fast path
+            // produces) straight into the buffer. Int leaves dominate the
+            // fused concat chains (`"#" + ri(9000) + …`), and the general
+            // path below would allocate a temporary heap string per leaf.
+            let (buf, start) = fmt_i32_buf(n);
+            if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
+                js.push_wtf8(&buf[start..]);
+                return Some(acc);
+            }
+        }
+        // W11 (B124): flat-Str RHS at a DIFFERENT slot — append its bytes
+        // directly instead of round-tripping through `str_wtf8_cow(..)
+        // .into_owned()` (a Rust malloc + copy + free per link; string leaves
+        // dominate the fused chains alongside ints). Split-borrow safely by
+        // TAKING the accumulator's `JsStr` out of its slot for the append:
+        // nothing in between allocates on the VM heap, so no GC safepoint can
+        // observe the placeholder. Same-index RHS (`a += a` shapes reaching
+        // the legacy `StrAppendInPlace` path) and ropes keep the general path
+        // below — byte-identical results either way (`push_wtf8` is the same
+        // append the cow path fed).
+        if mutable && val.is_heap() && val.heap_index() != acc.heap_index() {
+            let ai = acc.heap_index();
+            let slot = self.heap.get_mut(ai);
+            if matches!(slot, HeapObj::Str(_)) {
+                let taken = std::mem::replace(
+                    slot,
+                    HeapObj::Str(crate::heap::JsStr::from_wtf8(Vec::new())),
+                );
+                let mut js = match taken {
+                    HeapObj::Str(js) => js,
+                    _ => unreachable!("checked Str above"),
+                };
+                if let HeapObj::Str(vs) = self.heap.get(val.heap_index()) {
+                    js.push_wtf8(vs.as_bytes());
+                    *self.heap.get_mut(ai) = HeapObj::Str(js);
+                    return Some(acc);
+                }
+                // Rope RHS: restore the accumulator and take the general path.
+                *self.heap.get_mut(ai) = HeapObj::Str(js);
             }
         }
         // General: materialise `val`'s EXACT (WTF-8) string form (same coercion

@@ -1086,6 +1086,17 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    // W11 (B124) fused concat-chain link: `+` semantics exactly
+                    // (add_values_chain delegates every non-in-place case to
+                    // add_values); `a` is the chain's dead fresh accumulator
+                    // temp, so a flat-Str `a` may grow in place.
+                    Instr::StrConcatChain { dst, a, b } => {
+                        let va = self.get(base, a);
+                        let vb = self.get(base, b);
+                        let r = self.add_values_chain(va, vb)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     // In-place string append (emitter proved `a` uniquely owned).
                     Instr::StrAppendInPlace { dst, a, b } => {
                         let av = self.get(base, a);

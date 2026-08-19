@@ -157,6 +157,24 @@ pub enum Instr {
     /// linearity proof the emitter guarantees.
     StrAppendInPlace { dst: Reg, a: Reg, b: Reg },
 
+    /// `dst = a + b` — SEMANTICALLY IDENTICAL to `Add` for EVERY operand pair
+    /// (numeric folding, BigInt rules and the mixing TypeError, Symbol
+    /// TypeError, object ToPrimitive order and side effects, WTF-8 seam
+    /// canonicalization). Emitted ONLY by the W11 (B124) n-ary concat-chain
+    /// fusion in `FnCompiler::binary`/the template arm, for links 2.. of a
+    /// flattened `L1+L2+…+Ln` spine: `acc = Add(L1,L2)` then per leaf
+    /// `StrConcatChain{dst:acc, a:acc, b:leaf}` and a final `Move` to the
+    /// caller's dst. The extra licence over `Add`: `a` is ALWAYS the dead,
+    /// freshly-heap-allocated result of the immediately preceding chain link
+    /// (an unnamed compiler temp — never a param, never Moved/stored/read
+    /// elsewhere, unreachable from JS), so when it is a non-interned flat
+    /// `Str` the runtime may grow its buffer IN PLACE instead of allocating.
+    /// The first link stays a plain `Add` so a `LoadConst`'d (JIT-shared,
+    /// pre-interned) string is never the in-place accumulator. Runtime =
+    /// `Vm::add_values_chain`, shared verbatim by the interpreter arm, the
+    /// MEM-region helper and the Tier-C helper (`jit_concat_chain`).
+    StrConcatChain { dst: Reg, a: Reg, b: Reg },
+
     // ── comparisons → boolean ──
     Lt { dst: Reg, a: Reg, b: Reg },
     Le { dst: Reg, a: Reg, b: Reg },

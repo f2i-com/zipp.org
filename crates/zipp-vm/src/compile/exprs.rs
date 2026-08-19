@@ -97,6 +97,39 @@ pub(crate) fn fused_cmp_jump_enabled() -> bool {
     }
 }
 
+/// Flatten the LEFT-leaning `+` spine: `L1+L2+…+Ln` parses as
+/// `Binary{Add, Binary{Add, …}, Ln}`, so only the LEFT child is walked — a
+/// parenthesized right operand (`a + (b + c)`) is its own subexpression with
+/// a different pairwise coercion order and stays a single leaf here (its own
+/// `binary()` call may fuse it independently). (W11 B124 chain fusion.)
+fn add_spine<'e>(e: &'e ast::Expr, leaves: &mut Vec<&'e ast::Expr>) {
+    if let ast::Expr::Binary { op: ast::BinaryOp::Add, left, right } = e {
+        add_spine(left, leaves);
+        leaves.push(right);
+    } else {
+        leaves.push(e);
+    }
+}
+
+/// W11 (B124): `ZIPP_NO_CONCAT_FUSE=1` disables the n-ary string-concat chain
+/// fusion (`FnCompiler::concat_chain` — the `binary()` Add-spine flatten and
+/// the ≥3-piece template emission), restoring the pairwise `Add` bytecode
+/// bit-for-bit. Compiler-side gate; read once per process (memoized AtomicU8).
+#[inline]
+pub(crate) fn concat_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CONCAT_FUSE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// How a property's value arrives: an ordinary expression (`k: v`, `[k]: v`), or
 /// a method/accessor's own `Function` node (`m(){}`, `get k(){}`). oxc modelled
 /// the second as a `FunctionExpression` in `value`; `ast` names it directly, so
@@ -252,6 +285,59 @@ impl<'a> FnCompiler<'a> {
                     // has always emitted rather than inventing a value.
                     None => self.add_string_const(""),
                 };
+                // ── W11 (B124) chain fusion, template form ── the desugared
+                // concat pieces: q0, then per `${e}` a ToStr'd value plus its
+                // trailing non-empty quasi. A ≥3-piece template fuses like the
+                // `binary()` Add spine (q0 is always a string leaf, so the
+                // literal gate is satisfied by construction): link 1 is a
+                // plain `Add` of q0 with the first ToStr (never grow the
+                // JIT-shared LoadConst'd constant in place), links 2.. are
+                // `StrConcatChain` on a fresh `acc` temp, and a final `Move`
+                // writes `dst`. Building in `acc` rather than `dst` also
+                // closes the old build-into-var-dst quirk: a `${}` expression
+                // reading the destination var mid-build now sees its PRIOR
+                // value (matching node), not a partial intermediate. Op order
+                // (LoadConst / leaf eval / ToStr) is otherwise identical.
+                let pieces = 1
+                    + t.exprs.len()
+                    + t.quasis
+                        .iter()
+                        .skip(1)
+                        .filter(|q| q.cooked.as_ref().is_some_and(|s| !s.is_empty()))
+                        .count();
+                if concat_fuse_enabled() && pieces >= 3 {
+                    let acc = self.temp();
+                    let save = self.next_reg; // == acc + 1
+                    let q0r = self.temp();
+                    self.emit(Instr::LoadConst { dst: q0r, idx });
+                    // `pieces >= 3` implies at least one `${e}`, so link 1
+                    // (the plain Add consuming q0r) fires in iteration 0.
+                    let mut started = false;
+                    for (i, e) in t.exprs.iter().enumerate() {
+                        let r = self.expr(e)?;
+                        let rs = self.temp();
+                        self.emit(Instr::ToStr { dst: rs, a: r });
+                        if started {
+                            self.emit(Instr::StrConcatChain { dst: acc, a: acc, b: rs });
+                        } else {
+                            self.emit(Instr::Add { dst: acc, a: q0r, b: rs });
+                            started = true;
+                        }
+                        self.next_reg = save;
+                        if let Some(qe) = t.quasis.get(i + 1) {
+                            if let Some(q) = qe.cooked.as_ref().filter(|s| !s.is_empty()) {
+                                let qidx = self.str_const(q);
+                                let qr = self.temp();
+                                self.emit(Instr::LoadConst { dst: qr, idx: qidx });
+                                self.emit(Instr::StrConcatChain { dst: acc, a: acc, b: qr });
+                                self.next_reg = save;
+                            }
+                        }
+                    }
+                    self.emit(Instr::Move { dst, src: acc });
+                    self.next_reg = acc.max(dst + 1);
+                    return Ok(dst);
+                }
                 self.emit(Instr::LoadConst { dst, idx });
                 for (i, e) in t.exprs.iter().enumerate() {
                     let r = self.expr(e)?;
@@ -1480,6 +1566,48 @@ impl<'a> FnCompiler<'a> {
         Ok(j)
     }
 
+    /// W11 (B124) n-ary string-concat chain fusion: emit a flattened
+    /// `L1+L2+…+Ln` (n≥3) as `acc = Add(L1,L2)` then, per remaining leaf,
+    /// `StrConcatChain{dst:acc, a:acc, b:leaf}`, and a final `Move` into the
+    /// caller's `dst`. Leaf EVALUATION stays exactly where the pairwise tree
+    /// put it (E1 E2 C1 C2 | E3 C3 | …), so every observable — a call leaf's
+    /// side effects, an object operand's ToPrimitive, a Symbol/BigInt-mix
+    /// TypeError's position, a throw mid-chain — is bit-identical to the
+    /// unfused emission. What changes is only the combine op: links 2.. may
+    /// grow the accumulator (a dead fresh temp) in place instead of
+    /// re-allocating per level. Link 1 stays a plain `Add` so a `LoadConst`'d
+    /// (JIT-shared) string constant is never the in-place accumulator.
+    ///
+    /// The trailing `Move` (rather than pointing the last link at `dst`) is
+    /// LOAD-BEARING twice over: (a) every `StrConcatChain` dst is then the
+    /// `acc` temp, which the same region always also defines via the link-1
+    /// `Add` — so write-cover scans that don't enumerate the new op (e.g. the
+    /// TA-pin plan's `writes()`) still find a recognised writer and stay
+    /// conservative; (b) a var-destination chain (`x = …` / template into a
+    /// declared var) never exposes a partial intermediate through `dst`.
+    fn concat_chain(&mut self, leaves: &[&ast::Expr], dst: Reg) -> R<Reg> {
+        let acc = self.temp();
+        let save = self.next_reg; // == acc + 1: leaf temps roll back to here
+        let a = self.expr(leaves[0])?;
+        let b = self.expr(leaves[1])?;
+        self.emit(Instr::Add { dst: acc, a, b });
+        self.next_reg = save;
+        for leaf in &leaves[2..] {
+            let r = self.expr(leaf)?;
+            self.emit(Instr::StrConcatChain { dst: acc, a: acc, b: r });
+            // Per-link rollback keeps the live-temp footprint flat (~2 above
+            // `acc`) however long the chain — never below `acc` while the
+            // chain is live (the in-place licence depends on `acc`'s slot
+            // staying untouched between links).
+            self.next_reg = save;
+        }
+        self.emit(Instr::Move { dst, src: acc });
+        // `acc` is dead after the Move; reclaim it (guarding a high `dst`,
+        // following the `calls.rs` `save.max(dst + 1)` precedent).
+        self.next_reg = acc.max(dst + 1);
+        Ok(dst)
+    }
+
     pub(crate) fn binary(
         &mut self,
         op: ast::BinaryOp,
@@ -1560,6 +1688,25 @@ impl<'a> FnCompiler<'a> {
                 }
                 self.emit(Instr::AddInt { dst, a, imm, upd: false });
                 return Ok(dst);
+            }
+        }
+        // ── W11 (B124) n-ary concat-chain fusion ── a ≥3-leaf `+` spine with
+        // at least one syntactic string producer (Str literal / template) is a
+        // string-concat chain: fuse it (see `concat_chain`). Pure-numeric
+        // chains keep the pairwise `Add`s so INT/GPR/DV region admission is
+        // unchanged. `ZIPP_NO_CONCAT_FUSE=1` restores the pairwise emission
+        // bit-for-bit. (This sits AFTER the AddInt fast path, which never
+        // fires on an Add spine — `is_numeric_expr` rejects `Binary::Add`.)
+        if matches!(op, Op::Add) && concat_fuse_enabled() {
+            let mut leaves: Vec<&ast::Expr> = Vec::new();
+            add_spine(left, &mut leaves);
+            leaves.push(right);
+            if leaves.len() >= 3
+                && leaves
+                    .iter()
+                    .any(|l| matches!(l, ast::Expr::Str(_) | ast::Expr::Template(_)))
+            {
+                return self.concat_chain(&leaves, dst);
             }
         }
         let a = self.expr(left)?;

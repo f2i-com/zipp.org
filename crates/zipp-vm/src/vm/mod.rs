@@ -489,7 +489,9 @@ pub struct Vm<'p> {
     /// done latch). Its `next()` drives RegExpExec (honouring a user `exec`) one
     /// match at a time, rather than matchAll eagerly collecting every match up
     /// front.
-    regexp_string_iters: std::collections::HashMap<u32, (u32, Value, u8, bool)>,
+    // W11 (B124): FxHashMap — the fused matchAll step probes this map once
+    // per step (600k/run on regex-log-scan); SipHash was ~17ns of that probe.
+    regexp_string_iters: rustc_hash::FxHashMap<u32, (u32, Value, u8, bool)>,
     /// RegExp legacy statics backing `RegExp.input`/`$_`/`lastMatch`/`$&`/
     /// `lastParen`/`$+`/`leftContext`/`$``/`rightContext`/`$'`/`$1`–`$9`, laid
     /// out as [input, lastMatch, lastParen, leftContext, rightContext, $1..$9]

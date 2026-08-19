@@ -106,7 +106,7 @@ impl<'p> Vm<'p> {
             template_cache: std::collections::HashMap::new(),
             jit_shape_slot: rustc_hash::FxHashMap::default(),
             for_in_barren: rustc_hash::FxHashMap::default(),
-            regexp_string_iters: std::collections::HashMap::new(),
+            regexp_string_iters: rustc_hash::FxHashMap::default(),
             regexp_last: Vec::new(),
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,

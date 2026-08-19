@@ -2031,6 +2031,9 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::Mod { a, b, .. }
         | Instr::StrConcat { a, b, .. }
         | Instr::StrAppendInPlace { a, b, .. }
+        // W11 (B124) fused chain link. In `numeric_operand_uses` above it is
+        // deliberately ABSENT, like `StrConcat` (the 3.31x→3.45x lesson).
+        | Instr::StrConcatChain { a, b, .. }
         | Instr::Bitwise { a, b, .. }
         | Instr::Lt { a, b, .. }
         | Instr::Le { a, b, .. }
