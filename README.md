@@ -183,7 +183,7 @@ for reasons that have nothing to do with the engine. If an existing clone has it
 on: `git config core.autocrlf false && git rm --cached -r -q . && git reset
 --hard`.
 
-**Performance — cold geomean 1.28× zipp/node (95% CI 1.27×–1.29×)** on the
+**Performance — cold geomean 1.21× zipp/node (95% CI 1.20×–1.22×)** on the
 ten programs in `bench/real/`, 21 counterbalanced paired observations against
 Node v24.12.0, every output byte-identical to Node. The measured binary is the
 profile-guided release build (`bash tools/pgo.sh` — adopted after PGO measured
@@ -191,31 +191,32 @@ profile-guided release build (`bash tools/pgo.sh` — adopted after PGO measured
 
 | bench | node | zipp | paired ratio |
 |---|---|---|---|
-| map-set-heavy | 1068ms | 696ms | **0.65×** |
-| async-promise-chain | 365ms | 386ms | 1.05× |
-| markdown-render | 304ms | 328ms | 1.07× |
-| json-large | 312ms | 351ms | 1.13× |
-| class-prototype-hot | 300ms | 385ms | 1.29× |
-| sparse-array | 84ms | 113ms | 1.35× |
-| polymorphic-objects | 335ms | 483ms | 1.42× |
-| parse-large-js | 289ms | 458ms | 1.59× |
-| typedarray-math | 210ms | 347ms | 1.66× |
-| regex-log-scan | 509ms | 1130ms | 2.25× |
+| map-set-heavy | 1278ms | 831ms | **0.66×** |
+| markdown-render | 367ms | 359ms | **0.99×** |
+| async-promise-chain | 425ms | 434ms | 1.02× |
+| json-large | 361ms | 384ms | 1.08× |
+| class-prototype-hot | 310ms | 391ms | 1.26× |
+| sparse-array | 93ms | 127ms | 1.33× |
+| parse-large-js | 363ms | 486ms | 1.34× |
+| polymorphic-objects | 356ms | 500ms | 1.39× |
+| typedarray-math | 239ms | 369ms | 1.56× |
+| regex-log-scan | 604ms | 1164ms | 1.95× |
 
-Cold total is the primary metric. Zipp starts about 3.4× faster than Node
-(9.8ms vs 33.0ms — no snapshot to load), is *faster than Node* on
-`map-set-heavy` by 35%, and `async-promise-chain` and `markdown-render` are
-within 7%.
+Cold total is the primary metric. Zipp starts about 3.1× faster than Node
+(12.6ms vs 39.6ms — no snapshot to load), is *faster than Node* on
+`map-set-heavy` by 34% and now on `markdown-render` too (0.99×, the wave-9
+generational nursery's doing), and `async-promise-chain` is within 2%.
+`regex-log-scan` is under 2× for the first time in this file's history.
 
 The same capture also times three DIAGNOSTIC benchmarks that are deliberately
 outside the ten, because they exist to expose weaknesses the ten cannot see:
-`polymorphic-objects-v2` 2.54×, `sparse-array-v2` 3.58×, `property-ic-shapes`
-3.84×. Their own geomean is 3.27×, and quoting a geomean over all thirteen gives
-1.59×, which is not comparable to any historical figure in this file — the ten
+`polymorphic-objects-v2` 2.42×, `sparse-array-v2` 3.64×, `property-ic-shapes`
+3.74×. Their own geomean is 3.21×, and quoting a geomean over all thirteen gives
+1.52×, which is not comparable to any historical figure in this file — the ten
 are the series. The harness now computes and records both, so the split no
 longer depends on anyone remembering to pass `--benches`.
 
-This capture is `bench/head_clean_72cb640_pgo.json`, marked `publishable: true`
+This capture is `bench/head_clean_74d03d2_pgo.json`, marked `publishable: true`
 like its predecessors (`bench/head_clean_e839613.json` was the first artifact
 to earn that flag). The flag means the harness checked, *before
 measuring*, that the engine reported a build identity, that its tree was not
@@ -235,9 +236,15 @@ useful as direction and are not a measurement of any commit (`PERF_ROADMAP.md`
 B103).
 
 Re-measuring at a later commit gives similar ratios but not the same absolute
-milliseconds, because the box and the Node build both move — between these two
-captures Node itself got 6–12% faster on four rows, which moved the ratio
-without anything changing in zipp.
+milliseconds, because the box and the Node build both move — between the wave-7
+and wave-8 captures Node itself got 6–12% faster on four rows, and between the
+wave-8 and wave-9 captures the box ran BOTH engines 10–20% slower in absolute
+terms (every pair is measured interleaved, so the paired ratios stay honest for
+the session). Read the wave-to-wave headline with that split in mind: wave 9's
+own attributable delta is its one-binary bundle, −0.5% [−0.8, −0.1] over the
+ten plus the nursery retrial's −0.7% [−1.0, −0.5] — the remainder of
+1.283 → 1.212 is capture-to-capture drift of the box and Node, in zipp's
+favour this time as it was against it last time.
 
 Checking this table is worth doing rather than trusting it: between two earlier
 captures `class-prototype-hot` had silently regressed to **7.99×** and the suite
@@ -283,19 +290,22 @@ the ten ratios above:
 
 | scenario | geomean |
 |---|---|
-| today (cold total) | 1.28× |
-| `regex-log-scan` at Node parity | **1.18×** |
-| `typedarray-math` at Node parity | **1.22×** |
-| **both of the two worst at Node parity** | **1.12×** |
+| today (cold total) | 1.21× |
+| `regex-log-scan` at Node parity | **1.13×** |
+| `typedarray-math` at Node parity | **1.16×** |
+| **both of the two worst at Node parity** | **1.08×** |
 
 (The *shape* of this arithmetic is what matters and it does not move as the
-headline does: the two worst rows going to parity is worth ~0.2 of geomean, and
-no contained fix reaches that.)
+headline does: the two worst rows going to parity is worth ~0.13 of geomean,
+and no contained fix reaches that.)
 
-The cold score being below 1.30× is not general parity: nine rows remain slower
-and the two worst are 2.25× and 1.66×. The contained fixes in `PERF_ROADMAP.md` are
-safe substrate, but moving toward 1× still requires stable shape metadata, an
-optimizing CFG/SSA tier, and arena/nursery allocation rather than a stack of
+The cold score being below 1.25× is not general parity: eight rows remain
+slower and the two worst are 1.95× and 1.56×. The contained fixes in
+`PERF_ROADMAP.md` are safe substrate, and one of the three architectural items
+has now landed — the generational nursery is the DEFAULT collector since wave
+9 (B122: net −0.7% with regex/json/markdown taking 2–7% row wins against two
+named sub-2% trades). Moving toward 1× still requires the other two: stable
+shape metadata and an optimizing CFG/SSA tier, rather than a stack of
 unmeasured 1–2% tweaks.
 
 **One number explains most of the rest: the general (boxed) JIT tier costs
