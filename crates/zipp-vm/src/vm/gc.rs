@@ -44,9 +44,15 @@
 //! barrier (`Heap::write_barrier[_val]` at the enumerated VM chokepoints) or
 //! targets a registered scan root (`Heap::register_scan_root` — receivers
 //! JIT caches store into call-free), or lands in a VM side table, which the
-//! root walk re-scans wholesale each minor. So H is in the dirty set, its
-//! edges are re-traced, Y' is found, and the (young) path suffix Y'→…→Y is
-//! traced normally. `tests/nursery_minor.rs` pins this per edge idiom, and
+//! root walk re-scans wholesale each minor. W10 (B123) splits the barrier
+//! disjunct in two: the value-tested form RECORDS Y' ITSELF (`Heap::vremset`,
+//! `GEN_VLOG`-deduped) and the minor marks it directly — no holder
+//! re-trace; the value-BLIND card form (`Heap::write_barrier` — batch
+//! mutators, register re-parks, `Heap::replace`) still dirties H for a full
+//! re-trace. Either way Y' is found, and the (young) path suffix Y'→…→Y is
+//! traced normally. A recorded value OVERWRITTEN before the minor is kept
+//! one epoch (a conservative float, reclaimed on the `major_at` schedule).
+//! `tests/nursery_minor.rs` pins this per edge idiom, and
 //! `ZIPP_NURSERY_VERIFY=1` re-runs the FULL mark beside every minor and
 //! panics on the first young object the minor trace missed.
 
@@ -709,8 +715,19 @@ impl Vm<'_> {
         let t_start = gcstats::now(stats);
         // Every non-young slot (old, pinned prefix, free tombstone) is
         // presumed live: the shared root walk and the unchanged `trace_edges`
-        // push only unmarked — i.e. YOUNG — objects from here on.
-        let mut marks = self.heap.gen_nonyoung_marks();
+        // push only unmarked — i.e. YOUNG — objects from here on. W10: the
+        // vector is CACHED between minors (a fresh O(heap) build per minor
+        // measured 25.4ms/run on async-promise-chain — B123); the take
+        // re-derives it in O(young log). Equivalence with the fresh build is
+        // re-proven per minor under the verifier.
+        let mut marks = self.heap.take_nonyoung_marks();
+        if nursery_verify::enabled() {
+            let fresh = self.heap.gen_nonyoung_marks();
+            assert!(
+                marks == fresh,
+                "nonyoung-cache drift: cached mark vector != fresh gen_nonyoung_marks"
+            );
+        }
         let mut stack: Vec<u32> = Vec::with_capacity(1024);
         self.mark_roots(&mut marks, &mut stack, n);
         let t_roots = gcstats::now(stats);
@@ -723,6 +740,17 @@ impl Vm<'_> {
         for &h in &dirty {
             self.trace_edges(h, &mut marks, &mut stack, n);
         }
+        // W10 value-grain records (B123): each entry is a young value some
+        // old-clean holder received this epoch — mark it directly and trace
+        // from it. This is what replaced the dirty-holder full edge-list
+        // re-trace for value-form stores (59.3ms/run on regex-log-scan).
+        for i in 0..self.heap.value_remset().len() {
+            let v = self.heap.value_remset()[i];
+            if !marks[v as usize] {
+                marks[v as usize] = true;
+                stack.push(v);
+            }
+        }
         while let Some(idx) = stack.pop() {
             self.trace_edges(idx, &mut marks, &mut stack, n);
         }
@@ -732,17 +760,33 @@ impl Vm<'_> {
             self.verify_minor_marks(&marks, n);
         }
         let mut freed: Vec<u32> = Vec::new();
+        let log_len = self.heap.young_log().len();
         let swept = self.heap.sweep_young(&marks, &mut freed);
         let t_sweep = gcstats::now(stats);
+        // W10 survival-adaptive budget (B123) — before note_minor_done reads
+        // it for the next threshold. Skipped under stress: epochs of ~1 alloc
+        // make the ratio noise, and stress ignores gc_threshold anyway.
+        if !self.gc_stress {
+            self.heap.adapt_young_budget(log_len - swept, log_len);
+        }
         // A minor prunes only what it FREED (see `prune_freed`); the
         // whole-table retains are the major's.
         self.prune_freed(&freed);
+        // W10: restore the freed slots to TRUE (their tombstones are OLD) —
+        // survivors were already set true by the trace — and the vector is
+        // all-true again: exactly the next minor's base. Stash it for reuse.
+        for &i in &freed {
+            marks[i as usize] = true;
+        }
+        self.heap.stash_nonyoung_marks(marks);
         // Dirty holders' young referents were just promoted: their edges are
         // old→old now, so they go back to clean (the scan roots persist).
         self.heap.remset_reset();
+        self.heap.vremset_reset();
         let free_after = self.heap.free_indices().len();
         gcstats::record(stats, true, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
         gcstats::record_minor(swept as u64, dirty.len() as u64, n);
+        gcstats::record_budget(self.heap.young_budget() as u64);
         self.heap.note_minor_done(n - free_after);
         if self.heap.oracle_on() {
             self.heap.oracle_next_epoch();
@@ -1241,6 +1285,9 @@ mod gcstats {
     static FLOATED_SWEPT: AtomicU64 = AtomicU64::new(0);
     static NS_MINOR: AtomicU64 = AtomicU64::new(0);
     static NS_MAJOR: AtomicU64 = AtomicU64::new(0);
+    // W10: the survival-adaptive young budget's last value and peak.
+    static BUDGET_LAST: AtomicU64 = AtomicU64::new(0);
+    static BUDGET_PEAK: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub(super) fn enabled() -> bool {
@@ -1300,6 +1347,13 @@ mod gcstats {
         PEAK_SLOTS.fetch_max(slots as u64, Ordering::Relaxed);
     }
 
+    /// W10: the live young budget after each minor (last + peak), for the
+    /// `[gc-nursery]` report — the adaptive controller's observable.
+    pub(super) fn record_budget(budget: u64) {
+        BUDGET_LAST.store(budget, Ordering::Relaxed);
+        BUDGET_PEAK.fetch_max(budget, Ordering::Relaxed);
+    }
+
     /// Unconditional per-MAJOR accounting (`floated_swept` is stats-gated by
     /// the caller — computing it costs a young-log walk).
     pub(super) fn record_major(floated_swept: u64, slots: usize) {
@@ -1323,6 +1377,16 @@ mod gcstats {
             g(&FLOATED_SWEPT),
             g(&DIRTY_PEAK),
             g(&PEAK_SLOTS),
+        )
+    }
+
+    /// W10: `(last, peak)` of the survival-adaptive young budget — a
+    /// separate accessor so `dump_nursery`'s 8-tuple (destructured by the
+    /// CLI and the nursery tests) keeps its shape.
+    pub fn dump_budget() -> (u64, u64) {
+        (
+            BUDGET_LAST.load(Ordering::Relaxed),
+            BUDGET_PEAK.load(Ordering::Relaxed),
         )
     }
 
@@ -1435,4 +1499,5 @@ mod nursery_verify {
 
 pub use gcstats::dump as gc_stats;
 pub use gcstats::dump_gen as gc_gen_stats;
+pub use gcstats::dump_budget as gc_young_budget_stats;
 pub use gcstats::dump_nursery as gc_nursery_stats;

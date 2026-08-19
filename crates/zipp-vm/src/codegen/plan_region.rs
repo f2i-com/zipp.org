@@ -1495,8 +1495,19 @@ fn plan_region_cold_inner(
     // ── overflow-guard elision (INT path) ── interval analysis proves which
     // arithmetic results always stay inside [-2^53, 2^53].
     let mut elide_guard: FxHashSet<usize> = FxHashSet::default();
+    let mut strict_entry_globs: FxHashSet<u32> = FxHashSet::default();
     let mut mul_shift: FxHashMap<usize, (u16, u8)> = FxHashMap::default();
-    if region_is_int(proto, start, end, ta_plan) {
+    // W10 (B123): a DV-retry plan (admit_bitwise && admit_dv) runs the prover
+    // too, with the DV arms enabled — without this, DV regions kept every i53
+    // guard AND lost r13/r14 from the GPR pool (`region_is_int` runs the
+    // strict admission, which the DV CallMethods fail). `dv_prover` is None
+    // for every other caller, so their elide sets stay byte-identical.
+    let dv_prover = (admit_bitwise
+        && admit_dv
+        && !region_is_int(proto, start, end, ta_plan)
+        && int_unadmitted_ips(proto, start, end, ta_plan, true).is_some_and(|v| v.is_empty()))
+    .then_some(ta_plan);
+    if region_is_int(proto, start, end, ta_plan) || dv_prover.is_some() {
         let mut entry = AbsState {
             regs: FxHashMap::default(),
             globs: FxHashMap::default(),
@@ -1538,7 +1549,26 @@ fn plan_region_cold_inner(
                 entry.regs.insert(r, (v, v)); // materialised in the prologue
             }
         }
-        elide_guard = analyze_int_guards(proto, s, e, entry);
+        // W10: strict-entry candidates for the DV prover — loop-carried
+        // globals (read-first AND stored in-region). A survivor's entry load
+        // becomes strict-i32 (see `RegionPlan::strict_entry_globs`).
+        if dv_prover.is_some() {
+            for (&gi, &read_first) in &glob_first_read {
+                if read_first
+                    && code[s..=e].iter().enumerate().any(|(off, i2)| {
+                        !cold.contains(&(s + off))
+                            && matches!(*i2,
+                                Instr::StoreGlobal { idx, .. }
+                                | Instr::StoreGlobalStrict { idx, .. }
+                                | Instr::StoreGlobalResolved { idx, .. } if idx == gi)
+                    })
+                {
+                    strict_entry_globs.insert(gi);
+                }
+            }
+        }
+        elide_guard =
+            analyze_int_guards_strict(proto, s, e, entry, dv_prover, &mut strict_entry_globs);
         // Strength-reduce a guard-elided `Mul` by a constant power of two into a
         // left shift (`psllq`), skipping the imul gpr round-trip.
         for ip in s..=e {
@@ -1914,6 +1944,7 @@ fn plan_region_cold_inner(
         dv_flag_fuse,
         hoist_pins,
         hoist_len_ips,
+        strict_entry_globs,
     }))
 }
 

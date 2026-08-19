@@ -1493,6 +1493,7 @@ mod gc;
 pub(crate) use gc::gc_stats;
 pub(crate) use gc::gc_gen_stats;
 pub(crate) use gc::gc_nursery_stats;
+pub(crate) use gc::gc_young_budget_stats;
 pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use helpers_misc::call_inline_stats;

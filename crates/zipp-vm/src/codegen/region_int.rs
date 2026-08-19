@@ -259,6 +259,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ta_snapshot,
                     &p,
                     meter,
+                    false, // W10.3: never spill on the first attempt (B96 ordering)
                 ) {
                     GprAttempt::Emitted(f) => return Some(f),
                     // The B119 relief valve: one shared-home re-plan when only
@@ -273,6 +274,10 @@ pub(crate) fn compile_region_int_maybe_cold(
                                     "[jit] INT-GPR DV retry [{start},{end}]: shared-home re-plan"
                                 );
                             }
+                            // W10.3: the post-share attempt may spill the
+                            // coldest homes to frame slots instead of
+                            // declining (ZIPP_NO_GPR_SPILL_SLOTS=1 restores
+                            // the decline byte-for-byte).
                             if let GprAttempt::Emitted(f) = compile_region_int_gpr(
                                 proto,
                                 start,
@@ -282,6 +287,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                 ta_snapshot,
                                 &shared,
                                 meter,
+                                true,
                             ) {
                                 return Some(f);
                             }
@@ -401,6 +407,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                             ta_snapshot,
                             &p2,
                             meter,
+                            false, // W10.3: never spill on the first attempt
                         ) {
                             GprAttempt::Emitted(f) => return Some(f),
                             // Same B119 relief valve as the main flow: one
@@ -415,6 +422,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                             "[jit] INT-GPR nest retry [{start},{end}]: shared-home re-plan"
                                         );
                                     }
+                                    // W10.3: spill on the post-share attempt.
                                     if let GprAttempt::Emitted(f) = compile_region_int_gpr(
                                         proto,
                                         start,
@@ -424,6 +432,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                         ta_snapshot,
                                         &shared,
                                         meter,
+                                        true,
                                     ) {
                                         return Some(f);
                                     }
@@ -463,6 +472,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             ta_snapshot,
             &plan,
             meter,
+            false, // W10.3 spilling is scoped to the DV / split-fallback retries above
         ) {
             GprAttempt::Emitted(f) => return Some(f),
             // ── B119 nested-loop residual ── the ENCLOSING region of a loop
@@ -503,6 +513,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         ta_snapshot,
                         &shared,
                         meter,
+                        false, // W10.3 spilling is scoped to the DV / split-fallback retries
                     ) {
                         return Some(f);
                     }

@@ -80,6 +80,12 @@ pub fn gc_nursery_stats() -> (u64, u64, f64, f64, u64, u64, u64, u64) {
     vm::gc_nursery_stats()
 }
 
+/// W10: `(last, peak)` of the survival-adaptive young budget (B123). Both 0
+/// until the first minor records; updates in every mode (relaxed atomics).
+pub fn gc_young_budget_stats() -> (u64, u64) {
+    vm::gc_young_budget_stats()
+}
+
 /// `ZIPP_RXSTATS=1` RegExp match-result representation counters:
 /// `(compact_constructions, materialized, matchall_steps_fused,
 /// matchall_steps_fallback)` — how many successful capturing exec results

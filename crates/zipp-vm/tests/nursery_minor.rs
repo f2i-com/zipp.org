@@ -460,6 +460,183 @@ fn nursery_parity_pretenured_split_array_receives_young() {
     assert_eq!(out[0], format!("256:{vsum}"));
 }
 
+/// W10 adaptive budget: high young survival (a retained build) must grow the
+/// budget; the churn tail must bring it back to the floor; env pins hold it
+/// fixed. Each probe spawns a child with a clean env (the latches are
+/// per-process) running an in-process assert against
+/// `zipp_vm::gc_young_budget_stats()`.
+#[test]
+fn budget_adapts_and_pins() {
+    let exe = std::env::current_exe().expect("test exe path");
+    for (probe, envs) in [
+        ("probe_budget_grows_then_shrinks", vec![]),
+        ("probe_budget_pinned_by_env", vec![("ZIPP_NURSERY_YOUNG_BUDGET", "32768")]),
+        ("probe_budget_pinned_by_no_adapt", vec![("ZIPP_NO_NURSERY_ADAPT", "1")]),
+    ] {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg(probe).arg("--ignored");
+        cmd.env_remove("ZIPP_NURSERY_YOUNG_BUDGET");
+        cmd.env_remove("ZIPP_NO_NURSERY_ADAPT");
+        cmd.env_remove("ZIPP_GC_STRESS");
+        cmd.env_remove("ZIPP_NO_NURSERY");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{probe} failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!stdout.contains("running 0 tests"), "{probe} filter matched nothing");
+    }
+}
+
+/// Spawned by `budget_adapts_and_pins` with a clean env: build a large
+/// retained structure (survival ~100% per epoch → budget doubles), then
+/// churn (survival ~0% → halves back to the 16384 floor).
+#[test]
+#[ignore = "spawned by budget_adapts_and_pins with a clean env"]
+fn probe_budget_grows_then_shrinks() {
+    let out = run_ok(
+        r#"
+        "use strict";
+        var keep = [];
+        for (var i = 0; i < 200000; i++) keep.push({ v: i });   // high survival
+        var s = 0;
+        for (var j = 0; j < 400000; j++) { var g = { a: j }; s = (s + g.a) | 0; } // churn
+        console.log(keep.length + ":" + (s !== 0));
+        "#,
+    );
+    assert_eq!(out[0], "200000:true");
+    let (last, peak) = zipp_vm::gc_young_budget_stats();
+    assert!(peak >= 65536, "budget never grew: peak {peak}");
+    assert_eq!(last, 16384, "budget did not shrink back: last {last}");
+}
+
+/// Spawned with ZIPP_NURSERY_YOUNG_BUDGET=32768: pinned at the env value.
+#[test]
+#[ignore = "spawned by budget_adapts_and_pins with ZIPP_NURSERY_YOUNG_BUDGET=32768"]
+fn probe_budget_pinned_by_env() {
+    let out = run_ok(
+        r#"
+        "use strict";
+        var keep = [];
+        for (var i = 0; i < 200000; i++) keep.push({ v: i });
+        console.log(keep.length);
+        "#,
+    );
+    assert_eq!(out[0], "200000");
+    let (last, peak) = zipp_vm::gc_young_budget_stats();
+    assert_eq!((last, peak), (32768, 32768), "env pin did not hold");
+}
+
+/// Spawned with ZIPP_NO_NURSERY_ADAPT=1: pinned at the 16384 default.
+#[test]
+#[ignore = "spawned by budget_adapts_and_pins with ZIPP_NO_NURSERY_ADAPT=1"]
+fn probe_budget_pinned_by_no_adapt() {
+    let out = run_ok(
+        r#"
+        "use strict";
+        var keep = [];
+        for (var i = 0; i < 200000; i++) keep.push({ v: i });
+        console.log(keep.length);
+        "#,
+    );
+    assert_eq!(out[0], "200000");
+    let (last, peak) = zipp_vm::gc_young_budget_stats();
+    assert_eq!((last, peak), (16384, 16384), "no-adapt pin did not hold");
+}
+
+/// W10 value-grain remset: the SAME young value stored repeatedly into an old
+/// holder in a tight loop — pins the GEN_VLOG dedup (one vremset entry, not
+/// one per store) and the repeat-store fast path, while minors keep the value
+/// alive across the loop.
+#[test]
+fn nursery_parity_same_young_value_stored_repeatedly() {
+    let n = scaled(400_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        var keep = [null];
+        for (var w = 0; w < 64; w++) keep.push({{ pin: w }}); // grow + survive
+        var y = {{ v: 42 }};
+        for (var i = 0; i < N; i++) {{
+          keep[0] = y;                    // same young value, every iteration
+          var g = {{ a: i }};              // young garbage driving minors
+          if (g.a === -1) console.log("unreachable");
+        }}
+        console.log(keep[0].v + ":" + keep.length);
+        "#
+    ));
+    assert_eq!(out[0], "42:65");
+}
+
+/// W10 value-grain remset: young values stored into old array slots and then
+/// OVERWRITTEN with ints before the next minor — the recorded values float
+/// one epoch by design (conservative), and the majors reclaim them: the
+/// bounded-heap arithmetic must still hold and the final ints must read back.
+#[test]
+fn nursery_parity_young_store_overwritten_before_minor() {
+    let n = scaled(300_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        var arr = [];
+        for (var w = 0; w < 128; w++) arr.push(0);
+        for (var i = 0; i < N; i++) {{
+          arr[i & 127] = {{ v: i }};       // young in
+          arr[i & 127] = i;               // overwritten with an int
+          var g = [i];
+          if (g.length !== 1) console.log("unreachable");
+        }}
+        var s = 0;
+        for (var j = 0; j < 128; j++) s += arr[j];
+        console.log(s);
+        "#
+    ));
+    let s: u64 = ((n as u64 - 128)..n as u64).sum();
+    assert_eq!(out[0], format!("{s}"));
+}
+
+/// W10 value-grain remset: a young value recorded via old holder A, then A's
+/// slot nulled and the value kept ONLY through old holder B (stored in the
+/// same epoch) — both records independently keep it alive; losing either
+/// would sweep it live.
+#[test]
+fn nursery_parity_value_moved_between_old_holders() {
+    let n = scaled(200_000);
+    let out = run_ok(&format!(
+        r#"
+        "use strict";
+        var N = {n};
+        var a = {{ slot: null }};
+        var b = {{ slot: null }};
+        var g0 = {{ warm: 1 }};
+        for (var w = 0; w < 70000; w++) {{ var t = {{ x: w }}; if (t.x < 0) console.log(t.x); }}
+        var sum = 0;
+        for (var i = 0; i < N; i++) {{
+          var y = {{ v: i }};
+          a.slot = y;                      // record via A
+          b.slot = y;                      // record via B (same epoch)
+          a.slot = null;                   // A no longer holds it
+          sum = (sum + b.slot.v) | 0;      // alive through B across minors
+          var g = {{ churn: i }};
+          if (g.churn === -1) console.log("unreachable");
+        }}
+        console.log(sum + ":" + (a.slot === null) + ":" + b.slot.v);
+        "#
+    ));
+    let mut sum: i64 = 0;
+    for i in 0..n as i64 {
+        sum = (sum + i) as i32 as i64;
+    }
+    assert_eq!(out[0], format!("{sum}:true:{}", n - 1));
+}
+
 /// Re-run every `nursery_parity_` case in eight more modes, each in its own
 /// child process (the env latches are read once per process). The same
 /// arithmetic assertions passing in all modes IS the parity check; a swept
@@ -469,7 +646,7 @@ fn nursery_parity_pretenured_split_array_receives_young() {
 #[test]
 fn all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 8] = [
+    let modes: [&[(&str, &str)]; 12] = [
         &[("ZIPP_NO_NURSERY", "1")],
         &[("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_NO_NURSERY", "1"), ("ZIPP_GC_STRESS", "1")],
@@ -478,6 +655,14 @@ fn all_modes_answer_identically() {
         &[("ZIPP_NURSERY_VERIFY", "1"), ("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_GCSTATS", "1")],
         &[("ZIPP_NOJIT", "1")],
+        // W10: value-grain remset off (holder-grain), alone, under stress,
+        // and under the verifier — the escape hatch must stay a tested
+        // configuration.
+        &[("ZIPP_NO_VALGRAIN_REMSET", "1")],
+        &[("ZIPP_NO_VALGRAIN_REMSET", "1"), ("ZIPP_GC_STRESS", "1")],
+        &[("ZIPP_NO_VALGRAIN_REMSET", "1"), ("ZIPP_NURSERY_VERIFY", "1")],
+        // W10: minor-marks cache off (per-minor rebuild).
+        &[("ZIPP_NO_NONYOUNG_CACHE", "1")],
     ];
     for envs in modes {
         let mut cmd = std::process::Command::new(&exe);

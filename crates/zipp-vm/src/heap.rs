@@ -2281,6 +2281,31 @@ pub struct Heap {
     /// Latched absence of `ZIPP_NO_PRETENURE` — the escape hatch that keeps
     /// the nursery trial one-binary.
     pretenure_on: bool,
+    /// W10: the minor mark vector, retained between minors (all-true at
+    /// stash time; one O(young-log) pass re-derives the fresh build — see
+    /// [`Heap::take_nonyoung_marks`]). Empty when invalid or taken.
+    nonyoung_cache: Vec<bool>,
+    /// Whether `nonyoung_cache` may be reused (false after a take, a major's
+    /// gen rewrite, `young_reset`, or the `set_nursery` hook).
+    nonyoung_cache_valid: bool,
+    /// Latched absence of `ZIPP_NO_NONYOUNG_CACHE`.
+    nonyoung_cache_on: bool,
+    /// W10: whether the young budget is PINNED (an explicit
+    /// `ZIPP_NURSERY_YOUNG_BUDGET` or `ZIPP_NO_NURSERY_ADAPT=1`) — the
+    /// survival-adaptive controller then never moves it.
+    budget_pinned: bool,
+    /// W10 value-grain remembered set (B123): the YOUNG values stored into
+    /// OLD-clean holders this epoch, recorded by `write_barrier_val` and
+    /// marked DIRECTLY as minor roots — replacing the holder-grain full
+    /// edge-list re-trace for every store site that knows its value (on
+    /// regex-log-scan that re-trace was 59.3ms/run: 227,698 `jit_set_index`
+    /// stores into two retained arrays). Deduped per value by `GEN_VLOG`;
+    /// cleared (capacity kept) at every minor and major. The value-BLIND
+    /// card form (`write_barrier`) and its callers keep holder-grain
+    /// `remset` treatment, as do the `scan_roots`.
+    vremset: Vec<u32>,
+    /// Latched absence of `ZIPP_NO_VALGRAIN_REMSET`.
+    valgrain: bool,
 }
 
 /// Stage-3 generation states (low two bits of a `Heap::gen` byte).
@@ -2294,6 +2319,11 @@ const GEN_DIRTY: u8 = 2;
 const GEN_STATE: u8 = 0b11;
 /// Sticky "registered in `Heap::scan_roots`" bit (call-free store target).
 const GEN_SCAN: u8 = 0b100;
+/// W10: "already recorded in `Heap::vremset` this epoch" — the value-grain
+/// remembered set's dedup bit (a young VALUE stored into an old holder is
+/// pushed at most once per epoch). Cleared wherever the slot's state is
+/// wholesale restamped (`alloc`, `free_slot`, the promote arms).
+const GEN_VLOG: u8 = 0b1000;
 
 /// Smallest live-object count that triggers a collection — below this the heap is
 /// trivially small and collecting would be pure overhead.
@@ -2355,8 +2385,19 @@ const NURSERY_YOUNG_BUDGET: usize = 1 << 14;
 /// Backstop: run a major at least every 64th collection even if the occupied
 /// count never crosses `major_at`, so major-only hygiene (the
 /// `brand_private_names` recompute, reclaiming table capacity) is never
-/// deferred forever.
+/// deferred forever. W10 note: at the adaptive cap (`NURSERY_BUDGET_MAX`)
+/// this defers the hygiene major to at most 64×128k allocations; `major_at`
+/// still bounds floats within one (now larger) budget of the pre-nursery
+/// schedule.
 const NURSERY_MAX_MINORS: u32 = 64;
+
+/// W10: the survival-adaptive budget's ceiling (the floor is
+/// [`NURSERY_YOUNG_BUDGET`]). 128k: the B122 sweep measured 131072 at +1.31%
+/// SUITE-wide — but that was as a fixed budget for every row; the controller
+/// reaches it only while young survival stays above ~25%, which on the
+/// measured rows happens exactly where fewer minors pay
+/// (async-promise-chain's chain-build phases: −3.3% at 64k in B121's trial).
+const NURSERY_BUDGET_MAX: usize = 1 << 17;
 
 /// Under `ZIPP_GC_STRESS=1` a collection runs at EVERY safe point; capping the
 /// streak at 3 makes stress alternate minor,minor,minor,major so BOTH sweep
@@ -2392,12 +2433,18 @@ impl Heap {
         let nursery = std::env::var_os("ZIPP_NO_NURSERY").is_none();
         // The pre-interned prefix is pinned and immutable — OLD from birth.
         let gen = if nursery { vec![GEN_OLD; objs.len()] } else { Vec::new() };
-        let young_budget = std::env::var("ZIPP_NURSERY_YOUNG_BUDGET")
+        let budget_env = std::env::var("ZIPP_NURSERY_YOUNG_BUDGET")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&v| v >= 1024)
-            .unwrap_or(NURSERY_YOUNG_BUDGET);
+            .filter(|&v| v >= 1024);
+        // W10: an explicit budget (or the adapt kill switch) PINS it — the
+        // survival controller below then never moves it.
+        let budget_pinned =
+            budget_env.is_some() || std::env::var_os("ZIPP_NO_NURSERY_ADAPT").is_some();
+        let young_budget = budget_env.unwrap_or(NURSERY_YOUNG_BUDGET);
         let pretenure_on = std::env::var_os("ZIPP_NO_PRETENURE").is_none();
+        let nonyoung_cache_on = std::env::var_os("ZIPP_NO_NONYOUNG_CACHE").is_none();
+        let valgrain = std::env::var_os("ZIPP_NO_VALGRAIN_REMSET").is_none();
         Heap {
             objs,
             versions,
@@ -2419,8 +2466,14 @@ impl Heap {
             major_due: false,
             minors_since_major: 0,
             young_budget,
+            budget_pinned,
             pretenure: 0,
             pretenure_on,
+            nonyoung_cache: Vec::new(),
+            nonyoung_cache_valid: false,
+            nonyoung_cache_on,
+            vremset: Vec::new(),
+            valgrain,
         }
     }
 
@@ -2542,6 +2595,7 @@ impl Heap {
         if on && self.gen.len() != self.objs.len() {
             self.gen = vec![GEN_OLD; self.objs.len()];
         }
+        self.invalidate_nonyoung_cache();
     }
 
     /// Whether the collection about to run may be a MINOR (young-only trace,
@@ -2571,6 +2625,7 @@ impl Heap {
             self.gen[i as usize] = GEN_OLD;
         }
         self.young.clear();
+        self.invalidate_nonyoung_cache();
     }
 
     /// MINOR sweep: walk ONLY the young log, freeing the unmarked entries —
@@ -2591,8 +2646,10 @@ impl Heap {
                 self.free_slot(idx);
                 freed.push(idx);
             } else {
+                // Promote: OLD, keeping only the sticky scan bit — a stale
+                // GEN_VLOG must not survive promotion (W10).
                 let g = &mut self.gen[idx as usize];
-                *g = (*g & !GEN_STATE) | GEN_OLD;
+                *g = (*g & GEN_SCAN) | GEN_OLD;
             }
         }
         log.clear();
@@ -2616,15 +2673,32 @@ impl Heap {
         }
     }
 
-    /// Value-tested write barrier: enter `holder` into the remembered set only
-    /// when it is OLD-clean AND `v` is a YOUNG heap value — the exact
-    /// old→young edge condition (NURSERY_DESIGN.md §1). Everything else is
-    /// filtered in at most three compares; the common repeat-store exits on
-    /// the first (the holder is already `GEN_DIRTY`).
+    /// Value-tested write barrier. W10 (B123): VALUE-GRAIN — when `v` is a
+    /// young heap value not yet recorded this epoch (`GEN_VLOG` clear, one
+    /// masked compare tests young+unrecorded together) and `holder` is
+    /// OLD-clean, record the VALUE itself in `vremset`; the minor marks it
+    /// directly, and the holder's full edge-list re-trace stops existing for
+    /// value-form stores. A `GEN_DIRTY` holder is deliberately SKIPPED — a
+    /// card-dirtied holder gets a full re-trace anyway, so recording its
+    /// values would be redundant work. The conservative trade: a recorded
+    /// value later overwritten before the minor is still kept one epoch (a
+    /// float, reclaimed on the unchanged `major_at` schedule); on the
+    /// measured rows the added float is zero (the stores are retained
+    /// appends). `ZIPP_NO_VALGRAIN_REMSET=1` restores the holder-grain body.
     #[inline]
     pub fn write_barrier_val(&mut self, holder: u32, v: Value) {
-        if self.nursery
-            && self.gen[holder as usize] & GEN_STATE == GEN_OLD
+        if !self.nursery {
+            return;
+        }
+        if self.valgrain {
+            if v.is_heap()
+                && self.gen[v.heap_index() as usize] & (GEN_STATE | GEN_VLOG) == GEN_YOUNG
+                && self.gen[holder as usize] & GEN_STATE == GEN_OLD
+            {
+                self.gen[v.heap_index() as usize] |= GEN_VLOG;
+                self.vremset.push(v.heap_index());
+            }
+        } else if self.gen[holder as usize] & GEN_STATE == GEN_OLD
             && v.is_heap()
             && self.gen[v.heap_index() as usize] & GEN_STATE == GEN_YOUNG
         {
@@ -2684,12 +2758,106 @@ impl Heap {
         self.remset = remset;
     }
 
+    /// W10: the value-grain remembered set — young value indices recorded by
+    /// `write_barrier_val` this epoch, for the minor to mark directly.
+    #[inline]
+    pub fn value_remset(&self) -> &[u32] {
+        &self.vremset
+    }
+
+    /// W10 survival-adaptive young budget (B123): called by `gc_minor` after
+    /// each sweep with the just-ended epoch's survivor and log counts,
+    /// BEFORE `note_minor_done` reads the budget for the next threshold.
+    /// Bang-bang with a 5×-wide dead band: survival above ~25% doubles the
+    /// budget (minors are reclaiming little — the async chain-build shape,
+    /// which measured −3.3% at a 64k budget while paying +7.6% at 8k), below
+    /// ~5% halves it back toward the 16k floor (churn rows: json 0.2%
+    /// post-pretenure, regex 3.4%, map-set 0.0% — all measured 16k-optimal).
+    /// Monotone negative feedback (survival falls as the budget grows), so a
+    /// stationary workload converges to a clamp bound or the dead band.
+    /// Skipped when pinned (`ZIPP_NURSERY_YOUNG_BUDGET` /
+    /// `ZIPP_NO_NURSERY_ADAPT=1`), on an empty log (an all-pretenured
+    /// epoch), and under GC stress (the caller guards — epochs of ~1 alloc
+    /// make the ratio noise).
+    pub fn adapt_young_budget(&mut self, survivors: usize, log_len: usize) {
+        if self.budget_pinned || log_len == 0 {
+            return;
+        }
+        if survivors * 4 > log_len {
+            self.young_budget = (self.young_budget * 2).min(NURSERY_BUDGET_MAX);
+        } else if survivors * 20 < log_len {
+            self.young_budget = (self.young_budget / 2).max(NURSERY_YOUNG_BUDGET);
+        }
+    }
+
+    /// W10: the live young budget (for the GCSTATS report).
+    #[inline]
+    pub fn young_budget(&self) -> usize {
+        self.young_budget
+    }
+
+    /// W10: drop the epoch's value records (capacity kept — steady state
+    /// never reallocates, the young-log pattern). The recorded values were
+    /// just promoted or swept, and a promoted slot's stale `GEN_VLOG` is
+    /// stripped by the promote arms; a swept slot's by `free_slot`.
+    pub fn vremset_reset(&mut self) {
+        self.vremset.clear();
+    }
+
     /// A minor needs `marks[i] == true` for every NON-YOUNG slot (old objects
     /// are boundary nodes presumed live; free tombstones are `GEN_OLD` by
     /// `free_slot`), so the shared root walk and the unchanged `trace_edges`
     /// push — and therefore trace — ONLY young objects.
     pub fn gen_nonyoung_marks(&self) -> Vec<bool> {
         self.gen.iter().map(|&g| g & GEN_STATE != GEN_YOUNG).collect()
+    }
+
+    /// W10: the minor's mark vector WITHOUT the O(heap) rebuild. Building
+    /// `gen_nonyoung_marks` fresh at every minor measured 0.039ns/slot — at
+    /// async-promise-chain's 1.37M slots × 463 minors that was 25.4ms/run,
+    /// misattributed to "roots" (B123). A minor ends with the vector ALL TRUE
+    /// (every young-log slot was either promoted — marked live by the trace —
+    /// or freed and restored by `gc_minor`), which is exactly the next
+    /// minor's starting point for every slot that is not in the NEW young
+    /// log: an old slot stays old between minors, a recycled slot re-enters
+    /// the log, a fresh push is either logged (young) or pretenured (old,
+    /// covered by the `resize(.., true)`). So the stashed vector plus one
+    /// O(young-log) clearing pass reproduces the fresh build. The dangerous
+    /// direction — a stale TRUE on a young slot, whose referents the trace
+    /// would then skip and sweep alive — is impossible by construction (every
+    /// current log entry is cleared unconditionally); a stale FALSE on an old
+    /// slot only over-traces. `gc_minor` re-verifies equivalence against the
+    /// fresh build under `ZIPP_NURSERY_VERIFY=1`.
+    /// `ZIPP_NO_NONYOUNG_CACHE=1` restores the per-minor rebuild.
+    pub fn take_nonyoung_marks(&mut self) -> Vec<bool> {
+        if !self.nonyoung_cache_on || !self.nonyoung_cache_valid {
+            return self.gen_nonyoung_marks();
+        }
+        let mut m = std::mem::take(&mut self.nonyoung_cache);
+        self.nonyoung_cache_valid = false;
+        m.resize(self.objs.len(), true);
+        for &i in &self.young {
+            m[i as usize] = false;
+        }
+        m
+    }
+
+    /// W10: hand the minor's mark vector back for reuse. Called by `gc_minor`
+    /// only after the freed-slot restore, when the vector is all-true again.
+    pub fn stash_nonyoung_marks(&mut self, m: Vec<bool>) {
+        if !self.nonyoung_cache_on {
+            return;
+        }
+        self.nonyoung_cache = m;
+        self.nonyoung_cache_valid = true;
+    }
+
+    /// W10: drop the cached mark vector — called wherever `gen` is rewritten
+    /// outside the minor path (a major's wholesale promote, `young_reset`,
+    /// the `set_nursery` test hook). The next minor rebuilds cold, exactly
+    /// today's cost, once.
+    fn invalidate_nonyoung_cache(&mut self) {
+        self.nonyoung_cache_valid = false;
     }
 
     /// Total slot count (live + free + pinned). Sweeps iterate `0..len`.
@@ -2768,12 +2936,16 @@ impl Heap {
         if self.nursery {
             // Every survivor of a major is OLD (and the remembered set is
             // stale — its young referents were just promoted or swept).
+            // Keeping only GEN_SCAN also strips any stale GEN_VLOG (W10) —
+            // the value-grain dedup bit must not outlive its vremset entry.
             for g in &mut self.gen {
-                *g = (*g & !GEN_STATE) | GEN_OLD;
+                *g = (*g & GEN_SCAN) | GEN_OLD;
             }
             self.remset.clear();
+            self.vremset.clear();
         }
         self.young.clear();
+        self.invalidate_nonyoung_cache();
     }
 
     /// [`Heap::note_gc_done`]'s MINOR twin. `live` is the post-sweep OCCUPIED
@@ -3542,6 +3714,9 @@ mod tests {
     /// holders to clean so the next epoch's first store re-remembers them.
     #[test]
     fn a_write_barrier_remembers_old_holders_of_young_values_exactly_once() {
+        // W10 (B123): the value-tested form is VALUE-GRAIN — it records the
+        // young VALUE (vremset, GEN_VLOG-deduped) and leaves the holder
+        // clean; the value-BLIND card form still dirties the holder.
         let mut h = Heap::new();
         h.set_nursery(true); // hold even in a suite run under ZIPP_NO_NURSERY=1
         let holder = h.alloc(HeapObj::Cell(Value::UNDEFINED));
@@ -3552,30 +3727,50 @@ mod tests {
         assert!(freed.is_empty());
 
         let young = h.alloc(HeapObj::Str(JsStr::new("yy".into())));
-        // young holder / young value: no entry.
+        // young holder / young value: no record either way.
         h.write_barrier_val(young, Value::heap(young));
+        assert_eq!(h.value_remset(), &[] as &[u32]);
         assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());
-        // old holder / non-heap value: no entry.
+        // old holder / non-heap value: nothing.
         h.write_barrier_val(holder, Value::int(7));
-        assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());
-        // old holder / OLD value (the interned prefix is old): no entry.
+        assert_eq!(h.value_remset(), &[] as &[u32]);
+        // old holder / OLD value (the interned prefix is old): nothing.
         h.write_barrier_val(holder, Value::heap(INTERN_EMPTY));
+        assert_eq!(h.value_remset(), &[] as &[u32]);
+        // old holder / young value: the VALUE is recorded — exactly once
+        // across repeats (GEN_VLOG dedup), and the holder stays CLEAN.
+        h.write_barrier_val(holder, Value::heap(young));
+        h.write_barrier_val(holder, Value::heap(young));
+        assert_eq!(h.value_remset(), &[young]);
         assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());
-        // old holder / young value: remembered — exactly once across repeats.
-        h.write_barrier_val(holder, Value::heap(young));
-        h.write_barrier_val(holder, Value::heap(young));
-        h.write_barrier(holder); // the card form dedups against the same state
+        // The card form still dirties the holder (holder-grain).
+        h.write_barrier(holder);
         assert_eq!(h.dirty_for_trace(), vec![holder]);
+        // A DIRTY holder's further value stores are skipped (its full
+        // re-trace covers them) — no new value records for a fresh young.
+        let young1b = h.alloc(HeapObj::Str(JsStr::new("y2".into())));
+        h.write_barrier_val(holder, Value::heap(young1b));
+        assert_eq!(h.value_remset(), &[young]);
 
-        // End of minor: the holder returns to clean; a fresh young store in
-        // the next epoch re-remembers it.
+        // End of minor: both sets reset; the next epoch records afresh.
         let marks = vec![true; h.len()];
         h.sweep_young(&marks, &mut freed);
         h.remset_reset();
+        h.vremset_reset();
         assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());
+        assert_eq!(h.value_remset(), &[] as &[u32]);
         let young2 = h.alloc(HeapObj::Str(JsStr::new("zz".into())));
         h.write_barrier_val(holder, Value::heap(young2));
-        assert_eq!(h.dirty_for_trace(), vec![holder]);
+        assert_eq!(h.value_remset(), &[young2]);
+
+        // Stale-VLOG-after-major regression: run the major-side reset (gen
+        // wholesale rewrite must strip GEN_VLOG), then a NEW young occupant
+        // of the same slot must be recordable again.
+        h.note_gc_done(h.len());
+        assert_eq!(h.value_remset(), &[] as &[u32]);
+        let young3 = h.alloc(HeapObj::Str(JsStr::new("ww".into())));
+        h.write_barrier_val(holder, Value::heap(young3));
+        assert_eq!(h.value_remset(), &[young3]);
     }
 
     /// Persistent scan roots (call-free JIT store targets): registered once,

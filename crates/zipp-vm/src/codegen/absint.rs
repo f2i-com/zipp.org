@@ -168,10 +168,106 @@ pub(crate) fn refine_cmp(st: &mut AbsState, a: u16, b: u16, cmp: Cmp, truth: boo
 /// live-in i32 facts and hoisted-constant values. Returns an empty set on any
 /// op outside the modelled subset or non-convergence (all guards kept).
 pub(crate) fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: AbsState) -> FxHashSet<usize> {
+    analyze_int_guards_ext(proto, s, e, entry, None)
+}
+
+/// W10 (B123): the interval prover with the DV-region arms enabled. `dv` is
+/// `Some(ta_plan)` ONLY for a `region_int` DV-retry plan — every other caller
+/// keeps the strict subset, so existing regions' `elide_guard` sets are
+/// byte-identical. The extension models exactly the ops a DV swizzle region
+/// carries, each bounded BY CONSTRUCTION: a non-`>>>` Bitwise result and
+/// `Math.imul` are ToInt32; `>>>` a u32; a pinned DV get* is bounded by its
+/// kind's value range; a pinned flat-ASCII `charCodeAt` by the byte; a pinned
+/// int element by i32. This is what lets the bsum accumulator chain prove
+/// itself under 2^53 and shed its six per-iteration i53 guards — without it a
+/// DV region kept every guard AND lost r13/r14 from the GPR pool.
+pub(crate) fn analyze_int_guards_ext(
+    proto: &FuncProto,
+    s: usize,
+    e: usize,
+    entry: AbsState,
+    dv: Option<&TaPinPlan>,
+) -> FxHashSet<usize> {
+    let mut none: FxHashSet<u32> = FxHashSet::default();
+    analyze_int_guards_strict(proto, s, e, entry, dv, &mut none)
+}
+
+/// W10 (B123): the DV prover with STRICT-ENTRY seeding. `strict_globs` comes
+/// in holding CANDIDATE global slots (loop-carried accumulators stored in the
+/// region) and leaves holding the verified SURVIVORS: each survivor was
+/// optimistically seeded `IV_I32` at entry, and the converged fixpoint's
+/// header join stayed within i32 — the standard seed-and-check invariant
+/// proof, valid PROVIDED the entry value really is i32, which the caller
+/// enforces by marking the survivor's entry load strict (bail on wider — an
+/// entry bail computes nothing, so it is always sound). A candidate whose
+/// join escapes i32 is pruned and the fixpoint re-runs (the set shrinks
+/// monotonically, so this terminates). Without this, a `|0`-truncated
+/// accumulator like the DV swizzle's `bsum` enters at the ±2^53 entry-guard
+/// interval and poisons every add on its chain.
+pub(crate) fn analyze_int_guards_strict(
+    proto: &FuncProto,
+    s: usize,
+    e: usize,
+    entry: AbsState,
+    dv: Option<&TaPinPlan>,
+    strict_globs: &mut FxHashSet<u32>,
+) -> FxHashSet<usize> {
     let n = e - s + 1;
     if n > 512 {
+        strict_globs.clear();
         return FxHashSet::default();
     }
+    let mut cands: FxHashSet<u32> = strict_globs.clone();
+    loop {
+        let mut seeded = entry.clone();
+        for &g in &cands {
+            seeded.globs.insert(g, IV_I32);
+        }
+        match analyze_run(proto, s, e, seeded, dv) {
+            None => {
+                strict_globs.clear();
+                return FxHashSet::default();
+            }
+            Some((states, elide)) => {
+                let bad: Vec<u32> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&g| {
+                        states[0].as_ref().map_or(true, |st| {
+                            let iv = st.glob(g);
+                            iv.0 < i32::MIN as i64 || iv.1 > i32::MAX as i64
+                        })
+                    })
+                    .collect();
+                if bad.is_empty() {
+                    *strict_globs = cands;
+                    return elide;
+                }
+                for g in bad {
+                    cands.remove(&g);
+                }
+                if cands.is_empty() {
+                    strict_globs.clear();
+                    return analyze_run(proto, s, e, entry, dv)
+                        .map(|(_, el)| el)
+                        .unwrap_or_default();
+                }
+            }
+        }
+    }
+}
+
+/// One full fixpoint + elide collection from a given entry state. `None` on
+/// an op outside the (possibly DV-extended) subset or non-convergence.
+#[allow(clippy::type_complexity)]
+fn analyze_run(
+    proto: &FuncProto,
+    s: usize,
+    e: usize,
+    entry: AbsState,
+    dv: Option<&TaPinPlan>,
+) -> Option<(Vec<Option<AbsState>>, FxHashSet<usize>)> {
+    let n = e - s + 1;
     // states[i] = abstract state BEFORE executing ip s+i.
     let mut states: Vec<Option<AbsState>> = vec![None; n];
     states[0] = Some(entry);
@@ -184,6 +280,7 @@ pub(crate) fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: A
         ip: usize,
         st: &AbsState,
         elide: Option<&mut FxHashSet<usize>>,
+        dv: Option<&TaPinPlan>,
     ) -> Option<(Option<AbsState>, Option<(usize, AbsState)>)> {
         let code = &proto.code;
         let mut out = st.clone();
@@ -280,6 +377,71 @@ pub(crate) fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: A
                 return Some((Some(fall), Some((target as usize, jump))));
             }
             Instr::Return { .. } | Instr::ReturnUndefined => return Some((None, None)),
+            // ── W10 DV-region arms (dv-retry plans only; see the fn doc) ──
+            Instr::Bitwise { dst, op, .. } if dv.is_some() => {
+                use crate::bytecode::BitwiseOp as B;
+                let iv: Iv = if matches!(op, B::Ushr) {
+                    (0, (1i64 << 32) - 1) // a u32
+                } else {
+                    IV_I32 // ToInt32 by definition
+                };
+                out.regs.insert(dst, iv);
+                out.alias.remove(&dst);
+            }
+            Instr::MathOp { dst, op: MathFn::Imul, argc: 2, .. } if dv.is_some() => {
+                out.regs.insert(dst, IV_I32); // ToInt32 by definition
+                out.alias.remove(&dst);
+            }
+            Instr::CallMethod { dst, name, .. } if dv.is_some() => {
+                let ta = dv.unwrap();
+                let iv: Iv = match ta.access.get(&ip).map(|&j| ta.pins[j as usize].kind) {
+                    Some(k) if k == DV_PIN_KIND => {
+                        match proto
+                            .string_constants
+                            .get(name as usize)
+                            .and_then(|s2| dv_get_kind(s2))
+                        {
+                            Some(0) => (-128, 127),
+                            Some(1) => (0, 255),
+                            Some(3) => (-32768, 32767),
+                            Some(4) => (0, 65535),
+                            Some(5) => IV_I32,
+                            Some(6) => (0, (1i64 << 32) - 1),
+                            _ => return None, // float kinds never reach an INT plan
+                        }
+                    }
+                    // Flat-ASCII pinned charCodeAt: a byte.
+                    Some(k) if k == STR_PIN_KIND => (0, 255),
+                    _ => return None, // an unpinned call is outside the subset
+                };
+                out.regs.insert(dst, iv);
+                out.alias.remove(&dst);
+            }
+            // A pinned int element read defines an i32; a pinned store defines
+            // nothing. Unpinned index ops stay outside the subset.
+            Instr::GetIndex { dst, .. } if dv.is_some() => {
+                let ta = dv.unwrap();
+                match ta.access.get(&ip).map(|&j| ta.pins[j as usize].kind) {
+                    Some(k) if k == 5 || k == ARR_INT_PIN_KIND => {
+                        out.regs.insert(dst, IV_I32);
+                        out.alias.remove(&dst);
+                    }
+                    _ => return None,
+                }
+            }
+            Instr::SetIndex { .. } if dv.is_some() => {
+                if dv.unwrap().access.get(&ip).is_none() {
+                    return None;
+                }
+            }
+            // A pinned length read: non-negative, within the 2^53 range.
+            Instr::GetProp { dst, .. } if dv.is_some() => {
+                if dv.unwrap().access.get(&ip).is_none() {
+                    return None;
+                }
+                out.regs.insert(dst, (0, TWO_POW_53));
+                out.alias.remove(&dst);
+            }
             _ => return None, // outside the modelled subset
         }
         Some((Some(out), None))
@@ -290,7 +452,7 @@ pub(crate) fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: A
     loop {
         pass += 1;
         if pass > 40 {
-            return FxHashSet::default(); // no convergence — keep all guards
+            return None; // no convergence — keep all guards
         }
         let widen = pass > 8;
         let mut changed = false;
@@ -299,9 +461,9 @@ pub(crate) fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: A
                 Some(st) if !st.infeasible() => st.clone(),
                 _ => continue,
             };
-            let (fall, jump) = match step(proto, ip, &st, None) {
+            let (fall, jump) = match step(proto, ip, &st, None, dv) {
                 Some(r) => r,
-                None => return FxHashSet::default(),
+                None => return None,
             };
             let mut merge = |tip: usize, ns: AbsState, states: &mut Vec<Option<AbsState>>| {
                 if tip < s || tip > e || ns.infeasible() {
@@ -332,10 +494,10 @@ pub(crate) fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: A
     for ip in s..=e {
         if let Some(st) = &states[ip - s] {
             if !st.infeasible() {
-                let _ = step(proto, ip, st, Some(&mut elide));
+                let _ = step(proto, ip, st, Some(&mut elide), dv);
             }
         }
     }
-    elide
+    Some((states, elide))
 }
 

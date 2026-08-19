@@ -49,6 +49,20 @@
 //! forms, `imul r32, r32, imm`, `movzx home, byte` for charCodeAt), dropping
 //! the rax staging round-trips. `ZIPP_NO_GPR_LAZYSX=1` turns only the deferred
 //! sign-extension off (defs canonicalize immediately again).
+//!
+//! W10.3 — GPR SPILL SLOTS: a pool overflow is no longer final. On the attempt
+//! AFTER the B119 shared-home re-plan still overflows (B96's ordering,
+//! `allow_spill` threaded from `region_int`'s DV and split-fallback retries),
+//! [`gpr_home_map`] ranks homes by a weighted use census (8^loop-depth), keeps
+//! the hottest resident (r13/r14 join the pool with inline guards; split
+//! receivers force-resident), and parks the coldest — at most
+//! [`GPR_SPILL_CAP`] — in frame slots after the resume-ip slot. A slot ALWAYS
+//! holds the canonical sign-extended i64 (spilled homes are never lazy), so
+//! operands read as qword mem forms, dsts stage through rax/eax and park the
+//! full qword, and every exit boxes spilled homes from their slots. This is
+//! what lets typedarray-math's 13/14-home DV swizzle regions ([215,262] /
+//! [210,266]) host on this tier instead of falling to DOUBLE.
+//! `ZIPP_NO_GPR_SPILL_SLOTS=1` restores the pre-wave decline byte-for-byte.
 
 #![allow(unused_imports)]
 use super::*;
@@ -150,6 +164,38 @@ pub(crate) fn gpr_lazysx_enabled() -> bool {
     }
 }
 
+/// Kill switch: `ZIPP_NO_GPR_SPILL_SLOTS=1` disables the W10.3 frame spill
+/// slots ONLY: a pool overflow declines exactly as before the wave
+/// (`PoolOverflow` stays final after the shared-home re-plan) and emission is
+/// byte-identical to the pre-spill emitter. NOTE the `_SLOTS` suffix —
+/// `ZIPP_NO_GPR_SPLIT` (above) is a DIFFERENT switch one edit-distance away.
+pub(crate) fn gpr_spill_slots_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            // W10 verdict: OPT-IN (dark). The mechanism is built, correct and
+            // multi-mode-proven, but on its target shape it LOSES to the
+            // DOUBLE-tier incumbent — typedarray-math's swizzle regions
+            // measured 448ms spilled vs 361ms declining-to-DOUBLE (best-of-5,
+            // replicated at 451 vs 344 on an independent build), even after
+            // the DV guard prover freed r13/r14 and elided the chain guards:
+            // four spilled homes' slot traffic plus per-def movsxd on a
+            // 0-lazy region loses to fourteen xmm homes with no spills. The
+            // B99 lesson generalizes ("register homes are only a win when the
+            // representation makes the op cheaper"). Kept dark for shapes a
+            // future planner cost model may admit; `ZIPP_GPR_SPILL_SLOTS=1`
+            // engages it, `ZIPP_NO_GPR_SPILL_SLOTS=1` forces it off even then.
+            let on = std::env::var_os("ZIPP_GPR_SPILL_SLOTS").is_some()
+                && std::env::var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// `compile_region_int_gpr`'s result. `PoolOverflow` is the one decline worth
 /// acting on: every OTHER gate passed and only the live set didn't fit, so the
 /// caller can re-plan with forced home sharing (B119 — the nested-loop
@@ -161,14 +207,59 @@ pub(crate) enum GprAttempt {
     OutOfScope,
 }
 
-/// An operand as this emitter reads it: a GPR home, or a hoisted-constant
+/// An operand as this emitter reads it: a GPR home, a hoisted-constant
 /// immediate (always i32 — `LoadInt`'s payload and `LoadConst`-Int's payload
-/// both are, which is what makes every imm form below encodable).
-#[derive(Clone, Copy)]
+/// both are, which is what makes every imm form below encodable), or — W10.3 —
+/// a frame spill slot at `[rsp + disp]`. A slot ALWAYS holds the canonical
+/// sign-extended i64 (spilled homes are never W8-lazy), so a qword mem-operand
+/// form reads it directly and the canon variants need no extra work.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Src {
     R(u8),
     I(i32),
+    S(i32),
 }
+
+/// W10.3: where a home LIVES — a hardware GPR (as before the wave) or a frame
+/// spill slot (`[rsp + disp]`, canonical sign-extended i64 at all times).
+/// Local to this emitter; the plan still identifies homes by xmm index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Loc {
+    R(u8),
+    S(i32),
+}
+
+/// The register an arm computes a possibly-spilled dst into: the home itself
+/// when resident, rax (scratch 0) when spilled — [`store_dst`] then parks the
+/// staged qword in the slot. Sound wherever rax is otherwise dead at the def.
+fn dst_reg(l: Loc) -> u8 {
+    match l {
+        Loc::R(h) => h,
+        Loc::S(_) => 0,
+    }
+}
+
+/// Park a staged (rax) dst into its spill slot; emits NOTHING for a resident
+/// home — which is what keeps every resident-only arm byte-identical. A plain
+/// mov, so compare flags survive.
+fn store_dst(ops: &mut dynasmrt::x64::Assembler, l: Loc) {
+    if let Loc::S(d) = l {
+        dynasm!(ops ; mov [rsp + d], rax);
+    }
+}
+
+/// A mapped home as an operand.
+fn loc_src(l: Loc) -> Src {
+    match l {
+        Loc::R(h) => Src::R(h),
+        Loc::S(d) => Src::S(d),
+    }
+}
+
+/// W10.3: at most this many homes may live in frame slots — a region colder
+/// than this declines to the other tiers exactly as before the wave (the
+/// failure mode stays "decline as today", never "engage mostly-spilled").
+const GPR_SPILL_CAP: usize = 8;
 
 /// The home map and the hoisted-constant table, or the decline reason when
 /// the region is outside this mode's bounded scope (`Err(true)` = the live set
@@ -194,7 +285,9 @@ fn gpr_home_map(
     s: usize,
     e: usize,
     metered: bool,
-) -> Result<(FxHashMap<u8, u8>, FxHashMap<u16, i32>, bool), bool> {
+    allow_spill: bool,
+    spill_base: i32,
+) -> Result<(FxHashMap<u8, Loc>, FxHashMap<u16, i32>, bool, usize), bool> {
     // Out of scope: any plan feature whose write-through/flush interplay was
     // only ever proven against the other emitters. B94 split receivers are in
     // scope since W8 (per-def write-through mirrored from the xmm INT emitter;
@@ -292,7 +385,82 @@ fn gpr_home_map(
         pool.push(13);
         pool.push(14);
     }
-    if used.len() > pool.len() {
+    let mut n_spill = 0usize;
+    let mut spilled_path = false;
+    // Review fix (B123): the pre-spill pool size, so a spill-path decline
+    // logs the SAME "N homes > M gprs" line the pre-wave decline logged —
+    // the ablation discipline greps and diffs these lines across modes.
+    let base_pool_len = pool.len();
+    let map: FxHashMap<u8, Loc> = if used.len() <= pool.len() {
+        used.into_iter().zip(pool).map(|(x, h)| (x, Loc::R(h))).collect()
+    } else if allow_spill && gpr_spill_slots_enabled() {
+        // ── W10.3 spill slots ── the overflow is no longer final: rank homes
+        // by weighted use count, keep the hottest resident, park the coldest
+        // in frame slots (canonical i64, [rsp + spill_base + 8k]). Engaged
+        // only on the attempt AFTER the shared-home re-plan still overflowed
+        // (allow_spill — B96's ordering, threaded from `region_int`'s retry
+        // sites) and only under `gpr_spill_slots_enabled()`.
+        //
+        // r13/r14 always join the pool here (inline_guards=true): once slot
+        // traffic is being paid, two more resident homes are strictly cheaper
+        // than two guard-constant registers plus movabs pairs.
+        spilled_path = true;
+        if needs_guard && !inline_guards {
+            inline_guards = true;
+            pool.push(13);
+            pool.push(14);
+        }
+        // B94 split receivers are FORCE-RESIDENT (v1): their contract — home
+        // garbage until the first numeric def, memory slot authoritative,
+        // per-def boxed write-through before any i53 guard, flush skips the
+        // reg — was proven against register homes and stays textually intact.
+        let mut forced: FxHashSet<u8> = FxHashSet::default();
+        for r in plan.split_recvs.iter() {
+            match plan.reg_home.get(r) {
+                Some(&Home::Xmm(x)) if used.contains(&x) => {
+                    forced.insert(x);
+                }
+                _ => return Err(false),
+            }
+        }
+        n_spill = used.len() - pool.len();
+        if forced.len() > pool.len() || n_spill > GPR_SPILL_CAP {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                // base_pool_len, not pool.len(): the spill path forcibly
+                // added r13/r14 above, and the ablation discipline diffs
+                // these lines against the pre-wave form (review fix, B123).
+                eprintln!(
+                    "[jit] INT-GPR decline [{s},{e}]: {} homes > {} gprs",
+                    used.len(),
+                    base_pool_len
+                );
+            }
+            return Err(true); // decline to DOUBLE/MEM exactly as today
+        }
+        let universe: FxHashSet<u8> = used.iter().copied().collect();
+        let weights = spill_census(proto, plan, s, e, &hoist_c, &universe);
+        // Forced-resident first, then hottest first; home index breaks ties
+        // deterministically. The hottest pool.len() homes take the pool in
+        // hand-out order, the rest take slots 0..n_spill.
+        let mut order = used;
+        order.sort_by_key(|&x| {
+            (
+                !forced.contains(&x),
+                std::cmp::Reverse(weights.get(&x).copied().unwrap_or(0)),
+                x,
+            )
+        });
+        let mut m: FxHashMap<u8, Loc> = FxHashMap::default();
+        for (i, &x) in order.iter().enumerate() {
+            let l = if i < pool.len() {
+                Loc::R(pool[i])
+            } else {
+                Loc::S(spill_base + 8 * (i - pool.len()) as i32)
+            };
+            m.insert(x, l);
+        }
+        m
+    } else {
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!(
                 "[jit] INT-GPR decline [{s},{e}]: {} homes > {} gprs",
@@ -301,19 +469,157 @@ fn gpr_home_map(
             );
         }
         return Err(true); // the retryable decline — see `GprAttempt::PoolOverflow`
-    }
-    let map: FxHashMap<u8, u8> = used.into_iter().zip(pool).collect();
-    // A B94 split (or write-through) register must own a MAPPED home — its
-    // defs write through it to memory. A split register whose home didn't map
-    // (hoisted-const-only, which its LoadGlobal def should make impossible)
+    };
+    // A B94 split register must own a RESIDENT home — its defs write through
+    // it to memory and the split contract is only proven against register
+    // homes (force-resident above guarantees this; the check keeps the
+    // no-spill path's refusal). A write-through register needs a MAPPED home
+    // (register or slot — its raw slot store is additive to the boxed
+    // write-through its defs already pay). A split/wt register whose home
+    // didn't map (hoisted-const-only, which its defs should make impossible)
     // would leave its slot stale on exit; refuse rather than assume.
-    for r in plan.split_recvs.iter().chain(plan.write_through.iter()) {
+    for r in plan.split_recvs.iter() {
         match plan.reg_home.get(r) {
-            Some(&Home::Xmm(x)) if map.contains_key(&x) => {}
+            Some(&Home::Xmm(x)) if matches!(map.get(&x), Some(Loc::R(_))) => {}
             _ => return Err(false),
         }
     }
-    Ok((map, hoist_c, inline_guards))
+    for r in plan.write_through.iter() {
+        match plan.reg_home.get(r) {
+            Some(&Home::Xmm(x)) if map.contains_key(&x) => {}
+            // ── W10.3 (spill attempts only, so the kill switch restores the
+            // strict refusal byte-for-byte) ── the swizzle regions' recycled
+            // endian-flag registers land in `write_through` (shareable +
+            // read_outside is a REG-level rule, blind to type) without a
+            // numeric home, and the strict check above declined the whole
+            // region. Two shapes are provably fine:
+            //
+            // A real BOOL home (`bool_regs` member): bool homes are never
+            // shared (one gpr per bool, no linear-scan reuse), every def
+            // writes the home, and flush_exit's bool loop boxes the CURRENT
+            // value into the register's own slot at every exit — the stale-
+            // sharer hazard write-through exists for cannot occur. (The
+            // DOUBLE tier engages this exact plan shape today with the same
+            // treatment.) Nothing to write through; the wt hook is Xmm-only
+            // and never fires for it.
+            //
+            // NO home at all: every in-region def is a W9-ELIDED Eq
+            // (`dv_flag_elide`), so nothing is ever written natively — the
+            // fused call reads the Eq OPERANDS, not the flag — and a fused
+            // deopt resumes AT the elided Eq, which recomputes the flag into
+            // the frame slot the interpreter owns. Verified op by op.
+            //
+            // Anything else stays a refusal.
+            // (Review fix, B123: the admitted Bool-home wt reg additionally
+            // gets an ENTRY LOAD in the prologue — without one the home is
+            // caller garbage until the flag's first def, and flush_exit's
+            // bool loop boxes EVERY bool home at every exit, so an exit
+            // before that def would write BOOL_TAG|garbage into a
+            // read-outside slot. The former "no home at all, every def
+            // elided" escape was removed: the elision fixpoint requires a
+            // non-elided kill def, which types the reg — the arm could only
+            // fire on a plan shape the planner cannot produce, and admitting
+            // it on faith was a latent stale-slot hazard.)
+            Some(&Home::Gpr(_))
+                if spilled_path && plan.bool_regs.iter().any(|&(br, _)| br == *r) => {}
+            _ => return Err(false),
+        }
+    }
+    Ok((map, hoist_c, inline_guards, n_spill))
+}
+
+/// W10.3 weighted use census, per HOME (the spill ranking's cost model: a
+/// home's slot traffic is the SUM over its linear-scan sharers). Walks the
+/// body exactly as the emitter will — skipping hoisted-const fills, hoisted
+/// length reads, W9-elided Eqs and dead-dst ops — and counts one touch per
+/// operand read / def write, weighted `8^loop-depth` (back-edge spans).
+/// `instr_uses`/`writes_reg` cover CallMethod/MathOp operand windows and dsts;
+/// the two remaining blind spots are the global side of LoadGlobal/StoreGlobal
+/// (a home with no reg operand) and a fused DV call's elided-Eq operand reads
+/// at the call ip — both counted explicitly below.
+fn spill_census(
+    proto: &FuncProto,
+    plan: &RegionPlan,
+    s: usize,
+    e: usize,
+    hoist_c: &FxHashMap<u16, i32>,
+    universe: &FxHashSet<u8>,
+) -> FxHashMap<u8, u64> {
+    let mut depth = vec![0u32; e - s + 1];
+    for ip in s..=e {
+        let t = match proto.code[ip] {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => target as usize,
+            _ => continue,
+        };
+        if t >= s && t <= ip {
+            for d in depth[(t - s)..=(ip - s)].iter_mut() {
+                *d += 1;
+            }
+        }
+    }
+    let mut w: FxHashMap<u8, u64> = FxHashMap::default();
+    for ip in s..=e {
+        if plan.hoist_len_ips.contains(&ip) || plan.dv_flag_elide.contains(&ip) {
+            continue;
+        }
+        if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
+            if plan.hoisted.contains(&dst) {
+                continue;
+            }
+        }
+        if let Some(d) = writes_reg(&proto.code[ip]) {
+            if plan.dead.contains(&d) {
+                continue;
+            }
+        }
+        let wt = 8u64.saturating_pow(depth[ip - s].min(20));
+        let mut touch_reg = |r: u16, w: &mut FxHashMap<u8, u64>| {
+            if hoist_c.contains_key(&r) {
+                return; // reads as an immediate — no home traffic
+            }
+            if let Some(&Home::Xmm(x)) = plan.reg_home.get(&r) {
+                if universe.contains(&x) {
+                    { let e2 = w.entry(x).or_insert(0); *e2 = e2.saturating_add(wt); }
+                }
+            }
+        };
+        for r in instr_uses(&proto.code[ip]) {
+            touch_reg(r, &mut w);
+        }
+        if let Some(d) = writes_reg(&proto.code[ip]) {
+            touch_reg(d, &mut w);
+        }
+        if let Some(&(fa, fb)) = plan.dv_flag_fuse.get(&ip) {
+            touch_reg(fa, &mut w);
+            touch_reg(fb, &mut w);
+        }
+        match proto.code[ip] {
+            Instr::LoadGlobal { dst, idx } => {
+                if !plan.ta_recv_regs.contains(&dst) && !plan.split_recv_lg.contains(&ip) {
+                    if let Some(&x) = plan.glob_home.get(&idx) {
+                        if universe.contains(&x) {
+                            { let e2 = w.entry(x).or_insert(0); *e2 = e2.saturating_add(wt); }
+                        }
+                    }
+                }
+            }
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } => {
+                if let Some(&x) = plan.glob_home.get(&idx) {
+                    if universe.contains(&x) {
+                        { let e2 = w.entry(x).or_insert(0); *e2 = e2.saturating_add(wt); }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    w
 }
 
 /// W8 deferred sign-extension: `(lazy, strict)` home sets.
@@ -367,12 +673,19 @@ fn gpr_home_map(
 /// `>>>` sits out on both sides by design: its result is already written
 /// zero-extended = canonical, and it neither needs deferral nor tolerates a
 /// movsxd (its u32 value may not survive one).
+/// W10.3 spilled homes: a spill slot is read as a full qword by 64-bit
+/// consumers, so a spilled home can NEVER be lazy — it simply does not enter
+/// the h-universe below (which holds hardware-GPR ids), and any copy FROM a
+/// spilled slot into a resident home marks the dst WIDE (fail safe, exactly
+/// like an unmapped source). That seeds every spilled home WIDE by
+/// construction, and the strict-entry closure stays consistent: no lazy home
+/// ever (transitively) copies from a spilled one.
 fn lazy_sx_sets(
     proto: &FuncProto,
     plan: &RegionPlan,
     s: usize,
     e: usize,
-    map: &FxHashMap<u8, u8>,
+    map: &FxHashMap<u8, Loc>,
     hoist_c: &FxHashMap<u16, i32>,
 ) -> (FxHashSet<u8>, FxHashSet<u8>) {
     if !gpr_lazysx_enabled() {
@@ -389,7 +702,7 @@ fn lazy_sx_sets(
     // write-through boxes the full canonical home).
     for r in plan.split_recvs.iter().chain(plan.write_through.iter()) {
         if let Some(&Home::Xmm(x)) = plan.reg_home.get(r) {
-            if let Some(&h) = map.get(&x) {
+            if let Some(&Loc::R(h)) = map.get(&x) {
                 wide.insert(h);
             }
         }
@@ -398,7 +711,7 @@ fn lazy_sx_sets(
     // (the u64 units count is not proven i32).
     for &hip in &plan.hoist_len_ips {
         if let Instr::GetProp { dst, .. } = proto.code[hip] {
-            if let Some(&h) = map.get(&xh(plan, dst)) {
+            if let Some(&Loc::R(h)) = map.get(&xh(plan, dst)) {
                 wide.insert(h);
             }
         }
@@ -420,12 +733,12 @@ fn lazy_sx_sets(
             Instr::LoadInt { .. } | Instr::LoadConst { .. } => {}
             Instr::Move { dst, src: sr } => {
                 if let Home::Xmm(dx) = home(plan, dst) {
-                    if let Some(&dh) = map.get(&dx) {
+                    if let Some(&Loc::R(dh)) = map.get(&dx) {
                         if !hoist_c.contains_key(&sr) {
                             match map.get(&xh(plan, sr)) {
-                                Some(&sh) => copies.push((dh, sh)),
-                                None => {
-                                    wide.insert(dh); // unmapped source: fail safe
+                                Some(&Loc::R(sh)) => copies.push((dh, sh)),
+                                _ => {
+                                    wide.insert(dh); // unmapped/spilled source: fail safe
                                 }
                             }
                         }
@@ -436,20 +749,23 @@ fn lazy_sx_sets(
             // The split receiver's OBJECT load: memory store only, no home def.
             Instr::LoadGlobal { .. } if plan.split_recv_lg.contains(&ip) => {}
             Instr::LoadGlobal { dst, idx } => {
-                if let (Some(&dh), Some(&sh)) =
-                    (map.get(&xh(plan, dst)), map.get(&plan.glob_home[&idx]))
-                {
-                    copies.push((dh, sh));
+                if let Some(&Loc::R(dh)) = map.get(&xh(plan, dst)) {
+                    match map.get(&plan.glob_home[&idx]) {
+                        Some(&Loc::R(sh)) => copies.push((dh, sh)),
+                        _ => {
+                            wide.insert(dh); // spilled global source: fail safe
+                        }
+                    }
                 }
             }
             Instr::StoreGlobal { idx, src: sr }
             | Instr::StoreGlobalStrict { idx, src: sr }
             | Instr::StoreGlobalResolved { idx, src: sr } => {
-                if let Some(&dh) = map.get(&plan.glob_home[&idx]) {
+                if let Some(&Loc::R(dh)) = map.get(&plan.glob_home[&idx]) {
                     if !hoist_c.contains_key(&sr) {
                         match map.get(&xh(plan, sr)) {
-                            Some(&sh) => copies.push((dh, sh)),
-                            None => {
+                            Some(&Loc::R(sh)) => copies.push((dh, sh)),
+                            _ => {
                                 wide.insert(dh);
                             }
                         }
@@ -457,11 +773,11 @@ fn lazy_sx_sets(
                 }
             }
             Instr::AddInt { dst, a, imm, .. } => {
-                if let Some(&dh) = map.get(&xh(plan, dst)) {
+                if let Some(&Loc::R(dh)) = map.get(&xh(plan, dst)) {
                     if imm == 0 && !hoist_c.contains_key(&a) {
                         match map.get(&xh(plan, a)) {
-                            Some(&sh) => copies.push((dh, sh)),
-                            None => {
+                            Some(&Loc::R(sh)) => copies.push((dh, sh)),
+                            _ => {
                                 wide.insert(dh);
                             }
                         }
@@ -472,7 +788,7 @@ fn lazy_sx_sets(
                 }
             }
             Instr::Bitwise { dst, op, .. } => {
-                if let Some(&dh) = map.get(&xh(plan, dst)) {
+                if let Some(&Loc::R(dh)) = map.get(&xh(plan, dst)) {
                     if matches!(op, crate::bytecode::BitwiseOp::Ushr) {
                         wide.insert(dh); // u32 result may exceed i32
                     } else {
@@ -481,7 +797,7 @@ fn lazy_sx_sets(
                 }
             }
             Instr::MathOp { dst, op: MathFn::Imul, argc: 2, .. } => {
-                if let Some(&dh) = map.get(&xh(plan, dst)) {
+                if let Some(&Loc::R(dh)) = map.get(&xh(plan, dst)) {
                     bit.insert(dh);
                 }
             }
@@ -501,7 +817,7 @@ fn lazy_sx_sets(
                     == Some(6)
                 {
                     if let Some(&Home::Xmm(dx)) = plan.reg_home.get(&dst) {
-                        if let Some(&dh) = map.get(&dx) {
+                        if let Some(&Loc::R(dh)) = map.get(&dx) {
                             wide.insert(dh);
                         }
                     }
@@ -513,7 +829,7 @@ fn lazy_sx_sets(
             _ => {
                 if let Some(d) = writes_reg(&proto.code[ip]) {
                     if let Some(Home::Xmm(dx)) = plan.reg_home.get(&d) {
-                        if let Some(&dh) = map.get(dx) {
+                        if let Some(&Loc::R(dh)) = map.get(dx) {
                             wide.insert(dh);
                         }
                     }
@@ -522,7 +838,14 @@ fn lazy_sx_sets(
         }
     }
     // Fixpoint: i32-invariant = not WIDE and copying only from i32-invariant.
-    let mut i32ok: FxHashSet<u8> = map.values().copied().collect();
+    // (Resident homes only — a W10.3 spilled home never enters the universe.)
+    let mut i32ok: FxHashSet<u8> = map
+        .values()
+        .filter_map(|l| match l {
+            Loc::R(h) => Some(*h),
+            Loc::S(_) => None,
+        })
+        .collect();
     for h in &wide {
         i32ok.remove(h);
     }
@@ -571,7 +894,7 @@ fn lazy_sx_sets(
 /// has been computed, so resuming the header interpreted is always sound.
 fn emit_int_entry_load_gpr(
     ops: &mut dynasmrt::x64::Assembler,
-    home: u8,
+    home: Loc,
     entry_bail: dynasmrt::DynamicLabel,
     strict_i32: bool,
 ) {
@@ -583,7 +906,13 @@ fn emit_int_entry_load_gpr(
         ; shr rdx, 48
         ; cmp edx, INT_TAG_HI as i32
         ; jne => as_double         // not Int-tagged — try the integral-double form
-        ; movsxd Rq(home), eax     // sign-extend the i32 payload to i64
+    );
+    match home {
+        Loc::R(h) => dynasm!(ops ; movsxd Rq(h), eax), // sign-extend the i32 payload to i64
+        // W10.3 spilled home: stage the canonical i64 and store to the slot.
+        Loc::S(d) => dynasm!(ops ; movsxd rax, eax ; mov [rsp + d], rax),
+    }
+    dynasm!(ops
         ; jmp => done
         ; => as_double
         ; movq xmm0, rax
@@ -612,18 +941,21 @@ fn emit_int_entry_load_gpr(
         ; test rax, rax
         ; js => entry_bail
         ; => store
-        ; mov Rq(home), rcx
-        ; => done
     );
+    match home {
+        Loc::R(h) => dynasm!(ops ; mov Rq(h), rcx),
+        Loc::S(d) => dynasm!(ops ; mov [rsp + d], rcx),
+    }
+    dynasm!(ops ; => done);
 }
 
-/// Box the i64 in GPR home `h` into a Value in `rax` (Int if it fits i32, else
-/// a double — exact, |x| ≤ 2^53). The GPR twin of `emit_int_box_from_home`.
-fn emit_int_box_from_gpr(ops: &mut dynasmrt::x64::Assembler, h: u8) {
+/// Box the canonical i64 in `rax` into a Value in `rax` (Int if it fits i32,
+/// else a double — exact, |x| ≤ 2^53). The core [`emit_int_box_from_loc`]
+/// wraps with the home load.
+fn emit_int_box_from_rax(ops: &mut dynasmrt::x64::Assembler) {
     let big = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
-        ; mov rax, Rq(h)
         ; cmp rax, 0x7FFFFFFF            // > i32::MAX ?
         ; jg => big
         ; cmp rax, -0x80000000           // < i32::MIN ?
@@ -638,6 +970,18 @@ fn emit_int_box_from_gpr(ops: &mut dynasmrt::x64::Assembler, h: u8) {
         ; movq rax, xmm0                 // double Value bits
         ; => done
     );
+}
+
+/// Box the i64 home `l` into a Value in `rax` — a resident home loads from its
+/// GPR (the pre-W10.3 `emit_int_box_from_gpr`, byte-identical), a spilled home
+/// from its slot (canonical by the slot invariant). The GPR twin of
+/// `emit_int_box_from_home`.
+fn emit_int_box_from_loc(ops: &mut dynasmrt::x64::Assembler, l: Loc) {
+    match l {
+        Loc::R(h) => dynasm!(ops ; mov rax, Rq(h)),
+        Loc::S(d) => dynasm!(ops ; mov rax, [rsp + d]),
+    }
+    emit_int_box_from_rax(ops);
 }
 
 /// B94 write-through on GPR homes (W8) — the twin of `emit_int_wt`: a numeric
@@ -656,7 +1000,7 @@ fn emit_int_box_from_gpr(ops: &mut dynasmrt::x64::Assembler, h: u8) {
 fn emit_int_wt_gpr(
     ops: &mut dynasmrt::x64::Assembler,
     plan: &RegionPlan,
-    map: &FxHashMap<u8, u8>,
+    map: &FxHashMap<u8, Loc>,
     dst: u16,
     known_i32: bool,
 ) -> bool {
@@ -664,16 +1008,22 @@ fn emit_int_wt_gpr(
         return false;
     }
     if let Some(&Home::Xmm(x)) = plan.reg_home.get(&dst) {
-        if let Some(&h) = map.get(&x) {
+        if let Some(&l) = map.get(&x) {
             if known_i32 {
+                // Zero-extend the i32 payload (a 32-bit load/mov zero-extends;
+                // a W10.3 slot holds the canonical i64, whose low 32 IS the
+                // payload — the def's raw slot store already ran).
+                match l {
+                    Loc::R(h) => dynasm!(ops ; mov eax, Rd(h)),
+                    Loc::S(d) => dynasm!(ops ; mov eax, [rsp + d]),
+                }
                 dynasm!(ops
-                    ; mov eax, Rd(h)                 // zero-extend the i32 payload
                     ; mov rcx, QWORD INT_TAG as i64
                     ; or rax, rcx
                     ; mov [rbx + dreg(dst)], rax
                 );
             } else {
-                emit_int_box_from_gpr(ops, h);
+                emit_int_box_from_loc(ops, l);
                 dynasm!(ops ; mov [rbx + dreg(dst)], rax);
             }
             return true;
@@ -694,16 +1044,20 @@ fn emit_store_ip(ops: &mut dynasmrt::x64::Assembler, ip_slot: i32, v: i32) {
 /// when r13/r14 were handed out as homes to make the region fit.
 fn emit_i53_guard_gpr(
     ops: &mut dynasmrt::x64::Assembler,
-    h: u8,
+    h: Loc,
     ip: usize,
     ip_slot: i32,
     inline: bool,
     flush_exit: dynasmrt::DynamicLabel,
 ) {
     let done = ops.new_dynamic_label();
+    match h {
+        Loc::R(h) => dynasm!(ops ; mov rax, Rq(h)),
+        // W10.3 spilled dst: the def's raw slot store already ran.
+        Loc::S(d) => dynasm!(ops ; mov rax, [rsp + d]),
+    }
     if inline {
         dynasm!(ops
-            ; mov rax, Rq(h)
             ; mov rcx, QWORD TWO_POW_53
             ; add rax, rcx           // + 2^53 (no i64 overflow: |x| ≤ 2^54 here)
             ; mov rcx, QWORD TWO_POW_54
@@ -712,7 +1066,6 @@ fn emit_i53_guard_gpr(
         );
     } else {
         dynasm!(ops
-            ; mov rax, Rq(h)
             ; add rax, r13           // + 2^53 (no i64 overflow: |x| ≤ 2^54 here)
             ; cmp rax, r14           // 2^54
             ; jbe => done
@@ -735,6 +1088,8 @@ fn emit_src64(ops: &mut dynasmrt::x64::Assembler, s: Src, scratch: u8) {
             }
         }
         Src::I(v) => dynasm!(ops ; mov Rq(scratch), v),
+        // W10.3 spill slot: always the canonical sign-extended i64.
+        Src::S(d) => dynasm!(ops ; mov Rq(scratch), [rsp + d]),
     }
 }
 
@@ -774,6 +1129,27 @@ fn emit_home_copy(ops: &mut dynasmrt::x64::Assembler, d: u8, s: Src, lazy: &FxHa
     }
 }
 
+/// W10.3 [`emit_home_copy`] generalized to a possibly-spilled DST: a resident
+/// dst takes the existing home-copy forms (byte-identical; a spill-slot source
+/// reads as a canonical qword), a spilled dst stages through rax — a lazy
+/// source canonicalizes on the way (slots always hold the canonical i64), an
+/// immediate stores directly (`mov r/m64, imm32` sign-extends). All plain
+/// movs: compare flags survive. The caller handles the same-location
+/// nothing-to-emit case.
+fn emit_loc_copy(ops: &mut dynasmrt::x64::Assembler, d: Loc, s: Src, lazy: &FxHashSet<u8>) {
+    match d {
+        Loc::R(dg) => emit_home_copy(ops, dg, s, lazy),
+        Loc::S(dd) => match s {
+            Src::R(sg) if lazy.contains(&sg) => {
+                dynasm!(ops ; movsxd rax, Rd(sg) ; mov [rsp + dd], rax);
+            }
+            Src::R(sg) => dynasm!(ops ; mov rax, Rq(sg) ; mov [rsp + dd], rax),
+            Src::I(v) => dynasm!(ops ; mov QWORD [rsp + dd], v),
+            Src::S(sd) => dynasm!(ops ; mov rax, [rsp + sd] ; mov [rsp + dd], rax),
+        },
+    }
+}
+
 /// GPR-home INT region codegen. Same plan, same guards, same exits as
 /// `compile_region_int` — only the home register file differs. A non-`Emitted`
 /// result sends the caller back to the xmm emitter, except `PoolOverflow`,
@@ -788,18 +1164,24 @@ pub(crate) fn compile_region_int_gpr(
     ta_snapshot: usize,
     plan: &RegionPlan,
     meter: Option<crate::codegen::meter::Meter>,
+    allow_spill: bool,
 ) -> GprAttempt {
     let (s, e) = (start as usize, end as usize);
-    let (map, hoist_c, inline_guards) = match gpr_home_map(proto, plan, s, e, meter.is_some()) {
-        Ok(m) => m,
-        Err(true) => return GprAttempt::PoolOverflow,
-        Err(false) => return GprAttempt::OutOfScope,
-    };
+    // W10.3 frame spill slots sit AFTER the resume-ip slot (see the frame
+    // layout at the prologue below): slot k at [rsp + spill_base + 8k].
+    let spill_base = 40 + 32 * ta_plan.pins.len() as i32;
+    let (map, hoist_c, inline_guards, n_spill) =
+        match gpr_home_map(proto, plan, s, e, meter.is_some(), allow_spill, spill_base) {
+            Ok(m) => m,
+            Err(true) => return GprAttempt::PoolOverflow,
+            Err(false) => return GprAttempt::OutOfScope,
+        };
     // W8: homes that defer sign-extension, and the entry loads that must be
-    // i32-strict to license it (empty sets under ZIPP_NO_GPR_LAZYSX=1; split
-    // and write-through homes are never members — see `lazy_sx_sets`).
+    // i32-strict to license it (empty sets under ZIPP_NO_GPR_LAZYSX=1; split,
+    // write-through and W10.3 spilled homes are never members — see
+    // `lazy_sx_sets`).
     let (lazy, strict) = lazy_sx_sets(proto, plan, s, e, &map, &hoist_c);
-    // GPR home of raw xmm-index `x` / dst register `r` (dsts are never
+    // Home location of raw xmm-index `x` / dst register `r` (dsts are never
     // hoisted-const, so their home is always mapped).
     let gx = |x: u8| map[&x];
     let g = |r: u16| gx(xh(plan, r));
@@ -807,15 +1189,24 @@ pub(crate) fn compile_region_int_gpr(
     let src = |r: u16| -> Src {
         match hoist_c.get(&r) {
             Some(&v) => Src::I(v),
-            None => Src::R(g(r)),
+            None => loc_src(g(r)),
         }
     };
     if std::env::var_os("ZIPP_JITLOG").is_some() {
-        eprintln!(
-            "[jit] INT region [{start},{end}] GPR homes engaged ({} homes, {} lazy-sx)",
-            map.len(),
-            lazy.len()
-        );
+        if n_spill > 0 {
+            eprintln!(
+                "[jit] INT region [{start},{end}] GPR homes engaged ({} homes, {} lazy-sx, {} spilled)",
+                map.len(),
+                lazy.len(),
+                n_spill
+            );
+        } else {
+            eprintln!(
+                "[jit] INT region [{start},{end}] GPR homes engaged ({} homes, {} lazy-sx)",
+                map.len(),
+                lazy.len()
+            );
+        }
         // W8 mechanism proof: name every split receiver this GPR body carries
         // (the xmm/double tiers print the same line for theirs).
         let mut srs: Vec<u16> = plan.split_recvs.iter().copied().collect();
@@ -843,11 +1234,15 @@ pub(crate) fn compile_region_int_gpr(
     // pool) and minus the xmm6..15 save area (no xmm homes; only the volatile
     // xmm0/xmm1 are scratched). 8 pushes keep rsp ≡ 8 (mod 16) before the subs,
     // so both call sites below stay 16-aligned. Frame: [shadow 32]
-    // [TA snapshot slots 32·n_ta][resume-ip pointer 8]; the last slot frees rsi.
+    // [TA snapshot slots 32·n_ta][resume-ip pointer 8][W10.3 spill slots
+    // 8·n_spill, rounded up to 16]; the ip slot frees rsi. The spill area must
+    // be a 16-byte multiple so frame stays ≡ 8 (mod 16) — the pin-snapshot
+    // `call rax` sites below run after `sub rsp, frame` and need rsp ≡ 0.
     let n_ta = ta_plan.pins.len() as i32;
-    let frame = 40 + 32 * n_ta;
+    let frame = 40 + 32 * n_ta + ((8 * n_spill as i32 + 15) & !15);
     let ta_base = 32i32;
     let ip_slot = 32 + 32 * n_ta;
+    debug_assert_eq!(spill_base, 40 + 32 * n_ta);
     dynasm!(ops
         ; push rbx
         ; push rsi
@@ -898,26 +1293,53 @@ pub(crate) fn compile_region_int_gpr(
         }
     }
     // Live-in loads (globals, regs, then bools — same order and same guards as
-    // the xmm tier; the bool loader's rdx scratch never aliases a home).
+    // the xmm tier; the bool loader's rdx scratch never aliases a home). A
+    // W10.3 spilled home is never strict (nothing lazy ever copies from it).
+    let is_strict = |l: Loc| match l {
+        Loc::R(h) => strict.contains(&h),
+        Loc::S(_) => false,
+    };
     for &(gi, x) in &plan.live_in_globs {
         dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]);
-        emit_int_entry_load_gpr(&mut ops, gx(x), entry_bail, strict.contains(&gx(x)));
+        // W10: a strict-entry global (the DV prover's verified accumulators)
+        // must bail on a value wider than i32 — that bail is what licenses
+        // the i32 entry interval its guard elisions were proven under.
+        let strict = is_strict(gx(x)) || plan.strict_entry_globs.contains(&gi);
+        emit_int_entry_load_gpr(&mut ops, gx(x), entry_bail, strict);
     }
     for &(r, x) in &plan.live_in_regs {
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
-        emit_int_entry_load_gpr(&mut ops, gx(x), entry_bail, strict.contains(&gx(x)));
+        emit_int_entry_load_gpr(&mut ops, gx(x), entry_bail, is_strict(gx(x)));
     }
     for &(r, gb) in &plan.live_in_bools {
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_bool_entry_load(&mut ops, gb, entry_bail);
     }
+    // W10.3 review fix (B123): a write-through Bool home is shareable (no
+    // live-in entry) but flush_exit boxes EVERY bool home at every exit — an
+    // exit before the flag's first in-region def would box caller garbage
+    // into a read-outside slot. Load the interpreter's value at entry so the
+    // home is faithful on every path; a non-Bool slot (the reg's first-ever
+    // def is inside the region) takes entry_bail, and the next OSR attempt —
+    // after the interpreter has run one iteration — finds a real Bool.
+    for r in plan.write_through.iter() {
+        if let Some(&Home::Gpr(gb)) = plan.reg_home.get(r) {
+            if !plan.live_in_bools.iter().any(|&(br, _)| br == *r) {
+                dynasm!(ops ; mov rax, [rbx + dreg(*r)]);
+                emit_bool_entry_load(&mut ops, gb, entry_bail);
+            }
+        }
+    }
     // Hoisted constants: only a MAPPED home needs the fill (a home is mapped
     // when a non-hoisted reg — e.g. a Move alias — shares it; an unmapped
-    // hoisted reg reads as an immediate everywhere instead).
+    // hoisted reg reads as an immediate everywhere instead). A spilled home's
+    // fill stores the sign-extended imm32 — canonical by the slot invariant.
     for &hip in &plan.hoist_ips {
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[hip] {
-            if let Some(&h) = map.get(&xh(plan, dst)) {
-                dynasm!(ops ; mov Rq(h), hoist_c[&dst]);
+            match map.get(&xh(plan, dst)) {
+                Some(&Loc::R(h)) => dynasm!(ops ; mov Rq(h), hoist_c[&dst]),
+                Some(&Loc::S(d)) => dynasm!(ops ; mov QWORD [rsp + d], hoist_c[&dst]),
+                None => {}
             }
         }
     }
@@ -928,8 +1350,13 @@ pub(crate) fn compile_region_int_gpr(
     for &hip in &plan.hoist_len_ips {
         if let Instr::GetProp { dst, .. } = proto.code[hip] {
             let j = ta_plan.access[&hip] as usize;
-            let h = g(dst);
-            dynasm!(ops ; mov Rq(h), [rsp + ta_base + 32 * j as i32 + 16]);
+            match g(dst) {
+                Loc::R(h) => dynasm!(ops ; mov Rq(h), [rsp + ta_base + 32 * j as i32 + 16]),
+                Loc::S(d) => dynasm!(ops
+                    ; mov rax, [rsp + ta_base + 32 * j as i32 + 16]
+                    ; mov [rsp + d], rax
+                ),
+            }
         }
     }
     // (No addint_imm_home / gpr_const fills: immediates encode directly here.)
@@ -966,20 +1393,25 @@ pub(crate) fn compile_region_int_gpr(
         // generic post-op hook below then skips the duplicate store.
         let mut wt_pre = false;
         match proto.code[ip] {
-            Instr::LoadInt { dst, val } => {
-                dynasm!(ops ; mov Rq(g(dst)), val);
-            }
+            Instr::LoadInt { dst, val } => match g(dst) {
+                Loc::R(h) => dynasm!(ops ; mov Rq(h), val),
+                Loc::S(d) => dynasm!(ops ; mov QWORD [rsp + d], val), // sign-extends: canonical
+            },
             Instr::LoadConst { dst, idx } => {
                 // region admission guaranteed an Int constant (i32 payload).
                 let v = proto.constants[idx as usize].bits() as u32 as i32;
-                dynasm!(ops ; mov Rq(g(dst)), v);
+                match g(dst) {
+                    Loc::R(h) => dynasm!(ops ; mov Rq(h), v),
+                    Loc::S(d) => dynasm!(ops ; mov QWORD [rsp + d], v),
+                }
             }
             Instr::Move { dst, src: sr } => match home(plan, dst) {
                 Home::Xmm(dx) => {
                     let d = gx(dx);
-                    match src(sr) {
-                        Src::R(sg) if sg == d => flag_cmp = prev_flag, // nothing emitted
-                        s_ => emit_home_copy(&mut ops, d, s_, &lazy),
+                    match (src(sr), d) {
+                        (Src::R(sg), Loc::R(dg)) if sg == dg => flag_cmp = prev_flag, // nothing emitted
+                        (Src::S(sd), Loc::S(dd)) if sd == dd => flag_cmp = prev_flag,
+                        (s_, _) => emit_loc_copy(&mut ops, d, s_, &lazy),
                     }
                 }
                 Home::Gpr(d) => {
@@ -1005,7 +1437,7 @@ pub(crate) fn compile_region_int_gpr(
             Instr::LoadGlobal { dst, idx } => {
                 let (d, gg) = (g(dst), gx(plan.glob_home[&idx]));
                 if d != gg {
-                    emit_home_copy(&mut ops, d, Src::R(gg), &lazy);
+                    emit_loc_copy(&mut ops, d, loc_src(gg), &lazy);
                 } else {
                     flag_cmp = prev_flag;
                 }
@@ -1014,14 +1446,58 @@ pub(crate) fn compile_region_int_gpr(
             | Instr::StoreGlobalStrict { idx, src: sr }
             | Instr::StoreGlobalResolved { idx, src: sr } => {
                 let gg = gx(plan.glob_home[&idx]);
-                match src(sr) {
-                    Src::R(sg) if sg == gg => flag_cmp = prev_flag,
-                    s_ => emit_home_copy(&mut ops, gg, s_, &lazy),
+                match (src(sr), gg) {
+                    (Src::R(sg), Loc::R(gr)) if sg == gr => flag_cmp = prev_flag,
+                    (Src::S(sd), Loc::S(gd)) if sd == gd => flag_cmp = prev_flag,
+                    (s_, _) => emit_loc_copy(&mut ops, gg, s_, &lazy),
                 }
             }
             Instr::Add { dst, a, b } | Instr::Sub { dst, a, b } => {
                 let add = matches!(proto.code[ip], Instr::Add { .. });
-                let d = g(dst);
+                let dl = g(dst);
+                let (sa, sb) = (src(a), src(b));
+                let spilled = matches!(dl, Loc::S(_))
+                    || matches!(sa, Src::S(_))
+                    || matches!(sb, Src::S(_));
+                if spilled {
+                    // ── W10.3 ── any spilled participant stages through rax:
+                    // load a canonical (a slot IS canonical), fold b in, store
+                    // the canonical i64 to the dst home or slot.
+                    emit_src64_canon(&mut ops, sa, 0, &lazy); // rax = a
+                    match sb {
+                        Src::R(bg) => {
+                            emit_canon_home(&mut ops, bg, &lazy);
+                            if add {
+                                dynasm!(ops ; add rax, Rq(bg));
+                            } else {
+                                dynasm!(ops ; sub rax, Rq(bg));
+                            }
+                        }
+                        Src::I(bi) => {
+                            if add {
+                                dynasm!(ops ; add rax, bi);
+                            } else {
+                                dynasm!(ops ; sub rax, bi);
+                            }
+                        }
+                        Src::S(bd) => {
+                            if add {
+                                dynasm!(ops ; add rax, [rsp + bd]);
+                            } else {
+                                dynasm!(ops ; sub rax, [rsp + bd]);
+                            }
+                        }
+                    }
+                    match dl {
+                        Loc::R(dg) => dynasm!(ops ; mov Rq(dg), rax),
+                        Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
+                    }
+                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
+                    if !plan.elide_guard.contains(&ip) {
+                        emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                    }
+                } else {
+                let d = dst_reg(dl); // resident (nothing spilled on this op)
                 // W8: 64-bit arithmetic needs canonical operands (dst is
                 // never lazy — an Add/Sub def is WIDE).
                 if let Src::R(h) = src(a) {
@@ -1085,20 +1561,34 @@ pub(crate) fn compile_region_int_gpr(
                 }
                 wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
                 if !plan.elide_guard.contains(&ip) {
-                    emit_i53_guard_gpr(&mut ops, d, ip, ip_slot, inline_guards, flush_exit);
+                    emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                }
                 }
             }
             Instr::Mul { dst, a, b } => {
-                let d = g(dst);
+                let dl = g(dst);
                 if let Some(&(val_reg, shift)) = plan.mul_shift.get(&ip) {
                     // Guard-elided multiply by a constant power of two.
                     let vg = g(val_reg);
-                    if d != vg {
-                        emit_home_copy(&mut ops, d, Src::R(vg), &lazy); // d is never lazy (WIDE def)
-                    } else {
-                        emit_canon_home(&mut ops, d, &lazy);
+                    match (dl, vg) {
+                        (Loc::R(d), Loc::R(vr)) => {
+                            if d != vr {
+                                emit_home_copy(&mut ops, d, Src::R(vr), &lazy); // d is never lazy (WIDE def)
+                            } else {
+                                emit_canon_home(&mut ops, d, &lazy);
+                            }
+                            dynasm!(ops ; shl Rq(d), shift as i8);
+                        }
+                        _ => {
+                            // W10.3: stage through rax (slots are canonical).
+                            emit_src64_canon(&mut ops, loc_src(vg), 0, &lazy);
+                            dynasm!(ops ; shl rax, shift as i8);
+                            match dl {
+                                Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
+                                Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
+                            }
+                        }
                     }
-                    dynasm!(ops ; shl Rq(d), shift as i8);
                 } else if plan.elide_guard.contains(&ip) {
                     emit_src64_canon(&mut ops, src(a), 0, &lazy); // rax
                     match src(b) {
@@ -1107,8 +1597,12 @@ pub(crate) fn compile_region_int_gpr(
                             dynasm!(ops ; imul rax, Rq(bg));
                         }
                         Src::I(bi) => dynasm!(ops ; imul rax, rax, bi),
+                        Src::S(bd) => dynasm!(ops ; imul rax, [rsp + bd]),
                     }
-                    dynasm!(ops ; mov Rq(d), rax);
+                    match dl {
+                        Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
+                        Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
+                    }
                 } else {
                     // Same i64-overflow / i53 split as the xmm arm.
                     let ovf = ops.new_dynamic_label();
@@ -1120,10 +1614,14 @@ pub(crate) fn compile_region_int_gpr(
                             dynasm!(ops ; imul rax, Rq(bg));
                         }
                         Src::I(bi) => dynasm!(ops ; imul rax, rax, bi),
+                        Src::S(bd) => dynasm!(ops ; imul rax, [rsp + bd]),
+                    }
+                    dynasm!(ops ; jo => ovf); // i64 overflow → redo in interp at THIS ip
+                    match dl {
+                        Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
+                        Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
                     }
                     dynasm!(ops
-                        ; jo => ovf            // i64 overflow → redo in interp at THIS ip
-                        ; mov Rq(d), rax
                         ; jmp => done
                         ; => ovf
                     );
@@ -1133,12 +1631,12 @@ pub(crate) fn compile_region_int_gpr(
                         ; => done
                     );
                     wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
-                    emit_i53_guard_gpr(&mut ops, d, ip, ip_slot, inline_guards, flush_exit);
+                    emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
                 }
             }
             Instr::Mod { dst, a, b } => {
                 // Same semantics and bails as the xmm arm (see its comment).
-                let d = g(dst);
+                let dl = g(dst);
                 let zbail = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 let store = ops.new_dynamic_label();
@@ -1157,7 +1655,12 @@ pub(crate) fn compile_region_int_gpr(
                     ; test rcx, rcx
                     ; js => zbail
                     ; => store
-                    ; mov Rq(d), rdx
+                );
+                match dl {
+                    Loc::R(d) => dynasm!(ops ; mov Rq(d), rdx),
+                    Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rdx),
+                }
+                dynasm!(ops
                     ; jmp => done
                     ; => zbail
                 );
@@ -1168,9 +1671,9 @@ pub(crate) fn compile_region_int_gpr(
                 );
             }
             Instr::AddInt { dst, a, imm, .. } => {
-                let d = g(dst);
-                match src(a) {
-                    Src::R(ag) => {
+                let dl = g(dst);
+                match (src(a), dl) {
+                    (Src::R(ag), Loc::R(d)) => {
                         if imm == 0 {
                             if d != ag {
                                 emit_home_copy(&mut ops, d, Src::R(ag), &lazy);
@@ -1187,21 +1690,43 @@ pub(crate) fn compile_region_int_gpr(
                             dynasm!(ops ; add Rq(d), imm); // sign-extended imm32 == i64 add
                             wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
                             if !plan.elide_guard.contains(&ip) {
-                                emit_i53_guard_gpr(&mut ops, d, ip, ip_slot, inline_guards, flush_exit);
+                                emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
                             }
                         }
                     }
-                    Src::I(ai) => {
+                    (Src::I(ai), Loc::R(d)) => {
                         // Fold const + imm (both i32 — cannot overflow i64).
                         let v = ai as i64 + imm as i64;
                         dynasm!(ops ; mov rax, QWORD v ; mov Rq(d), rax);
+                    }
+                    // ── W10.3: a spilled participant ──
+                    (sa_, _) => {
+                        if imm == 0 {
+                            match (sa_, dl) {
+                                (Src::S(sd), Loc::S(dd)) if sd == dd => flag_cmp = prev_flag,
+                                _ => emit_loc_copy(&mut ops, dl, sa_, &lazy),
+                            }
+                        } else {
+                            // Stage through rax (exact for the folded-const
+                            // case too: i32 + i32 cannot overflow i64).
+                            emit_src64_canon(&mut ops, sa_, 0, &lazy);
+                            dynasm!(ops ; add rax, imm);
+                            store_dst(&mut ops, dl);
+                            if let Loc::R(d) = dl {
+                                dynasm!(ops ; mov Rq(d), rax);
+                            }
+                            wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
+                            if !plan.elide_guard.contains(&ip) {
+                                emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                            }
+                        }
                     }
                 }
             }
             Instr::Neg { dst, a } => {
                 // -0 is not representable in an i64 home — bail on a zero operand
                 // (same as the xmm arm; Neg is pure, resuming AT this ip is sound).
-                let d = g(dst);
+                let dl = g(dst);
                 let nonzero = ops.new_dynamic_label();
                 emit_src64_canon(&mut ops, src(a), 0, &lazy); // rax
                 dynasm!(ops
@@ -1213,11 +1738,14 @@ pub(crate) fn compile_region_int_gpr(
                     ; jmp => flush_exit
                     ; => nonzero
                     ; neg rax
-                    ; mov Rq(d), rax
                 );
+                match dl {
+                    Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
+                    Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
+                }
                 wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
                 if !plan.elide_guard.contains(&ip) {
-                    emit_i53_guard_gpr(&mut ops, d, ip, ip_slot, inline_guards, flush_exit);
+                    emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
                 }
             }
             Instr::Lt { dst, a, b }
@@ -1306,7 +1834,8 @@ pub(crate) fn compile_region_int_gpr(
             Instr::GetIndex { dst, key, .. } => {
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
-                let d = g(dst);
+                let dl = g(dst);
+                let d = dst_reg(dl); // W10.3: a spilled dst stages in rax
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 // W7: identity hoisted to the entry guard for a hoisted pin;
@@ -1341,6 +1870,7 @@ pub(crate) fn compile_region_int_gpr(
                         ; movsxd Rq(d), DWORD [rdx + rcx * 4] // sign-extend i32 element
                     );
                 }
+                store_dst(&mut ops, dl); // W10.3 spilled dst: park the canonical qword
                 dynasm!(ops
                     ; jmp => done
                     ; => deopt
@@ -1399,7 +1929,13 @@ pub(crate) fn compile_region_int_gpr(
                 // u32, within ±2^53 — exit boxing picks Int vs double) and is
                 // canonical as written; the others sign-extend at the def only
                 // when the dst home is not lazy.
-                let d = g(dst);
+                let dl = g(dst);
+                // W10.3: a spilled dst stages in eax/rax (`store_dst` parks the
+                // full qword; no home is ever rax, so the `== d` in-place
+                // shortcuts below can never fire spuriously). Spilled OPERANDS
+                // read through 32-bit mem forms — a slot's low 32 IS ToInt32
+                // of its value (canonical i64), same as any home's low 32.
+                let d = dst_reg(dl);
                 let (sa, sb) = (src(a), src(b));
                 if let (Src::I(ai), Src::I(bi)) = (sa, sb) {
                     // Two hoisted i32 constants: fold. `>>>` folds to a u32
@@ -1427,36 +1963,43 @@ pub(crate) fn compile_region_int_gpr(
                                 match fill {
                                     Src::R(ag) => dynasm!(ops ; mov Rd(d), Rd(ag)),
                                     Src::I(ai) => dynasm!(ops ; mov Rd(d), ai),
+                                    Src::S(sd) => dynasm!(ops ; mov Rd(d), [rsp + sd]),
                                 }
                             }
                             match (op, other) {
                                 (B::And, Src::R(h)) => dynasm!(ops ; and Rd(d), Rd(h)),
                                 (B::And, Src::I(v)) => dynasm!(ops ; and Rd(d), v),
+                                (B::And, Src::S(sd)) => dynasm!(ops ; and Rd(d), [rsp + sd]),
                                 (B::Or, Src::R(h)) => dynasm!(ops ; or Rd(d), Rd(h)),
                                 (B::Or, Src::I(v)) => dynasm!(ops ; or Rd(d), v),
+                                (B::Or, Src::S(sd)) => dynasm!(ops ; or Rd(d), [rsp + sd]),
                                 (B::Xor, Src::R(h)) => dynasm!(ops ; xor Rd(d), Rd(h)),
                                 (B::Xor, Src::I(v)) => dynasm!(ops ; xor Rd(d), v),
+                                (B::Xor, Src::S(sd)) => dynasm!(ops ; xor Rd(d), [rsp + sd]),
                                 _ => unreachable!(),
                             }
                         }
                         B::Shl | B::Shr | B::Ushr => {
                             // Count to cl FIRST (d may BE the count home),
                             // then the value onto d, then shift in place.
-                            if let Src::R(bg) = sb {
-                                dynasm!(ops ; mov ecx, Rd(bg));
+                            match sb {
+                                Src::R(bg) => dynasm!(ops ; mov ecx, Rd(bg)),
+                                Src::S(sd) => dynasm!(ops ; mov ecx, [rsp + sd]),
+                                Src::I(_) => {}
                             }
                             match sa {
                                 Src::R(ag) if ag != d => dynasm!(ops ; mov Rd(d), Rd(ag)),
                                 Src::R(_) => {}
                                 Src::I(ai) => dynasm!(ops ; mov Rd(d), ai),
+                                Src::S(sd) => dynasm!(ops ; mov Rd(d), [rsp + sd]),
                             }
                             match (op, sb) {
-                                (B::Shl, Src::R(_)) => dynasm!(ops ; shl Rd(d), cl),
                                 (B::Shl, Src::I(bi)) => dynasm!(ops ; shl Rd(d), (bi & 31) as i8),
-                                (B::Shr, Src::R(_)) => dynasm!(ops ; sar Rd(d), cl),
+                                (B::Shl, _) => dynasm!(ops ; shl Rd(d), cl),
                                 (B::Shr, Src::I(bi)) => dynasm!(ops ; sar Rd(d), (bi & 31) as i8),
-                                (B::Ushr, Src::R(_)) => dynasm!(ops ; shr Rd(d), cl),
+                                (B::Shr, _) => dynasm!(ops ; sar Rd(d), cl),
                                 (B::Ushr, Src::I(bi)) => dynasm!(ops ; shr Rd(d), (bi & 31) as i8),
+                                (B::Ushr, _) => dynasm!(ops ; shr Rd(d), cl),
                                 _ => unreachable!(),
                             }
                         }
@@ -1465,11 +2008,14 @@ pub(crate) fn compile_region_int_gpr(
                     // the movsxd this elides was ON the accumulator chain.
                     // `>>>` is canonical as written and never sign-extends.
                     // (A split/write-through dst is never lazy, so its
-                    // post-op boxing below always reads a canonical home.)
+                    // post-op boxing below always reads a canonical home; a
+                    // W10.3 staged dst — rax, never in `lazy` — always
+                    // canonicalizes here, then `store_dst` parks the qword.)
                     if !matches!(op, B::Ushr) && !lazy.contains(&d) {
                         dynasm!(ops ; movsxd Rq(d), Rd(d));
                     }
                 }
+                store_dst(&mut ops, dl);
             }
             // ── pinned-string charCodeAt ── same guards/deopt as the xmm arm.
             Instr::CallMethod { dst, arg_base, .. }
@@ -1480,7 +2026,8 @@ pub(crate) fn compile_region_int_gpr(
             {
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
-                let d = g(dst);
+                let dl = g(dst);
+                let d = dst_reg(dl); // W10.3: a spilled dst stages in eax
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
@@ -1500,7 +2047,10 @@ pub(crate) fn compile_region_int_gpr(
                     ; jae => deopt                       // OOB → deopt (interp yields NaN)
                     ; mov rdx, [rsp + off + 8]           // pinned bytes base
                     ; movzx Rd(d), BYTE [rdx + rcx]      // ASCII code unit, 0..255 —
-                    ; jmp => done                        // zext == sext: canonical
+                );                                       // zext == sext: canonical
+                store_dst(&mut ops, dl);
+                dynasm!(ops
+                    ; jmp => done
                     ; => deopt
                 );
                 emit_store_ip(&mut ops, ip_slot, ip as i32); // resume AT this ip
@@ -1548,7 +2098,13 @@ pub(crate) fn compile_region_int_gpr(
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
                 let size = [1i32, 1, 1, 2, 2, 4, 4, 4, 8][kindid as usize];
-                let d = g(dst);
+                let dl = g(dst);
+                // W10.3: a spilled dst stages in rax — every LE/BE load form
+                // below is legal with rax as the landing register (the BE
+                // 16-bit paths already stage through eax), and `store_dst`
+                // parks the FULL qword (the kind-6 zext u32 included — a dword
+                // slot store would leave stale high bits).
+                let d = dst_reg(dl);
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 // W7: identity hoisted to entry for a hoisted pin (see GetIndex).
@@ -1634,6 +2190,7 @@ pub(crate) fn compile_region_int_gpr(
                     }
                     dynasm!(ops ; => loaded);
                 }
+                store_dst(&mut ops, dl); // W10.3 spilled dst: park the qword
                 // A FUSED access resumes at the ELIDED Eq (ip-1): the
                 // interpreter recomputes the flag into the frame slot — which
                 // native code never writes — then re-runs the call. flush_exit
@@ -1665,13 +2222,15 @@ pub(crate) fn compile_region_int_gpr(
             {
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
-                let d = g(dst);
+                let dl = g(dst);
+                let d = dst_reg(dl); // W10.3: a spilled dst stages in rax
                 // W7: a hoisted pin's length read collapses to a bare snapshot
                 // load (identity entry-guarded; length region-invariant). The
                 // fully hoisted STRING case never reaches here (body op
                 // skipped); this is the multi-def / on-a-branch / Array residue.
                 if plan.hoist_pins.contains(&(j as u8)) {
                     dynasm!(ops ; mov Rq(d), [rsp + off + 16]);
+                    store_dst(&mut ops, dl);
                 } else {
                     let deopt = ops.new_dynamic_label();
                     let done = ops.new_dynamic_label();
@@ -1683,6 +2242,9 @@ pub(crate) fn compile_region_int_gpr(
                         ; cmp rax, [rsp + off]           // receiver identity vs snapshot
                         ; jne => deopt
                         ; mov Rq(d), [rsp + off + 16]    // units / len
+                    );
+                    store_dst(&mut ops, dl);
+                    dynasm!(ops
                         ; jmp => done
                         ; => deopt
                     );
@@ -1699,7 +2261,11 @@ pub(crate) fn compile_region_int_gpr(
             // 3-operand imm form and the in-place 2-operand form keep the
             // whole op to ONE instruction on the chain.
             Instr::MathOp { dst, arg_base, op: MathFn::Imul, argc: 2, .. } => {
-                let d = g(dst);
+                let dl = g(dst);
+                // W10.3: a spilled dst stages in eax (imul has no mem-dst
+                // form); spilled operands use the r32, r/m32 (,imm) forms —
+                // a slot's low 32 is ToInt32 of its value.
+                let d = dst_reg(dl);
                 match (src(arg_base), src(arg_base + 1)) {
                     (Src::I(ai), Src::I(bi)) => {
                         // Two hoisted i32 constants: fold (canonical store,
@@ -1708,6 +2274,8 @@ pub(crate) fn compile_region_int_gpr(
                     }
                     (Src::R(ag), Src::I(bi)) => dynasm!(ops ; imul Rd(d), Rd(ag), bi),
                     (Src::I(ai), Src::R(bg)) => dynasm!(ops ; imul Rd(d), Rd(bg), ai),
+                    (Src::S(ad), Src::I(bi)) => dynasm!(ops ; imul Rd(d), [rsp + ad], bi),
+                    (Src::I(ai), Src::S(bd)) => dynasm!(ops ; imul Rd(d), [rsp + bd], ai),
                     (Src::R(ag), Src::R(bg)) => {
                         if d == ag {
                             dynasm!(ops ; imul Rd(d), Rd(bg));
@@ -1717,14 +2285,30 @@ pub(crate) fn compile_region_int_gpr(
                             dynasm!(ops ; mov Rd(d), Rd(ag) ; imul Rd(d), Rd(bg));
                         }
                     }
+                    (Src::R(ag), Src::S(bd)) => {
+                        if d != ag {
+                            dynasm!(ops ; mov Rd(d), Rd(ag));
+                        }
+                        dynasm!(ops ; imul Rd(d), [rsp + bd]);
+                    }
+                    (Src::S(ad), Src::R(bg)) => {
+                        if d != bg {
+                            dynasm!(ops ; mov Rd(d), Rd(bg)); // commutative
+                        }
+                        dynasm!(ops ; imul Rd(d), [rsp + ad]);
+                    }
+                    (Src::S(ad), Src::S(bd)) => {
+                        dynasm!(ops ; mov Rd(d), [rsp + ad] ; imul Rd(d), [rsp + bd]);
+                    }
                 }
                 let folded = matches!((src(arg_base), src(arg_base + 1)), (Src::I(_), Src::I(_)));
                 if !folded && !lazy.contains(&d) {
                     dynasm!(ops ; movsxd Rq(d), Rd(d));
                 }
-                // W9: writes_reg is blind to MathOp, so the generic hook never
-                // fires for an Imul def — write through explicitly (membership
-                // no-op otherwise). An imul result is ToInt32 — provably i32.
+                store_dst(&mut ops, dl); // W10.3 spilled dst: park the qword
+                // The generic writes_reg hook covers MathOp dsts, but this arm
+                // writes through explicitly like the DV arm (membership no-op
+                // otherwise). An imul result is ToInt32 — provably i32.
                 emit_int_wt_gpr(&mut ops, plan, &map, dst, true);
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
@@ -1799,7 +2383,7 @@ pub(crate) fn compile_region_int_gpr(
             continue;
         }
         match map.get(&x) {
-            Some(&h) => emit_int_box_from_gpr(&mut ops, h),
+            Some(&l) => emit_int_box_from_loc(&mut ops, l), // W10.3: spilled homes box from their slot
             None => {
                 let bits = INT_TAG | hoist_c[&r] as u32 as u64;
                 dynasm!(ops ; mov rax, QWORD bits as i64);
@@ -1811,7 +2395,7 @@ pub(crate) fn compile_region_int_gpr(
         dynasm!(ops ; mov rax, QWORD BOOL_TAG as i64 ; or rax, Rq(gb) ; mov [rbx + dreg(r)], rax);
     }
     for &(gi, x) in &plan.globs {
-        emit_int_box_from_gpr(&mut ops, gx(x));
+        emit_int_box_from_loc(&mut ops, gx(x));
         dynasm!(ops ; mov [r12 + (gi as i32) * 8], rax);
     }
     emit_gpr_region_restore(&mut ops, frame);
@@ -1855,11 +2439,19 @@ fn emit_icmp_flags_gpr(ops: &mut dynasmrt::x64::Assembler, a: Src, b: Src, lazy:
     if let Src::R(h) = b {
         emit_canon_home(ops, h, lazy);
     }
+    // W10.3 spill-slot operands use qword mem-operand forms (slots are always
+    // canonical), staging through rax ONLY — the DV fused-Eq call site needs
+    // rcx/rdx to stay live across this compare.
     match (a, b) {
         (Src::R(ag), Src::R(bg)) => dynasm!(ops ; cmp Rq(ag), Rq(bg)),
         (Src::R(ag), Src::I(bi)) => dynasm!(ops ; cmp Rq(ag), bi),
+        (Src::R(ag), Src::S(bd)) => dynasm!(ops ; cmp Rq(ag), [rsp + bd]),
         (Src::I(ai), Src::R(bg)) => dynasm!(ops ; mov rax, ai ; cmp rax, Rq(bg)),
         (Src::I(ai), Src::I(bi)) => dynasm!(ops ; mov rax, ai ; cmp rax, bi),
+        (Src::I(ai), Src::S(bd)) => dynasm!(ops ; mov rax, ai ; cmp rax, [rsp + bd]),
+        (Src::S(ad), Src::R(bg)) => dynasm!(ops ; mov rax, [rsp + ad] ; cmp rax, Rq(bg)),
+        (Src::S(ad), Src::I(bi)) => dynasm!(ops ; mov rax, [rsp + ad] ; cmp rax, bi),
+        (Src::S(ad), Src::S(bd)) => dynasm!(ops ; mov rax, [rsp + ad] ; cmp rax, [rsp + bd]),
     }
 }
 

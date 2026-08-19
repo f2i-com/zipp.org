@@ -684,11 +684,13 @@ cargo build --target wasm32-unknown-unknown -p zipp-vm --no-default-features
 `ZIPP_NOJIT=1` disables native codegen (it is **presence**-checked, so
 `ZIPP_NOJIT=0` also disables it — unset it for a JIT run); `ZIPP_NO_NURSERY=1`
 reverts to the majors-only collector (the generational nursery is default-on
-since wave 9; `ZIPP_NURSERY_YOUNG_BUDGET=<n>` tunes the minor cadence, and
-`ZIPP_NURSERY_VERIFY=1` re-runs the full mark beside every minor and panics
-naming any slot the young-only trace missed); `ZIPP_GC_STRESS=1` collects on
-every allocation; `ZIPP_JITLOG=1` reports tier decisions, deopts and
-evictions; `ZIPP_JITDECLINE=1` names which planner check rejected a region.
+since wave 9; its young budget ADAPTS to measured survival since wave 10 —
+`ZIPP_NURSERY_YOUNG_BUDGET=<n>` pins it, `ZIPP_NO_NURSERY_ADAPT=1` pins the
+16k default, and `ZIPP_NURSERY_VERIFY=1` re-runs the full mark beside every
+minor and panics naming any slot the young-only trace missed);
+`ZIPP_GC_STRESS=1` collects on every allocation; `ZIPP_JITLOG=1` reports tier
+decisions, deopts and evictions; `ZIPP_JITDECLINE=1` names which planner
+check rejected a region.
 
 Any change touching the JIT must produce identical output both ways —
 `assert_jit_matches` in the test suite pins that per case. A JIT change that

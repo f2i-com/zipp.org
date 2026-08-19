@@ -66,6 +66,13 @@ pub(crate) struct RegionPlan {
     /// a loop counter bounded by the loop condition's constant). INT path only;
     /// for a `Mul` it also licenses dropping the i64-overflow `jo` check.
     pub(crate) elide_guard: FxHashSet<usize>,
+    /// W10 (B123): global slots whose entry load must be STRICT-i32 (bail on
+    /// a wider value) because the DV guard prover assumed an i32 entry
+    /// interval for them — licensed exactly like the W8 lazy strict set: an
+    /// entry bail computes nothing, so bailing is always sound, and every
+    /// in-region def of these globals provably writes i32 (`|0`-truncated
+    /// accumulators). Empty for every non-DV plan.
+    pub(crate) strict_entry_globs: FxHashSet<u32>,
     /// Guard-elided `Mul` ips whose one operand is a single-def constant power of
     /// two: `(value operand reg, shift)` — emitted as `psllq` instead of an
     /// imul gpr round-trip. INT path only (f64 keeps `mulsd`).
