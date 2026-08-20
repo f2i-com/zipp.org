@@ -2361,7 +2361,7 @@ impl<'p> Vm<'p> {
                         // advance exactly +1. `global` gates it because only
                         // the global step loop is fused.
                         use crate::vm::proxy_regexp::{
-                            ITFB_FUSED, ITFB_INDICES, ITFB_STICKY,
+                            RegexpIterRec, ITFB_FUSED, ITFB_INDICES, ITFB_STICKY,
                         };
                         let mut extra_bits = 0u8;
                         if global && s_val.is_heap() {
@@ -2374,6 +2374,33 @@ impl<'p> Vm<'p> {
                                     | if flags.contains('d') { ITFB_INDICES } else { 0 };
                             }
                         }
+                        // A fused-eligible source with no twin yet gets it built
+                        // HERE, on the SOURCE, so every matcher clone carries
+                        // `Some` from creation: a regex only ever used via
+                        // matchAll is never `exec`'d, so nothing else ensures
+                        // its twin, and the slim step's cold build lands on the
+                        // per-call matcher — which dies with the iteration, so
+                        // every creation re-paid the full ensure (~136ns
+                        // measured: compile-cps vec builds, cache-key
+                        // materialisation, SipHash probe). `is_none()`
+                        // deliberately skips `Some(None)` (a recorded compile
+                        // failure): the clone carries the failure and the slim
+                        // step's base-program arm handles it, unchanged. The
+                        // ensure writes only engine-internal state — exactly
+                        // what the first pristine `exec` on an ASCII subject
+                        // does today — so nothing observable moves.
+                        let twin = if extra_bits & ITFB_FUSED != 0
+                            && twin.is_none()
+                            && crate::vm::proxy_regexp::twin_at_create_enabled()
+                        {
+                            self.ensure_regexp_ascii_twin(re_idx);
+                            match self.heap.get(re_idx) {
+                                HeapObj::RegExp { ascii_twin, .. } => ascii_twin.clone(),
+                                _ => twin,
+                            }
+                        } else {
+                            twin
+                        };
                         // The matcher is a SEPARATE object: the iterator advances
                         // its lastIndex independently of the source regex.
                         // Carry the byte-optimized twin over. It is derived from
@@ -2412,7 +2439,23 @@ impl<'p> Vm<'p> {
                         });
                         let fbits =
                             (global as u8) | ((full_unicode as u8) << 1) | extra_bits;
-                        self.regexp_string_iters.insert(it, (matcher_idx, s_val, fbits, false));
+                        // O(1): stored units on a Str, stored len on a Cons —
+                        // no flatten needed for the length alone.
+                        let subj_units = if s_val.is_heap() {
+                            self.heap.str_units(s_val.heap_index()).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        self.regexp_string_iters.insert(
+                            it,
+                            RegexpIterRec {
+                                matcher: matcher_idx,
+                                subject: s_val,
+                                subj_units,
+                                fbits,
+                                done: false,
+                            },
+                        );
                         return Ok(Value::heap(it));
                     }
                 }
@@ -2461,7 +2504,24 @@ impl<'p> Vm<'p> {
                 let it =
                     self.heap.alloc(HeapObj::Iterator { items: Vec::new(), index: 0, proto, live: None });
                 let fbits = (global as u8) | ((full_unicode as u8) << 1);
-                self.regexp_string_iters.insert(it, (matcher_idx, s_val, fbits, false));
+                // O(1) whatever the subject's shape (Str or Cons); the field
+                // is only load-bearing on the `ITFB_FUSED` path, which this
+                // arm never sets.
+                let subj_units = if s_val.is_heap() {
+                    self.heap.str_units(s_val.heap_index()).unwrap_or(0)
+                } else {
+                    0
+                };
+                self.regexp_string_iters.insert(
+                    it,
+                    crate::vm::proxy_regexp::RegexpIterRec {
+                        matcher: matcher_idx,
+                        subject: s_val,
+                        subj_units,
+                        fbits,
+                        done: false,
+                    },
+                );
                 Value::heap(it)
             }
             REGEXP_GET_GLOBAL

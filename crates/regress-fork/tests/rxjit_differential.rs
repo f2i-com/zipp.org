@@ -172,6 +172,86 @@ fn rxjit_differential_vs_interpreter() {
     assert_eq!(bails, 0, "native code should not hit the backtrack cap here");
 }
 
+/// The scan-session path (rxjit.rs `with_session`) hoists the TLS borrow and
+/// context build out of the advance loop; its match streams — ranges and
+/// capture groups — must be identical to the legacy per-attempt wrapper's.
+#[test]
+fn rx_session_differential_vs_legacy() {
+    let cases = corpus();
+    let sessions_before = regress::rx_session_stats();
+    let mut compared = 0usize;
+    for (p, f, s) in &cases {
+        for start in [0usize, 1, s.len() / 2] {
+            if start > s.len() {
+                continue;
+            }
+            let compile = || Regex::with_flags(p.as_str(), f.as_str());
+            let (Ok(legacy_re), Ok(session_re)) = (compile(), compile()) else {
+                continue;
+            };
+            regress::__rxjit_force(Some(true));
+            regress::__rx_scansession_force(Some(false));
+            let legacy = run_all(&legacy_re, s, start);
+            regress::__rx_scansession_force(Some(true));
+            // Twice: the second drain is compiled from its first attempt, so
+            // every next_match call of it runs inside a session.
+            let session_cold = run_all(&session_re, s, start);
+            let session_warm = run_all(&session_re, s, start);
+            regress::__rx_scansession_force(None);
+            regress::__rxjit_force(None);
+            assert_eq!(
+                legacy, session_cold,
+                "session/legacy divergence (cold) on /{p}/{f} over {s:?} from {start}"
+            );
+            assert_eq!(
+                legacy, session_warm,
+                "session/legacy divergence (warm) on /{p}/{f} over {s:?} from {start}"
+            );
+            compared += 1;
+        }
+    }
+    let sessions = regress::rx_session_stats() - sessions_before;
+    println!("session differential: {compared} cases; {sessions} sessions opened");
+    assert!(compared > 300, "corpus unexpectedly small: {compared}");
+    assert!(sessions > 100, "session path did not engage: {sessions}");
+}
+
+/// The backtrack buffer can grow mid-session (the native -2 return); the
+/// session must recompute its context pointers rather than keep entering the
+/// stale buffer. A fresh thread gets the small initial buffer, so the first
+/// deep attempt is guaranteed to grow it inside an active session.
+#[test]
+fn rx_session_bt_grow() {
+    // ~1100 GreedyLoop1Char pushes per attempt at position 0 — past the
+    // 1024-entry initial buffer.
+    let pattern = "a?".repeat(1200);
+    let subject = "a".repeat(1100);
+    regress::__rxjit_force(Some(true));
+    regress::__rx_scansession_force(Some(false));
+    let legacy = run_all(&Regex::with_flags(&pattern, "g").unwrap(), &subject, 0);
+    regress::__rxjit_force(None);
+    regress::__rx_scansession_force(None);
+    let session = std::thread::spawn(move || {
+        regress::__rxjit_force(Some(true));
+        regress::__rx_scansession_force(Some(true));
+        let r = run_all(&Regex::with_flags(&pattern, "g").unwrap(), &subject, 0);
+        regress::__rxjit_force(None);
+        regress::__rx_scansession_force(None);
+        r
+    })
+    .join()
+    .unwrap();
+    assert_eq!(legacy, session, "session diverged across a mid-scan bt grow");
+    // Deterministic when run filtered to this test alone (no force races):
+    // both instances compile, and the spawned drain runs inside sessions.
+    let (compiled, _, _, native, _, bails) = regress::rx_jit_stats();
+    println!(
+        "bt-grow: compiled {compiled}, native attempts {native}, bails {bails}, sessions {}",
+        regress::rx_session_stats()
+    );
+    assert_eq!(bails, 0, "the grow-and-retry loop must not bail here");
+}
+
 /// Compare against node's matchAll for the same corpus where flags allow.
 #[test]
 fn rxjit_differential_vs_node() {

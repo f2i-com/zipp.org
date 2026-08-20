@@ -480,18 +480,23 @@ pub struct Vm<'p> {
     /// each key. Measured, `for (k in o)` on a one-key object cost 185ns against
     /// node's 3.
     for_in_barren: rustc_hash::FxHashMap<u32, u32>,
-    /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index:
-    /// (matcher regexp heap idx, subject string, flag bits — the `ITFB_*`
-    /// layout in `proxy_regexp`: bit0 global, bit1 fullUnicode (`u`/`v`,
-    /// captured at creation per CreateRegExpStringIterator), bit2 fused-step
-    /// eligible (B118 — pristine-clone matcher over a flat-ASCII subject),
-    /// bit3 sticky, bit4 hasIndices,
-    /// done latch). Its `next()` drives RegExpExec (honouring a user `exec`) one
-    /// match at a time, rather than matchAll eagerly collecting every match up
-    /// front.
+    /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index —
+    /// see [`proxy_regexp::RegexpIterRec`] for the record's fields.
     // W11 (B124): FxHashMap — the fused matchAll step probes this map once
     // per step (600k/run on regex-log-scan); SipHash was ~17ns of that probe.
-    regexp_string_iters: rustc_hash::FxHashMap<u32, (u32, Value, u8, bool)>,
+    regexp_string_iters: rustc_hash::FxHashMap<u32, proxy_regexp::RegexpIterRec>,
+    /// Drained matchAll scans for live `ITFB_FUSED` iterators, keyed by the
+    /// same iterator heap index as (and pruned alongside) the
+    /// `regexp_string_iters` record — see [`proxy_regexp::MatchBatch`].
+    /// Integers only: GC never traces it (the paired record roots the
+    /// matcher and subject).
+    matchall_batches: rustc_hash::FxHashMap<u32, proxy_regexp::MatchBatch>,
+    /// Allocation scratch for the batch's per-step publish (the capture Vec a
+    /// `regress::Match` owns) and per-drain triple storage: taken empty,
+    /// returned cleared, so the steady state re-mallocs neither. Plain ranges
+    /// and integers — never traced, never pruned.
+    matchall_caps_scratch: Vec<Option<std::ops::Range<usize>>>,
+    matchall_flat_scratch: Vec<u32>,
     /// RegExp legacy statics backing `RegExp.input`/`$_`/`lastMatch`/`$&`/
     /// `lastParen`/`$+`/`leftContext`/`$``/`rightContext`/`$'`/`$1`–`$9`, laid
     /// out as [input, lastMatch, lastParen, leftContext, rightContext, $1..$9]
@@ -696,6 +701,22 @@ pub struct Vm<'p> {
     /// hot function that survived a global delete from re-scanning its whole body on
     /// every call. Only ever touched while `global_route_epoch != 0`.
     jit_global_route_ok: rustc_hash::FxHashMap<u32, (u32, bool)>,
+    /// One u32 GENERATION per global slot, bumped by every NON-BYTECODE Rust
+    /// write to `globals` (`Vm::bump_global_gen`). A spliced leaf call whose
+    /// callee register provably holds slot g's value guards `global_gens[g]`
+    /// (one 32-bit compare) instead of re-checking the callee bits+version per
+    /// execution — sound only for slots NO bytecode store can ever hit (see
+    /// `bytecode_stored_slots`), which makes the enumerated Rust writers
+    /// exhaustive. Sized with `globals` at boot and NEVER reallocated (the JIT
+    /// bakes element addresses); late `globals.push` module slots have no
+    /// generation and are never keyable.
+    global_gens: Vec<u32>,
+    /// Global slots ANY bytecode store op targets (StoreGlobal / -Strict /
+    /// -Resolved / -Dyn / EvalScopeSet), collected over the main program at
+    /// boot and extended by every eval/Function registration. `slot_guard`
+    /// keying declines for members — fail-closed: a slot writable by bytecode
+    /// could change without a `bump_global_gen`.
+    bytecode_stored_slots: rustc_hash::FxHashSet<u32>,
     /// Global-slot indices that `CheckGlobalResolvable` (a strict `name = …` on
     /// a name this program never declares) found UNRESOLVABLE when the reference
     /// was created, i.e. before the RHS evaluated. PutValue's ReferenceError

@@ -748,6 +748,7 @@ impl<'p> Vm<'p> {
                 let v = Value::heap(self.heap.alloc(HeapObj::Func(id as u32)));
                 if (slot as usize) < self.globals.len() {
                     self.globals[slot as usize] = v;
+                    self.bump_global_gen(slot);
                 }
             }
         }
@@ -794,6 +795,7 @@ impl<'p> Vm<'p> {
         let s = self.eval_global_next;
         self.eval_global_next += 1;
         self.globals[s as usize] = seed;
+        self.bump_global_gen(s);
         self.realm_globals.entry(rid).or_default().insert(name.to_string(), s);
         Ok(s)
     }
@@ -838,6 +840,7 @@ impl<'p> Vm<'p> {
             Some(&v) => Value::heap(v),
             None => Value::UNINITIALIZED,
         };
+        self.bump_global_gen(s);
         Ok(s)
     }
 
@@ -980,7 +983,21 @@ impl<'p> Vm<'p> {
         if let Some(g) = self.globals.get_mut(slot as usize) {
             *g = Value::UNINITIALIZED;
         }
+        self.bump_global_gen(slot);
         self.note_global_route_change();
+    }
+
+    /// Bump global slot `slot`'s generation. Every NON-BYTECODE Rust write to
+    /// `globals[slot]` must call this (all such writers are cold paths); the
+    /// baked `slot_guard` generation compare in spliced leaf calls then misses
+    /// and the site degrades to the per-call helper — exactly what a baked
+    /// bits-guard miss does today. Slots past the table (late `globals.push`
+    /// module slots) are never keyable — no-op. Wrapping keeps compares exact.
+    #[inline]
+    pub(crate) fn bump_global_gen(&mut self, slot: u32) {
+        if let Some(g) = self.global_gens.get_mut(slot as usize) {
+            *g = g.wrapping_add(1);
+        }
     }
 
     /// Bump the global-route epoch: some global slot no longer matches what compiled

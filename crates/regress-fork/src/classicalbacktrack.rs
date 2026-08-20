@@ -1229,6 +1229,73 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         prefix_search: &PrefixSearch,
     ) -> Option<Match> {
         let inp = self.input;
+        // PATCH (see rxjit.rs): when this regex has native code and the input
+        // is byte-addressed, run the whole advance loop inside one scan
+        // session — the per-attempt TLS borrow and context build hoist out.
+        // The loop body below is move-for-move the legacy loop's, with
+        // `attempt_at` unrolled onto `Session::attempt`.
+        #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+        if crate::rxjit::session_enabled() {
+            if let Some(bytes) = inp.rxjit_bytes() {
+                let re: &CompiledRegex = self.matcher.re;
+                if let Some(code) = re.rxjit.acquire(re) {
+                    return crate::rxjit::with_session(code, bytes, |sess| {
+                        loop {
+                            if Input::CODE_UNITS_ARE_BYTES {
+                                pos = inp.find_bytes(pos, prefix_search)?;
+                            }
+                            // PATCH (see possessify.rs): a fresh attempt must
+                            // not observe a hint recorded by an earlier one.
+                            self.matcher.skip_hint = None;
+                            rxstat!(ATTEMPTS);
+                            let origin = inp.left_end();
+                            let groups = &mut self.matcher.s.groups;
+                            let outcome = sess.attempt(inp.pos_to_offset(pos), |g, s, e| {
+                                let gd = groups.mat(g);
+                                gd.start = (s != u64::MAX).then(|| origin + s as usize);
+                                gd.end = (e != u64::MAX).then(|| origin + e as usize);
+                            });
+                            let hint = |h: u64| (h != u64::MAX).then(|| origin + h as usize);
+                            let end = match outcome {
+                                crate::rxjit::Outcome::Match { end, skip_hint } => {
+                                    self.matcher.skip_hint = hint(skip_hint);
+                                    Some(origin + end)
+                                }
+                                crate::rxjit::Outcome::NoMatch { skip_hint } => {
+                                    self.matcher.skip_hint = hint(skip_hint);
+                                    None
+                                }
+                                // Native gave up (backtrack buffer cap);
+                                // rerun this attempt in the interpreter.
+                                crate::rxjit::Outcome::Bail => {
+                                    self.matcher.try_at_pos(inp, 0, pos, Forward::new())
+                                }
+                            };
+                            if let Some(end) = end {
+                                // If we matched the empty string, we have to increment.
+                                if end != pos {
+                                    *next_start = Some(end)
+                                } else {
+                                    *next_start = inp.next_right_pos(end);
+                                }
+                                return Some(self.successful_match(pos, end));
+                            }
+                            // Didn't find it at this position, try the next one.
+                            // PATCH (see possessify.rs): if the failed attempt proved a whole
+                            // run matchless, resume after the run instead.
+                            let hint = self.matcher.skip_hint.take();
+                            pos = inp.next_right_pos(pos)?;
+                            if let Some(h) = hint {
+                                if h > pos {
+                                    rxstat!(SKIPS);
+                                    pos = h;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
         loop {
             // Find the next start location, or None if none.
             // Don't try this unless CODE_UNITS_ARE_BYTES - i.e. don't do byte searches
@@ -1262,6 +1329,264 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             }
         }
     }
+
+    /// PATCH (see VENDORED.md): the range-copy half of `successful_match` —
+    /// map the winning attempt's group data into caller-owned offset ranges,
+    /// resetting each `GroupData` exactly as `successful_match` does, without
+    /// building a `Match` (no per-match captures Vec, no group-name clone).
+    fn take_group_ranges(&mut self, out: &mut Vec<Option<Range<usize>>>) {
+        out.clear();
+        for gd in self.matcher.s.groups.iter_mut() {
+            out.push(gd.as_range().map(|r| Range {
+                start: self.input.pos_to_offset(r.start),
+                end: self.input.pos_to_offset(r.end),
+            }));
+            gd.start = None;
+            gd.end = None;
+        }
+    }
+
+    /// PATCH (see VENDORED.md): drained multi-match scan (`Regex::scan_ascii`'s
+    /// engine). Semantically `cap` iterations of `exec::Matches::next` over
+    /// this executor — the identical attempt sequence and the identical
+    /// advance (next position = the match end, or one past it for an empty
+    /// match) — except each hit is handed to `sink` as raw offset ranges
+    /// instead of an allocated `Match`. \return true when the subject is
+    /// exhausted (no match exists past the last emitted one), false when the
+    /// scan stopped at `cap` hits.
+    pub(crate) fn scan_drain(
+        &mut self,
+        start: usize,
+        cap: usize,
+        sink: &mut dyn FnMut(Range<usize>, &[Option<Range<usize>>]),
+    ) -> bool {
+        let re: &CompiledRegex = self.matcher.re;
+        match &re.start_pred {
+            StartPredicate::Arbitrary => {
+                self.scan_drain_with_prefix_search(start, cap, sink, &bytesearch::EmptyString {})
+            }
+            StartPredicate::StartAnchored => self.scan_drain_anchored(start, cap, sink),
+            StartPredicate::ByteSet1(bytes) => {
+                self.scan_drain_with_prefix_search(start, cap, sink, bytes)
+            }
+            StartPredicate::ByteSet2(bytes) => {
+                self.scan_drain_with_prefix_search(start, cap, sink, bytes)
+            }
+            StartPredicate::ByteSet3(bytes) => {
+                self.scan_drain_with_prefix_search(start, cap, sink, bytes)
+            }
+            StartPredicate::ByteSeq(bytes) => {
+                self.scan_drain_with_prefix_search(start, cap, sink, bytes.as_ref())
+            }
+            StartPredicate::ByteBracket(bitmap) => {
+                self.scan_drain_with_prefix_search(start, cap, sink, bitmap)
+            }
+        }
+    }
+
+    /// The drained form of `next_match_anchored`: per hit the attempt and the
+    /// advance are move-for-move that loop's, `sink` replaces
+    /// `successful_match`.
+    fn scan_drain_anchored(
+        &mut self,
+        start: usize,
+        cap: usize,
+        sink: &mut dyn FnMut(Range<usize>, &[Option<Range<usize>>]),
+    ) -> bool {
+        let inp = self.input;
+        let Some(mut pos) = inp.try_move_right(inp.left_end(), start) else {
+            return true;
+        };
+        let mut caps_buf: Vec<Option<Range<usize>>> =
+            Vec::with_capacity(self.matcher.re.groups as usize);
+        let mut emitted = 0usize;
+        while emitted < cap {
+            rxstat!(ATTEMPTS);
+            let Some(end) = self.attempt_at(pos) else {
+                return true;
+            };
+            self.take_group_ranges(&mut caps_buf);
+            sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), &caps_buf);
+            emitted += 1;
+            // If we matched the empty string, we have to increment.
+            pos = if end != pos {
+                end
+            } else {
+                match inp.next_right_pos(end) {
+                    Some(p) => p,
+                    None => return true,
+                }
+            };
+        }
+        false
+    }
+
+    /// The drained form of `next_match_with_prefix_search`: up to `cap` hits
+    /// from ONE executor, with the whole multi-match advance loop inside one
+    /// scan session when the regex has native code — the per-attempt TLS
+    /// borrow and context build hoist out across MATCHES too, not just across
+    /// the positions of one. Per position the attempt sequence, group writes,
+    /// skip-hint handling and interpreter Bail fallback are move-for-move the
+    /// one-match loop's.
+    fn scan_drain_with_prefix_search<PrefixSearch: bytesearch::ByteSearcher>(
+        &mut self,
+        start: usize,
+        cap: usize,
+        sink: &mut dyn FnMut(Range<usize>, &[Option<Range<usize>>]),
+        prefix_search: &PrefixSearch,
+    ) -> bool {
+        let inp = self.input;
+        let Some(mut pos) = inp.try_move_right(inp.left_end(), start) else {
+            return true;
+        };
+        let mut caps_buf: Vec<Option<Range<usize>>> =
+            Vec::with_capacity(self.matcher.re.groups as usize);
+        let mut emitted = 0usize;
+        #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+        if crate::rxjit::session_enabled() {
+            if let Some(bytes) = inp.rxjit_bytes() {
+                let re: &CompiledRegex = self.matcher.re;
+                if let Some(code) = re.rxjit.acquire(re) {
+                    return crate::rxjit::with_session(code, bytes, |sess| {
+                        'hits: while emitted < cap {
+                            loop {
+                                if Input::CODE_UNITS_ARE_BYTES {
+                                    pos = match inp.find_bytes(pos, prefix_search) {
+                                        Some(p) => p,
+                                        None => return true,
+                                    };
+                                }
+                                // PATCH (see possessify.rs): a fresh attempt must
+                                // not observe a hint recorded by an earlier one.
+                                self.matcher.skip_hint = None;
+                                rxstat!(ATTEMPTS);
+                                let origin = inp.left_end();
+                                let groups = &mut self.matcher.s.groups;
+                                let outcome = sess.attempt(inp.pos_to_offset(pos), |g, s, e| {
+                                    let gd = groups.mat(g);
+                                    gd.start = (s != u64::MAX).then(|| origin + s as usize);
+                                    gd.end = (e != u64::MAX).then(|| origin + e as usize);
+                                });
+                                let hint = |h: u64| (h != u64::MAX).then(|| origin + h as usize);
+                                let end = match outcome {
+                                    crate::rxjit::Outcome::Match { end, skip_hint } => {
+                                        self.matcher.skip_hint = hint(skip_hint);
+                                        Some(origin + end)
+                                    }
+                                    crate::rxjit::Outcome::NoMatch { skip_hint } => {
+                                        self.matcher.skip_hint = hint(skip_hint);
+                                        None
+                                    }
+                                    // Native gave up (backtrack buffer cap);
+                                    // rerun this attempt in the interpreter.
+                                    crate::rxjit::Outcome::Bail => {
+                                        self.matcher.try_at_pos(inp, 0, pos, Forward::new())
+                                    }
+                                };
+                                if let Some(end) = end {
+                                    self.take_group_ranges(&mut caps_buf);
+                                    sink(
+                                        inp.pos_to_offset(pos)..inp.pos_to_offset(end),
+                                        &caps_buf,
+                                    );
+                                    emitted += 1;
+                                    // If we matched the empty string, we have to increment.
+                                    pos = if end != pos {
+                                        end
+                                    } else {
+                                        match inp.next_right_pos(end) {
+                                            Some(p) => p,
+                                            None => return true,
+                                        }
+                                    };
+                                    continue 'hits;
+                                }
+                                // Didn't find it at this position, try the next one.
+                                // PATCH (see possessify.rs): if the failed attempt
+                                // proved a whole run matchless, resume after the
+                                // run instead.
+                                let hint = self.matcher.skip_hint.take();
+                                pos = match inp.next_right_pos(pos) {
+                                    Some(p) => p,
+                                    None => return true,
+                                };
+                                if let Some(h) = hint {
+                                    if h > pos {
+                                        rxstat!(SKIPS);
+                                        pos = h;
+                                    }
+                                }
+                            }
+                        }
+                        false
+                    });
+                }
+            }
+        }
+        'hits: while emitted < cap {
+            loop {
+                if Input::CODE_UNITS_ARE_BYTES {
+                    pos = match inp.find_bytes(pos, prefix_search) {
+                        Some(p) => p,
+                        None => return true,
+                    };
+                }
+                // PATCH (see possessify.rs): a fresh attempt must not observe a
+                // hint recorded by an earlier one.
+                self.matcher.skip_hint = None;
+                rxstat!(ATTEMPTS);
+                if let Some(end) = self.attempt_at(pos) {
+                    self.take_group_ranges(&mut caps_buf);
+                    sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), &caps_buf);
+                    emitted += 1;
+                    // If we matched the empty string, we have to increment.
+                    pos = if end != pos {
+                        end
+                    } else {
+                        match inp.next_right_pos(end) {
+                            Some(p) => p,
+                            None => return true,
+                        }
+                    };
+                    continue 'hits;
+                }
+                // Didn't find it at this position, try the next one.
+                // PATCH (see possessify.rs): if the failed attempt proved a whole
+                // run matchless, resume after the run instead.
+                let hint = self.matcher.skip_hint.take();
+                pos = match inp.next_right_pos(pos) {
+                    Some(p) => p,
+                    None => return true,
+                };
+                if let Some(h) = hint {
+                    if h > pos {
+                        rxstat!(SKIPS);
+                        pos = h;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// PATCH (see VENDORED.md): one drained ASCII scan — `Regex::scan_ascii`'s
+/// entry into this module. One executor (and, with rx-jit, one scan session)
+/// serves up to `cap` matches; per hit `sink` receives the raw offset ranges
+/// and no `Match` is built. \return whether the subject was exhausted.
+pub(crate) fn scan_ascii_drain(
+    re: &CompiledRegex,
+    text: &str,
+    start: usize,
+    cap: usize,
+    sink: &mut dyn FnMut(Range<usize>, &[Option<Range<usize>>]),
+) -> bool {
+    let input = AsciiInput::new(text, re.flags.unicode_mode());
+    let mut ex = BacktrackExecutor {
+        input,
+        matcher: MatchAttempter::new(re, input.left_end()),
+    };
+    ex.scan_drain(start, cap, sink)
 }
 
 impl<Input: InputIndexer> exec::MatchProducer for BacktrackExecutor<'_, Input> {

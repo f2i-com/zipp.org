@@ -189,6 +189,27 @@ pub fn __rxjit_force(mode: Option<bool>) {
     rxjit::force(mode)
 }
 
+/// PATCH (test hook, see rxjit.rs): force the scan-session path on or off,
+/// overriding the `ZIPP_NO_RX_SCANSESSION` env switch. For the differential
+/// harness only.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __rx_scansession_force(mode: Option<bool>) {
+    rxjit::session_force(mode)
+}
+
+/// PATCH (see rxjit.rs): scan sessions opened — the hoisted advance loop
+/// engaged in place of the per-attempt wrapper. Zero when the `rx-jit`
+/// feature or the x86-64 target is absent.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+pub fn rx_session_stats() -> u64 {
+    rxjit::session_stats()
+}
+#[cfg(not(all(feature = "rx-jit", target_arch = "x86_64")))]
+pub fn rx_session_stats() -> u64 {
+    0
+}
+
 #[macro_use]
 mod util;
 

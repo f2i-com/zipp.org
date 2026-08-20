@@ -50,6 +50,15 @@ static DECLINED_LIMITS: AtomicU64 = AtomicU64::new(0);
 static NATIVE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static BAILS: AtomicU64 = AtomicU64::new(0);
+/// Scan sessions opened (`with_session`). Counts unconditionally — per call,
+/// not per attempt — so the differential harness can assert the session path
+/// engaged without env plumbing.
+static SESSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Scan sessions opened.
+pub(crate) fn session_stats() -> u64 {
+    SESSIONS.load(Ordering::Relaxed)
+}
 
 /// (compiled, declined: unsupported insn, declined: limits, native attempts,
 /// interpreter attempts on byte inputs, native bails).
@@ -97,6 +106,37 @@ fn threshold() -> u32 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(64)
     })
+}
+
+/// Test override for the scan session: 0 = env policy, 1 = force off, 2 =
+/// force on. Set via `__rx_scansession_force` for the differential harness.
+static SESSION_FORCE: AtomicU8 = AtomicU8::new(0);
+
+pub(crate) fn session_force(mode: Option<bool>) {
+    SESSION_FORCE.store(
+        match mode {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn session_env_disabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("ZIPP_NO_RX_SCANSESSION").is_some_and(|v| v != "0"))
+}
+
+/// Whether the advance loop may hoist the per-attempt wrapper into a session
+/// (`ZIPP_NO_RX_SCANSESSION=1` keeps the legacy `run_attempt` path).
+#[inline]
+pub(crate) fn session_enabled() -> bool {
+    match SESSION_FORCE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => !session_env_disabled(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +309,118 @@ pub(crate) fn run_attempt(
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Scan session: the per-call form of the attempt wrapper. One advance loop's
+// worth of attempts shares a single TLS borrow, groups sizing, and context
+// build; each attempt only refills the group slots and re-enters the code.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct Session<'s> {
+    code: &'s JitCode,
+    ctx: JitCtx,
+    groups: &'s mut Vec<u64>,
+    bt: &'s mut Vec<u64>,
+}
+
+/// Open a session over `bytes` and run `f` inside it. The thread-local
+/// scratch backs the session; if it is already borrowed (regress-internal
+/// re-entry — none exists today) the session degrades to freshly allocated
+/// buffers rather than panicking.
+pub(crate) fn with_session<R>(
+    code: &JitCode,
+    bytes: &[u8],
+    f: impl FnOnce(&mut Session) -> R,
+) -> R {
+    SESSIONS.fetch_add(1, Ordering::Relaxed);
+    SCRATCH.with(|s| match s.try_borrow_mut() {
+        Ok(mut s) => {
+            let s = &mut *s;
+            f(&mut Session::new(code, bytes, &mut s.groups, &mut s.bt))
+        }
+        Err(_) => {
+            let mut groups = Vec::new();
+            let mut bt = vec![0u64; 4096];
+            f(&mut Session::new(code, bytes, &mut groups, &mut bt))
+        }
+    })
+}
+
+impl<'s> Session<'s> {
+    fn new(
+        code: &'s JitCode,
+        bytes: &[u8],
+        groups: &'s mut Vec<u64>,
+        bt: &'s mut Vec<u64>,
+    ) -> Self {
+        groups.clear();
+        groups.resize(code.groups * 2, u64::MAX);
+        let ctx = JitCtx {
+            input: bytes.as_ptr(),
+            len: bytes.len() as u64,
+            start: 0,
+            groups: groups.as_mut_ptr(),
+            bt_base: bt.as_mut_ptr(),
+            // Entries are 4 u64s; the last allowed entry starts 4 short.
+            bt_limit: unsafe { bt.as_mut_ptr().add(bt.len() - 4) },
+            skip_hint: u64::MAX,
+        };
+        Self { code, ctx, groups, bt }
+    }
+
+    /// Run one native attempt at byte offset `start`; the per-attempt
+    /// contract is `run_attempt`'s. On a match, `set_group` is called for
+    /// every capture group with (index, start, end) — u64::MAX = unset.
+    pub(crate) fn attempt(
+        &mut self,
+        start: usize,
+        mut set_group: impl FnMut(usize, u64, u64),
+    ) -> Outcome {
+        debug_assert!(start as u64 <= self.ctx.len);
+        loop {
+            // A failed attempt leaves partial group writes behind — refill
+            // before every entry (only the alloc/borrow was hoisted).
+            self.groups.fill(u64::MAX);
+            self.ctx.groups = self.groups.as_mut_ptr();
+            self.ctx.start = start as u64;
+            self.ctx.skip_hint = u64::MAX;
+            // SAFETY: as in `run_attempt` — the code only reads the input
+            // slice `with_session` was given (alive for the whole session)
+            // and stays within the scratch bounds in `ctx`.
+            let r = unsafe { (self.code.entry)(&mut self.ctx) };
+            match r {
+                -2 => {
+                    let grown = self.bt.len() * 2;
+                    if grown > MAX_BT_U64S {
+                        BAILS.fetch_add(1, Ordering::Relaxed);
+                        return Outcome::Bail;
+                    }
+                    self.bt.resize(grown, 0);
+                    // The resize can move the buffer: recompute the context
+                    // pointers before the retry.
+                    self.ctx.bt_base = self.bt.as_mut_ptr();
+                    self.ctx.bt_limit =
+                        unsafe { self.bt.as_mut_ptr().add(self.bt.len() - 4) };
+                }
+                -1 => {
+                    if crate::classicalbacktrack::rxstats::enabled() {
+                        NATIVE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Outcome::NoMatch { skip_hint: self.ctx.skip_hint };
+                }
+                end => {
+                    if crate::classicalbacktrack::rxstats::enabled() {
+                        NATIVE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for g in 0..self.code.groups {
+                        set_group(g, self.groups[g * 2], self.groups[g * 2 + 1]);
+                    }
+                    return Outcome::Match { end: end as usize, skip_hint: self.ctx.skip_hint };
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

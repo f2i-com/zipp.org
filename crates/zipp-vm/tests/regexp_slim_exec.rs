@@ -16,7 +16,8 @@
 //! v24.12.0 (each block in its OWN process — several deliberately leave
 //! the realm polluted) and diffs byte-identical. The whole set re-runs in
 //! child processes with `ZIPP_NO_SLIM_EXEC=1`, `ZIPP_NOJIT=1`,
-//! `ZIPP_JIT_THRESHOLD=1` and `ZIPP_GC_STRESS=1`.
+//! `ZIPP_JIT_THRESHOLD=1`, `ZIPP_GC_STRESS=1`, `ZIPP_NO_ITER_SUBJ_UNITS=1`
+//! and `ZIPP_NO_TWIN_AT_CREATE=1`.
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
@@ -261,6 +262,91 @@ fn slimexec_parity_compile_inside_lastindex_valueof() {
     assert_eq!(out[0], "i=2:a||0");
 }
 
+#[test]
+fn slimexec_parity_test_statics_ordering_and_exec_indices() {
+    // `test()` on a global regex records the statics and advances lastIndex
+    // WITHOUT building a result (the statics-recorder runs, the
+    // result-builder must not); the follow-up `exec` resumes from the
+    // written lastIndex and exercises the `/d` indices build with named
+    // groups on the pristine instantiation.
+    let out = run_ok(
+        r#"
+        var re = /(?<a>x)(\d)/dg;
+        var s = "wx1 x2z";
+        var t = re.test(s);
+        var afterTest = RegExp.$1 + "," + RegExp.$2 + "," + RegExp.lastMatch + "," + RegExp.leftContext + "," + RegExp.rightContext + "," + re.lastIndex;
+        var m = re.exec(s);
+        console.log("j=" + t + "|" + afterTest + "|" + JSON.stringify(m.indices) + "|" + JSON.stringify(m.indices.groups) + "|" + m.groups.a + "|" + m.index);
+        "#,
+    );
+    assert_eq!(out[0], r#"j=true|x,1,x1,w, x2z,3|[[4,6],[4,5],[5,6]]|{"a":[4,5]}|x|4"#);
+}
+
+#[test]
+fn slimexec_parity_matchall_indices_named_groups() {
+    // `/d` + named groups on the FUSED path: the indices block (pair arrays,
+    // null-proto indices.groups) built by the shared result-builder under
+    // the ASCII slicer instantiation.
+    let out = run_ok(&format!(
+        r##"
+        var re = /(?<k>[a-z]+)=(?<v>\d+)/dg;
+        var s = "aa=1 bb=22";
+        var out = [];
+        for (var i = 0; i < {HOT}; i++) {{ out = []; for (var m of s.matchAll(re)) out.push(JSON.stringify(m.indices) + "#" + JSON.stringify(m.indices.groups)); }}
+        console.log("k=" + out.join(";"));
+        "##
+    ));
+    assert_eq!(
+        out[0],
+        r#"k=[[0,4],[0,2],[3,4]]#{"k":[0,2],"v":[3,4]};[[5,10],[5,7],[8,10]]#{"k":[5,7],"v":[8,10]}"#
+    );
+}
+
+#[test]
+fn slimexec_parity_slow_arm_subclass_rope_and_nonascii() {
+    // A RegExp SUBCLASS fails the pristine matchAll gate, so the iterator
+    // record is built by the SLOW creation arm (species construct) — over a
+    // rope subject built by concatenation, then over a non-ASCII subject.
+    // Neither is fused-eligible; the record's non-fused fields drive the
+    // full per-step protocol.
+    let out = run_ok(
+        r#"
+        class R extends RegExp {}
+        var s1 = "";
+        for (var i = 0; i < 4; i++) s1 = s1 + "ab";
+        var out1 = [];
+        for (var m of s1.matchAll(new R("ab", "g"))) out1.push(m.index);
+        var s2 = "é1 é2";
+        var out2 = [];
+        for (var m of s2.matchAll(new R("é(\\d)", "g"))) out2.push(m.index + ":" + m[1]);
+        console.log("l=" + out1.join(",") + "|" + out2.join(","));
+        "#,
+    );
+    assert_eq!(out[0], "l=0,2,4,6|0:1,3:2");
+}
+
+#[test]
+fn slimexec_parity_twin_lone_surrogate_pattern_and_nonascii_subject() {
+    // A lone-surrogate pattern keeps its exact source bytes
+    // (`regexp_exact_source`) and skips the twin compile cache — the
+    // creation-arm ensure must carry whatever the build recorded (twin or
+    // failure) without changing the matches. The non-ASCII subject never
+    // sets ITFB_FUSED, so the creation-arm ensure must NOT run there —
+    // asserted via behavior, not internals.
+    let out = run_ok(&format!(
+        r#"
+        var re = new RegExp("x|\uD800", "g");
+        var out = [];
+        for (var i = 0; i < {HOT}; i++) {{ out = []; for (var m of "axbxc".matchAll(re)) out.push(m.index); }}
+        var re2 = /b(\d)/g;
+        var out2 = [];
+        for (var m of "éb1éb2".matchAll(re2)) out2.push(m.index + ":" + m[1]);
+        console.log("m=" + out.join(",") + "|" + out2.join(","));
+        "#
+    ));
+    assert_eq!(out[0], "m=1,3|1:1,4:2");
+}
+
 /// RXSTATS structural evidence: the hot steps are still served (and counted)
 /// by the fused path with the slim entry in place. Runs in a child process
 /// because the `ZIPP_RXSTATS` latch is read once per process and the
@@ -328,6 +414,8 @@ fn all_modes_answer_identically() {
         ("ZIPP_NOJIT", "1"),
         ("ZIPP_JIT_THRESHOLD", "1"),
         ("ZIPP_GC_STRESS", "1"),
+        ("ZIPP_NO_ITER_SUBJ_UNITS", "1"),
+        ("ZIPP_NO_TWIN_AT_CREATE", "1"),
     ] {
         let out = std::process::Command::new(&exe)
             .arg("slimexec_parity_")

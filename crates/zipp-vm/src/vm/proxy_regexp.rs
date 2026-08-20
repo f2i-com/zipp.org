@@ -103,6 +103,69 @@ fn slim_exec_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_TWIN_AT_CREATE=1` stops the fused matchAll creation arm from
+/// building the SOURCE regex's `ascii_twin` up front: the first slim step's
+/// cold arm builds it on the per-call MATCHER instead — which dies with the
+/// iteration, so a source only ever used via `matchAll` re-pays the full
+/// `ensure_regexp_ascii_twin` body (compile-cps vec builds, cache-key
+/// materialisation, SipHash probe) on every creation. The rollback switch and
+/// one side of a one-binary A/B, same idiom as `ZIPP_NO_SLIM_EXEC`.
+#[inline]
+pub(crate) fn twin_at_create_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_TWIN_AT_CREATE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_ITER_SUBJ_UNITS=1` makes the fused slim exec ignore the iterator
+/// record's creation-time subject length ([`RegexpIterRec::subj_units`]) and
+/// re-derive `subj.len()` inside the search loop, as before — the rollback
+/// switch and one side of a one-binary A/B, same idiom as `ZIPP_NO_SLIM_EXEC`.
+/// The batched matchAll path consumes the cached field unconditionally, so a
+/// faithful A/B of the cached length requires `ZIPP_NO_MATCHALL_BATCH=1` too.
+#[inline]
+fn iter_subj_units_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ITER_SUBJ_UNITS").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_MATCHALL_BATCH=1` disables the fused matchAll DRAIN (one
+/// host-side scan serving up to [`MATCHALL_BATCH_CAP`] steps): every fused
+/// step goes back to the one-shot B124 slim exec, re-paying the per-step
+/// executor construction and scan-session setup. The rollback switch and one
+/// side of a one-binary A/B, same idiom as `ZIPP_NO_SLIM_EXEC`.
+#[inline]
+fn matchall_batch_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_MATCHALL_BATCH").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Flag-bit layout of the `regexp_string_iters` record's `u8` (computed ONCE
 /// at iterator creation): `global`/`fullUnicode` are what
 /// CreateRegExpStringIterator captures per spec; the rest exist so the fused
@@ -115,6 +178,64 @@ pub(crate) const ITFB_UNICODE: u8 = 1 << 1;
 pub(crate) const ITFB_FUSED: u8 = 1 << 2;
 pub(crate) const ITFB_STICKY: u8 = 1 << 3;
 pub(crate) const ITFB_INDICES: u8 = 1 << 4;
+
+/// One lazy %RegExpStringIterator%'s state — the value of
+/// `Vm::regexp_string_iters`, keyed by the iterator's heap index. Its
+/// `next()` drives RegExpExec (honouring a user `exec`) one match at a time,
+/// rather than matchAll eagerly collecting every match up front.
+pub(crate) struct RegexpIterRec {
+    /// The matcher regexp's heap index — a SEPARATE object from the source
+    /// regex, so the iteration advances its `lastIndex` independently.
+    pub matcher: u32,
+    /// The subject string.
+    pub subject: Value,
+    /// The subject's unit length, captured at creation. Strings are immutable
+    /// and Cons→Str flattening preserves the unit count, so it can never go
+    /// stale; it is load-bearing only on the `ITFB_FUSED` path (flat-ASCII
+    /// subject, units == bytes), where the slim exec reads it instead of
+    /// re-deriving `subj.len()` per search-loop pass. `usize` deliberately:
+    /// a >4GB subject needs no `ITFB_FUSED` demotion (the eager >u32 statics
+    /// arm keeps working).
+    pub subj_units: usize,
+    /// The `ITFB_*` flag bits above, computed ONCE at creation.
+    pub fbits: u8,
+    /// Done latch: set by a null result or the single match of a non-global
+    /// regex; every later step answers `(undefined, true)`.
+    pub done: bool,
+}
+
+/// Matches served per drain of the fused matchAll batch. The drain runs at
+/// the FIRST step (never at `matchAll()` itself, which stays lazy), and the
+/// cap bounds the wasted scan when a consumer breaks early.
+const MATCHALL_BATCH_CAP: usize = 16;
+
+/// One drained matchAll scan for a live `ITFB_FUSED` iterator — the value of
+/// `Vm::matchall_batches`, keyed by the SAME iterator heap index as the
+/// paired `regexp_string_iters` record and pruned alongside it. A PURE memo
+/// of integers ("scanning this immutable flat-ASCII subject with this fixed
+/// program from `expected_li` onward yields these ranges"), so GC never
+/// traces it — the paired record roots the matcher and subject. Everything
+/// OBSERVABLE stays per-step: `lastIndex` writes, Annex-B statics and the
+/// result array are produced by `Vm::fused_publish` at each `next()`, never
+/// at drain time.
+pub(crate) struct MatchBatch {
+    /// The matcher `lastIndex` the next unconsumed triple was drained at. Any
+    /// divergence (a fallback round ran a user `exec` mid-iteration and moved
+    /// the heap slot) invalidates the memo — the step re-drains from the live
+    /// position.
+    expected_li: u32,
+    /// Next unconsumed triple.
+    next: u16,
+    /// Capture-group count; the triple stride is `2 + 2 * ncaps`.
+    ncaps: u16,
+    /// The drain hit the end of the subject: no match exists past the last
+    /// triple, so consuming them all makes the NEXT step the done protocol
+    /// (a consumed batch WITHOUT this bit re-drains instead).
+    exhausted: bool,
+    /// `[start, end, cap0.start, cap0.end, ..]` per match, stride
+    /// `2 + 2 * ncaps`; `u32::MAX` = unparticipating capture.
+    flat: Vec<u32>,
+}
 
 impl<'p> Vm<'p> {
     /// `new Proxy(target, handler)` — both must be objects.
@@ -1456,42 +1577,71 @@ impl<'p> Vm<'p> {
                 vm.units_value(&u16s[r])
             }
         };
-        // Annex B legacy RegExp statics (RegExp.input/$_, lastMatch/$&,
-        // lastParen/$+, leftContext/$`, rightContext/$', $1–$9): refreshed by
-        // EVERY successful RegExpBuiltinExec — `exec`, `test`, and the String /
-        // RegExp methods that funnel through this builtin.
-        // Slots 2..=13 (lastParen, leftContext, rightContext, $1..$9) are all
-        // SLICES OF THE SUBJECT, and `ascii_slice_value` copies: `as_bytes()[r]
-        // .to_vec()`, an `is_ascii` rescan in `from_wtf8`, and a heap slot. So the
-        // eager form copied leftContext + rightContext — together ~87% of the
-        // subject — on EVERY successful match, `test` included (the `!build`
-        // early-out is below), plus one slice per capture that the result array
-        // then sliced again. Virtually no program reads `RegExp.leftContext`.
-        //
-        // Defer them: root the subject and keep unit RANGES, and materialise all
-        // THIRTEEN on the first legacy-static getter read (see
-        // `Vm::regexp_last_materialise`). Only slot 0 stays eager — `input_val` is
-        // already a Value.
-        //
-        // Slot 1 (lastMatch) was eager on the stated grounds that `whole` "is
-        // computed for the result array regardless". That holds for `exec` and NOT
-        // for `test`, which returns a boolean: every successful `.test()` was paying
-        // one `ascii_slice_value` — a malloc, a memcpy of the matched span, an
-        // `is_ascii` rescan of those same bytes, and a heap slot — for a string
-        // nothing ever read. On `regex-log-scan`'s anchored phase the match IS the
-        // whole ~112-byte line, ~90k times.
-        //
-        // MEASURED (tools/bench.py --ab-env against the same binary, 21 paired
-        // reps): ablating this block entirely was -8.65% on regex-log-scan
-        // [-8.86, -7.77], 2015ms -> 1844ms. That ablation is the ceiling this is
-        // aiming at, and it is reached whenever the statics go unread.
-        //
-        // Only the ASCII subject defers, because a non-ASCII slice reads the
-        // locally-decoded `u16s` buffer that does not outlive this call; that path
-        // is byte-for-byte what it always was. The length bound keeps the `as u32`
-        // range casts below from truncating silently — unreachable in practice (a
-        // 4GB flat string), and a wrong slice is exactly what it would produce.
-        if is_ascii && subj_units <= u32::MAX as usize {
+        // Annex B legacy RegExp statics — see `regexp_record_statics`. Only an
+        // ASCII subject can defer: a non-ASCII slice reads the locally-decoded
+        // `u16s` buffer, which does not outlive this call. The length bound
+        // keeps the deferred record's `as u32` range casts from truncating
+        // silently — unreachable in practice (a 4GB flat string), and a wrong
+        // slice is exactly what it would produce.
+        let defer = is_ascii && subj_units <= u32::MAX as usize;
+        self.regexp_record_statics(&m, input_val, s_idx, mstart, mend, subj_units, defer, &mk);
+        if !build {
+            // `test`: nothing below is reachable, and with slot 1 deferred there is
+            // no longer any string to build here at all.
+            return Ok(Value::TRUE);
+        }
+        Ok(self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mk))
+    }
+
+    /// Record the Annex B legacy RegExp statics (RegExp.input/$_, lastMatch/$&,
+    /// lastParen/$+, leftContext/$`, rightContext/$', $1–$9) for successful
+    /// match `m`: refreshed by EVERY successful RegExpBuiltinExec — `exec`,
+    /// `test`, the fused matchAll step, and the String / RegExp methods that
+    /// funnel through the builtin. Every subject slice goes through `mk`, so
+    /// each caller monomorphizes its own slicer (see `regexp_build_result`).
+    ///
+    /// Slots 2..=13 (lastParen, leftContext, rightContext, $1..$9) are all
+    /// SLICES OF THE SUBJECT, and `ascii_slice_value` copies: `as_bytes()[r]
+    /// .to_vec()`, an `is_ascii` rescan in `from_wtf8`, and a heap slot. So the
+    /// eager form copied leftContext + rightContext — together ~87% of the
+    /// subject — on EVERY successful match, `test` included (the `!build`
+    /// early-out sits between this and the result build), plus one slice per
+    /// capture that the result array then sliced again. Virtually no program
+    /// reads `RegExp.leftContext`.
+    ///
+    /// `defer` is the caller's proof that every slice can be re-derived later
+    /// (an ASCII subject whose length fits the record's u32 ranges): root the
+    /// subject and keep unit RANGES, and materialise all THIRTEEN on the first
+    /// legacy-static getter read (see `Vm::regexp_last_materialise`). Only
+    /// slot 0 stays eager — `input_val` is already a Value.
+    ///
+    /// Slot 1 (lastMatch) was eager on the stated grounds that the whole-match
+    /// slice "is computed for the result array regardless". That holds for
+    /// `exec` and NOT for `test`, which returns a boolean: every successful
+    /// `.test()` was paying one `ascii_slice_value` — a malloc, a memcpy of
+    /// the matched span, an `is_ascii` rescan of those same bytes, and a heap
+    /// slot — for a string nothing ever read. On `regex-log-scan`'s anchored
+    /// phase the match IS the whole ~112-byte line, ~90k times.
+    ///
+    /// MEASURED (tools/bench.py --ab-env against the same binary, 21 paired
+    /// reps): ablating this block entirely was -8.65% on regex-log-scan
+    /// [-8.86, -7.77], 2015ms -> 1844ms. That ablation is the ceiling this is
+    /// aiming at, and it is reached whenever the statics go unread.
+    #[inline]
+    fn regexp_record_statics<F>(
+        &mut self,
+        m: &regress::Match,
+        input_val: Value,
+        s_idx: u32,
+        mstart: usize,
+        mend: usize,
+        subj_units: usize,
+        defer: bool,
+        mk: &F,
+    ) where
+        F: Fn(&mut Self, std::ops::Range<usize>) -> Value,
+    {
+        if defer {
             // ranges[i] is slot 1+i: lastMatch, lastParen, leftContext,
             // rightContext, $1..$9.
             let mut ranges: [Option<(u32, u32)>; 13] = [None; 13];
@@ -1520,8 +1670,7 @@ impl<'p> Vm<'p> {
             }
             self.regexp_last_lazy = Some(RegexpLastLazy { subj: input_val, subj_idx: s_idx, ranges });
         } else {
-            // A non-ASCII subject cannot defer: the slices read the locally-decoded
-            // `u16s` buffer, which does not outlive this call.
+            // Cannot defer: slice all thirteen eagerly through `mk`.
             let empty = self.alloc_str(String::new());
             let mut rec = Vec::with_capacity(14);
             rec.push(input_val);
@@ -1542,11 +1691,31 @@ impl<'p> Vm<'p> {
             self.regexp_last = rec;
             self.regexp_last_lazy = None;
         }
-        if !build {
-            // `test`: nothing below is reachable, and with slot 1 deferred there is
-            // no longer any string to build here at all.
-            return Ok(Value::TRUE);
-        }
+    }
+
+    /// Build the RegExpBuiltinExec result array for successful match `m`:
+    /// element 0 the whole-match slice, one element per capture, the compact
+    /// `index`/`input`/`groups`/`indices` record, and (under `/d`) the
+    /// `indices` array. Every subject slice goes through `mk` — generic so
+    /// each caller's instantiation monomorphizes its slicer: the pristine
+    /// exec's ascii-or-units closure, the fused slim exec's ASCII-only form
+    /// (byte-identical outputs, since the pristine closure's ascii arm IS
+    /// `ascii_slice_value`). Allocation order is load-bearing for heap-index
+    /// assignment: whole + capture slices, groups object, result array,
+    /// indices pair arrays, indices array.
+    #[inline]
+    fn regexp_build_result<F>(
+        &mut self,
+        m: &regress::Match,
+        input_val: Value,
+        mstart: usize,
+        mend: usize,
+        has_indices: bool,
+        mk: &F,
+    ) -> Value
+    where
+        F: Fn(&mut Self, std::ops::Range<usize>) -> Value,
+    {
         let whole = mk(self, mstart..mend);
         let mut elems = Vec::with_capacity(1 + m.captures.len());
         elems.push(whole);
@@ -1577,7 +1746,6 @@ impl<'p> Vm<'p> {
         };
         let arr_idx = self.heap.alloc(HeapObj::Array(elems));
         let index_v = Value::num(mstart as f64);
-        let input_sv = input_val;
         // index/input/groups are real own data properties of the result array
         // (writable, enumerable, configurable) so reflection sees them.
         let attr = PropAttr {
@@ -1639,7 +1807,7 @@ impl<'p> Vm<'p> {
         self.regexp_result_props.insert(
             arr_idx,
             RegexpResultProps {
-                values: [index_v, input_sv, groups, indices_v],
+                values: [index_v, input_val, groups, indices_v],
             },
         );
         rxstats::count_compact();
@@ -1648,7 +1816,7 @@ impl<'p> Vm<'p> {
             // `ObjMap` in `arr_props`) so the compact form is A/B-able.
             self.materialize_regexp_result_props(arr_idx);
         }
-        Ok(Value::heap(arr_idx))
+        Value::heap(arr_idx)
     }
 
     /// The SLIM per-call exec for the fused matchAll step (B124): the same
@@ -1703,6 +1871,7 @@ impl<'p> Vm<'p> {
         re_idx: u32,
         input_val: Value,
         fbits: u8,
+        subj_units: usize,
         li_v: Value,
     ) -> (Value, Option<usize>) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
@@ -1726,42 +1895,59 @@ impl<'p> Vm<'p> {
         // (unreachable today — ITFB_FUSED implies `g` — but kept parallel).
         let start = if stateful { li } else { 0 };
         let s_idx = input_val.heap_index();
+        // The record's creation-time unit length (== byte length: the subject
+        // is flat ASCII and immutable) makes the rare past-the-end bail
+        // decidable before the subject borrow; the shared no-match tail below
+        // handles it. `ZIPP_NO_ITER_SUBJ_UNITS=1` ignores the cache and
+        // re-derives `subj.len()` inside the loop, as before.
+        let use_cached_units = iter_subj_units_enabled();
         // The matcher fetch the search needs anyway doubles as the twin
         // probe; `built_twin` bounds the cold build at one attempt so a
         // (impossible today) non-RegExp slot cannot loop.
         let mut built_twin = false;
-        let (found, subj_units) = loop {
-            let subj: &str = match self.heap.get(s_idx) {
-                HeapObj::Str(js) => {
-                    debug_assert!(js.is_ascii(), "ITFB_FUSED encodes a flat-ASCII subject");
-                    js.as_str_wf()
+        let found = if use_cached_units && start > subj_units {
+            None
+        } else {
+            loop {
+                let subj: &str = match self.heap.get(s_idx) {
+                    HeapObj::Str(js) => {
+                        debug_assert!(js.is_ascii(), "ITFB_FUSED encodes a flat-ASCII subject");
+                        debug_assert_eq!(
+                            subj_units,
+                            js.as_bytes().len(),
+                            "cached units must equal the flat-ASCII byte length"
+                        );
+                        js.as_str_wf()
+                    }
+                    _ => "",
+                };
+                if !use_cached_units && start > subj.len() {
+                    break None;
                 }
-                _ => "",
-            };
-            // ASCII: the unit length IS the byte length — no `str_units` get.
-            let subj_units = subj.len();
-            if start > subj_units {
-                break (None, subj_units);
+                match self.heap.get(re_idx) {
+                    HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => {
+                        break twin.find_from_ascii(subj, start).next();
+                    }
+                    // Twin compile failed once: the base program is byte-safe too.
+                    HeapObj::RegExp { ascii_twin: Some(None), regex, .. } => {
+                        break regex.find_from_ascii(subj, start).next();
+                    }
+                    HeapObj::RegExp { ascii_twin: None, .. } if !built_twin => {}
+                    HeapObj::RegExp { regex, .. } => {
+                        break regex.find_from_ascii(subj, start).next();
+                    }
+                    _ => break None,
+                }
+                // Cold, at most once per matcher: build (or record the failure
+                // of) the byte-optimized twin, then re-enter with it in place —
+                // `ascii_twin` is monotonic, so the next pass takes a `Some` arm.
+                // The fused creation arm normally ensures the SOURCE's twin so
+                // its clone arrives here as `Some`; this arm stays live for
+                // `ZIPP_NO_TWIN_AT_CREATE=1` and for any matcher whose source
+                // carried `None` at creation.
+                built_twin = true;
+                self.ensure_regexp_ascii_twin(re_idx);
             }
-            match self.heap.get(re_idx) {
-                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => {
-                    break (twin.find_from_ascii(subj, start).next(), subj_units);
-                }
-                // Twin compile failed once: the base program is byte-safe too.
-                HeapObj::RegExp { ascii_twin: Some(None), regex, .. } => {
-                    break (regex.find_from_ascii(subj, start).next(), subj_units);
-                }
-                HeapObj::RegExp { ascii_twin: None, .. } if !built_twin => {}
-                HeapObj::RegExp { regex, .. } => {
-                    break (regex.find_from_ascii(subj, start).next(), subj_units);
-                }
-                _ => break (None, subj_units),
-            }
-            // Cold, at most once per matcher: build (or record the failure
-            // of) the byte-optimized twin, then re-enter with it in place —
-            // `ascii_twin` is monotonic, so the next pass takes a `Some` arm.
-            built_twin = true;
-            self.ensure_regexp_ascii_twin(re_idx);
         };
         // Sticky: the match must begin exactly at the search start.
         let found = found.filter(|m| !(sticky && m.start() != start));
@@ -1789,156 +1975,85 @@ impl<'p> Vm<'p> {
                 *last_index = Value::num(mend as f64);
             }
         }
-        // Annex-B legacy statics: refreshed by EVERY successful
-        // RegExpBuiltinExec, fused steps included — `RegExp.$1`/`lastMatch`
-        // after a matchAll iteration are observable global state. VERBATIM
-        // the shared impl's ASCII deferral arm (the subject here is always
-        // ASCII); the length bound keeps the `as u32` casts exact.
-        if subj_units <= u32::MAX as usize {
-            let mut ranges: [Option<(u32, u32)>; 13] = [None; 13];
-            ranges[0] = Some((mstart as u32, mend as u32));
-            ranges[1] = m
-                .captures
-                .iter()
-                .rev()
-                .find_map(|c| c.clone())
-                .map(|r| (r.start as u32, r.end as u32));
-            ranges[2] = Some((0, mstart as u32));
-            ranges[3] = Some((mend as u32, subj_units as u32));
-            for i in 0..9 {
-                ranges[4 + i] =
-                    m.captures.get(i).and_then(|c| c.clone()).map(|r| (r.start as u32, r.end as u32));
-            }
-            if self.regexp_last.len() == 14 {
-                self.regexp_last[0] = input_val;
-            } else {
-                self.regexp_last.clear();
-                self.regexp_last.push(input_val);
-                self.regexp_last.resize(14, Value::UNDEFINED);
-            }
-            self.regexp_last_lazy =
-                Some(RegexpLastLazy { subj: input_val, subj_idx: s_idx, ranges });
-        } else {
-            // A >4GB flat subject cannot defer through u32 ranges: the shared
-            // impl's eager arm, specialised to its ASCII half.
-            let empty = self.alloc_str(String::new());
-            let mut rec = Vec::with_capacity(14);
-            rec.push(input_val);
-            let whole_units = self.ascii_slice_value(s_idx, mstart..mend);
-            rec.push(whole_units);
-            rec.push(match m.captures.iter().rev().find_map(|c| c.clone()) {
-                Some(r) => self.ascii_slice_value(s_idx, r),
-                None => empty,
-            });
-            rec.push(self.ascii_slice_value(s_idx, 0..mstart));
-            rec.push(self.ascii_slice_value(s_idx, mend..subj_units));
-            for i in 0..9 {
-                rec.push(match m.captures.get(i).and_then(|c| c.clone()) {
-                    Some(r) => self.ascii_slice_value(s_idx, r),
-                    None => empty,
-                });
-            }
-            self.regexp_last = rec;
-            self.regexp_last_lazy = None;
-        }
-        // The result build — VERBATIM the shared impl's, with `mk` collapsed
-        // to its ASCII arm (the subject is proven ASCII).
-        let whole = self.ascii_slice_value(s_idx, mstart..mend);
-        let mut elems = Vec::with_capacity(1 + m.captures.len());
-        elems.push(whole);
-        for cap in &m.captures {
-            let v = match cap {
-                Some(r) => self.ascii_slice_value(s_idx, r.clone()),
-                None => Value::UNDEFINED,
-            };
-            elems.push(v);
-        }
-        let named: Vec<(String, Option<std::ops::Range<usize>>)> =
-            m.named_groups().map(|(n, r)| (n.to_string(), r)).collect();
-        let groups = if named.is_empty() {
-            Value::UNDEFINED
-        } else {
-            let mut gm = ObjMap::with_capacity(named.len());
-            for (name, r) in &named {
-                let v = match r {
-                    Some(r) => self.ascii_slice_value(s_idx, r.clone()),
-                    None => Value::UNDEFINED,
-                };
-                gm.set(name, v);
-            }
-            let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
-            // The groups object is OrdinaryObjectCreate(null) — no prototype.
-            self.proto_of.insert(gidx, Value::NULL);
-            Value::heap(gidx)
-        };
-        let arr_idx = self.heap.alloc(HeapObj::Array(elems));
-        let index_v = Value::num(mstart as f64);
-        // index/input/groups are real own data properties of the result array
-        // (writable, enumerable, configurable) so reflection sees them.
-        let attr = PropAttr {
-            writable: true,
-            enumerable: true,
-            configurable: true,
-            accessor: false,
-            setter: Value::UNDEFINED,
-        };
-        // `/d` (hasIndices): an `indices` array of [start,end] unit ranges for
-        // the whole match + each capture group, with `.groups` for named groups.
-        let indices_v = if has_indices {
-            let mk = |vm: &mut Self, r: &std::ops::Range<usize>| -> Value {
-                let s = Value::num(r.start as f64);
-                let e = Value::num(r.end as f64);
-                Value::heap(vm.heap.alloc(HeapObj::Array(vec![s, e])))
-            };
-            let mut idx_elems = vec![mk(self, &(mstart..mend))];
-            for cap in &m.captures {
-                idx_elems.push(match cap {
-                    Some(r) => mk(self, r),
-                    None => Value::UNDEFINED,
-                });
-            }
-            let idx_groups = if named.is_empty() {
-                Value::UNDEFINED
-            } else {
-                let mut gm = ObjMap::new();
-                for (name, r) in &named {
-                    let v = match r {
-                        Some(r) => mk(self, r),
-                        None => Value::UNDEFINED,
-                    };
-                    gm.set(name, v);
-                }
-                let gidx = self.heap.alloc(HeapObj::Object(Box::new(gm)));
-                self.proto_of.insert(gidx, Value::NULL);
-                Value::heap(gidx)
-            };
-            let indices_arr = self.heap.alloc(HeapObj::Array(idx_elems));
-            self.arr_props.entry(indices_arr).or_insert_with(ObjMap::new_side_table).define(
-                "groups",
-                idx_groups,
-                attr,
-            );
-            Value::heap(indices_arr)
-        } else {
-            Value::UNDEFINED
-        };
-        // Fresh slot; both side tables are pruned against the mark bits
-        // before a slot can be recycled (same argument as the shared impl).
-        debug_assert!(!self.arr_props.contains_key(&arr_idx));
-        debug_assert!(!self.regexp_result_props.contains_key(&arr_idx));
-        self.regexp_result_props.insert(
-            arr_idx,
-            RegexpResultProps {
-                values: [index_v, input_val, groups, indices_v],
-            },
+        // Annex-B legacy statics + result build: the shared helpers with `mk`
+        // monomorphized to the ASCII slicer — `is_ascii` is proven by
+        // ITFB_FUSED, so this is the pristine instantiation byte-for-byte
+        // (its closure's ascii arm IS `ascii_slice_value`) and the deferral
+        // predicate reduces to the u32 length bound alone.
+        let mka =
+            |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.ascii_slice_value(s_idx, r) };
+        self.regexp_record_statics(
+            &m,
+            input_val,
+            s_idx,
+            mstart,
+            mend,
+            subj_units,
+            subj_units <= u32::MAX as usize,
+            &mka,
         );
-        rxstats::count_compact();
-        if !match_variant_enabled() {
-            // Off-switch: reproduce the eager representation (an ordinary
-            // `ObjMap` in `arr_props`) so the compact form is A/B-able.
-            self.materialize_regexp_result_props(arr_idx);
+        let arr = self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mka);
+        (arr, (mstart == mend).then_some(mend))
+    }
+
+    /// Publish ONE drained matchAll triple as a full observable step: the
+    /// stateful `lastIndex = matchEnd` write (spec step 15, BEFORE the result
+    /// is handed over), the per-step Annex-B statics record, and the result
+    /// array — the publish half of `regexp_exec_fused_slim`, driven from a
+    /// [`MatchBatch`] triple instead of a live search. The triple is
+    /// reassembled into a `regress::Match` so the shared helpers
+    /// (`regexp_record_statics` / `regexp_build_result`) run VERBATIM with
+    /// the same ASCII slicer instantiation — byte-identical output by
+    /// construction. Only reachable for batch-eligible iterations (flat-ASCII
+    /// subject, no named groups, no `/d`), so the assembled match's empty
+    /// group-name table is exact.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_publish(
+        &mut self,
+        re_idx: u32,
+        s_idx: u32,
+        input_val: Value,
+        subj_units: usize,
+        mstart: usize,
+        mend: usize,
+        caps: Vec<Option<std::ops::Range<usize>>>,
+        fbits: u8,
+    ) -> Value {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
+        // The result pieces below live in Rust locals — hold GC off until we
+        // return, exactly as the slim exec does.
+        let _gc = self.gc_lock_guard();
+        let has_indices = fbits & ITFB_INDICES != 0;
+        debug_assert!(!has_indices, "the batch gate excludes /d");
+        if fbits & (ITFB_GLOBAL | ITFB_STICKY) != 0 {
+            // Set(R,"lastIndex",e,true) — the direct write; see the slim
+            // exec's doc for why the throwing form is unreachable on the
+            // engine-internal matcher.
+            debug_assert!(self.arr_props.get(&re_idx).is_none());
+            if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(re_idx) {
+                *last_index = Value::num(mend as f64);
+            }
         }
-        (Value::heap(arr_idx), (mstart == mend).then_some(mend))
+        let m = regress::Match::from_scan_parts(mstart..mend, caps);
+        let mka =
+            |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.ascii_slice_value(s_idx, r) };
+        self.regexp_record_statics(
+            &m,
+            input_val,
+            s_idx,
+            mstart,
+            mend,
+            subj_units,
+            subj_units <= u32::MAX as usize,
+            &mka,
+        );
+        let out = self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mka);
+        // Hand the capture Vec back to the scratch slot so the next publish
+        // re-mallocs nothing (the caller took it from there).
+        let mut caps = m.captures;
+        caps.clear();
+        self.matchall_caps_scratch = caps;
+        out
     }
 
     /// Allocate the string for a byte-range slice of the (all-ASCII, flat)
@@ -2185,7 +2300,7 @@ impl<'p> Vm<'p> {
     /// `build_regexp`, incl. the exact-bytes lone-surrogate form). A failed
     /// compile is recorded as `Some(None)` so it isn't retried; callers fall
     /// back to `find_from_ascii` on the unoptimized program (also byte-safe).
-    fn ensure_regexp_ascii_twin(&mut self, re_idx: u32) {
+    pub(crate) fn ensure_regexp_ascii_twin(&mut self, re_idx: u32) {
         let (source, flags) = match self.heap.get(re_idx) {
             // Already computed (twin or recorded failure): nothing to do.
             HeapObj::RegExp { ascii_twin: Some(_), .. } => return,
@@ -2277,9 +2392,12 @@ impl<'p> Vm<'p> {
         &mut self,
         it_idx: u32,
     ) -> Option<Result<(Value, bool), Thrown>> {
-        let &(regexp, string, fbits, done) = self.regexp_string_iters.get(&it_idx)?;
+        let &RegexpIterRec { matcher: regexp, subject: string, subj_units, fbits, done } =
+            self.regexp_string_iters.get(&it_idx)?;
         if fbits & ITFB_FUSED != 0 && !done && matchall_step_enabled() {
-            if let Some(r) = self.regexp_string_iter_step_fused(it_idx, regexp, string, fbits) {
+            if let Some(r) =
+                self.regexp_string_iter_step_fused(it_idx, regexp, string, fbits, subj_units)
+            {
                 return Some(r);
             }
         }
@@ -2314,6 +2432,7 @@ impl<'p> Vm<'p> {
         regexp: u32,
         string: Value,
         fbits: u8,
+        subj_units: usize,
     ) -> Option<Result<(Value, bool), Thrown>> {
         if !self.matchall_fast_from_slots() {
             rxstats::count_step_full();
@@ -2332,14 +2451,26 @@ impl<'p> Vm<'p> {
             }
         };
         if slim_exec_enabled() {
+            // W12 batch: serve the step from a drained scan when one is live
+            // (or drainable) for this iterator — one host-side scan per
+            // subject instead of one per step. `None` = not batchable; the
+            // one-shot slim call below runs unchanged.
+            if matchall_batch_enabled() {
+                if let Some(r) = self.regexp_string_iter_step_batched(
+                    it_idx, regexp, string, fbits, subj_units, li_v,
+                ) {
+                    return Some(r);
+                }
+            }
             // B124 slim entry: one infallible call returns the result array
             // plus the empty-match fact the probe below re-derived from the
             // just-built array's element 0.
-            let (r, empty_end) = self.regexp_exec_fused_slim(regexp, string, fbits, li_v);
+            let (r, empty_end) =
+                self.regexp_exec_fused_slim(regexp, string, fbits, subj_units, li_v);
             rxstats::count_step_fused();
             if r == Value::NULL {
                 if let Some(e) = self.regexp_string_iters.get_mut(&it_idx) {
-                    e.3 = true;
+                    e.done = true;
                 }
                 return Some(Ok((Value::UNDEFINED, true)));
             }
@@ -2373,7 +2504,7 @@ impl<'p> Vm<'p> {
         rxstats::count_step_fused();
         if r == Value::NULL {
             if let Some(e) = self.regexp_string_iters.get_mut(&it_idx) {
-                e.3 = true;
+                e.done = true;
             }
             return Some(Ok((Value::UNDEFINED, true)));
         }
@@ -2397,6 +2528,198 @@ impl<'p> Vm<'p> {
             self.set_regexp_last_index(regexp, cur + 1);
         }
         Some(Ok((r, false)))
+    }
+
+    /// The fused matchAll step served from a DRAINED batch: one host-side
+    /// scan per subject serves up to [`MATCHALL_BATCH_CAP`] steps, hoisting
+    /// the per-step executor construction and (with rx-jit) the scan-session
+    /// setup out of the step. The batch is a PURE memo, so soundness reduces
+    /// to guarding the resume position: the caller already re-proved the
+    /// per-step protocol (slot memo + numeric `lastIndex`), and the
+    /// `expected_li` check catches every remaining divergence — a fallback
+    /// round ran a user `exec` mid-iteration and moved the heap slot — by
+    /// re-draining from the live position. Everything OBSERVABLE stays
+    /// per-step (`fused_publish`): `RegExp.$1`/`lastMatch` read in the loop
+    /// body see per-step values, and `lastIndex` is written per published
+    /// step so a mid-iteration `RegExp.prototype.exec` swap resumes the full
+    /// path from a coherent position.
+    ///
+    /// `None` = not batchable — sticky needs the per-step start filter, `/d`
+    /// and named groups need publish machinery the triples don't carry, and
+    /// an over-u32 subject doesn't fit the triple encoding (matching the
+    /// statics-deferral bound) — the caller falls through to the one-shot
+    /// slim exec unchanged.
+    fn regexp_string_iter_step_batched(
+        &mut self,
+        it_idx: u32,
+        regexp: u32,
+        string: Value,
+        fbits: u8,
+        subj_units: usize,
+        li_v: Value,
+    ) -> Option<Result<(Value, bool), Thrown>> {
+        if fbits & (ITFB_STICKY | ITFB_INDICES) != 0 || subj_units >= u32::MAX as usize {
+            return None;
+        }
+        debug_assert!(li_v.is_number(), "the fused-step guard admits numbers only");
+        debug_assert!(fbits & ITFB_GLOBAL != 0, "ITFB_FUSED implies g");
+        // ToLength on the engine-written number — the slim exec's inline form.
+        let li = {
+            let d = li_v.as_f64().trunc();
+            let d = if d.is_nan() { 0.0 } else { d };
+            d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize
+        };
+        if li > u32::MAX as usize {
+            return None;
+        }
+        let s_idx = string.heap_index();
+        // At most two passes: a refill installs a batch at exactly `li`, and
+        // a capped drain always carries either a triple or the exhausted bit.
+        loop {
+            if let Some(b) = self.matchall_batches.get_mut(&it_idx) {
+                if b.expected_li as usize == li {
+                    let stride = 2 + 2 * b.ncaps as usize;
+                    let next = b.next as usize;
+                    if next < b.flat.len() / stride {
+                        let base = next * stride;
+                        let mstart = b.flat[base] as usize;
+                        let mend = b.flat[base + 1] as usize;
+                        let ncaps = b.ncaps as usize;
+                        // The capture Vec cycles through the scratch slot
+                        // (`fused_publish` returns it there cleared), so the
+                        // steady-state publish re-mallocs nothing.
+                        let mut caps = std::mem::take(&mut self.matchall_caps_scratch);
+                        debug_assert!(caps.is_empty());
+                        caps.reserve(ncaps);
+                        for g in 0..ncaps {
+                            let (s, e) = (b.flat[base + 2 + 2 * g], b.flat[base + 3 + 2 * g]);
+                            caps.push((s != u32::MAX).then(|| s as usize..e as usize));
+                        }
+                        // Advance the memo BEFORE publishing (the publish half
+                        // never reads the batch): the next triple was drained
+                        // from the end, one past it for an empty match.
+                        b.next += 1;
+                        b.expected_li = mend as u32 + (mstart == mend) as u32;
+                        rxstats::count_step_fused();
+                        let r = self.fused_publish(
+                            regexp, s_idx, string, subj_units, mstart, mend, caps, fbits,
+                        );
+                        if mstart == mend {
+                            // `lastIndex` was just written by the publish (==
+                            // the match end); ASCII subject ⇒ the advance is
+                            // exactly +1.
+                            self.set_regexp_last_index(regexp, mend + 1);
+                        }
+                        return Some(Ok((r, false)));
+                    }
+                    if b.exhausted {
+                        rxstats::count_step_fused();
+                        if let Some(dead) = self.matchall_batches.remove(&it_idx) {
+                            // Hand the triple storage back to the scratch slot
+                            // so the next drain re-mallocs nothing.
+                            let mut flat = dead.flat;
+                            flat.clear();
+                            self.matchall_flat_scratch = flat;
+                        }
+                        // Set(R,"lastIndex",0,true) — the slim exec's no-match
+                        // tail, direct form (same unreachability argument).
+                        debug_assert!(self.arr_props.get(&regexp).is_none());
+                        if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(regexp) {
+                            *last_index = Value::int(0);
+                        }
+                        if let Some(e) = self.regexp_string_iters.get_mut(&it_idx) {
+                            e.done = true;
+                        }
+                        return Some(Ok((Value::UNDEFINED, true)));
+                    }
+                    // A consumed batch with subject left: re-drain from the
+                    // live position (== expected_li == li).
+                }
+                // else: resume-position divergence — drop the stale memo and
+                // re-drain from the live position.
+            }
+            self.matchall_batches.remove(&it_idx);
+            if !self.matchall_batch_refill(it_idx, regexp, s_idx, subj_units, li) {
+                return None;
+            }
+        }
+    }
+
+    /// Drain up to [`MATCHALL_BATCH_CAP`] matches from `li` into a fresh
+    /// batch record for `it_idx` — `false` when this iteration cannot be
+    /// batched (named capture groups, or a non-RegExp matcher slot). The scan
+    /// is `Regex::scan_ascii`: the identical attempt/advance sequence the
+    /// one-shot steps would run, minus the per-step executor construction —
+    /// RXSTATS attempt counts are invariant by construction.
+    fn matchall_batch_refill(
+        &mut self,
+        it_idx: u32,
+        regexp: u32,
+        s_idx: u32,
+        subj_units: usize,
+        li: usize,
+    ) -> bool {
+        match self.heap.get(regexp) {
+            HeapObj::RegExp { regex, .. } => {
+                if regex.has_named_groups() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
+        // Cold, at most once per matcher — the fused creation arm normally
+        // pre-builds the SOURCE's twin, so the clone arrives here as `Some`;
+        // this stays live for `ZIPP_NO_TWIN_AT_CREATE=1`.
+        self.ensure_regexp_ascii_twin(regexp);
+        // Cycles through the scratch slot (the done protocol returns a dead
+        // batch's storage there cleared) — steady state re-mallocs nothing.
+        let mut flat = std::mem::take(&mut self.matchall_flat_scratch);
+        debug_assert!(flat.is_empty());
+        let mut ncaps: u16 = 0;
+        let exhausted = {
+            let subj: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => {
+                    debug_assert!(js.is_ascii(), "ITFB_FUSED encodes a flat-ASCII subject");
+                    debug_assert_eq!(
+                        subj_units,
+                        js.as_bytes().len(),
+                        "cached units must equal the flat-ASCII byte length"
+                    );
+                    js.as_str_wf()
+                }
+                _ => "",
+            };
+            let re = match self.heap.get(regexp) {
+                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => &**twin,
+                // Twin compile failed once: the base program is byte-safe too.
+                HeapObj::RegExp { regex, .. } => &**regex,
+                _ => return false,
+            };
+            re.scan_ascii(subj, li, MATCHALL_BATCH_CAP, &mut |r, caps| {
+                ncaps = caps.len() as u16;
+                flat.push(r.start as u32);
+                flat.push(r.end as u32);
+                for c in caps {
+                    match c {
+                        Some(c) => {
+                            flat.push(c.start as u32);
+                            flat.push(c.end as u32);
+                        }
+                        None => {
+                            flat.push(u32::MAX);
+                            flat.push(u32::MAX);
+                        }
+                    }
+                }
+            })
+        };
+        debug_assert!(exhausted || !flat.is_empty(), "a capped drain always carries matches");
+        self.matchall_batches.insert(
+            it_idx,
+            MatchBatch { expected_li: li as u32, next: 0, ncaps, exhausted, flat },
+        );
+        true
     }
 
     fn regexp_string_iter_step_inner(
@@ -2464,7 +2787,7 @@ impl<'p> Vm<'p> {
         };
         if latch != done {
             if let Some(e) = self.regexp_string_iters.get_mut(&it_idx) {
-                e.3 = latch;
+                e.done = latch;
             }
         }
         Ok((value, ret_done))

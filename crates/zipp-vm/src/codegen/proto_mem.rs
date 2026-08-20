@@ -151,6 +151,20 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             }
             // General plain call `f(args…)` — `this = undefined`.
             Instr::Call { .. } => {}
+            // Proper-tail-call PREFIX: the compiler always emits `TailCall`
+            // immediately before an ordinary `Call`+`Return` of the same site
+            // (compile/bindings.rs, compile/exprs.rs), and the interpreter's
+            // arm is pure frame-reuse with that Call as its own fallback — so
+            // Tier C admits it and emits only a depth guard (see the emitter
+            // arm below): shallow tail calls run as ordinary native calls,
+            // and a deep chain bails at the TailCall ip so the interpreter's
+            // constant-stack reuse takes over. `TailCallWithThis` stays
+            // rejected (with-bodies only).
+            Instr::TailCall { .. } => {
+                if !tierc_tailcall_enabled() {
+                    reject!("[tierC-reject] op TailCall (disabled)");
+                }
+            }
             // Method calls: the INTRINSIC set only — the builtins with
             // dedicated pure win64 helpers, i.e. the region path's whitelist
             // minus its pin-dependent fast paths. NOT the generic
@@ -356,6 +370,11 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             }
             Instr::Call { dst, callee, arg_base, argc } => {
                 (Uses::range(arg_base, argc).plus(callee), Some(dst))
+            }
+            // Frame-reuse prefix: the interpreter reads callee + args (USES
+            // must be exact per the contract above); it defines nothing.
+            Instr::TailCall { callee, arg_base, argc } => {
+                (Uses::range(arg_base, argc).plus(callee), None)
             }
             Instr::CallMethod { dst, obj, arg_base, argc, .. } => {
                 (Uses::range(arg_base, argc).plus(obj), Some(dst))
@@ -1477,6 +1496,27 @@ pub(crate) fn compile_proto_mem(
                     ; mov rax, QWORD Value::UNDEFINED.bits() as i64
                     ; jmp => epilogue
                 );
+            }
+            // Proper-tail-call prefix to the Call+Return the compiler emits
+            // right after it. Emitting nothing would be value-sound, but it
+            // loses the interpreter's constant-stack frame reuse: past the
+            // cross-call depth cap every tail hop's Call bails at ITS ip, the
+            // resumed interpreter pushes a real frame per hop, and a strict
+            // tail chain that completes today dies at MAX_FRAMES (measured at
+            // exactly the 100k boundary). So guard the DEPTH: at the cap,
+            // bail at THIS ip — the interpreter executes the TailCall itself
+            // and frame reuse resumes (streak-bounded, the same catchable
+            // RangeError contract as before admission). Below the cap the
+            // guard is one load + one not-taken branch and the following
+            // Call runs native.
+            Instr::TailCall { .. } => {
+                let depth_off = crate::vm::host_api::JIT_CALL_DEPTH_OFFSET as i32;
+                dynasm!(ops
+                    ; mov eax, [rdi + depth_off]
+                    ; cmp eax, crate::vm::JIT_REGION_CALL_MAX as i32
+                    ; jae => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             _ => return None, // mem_can_compile already filtered; defensive
         }

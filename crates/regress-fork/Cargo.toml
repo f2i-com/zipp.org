@@ -81,6 +81,10 @@ name = "replacement_tests"
 path = "tests/replacement_tests.rs"
 
 [[test]]
+name = "scan_drain"
+path = "tests/scan_drain.rs"
+
+[[test]]
 name = "syntax_error_tests"
 path = "tests/syntax_error_tests.rs"
 

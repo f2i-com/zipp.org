@@ -863,6 +863,7 @@ impl<'p> Vm<'p> {
             {
                 let s = self.realm_global_slot(rid, key)?;
                 self.globals[s as usize] = val;
+                self.bump_global_gen(s);
                 return Ok(true);
             }
         }
@@ -877,6 +878,7 @@ impl<'p> Vm<'p> {
         {
             if let Some(&s) = self.realm_globals.get(&obj.heap_index()).and_then(|m| m.get(key)) {
                 self.globals[s as usize] = val;
+                self.bump_global_gen(s);
                 return Ok(true);
             }
         }
@@ -1582,6 +1584,9 @@ impl<'p> Vm<'p> {
             if let Some(slot) = self.program.global_names.iter().position(|n| n == key) {
                 if !self.globals[slot].is_uninitialized() {
                     self.globals[slot] = val;
+                    // The `globalThis.f = g` rebind path — the main slot-guard
+                    // invalidation point.
+                    self.bump_global_gen(slot as u32);
                 }
             }
         }

@@ -69,6 +69,7 @@ impl<'p> Vm<'p> {
                 let s = self.eval_global_next;
                 self.eval_global_next += 1;
                 self.globals[s as usize] = Value::UNINITIALIZED;
+                self.bump_global_gen(s);
                 gmap.push(s);
             } else {
                 gmap.push(self.eval_global_slot(name)?);
@@ -223,6 +224,24 @@ impl<'p> Vm<'p> {
             new_funcs.push(Box::leak(Box::new(f)));
         }
         for r in new_funcs {
+            // New code can bytecode-store slots the main-program scan proved
+            // store-free: permanently un-key each such slot (fail-closed) and
+            // bump its generation so any already-baked slot_guard misses to
+            // the per-call helper from now on. Ops are scanned AFTER the gmap
+            // remap above, so `idx` is the LIVE slot.
+            for ins in &r.code {
+                match *ins {
+                    Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. }
+                    | Instr::StoreGlobalDyn { idx, .. }
+                    | Instr::EvalScopeSet { idx, .. } => {
+                        self.bytecode_stored_slots.insert(idx);
+                        self.bump_global_gen(idx);
+                    }
+                    _ => {}
+                }
+            }
             self.eval_funcs.push(r);
         }
         // EvalDeclarationInstantiation step 5.a: a sloppy eval may not
@@ -435,6 +454,7 @@ impl<'p> Vm<'p> {
                 }
                 if !own_backed {
                     self.globals[rs] = Value::UNDEFINED;
+                    self.bump_global_gen(rs as u32);
                 }
             }
         }
@@ -514,6 +534,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 self.globals[slot as usize] = v;
+                self.bump_global_gen(slot);
             }
         }
         Ok((gmap, base_func))

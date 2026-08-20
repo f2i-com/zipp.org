@@ -2675,6 +2675,7 @@ impl<'p> Vm<'p> {
         for (slot, v) in sets {
             if slot < self.globals.len() {
                 self.globals[slot] = Value::heap(v);
+                self.bump_global_gen(slot as u32);
             }
         }
         // `get [Symbol.species]` (a shared getter returning `this`) on every

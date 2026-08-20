@@ -548,6 +548,30 @@ impl<'p> Vm<'p> {
             } else {
                 0
             };
+            // W12: slot-generation guard — key the site to (addr of
+            // global_gens[g], baked gen) when the callee register provably
+            // holds global slot g's value at the call and every write to g
+            // bumps the generation (conditions (a)-(g), `slot_guard_key`).
+            // `None` keeps today's per-execution bits+version guard.
+            let slot_guard = if !crate::codegen::splice_slotgen_enabled() {
+                None
+            } else {
+                match self.slot_guard_key(func_id, start as usize, ip, callee_bits, callee_ver)
+                {
+                    Ok((g, addr, gen)) => {
+                        if log {
+                            eprintln!("[leaf] fn{func_id}@{ip} slot_guard=g{g}@gen{gen}");
+                        }
+                        Some((addr, gen))
+                    }
+                    Err(reason) => {
+                        if log {
+                            eprintln!("[leaf] fn{func_id}@{ip} slot_guard=DECLINED({reason})");
+                        }
+                        None
+                    }
+                }
+            };
             if log {
                 // W11 mechanism proof: the fill mask must come out ~0 on the
                 // hot bodies (tokIs/mix) or the cut silently no-ops.
@@ -574,10 +598,100 @@ impl<'p> Vm<'p> {
                     callee_fid: fid,
                     uninit_mask,
                     alias_params,
+                    slot_guard,
                 },
             );
         }
         plan
+    }
+
+    /// W12: prove the `Call` at `call_ip`'s callee register holds global slot
+    /// g's value on every execution that reaches the call within the compiled
+    /// range, and key the site to `(g, &global_gens[g] as u64, baked gen)`.
+    /// `Err` carries the JITLOG decline reason. The conditions, each
+    /// load-bearing:
+    ///
+    /// * (b) the NEAREST preceding def of the callee register — scanning
+    ///   backwards from the call but never past `range_start` (a def outside
+    ///   the compiled range is unknowable at OSR entry) — is exactly
+    ///   `LoadGlobal { idx: g }` (NOT `LoadGlobalOrUndefined`, whose sentinel
+    ///   rewrite diverges from the raw slot read), with no other def of that
+    ///   register in between (nearest-def gives this by construction; any op
+    ///   the def model cannot classify declines, fail-closed).
+    /// * (c) no jump target anywhere in the proto lands in `(def_ip, call_ip]`
+    ///   — the gap is straight-line, so the def dominates the call and the
+    ///   register cannot be observed with any other value there.
+    /// * (d) a real program slot: field-pool/eval-pool slots are synced by
+    ///   Rust paths outside the bump audit (e.g. the SROA field sync).
+    /// * (e) no bytecode store op anywhere targets g (fail-closed set, kept
+    ///   current by the eval registration hook) — so every possible write to
+    ///   `globals[g]` is an enumerated `bump_global_gen` caller.
+    /// * (f) the slot is a live, plain, directly-routable binding (shared
+    ///   predicate with every other JIT global gate).
+    /// * (g) the LIVE slot holds the IC's callee NOW, same (bits, version) —
+    ///   the baked generation then WITNESSES exactly that tuple: while
+    ///   `gens[g]` is unchanged, `globals[g]` still holds F (every write
+    ///   bumps), and a rooted, non-moving F keeps its index; a same-bits
+    ///   reuse would require F to die first — impossible while rooted — so
+    ///   the version re-check's ABA job transfers to rooting.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn slot_guard_key(
+        &self,
+        func_id: u32,
+        range_start: usize,
+        call_ip: usize,
+        callee_bits: u64,
+        callee_ver: u32,
+    ) -> Result<(u32, u64, u32), &'static str> {
+        let caller = self.func(func_id as usize);
+        let Instr::Call { callee, .. } = caller.code[call_ip] else {
+            return Err("not-a-call");
+        };
+        let mut def: Option<(usize, u32)> = None;
+        for j in (range_start..call_ip).rev() {
+            match slot_guard_def(&caller.code[j]) {
+                None => return Err("unmodelled-op-in-scan"),
+                Some(Some(d)) if d == callee => {
+                    if let Instr::LoadGlobal { idx, .. } = caller.code[j] {
+                        def = Some((j, idx));
+                    }
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        let Some((def_ip, g)) = def else {
+            return Err("nearest-def-not-loadglobal");
+        };
+        for ins in &caller.code {
+            if let Some(t) = slot_guard_jump_target(ins) {
+                let t = t as usize;
+                if t > def_ip && t <= call_ip {
+                    return Err("jump-target-in-gap");
+                }
+            }
+        }
+        if g >= self.program.global_count {
+            return Err("pool-slot");
+        }
+        if self.bytecode_stored_slots.contains(&g) {
+            return Err("bytecode-stored");
+        }
+        if !self.global_slot_directly_routable(g) {
+            return Err("not-directly-routable");
+        }
+        if self.globals[g as usize].bits() != callee_bits {
+            return Err("live-slot-differs-from-ic");
+        }
+        if self.heap.version_of(Value::from_bits(callee_bits).heap_index()) != callee_ver {
+            return Err("callee-version-stale");
+        }
+        // Same absolute-VM-address pattern as `epoch_ptr` below: the Vm (and
+        // the never-reallocated gens table) is address-stable for the run.
+        // (d) bounds the index: gens was sized past global_count at boot.
+        debug_assert!((g as usize) < self.global_gens.len());
+        let addr = unsafe { self.global_gens.as_ptr().add(g as usize) } as u64;
+        Ok((g, addr, self.global_gens[g as usize]))
     }
 
     /// Q7 method-inline plan: in-region `CallMethod` sites whose LIVE receiver is
@@ -1484,4 +1598,86 @@ fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
         Instr::UpvalSet { idx, src } => Instr::UpvalSet { idx, src: s(src) },
         _ => return None,
     })
+}
+
+/// W12 slot-guard def model: what register does this op define? `Some(None)` =
+/// provably none, `Some(Some(r))` = exactly r, `None` = unmodelled (the
+/// reaching-def scan declines, fail-closed). USES need no modelling here —
+/// only defs can break the "callee register still holds slot g's value"
+/// chain; helper calls the ops make cannot write caller registers.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
+    Some(match *i {
+        Instr::LoadConst { dst, .. }
+        | Instr::LoadInt { dst, .. }
+        | Instr::LoadBool { dst, .. }
+        | Instr::LoadNull { dst }
+        | Instr::LoadUndefined { dst }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::LoadGlobalOrUndefined { dst, .. }
+        | Instr::Move { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Div { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::Neg { dst, .. }
+        | Instr::Bitwise { dst, .. }
+        | Instr::Not { dst, .. }
+        | Instr::TypeOf { dst, .. }
+        | Instr::TypeOfIs { dst, .. }
+        | Instr::IsArray { dst, .. }
+        | Instr::LenOf { dst, .. }
+        | Instr::ForInKeys { dst, .. }
+        | Instr::ForInLive { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::GetProp { dst, .. }
+        | Instr::StrAppendInPlace { dst, .. }
+        | Instr::StrConcatChain { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::MathOp { dst, .. }
+        | Instr::Call { dst, .. }
+        | Instr::CallMethod { dst, .. }
+        | Instr::UpvalGet { dst, .. }
+        | Instr::CellGet { dst, .. } => Some(dst),
+        Instr::StoreGlobal { .. }
+        | Instr::StoreGlobalStrict { .. }
+        | Instr::StoreGlobalResolved { .. }
+        | Instr::SetProp { .. }
+        | Instr::UpvalSet { .. }
+        | Instr::CellSet { .. }
+        | Instr::TailCall { .. }
+        | Instr::Jump { .. }
+        | Instr::JumpIfFalse { .. }
+        | Instr::JumpIfTrue { .. }
+        | Instr::JumpIfNotLt { .. }
+        | Instr::JumpIfNotLe { .. }
+        | Instr::Return { .. }
+        | Instr::ReturnUndefined => None,
+        _ => return None,
+    })
+}
+
+/// W12 slot-guard control model: the jump target this op carries, if any.
+/// These are the ONLY ops with instruction-index targets (`bytecode.rs`); a
+/// target inside the def→call gap breaks the straight-line dominance proof.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn slot_guard_jump_target(i: &Instr) -> Option<u32> {
+    match *i {
+        Instr::Jump { target }
+        | Instr::JumpIfFalse { target, .. }
+        | Instr::JumpIfTrue { target, .. }
+        | Instr::JumpIfNotLt { target, .. }
+        | Instr::JumpIfNotLe { target, .. }
+        | Instr::PushFinally { target, .. }
+        | Instr::JumpFinally { target, .. } => Some(target),
+        Instr::PushHandler { catch_target, .. } => Some(catch_target),
+        _ => None,
+    }
 }

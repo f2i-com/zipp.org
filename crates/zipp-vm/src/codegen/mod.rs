@@ -342,6 +342,14 @@ pub struct LeafInlinePlan {
     /// body op writes callee reg `1+i` (fail-closed: unknown defs ⇒ 0) and
     /// the site passes at least i+1 args. `0` under `ZIPP_NO_SPLICE_ALIAS=1`.
     pub alias_params: u64,
+    /// W12: slot-generation guard — `Some((abs addr of global_gens[g], baked
+    /// gen))` replaces the per-execution callee bits+version re-check with one
+    /// 32-bit generation compare. Keyed only when the planner proved the
+    /// callee register holds global slot g's value at the call and no write
+    /// to g can escape a `bump_global_gen` (see `build_leaf_inline_plan`'s
+    /// keying conditions). `None` = today's identity+version guard,
+    /// byte-identical emission (pinned by `ZIPP_NO_SPLICE_SLOTGEN=1`).
+    pub slot_guard: Option<(u64, u32)>,
 }
 
 /// Identity guard for a nested inline. Same `(bits, version)` tuple the outer
@@ -736,6 +744,26 @@ fn fnjit_mem_enabled() -> bool {
     std::env::var_os("ZIPP_NO_FNJIT_MEM").is_none()
 }
 
+/// Tier-C admission of the proper-tail-call PREFIX op (`TailCall`): the
+/// compiler always follows it with the ordinary `Call`+`Return` of the same
+/// site, so Tier C admits it and emits nothing — see the `mem_can_compile`
+/// arm. `ZIPP_NO_TIERC_TAILCALL=1` restores the blacklist. Read only inside
+/// `mem_can_compile` (per-compile, cold), never on generated code paths.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn tierc_tailcall_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_TAILCALL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// W9 tier-selection yield (B121's "Tier C SHADOWS the region tier"): while a
 /// function owns a LIVE register-homed loop region (SROA/INT/DOUBLE — anything
 /// but MEM, whose per-op code equals Tier C's by construction, B107), the
@@ -757,6 +785,23 @@ pub(crate) fn splice_fill_enabled() -> bool {
         2 => false,
         _ => {
             let on = std::env::var_os("ZIPP_NO_SPLICE_FILL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W12: splice slot-generation guard — `ZIPP_NO_SPLICE_SLOTGEN=1` pins every
+/// leaf plan's `slot_guard` to `None` (the per-execution callee bits+version
+/// guard, byte-identical to pre-W12 emission). Read at plan time only.
+pub(crate) fn splice_slotgen_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPLICE_SLOTGEN").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

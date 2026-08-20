@@ -456,9 +456,9 @@ impl Vm<'_> {
             root_val!(*v);
         }
         // A live lazy RegExpStringIterator keeps its matcher + subject string alive.
-        for (regexp, string, _, _) in self.regexp_string_iters.values() {
-            root_idx!(*regexp);
-            root_val!(*string);
+        for rec in self.regexp_string_iters.values() {
+            root_idx!(rec.matcher);
+            root_val!(rec.subject);
         }
         // The legacy RegExp statics' last-match record (input/match/capture
         // strings) is live until the next match replaces it.
@@ -633,6 +633,7 @@ impl Vm<'_> {
         self.ta_tracking.retain(|&k| marks[k as usize]);
         self.dv_tracking.retain(|&k| marks[k as usize]);
         self.regexp_string_iters.retain(|&k, _| marks[k as usize]);
+        self.matchall_batches.retain(|&k, _| marks[k as usize]);
         self.method_brand.retain(|&k, _| marks[k as usize]);
         self.instance_brand.retain(|&k, _| marks[k as usize]);
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
@@ -915,6 +916,7 @@ impl Vm<'_> {
         prune_set!(self.ta_tracking);
         prune_set!(self.dv_tracking);
         prune_map!(self.regexp_string_iters);
+        prune_map!(self.matchall_batches);
         let brand_entries = self.method_brand.len() + self.instance_brand.len();
         prune_map!(self.method_brand);
         prune_map!(self.instance_brand);

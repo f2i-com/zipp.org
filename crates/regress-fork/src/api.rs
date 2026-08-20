@@ -276,6 +276,19 @@ impl Match {
     pub fn groups(&self) -> Groups<'_> {
         Groups::new(self)
     }
+
+    /// PATCH (see VENDORED.md): assemble a `Match` from a drained scan's raw
+    /// ranges (`Regex::scan_ascii`). Only correct for patterns WITHOUT named
+    /// capture groups — the assembled match carries no group names, so
+    /// `named_group`/`named_groups` see none.
+    #[inline]
+    pub fn from_scan_parts(range: Range, captures: Vec<Option<Range>>) -> Self {
+        Match {
+            range,
+            captures,
+            group_names: Box::default(),
+        }
+    }
 }
 
 /// An iterator over the capture groups of a [`Match`]
@@ -652,6 +665,34 @@ impl Regex {
             start,
             plan,
         )
+    }
+
+    /// PATCH (see VENDORED.md): drained multi-match ASCII scan for the fused
+    /// matchAll batch. Runs the classical backtracker over `text` from byte
+    /// offset `start` exactly as `find_from_ascii` would drive it match by
+    /// match — same attempt sequence, same advance — but with ONE executor
+    /// (and, under rx-jit, one scan session) serving up to `cap` matches; per
+    /// hit `sink` receives the match range plus the raw capture-group ranges
+    /// and no `Match` is allocated. Returns true when the subject is
+    /// exhausted (no match exists past the last emitted one), false when the
+    /// scan stopped at `cap` hits. The input text is expected to be
+    /// ascii-only, as for `find_from_ascii`.
+    pub fn scan_ascii(
+        &self,
+        text: &str,
+        start: usize,
+        cap: usize,
+        sink: &mut dyn FnMut(core::ops::Range<usize>, &[Option<core::ops::Range<usize>>]),
+    ) -> bool {
+        crate::classicalbacktrack::scan_ascii_drain(&self.cr, text, start, cap, sink)
+    }
+
+    /// PATCH (see VENDORED.md): whether the pattern has named capture groups.
+    /// (`scan_ascii`'s consumers cannot rebuild a named-groups object from
+    /// bare ranges, so such patterns stay off the drained path.)
+    #[inline]
+    pub fn has_named_groups(&self) -> bool {
+        !self.cr.group_names.is_empty()
     }
 
     /// Returns an iterator for matches found in 'text' starting at index `start`.

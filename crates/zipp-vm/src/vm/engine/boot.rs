@@ -63,6 +63,26 @@ impl<'p> Vm<'p> {
                 globals[slot as usize] = Value::UNDEFINED;
             }
         }
+        // Slot-generation table (same length/no-realloc contract as `globals`)
+        // and the fail-closed set of slots bytecode stores can reach — the
+        // complement is what `slot_guard` keying may bake a generation for.
+        // Eval/Function registration extends the set at runtime (`eval_prog`).
+        let global_gens = vec![0u32; globals.len()];
+        let mut bytecode_stored_slots = rustc_hash::FxHashSet::default();
+        for f in &program.functions {
+            for ins in &f.code {
+                match *ins {
+                    crate::bytecode::Instr::StoreGlobal { idx, .. }
+                    | crate::bytecode::Instr::StoreGlobalStrict { idx, .. }
+                    | crate::bytecode::Instr::StoreGlobalResolved { idx, .. }
+                    | crate::bytecode::Instr::StoreGlobalDyn { idx, .. }
+                    | crate::bytecode::Instr::EvalScopeSet { idx, .. } => {
+                        bytecode_stored_slots.insert(idx);
+                    }
+                    _ => {}
+                }
+            }
+        }
         let _ = &mut heap;
         Vm {
             program,
@@ -81,6 +101,8 @@ impl<'p> Vm<'p> {
             site_ics: Vec::new(),
             heap,
             globals,
+            global_gens,
+            bytecode_stored_slots,
             regs: Vec::new(),
             frames: Vec::new(),
             #[cfg(feature = "instrument")]
@@ -107,6 +129,9 @@ impl<'p> Vm<'p> {
             jit_shape_slot: rustc_hash::FxHashMap::default(),
             for_in_barren: rustc_hash::FxHashMap::default(),
             regexp_string_iters: rustc_hash::FxHashMap::default(),
+            matchall_batches: rustc_hash::FxHashMap::default(),
+            matchall_caps_scratch: Vec::new(),
+            matchall_flat_scratch: Vec::new(),
             regexp_last: Vec::new(),
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,

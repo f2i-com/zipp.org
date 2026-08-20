@@ -32,6 +32,15 @@ use crate::heap::{HeapObj, ObjMap};
 use crate::value::Value;
 use crate::vm::Vm;
 
+/// Byte offset of `Vm::jit_call_depth`, for Tier C's `TailCall` depth guard —
+/// the emitted code reads the counter as `[vm + off]` before the tail site's
+/// `Call`, and bails to the interpreter's frame-reuse arm at the cap. The
+/// field is private to `vm`, so the offset is computed here, inside the module
+/// tree that can see it (the `JIT_RECURSE_DEPTH_OFFSET` precedent).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CALL_DEPTH_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, jit_call_depth);
+
 /// Whether a global slot holds a top-level function/class declaration or an
 /// ordinary variable. Hosts use this to decide what is callable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +151,7 @@ impl<'p> Vm<'p> {
         let _g = self.gc_lock_guard();
         let v = self.host_in_over(cur, hv, 0);
         self.globals[index as usize] = v;
+        self.bump_global_gen(index);
         true
     }
 

@@ -18,6 +18,7 @@ impl<'p> Vm<'p> {
         let s = self.eval_global_next;
         self.eval_global_next += 1;
         self.globals[s as usize] = Value::UNINITIALIZED;
+        self.bump_global_gen(s);
         Ok(s)
     }
 
@@ -50,6 +51,7 @@ impl<'p> Vm<'p> {
                 .insert(idx, Value::heap(self.abstractmodulesource_proto));
         }
         self.globals[s as usize] = Value::heap(idx);
+        self.bump_global_gen(s);
         self.module_source_slots.insert(key.to_path_buf(), s);
         Ok(s)
     }
@@ -369,6 +371,7 @@ impl<'p> Vm<'p> {
                     let live = self.eval_global_next;
                     self.eval_global_next += 1;
                     self.globals[live as usize] = Value::UNINITIALIZED;
+                    self.bump_global_gen(live);
                     prealloc.insert(c, live);
                     own_pre.insert(exported.clone(), live);
                 }
@@ -621,6 +624,7 @@ impl<'p> Vm<'p> {
                             };
                             if let Some(v) = nsv {
                                 self.globals[slot as usize] = v;
+                                self.bump_global_gen(slot);
                             }
                         }
                     }
@@ -684,6 +688,7 @@ impl<'p> Vm<'p> {
         for (cslot, ns) in ns_writes {
             let live = gmap[cslot as usize] as usize;
             self.globals[live] = ns;
+            self.bump_global_gen(live as u32);
         }
         // Re-exports LINK (and their dependencies evaluate) BEFORE this body
         // runs — the namespace must be complete at evaluation start (a TDZ
@@ -863,6 +868,7 @@ impl<'p> Vm<'p> {
             let slot = self.module_ns_slot(&canon)?;
             let ns = self.import_module_sync(&dep, None)?;
             self.globals[slot as usize] = ns;
+            self.bump_global_gen(slot);
             full.push((exported.clone(), slot));
         }
         for (exported, imported, spec) in reexports {

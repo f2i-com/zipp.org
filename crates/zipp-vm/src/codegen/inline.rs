@@ -117,29 +117,51 @@ pub(crate) fn emit_inline_leaf_call(
     let fallback = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     let w = plan.reg_window;
-    // ── identity guard ── the callee register must hold EXACTLY the cached
-    // function value. A miss (callee reassigned, or a 2nd shape appears at this
-    // now-not-really-mono site) takes the helper — never evicts the region.
+    if let Some((gen_addr, gen_val)) = plan.slot_guard {
+        // ── W12 slot-generation guard ── the planner proved the callee
+        // register holds global slot g's value at this call and every write
+        // to g bumps `global_gens[g]` (`slot_guard_key`'s conditions), so ONE
+        // 32-bit generation compare witnesses the same (bits, version) tuple
+        // the identity+version block below re-checks per execution — rooting
+        // plus the non-moving collector freeze a live callee's index AND
+        // version while the slot holds it, transferring the version guard's
+        // ABA job to the bump audit. A miss means the slot was rebound: fall
+        // to the helper (a real, correct call) forever — exactly what a baked
+        // bits-guard miss does today. Mirrors the SuperMethod epoch-guard
+        // shape. No downstream op reads rax from the replaced block.
+        dynasm!(ops
+            ; mov r10, QWORD gen_addr as i64
+            ; mov r10d, [r10]
+            ; cmp r10d, DWORD gen_val as i32
+            ; jne => fallback
+        );
+    } else {
+        // ── identity guard ── the callee register must hold EXACTLY the cached
+        // function value. A miss (callee reassigned, or a 2nd shape appears at this
+        // now-not-really-mono site) takes the helper — never evicts the region.
+        dynasm!(ops
+            ; mov rax, [rbx + dreg(callee)]
+            ; mov r10, QWORD plan.callee_bits as i64
+            ; cmp rax, r10
+            ; jne => fallback
+            // ── version guard ── heap Value bits are pure `TAG_HEAP|idx`; a GC'd +
+            // reused callee slot keeps IDENTICAL bits but bumps its `versions[idx]`.
+            // The bits compare alone would then PASS and run the STALE old callee
+            // body. Re-check the live slot version against the baked one (exactly the
+            // `(bits, version)` tuple `ic_call` checks) — a mismatch falls to the
+            // helper, which re-resolves the call correctly. `rax` still holds the
+            // callee bits; its low 32 bits are the heap index. r13 = pinned heap
+            // version-array base (re-derived after any allocating helper because the
+            // region inlines a call — see `refetch_pinned`). The read is in-bounds:
+            // the index came from a live heap Value (the bits matched) and `versions`
+            // never shrinks; staleness is caught by this very compare.
+            ; mov ecx, eax                          // recv heap idx (low 32 of bits)
+            ; mov edx, [r13 + rcx*4]                // live slot version
+            ; cmp edx, DWORD plan.callee_ver as i32
+            ; jne => fallback
+        );
+    }
     dynasm!(ops
-        ; mov rax, [rbx + dreg(callee)]
-        ; mov r10, QWORD plan.callee_bits as i64
-        ; cmp rax, r10
-        ; jne => fallback
-        // ── version guard ── heap Value bits are pure `TAG_HEAP|idx`; a GC'd +
-        // reused callee slot keeps IDENTICAL bits but bumps its `versions[idx]`.
-        // The bits compare alone would then PASS and run the STALE old callee
-        // body. Re-check the live slot version against the baked one (exactly the
-        // `(bits, version)` tuple `ic_call` checks) — a mismatch falls to the
-        // helper, which re-resolves the call correctly. `rax` still holds the
-        // callee bits; its low 32 bits are the heap index. r13 = pinned heap
-        // version-array base (re-derived after any allocating helper because the
-        // region inlines a call — see `refetch_pinned`). The read is in-bounds:
-        // the index came from a live heap Value (the bits matched) and `versions`
-        // never shrinks; staleness is caught by this very compare.
-        ; mov ecx, eax                          // recv heap idx (low 32 of bits)
-        ; mov edx, [r13 + rcx*4]                // live slot version
-        ; cmp edx, DWORD plan.callee_ver as i32
-        ; jne => fallback
         // ── headroom flag ── 0 ⇒ the scratch window might overflow the pinned
         // register file (near-MAX_FRAMES recursion) → take the helper.
         ; cmp QWORD [rsp + leaf_flag_off], 0
