@@ -1238,7 +1238,16 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         if crate::rxjit::session_enabled() {
             if let Some(bytes) = inp.rxjit_bytes() {
                 let re: &CompiledRegex = self.matcher.re;
-                if let Some(code) = re.rxjit.acquire(re) {
+                // The entry probe is read-only: a scan that attempts zero
+                // positions must not advance the compile threshold. The
+                // counter still ticks per real attempt via the legacy loop's
+                // `attempt_at` until the code exists.
+                let code = if crate::rxjit::acqgate_enabled() {
+                    re.rxjit.acquire_if_compiled()
+                } else {
+                    re.rxjit.acquire(re)
+                };
+                if let Some(code) = code {
                     return crate::rxjit::with_session(code, bytes, |sess| {
                         loop {
                             if Input::CODE_UNITS_ARE_BYTES {
@@ -1446,7 +1455,16 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         if crate::rxjit::session_enabled() {
             if let Some(bytes) = inp.rxjit_bytes() {
                 let re: &CompiledRegex = self.matcher.re;
-                if let Some(code) = re.rxjit.acquire(re) {
+                // The entry probe is read-only: a scan that attempts zero
+                // positions must not advance the compile threshold. The
+                // counter still ticks per real attempt via the legacy loop's
+                // `attempt_at` until the code exists.
+                let code = if crate::rxjit::acqgate_enabled() {
+                    re.rxjit.acquire_if_compiled()
+                } else {
+                    re.rxjit.acquire(re)
+                };
+                if let Some(code) = code {
                     return crate::rxjit::with_session(code, bytes, |sess| {
                         'hits: while emitted < cap {
                             loop {

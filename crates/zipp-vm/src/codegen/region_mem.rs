@@ -1975,39 +1975,96 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::StrConcatChain { dst, a, b } => {
-                // W11 (B124) fused chain link: `dst = a + b` via the win64
-                // `jit_concat_chain` helper (in-place growth of the chain's
-                // fresh flat-Str accumulator, full pairwise `+` otherwise —
-                // the same `Vm::add_values_chain` the interpreter arm calls).
-                // The helper ALLOCATES and, unlike `jit_concat`'s expected
-                // targets, CAN run user code (an object RHS's ToPrimitive via
-                // the `add_values` fallback) — so refetch r13 AND r14 (and
-                // the TA snapshots) after the call. A throw comes back as
-                // CALL_THREW (pending_throw set) → bail = UNWIND, never a
-                // redo (the user side effects must not run twice); the
-                // helper never returns SELF_CALL_DEOPT, the check is kept
-                // for uniformity with its siblings.
-                dynasm!(ops
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, [rbx + dreg(a)]            // acc bits
-                    ; mov r8, [rbx + dreg(b)]             // leaf bits
-                    ; mov rax, QWORD crate::vm::jit_concat_chain as usize as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov r10, QWORD CALL_THREW as i64
-                    ; cmp rax, r10
-                    ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
-                    ; mov [rbx + dreg(dst)], rax
-                );
-                if refetch_pinned {
-                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                if crate::codegen::chain_fast_enabled() {
+                    // Fused chain link via the single-dispatch fast sibling
+                    // `jit_concat_chain_fast` (value-identical to
+                    // `Vm::add_values_chain`, the interpreter arm's entry).
+                    // r9d carries the first-link capacity hint (0 = none).
+                    // The helper CAN allocate and run user code on its
+                    // generic tail, but its in-place arms do neither and are
+                    // the ONLY arms that return the accumulator's own bits
+                    // for a heap accumulator — so `result == old acc bits &&
+                    // old acc is heap-tagged` licenses skipping the
+                    // r13/r14/TA refetch (dynamic evidence, not a guard
+                    // removal). The heap-tag test is load-bearing: a numeric
+                    // accumulator can get its own bits back from the generic
+                    // tail AFTER user coercion code ran (e.g. int acc + an
+                    // object leaf whose valueOf returns 0). A throw comes
+                    // back as CALL_THREW (pending_throw set) → bail = UNWIND,
+                    // never a redo; SELF_CALL_DEOPT is never returned, the
+                    // check is kept for uniformity with the siblings.
+                    let hint = chain_capacity_hint(&proto.code, ip, a, e);
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(a)]            // acc bits
+                        ; mov r8, [rbx + dreg(b)]             // leaf bits
+                        ; mov r9d, hint as i32                // capacity hint
+                        ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
+                        ; mov r10, [rbx + dreg(a)]            // pre-call acc bits (dst not yet stored)
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if refetch_pinned || ta_refetch.is_some() {
+                        let refetch = ops.new_dynamic_label();
+                        let skip = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; cmp rax, r10
+                            ; jne => refetch
+                            ; shr r10, 48
+                            ; cmp r10d, TAG_HEAP_HI as i32
+                            ; je => skip                      // in-place arm: no alloc, no user code
+                            ; => refetch
+                        );
+                        if refetch_pinned {
+                            emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                        }
+                        if let Some((snap, plan)) = ta_refetch {
+                            emit_refetch_ta(&mut ops, snap, plan);
+                        }
+                        dynasm!(ops ; => skip);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else {
+                    // W11 (B124) fused chain link: `dst = a + b` via the win64
+                    // `jit_concat_chain` helper (in-place growth of the chain's
+                    // fresh flat-Str accumulator, full pairwise `+` otherwise —
+                    // the same `Vm::add_values_chain` the interpreter arm calls).
+                    // The helper ALLOCATES and, unlike `jit_concat`'s expected
+                    // targets, CAN run user code (an object RHS's ToPrimitive via
+                    // the `add_values` fallback) — so refetch r13 AND r14 (and
+                    // the TA snapshots) after the call. A throw comes back as
+                    // CALL_THREW (pending_throw set) → bail = UNWIND, never a
+                    // redo (the user side effects must not run twice); the
+                    // helper never returns SELF_CALL_DEOPT, the check is kept
+                    // for uniformity with its siblings.
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(a)]            // acc bits
+                        ; mov r8, [rbx + dreg(b)]             // leaf bits
+                        ; mov rax, QWORD crate::vm::jit_concat_chain as usize as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                    }
+                    if let Some((snap, plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, plan);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
-                }
-                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::StaticFn { dst, op, arg_base, argc: _ } => {
                 // Bounded set (admission gated argc == 1). PromiseResolve
@@ -2220,4 +2277,72 @@ pub(crate) fn compile_region_mem(
 // int/poly Eq/Ne + Lt/Le/Gt/Ge, Jump/JumpIf*, general Call, one charCodeAt
 // CallMethod, Return/ReturnUndefined. Anything else declines (the function stays
 // interpreted). Gated behind `ZIPP_FNJIT_MEM` until validated (see `Jit::compile`).
+
+/// Set in `chain_capacity_hint`'s result at a chain's LAST link — the request
+/// to hand back whatever the first link's estimate over-reserved. Kept clear
+/// of the capacity's value range (a capacity is <= 256) and below bit 31, so
+/// `hint as i32` stays positive and r9d zero-extends cleanly.
+pub(crate) const CHAIN_HINT_LAST: u32 = 1 << 30;
+
+/// Byte-capacity hint for `jit_concat_chain_fast` (r9d at each fused link).
+/// A chain's statically-recognised FIRST link — the one whose accumulator's
+/// nearest preceding writer in the instruction stream is the link-1 `Add` —
+/// carries the estimate for the FINISHED chain (12 bytes per link, capped at
+/// 256, the small-flat threshold) so the helper pre-sizes the builder once
+/// instead of climbing the realloc ladder. The chain's LAST link — the one
+/// after which `acc` is `Move`d out rather than concatenated again — carries
+/// the SAME estimate plus `CHAIN_HINT_LAST`, which asks the helper to trim
+/// the slack once the string is finished. Without the trim the estimate's
+/// over-reservation is retained for the whole lifetime of every chain-built
+/// string (nothing else ever shrinks a `JsStr`'s buffer): a 26-leaf chain of
+/// one-char leaves holds a 256-byte buffer for 25 bytes of content, measured
+/// at +194 MB of steady-state RSS over 1.2M retained strings. Every other
+/// link carries 0. The forward count ends at the chain's trailing
+/// `Move{src: acc}` (the lowering always emits one). Purely advisory in BOTH
+/// directions: a misclassified link changes a buffer's capacity, never
+/// content — so the linear scans may ignore control flow.
+pub(crate) fn chain_capacity_hint(code: &[Instr], ip: usize, acc: u16, end: usize) -> u32 {
+    debug_assert!(matches!(code[ip], Instr::StrConcatChain { .. }));
+    debug_assert!(ip <= end && end < code.len());
+    // Backward: walk to the chain's head (the link-1 `Add` that seeded `acc`),
+    // stepping over this chain's own earlier links and counting them. `before
+    // == 0` is exactly the old first-link test ("the nearest writer of `acc`
+    // is an `Add`"), since a link that accumulates in place writes `acc`.
+    let mut head = false;
+    let mut before = 0u32;
+    for j in (0..ip).rev() {
+        match code[j] {
+            Instr::Add { dst, .. } if dst == acc => {
+                head = true;
+                break;
+            }
+            Instr::StrConcatChain { a, .. } if a == acc => before += 1,
+            ref i if crate::codegen::fn_int::writes_reg(i) == Some(acc) => break,
+            _ => {}
+        }
+    }
+    if !head {
+        return 0;
+    }
+    // Forward: count this chain's remaining links up to the trailing Move.
+    let mut after = 0u32;
+    for j in ip + 1..=end.min(code.len() - 1) {
+        match code[j] {
+            Instr::StrConcatChain { a, .. } if a == acc => after += 1,
+            Instr::Move { src, .. } if src == acc => break,
+            ref i if crate::codegen::fn_int::writes_reg(i) == Some(acc) => break,
+            _ => {}
+        }
+    }
+    // the link-1 Add + this link + the links on either side of it
+    let cap = ((before + after + 2) * 12).min(256);
+    match (before, after) {
+        // First link (a single-link chain included: it pre-sizes exactly as
+        // before, and has no slack worth a second buffer move).
+        (0, _) => cap,
+        // Last link of a chain whose first link pre-sized the builder.
+        (_, 0) => CHAIN_HINT_LAST | cap,
+        _ => 0,
+    }
+}
 

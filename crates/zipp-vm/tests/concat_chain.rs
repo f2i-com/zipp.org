@@ -297,6 +297,109 @@ fn ccf_parity_hot_chain_into_heap() {
     );
 }
 
+/// Self-aliasing accumulators (`a += a` shapes, chains whose leaves are the
+/// destination var) and exotic primitive leaves (double/bool/null/undefined)
+/// on a live builder: the single-dispatch fast link must route every one of
+/// these through the generic pairwise `+` (fresh index -- never the raw
+/// split-borrow arms) and still match node byte for byte, hot.
+#[test]
+fn ccf_parity_self_alias_and_exotic_leaves() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        var a = 'ab';
+        for (var i = 0; i < 4000; i++) { a += a; if (a.length > 4096) a = 'ab' + (i % 10); }
+        console.log(a.length, a.slice(0, 8), a.slice(-8));
+        var b = 'x';
+        b = b + b + b;
+        b = b + (b + b) + b + '' + b;
+        console.log(b);
+        for (var j = 0; j < 3000; j++) {
+            var line = 'd=' + 1.5 + ' b=' + true + ' n=' + null + ' u=' + undefined + ' f=' + false + '#' + j;
+            if (j === 2999) console.log(line);
+        }
+        console.log('q=' + 1e21 + ' s=' + 0.1 + ' neg=' + (-2.5) + ' nz=' + (-0) + ' end');
+        "#,
+    );
+}
+
+/// An object leaf with an effectful `toString` MID-chain, after earlier links
+/// already committed into the builder in place: the coercion must run at its
+/// exact pairwise step -- after link i's commit, before leaf i+1's evaluation
+/// (per-link dispatch, never batched across links) -- and a throw at that
+/// step must leave exactly the earlier side effects done.
+#[test]
+fn ccf_parity_effectful_leaf_after_committed_links() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        var log = [];
+        function e(tag, v) { log.push(tag); return v; }
+        var obj = { n: 0, toString: function () { this.n++; log.push('T' + this.n); return '<' + this.n + '>'; } };
+        for (var i = 0; i < 1500; i++) {
+            var s = 'a' + e('L1', i) + 'b' + obj + 'c' + e('L2', i) + obj + 'z';
+            if (i === 1499) console.log(s);
+        }
+        console.log(log.length, log.slice(0, 8).join(','), log.slice(-8).join(','));
+        var thrown = '';
+        try {
+            var t = 'x' + e('P', 1) + { toString: function () { throw new Error('boom'); } } + e('NEVER', 2);
+        } catch (err) { thrown = err.message; }
+        console.log(thrown, log[log.length - 1]);
+        "#,
+    );
+}
+
+/// Non-ASCII leaves (Latin-1, BMP, astral) through a HOT chain: the in-place
+/// str arm's byte append must keep WTF-8 content and UTF-16 unit accounting
+/// exact (lengths, charCodeAt) -- asserted via code units so terminal
+/// transcoding can't blur the diff.
+#[test]
+fn ccf_parity_nonascii_hot_chain() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        var em = '\u00e9', snow = '\u2603', astral = '\uD83D\uDE00';
+        var total = 0, last = '';
+        for (var i = 0; i < 20000; i++) {
+            var s = em + i + snow + (i % 7) + astral + 'k' + em + snow;
+            total += s.length;
+            if (i === 19999) last = s;
+        }
+        var units = [];
+        for (var k = 0; k < last.length; k++) units.push(last.charCodeAt(k));
+        console.log(total, last.length, units.join(','));
+        "#,
+    );
+}
+
+/// A chain whose builder CROSSES the 256-unit small-flat threshold mid-run
+/// (in-place growth continues regardless), and one whose link-1 `Add` already
+/// exceeds it -- a rope accumulator, so EVERY link must fall through to the
+/// generic path (O(1) rope links preserved), hot in both directions.
+#[test]
+fn ccf_parity_flat_threshold_crossing() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        var piece40 = '0123456789012345678901234567890123456789';
+        var last = '';
+        for (var i = 0; i < 3000; i++) {
+            var s = '<' + i + piece40 + i + piece40 + i + piece40 + i + piece40 +
+                    i + piece40 + i + piece40 + i + piece40 + i + piece40 + '>';
+            if (i === 2999) last = s;
+        }
+        console.log(last.length, last.slice(0, 50), last.slice(-50));
+        var big = piece40 + piece40 + piece40 + piece40 + piece40 + piece40 + piece40 + piece40;
+        for (var j = 0; j < 3000; j++) {
+            var t = big + j + 'x' + j + big + '!';
+            if (j === 2999) last = t;
+        }
+        console.log(last.length, last.slice(0, 30), last.slice(-30));
+        "#,
+    );
+}
+
 /// The load-bearing admission risk, asserted directly: the gen-shaped hot
 /// loop's region must still compile on the MEM tier with the fused chain ops
 /// admitted, and no tier may decline/reject `StrConcatChain` anywhere.
@@ -342,6 +445,7 @@ fn all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
     for (key, val) in [
         ("ZIPP_NO_CONCAT_FUSE", "1"),
+        ("ZIPP_NO_CHAIN_FAST", "1"),
         ("ZIPP_NOJIT", "1"),
         ("ZIPP_JIT_THRESHOLD", "1"),
         ("ZIPP_GC_STRESS", "1"),

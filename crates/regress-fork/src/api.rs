@@ -695,6 +695,15 @@ impl Regex {
         !self.cr.group_names.is_empty()
     }
 
+    /// PATCH (test hook, see rxjit.rs): whether this regex's JIT slot holds
+    /// compiled native code. Per-instance, so the differential harness can
+    /// assert compile-threshold behavior without racing on global counters.
+    #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+    #[doc(hidden)]
+    pub fn __rxjit_is_compiled(&self) -> bool {
+        self.cr.rxjit.is_compiled()
+    }
+
     /// Returns an iterator for matches found in 'text' starting at index `start`.
     #[cfg(feature = "utf16")]
     pub fn find_from_utf16<'r, 't>(

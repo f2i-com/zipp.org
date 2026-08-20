@@ -139,6 +139,39 @@ pub(crate) fn session_enabled() -> bool {
     }
 }
 
+/// Test override for the read-only session-entry gate: 0 = env policy, 1 =
+/// force off, 2 = force on. Set via `__rx_acqgate_force` for the differential
+/// harness.
+static ACQGATE_FORCE: AtomicU8 = AtomicU8::new(0);
+
+pub(crate) fn acqgate_force(mode: Option<bool>) {
+    ACQGATE_FORCE.store(
+        match mode {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn acqgate_env_disabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("ZIPP_NO_RX_ACQGATE").is_some_and(|v| v != "0"))
+}
+
+/// Whether the session entry probes read-only (`acquire_if_compiled`) instead
+/// of ticking the use counter once per scan call (`ZIPP_NO_RX_ACQGATE=1`
+/// restores the entry tick).
+#[inline]
+pub(crate) fn acqgate_enabled() -> bool {
+    match ACQGATE_FORCE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => !acqgate_env_disabled(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The per-regex slot: use counter + lazily compiled code.
 // ---------------------------------------------------------------------------
@@ -195,6 +228,23 @@ impl JitSlot {
             }
         }
         self.code.get_or_init(|| compile(re)).as_ref()
+    }
+
+    /// Read-only twin of `acquire`: the native code if this regex has ALREADY
+    /// compiled, else `None` — no use-counter tick, no fallback-stats tick,
+    /// no compile. Scan entries probe with this so a scan that attempts zero
+    /// positions cannot advance the compile threshold; the counter still
+    /// ticks per real attempt (`attempt_at` -> `acquire`). Under FORCE it
+    /// behaves as `acquire`'s code.get()-first arm: compiled code is
+    /// returned regardless of the force mode.
+    #[inline]
+    pub(crate) fn acquire_if_compiled(&self) -> Option<&JitCode> {
+        self.code.get().and_then(|c| c.as_ref())
+    }
+
+    /// Whether this slot holds compiled native code (test hook).
+    pub(crate) fn is_compiled(&self) -> bool {
+        self.code.get().is_some_and(|c| c.is_some())
     }
 }
 

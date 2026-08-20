@@ -330,7 +330,7 @@ impl<'p> Vm<'p> {
         let reg_window = caller.reg_count;
         let log = std::env::var_os("ZIPP_JITLOG").is_some();
         for ip in start as usize..=end as usize {
-            let Instr::Call { argc, .. } = caller.code[ip] else {
+            let Instr::Call { argc, arg_base, .. } = caller.code[ip] else {
                 continue;
             };
             // Monomorphic plain-callee from the live IC (with the cached slot
@@ -572,6 +572,42 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            // Typed splice lane: schedule a register-resident emission for a
+            // proven-numeric body (fail-closed — any Err keeps the generic
+            // boxed loop, byte-identical). Computed over the FINAL (possibly
+            // nested-flattened) body with the merged upvals/consts/nested
+            // maps, so the schedule sees exactly what the emitter would.
+            let typed_lane = if !crate::codegen::typed_splice_enabled() {
+                None
+            } else {
+                match crate::codegen::build_typed_lane(
+                    &body,
+                    callee.param_count,
+                    argc,
+                    arg_base,
+                    reg_window,
+                    callee.reg_count + extra_regs,
+                    &upvals,
+                    &consts,
+                    &nested,
+                ) {
+                    Ok(lane) => {
+                        if log {
+                            eprintln!(
+                                "[leaf] fn{func_id}@{ip} TYPED-LANE (ops={} guards={})",
+                                lane.n_ops, lane.n_guards
+                            );
+                        }
+                        Some(lane)
+                    }
+                    Err(reason) => {
+                        if log {
+                            eprintln!("[leaf] fn{func_id}@{ip} typed-lane=DECLINED({reason})");
+                        }
+                        None
+                    }
+                }
+            };
             if log {
                 // W11 mechanism proof: the fill mask must come out ~0 on the
                 // hot bodies (tokIs/mix) or the cut silently no-ops.
@@ -599,6 +635,7 @@ impl<'p> Vm<'p> {
                     uninit_mask,
                     alias_params,
                     slot_guard,
+                    typed_lane,
                 },
             );
         }

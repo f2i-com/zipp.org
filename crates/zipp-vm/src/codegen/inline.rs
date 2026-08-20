@@ -166,6 +166,27 @@ pub(crate) fn emit_inline_leaf_call(
         // register file (near-MAX_FRAMES recursion) → take the helper.
         ; cmp QWORD [rsp + leaf_flag_off], 0
         ; je => fallback
+    );
+    // ── typed lane ── a fully scheduled register-resident emission replaces
+    // the boxed loop below when the planner proved the body numeric; every
+    // guard/bail inside it jumps to `fallback` (a pure prefix — nothing is
+    // committed before the lane's exit steps). `None` keeps the generic
+    // emission below byte-identical.
+    if let Some(lane) = &plan.typed_lane {
+        emit_typed_lane(ops, lane, plan, dst, fallback);
+        dynasm!(ops
+            ; jmp => done
+            ; => fallback
+        );
+        let helper_bail = ops.new_dynamic_label();
+        emit_region_call_ic(
+            ops, call_ip, helper_bail, epilogue, helper, packed_fip, packed_args, argc, dst,
+            refetch, ta_refetch,
+        );
+        dynasm!(ops ; => done);
+        return;
+    }
+    dynasm!(ops
         // ── arg binding ── reg 0 (callee `this`) = undefined; positional args
         // into W+1.. (a leaf with simple_params binds args positionally). Args
         // beyond `param_count`/`argc` are ignored by a leaf body (no
@@ -1342,3 +1363,1354 @@ pub(crate) fn emit_inline_accessor(
     dynasm!(ops ; => after);
 }
 
+// ───────────────────────── typed splice lane ─────────────────────────
+//
+// A leaf-splice body whose every value op is provably numeric is emitted as a
+// REGISTER-RESIDENT lane instead of the boxed per-op loop above: params and
+// captured cells are tag-guarded once at entry and unboxed into GPRs, the
+// straight-line body runs on exact i64 integers (magnitude-bounded ≤ 2^53 so
+// i64 arithmetic equals f64 semantics exactly) and scalar doubles in xmm
+// homes, and ONE box happens at exit (plus the buffered upval commit). Every
+// runtime check — entry tag guard, the nested callee guard, a ToInt32 of an
+// out-of-i32 double — jumps to the per-call helper `fallback`, which re-runs
+// the whole call: sound because the lane is a PURE PREFIX until its exit
+// (no scratch-slot state is architectural, upval writes are buffered in
+// registers, `dst` is written last), exactly the contract the buffered
+// `UpvalSet` arm of the generic emitter already relies on.
+//
+// The schedule (types, magnitude bounds, physical registers, in-place
+// choices) is computed ONCE at plan time by `build_typed_lane` — fail-closed:
+// any op outside the closed numeric set, an unbounded add/sub chain, an
+// undefined/`this` read, or a blown register budget returns `Err` and the
+// generic loop is emitted byte-identically to today.
+//
+// Register budget: values live in GPR homes r8/r9/r10/r11/rdx and xmm homes
+// xmm2..xmm5; rax/rcx and xmm0/xmm1 stay scratch for the op templates (rcx
+// also serves variable shift counts). rbx/rsi/rdi/r12/r13/r14 remain pinned
+// as in the surrounding region body. The two helper calls (cell_get at entry,
+// cell_set at exit) clobber every volatile register, so they are scheduled
+// strictly before any home is live / after every home is dead.
+
+/// GPR value homes (dynasm register codes): r8, r9, r10, r11, rdx.
+const LANE_GPR_HOMES: [u8; 5] = [8, 9, 10, 11, 2];
+/// XMM value homes: xmm2..xmm5 (xmm0/xmm1 are operand-conversion scratch).
+const LANE_XMM_HOMES: [u8; 4] = [2, 3, 4, 5];
+/// Defensive cap on scheduled body length (splice bodies are ≤ ~64 ops).
+const LANE_MAX_BODY: usize = 96;
+
+/// A 32-bit operand of a lane ALU op: a GPR home's low 32 bits (which ARE the
+/// ToInt32 of the exact i64 value it holds — |v| ≤ 2^53 keeps truncation
+/// trivial) or a compile-time i32 immediate.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum LaneOp32 {
+    R(u8),
+    I(i32),
+}
+
+/// One scheduled lane instruction. Emission is a dumb match — every decision
+/// (types, homes, folds, in-place forms) was made by `build_typed_lane`.
+pub(crate) enum LaneStep {
+    /// `jit_cell_get(cell)`; deopt sentinel → fallback; optionally park the
+    /// boxed bits in a scratch-window slot (multi-upval entry).
+    UpvalCall { cell_bits: u64, park_slot: Option<u16> },
+    /// Tag-guard the fetched cell bits as Int and sign-extend into a home.
+    UpvalBind { park_slot: Option<u16>, d: u8 },
+    /// Load a caller arg slot, tag-guard Int, sign-extend into a home.
+    ParamLoad { slot: u16, d: u8 },
+    /// The nested-splice identity guard, fused with its feeding `LoadGlobal`:
+    /// re-read `globals[g]` (the value the guarded register would hold) and
+    /// compare bits + heap slot version, exactly the generic `Call` arm.
+    CalleeGuard { gidx: u32, bits: u64, ver: u32 },
+    /// `Rq(d) = imm64` (an int immediate too wide for an ALU imm32 field).
+    GImm { d: u8, v: i64 },
+    /// Exact i64 add/sub (bounds proven ≤ 2^53 at plan time).
+    IAdd { d: u8, a: u8, b: LaneOp32, sub: bool },
+    /// `d = imm - b` (the one non-commutative imm-lhs shape).
+    IAddImmRev { d: u8, imm: i64, b: u8 },
+    /// 32-bit ALU op on ToInt32'd operands; result re-extended per op
+    /// (movsxd for signed results, the 32-bit write's zero-extension for
+    /// `>>>`). Shift counts are pre-masked (&31) when immediate.
+    Bit32 { d: u8, a: LaneOp32, b: LaneOp32, op: crate::bytecode::BitwiseOp },
+    /// `movsxd Rq(d), low32(s)` — the `|0` wrap of a wide exact integer.
+    SignExt { d: u8, s: u8 },
+    /// `mov Rd(d), low32(s)` — zero-extend (the `>>>0` wrap).
+    ZeroExt { d: u8, s: u8 },
+    /// `Math.imul`: 32-bit signed multiply of ToInt32'd operands.
+    Imul32 { d: u8, a: LaneOp32, b: LaneOp32 },
+    /// ToInt32 of an f64 home, IN-RANGE ONLY: out-of-i32 (the modular-wrap
+    /// case, NaN, ±Inf) jumps to fallback and the whole call re-runs.
+    ToI32F64 { d: u8, s: u8 },
+    /// `Rx(d) = f64(Rq(s))` — exact, |v| ≤ 2^53 by the Int invariant.
+    CvtIX { d: u8, s: u8 },
+    /// `Rx(d) = <raw f64 bits>` via rax.
+    XImm { d: u8, bits: u64 },
+    /// Scalar f64 op, bytecode-op-for-op (never algebraically fused).
+    FBin { d: u8, a: u8, b: u8, op: DOp },
+    /// Exit: store pre-folded boxed bits into the caller's `dst`.
+    RetImm { bits: u64 },
+    /// Exit: box an Int home (`narrow` = proven i32 ⇒ direct Int tag).
+    RetInt { s: u8, narrow: bool },
+    /// Exit: store an f64 home's raw bits (the `store_xmm` convention).
+    RetF64 { s: u8 },
+    /// Exit upval commit staging: box into a scratch-window slot.
+    BoxIntToSlot { s: u8, slot: u16, narrow: bool },
+    BoxF64ToSlot { s: u8, slot: u16 },
+    ImmToSlot { bits: u64, slot: u16 },
+    /// Exit upval commit: `jit_cell_set(cell, [slot])`.
+    CellCommit { cell_bits: u64, slot: u16 },
+}
+
+/// The scheduled lane carried by a `LeafInlinePlan`.
+pub struct TypedLanePlan {
+    pub(crate) steps: Vec<LaneStep>,
+    /// Census counts for the plan-time JITLOG line.
+    pub n_ops: u16,
+    pub n_guards: u16,
+}
+
+/// Abstract value of one body register during scheduling. `Int` carries the
+/// exact-integer magnitude interval (the ≤ 2^53 invariant every Int home
+/// obeys); `ImmI`/`ImmF` are compile-time folds that never occupy a home.
+#[derive(Clone, Copy)]
+enum Av {
+    ImmI(i64),
+    ImmF(u64),
+    Int { h: u8, lo: i64, hi: i64 },
+    F64 { h: u8 },
+    Callee { g: u32 },
+}
+
+const I53: i64 = 1i64 << 53;
+const IV32: (i64, i64) = (i32::MIN as i64, i32::MAX as i64);
+
+/// Sources / def of a body op, for the straight-line liveness scans. `None`
+/// = an op outside the modelled set (treated as using everything — the walk
+/// declines on it anyway, this only keeps the scans conservative).
+#[allow(clippy::type_complexity)]
+fn lane_use_def(ins: &Instr) -> Option<(([u16; 3], u8), Option<u16>)> {
+    let u0 = |d| Some((([0u16; 3], 0u8), d));
+    let u1 = |a, d| Some((([a, 0, 0], 1u8), d));
+    let u2 = |a, b, d| Some((([a, b, 0], 2u8), d));
+    match *ins {
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::UpvalGet { dst, .. } => u0(Some(dst)),
+        Instr::Move { dst, src } => u1(src, Some(dst)),
+        Instr::Add { dst, a, b }
+        | Instr::Sub { dst, a, b }
+        | Instr::Mul { dst, a, b }
+        | Instr::Div { dst, a, b }
+        | Instr::Bitwise { dst, a, b, .. } => u2(a, b, Some(dst)),
+        Instr::AddInt { dst, a, .. } => u1(a, Some(dst)),
+        Instr::MathOp { dst, arg_base, argc, .. } => {
+            if argc == 2 {
+                u2(arg_base, arg_base + 1, Some(dst))
+            } else {
+                u1(arg_base, Some(dst))
+            }
+        }
+        Instr::UpvalSet { src, .. } => u1(src, None),
+        // The nested-splice guard marker: consumes the callee register,
+        // defines nothing (the rewritten inner Return writes the dst later).
+        Instr::Call { callee, .. } => u1(callee, None),
+        Instr::Return { src } => u1(src, None),
+        Instr::ReturnUndefined => u0(None),
+        _ => None,
+    }
+}
+
+/// Is vreg `v` read at or after body index `from` (before being redefined)?
+fn lane_used_from(body: &[Instr], from: usize, v: u16) -> bool {
+    for ins in &body[from.min(body.len())..] {
+        match lane_use_def(ins) {
+            None => return true, // unmodelled op: conservative
+            Some(((uses, n), def)) => {
+                if uses[..n as usize].contains(&v) {
+                    return true;
+                }
+                if def == Some(v) {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Is upval `idx` read (UpvalGet) at or after `from`, before an UpvalSet of
+/// the same index?
+fn lane_upval_get_from(body: &[Instr], from: usize, idx: u16) -> bool {
+    for ins in &body[from.min(body.len())..] {
+        match *ins {
+            Instr::UpvalGet { idx: k, .. } if k == idx => return true,
+            Instr::UpvalSet { idx: k, .. } if k == idx => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Is the CURRENT buffered value of upval `idx` still needed at or after
+/// `from`? (Read before the next UpvalSet, or committed at exit if no later
+/// UpvalSet supersedes it.)
+fn lane_buffer_live_from(body: &[Instr], from: usize, idx: u16) -> bool {
+    for ins in &body[from.min(body.len())..] {
+        match *ins {
+            Instr::UpvalGet { idx: k, .. } if k == idx => return true,
+            Instr::UpvalSet { idx: k, .. } if k == idx => return false,
+            _ => {}
+        }
+    }
+    true // survives to the exit commit
+}
+
+/// ToInt32 of an exact integer ≤ 2^53 in magnitude: the low 32 bits.
+fn to_i32_exact(v: i64) -> i32 {
+    v as u32 as i32
+}
+
+/// Full spec ToInt32 of an f64 (plan-time fold only).
+fn to_i32_f64(x: f64) -> i32 {
+    if !x.is_finite() {
+        return 0;
+    }
+    let t = x.trunc();
+    // fmod is exact; the shifted result is an integer < 2^32, also exact.
+    let m = t % 4294967296.0;
+    let m = if m < 0.0 { m + 4294967296.0 } else { m };
+    (m as u32) as i32
+}
+
+/// Box an exact numeric fold with `Value::num` semantics (i32 narrows, NaN
+/// canonicalises, -0/±Inf/wide stay doubles).
+fn lane_box_imm(av: Av) -> u64 {
+    match av {
+        Av::ImmI(v) => {
+            if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+                Value::int(v as i32).bits()
+            } else {
+                Value::num(v as f64).bits()
+            }
+        }
+        Av::ImmF(bits) => Value::num(f64::from_bits(bits)).bits(),
+        _ => unreachable!("lane_box_imm on a non-immediate"),
+    }
+}
+
+struct LaneBuilder<'a> {
+    body: &'a [Instr],
+    param_count: u16,
+    argc: u16,
+    arg_base: u16,
+    slots: Vec<Av>,
+    binds: FxHashMap<u16, usize>,
+    buffer: FxHashMap<u16, usize>,
+    uentry: FxHashMap<u16, usize>,
+    steps: Vec<LaneStep>,
+    n_guards: u16,
+}
+
+impl LaneBuilder<'_> {
+    fn push_slot(&mut self, av: Av) -> usize {
+        self.slots.push(av);
+        self.slots.len() - 1
+    }
+
+    /// Is physical home `h` (GPR when `gpr`, else XMM) referenced by any
+    /// value still live when scanning from body index `from`?
+    fn home_live(&self, from: usize, gpr: bool, h: u8) -> bool {
+        let hits = |sid: usize| match self.slots[sid] {
+            Av::Int { h: hh, .. } => gpr && hh == h,
+            Av::F64 { h: hh } => !gpr && hh == h,
+            _ => false,
+        };
+        for (&v, &sid) in &self.binds {
+            if hits(sid) && lane_used_from(self.body, from, v) {
+                return true;
+            }
+        }
+        for (&idx, &sid) in &self.uentry {
+            if hits(sid) && lane_upval_get_from(self.body, from, idx) {
+                return true;
+            }
+        }
+        for (&idx, &sid) in &self.buffer {
+            if hits(sid) && lane_buffer_live_from(self.body, from, idx) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Allocate a GPR home, preferring `prefer` (dying source homes → the
+    /// in-place forms). `from` selects the liveness horizon: pass the current
+    /// op index while resolving that op's OTHER sources (inclusive — they are
+    /// still needed), or the next index for the op's own dst (exclusive —
+    /// dying sources may be reused). `exclude` shields an UNTRACKED temp
+    /// (a just-allocated ToInt32 destination has no binder yet, so liveness
+    /// alone would hand its home out again within the same op).
+    fn alloc_gpr(&self, from: usize, prefer: &[u8], exclude: Option<u8>) -> Result<u8, &'static str> {
+        for &h in prefer.iter().chain(LANE_GPR_HOMES.iter()) {
+            if Some(h) != exclude && !self.home_live(from, true, h) {
+                return Ok(h);
+            }
+        }
+        Err("gpr-budget")
+    }
+
+    fn alloc_xmm(
+        &self,
+        from: usize,
+        prefer: &[u8],
+        exclude: Option<u8>,
+    ) -> Result<u8, &'static str> {
+        for &h in prefer.iter().chain(LANE_XMM_HOMES.iter()) {
+            if Some(h) != exclude && !self.home_live(from, false, h) {
+                return Ok(h);
+            }
+        }
+        Err("xmm-budget")
+    }
+
+    /// Resolve a body vreg to its abstract value, lazily entry-loading a
+    /// param on first read (pure prefix: the tag guard jumps to fallback and
+    /// nothing has been committed at any body position).
+    fn resolve(&mut self, i: usize, v: u16) -> Result<usize, &'static str> {
+        if let Some(&sid) = self.binds.get(&v) {
+            return match self.slots[sid] {
+                Av::Callee { .. } => Err("callee-value-escapes"),
+                _ => Ok(sid),
+            };
+        }
+        if v >= 1 && v <= self.param_count {
+            let pi = v - 1;
+            if pi >= self.argc {
+                return Err("param-not-passed");
+            }
+            let h = self.alloc_gpr(i, &[], None)?;
+            self.steps.push(LaneStep::ParamLoad { slot: self.arg_base + pi, d: h });
+            self.n_guards += 1;
+            let sid = self.push_slot(Av::Int { h, lo: IV32.0, hi: IV32.1 });
+            self.binds.insert(v, sid);
+            return Ok(sid);
+        }
+        Err("read-undefined-reg") // `this`, an uninitialized local, …
+    }
+
+    /// Homes of op sources that die at op `i` (nothing reads them at i+1 or
+    /// later) — preferred reuse targets for the op's dst.
+    fn dying_homes(&self, i: usize, srcs: &[usize], gpr: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &sid in srcs {
+            let h = match self.slots[sid] {
+                Av::Int { h, .. } if gpr => h,
+                Av::F64 { h } if !gpr => h,
+                _ => continue,
+            };
+            if !self.home_live(i + 1, gpr, h) && !out.contains(&h) {
+                out.push(h);
+            }
+        }
+        out
+    }
+
+    fn iv_of(&self, sid: usize) -> (i64, i64) {
+        match self.slots[sid] {
+            Av::ImmI(v) => (v, v),
+            Av::Int { lo, hi, .. } => (lo, hi),
+            _ => unreachable!("iv_of on a non-int"),
+        }
+    }
+
+    /// Int-or-float add/sub over two resolved slots.
+    fn arith(
+        &mut self,
+        i: usize,
+        dst: u16,
+        sa: usize,
+        sb: usize,
+        sub: bool,
+    ) -> Result<(), &'static str> {
+        let is_f = |av: Av| matches!(av, Av::F64 { .. } | Av::ImmF(_));
+        if is_f(self.slots[sa]) || is_f(self.slots[sb]) {
+            return self.fbin(i, dst, sa, sb, if sub { DOp::Sub } else { DOp::Add });
+        }
+        // Exact-integer path: magnitude bounds must stay ≤ 2^53 or i64
+        // arithmetic diverges from f64 rounding — FAIL CLOSED.
+        if let (Av::ImmI(va), Av::ImmI(vb)) = (self.slots[sa], self.slots[sb]) {
+            let r = if sub { va - vb } else { va + vb };
+            if r.abs() > I53 {
+                return Err("i53-overflow");
+            }
+            let sid = self.push_slot(Av::ImmI(r));
+            self.binds.insert(dst, sid);
+            return Ok(());
+        }
+        let (alo, ahi) = self.iv_of(sa);
+        let (blo, bhi) = self.iv_of(sb);
+        let iv = if sub { (alo - bhi, ahi - blo) } else { (alo + blo, ahi + bhi) };
+        if iv.0 < -I53 || iv.1 > I53 {
+            return Err("i53-overflow");
+        }
+        self.binds.remove(&dst);
+        let step = match (self.slots[sa], self.slots[sb]) {
+            (Av::Int { h: ha, .. }, Av::Int { h: hb, .. }) => {
+                let prefer = self.dying_homes(i, &[sa, sb], true);
+                let d = self.alloc_gpr(i + 1, &prefer, None)?;
+                LaneStep::IAdd { d, a: ha, b: LaneOp32::R(hb), sub }
+            }
+            (Av::Int { h: ha, .. }, Av::ImmI(vb)) => {
+                let prefer = self.dying_homes(i, &[sa], true);
+                if vb >= i32::MIN as i64 && vb <= i32::MAX as i64 {
+                    let d = self.alloc_gpr(i + 1, &prefer, None)?;
+                    LaneStep::IAdd { d, a: ha, b: LaneOp32::I(vb as i32), sub }
+                } else {
+                    // Materialize the wide imm, then reg-reg (the template
+                    // reads both sources before writing d, so d may even
+                    // reuse the temp's home).
+                    let t = self.alloc_gpr(i, &[], None)?;
+                    self.steps.push(LaneStep::GImm { d: t, v: vb });
+                    let d = self.alloc_gpr(i + 1, &prefer, None)?;
+                    LaneStep::IAdd { d, a: ha, b: LaneOp32::R(t), sub }
+                }
+            }
+            (Av::ImmI(va), Av::Int { h: hb, .. }) => {
+                let prefer = self.dying_homes(i, &[sb], true);
+                let narrow = va >= i32::MIN as i64 && va <= i32::MAX as i64;
+                if !sub && !narrow {
+                    // IAddImmRev is `imm - b`, i.e. Sub's form only. Add is
+                    // commutative, so materialize the wide imm and go reg-reg.
+                    let t = self.alloc_gpr(i, &[], None)?;
+                    self.steps.push(LaneStep::GImm { d: t, v: va });
+                    let d = self.alloc_gpr(i + 1, &prefer, None)?;
+                    LaneStep::IAdd { d, a: hb, b: LaneOp32::R(t), sub: false }
+                } else {
+                    let d = self.alloc_gpr(i + 1, &prefer, None)?;
+                    if !sub {
+                        LaneStep::IAdd { d, a: hb, b: LaneOp32::I(va as i32), sub: false }
+                    } else {
+                        LaneStep::IAddImmRev { d, imm: va, b: hb }
+                    }
+                }
+            }
+            _ => unreachable!("non-int reached the int arith path"),
+        };
+        let d = match step {
+            LaneStep::IAdd { d, .. } | LaneStep::IAddImmRev { d, .. } => d,
+            _ => unreachable!(),
+        };
+        self.steps.push(step);
+        let sid = self.push_slot(Av::Int { h: d, lo: iv.0, hi: iv.1 });
+        self.binds.insert(dst, sid);
+        Ok(())
+    }
+
+    /// Scalar f64 op, IEEE bytecode-op-for-op. Int operands convert via
+    /// cvtsi2sd (exact ≤ 2^53); immediates fold or materialize into the
+    /// xmm0/xmm1 scratch pair.
+    fn fbin(
+        &mut self,
+        i: usize,
+        dst: u16,
+        sa: usize,
+        sb: usize,
+        op: DOp,
+    ) -> Result<(), &'static str> {
+        let comm = matches!(op, DOp::Add | DOp::Mul);
+        let as_f = |av: Av| -> Option<f64> {
+            match av {
+                Av::ImmI(v) => Some(v as f64),
+                Av::ImmF(bits) => Some(f64::from_bits(bits)),
+                _ => None,
+            }
+        };
+        if let (Some(fa), Some(fb)) = (as_f(self.slots[sa]), as_f(self.slots[sb])) {
+            let r = match op {
+                DOp::Add => fa + fb,
+                DOp::Sub => fa - fb,
+                DOp::Mul => fa * fb,
+                DOp::Div => fa / fb,
+            };
+            let sid = self.push_slot(Av::ImmF(r.to_bits()));
+            self.binds.insert(dst, sid);
+            return Ok(());
+        }
+        // Operand conversions into the scratch pair (a → xmm0, b → xmm1).
+        let mut conv = |slf: &mut Self, sid: usize, scratch: u8| -> u8 {
+            match slf.slots[sid] {
+                Av::F64 { h } => h,
+                Av::Int { h, .. } => {
+                    slf.steps.push(LaneStep::CvtIX { d: scratch, s: h });
+                    scratch
+                }
+                Av::ImmI(v) => {
+                    slf.steps.push(LaneStep::XImm { d: scratch, bits: (v as f64).to_bits() });
+                    scratch
+                }
+                Av::ImmF(bits) => {
+                    slf.steps.push(LaneStep::XImm { d: scratch, bits });
+                    scratch
+                }
+                Av::Callee { .. } => unreachable!("resolve rejected a callee value"),
+            }
+        };
+        let xa = conv(self, sa, 0);
+        let xb = conv(self, sb, 1);
+        self.binds.remove(&dst);
+        let mut prefer = self.dying_homes(i, &[sa], false);
+        if comm {
+            prefer.extend(self.dying_homes(i, &[sb], false));
+        }
+        // A non-commutative op must never compute in-place over b.
+        let d = self.alloc_xmm(i + 1, &prefer, if !comm && xb >= 2 { Some(xb) } else { None })?;
+        self.steps.push(LaneStep::FBin { d, a: xa, b: xb, op });
+        let sid = self.push_slot(Av::F64 { h: d });
+        self.binds.insert(dst, sid);
+        Ok(())
+    }
+
+    /// A source in ToInt32 position: free for Int homes/imms; an f64 home
+    /// takes the in-range-only cvttsd2si (out-of-i32 → fallback). `avoid`
+    /// carries the other operand's already-materialized temp so two f64
+    /// operands of one op never share a temp home.
+    fn to32(&mut self, i: usize, sid: usize, avoid: Option<u8>) -> Result<LaneOp32, &'static str> {
+        Ok(match self.slots[sid] {
+            Av::ImmI(v) => LaneOp32::I(to_i32_exact(v)),
+            Av::ImmF(bits) => LaneOp32::I(to_i32_f64(f64::from_bits(bits))),
+            Av::Int { h, .. } => LaneOp32::R(h),
+            Av::F64 { h } => {
+                let t = self.alloc_gpr(i, &[], avoid)?;
+                self.steps.push(LaneStep::ToI32F64 { d: t, s: h });
+                LaneOp32::R(t)
+            }
+            Av::Callee { .. } => unreachable!("resolve rejected a callee value"),
+        })
+    }
+
+    fn bind_int(&mut self, dst: u16, h: u8, iv: (i64, i64)) {
+        let sid = self.push_slot(Av::Int { h, lo: iv.0, hi: iv.1 });
+        self.binds.insert(dst, sid);
+    }
+}
+
+/// Schedule a typed lane for a (possibly nested-flattened) leaf-splice body.
+/// `Err` declines with the JITLOG reason; the generic boxed loop is then
+/// emitted byte-identically to today. See the module comment above for the
+/// invariants; the closed op set is exactly the match below.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_typed_lane(
+    body: &[Instr],
+    param_count: u16,
+    argc: u16,
+    arg_base: u16,
+    reg_window: u16,
+    callee_reg_count: u16,
+    upvals: &FxHashMap<u16, u64>,
+    consts: &FxHashMap<u32, u64>,
+    nested: &FxHashMap<usize, NestedGuard>,
+) -> Result<TypedLanePlan, &'static str> {
+    use crate::bytecode::BitwiseOp as B;
+    if body.len() > LANE_MAX_BODY {
+        return Err("body-too-long");
+    }
+    if body.iter().any(|ins| {
+        matches!(
+            ins,
+            Instr::Jump { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
+        )
+    }) {
+        return Err("branchy-body");
+    }
+    let mut b = LaneBuilder {
+        body,
+        param_count,
+        argc,
+        arg_base,
+        slots: Vec::new(),
+        binds: FxHashMap::default(),
+        buffer: FxHashMap::default(),
+        uentry: FxHashMap::default(),
+        steps: Vec::new(),
+        n_guards: 0,
+    };
+    // ── entry: hoisted upval loads ── every upval index whose FIRST body op
+    // is a read gets one cell_get + Int guard at entry. Hoisting is sound:
+    // the body is straight-line and runs no user code, so nothing can write
+    // the cell between entry and the read (a body write is buffered and the
+    // buffered value is read instead). The helper calls clobber every
+    // volatile register, so they ALL run before any home is live — with more
+    // than one upval, earlier results park in scratch-window slots (inside
+    // the headroom-validated window).
+    let mut entry_idx: Vec<u16> = Vec::new();
+    {
+        let mut set_seen: FxHashSet<u16> = FxHashSet::default();
+        for ins in body {
+            match *ins {
+                Instr::UpvalGet { idx, .. }
+                    if !set_seen.contains(&idx) && !entry_idx.contains(&idx) =>
+                {
+                    entry_idx.push(idx)
+                }
+                Instr::UpvalSet { idx, .. } => {
+                    set_seen.insert(idx);
+                }
+                _ => {}
+            }
+        }
+    }
+    entry_idx.sort_unstable();
+    if entry_idx.len() > 4 {
+        return Err("too-many-upvals");
+    }
+    let parked = entry_idx.len() > 1;
+    for (k, &idx) in entry_idx.iter().enumerate() {
+        if k as u16 >= callee_reg_count {
+            return Err("park-slot-overflow");
+        }
+        let cell_bits = *upvals.get(&idx).ok_or("upval-cell-missing")?;
+        let park = if parked { Some(reg_window + k as u16) } else { None };
+        b.steps.push(LaneStep::UpvalCall { cell_bits, park_slot: park });
+        b.n_guards += 1;
+    }
+    for (k, &idx) in entry_idx.iter().enumerate() {
+        let park = if parked { Some(reg_window + k as u16) } else { None };
+        let h = b.alloc_gpr(0, &[], None)?;
+        b.steps.push(LaneStep::UpvalBind { park_slot: park, d: h });
+        b.n_guards += 1;
+        let sid = b.push_slot(Av::Int { h, lo: IV32.0, hi: IV32.1 });
+        b.uentry.insert(idx, sid);
+    }
+    // ── the straight-line body walk ──
+    let mut returned = false;
+    for (i, ins) in body.iter().enumerate() {
+        match *ins {
+            Instr::LoadInt { dst, val } => {
+                let sid = b.push_slot(Av::ImmI(val as i64));
+                b.binds.insert(dst, sid);
+            }
+            Instr::LoadConst { dst, idx } => {
+                let bits = *consts.get(&idx).ok_or("const-missing")?;
+                let v = Value::from_bits(bits);
+                let sid = if v.is_int() {
+                    b.push_slot(Av::ImmI(v.as_int() as i64))
+                } else {
+                    b.push_slot(Av::ImmF(bits))
+                };
+                b.binds.insert(dst, sid);
+            }
+            Instr::Move { dst, src } => {
+                let sid = b.resolve(i, src)?;
+                b.binds.insert(dst, sid);
+            }
+            Instr::LoadGlobal { dst, idx } => {
+                let sid = b.push_slot(Av::Callee { g: idx });
+                b.binds.insert(dst, sid);
+            }
+            Instr::Call { callee, .. } => {
+                let g = nested.get(&i).ok_or("call-without-nested-guard")?;
+                debug_assert_eq!(g.callee_reg, callee);
+                let gidx = match b.binds.get(&callee).map(|&sid| b.slots[sid]) {
+                    Some(Av::Callee { g }) => g,
+                    _ => return Err("callee-not-a-global-load"),
+                };
+                b.steps.push(LaneStep::CalleeGuard { gidx, bits: g.bits, ver: g.ver });
+                b.n_guards += 1;
+                b.binds.remove(&callee);
+            }
+            Instr::Add { dst, a, b: rb } => {
+                let sa = b.resolve(i, a)?;
+                let sb = b.resolve(i, rb)?;
+                b.arith(i, dst, sa, sb, false)?;
+            }
+            Instr::Sub { dst, a, b: rb } => {
+                let sa = b.resolve(i, a)?;
+                let sb = b.resolve(i, rb)?;
+                b.arith(i, dst, sa, sb, true)?;
+            }
+            Instr::AddInt { dst, a, imm, .. } => {
+                let sa = b.resolve(i, a)?;
+                let sb = b.push_slot(Av::ImmI(imm as i64));
+                b.arith(i, dst, sa, sb, false)?;
+            }
+            // JS `*` and `/` ARE the f64 ops — emitting mulsd/divsd over the
+            // (exactly converted) operands is the semantics, -0 and rounding
+            // included; the generic splice's dbinop routes Mul/Div the same
+            // way. Bytecode order is preserved op-for-op — never fused.
+            Instr::Mul { dst, a, b: rb } => {
+                let sa = b.resolve(i, a)?;
+                let sb = b.resolve(i, rb)?;
+                b.fbin(i, dst, sa, sb, DOp::Mul)?;
+            }
+            Instr::Div { dst, a, b: rb } => {
+                let sa = b.resolve(i, a)?;
+                let sb = b.resolve(i, rb)?;
+                b.fbin(i, dst, sa, sb, DOp::Div)?;
+            }
+            Instr::Bitwise { dst, a, b: rb, op } => {
+                let sa = b.resolve(i, a)?;
+                let sb = b.resolve(i, rb)?;
+                // ── wrap elisions: `x|0`, `x^0`, `x<<0`, `x>>0`, `x>>>0` ──
+                let b_wrap_zero = match (op, b.slots[sb]) {
+                    (B::Or | B::Xor, Av::ImmI(v)) => to_i32_exact(v) == 0,
+                    (B::Shl | B::Shr | B::Ushr, Av::ImmI(v)) => to_i32_exact(v) & 31 == 0,
+                    _ => false,
+                };
+                if b_wrap_zero {
+                    let signed = !matches!(op, B::Ushr);
+                    match b.slots[sa] {
+                        Av::ImmI(v) => {
+                            let t = to_i32_exact(v);
+                            let f = if signed { t as i64 } else { t as u32 as i64 };
+                            let sid = b.push_slot(Av::ImmI(f));
+                            b.binds.insert(dst, sid);
+                        }
+                        Av::ImmF(bits) => {
+                            let t = to_i32_f64(f64::from_bits(bits));
+                            let f = if signed { t as i64 } else { t as u32 as i64 };
+                            let sid = b.push_slot(Av::ImmI(f));
+                            b.binds.insert(dst, sid);
+                        }
+                        Av::Int { lo, hi, .. }
+                            if (signed && lo >= IV32.0 && hi <= IV32.1)
+                                || (!signed && lo >= 0 && hi <= u32::MAX as i64) =>
+                        {
+                            // Already its own wrap: pure alias, zero code.
+                            b.binds.insert(dst, sa);
+                        }
+                        Av::Int { h, .. } => {
+                            b.binds.remove(&dst);
+                            let prefer = b.dying_homes(i, &[sa], true);
+                            let d = b.alloc_gpr(i + 1, &prefer, None)?;
+                            b.steps.push(if signed {
+                                LaneStep::SignExt { d, s: h }
+                            } else {
+                                LaneStep::ZeroExt { d, s: h }
+                            });
+                            b.bind_int(dst, d, if signed { IV32 } else { (0, u32::MAX as i64) });
+                        }
+                        Av::F64 { h } => {
+                            b.binds.remove(&dst);
+                            let d = b.alloc_gpr(i + 1, &[], None)?;
+                            b.steps.push(LaneStep::ToI32F64 { d, s: h });
+                            if signed {
+                                b.bind_int(dst, d, IV32);
+                            } else {
+                                b.steps.push(LaneStep::ZeroExt { d, s: d });
+                                b.bind_int(dst, d, (0, u32::MAX as i64));
+                            }
+                        }
+                        Av::Callee { .. } => unreachable!("resolve rejected a callee value"),
+                    }
+                    continue;
+                }
+                let a32 = b.to32(i, sa, None)?;
+                let avoid = if let LaneOp32::R(r) = a32 { Some(r) } else { None };
+                let mut b32 = b.to32(i, sb, avoid)?;
+                if let (B::Shl | B::Shr | B::Ushr, LaneOp32::I(k)) = (op, b32) {
+                    b32 = LaneOp32::I(k & 31);
+                }
+                if let (LaneOp32::I(va), LaneOp32::I(vb)) = (a32, b32) {
+                    let r: i64 = match op {
+                        B::And => (va & vb) as i64,
+                        B::Or => (va | vb) as i64,
+                        B::Xor => (va ^ vb) as i64,
+                        B::Shl => (va << (vb & 31)) as i64,
+                        B::Shr => (va >> (vb & 31)) as i64,
+                        B::Ushr => (((va as u32) >> (vb & 31)) as u32) as i64,
+                    };
+                    let sid = b.push_slot(Av::ImmI(r));
+                    b.binds.insert(dst, sid);
+                    continue;
+                }
+                b.binds.remove(&dst);
+                let prefer = b.dying_homes(i, &[sa, sb], true);
+                let d = b.alloc_gpr(i + 1, &prefer, None)?;
+                b.steps.push(LaneStep::Bit32 { d, a: a32, b: b32, op });
+                let iv = if matches!(op, B::Ushr) { (0, u32::MAX as i64) } else { IV32 };
+                b.bind_int(dst, d, iv);
+            }
+            Instr::MathOp { dst, op: MathFn::Imul, arg_base: ab, argc: 2 } => {
+                let sa = b.resolve(i, ab)?;
+                let sb = b.resolve(i, ab + 1)?;
+                let a32 = b.to32(i, sa, None)?;
+                let avoid = if let LaneOp32::R(r) = a32 { Some(r) } else { None };
+                let b32 = b.to32(i, sb, avoid)?;
+                if let (LaneOp32::I(va), LaneOp32::I(vb)) = (a32, b32) {
+                    let sid = b.push_slot(Av::ImmI(va.wrapping_mul(vb) as i64));
+                    b.binds.insert(dst, sid);
+                    continue;
+                }
+                b.binds.remove(&dst);
+                let prefer = b.dying_homes(i, &[sa, sb], true);
+                let d = b.alloc_gpr(i + 1, &prefer, None)?;
+                b.steps.push(LaneStep::Imul32 { d, a: a32, b: b32 });
+                b.bind_int(dst, d, IV32);
+            }
+            Instr::UpvalGet { dst, idx } => {
+                let sid = b
+                    .buffer
+                    .get(&idx)
+                    .or_else(|| b.uentry.get(&idx))
+                    .copied()
+                    .ok_or("upval-read-order")?;
+                b.binds.insert(dst, sid);
+            }
+            Instr::UpvalSet { idx, src } => {
+                let sid = b.resolve(i, src)?;
+                if !upvals.contains_key(&idx) {
+                    return Err("upval-cell-missing");
+                }
+                b.buffer.insert(idx, sid);
+            }
+            Instr::Return { src } => {
+                if i != body.len() - 1 {
+                    return Err("return-not-terminal");
+                }
+                let sid = b.resolve(i, src)?;
+                match b.slots[sid] {
+                    Av::ImmI(_) | Av::ImmF(_) => {
+                        let bits = lane_box_imm(b.slots[sid]);
+                        b.steps.push(LaneStep::RetImm { bits });
+                    }
+                    Av::Int { h, lo, hi } => {
+                        b.steps.push(LaneStep::RetInt {
+                            s: h,
+                            narrow: lo >= IV32.0 && hi <= IV32.1,
+                        });
+                    }
+                    Av::F64 { h } => b.steps.push(LaneStep::RetF64 { s: h }),
+                    Av::Callee { .. } => return Err("callee-value-escapes"),
+                }
+                returned = true;
+            }
+            // The closed set is deliberately small: anything else (Mod, Neg,
+            // comparisons, heap loads/stores, non-Imul MathOps, StoreGlobal,
+            // ReturnUndefined, …) keeps the generic boxed loop.
+            _ => return Err("op-outside-lane-set"),
+        }
+    }
+    if !returned {
+        return Err("no-return");
+    }
+    // ── exit upval commit: box everything into scratch slots FIRST (reads
+    // the homes), then run the cell_set calls (which clobber the homes).
+    let mut pending: Vec<(u16, usize)> = b.buffer.iter().map(|(&k, &s)| (k, s)).collect();
+    pending.sort_unstable();
+    for (k, &(_, sid)) in pending.iter().enumerate() {
+        if k as u16 >= callee_reg_count {
+            return Err("commit-slot-overflow");
+        }
+        let slot = reg_window + k as u16;
+        match b.slots[sid] {
+            Av::ImmI(_) | Av::ImmF(_) => {
+                let bits = lane_box_imm(b.slots[sid]);
+                b.steps.push(LaneStep::ImmToSlot { bits, slot });
+            }
+            Av::Int { h, lo, hi } => {
+                b.steps.push(LaneStep::BoxIntToSlot {
+                    s: h,
+                    slot,
+                    narrow: lo >= IV32.0 && hi <= IV32.1,
+                });
+            }
+            Av::F64 { h } => b.steps.push(LaneStep::BoxF64ToSlot { s: h, slot }),
+            Av::Callee { .. } => return Err("callee-value-escapes"),
+        }
+    }
+    for (k, &(idx, _)) in pending.iter().enumerate() {
+        let cell_bits = *upvals.get(&idx).ok_or("upval-cell-missing")?;
+        b.steps.push(LaneStep::CellCommit { cell_bits, slot: reg_window + k as u16 });
+    }
+    let n_ops = b.steps.len() as u16;
+    let n_guards = b.n_guards;
+    Ok(TypedLanePlan { steps: b.steps, n_ops, n_guards })
+}
+
+/// Emit a scheduled typed lane. Every guard/bail jumps to `fallback` (the
+/// unchanged per-call helper — a pure prefix; nothing is committed before the
+/// exit steps). `dst` is the caller's destination register.
+fn emit_typed_lane(
+    ops: &mut dynasmrt::x64::Assembler,
+    lane: &TypedLanePlan,
+    plan: &LeafInlinePlan,
+    dst: u16,
+    fallback: dynasmrt::DynamicLabel,
+) {
+    use crate::bytecode::BitwiseOp as B;
+    for step in &lane.steps {
+        match *step {
+            LaneStep::UpvalCall { cell_bits, park_slot } => {
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD cell_bits as i64
+                    ; mov rax, QWORD plan.cell_get as i64
+                    ; call rax
+                    ; mov rcx, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, rcx
+                    ; je => fallback
+                );
+                if let Some(slot) = park_slot {
+                    dynasm!(ops ; mov [rbx + dreg(slot)], rax);
+                }
+            }
+            LaneStep::UpvalBind { park_slot, d } => {
+                if let Some(slot) = park_slot {
+                    dynasm!(ops ; mov rax, [rbx + dreg(slot)]);
+                }
+                dynasm!(ops
+                    ; mov rcx, rax
+                    ; shr rcx, 48
+                    ; cmp ecx, INT_TAG_HI as i32
+                    ; jne => fallback
+                    ; movsxd Rq(d), eax
+                );
+            }
+            LaneStep::ParamLoad { slot, d } => {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(slot)]
+                    ; mov rcx, rax
+                    ; shr rcx, 48
+                    ; cmp ecx, INT_TAG_HI as i32
+                    ; jne => fallback
+                    ; movsxd Rq(d), eax
+                );
+            }
+            LaneStep::CalleeGuard { gidx, bits, ver } => {
+                // Reads the LIVE global slot (the value the guarded register
+                // was loaded from — no store op is admitted between the load
+                // and this guard, so the slot cannot have changed in between)
+                // and re-checks the same (bits, version) tuple the generic
+                // nested-Call arm checks. r13 is valid: the lane runs no
+                // allocating helper before this point.
+                dynasm!(ops
+                    ; mov rax, [r12 + (gidx as i32) * 8]
+                    ; mov rcx, QWORD bits as i64
+                    ; cmp rax, rcx
+                    ; jne => fallback
+                    ; mov ecx, eax
+                    ; mov eax, [r13 + rcx * 4]
+                    ; cmp eax, ver as i32
+                    ; jne => fallback
+                );
+            }
+            LaneStep::GImm { d, v } => {
+                dynasm!(ops ; mov Rq(d), QWORD v);
+            }
+            LaneStep::IAdd { d, a, b, sub } => match b {
+                LaneOp32::R(rb) => {
+                    if d == a {
+                        if sub {
+                            dynasm!(ops ; sub Rq(d), Rq(rb));
+                        } else {
+                            dynasm!(ops ; add Rq(d), Rq(rb));
+                        }
+                    } else if d == rb && !sub {
+                        dynasm!(ops ; add Rq(d), Rq(a));
+                    } else {
+                        dynasm!(ops ; mov rax, Rq(a));
+                        if sub {
+                            dynasm!(ops ; sub rax, Rq(rb));
+                        } else {
+                            dynasm!(ops ; add rax, Rq(rb));
+                        }
+                        dynasm!(ops ; mov Rq(d), rax);
+                    }
+                }
+                LaneOp32::I(imm) => {
+                    if d == a {
+                        if sub {
+                            dynasm!(ops ; sub Rq(d), imm);
+                        } else {
+                            dynasm!(ops ; add Rq(d), imm);
+                        }
+                    } else {
+                        dynasm!(ops ; mov rax, Rq(a));
+                        if sub {
+                            dynasm!(ops ; sub rax, imm);
+                        } else {
+                            dynasm!(ops ; add rax, imm);
+                        }
+                        dynasm!(ops ; mov Rq(d), rax);
+                    }
+                }
+            },
+            LaneStep::IAddImmRev { d, imm, b } => {
+                dynasm!(ops
+                    ; mov rax, QWORD imm
+                    ; sub rax, Rq(b)
+                    ; mov Rq(d), rax
+                );
+            }
+            LaneStep::Bit32 { d, a, b, op } => match op {
+                B::And | B::Or | B::Xor => {
+                    // In-place when the dst reuses a (or, commutatively, b);
+                    // otherwise via eax. The 32-bit op zeroes the upper half,
+                    // so the trailing movsxd restores the exact-i64
+                    // invariant.
+                    let inplace_rhs = match (a, b) {
+                        (LaneOp32::R(ra), _) if ra == d => Some(b),
+                        (_, LaneOp32::R(rb)) if rb == d => Some(a),
+                        _ => None,
+                    };
+                    if let Some(rhs) = inplace_rhs {
+                        match rhs {
+                            LaneOp32::R(r) => match op {
+                                B::And => dynasm!(ops ; and Rd(d), Rd(r)),
+                                B::Or => dynasm!(ops ; or Rd(d), Rd(r)),
+                                _ => dynasm!(ops ; xor Rd(d), Rd(r)),
+                            },
+                            LaneOp32::I(v) => match op {
+                                B::And => dynasm!(ops ; and Rd(d), v),
+                                B::Or => dynasm!(ops ; or Rd(d), v),
+                                _ => dynasm!(ops ; xor Rd(d), v),
+                            },
+                        }
+                        dynasm!(ops ; movsxd Rq(d), Rd(d));
+                    } else {
+                        match a {
+                            LaneOp32::R(r) => dynasm!(ops ; mov eax, Rd(r)),
+                            LaneOp32::I(v) => dynasm!(ops ; mov eax, v),
+                        }
+                        match b {
+                            LaneOp32::R(r) => match op {
+                                B::And => dynasm!(ops ; and eax, Rd(r)),
+                                B::Or => dynasm!(ops ; or eax, Rd(r)),
+                                _ => dynasm!(ops ; xor eax, Rd(r)),
+                            },
+                            LaneOp32::I(v) => match op {
+                                B::And => dynasm!(ops ; and eax, v),
+                                B::Or => dynasm!(ops ; or eax, v),
+                                _ => dynasm!(ops ; xor eax, v),
+                            },
+                        }
+                        dynasm!(ops ; movsxd Rq(d), eax);
+                    }
+                }
+                B::Shl | B::Shr | B::Ushr => {
+                    // Variable count goes through cl (rcx is scratch); the
+                    // value moves into d's low 32 first (a 32-bit mov, so
+                    // `>>>` results stay zero-extended for free — emitted
+                    // even when d == a for Ushr, where `mov r,r` IS the
+                    // zero-extension of the count-0 case).
+                    if let LaneOp32::R(rc) = b {
+                        dynasm!(ops ; mov ecx, Rd(rc));
+                    }
+                    match a {
+                        LaneOp32::R(ra) => {
+                            if ra != d || matches!(op, B::Ushr) {
+                                dynasm!(ops ; mov Rd(d), Rd(ra));
+                            }
+                        }
+                        LaneOp32::I(v) => dynasm!(ops ; mov Rd(d), v),
+                    }
+                    match b {
+                        LaneOp32::R(_) => match op {
+                            B::Shl => dynasm!(ops ; shl Rd(d), cl),
+                            B::Shr => dynasm!(ops ; sar Rd(d), cl),
+                            _ => dynasm!(ops ; shr Rd(d), cl),
+                        },
+                        LaneOp32::I(k) => {
+                            if k != 0 {
+                                match op {
+                                    B::Shl => dynasm!(ops ; shl Rd(d), k as i8),
+                                    B::Shr => dynasm!(ops ; sar Rd(d), k as i8),
+                                    _ => dynasm!(ops ; shr Rd(d), k as i8),
+                                }
+                            }
+                        }
+                    }
+                    if !matches!(op, B::Ushr) {
+                        dynasm!(ops ; movsxd Rq(d), Rd(d));
+                    }
+                }
+            },
+            LaneStep::SignExt { d, s } => {
+                dynasm!(ops ; movsxd Rq(d), Rd(s));
+            }
+            LaneStep::ZeroExt { d, s } => {
+                dynasm!(ops ; mov Rd(d), Rd(s));
+            }
+            LaneStep::Imul32 { d, a, b } => {
+                match a {
+                    LaneOp32::R(r) => dynasm!(ops ; mov eax, Rd(r)),
+                    LaneOp32::I(v) => dynasm!(ops ; mov eax, v),
+                }
+                match b {
+                    LaneOp32::R(r) => dynasm!(ops ; imul eax, Rd(r)),
+                    LaneOp32::I(v) => dynasm!(ops ; mov ecx, v ; imul eax, ecx),
+                }
+                dynasm!(ops ; movsxd Rq(d), eax);
+            }
+            LaneStep::ToI32F64 { d, s } => {
+                // cvttsd2si's indefinite (NaN/±Inf/|x| ≥ 2^63) fails the
+                // round-trip compare like every other out-of-i32 value, so
+                // one branch covers the whole bail set. Out-of-range means
+                // the modular ToInt32 wrap — the fallback re-runs the call
+                // with full semantics.
+                dynasm!(ops
+                    ; cvttsd2si rax, Rx(s)
+                    ; movsxd rcx, eax
+                    ; cmp rcx, rax
+                    ; jne => fallback
+                    ; mov Rq(d), rcx
+                );
+            }
+            LaneStep::CvtIX { d, s } => {
+                dynasm!(ops
+                    ; xorps Rx(d), Rx(d)
+                    ; cvtsi2sd Rx(d), Rq(s)
+                );
+            }
+            LaneStep::XImm { d, bits } => {
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; movq Rx(d), rax
+                );
+            }
+            LaneStep::FBin { d, a, b, op } => {
+                debug_assert!(matches!(op, DOp::Add | DOp::Mul) || d != b || d == a);
+                if d == a {
+                    match op {
+                        DOp::Add => dynasm!(ops ; addsd Rx(d), Rx(b)),
+                        DOp::Sub => dynasm!(ops ; subsd Rx(d), Rx(b)),
+                        DOp::Mul => dynasm!(ops ; mulsd Rx(d), Rx(b)),
+                        DOp::Div => dynasm!(ops ; divsd Rx(d), Rx(b)),
+                    }
+                } else if d == b {
+                    match op {
+                        DOp::Add => dynasm!(ops ; addsd Rx(d), Rx(a)),
+                        DOp::Mul => dynasm!(ops ; mulsd Rx(d), Rx(a)),
+                        // The builder never routes a non-commutative op here.
+                        _ => unreachable!("non-commutative FBin with d == b"),
+                    }
+                } else {
+                    dynasm!(ops ; movaps Rx(d), Rx(a));
+                    match op {
+                        DOp::Add => dynasm!(ops ; addsd Rx(d), Rx(b)),
+                        DOp::Sub => dynasm!(ops ; subsd Rx(d), Rx(b)),
+                        DOp::Mul => dynasm!(ops ; mulsd Rx(d), Rx(b)),
+                        DOp::Div => dynasm!(ops ; divsd Rx(d), Rx(b)),
+                    }
+                }
+            }
+            LaneStep::RetImm { bits } => {
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            LaneStep::RetInt { s, narrow } => {
+                emit_lane_box_int(ops, s, narrow, dst);
+            }
+            LaneStep::RetF64 { s } => {
+                dynasm!(ops
+                    ; movq rax, Rx(s)
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            LaneStep::BoxIntToSlot { s, slot, narrow } => {
+                emit_lane_box_int(ops, s, narrow, slot);
+            }
+            LaneStep::BoxF64ToSlot { s, slot } => {
+                dynasm!(ops
+                    ; movq rax, Rx(s)
+                    ; mov [rbx + dreg(slot)], rax
+                );
+            }
+            LaneStep::ImmToSlot { bits, slot } => {
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(slot)], rax
+                );
+            }
+            LaneStep::CellCommit { cell_bits, slot } => {
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD cell_bits as i64
+                    ; mov r8, [rbx + dreg(slot)]
+                    ; mov rax, QWORD plan.cell_set as i64
+                    ; call rax
+                );
+            }
+        }
+    }
+}
+
+/// Box the exact i64 in home `s` into window register `dst` with `Value::num`
+/// shaping: in-i32 narrows to the Int tag (proven at plan time when
+/// `narrow`), a wider exact integer converts to its (exact, ≤ 2^53) double.
+fn emit_lane_box_int(ops: &mut dynasmrt::x64::Assembler, s: u8, narrow: bool, dst: u16) {
+    if narrow {
+        dynasm!(ops
+            ; mov eax, Rd(s)
+            ; mov rcx, QWORD INT_TAG as i64
+            ; or rax, rcx
+            ; mov [rbx + dreg(dst)], rax
+        );
+    } else {
+        let wide = ops.new_dynamic_label();
+        let store = ops.new_dynamic_label();
+        dynasm!(ops
+            ; movsxd rax, Rd(s)
+            ; cmp rax, Rq(s)
+            ; jne => wide
+            ; mov eax, eax
+            ; mov rcx, QWORD INT_TAG as i64
+            ; or rax, rcx
+            ; jmp => store
+            ; => wide
+            ; xorps xmm0, xmm0
+            ; cvtsi2sd xmm0, Rq(s)
+            ; movq rax, xmm0
+            ; => store
+            ; mov [rbx + dreg(dst)], rax
+        );
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::*;
+
+    fn no_upvals() -> FxHashMap<u16, u64> {
+        FxHashMap::default()
+    }
+    fn no_consts() -> FxHashMap<u32, u64> {
+        FxHashMap::default()
+    }
+    fn no_nested() -> FxHashMap<usize, NestedGuard> {
+        FxHashMap::default()
+    }
+
+    /// The fail-closed magnitude bound: an add chain whose interval could
+    /// pass 2^53 must DECLINE (i64 adds would stay exact where f64 rounds).
+    /// Synthetic body — the bytecode compiler's per-statement temps push a
+    /// source-level chain this long past the leaf register cap before the
+    /// lane ever sees it, but the bound check must hold regardless of where
+    /// the body came from.
+    #[test]
+    fn add_chain_beyond_2p53_declines() {
+        let mut body = vec![Instr::Add { dst: 3, a: 1, b: 2 }];
+        for _ in 0..23 {
+            body.push(Instr::Add { dst: 3, a: 3, b: 3 });
+        }
+        body.push(Instr::Return { src: 3 });
+        let r = build_typed_lane(&body, 2, 2, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        assert_eq!(r.err(), Some("i53-overflow"));
+        // Control: one doubling fewer keeps every bound ≤ 2^53 and schedules.
+        let mut ok = vec![Instr::Add { dst: 3, a: 1, b: 2 }];
+        for _ in 0..21 {
+            ok.push(Instr::Add { dst: 3, a: 3, b: 3 });
+        }
+        ok.push(Instr::Return { src: 3 });
+        let r = build_typed_lane(&ok, 2, 2, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        assert!(r.is_ok(), "bounded chain declined: {:?}", r.err());
+    }
+
+    /// Register budget: seven simultaneously-live integers exceed the five
+    /// GPR homes — decline, never a silent spill.
+    #[test]
+    fn register_budget_declines() {
+        let body = vec![
+            Instr::Bitwise { dst: 7, a: 1, b: 2, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 8, a: 3, b: 4, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 9, a: 5, b: 6, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 10, a: 1, b: 3, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 11, a: 2, b: 5, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 12, a: 4, b: 6, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 7, a: 7, b: 8, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 7, a: 7, b: 9, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 7, a: 7, b: 10, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 7, a: 7, b: 11, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise { dst: 7, a: 7, b: 12, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Return { src: 7 },
+        ];
+        let r = build_typed_lane(&body, 6, 6, 10, 20, 16, &no_upvals(), &no_consts(), &no_nested());
+        assert_eq!(r.err(), Some("gpr-budget"));
+    }
+
+    /// A param the site never passes reads `undefined` — decline at plan
+    /// time (the generic path's NaN arithmetic takes over).
+    #[test]
+    fn unpassed_param_declines() {
+        let body = vec![Instr::Add { dst: 3, a: 1, b: 2 }, Instr::Return { src: 3 }];
+        let r = build_typed_lane(&body, 2, 0, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        assert_eq!(r.err(), Some("param-not-passed"));
+    }
+
+    /// Ops outside the closed numeric set decline (fail-closed).
+    #[test]
+    fn out_of_set_op_declines() {
+        let body = vec![Instr::Mod { dst: 3, a: 1, b: 2 }, Instr::Return { src: 3 }];
+        let r = build_typed_lane(&body, 2, 2, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        assert_eq!(r.err(), Some("op-outside-lane-set"));
+    }
+
+    /// Two f64 operands in ONE bitwise op each need their own ToInt32 temp —
+    /// the second allocation must not hand back the first temp's home (it is
+    /// untracked, so liveness alone would).
+    #[test]
+    fn two_f64_toint32_temps_are_distinct() {
+        let body = vec![
+            Instr::Div { dst: 3, a: 1, b: 2 },
+            Instr::Div { dst: 4, a: 2, b: 1 },
+            Instr::Bitwise { dst: 5, a: 3, b: 4, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Return { src: 5 },
+        ];
+        let r = build_typed_lane(&body, 2, 2, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        let lane = r.expect("two-div xor must schedule");
+        let temps: Vec<u8> = lane
+            .steps
+            .iter()
+            .filter_map(|s| match *s {
+                LaneStep::ToI32F64 { d, .. } => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(temps.len(), 2, "both operands convert");
+        assert_ne!(temps[0], temps[1], "shared temp home would clobber operand a");
+    }
+
+    /// The mulberry/ri shape (upval PRNG state + imul/shift mixing + f64
+    /// div + int wrap) schedules: the exact body the row's 4.45M activations
+    /// run, reduced to its op skeleton.
+    #[test]
+    fn mulberry_shape_schedules() {
+        let mut upvals = FxHashMap::default();
+        upvals.insert(0u16, Value::heap(1234).bits());
+        let mut consts = FxHashMap::default();
+        consts.insert(0u32, Value::num(4294967296.0).bits());
+        let body = vec![
+            Instr::UpvalGet { dst: 3, idx: 0 },
+            Instr::AddInt { dst: 4, a: 3, imm: 0x6D2B79F5u32 as i32, upd: false },
+            Instr::LoadInt { dst: 5, val: 0 },
+            Instr::Bitwise { dst: 4, a: 4, b: 5, op: crate::bytecode::BitwiseOp::Or },
+            Instr::UpvalSet { idx: 0, src: 4 },
+            Instr::UpvalGet { dst: 6, idx: 0 },
+            Instr::LoadInt { dst: 7, val: 15 },
+            Instr::Bitwise { dst: 8, a: 6, b: 7, op: crate::bytecode::BitwiseOp::Ushr },
+            Instr::Bitwise { dst: 9, a: 6, b: 8, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::MathOp { dst: 10, op: MathFn::Imul, arg_base: 8, argc: 2 },
+            Instr::LoadInt { dst: 11, val: 0 },
+            Instr::Bitwise { dst: 12, a: 10, b: 11, op: crate::bytecode::BitwiseOp::Ushr },
+            Instr::LoadConst { dst: 13, idx: 0 },
+            Instr::Div { dst: 14, a: 12, b: 13 },
+            Instr::Mul { dst: 15, a: 14, b: 1 },
+            Instr::LoadInt { dst: 16, val: 0 },
+            Instr::Bitwise { dst: 17, a: 15, b: 16, op: crate::bytecode::BitwiseOp::Or },
+            Instr::Return { src: 17 },
+        ];
+        let r = build_typed_lane(&body, 1, 1, 10, 20, 18, &upvals, &consts, &no_nested());
+        let lane = r.expect("the mulberry/ri op skeleton must schedule");
+        // Entry upval call+bind, the param guard: at least three guards.
+        assert!(lane.n_guards >= 3, "guards={}", lane.n_guards);
+        assert!(lane.n_ops > 0);
+        // The upval write must commit: a box step + a cell_set call.
+        assert!(lane.steps.iter().any(|s| matches!(s, LaneStep::CellCommit { .. })));
+    }
+}

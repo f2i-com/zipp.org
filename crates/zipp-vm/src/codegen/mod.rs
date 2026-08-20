@@ -350,6 +350,15 @@ pub struct LeafInlinePlan {
     /// keying conditions). `None` = today's identity+version guard,
     /// byte-identical emission (pinned by `ZIPP_NO_SPLICE_SLOTGEN=1`).
     pub slot_guard: Option<(u64, u32)>,
+    /// Typed splice lane: a fully scheduled register-resident emission for a
+    /// proven-numeric straight-line body (see `build_typed_lane`). `Some` ⇒
+    /// `emit_inline_leaf_call` emits the lane INSTEAD of the boxed per-op
+    /// loop; any entry tag-guard miss or range bail jumps to the per-call
+    /// helper fallback as a pure prefix (nothing committed — upval writes are
+    /// buffered in registers until the exit commit). `None` (any untypeable
+    /// op, an unprovable magnitude bound, a blown register budget, or
+    /// `ZIPP_NO_TYPED_SPLICE=1`) keeps the generic loop, byte-identical.
+    pub typed_lane: Option<TypedLanePlan>,
 }
 
 /// Identity guard for a nested inline. Same `(bits, version)` tuple the outer
@@ -802,6 +811,61 @@ pub(crate) fn splice_slotgen_enabled() -> bool {
         2 => false,
         _ => {
             let on = std::env::var_os("ZIPP_NO_SPLICE_SLOTGEN").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Typed splice lanes — `ZIPP_NO_TYPED_SPLICE=1` pins every leaf plan's
+/// `typed_lane` to `None` (the boxed per-op splice loop, byte-identical to
+/// the prior emission). Read at plan time only.
+pub(crate) fn typed_splice_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TYPED_SPLICE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Stored-global live-range narrowing + mixed-role temp splitting on the
+/// INT-GPR region tier — `ZIPP_NO_GLOB_RANGE=1` pins every stored global to
+/// its B96 permanent whole-region home and every recycled temp to one
+/// contiguous interval (the pre-wave linear-scan allocation, byte-identical).
+/// Read at plan time only, and only for plans routed exclusively into the
+/// GPR emitter (`admit_dv || share_homes`).
+pub(crate) fn glob_range_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_GLOB_RANGE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Chain-link fast helper — `ZIPP_NO_CHAIN_FAST=1` keeps every
+/// `StrConcatChain` emission on `jit_concat_chain` with an unconditional
+/// pinned-pointer refetch (byte-identical to the prior emission). Read at
+/// emit time only.
+pub(crate) fn chain_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CHAIN_FAST").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

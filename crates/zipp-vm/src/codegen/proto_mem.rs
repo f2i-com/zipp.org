@@ -1454,32 +1454,85 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::StrConcatChain { dst, a, b } => {
-                // W11 (B124) fused chain link (`jit_concat_chain` →
-                // `Vm::add_values_chain`, the interpreter's own entry).
-                // Allocates ⇒ refetch r13/r14 when pinned. CAN run user code
-                // (object RHS ToPrimitive via the `add_values` fallback), so
-                // a throw returns CALL_THREW (pending_throw materialized) →
-                // bail = UNWIND, never a redo that would re-run the side
-                // effects. SELF_CALL_DEOPT is never returned by this helper;
-                // the check is kept for uniformity with its siblings.
-                dynasm!(ops
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, [rbx + dreg(a)]            // acc bits
-                    ; mov r8, [rbx + dreg(b)]             // leaf bits
-                    ; mov rax, QWORD crate::vm::jit_concat_chain as usize as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov r10, QWORD CALL_THREW as i64
-                    ; cmp rax, r10
-                    ; je => bail                          // threw → unwind, NOT redo
-                    ; mov [rbx + dreg(dst)], rax
-                );
-                if let Some((vb, icb)) = refetch {
-                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                if crate::codegen::chain_fast_enabled() {
+                    // Fused chain link via the single-dispatch fast sibling
+                    // `jit_concat_chain_fast` (value-identical to
+                    // `Vm::add_values_chain`, the interpreter's own entry);
+                    // r9d carries the first-link capacity hint (0 = none).
+                    // `result == old acc bits && old acc heap-tagged` proves
+                    // the in-place arm ran (no alloc, no user code) and
+                    // licenses skipping the r13/r14 refetch — the heap-tag
+                    // test is load-bearing: a numeric accumulator can get its
+                    // own bits back from the generic tail AFTER user coercion
+                    // code ran. A throw returns CALL_THREW (pending_throw
+                    // materialized) → bail = UNWIND, never a redo;
+                    // SELF_CALL_DEOPT is never returned, the check is kept
+                    // for uniformity with the siblings.
+                    let hint = super::region_mem::chain_capacity_hint(
+                        &proto.code,
+                        ip,
+                        a,
+                        proto.code.len() - 1,
+                    );
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(a)]            // acc bits
+                        ; mov r8, [rbx + dreg(b)]             // leaf bits
+                        ; mov r9d, hint as i32                // capacity hint
+                        ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // threw → unwind, NOT redo
+                        ; mov r10, [rbx + dreg(a)]            // pre-call acc bits (dst not yet stored)
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some((vb, icb)) = refetch {
+                        let refetch_lbl = ops.new_dynamic_label();
+                        let skip = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; cmp rax, r10
+                            ; jne => refetch_lbl
+                            ; shr r10, 48
+                            ; cmp r10d, TAG_HEAP_HI as i32
+                            ; je => skip                      // in-place arm: no alloc, no user code
+                            ; => refetch_lbl
+                        );
+                        emit_refetch_pinned(&mut ops, vb, Some(icb));
+                        dynasm!(ops ; => skip);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else {
+                    // W11 (B124) fused chain link (`jit_concat_chain` →
+                    // `Vm::add_values_chain`, the interpreter's own entry).
+                    // Allocates ⇒ refetch r13/r14 when pinned. CAN run user code
+                    // (object RHS ToPrimitive via the `add_values` fallback), so
+                    // a throw returns CALL_THREW (pending_throw materialized) →
+                    // bail = UNWIND, never a redo that would re-run the side
+                    // effects. SELF_CALL_DEOPT is never returned by this helper;
+                    // the check is kept for uniformity with its siblings.
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(a)]            // acc bits
+                        ; mov r8, [rbx + dreg(b)]             // leaf bits
+                        ; mov rax, QWORD crate::vm::jit_concat_chain as usize as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // threw → unwind, NOT redo
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(&mut ops, vb, Some(icb));
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
-                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Return { src } => {
                 // Whole-function return: NO_BAIL + result Value (UNLIKE the region,

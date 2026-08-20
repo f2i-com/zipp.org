@@ -1291,6 +1291,178 @@ pub(crate) extern "win64" fn jit_concat_chain(
     }
 }
 
+/// Re-seat a chain builder into a `cap`-byte buffer at the chain's FIRST link.
+/// A no-op at the last link, without a hint, or on a builder already past the
+/// estimate. Content-preserving — only the capacity changes — and it allocates
+/// on the Rust heap only, never on the VM heap.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn chain_reseat(js: &mut crate::heap::JsStr, cap: usize, last: bool) {
+    if last || cap == 0 || js.as_bytes().len() >= cap {
+        return;
+    }
+    let mut buf = Vec::with_capacity(cap);
+    buf.extend_from_slice(js.as_bytes());
+    *js = crate::heap::JsStr::from_wtf8(buf);
+    chainstats::reseat();
+}
+
+/// Hand back a FINISHED chain string's unused capacity (at the chain's last
+/// link). Fires only when the estimate over-reserved on both counts — at
+/// least 32 bytes AND at least half the buffer — which bounds the retained
+/// amplification by the Vec-doubling ladder the estimate replaced, and leaves
+/// a builder that outgrew its estimate (`len * 2 > cap`) untouched. The move
+/// mirrors the reseat: a fresh exactly-sized buffer, the same bytes, Rust
+/// heap only. One small copy per completed chain, once.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn chain_trim(js: &mut crate::heap::JsStr, cap: usize) {
+    let len = js.as_bytes().len();
+    if len * 2 > cap || cap - len < 32 {
+        return;
+    }
+    let mut buf = Vec::with_capacity(len);
+    buf.extend_from_slice(js.as_bytes());
+    *js = crate::heap::JsStr::from_wtf8(buf);
+    chainstats::trim();
+}
+
+/// `dst = a + b` for one `StrConcatChain` link — the single-dispatch fast
+/// sibling of `jit_concat_chain` (`ZIPP_NO_CHAIN_FAST=1` restores the
+/// sibling). When `a` is the chain's mutable builder (a non-interned flat
+/// `Str` — always the fresh, dead result of the previous link, per the
+/// emitter's licence on the op) and the leaf is an int or a flat `Str` at a
+/// DIFFERENT slot, the append happens here with ONE heap lookup and no
+/// take/put `mem::replace` dance. Every other shape falls to the full
+/// pairwise `+` (`Vm::add_values`), inheriting ToPrimitive order, the Symbol
+/// TypeError and rope asymptotics unchanged — results are value-identical to
+/// `Vm::add_values_chain` (the interpreter arm) for every operand pair.
+///
+/// `cap_hint` (see `chain_capacity_hint`) is a byte-capacity estimate for the
+/// finished chain, tagged with `CHAIN_HINT_LAST` at the chain's last link: at
+/// the FIRST link the builder is re-seated once into a buffer of that
+/// capacity instead of climbing the realloc ladder link by link, and at the
+/// LAST link — once the string is finished — `chain_trim` hands back what the
+/// estimate over-reserved. Both halves are needed: nothing else in the engine
+/// ever shrinks a `JsStr`'s buffer, so without the trim the reseat's slack is
+/// retained for the string's whole lifetime (a 26-leaf chain of one-char
+/// leaves holding a 256-byte buffer for 25 bytes of content measured at
+/// +194 MB of steady-state RSS over 1.2M live strings) — and the allocation
+/// counters are blind to it, since the buffer is the JsStr's own Rust `Vec`
+/// and `vm.heap.len()` never moves. Content-preserving in both directions — a
+/// wrong hint only changes capacity. The reseat sits INSIDE the two in-place
+/// arms: a link that falls to the generic tail builds a fresh string, so
+/// pre-sizing the old builder there would only have thrown the buffer away.
+///
+/// CONTRACT (the emitters' same-bits refetch elision rests on it): `a`'s own
+/// bits with `a` heap-tagged come back ONLY from the two in-place arms,
+/// which allocate nothing on the VM heap and run no user code — so
+/// `result == acc && acc is heap` proves the pinned pointers (r13/r14/TA
+/// snapshots) are still valid. The generic tail is `add_values`, never
+/// `str_append_inplace`: the latter's materialise arm can allocate a
+/// temporary heap string and still hand back `a`'s bits, which would break
+/// the elision. `add_values` on a heap `a` always produces a fresh index
+/// (pinned by `add_values_never_returns_lhs_index` in coerce.rs and the
+/// debug_assert below).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_concat_chain_fast(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+    cap_hint: u64,
+) -> u64 {
+    let a = Value::from_bits(a_bits);
+    let b = Value::from_bits(b_bits);
+    // SAFETY: exclusive view to mutate/allocate the string; the running region
+    // holds no conflicting borrow (reg file / globals base only).
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    // The chain's last link asks for the trim; every other hint is a capacity.
+    let last = cap_hint & crate::codegen::CHAIN_HINT_LAST as u64 != 0;
+    let cap = (cap_hint & !(crate::codegen::CHAIN_HINT_LAST as u64)) as usize;
+    if a.is_heap() && a.heap_index() > crate::heap::INTERN_EMPTY {
+        let ai = a.heap_index();
+        #[cfg(debug_assertions)]
+        let heap_len = vm.heap.len();
+        // ── in-place arms ── NO Vm::heap allocation is allowed inside either
+        // arm: the builder reference (and, in the str arm, the leaf's raw byte
+        // pointer) must not cross a slot-moving collection. The reseat, the
+        // trim and the buffer growth are all the JsStr's own Rust Vec — they
+        // never touch the VM heap (which is what the debug asserts pin).
+        if b.is_int() {
+            if let HeapObj::Str(js) = vm.heap.get_mut(ai) {
+                chain_reseat(js, cap, last);
+                let n = b.as_int();
+                if (0..=9).contains(&n) {
+                    js.push_ascii(b'0' + n as u8);
+                } else {
+                    let (buf, start) = super::coerce::fmt_i32_buf(n);
+                    js.push_wtf8(&buf[start..]);
+                }
+                if last {
+                    chain_trim(js, cap);
+                }
+                #[cfg(debug_assertions)]
+                debug_assert_eq!(heap_len, vm.heap.len(), "in-place int arm allocated");
+                chainstats::fast_int();
+                return a_bits;
+            }
+        } else if b.is_heap() && b.heap_index() != ai {
+            // The LEAF is read FIRST, and its shared borrow of the heap ends
+            // before the builder's `&mut` is taken. The order is load-bearing,
+            // not tidiness: with the builder's reference taken first, reaching
+            // the leaf reborrows the SAME allocation (the heap's slot vector)
+            // and invalidates the builder's tag under stacked borrows, so the
+            // push would write through a dead pointer. This way round the
+            // later `&mut` retags the slot vector, a DIFFERENT allocation from
+            // the leaf's byte buffer (a JsStr owns its Vec), so the leaf
+            // pointer keeps its provenance.
+            let leaf = match vm.heap.get(b.heap_index()) {
+                HeapObj::Str(vs) => {
+                    let bytes = vs.as_bytes();
+                    Some((bytes.as_ptr(), bytes.len()))
+                }
+                _ => None, // rope leaf → generic (O(1) rope links preserved)
+            };
+            if let Some((ptr, len)) = leaf {
+                if let HeapObj::Str(js) = vm.heap.get_mut(ai) {
+                    chain_reseat(js, cap, last);
+                    // SAFETY: distinct slots (`b.heap_index() != ai`), and a
+                    // JsStr owns its byte Vec, so the leaf's buffer and the
+                    // builder's are disjoint allocations; nothing since the
+                    // leaf pointer was taken has allocated on the VM heap or
+                    // written to the leaf, so its slot cannot have moved.
+                    unsafe { js.push_wtf8(std::slice::from_raw_parts(ptr, len)) };
+                    if last {
+                        chain_trim(js, cap);
+                    }
+                    #[cfg(debug_assertions)]
+                    debug_assert_eq!(heap_len, vm.heap.len(), "in-place str arm allocated");
+                    chainstats::fast_str();
+                    return a_bits;
+                }
+            }
+        }
+    }
+    chainstats::fallback();
+    // The full pairwise `+` — exactly what `add_values_chain` reduces to when
+    // its builder check fails. A throw is materialized into `pending_throw`,
+    // never redone — see `jit_concat_chain`.
+    match vm.add_values(a, b) {
+        Ok(v) => {
+            debug_assert!(
+                v.bits() != a_bits || !a.is_heap(),
+                "generic `+` returned a heap accumulator's own bits — the \
+                 same-bits refetch elision premise is broken"
+            );
+            v.bits()
+        }
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
 /// `dst = a + b` for the OSR region's `StrAppendInPlace` op: appends into `a`'s
 /// buffer in place when uniquely owned (see `str_append_inplace`). Deopts
 /// (SELF_CALL_DEOPT) when the appended value needs real ToPrimitive — a user
@@ -1487,6 +1659,91 @@ pub(crate) mod crossstats {
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use crossstats::dump as cross_fill_stats;
+
+/// `ZIPP_ICSTATS=1` — chain-link fast-helper counters: `fast_int`/`fast_str`
+/// count `StrConcatChain` links served by `jit_concat_chain_fast`'s in-place
+/// arms (one heap lookup, no VM alloc, no take/put dance); `fallback` counts
+/// links that fell to the full pairwise `+`; `reseat`/`trim` count the
+/// capacity-hint buffer moves at a chain's first and last link. Off, one
+/// relaxed atomic load on a path that already made an FFI helper call.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) mod chainstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static FAST_INT: AtomicU64 = AtomicU64::new(0);
+    static FAST_STR: AtomicU64 = AtomicU64::new(0);
+    static FALLBACK: AtomicU64 = AtomicU64::new(0);
+    static RESEAT: AtomicU64 = AtomicU64::new(0);
+    static TRIM: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => init(),
+        }
+    }
+
+    #[cold]
+    fn init() -> bool {
+        let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+        ON.store(v, Ordering::Relaxed);
+        v == 1
+    }
+
+    /// One chain link served by the in-place int-leaf arm.
+    #[inline]
+    pub(crate) fn fast_int() {
+        if enabled() {
+            FAST_INT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One chain link served by the in-place flat-Str-leaf arm.
+    #[inline]
+    pub(crate) fn fast_str() {
+        if enabled() {
+            FAST_STR.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One chain link that fell to the full pairwise `+`.
+    #[inline]
+    pub(crate) fn fallback() {
+        if enabled() {
+            FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One first-link builder re-seated into a capacity-hinted buffer.
+    #[inline]
+    pub(crate) fn reseat() {
+        if enabled() {
+            RESEAT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// One finished chain string handed its over-reserved capacity back.
+    #[inline]
+    pub(crate) fn trim() {
+        if enabled() {
+            TRIM.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// `(fast_int, fast_str, fallback, reseat, trim)`
+    pub fn dump() -> (u64, u64, u64, u64, u64) {
+        (
+            FAST_INT.load(Ordering::Relaxed),
+            FAST_STR.load(Ordering::Relaxed),
+            FALLBACK.load(Ordering::Relaxed),
+            RESEAT.load(Ordering::Relaxed),
+            TRIM.load(Ordering::Relaxed),
+        )
+    }
+}
 
 pub(crate) mod callstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -3177,4 +3434,236 @@ pub(crate) fn parse_bigint_str(s: &str) -> Option<crate::vm::bigint::BigVal> {
         }
     };
     Some(if neg { v.neg() } else { v })
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod chain_fast_tests {
+    use super::*;
+
+    /// The regex-log-scan gen loop's shape (the fast helper's target row):
+    /// int and const-string chain leaves plus Tier-C call leaves.
+    const GEN_SRC: &str = r#"
+        "use strict";
+        function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+        var seed = 12345;
+        function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+        function ri(n) { return (rnd() * n) | 0; }
+        var lens = 0;
+        for (var i = 0; i < 30000; i++) {
+            var line = '#' + ri(9000) + ' [' + pad2(ri(24)) + ':' + pad2(ri(60)) + ']' +
+                       ' status=' + ri(600) + ' bytes=' + ri(100000) + ' ms=' + ri(2000);
+            lens += line.length;
+        }
+        console.log(lens);
+    "#;
+
+    fn fixture(src: &str) -> (crate::bytecode::Program, ()) {
+        let ast = crate::front::parse_script(src).expect("source parses");
+        (crate::compile::compile_program(&ast, src).expect("source compiles"), ())
+    }
+
+    /// The non-negotiable pins, called straight through the helper's win64
+    /// entry: a same-index leaf (`a += a` shape) and an interned or rope
+    /// accumulator take the generic path (fresh index — no raw split borrow);
+    /// the in-place arms return the accumulator's own bits WITHOUT any VM
+    /// heap allocation (the same-bits refetch-elision premise); an exotic
+    /// leaf on a mutable builder returns a fresh index; the capacity hint
+    /// preserves content; WTF-8 seams and unit accounting stay exact.
+    #[test]
+    fn chain_fast_hazard_pins() {
+        let (program, ()) = fixture("var x = 0;");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+        let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;
+
+        // In-place int arm: same bits, content exact, NO VM-heap alloc.
+        let acc = Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("ab".into()))));
+        let len0 = vm.heap.len();
+        let r = jit_concat_chain_fast(vm_ptr, acc.bits(), Value::int(42).bits(), 0);
+        assert_eq!(r, acc.bits(), "int leaf must append in place");
+        assert_eq!(vm.heap.len(), len0, "in-place int arm allocated");
+        assert_eq!(vm.display(acc), "ab42");
+        let r = jit_concat_chain_fast(vm_ptr, acc.bits(), Value::int(-7).bits(), 0);
+        assert_eq!(r, acc.bits());
+        assert_eq!(vm.display(acc), "ab42-7");
+
+        // In-place str arm (distinct slot): same bits, no VM-heap alloc.
+        let leaf =
+            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("cd".into()))));
+        let len0 = vm.heap.len();
+        let r = jit_concat_chain_fast(vm_ptr, acc.bits(), leaf.bits(), 0);
+        assert_eq!(r, acc.bits(), "distinct flat-Str leaf must append in place");
+        assert_eq!(vm.heap.len(), len0, "in-place str arm allocated");
+        assert_eq!(vm.display(acc), "ab42-7cd");
+        assert_eq!(vm.display(leaf), "cd", "leaf must be untouched");
+
+        // Same-index leaf (`a += a`): generic path, FRESH index, both intact.
+        let alias =
+            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("xy".into()))));
+        let r = jit_concat_chain_fast(vm_ptr, alias.bits(), alias.bits(), 0);
+        assert_ne!(r, alias.bits(), "self-alias must not take the split-borrow arm");
+        let rv = Value::from_bits(r);
+        assert_eq!(vm.display(rv), "xyxy");
+        assert_eq!(vm.display(alias), "xy");
+
+        // Interned accumulator (single-char slot ≤ INTERN_EMPTY): generic
+        // path, fresh result, the interned slot never mutated.
+        let interned = Value::heap(b'x' as u32);
+        assert_eq!(vm.display(interned), "x");
+        let r = jit_concat_chain_fast(vm_ptr, interned.bits(), Value::int(5).bits(), 0);
+        assert_ne!(r, interned.bits(), "interned accumulator must not grow in place");
+        assert_eq!(vm.display(Value::from_bits(r)), "x5");
+        assert_eq!(vm.display(interned), "x");
+
+        // Rope accumulator: generic path (rope semantics inherited).
+        let li = vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("aaa".into())));
+        let ri = vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("bbb".into())));
+        let rope = Value::heap(vm.heap.alloc_cons(li, ri, 6));
+        let r = jit_concat_chain_fast(vm_ptr, rope.bits(), Value::int(5).bits(), 0);
+        assert_ne!(r, rope.bits(), "rope accumulator must fall through");
+        assert_eq!(vm.display(Value::from_bits(r)), "aaabbb5");
+
+        // Exotic leaf (double) on a mutable builder: generic path, fresh
+        // index (the debug_assert premise in the helper runs here too).
+        let acc2 =
+            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("n=".into()))));
+        let r = jit_concat_chain_fast(vm_ptr, acc2.bits(), Value::num(3.5).bits(), 0);
+        assert_ne!(r, acc2.bits(), "exotic leaf must take the generic path");
+        assert_eq!(vm.display(Value::from_bits(r)), "n=3.5");
+        assert_eq!(vm.display(acc2), "n=", "builder untouched by the generic path");
+
+        // Capacity hint: content-preserving re-seat, then in-place appends.
+        let acc3 =
+            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("ts".into()))));
+        let r = jit_concat_chain_fast(vm_ptr, acc3.bits(), Value::int(7).bits(), 256);
+        assert_eq!(r, acc3.bits());
+        assert_eq!(vm.display(acc3), "ts7");
+
+        // LAST-link hint: the trim stays on the in-place arm, preserves
+        // content, and allocates nothing on the VM heap (the same-bits
+        // refetch-elision premise covers it too). Exercised on an ASCII
+        // builder and on a lone-surrogate one, where the reconstruct has to
+        // recover `units`/`wellformed` from the bytes.
+        let last = crate::codegen::CHAIN_HINT_LAST as u64 | 256;
+        let len0 = vm.heap.len();
+        let r = jit_concat_chain_fast(vm_ptr, acc3.bits(), Value::int(8).bits(), last);
+        assert_eq!(r, acc3.bits(), "the last-link trim must stay in place");
+        assert_eq!(vm.heap.len(), len0, "the trim allocated on the VM heap");
+        assert_eq!(vm.display(acc3), "ts78");
+        let acc4 = Value::heap(
+            vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xD83D))),
+        );
+        let r = jit_concat_chain_fast(vm_ptr, acc4.bits(), Value::int(1).bits(), last);
+        assert_eq!(r, acc4.bits());
+        match vm.heap.get(acc4.heap_index()) {
+            HeapObj::Str(t) => {
+                assert_eq!(t.units(), 2, "lone surrogate + '1' is two units");
+                assert!(!t.is_wellformed(), "a lone surrogate stays ill-formed");
+                assert!(!t.is_ascii());
+            }
+            other => panic!("trimmed builder degenerated to {other:?}"),
+        }
+
+        // Non-ASCII + WTF-8 seam: a lone high surrogate builder and a lone
+        // low surrogate leaf canonicalize into ONE astral pair, exact units.
+        let hi = Value::heap(
+            vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xD83D))),
+        );
+        let lo = Value::heap(
+            vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xDE00))),
+        );
+        let len0 = vm.heap.len();
+        let r = jit_concat_chain_fast(vm_ptr, hi.bits(), lo.bits(), 0);
+        assert_eq!(r, hi.bits());
+        assert_eq!(vm.heap.len(), len0);
+        match vm.heap.get(hi.heap_index()) {
+            HeapObj::Str(s) => {
+                assert_eq!(s.units(), 2, "astral pair is two UTF-16 units");
+                assert!(s.is_wellformed(), "seam must canonicalize");
+                assert_eq!(s.as_bytes(), "\u{1F600}".as_bytes());
+            }
+            other => panic!("builder degenerated to {other:?}"),
+        }
+        let snowman =
+            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("é☃".into()))));
+        let r = jit_concat_chain_fast(vm_ptr, hi.bits(), snowman.bits(), 0);
+        assert_eq!(r, hi.bits());
+        assert_eq!(vm.display(hi), "\u{1F600}é☃");
+
+        // Non-heap accumulator numeric coincidence: the generic tail CAN
+        // legitimately return the accumulator's own (non-heap) bits — the
+        // reason the emitted elision also requires the heap tag.
+        let r = jit_concat_chain_fast(vm_ptr, Value::int(5).bits(), Value::int(0).bits(), 0);
+        assert_eq!(r, Value::int(5).bits());
+        assert!(!Value::from_bits(r).is_heap());
+    }
+
+    /// Child half of the engagement census: runs the gen shape hot and
+    /// prints the fast-helper counters (latched on by the parent's
+    /// `ZIPP_ICSTATS=1`; prints zeros when run standalone).
+    #[test]
+    fn chain_fast_gen_child() {
+        let out = crate::run(GEN_SRC).expect("gen source compiles");
+        assert!(out.error.is_none(), "gen child error: {:?}", out.error);
+        let (fi, fs, fb, rs, tr) = chainstats::dump();
+        println!("CHAINSTATS fast_int={fi} fast_str={fs} fallback={fb} reseat={rs} trim={tr}");
+    }
+
+    /// Engagement census: the compiled chain arms must actually route links
+    /// through `jit_concat_chain_fast`'s in-place arms on the gen shape
+    /// (~3 int + ~8 str links/line x 30k lines, minus interpreter warmup).
+    #[test]
+    fn chain_fast_engages_on_gen_shape() {
+        let exe = std::env::current_exe().expect("test exe path");
+        let out = std::process::Command::new(&exe)
+            .arg("chain_fast_gen_child")
+            .arg("--nocapture")
+            .env("ZIPP_ICSTATS", "1")
+            .output()
+            .expect("spawn the test binary");
+        assert!(
+            out.status.success(),
+            "census child failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with("CHAINSTATS"))
+            .unwrap_or_else(|| panic!("no CHAINSTATS line in:\n{stdout}"));
+        let field = |k: &str| -> u64 {
+            line.split_whitespace()
+                .find_map(|p| p.strip_prefix(k))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("bad CHAINSTATS field {k} in: {line}"))
+        };
+        let (fi, fs, rs) = (field("fast_int="), field("fast_str="), field("reseat="));
+        let tr = field("trim=");
+        assert!(fi > 50_000, "int-leaf fast arm barely engaged: fast_int={fi}\n{line}");
+        assert!(fs > 100_000, "str-leaf fast arm barely engaged: fast_str={fs}\n{line}");
+        assert!(rs > 10_000, "first-link capacity hint barely engaged: reseat={rs}\n{line}");
+        // Every re-seated chain must also reach its LAST link and give the
+        // slack back — a reseat count far above the trim count is the
+        // permanent-over-allocation regression (measured at +194 MB of
+        // retained RSS on the 26-leaf shape when the trim was missing).
+        assert!(tr > 10_000, "last-link trim barely engaged: trim={tr}\n{line}");
+        assert!(
+            tr * 2 > rs,
+            "most re-seated chains never trimmed: reseat={rs} trim={tr}\n{line}"
+        );
+    }
+
+    /// Evidence harness for the real bench row; not part of the suite.
+    /// `ZIPP_ICSTATS=1 cargo test --release -p zipp-vm --lib chain_fast_row_counters -- --ignored --nocapture`
+    #[test]
+    #[ignore = "evidence harness: run explicitly with ZIPP_ICSTATS=1"]
+    fn chain_fast_row_counters() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/real/regex-log-scan.js");
+        let src = std::fs::read_to_string(path).expect("bench row readable");
+        let out = crate::run(&src).expect("row compiles");
+        assert!(out.error.is_none(), "row error: {:?}", out.error);
+        let (fi, fs, fb, rs, tr) = chainstats::dump();
+        println!("CHAINSTATS row fast_int={fi} fast_str={fs} fallback={fb} reseat={rs} trim={tr}");
+    }
 }

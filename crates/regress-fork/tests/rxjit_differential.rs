@@ -252,6 +252,109 @@ fn rx_session_bt_grow() {
     assert_eq!(bails, 0, "the grow-and-retry loop must not bail here");
 }
 
+/// The session entry probes read-only (rxjit.rs `acquire_if_compiled`): a
+/// scan that attempts zero positions must not advance the compile threshold,
+/// while real attempts still tick it — and the match streams with the gate on
+/// must be identical to the entry-tick path's. One test function on purpose:
+/// the acqgate force flag is process-global and phases must not race it.
+#[test]
+fn rx_acqgate_threshold_and_streams() {
+    // Phase A: a compile-eligible pattern whose prefix search finds no
+    // candidate. Zero attempts per scan, so under the gate the slot must
+    // stay cold no matter how many scans run. Read-only probing makes this
+    // deterministic even while other tests toggle the jit/session forces.
+    regress::__rx_acqgate_force(Some(true));
+    regress::__rx_scansession_force(Some(true));
+    let re = Regex::with_flags(r"x\d\d", "g").unwrap();
+    let blank = "a".repeat(256);
+    let sessions_before = regress::rx_session_stats();
+    for _ in 0..200 {
+        assert_eq!(run_all(&re, &blank, 0), "");
+    }
+    let gated_sessions = regress::rx_session_stats() - sessions_before;
+    assert!(
+        !re.__rxjit_is_compiled(),
+        "zero-attempt scans advanced the compile threshold through the gate"
+    );
+
+    // Gate-off contrast (the ZIPP_NO_RX_ACQGATE semantics): the same scans
+    // tick the counter once per ENTRY, so a regex that never attempts still
+    // compiles — and then opens a session per zero-attempt scan. Loop with
+    // slack: concurrent tests may transiently force the jit or session off.
+    regress::__rx_acqgate_force(Some(false));
+    let ungated = Regex::with_flags(r"x\d\d", "g").unwrap();
+    let sessions_before = regress::rx_session_stats();
+    for _ in 0..10_000 {
+        assert_eq!(run_all(&ungated, &blank, 0), "");
+        if ungated.__rxjit_is_compiled() {
+            break;
+        }
+    }
+    assert!(
+        ungated.__rxjit_is_compiled(),
+        "gate off no longer reproduces the per-entry counter tick"
+    );
+    // Once compiled, every further zero-attempt scan opens a session.
+    for _ in 0..20 {
+        assert_eq!(run_all(&ungated, &blank, 0), "");
+    }
+    let ungated_sessions = regress::rx_session_stats() - sessions_before;
+    // Deterministic when run filtered to this test alone (no force races):
+    // the ungated twin compiles on entry ticks alone and sessions its
+    // zero-attempt scans; the gated one opens none.
+    println!(
+        "acqgate zero-attempt sessions: gated {gated_sessions}, ungated {ungated_sessions}"
+    );
+    regress::__rx_acqgate_force(Some(true));
+
+    // Phase B: the SAME instance compiles once scans elsewhere actually
+    // attempt (one failing attempt per scan at the 'x'). Loop past the
+    // threshold with slack: concurrent tests may force the jit off for
+    // brief windows, skipping some counter ticks.
+    let attempting = format!("{}x1a", "a".repeat(8));
+    for _ in 0..10_000 {
+        assert_eq!(run_all(&re, &attempting, 0), "");
+        if re.__rxjit_is_compiled() {
+            break;
+        }
+    }
+    assert!(
+        re.__rxjit_is_compiled(),
+        "attempting scans no longer cross the compile threshold under the gate"
+    );
+
+    // Phase C: gate on/off byte-identity of match streams over the corpus,
+    // cold (compiles mid-stream) and warm (all-session) alike.
+    regress::__rxjit_force(Some(true));
+    let mut compared = 0usize;
+    for (p, f, s) in &corpus() {
+        let compile = || Regex::with_flags(p.as_str(), f.as_str());
+        let (Ok(off_re), Ok(on_re)) = (compile(), compile()) else {
+            continue;
+        };
+        regress::__rx_acqgate_force(Some(false));
+        let off_cold = run_all(&off_re, s, 0);
+        let off_warm = run_all(&off_re, s, 0);
+        regress::__rx_acqgate_force(Some(true));
+        let on_cold = run_all(&on_re, s, 0);
+        let on_warm = run_all(&on_re, s, 0);
+        assert_eq!(
+            off_cold, on_cold,
+            "acqgate divergence (cold) on /{p}/{f} over {s:?}"
+        );
+        assert_eq!(
+            off_warm, on_warm,
+            "acqgate divergence (warm) on /{p}/{f} over {s:?}"
+        );
+        compared += 1;
+    }
+    regress::__rx_acqgate_force(None);
+    regress::__rx_scansession_force(None);
+    regress::__rxjit_force(None);
+    println!("acqgate differential: {compared} cases");
+    assert!(compared > 300, "corpus unexpectedly small: {compared}");
+}
+
 /// Compare against node's matchAll for the same corpus where flags allow.
 #[test]
 fn rxjit_differential_vs_node() {

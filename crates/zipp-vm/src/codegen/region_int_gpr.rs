@@ -330,6 +330,12 @@ fn gpr_home_map(
             _ => return Err(false), // not a shape this emitter hoists
         }
     }
+    // Slot-materialized consts read as immediates too — but their defining op
+    // is EMITTED (a boxed store to the frame slot), not skipped, and they own
+    // no home (see `RegionPlan::slot_consts`).
+    for (&r, &v) in plan.slot_consts.iter() {
+        hoist_c.insert(r, v);
+    }
     // Homes that need a GPR: every home some NON-hoisted reg or a global uses.
     let mut used: Vec<u8> = Vec::new();
     let mut push = |x: u8, used: &mut Vec<u8>| {
@@ -520,8 +526,19 @@ fn gpr_home_map(
             // non-elided kill def, which types the reg — the arm could only
             // fire on a plan shape the planner cannot produce, and admitting
             // it on faith was a latent stale-slot hazard.)
+            // A glob-range plan (`narrow_globs` non-empty — only ever built
+            // for this emitter) reaches this check on the NON-spill attempts
+            // too: the narrowed intervals fit the pool where the pre-wave
+            // plan overflowed first. The Bool-home admission argument above
+            // is path-independent (one gpr per bool, every def writes it,
+            // the B123 entry load runs on every attempt), so admit it here
+            // on the same terms; the spilled_path gate stays for un-narrowed
+            // plans so `ZIPP_NO_GPR_SPILL_SLOTS=1` keeps its byte-identical
+            // ablation, and `ZIPP_NO_GLOB_RANGE=1` empties `narrow_globs`
+            // and restores the strict refusal byte-for-byte.
             Some(&Home::Gpr(_))
-                if spilled_path && plan.bool_regs.iter().any(|&(br, _)| br == *r) => {}
+                if (spilled_path || !plan.narrow_globs.is_empty())
+                    && plan.bool_regs.iter().any(|&(br, _)| br == *r) => {}
             _ => return Err(false),
         }
     }
@@ -707,6 +724,8 @@ fn lazy_sx_sets(
             }
         }
     }
+    // (A NARROWED global's home needs no seeding here: its write-through
+    // loads through `emit_src64_canon`, which repairs a lazy source itself.)
     // Homes prologue-filled from a pinned-string length snapshot are WIDE
     // (the u64 units count is not proven i32).
     for &hip in &plan.hoist_len_ips {
@@ -982,6 +1001,33 @@ fn emit_int_box_from_loc(ops: &mut dynasmrt::x64::Assembler, l: Loc) {
         Loc::S(d) => dynasm!(ops ; mov rax, [rsp + d]),
     }
     emit_int_box_from_rax(ops);
+}
+
+/// [`emit_int_box_from_loc`], BRANCHLESS — for the narrowed-global
+/// write-through, which boxes a value of random magnitude (a `getUint32`
+/// swizzle alternates int-range and above ~every iteration, and the
+/// two-compare box then eats a mispredict per iteration on the hot path).
+/// Same canonical Value bits as `emit_int_box_from_rax`: the Int tag on the
+/// zero-extended low 32 when the value fits i32 exactly, else the cvtsi2sd
+/// double (exact — every home is |x| ≤ 2^53 by the tier's guard invariant).
+/// Both candidates are computed, `cmove` selects. A lazy source
+/// canonicalizes on the load. Scratch: rax/rcx/rdx/xmm0; clobbers FLAGS.
+fn emit_int_box_branchless_from_loc(
+    ops: &mut dynasmrt::x64::Assembler,
+    l: Loc,
+    lazy: &FxHashSet<u8>,
+) {
+    emit_src64_canon(ops, loc_src(l), 0, lazy); // rax = canonical i64
+    dynasm!(ops
+        ; cvtsi2sd xmm0, rax            // double candidate (exact ≤ 2^53)
+        ; mov ecx, eax                  // zero-extended low 32
+        ; mov rdx, QWORD INT_TAG as i64
+        ; or rdx, rcx                   // Int-tagged candidate
+        ; movsxd rcx, eax
+        ; cmp rcx, rax                  // ZF ⇔ the value IS its low 32 (i32)
+        ; movq rax, xmm0                // (movq leaves FLAGS alone)
+        ; cmove rax, rdx
+    );
 }
 
 /// B94 write-through on GPR homes (W8) — the twin of `emit_int_wt`: a numeric
@@ -1393,16 +1439,31 @@ pub(crate) fn compile_region_int_gpr(
         // generic post-op hook below then skips the duplicate store.
         let mut wt_pre = false;
         match proto.code[ip] {
-            Instr::LoadInt { dst, val } => match g(dst) {
-                Loc::R(h) => dynasm!(ops ; mov Rq(h), val),
-                Loc::S(d) => dynasm!(ops ; mov QWORD [rsp + d], val), // sign-extends: canonical
-            },
+            Instr::LoadInt { dst, val } => {
+                if plan.slot_consts.contains_key(&dst) {
+                    // Slot-materialized: the boxed Int goes straight to the
+                    // frame slot, exactly when the interpreter's def would —
+                    // the reg has no home and the flush never touches it.
+                    let bits = INT_TAG | val as u32 as u64;
+                    dynasm!(ops ; mov rax, QWORD bits as i64 ; mov [rbx + dreg(dst)], rax);
+                } else {
+                    match g(dst) {
+                        Loc::R(h) => dynasm!(ops ; mov Rq(h), val),
+                        Loc::S(d) => dynasm!(ops ; mov QWORD [rsp + d], val), // sign-extends: canonical
+                    }
+                }
+            }
             Instr::LoadConst { dst, idx } => {
                 // region admission guaranteed an Int constant (i32 payload).
                 let v = proto.constants[idx as usize].bits() as u32 as i32;
-                match g(dst) {
-                    Loc::R(h) => dynasm!(ops ; mov Rq(h), v),
-                    Loc::S(d) => dynasm!(ops ; mov QWORD [rsp + d], v),
+                if plan.slot_consts.contains_key(&dst) {
+                    let bits = INT_TAG | v as u32 as u64;
+                    dynasm!(ops ; mov rax, QWORD bits as i64 ; mov [rbx + dreg(dst)], rax);
+                } else {
+                    match g(dst) {
+                        Loc::R(h) => dynasm!(ops ; mov Rq(h), v),
+                        Loc::S(d) => dynasm!(ops ; mov QWORD [rsp + d], v),
+                    }
                 }
             }
             Instr::Move { dst, src: sr } => match home(plan, dst) {
@@ -1446,10 +1507,25 @@ pub(crate) fn compile_region_int_gpr(
             | Instr::StoreGlobalStrict { idx, src: sr }
             | Instr::StoreGlobalResolved { idx, src: sr } => {
                 let gg = gx(plan.glob_home[&idx]);
-                match (src(sr), gg) {
-                    (Src::R(sg), Loc::R(gr)) if sg == gr => flag_cmp = prev_flag,
-                    (Src::S(sd), Loc::S(gd)) if sd == gd => flag_cmp = prev_flag,
-                    (s_, _) => emit_loc_copy(&mut ops, gg, s_, &lazy),
+                let same = matches!((src(sr), gg), (Src::R(sg), Loc::R(gr)) if sg == gr)
+                    || matches!((src(sr), gg), (Src::S(sd), Loc::S(gd)) if sd == gd);
+                if !same {
+                    emit_loc_copy(&mut ops, gg, src(sr), &lazy);
+                }
+                if plan.narrow_globs.contains(&idx) {
+                    // Write-through: flush_exit skips this slot (at a
+                    // mid-iteration exit the narrowed home may already belong
+                    // to another value), so memory must receive the value HERE
+                    // — after this, `[r12 + 8*idx]` holds the last-stored
+                    // value on every path, exactly what the interpreter would
+                    // have. Branchless: the stored value's magnitude is data
+                    // (a swizzled u32 crosses i32::MAX at random), and the
+                    // two-compare box mispredicted per iteration. Clobbers
+                    // FLAGS: no compare fusion survives this arm.
+                    emit_int_box_branchless_from_loc(&mut ops, gg, &lazy);
+                    dynasm!(ops ; mov [r12 + (idx as i32) * 8], rax);
+                } else if same {
+                    flag_cmp = prev_flag;
                 }
             }
             Instr::Add { dst, a, b } | Instr::Sub { dst, a, b } => {
@@ -1569,6 +1645,20 @@ pub(crate) fn compile_region_int_gpr(
                 let dl = g(dst);
                 if let Some(&(val_reg, shift)) = plan.mul_shift.get(&ip) {
                     // Guard-elided multiply by a constant power of two.
+                    if let Some(&v) = hoist_c.get(&val_reg) {
+                        // BOTH operands are hoisted constants (the swizzle
+                        // bound `4096 * 4`): the shifted product is itself a
+                        // compile-time constant, exact in i64 (the elided
+                        // guard proved it fits i53). `g(val_reg)` must not
+                        // run here — a hoisted-only home is deliberately
+                        // unmapped, and the lookup panicked the first time a
+                        // const×const Mul region engaged this tier.
+                        let c = (v as i64) << shift;
+                        match dl {
+                            Loc::R(d) => dynasm!(ops ; mov Rq(d), QWORD c),
+                            Loc::S(dd) => dynasm!(ops ; mov rax, QWORD c ; mov [rsp + dd], rax),
+                        }
+                    } else {
                     let vg = g(val_reg);
                     match (dl, vg) {
                         (Loc::R(d), Loc::R(vr)) => {
@@ -1588,6 +1678,7 @@ pub(crate) fn compile_region_int_gpr(
                                 Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
                             }
                         }
+                    }
                     }
                 } else if plan.elide_guard.contains(&ip) {
                     emit_src64_canon(&mut ops, src(a), 0, &lazy); // rax
@@ -2395,6 +2486,12 @@ pub(crate) fn compile_region_int_gpr(
         dynasm!(ops ; mov rax, QWORD BOOL_TAG as i64 ; or rax, Rq(gb) ; mov [rbx + dreg(r)], rax);
     }
     for &(gi, x) in &plan.globs {
+        // A narrowed global's slot is written through at every StoreGlobal and
+        // its home may be another value's by now — flushing it here would put
+        // a stale value where the interpreter reads (the B9-class failure).
+        if plan.narrow_globs.contains(&gi) {
+            continue;
+        }
         emit_int_box_from_loc(&mut ops, gx(x));
         dynasm!(ops ; mov [r12 + (gi as i32) * 8], rax);
     }

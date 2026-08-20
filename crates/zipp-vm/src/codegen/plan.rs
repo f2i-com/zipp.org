@@ -142,6 +142,45 @@ pub(crate) struct RegionPlan {
     /// only defs of the register that do NOT fill its numeric home — the same
     /// register is also loaded from other globals, and those are numeric defs.
     pub(crate) split_recv_lg: FxHashSet<usize>,
+    /// Stored globals whose home interval is NARROWED to [first touch, last
+    /// touch] instead of B96's forced whole-region [s, e] — so the home is
+    /// reusable outside that window. Admission is a per-load dominance proof
+    /// (every in-region `LoadGlobal` of the slot has a nearest preceding
+    /// in-region store with no jump target in the gap — the `slot_guard_key`
+    /// straight-line scan), which guarantees the home is store-filled before
+    /// any read on every native path; a load not provably dominated keeps the
+    /// permanent home (fail closed).
+    ///
+    /// The exit contract moves from flush to WRITE-THROUGH: each in-region
+    /// `StoreGlobal` of a member also boxes the value into `[r12 + 8*slot]`,
+    /// `flush_exit` skips the slot (at a mid-iteration exit the home may
+    /// already belong to another value — flushing it would expose a stale
+    /// slot to the interpreter, the B9-class failure), and there is no entry
+    /// load (the home starts garbage; the dominance proof is what makes that
+    /// unreadable). Memory therefore holds the last-stored value at EVERY
+    /// exit — the same thing the interpreter would have — so no program-wide
+    /// read-set scan is needed. Members are never read-first, so they are
+    /// disjoint from `strict_entry_globs` by construction. Populated only for
+    /// plans routed exclusively into the GPR emitter (`admit_dv` or
+    /// `share_homes`); empty under `ZIPP_NO_GLOB_RANGE=1`.
+    pub(crate) narrow_globs: FxHashSet<u32>,
+    /// Glob-range SLOT-MATERIALIZED constants: single-def in-region
+    /// `LoadInt`/Int-`LoadConst` registers (reg → payload) that carry NO home
+    /// at all. Their uses read the immediate (they join the emitter's
+    /// `hoist_c`), their defining op stores the compile-time-boxed Int to the
+    /// register's frame slot — exactly when and what the interpreter's def
+    /// would — and the exit flush never touches them, so the slot is
+    /// interpreter-exact on EVERY path. This is the remat form for a const
+    /// that IS read outside the region (`remat`/`hoisted` requires
+    /// `!read_outside`, because an unconditional const flush could clobber a
+    /// pre-region value some later code still reads); the def-site store
+    /// costs two instructions per iteration where hoisting costs zero, so
+    /// the cheaper form is preferred whenever it is sound. Requires the def
+    /// to dominate every in-region use (no in-region jump target between
+    /// def and use — a native use reads the immediate, and a path reaching
+    /// it without the def would let the interpreter disagree). Populated
+    /// only for GPR-emitter-only plans; empty under `ZIPP_NO_GLOB_RANGE=1`.
+    pub(crate) slot_consts: FxHashMap<u16, i32>,
     /// DV endian-flag fusion: region ips of `Eq` ops ELIDED because their dst
     /// exists only to feed the immediately following pinned-DV `get*` call's
     /// littleEndian flag, while the SAME register is recycled as a numeric
@@ -240,6 +279,95 @@ impl XmmAlloc {
         self.active.push((end, x));
         Some(x)
     }
+}
+
+/// Multi-segment home allocator for the glob-range mechanism: every value
+/// brings a SET of disjoint live segments (a narrowed global or an unsplit
+/// value brings one; a mixed-role temp brings one per def-range), and all of a
+/// value's segments must land in ONE home — `reg_home`/`glob_home` are
+/// per-value, and `flush_exit` reads one location per value. That same-home
+/// constraint makes the graph non-interval (greedy start-order first-fit is no
+/// longer optimal — measured one home over on the swizzle outer region), so
+/// this searches: values in ascending first-segment start, lowest feasible
+/// home first, with bounded backtracking, trying k homes from the sweep lower
+/// bound upward. Segment overlap is inclusive at both ends — two touches at
+/// the SAME ip always conflict, exactly like `XmmAlloc`'s strict `end < start`
+/// freeing (an emitter arm may read an operand home after writing its dst's).
+///
+/// Returns one xmm home per value (in input order), or `None` when the values
+/// do not fit the pool within the node budget — the caller then declines
+/// exactly as an `XmmAlloc` exhaustion. Deterministic: fixed value order,
+/// fixed home order, fixed budget.
+pub(crate) fn alloc_value_homes(values: &[(Vec<(usize, usize)>, NumVal)]) -> Option<Vec<u8>> {
+    const POOL: usize = (HOME_XMM_LAST - HOME_XMM_FIRST + 1) as usize;
+    debug_assert!(values.windows(2).all(|w| w[0].0[0].0 <= w[1].0[0].0));
+    // Lower bound: the max number of values simultaneously live at one ip.
+    let mut events: Vec<(usize, i32)> = Vec::new();
+    for (segs, _) in values {
+        debug_assert!(segs.windows(2).all(|w| w[0].1 < w[1].0));
+        for &(a, b) in segs {
+            debug_assert!(a <= b);
+            events.push((a, 1));
+            events.push((b + 1, -1));
+        }
+    }
+    events.sort_unstable();
+    let (mut live, mut lb) = (0i32, 0i32);
+    for &(_, d) in &events {
+        live += d;
+        lb = lb.max(live);
+    }
+    fn overlaps(segs: &[(usize, usize)], taken: &[(usize, usize)]) -> bool {
+        segs.iter().any(|&(a, b)| taken.iter().any(|&(c, d)| a <= d && c <= b))
+    }
+    // DFS over values in order, lowest feasible home first. All empty homes
+    // are interchangeable, so only the LOWEST-indexed empty one is ever tried
+    // (canonical form — any solution permutes into it), which is what keeps
+    // the search from re-deriving the same partition k! times.
+    fn fit(
+        values: &[(Vec<(usize, usize)>, NumVal)],
+        homes: &mut [Vec<(usize, usize)>],
+        out: &mut Vec<usize>,
+        budget: &mut u32,
+    ) -> bool {
+        let i = out.len();
+        if i == values.len() {
+            return true;
+        }
+        let mut seen_empty = false;
+        for h in 0..homes.len() {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            if homes[h].is_empty() {
+                if seen_empty {
+                    continue;
+                }
+                seen_empty = true;
+            } else if overlaps(&values[i].0, &homes[h]) {
+                continue;
+            }
+            let before = homes[h].len();
+            homes[h].extend(values[i].0.iter().copied());
+            out.push(h);
+            if fit(values, homes, out, budget) {
+                return true;
+            }
+            out.pop();
+            homes[h].truncate(before);
+        }
+        false
+    }
+    for k in (lb.max(1) as usize)..=POOL {
+        let mut homes: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k];
+        let mut choice: Vec<usize> = Vec::with_capacity(values.len());
+        let mut budget = 200_000u32; // per pool size; spent ⇒ try a bigger pool
+        if fit(values, &mut homes, &mut choice, &mut budget) {
+            return Some(choice.iter().map(|&h| HOME_XMM_FIRST + h as u8).collect());
+        }
+    }
+    None
 }
 
 // ── region home unification (copy coalescing) ───────────────────────────────

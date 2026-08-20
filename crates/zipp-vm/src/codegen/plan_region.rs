@@ -444,7 +444,15 @@ fn plan_region_cold_inner(
     share_homes: bool,
     cold: &FxHashSet<usize>,
     // See `PlanOutcome::RetryNoHoist`: `false` on the retry pass — no constant
-    // is hoisted, so none pins a permanent home.
+    // is hoisted, so none pins a permanent home. ONE exemption: the glob-range
+    // const REMATERIALIZATION below is deliberately NOT conditioned on this
+    // flag, because in the segmented allocation a rematerialized const pins no
+    // home of its own (every hoisted constant shares one deliberately-unmapped
+    // index), so the pressure-release would have nothing to reclaim from it.
+    // That is why the segmented pool-overflow arm asks for the retry only when
+    // something this flag ACTUALLY gates was hoisted — a classic
+    // runs-every-iteration const or a pinned-string length; with remat consts
+    // alone the retry would re-plan bit-identically and decline anyway.
     allow_hoist: bool,
     // W9 — see `plan_region_cold`.
     admit_dv: bool,
@@ -1366,6 +1374,10 @@ fn plan_region_cold_inner(
     reg_order.retain(|r| !dead.contains(r));
     let mut hoist_ips: Vec<usize> = Vec::new();
     let mut hoisted: FxHashSet<u16> = FxHashSet::default();
+    // Did anything `allow_hoist` GATES get hoisted? That — not `hoisted`,
+    // which the ungated glob-range remat also fills — is what the pool-pressure
+    // retry can release. See the `allow_hoist` parameter doc.
+    let mut gated_hoists = false;
     for (&r, &ip) in &const_def_ip {
         // `first_seen == true` only says the first OCCURRENCE is a def — it says
         // nothing about whether that def runs. Hoisting a constant whose def sits
@@ -1384,6 +1396,273 @@ fn plan_region_cold_inner(
         {
             hoist_ips.push(ip);
             hoisted.insert(r);
+            gated_hoists = true;
+        }
+    }
+    // ── glob-range const rematerialization ── same gate as the narrowing /
+    // splitting mechanism at the allocation below (GPR-emitter-only plans;
+    // `ZIPP_NO_GLOB_RANGE=1` restores the pass above byte-for-byte). A
+    // single-def LoadInt/LoadConst register that is def-first, actually used,
+    // and never read outside the region hoists WITHOUT the
+    // runs-every-iteration proof: the GPR emitter reads it as an immediate
+    // everywhere and its flush writes the compile-time-boxed const — which IS
+    // the def's only possible value, so a flush on a path that skipped the
+    // def writes the same bits the def would have, and `!read_outside`
+    // empties the one observer class left (a post-region read of a
+    // pre-region value). The pass above must refuse these (a def inside an
+    // inner loop provably does not run on every pass of an ENCLOSING region,
+    // and without the const-identity argument the flush would be wrong);
+    // each then pins a real home — the swizzle OUTER region carries three
+    // such consts (24, 255, 2) and misses the GPR pool by exactly one home.
+    // Not conditioned on `allow_hoist`: these consume no home at all in the
+    // segmented allocation (one shared unmapped index), so the RetryNoHoist
+    // pressure-release has nothing to reclaim from them.
+    // ── glob-range: registers PROVABLY DEAD OUTSIDE the region despite being
+    // in `read_outside` ── a top-level proto recycles registers across phases,
+    // so `read_outside` (any textual use outside [s, e]) marks nearly every
+    // swizzle temp, and B97 then write-throughs each def BOXED — ~14 boxing
+    // sequences per iteration on the swizzle nest, measured at ~5ns/iter, the
+    // whole prize. A register is proven dead-outside when
+    //   (a) control is CONFINED: no op after `e` jumps to `target <= e` and
+    //       no in-region op jumps backward out (`target < s`) — once the
+    //       region is left FORWARD, neither it nor anything before it can
+    //       run again, so uses before `s` are unreachable from any exit; and
+    //   (b) every use after `e` has a nearest preceding def ALSO after `e`,
+    //       with no jump target anywhere in the proto landing strictly
+    //       between them (the `slot_guard_key` straight-line rule — entering
+    //       AT the def is fine) — every post-exit path rewrites the register
+    //       before reading it.
+    // The use model is over-approximated: an op whose reads `instr_uses` does
+    // not fully model (Call/New/window ops outside its match) counts as a use
+    // of EVERYTHING, and then needs a dominating def like any other use. The
+    // def model under-approximates (`writes_reg`), which only shortens gaps'
+    // candidates — a missed def means an earlier one is found and the gap
+    // grows, strictly more conservative. Members lose their B97 write-through
+    // (a stale flush into their slot is unobservable — in-region every read
+    // is dominated by a def per the segment/shareable rules, outside by (b)),
+    // may share homes on the nest paths, and qualify for const hoisting.
+    let mut outside_dead: FxHashSet<u16> = FxHashSet::default();
+    if (admit_dv || share_homes) && cold.is_empty() && glob_range_enabled() {
+        let target_of = |i: &Instr| -> Option<usize> {
+            match *i {
+                Instr::Jump { target }
+                | Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::JumpIfNotLt { target, .. }
+                | Instr::JumpIfNotLe { target, .. }
+                | Instr::PushFinally { target, .. }
+                | Instr::JumpFinally { target, .. } => Some(target as usize),
+                Instr::PushHandler { catch_target, .. } => Some(catch_target as usize),
+                _ => None,
+            }
+        };
+        let confined = code.iter().enumerate().all(|(ip, i2)| match target_of(i2) {
+            Some(t) => !(ip > e && t <= e) && !((s..=e).contains(&ip) && t < s),
+            None => true,
+        });
+        // Ops whose register READS `instr_uses` models completely (its match
+        // arms), plus ops that read no register at all. Anything else is a
+        // universal use.
+        let modeled = |i: &Instr| -> bool {
+            matches!(
+                *i,
+                Instr::Move { .. }
+                    | Instr::StoreGlobal { .. }
+                    | Instr::StoreGlobalStrict { .. }
+                    | Instr::StoreGlobalResolved { .. }
+                    | Instr::AddInt { .. }
+                    | Instr::Neg { .. }
+                    | Instr::Add { .. }
+                    | Instr::Sub { .. }
+                    | Instr::Mul { .. }
+                    | Instr::Div { .. }
+                    | Instr::Mod { .. }
+                    | Instr::StrConcat { .. }
+                    | Instr::StrAppendInPlace { .. }
+                    | Instr::StrConcatChain { .. }
+                    | Instr::Bitwise { .. }
+                    | Instr::Lt { .. }
+                    | Instr::Le { .. }
+                    | Instr::Gt { .. }
+                    | Instr::Ge { .. }
+                    | Instr::Eq { .. }
+                    | Instr::Ne { .. }
+                    | Instr::JumpIfNotLt { .. }
+                    | Instr::JumpIfNotLe { .. }
+                    | Instr::JumpIfFalse { .. }
+                    | Instr::JumpIfTrue { .. }
+                    | Instr::GetProp { .. }
+                    | Instr::SetProp { .. }
+                    | Instr::GetIndex { .. }
+                    | Instr::SetIndex { .. }
+                    | Instr::GetIndexConcat { .. }
+                    | Instr::SetIndexConcat { .. }
+                    | Instr::ToPropKey { .. }
+                    | Instr::DeleteIndexConcat { .. }
+                    | Instr::Return { .. }
+                    | Instr::MathOp { .. }
+                    | Instr::CallMethod { .. }
+                    | Instr::LoadInt { .. }
+                    | Instr::LoadConst { .. }
+                    | Instr::LoadBool { .. }
+                    | Instr::LoadNull { .. }
+                    | Instr::LoadUndefined { .. }
+                    | Instr::LoadGlobal { .. }
+                    | Instr::Jump { .. }
+                    | Instr::Now { .. }
+                    | Instr::ReturnUndefined
+            )
+        };
+        let grdbg = std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some();
+        if !confined && grdbg {
+            eprintln!("[globrange] [{s},{e}] outside-dead: NOT CONFINED");
+        }
+        if confined {
+            let mut all_targets: Vec<usize> = code.iter().filter_map(target_of).collect();
+            all_targets.sort_unstable();
+            let gap_has_target = |d: usize, u: usize| -> bool {
+                let lo = all_targets.partition_point(|&t| t <= d);
+                lo < all_targets.len() && all_targets[lo] <= u
+            };
+            'ro_reg: for &r in &reg_order {
+                if !read_outside.contains(&r) {
+                    continue;
+                }
+                for (uip, i2) in code.iter().enumerate() {
+                    if (s..=e).contains(&uip) || uip < s {
+                        continue;
+                    }
+                    // Call-family windows, modeled explicitly (their reads are
+                    // exactly callee/receiver + the contiguous arg window).
+                    let win_use = match *i2 {
+                        Instr::Call { callee, arg_base, argc, .. }
+                        | Instr::New { callee, arg_base, argc, .. }
+                        | Instr::TailCall { callee, arg_base, argc } => {
+                            r == callee || (r >= arg_base && (r - arg_base) < argc)
+                        }
+                        Instr::NewArray { arg_base, argc, .. }
+                        | Instr::ArrayCtor { arg_base, argc, .. }
+                        | Instr::GlobalFn { arg_base, argc, .. }
+                        | Instr::StaticFn { arg_base, argc, .. }
+                        | Instr::Print { arg_base, argc, .. } => {
+                            r >= arg_base && (r - arg_base) < argc
+                        }
+                        _ => false,
+                    };
+                    let call_family = matches!(
+                        *i2,
+                        Instr::Call { .. }
+                            | Instr::New { .. }
+                            | Instr::TailCall { .. }
+                            | Instr::NewArray { .. }
+                            | Instr::ArrayCtor { .. }
+                            | Instr::GlobalFn { .. }
+                            | Instr::StaticFn { .. }
+                            | Instr::Print { .. }
+                    );
+                    if call_family {
+                        if !win_use {
+                            continue;
+                        }
+                    } else if modeled(i2) && !instr_uses(i2).contains(&r) {
+                        continue;
+                    }
+                    // Def model: `writes_reg` plus the dst-writing ops it does
+                    // not cover (each fully overwrites its dst). A def this
+                    // still misses only lengthens the gap — conservative.
+                    let defines = |j: usize| -> bool {
+                        if writes_reg(&code[j]) == Some(r) {
+                            return true;
+                        }
+                        matches!(code[j],
+                            Instr::Now { dst, .. }
+                            | Instr::Call { dst, .. }
+                            | Instr::New { dst, .. }
+                            | Instr::NewArray { dst, .. }
+                            | Instr::ArrayCtor { dst, .. }
+                            | Instr::GlobalFn { dst, .. }
+                            | Instr::StaticFn { dst, .. } if dst == r)
+                    };
+                    let Some(d) = ((e + 1)..uip).rev().find(|&j| defines(j)) else {
+                        if grdbg {
+                            eprintln!("[globrange] [{s},{e}] r{r} not dead-out: no post-region def before use @{uip} ({:?})", i2);
+                        }
+                        continue 'ro_reg;
+                    };
+                    if gap_has_target(d, uip) {
+                        if grdbg {
+                            eprintln!("[globrange] [{s},{e}] r{r} not dead-out: target in ({d},{uip}]");
+                        }
+                        continue 'ro_reg;
+                    }
+                }
+                outside_dead.insert(r);
+            }
+        }
+    }
+
+    let mut remat_regs: FxHashSet<u16> = FxHashSet::default();
+    let mut slot_consts: FxHashMap<u16, i32> = FxHashMap::default();
+    if (admit_dv || share_homes) && cold.is_empty() && glob_range_enabled() {
+        for (&r, &ip) in &const_def_ip {
+            if def_count.get(&r) != Some(&1)
+                || first_seen.get(&r) != Some(&true)
+                || !used.contains(&r)
+                || hoisted.contains(&r)
+            {
+                continue;
+            }
+            // BOTH forms replace every in-region read with the immediate, so
+            // both need the def to DOMINATE every in-region use: a use
+            // reachable without the def (a jump target strictly inside
+            // (def, use], or a hidden window use ahead of the def) would read
+            // the immediate natively where pure interpretation reads an older
+            // slot value — a silent tier divergence, not a deopt. (The
+            // classic pass's `runs_every_iteration` subsumes this; dropping
+            // it is exactly what these forms do.)
+            let mut last_use = ip;
+            let mut use_before_def = false;
+            let mut note_use = |uip: usize, last_use: &mut usize, before: &mut bool| {
+                *last_use = (*last_use).max(uip);
+                *before |= uip < ip;
+            };
+            for (off, instr) in code[s..=e].iter().enumerate() {
+                if instr_uses(instr).contains(&r) {
+                    note_use(s + off, &mut last_use, &mut use_before_def);
+                }
+            }
+            for &(uip, ur, is_def) in &str_imul_touch {
+                if !is_def && ur == r {
+                    note_use(uip, &mut last_use, &mut use_before_def);
+                }
+            }
+            if use_before_def || jump_targets.iter().any(|&t| t > ip && t <= last_use) {
+                continue;
+            }
+            if !read_outside.contains(&r) || outside_dead.contains(&r) {
+                hoist_ips.push(ip);
+                hoisted.insert(r);
+                remat_regs.insert(r);
+                continue;
+            }
+            // Read outside without the dead-outside proof: hoisting is out
+            // (the flush would write the const over a pre-region value some
+            // later code still reads), but the SLOT-MATERIALIZED form is
+            // interpreter-exact on every path (see `RegionPlan::slot_consts`):
+            // uses read the immediate, the def stores the boxed const to the
+            // frame slot exactly when the interpreter's def would, nothing is
+            // flushed.
+            let v = match code[ip] {
+                Instr::LoadInt { val, .. } => val,
+                Instr::LoadConst { idx, .. } => {
+                    match proto.constants.get(idx as usize) {
+                        Some(c) if c.is_int() => c.bits() as u32 as i32,
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            slot_consts.insert(r, v);
         }
     }
     hoist_ips.sort_unstable();
@@ -1419,6 +1698,7 @@ fn plan_region_cold_inner(
             {
                 hoist_len_ips.push(ip);
                 hoisted.insert(dst);
+                gated_hoists = true;
             }
         }
         hoist_len_ips.sort_unstable();
@@ -1638,7 +1918,9 @@ fn plan_region_cold_inner(
         // via write-through instead of pinning a permanent home.
         if first_seen.get(&r) == Some(&false)
             || hoisted.contains(&r)
-            || (!(admit_wt_share && wt_share_enabled()) && read_outside.contains(&r))
+            || (!(admit_wt_share && wt_share_enabled())
+                && read_outside.contains(&r)
+                && !outside_dead.contains(&r))
         {
             (s, e)
         } else {
@@ -1656,7 +1938,9 @@ fn plan_region_cold_inner(
     let shareable = |r: u16| -> bool {
         first_seen.get(&r) != Some(&false)
             && !hoisted.contains(&r)
-            && ((admit_wt_share && wt_share_enabled()) || !read_outside.contains(&r))
+            && ((admit_wt_share && wt_share_enabled())
+                || !read_outside.contains(&r)
+                || outside_dead.contains(&r))
     };
 
     // ── B97 write-through set ── every read-after-region register that `shareable`
@@ -1671,7 +1955,15 @@ fn plan_region_cold_inner(
     // `c`'s only in-region def never executes, so nothing ever fills its home; with
     // the flush skipped, its slot correctly keeps the 3 the frame already held.
     for &r in &reg_order {
-        if admit_wt_share && read_outside.contains(&r) && shareable(r) {
+        // A slot-materialized const is NOT written through in the B97 sense:
+        // its defining op already stores the boxed const to the slot, it has
+        // no home to write from, and the flush skips it by construction.
+        if admit_wt_share
+            && read_outside.contains(&r)
+            && shareable(r)
+            && !slot_consts.contains_key(&r)
+            && !outside_dead.contains(&r)
+        {
             write_through.insert(r);
         }
     }
@@ -1705,11 +1997,325 @@ fn plan_region_cold_inner(
     // ILP cost of sharing is not the trade — staying on xmm homes is.
     let reuse = share_homes || n_numeric > POOL;
 
+    // ── stored-global live-range narrowing + mixed-role temp splitting ──
+    // B96 permanence forces every `glob_order` member onto a whole-region
+    // [s, e] interval, and the bytecode compiler's register recycling welds a
+    // temp's disjoint def-ranges into one wide interval — on the DV swizzle
+    // nest the two together hold 13-14 homes against the 7-9 GPR pool while
+    // the equivalent function-local form plans 8.
+    //
+    // NARROWING: a stored global whose every in-region load is DOMINATED by an
+    // in-region store (nearest preceding store, no jump target in the gap —
+    // the `slot_guard_key` straight-line scan, region-internal targets only:
+    // native code is entered at `s` alone, so region-internal branches are the
+    // complete native control flow) gets a [first touch, last touch] interval.
+    // The GPR emitter then writes each store THROUGH to `[r12 + 8*slot]`,
+    // skips the slot in flush_exit and drops the entry load (see
+    // `RegionPlan::narrow_globs`): memory holds the last-stored value at every
+    // exit, so a mid-iteration exit can never expose a stale slot, and reads
+    // of the slot outside the region (any function, `globalThis`) see exactly
+    // what the interpreter would have written. A load not provably dominated
+    // keeps the permanent home — fail closed (this region's loop-carried
+    // globals stay permanent: their header load's gap spans the back-edge
+    // target).
+    //
+    // SPLITTING: a shareable temp whose touches fall into disjoint def-ranges
+    // becomes one interval PER RANGE — all ranges bound to the ONE home
+    // `reg_home` names — provided no jump target lands strictly inside a range
+    // (entering AT the def is fine; mid-range entry could carry a value across
+    // a hole). Each range starts with its own def, so a hole's home can be
+    // lent to another value and whatever flush_exit writes into the temp's
+    // slot from a hole is rewritten by a def before any read — the same
+    // argument the shareable single-interval reuse already stands on.
+    //
+    // Both run only for plans the GPR emitter alone consumes: `admit_dv`
+    // routes exclusively there (B119 fallback contract) and every
+    // `share_homes` call site feeds `compile_region_int_gpr` only — the xmm
+    // emitters never see a narrowed plan. `ZIPP_NO_GLOB_RANGE=1` restores the
+    // forced intervals byte-for-byte.
+    let glob_range =
+        (admit_dv || share_homes) && reuse && cold.is_empty() && glob_range_enabled();
+    let mut narrow_globs: FxHashSet<u32> = FxHashSet::default();
+    let mut glob_touch: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    let mut seg_map: FxHashMap<u16, Vec<(usize, usize)>> = FxHashMap::default();
+    if glob_range {
+        let is_store_of = |ip: usize, gi: u32| -> bool {
+            matches!(code[ip],
+                Instr::StoreGlobal { idx, .. }
+                | Instr::StoreGlobalStrict { idx, .. }
+                | Instr::StoreGlobalResolved { idx, .. } if idx == gi)
+        };
+        'glob: for &gi in &glob_order {
+            let mut first: Option<usize> = None;
+            let mut last = s;
+            // Raw scan — includes receiver-excluded LoadGlobals of the same
+            // slot, which face the same dominance bar (they read the slot's
+            // MEMORY, which write-through keeps current, but holding them to
+            // the proof costs nothing and stays fail-closed).
+            for ip in s..=e {
+                let load = matches!(code[ip], Instr::LoadGlobal { idx, .. } if idx == gi);
+                if !load && !is_store_of(ip, gi) {
+                    continue;
+                }
+                if first.is_none() {
+                    first = Some(ip);
+                }
+                last = ip;
+                if load {
+                    let Some(d0) = (s..ip).rev().find(|&j| is_store_of(j, gi)) else {
+                        continue 'glob;
+                    };
+                    if jump_targets.iter().any(|&t| t > d0 && t <= ip) {
+                        continue 'glob;
+                    }
+                }
+            }
+            if let Some(f0) = first {
+                narrow_globs.insert(gi);
+                glob_touch.insert(gi, (f0, last));
+            }
+        }
+        // A narrowed global's first touch is a store (a read-first one fails
+        // the dominance scan), so it can never carry the strict-entry
+        // contract, whose license is the entry load this plan drops.
+        debug_assert!(narrow_globs.is_disjoint(&strict_entry_globs));
+
+        // Touches per register, from the same sources as `first_ip`/`last_ip`
+        // (instr_uses/writes_reg plus the str_imul/DV-fuse extensions — `cold`
+        // is empty under `glob_range`, so no cold filter is needed).
+        let mut touch: FxHashMap<u16, Vec<(usize, bool)>> = FxHashMap::default();
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            let ip = s + off;
+            // An ELIDED Eq's dst is a phantom on both sides of the fuse: the
+            // elided def writes no home, and the fused call's arg-window
+            // mention reads none (the arm computes the flag from the Eq's
+            // OPERAND homes; its deopt resumes AT the Eq, whose interpreted
+            // re-execution rewrites the dst slot before the call reads it).
+            // Recording either would reserve a home across the fuse window
+            // for a value that never materializes — one whole home on the
+            // swizzle regions.
+            let elided_dst = dv_flag_elide
+                .contains(&ip)
+                .then(|| writes_reg(instr))
+                .flatten()
+                .or_else(|| {
+                    (dv_flag_fuse.contains_key(&ip) && ip > s
+                        && dv_flag_elide.contains(&(ip - 1)))
+                    .then(|| writes_reg(&code[ip - 1]))
+                    .flatten()
+                });
+            for u in instr_uses(instr) {
+                if dv_flag_fuse.contains_key(&ip) && elided_dst == Some(u) {
+                    continue;
+                }
+                touch.entry(u).or_default().push((ip, false));
+            }
+            if let Some(d) = writes_reg(instr) {
+                if dv_flag_elide.contains(&ip) {
+                    continue;
+                }
+                touch.entry(d).or_default().push((ip, true));
+            }
+        }
+        for &(ip, r, is_def) in &str_imul_touch {
+            touch.entry(r).or_default().push((ip, is_def));
+        }
+        for &r in &reg_order {
+            // Split receivers keep their proven single-interval contract
+            // (force-resident, memory-authoritative); slot-materialized
+            // consts carry no home at all; permanent values keep [s, e] via
+            // `range` below.
+            if ty[&r] != VTy::Num
+                || !shareable(r)
+                || split_recvs.contains(&r)
+                || slot_consts.contains_key(&r)
+            {
+                continue;
+            }
+            let Some(tv) = touch.get_mut(&r) else { continue };
+            tv.sort_unstable();
+            let mut segs: Vec<(usize, usize)> = Vec::new();
+            let mut cur: Option<(usize, usize)> = None;
+            let mut ok = true;
+            let mut j = 0;
+            while j < tv.len() {
+                let ip = tv[j].0;
+                let mut has_use = false;
+                let mut has_def = false;
+                while j < tv.len() && tv[j].0 == ip {
+                    if tv[j].1 {
+                        has_def = true;
+                    } else {
+                        has_use = true;
+                    }
+                    j += 1;
+                }
+                // A use extends the open range (a use-and-def op reads the old
+                // value and refills the home at one ip — the range continues
+                // through it); a bare def closes it and opens the next.
+                match cur.as_mut() {
+                    Some(c) if has_use => c.1 = ip,
+                    None if has_use => {
+                        // A hidden-use-first shape (e.g. a str_imul touch ahead
+                        // of every def): not the def-first temp this is for.
+                        ok = false;
+                        break;
+                    }
+                    _ => {
+                        debug_assert!(has_def);
+                        if let Some(c) = cur.take() {
+                            segs.push(c);
+                        }
+                        cur = Some((ip, ip));
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            if let Some(c) = cur.take() {
+                segs.push(c);
+            }
+            if segs.len() < 2
+                || segs
+                    .iter()
+                    .any(|&(a, b)| jump_targets.iter().any(|&t| t > a && t <= b))
+            {
+                continue;
+            }
+            // Bounds only — the phantom-drop above may trim an endpoint
+            // relative to the raw first_ip/last_ip walk.
+            debug_assert!(segs.first().is_some_and(|x| x.0 >= *first_ip.get(&r).unwrap_or(&s)));
+            debug_assert!(segs.last().is_some_and(|x| x.1 <= *last_ip.get(&r).unwrap_or(&e)));
+            seg_map.insert(r, segs);
+        }
+    }
+
     // ── allocate xmm/gpr homes ──
     let mut reg_home: FxHashMap<u16, Home> = FxHashMap::default();
     let mut glob_home: FxHashMap<u32, u8> = FxHashMap::default();
     let first_free_xmm: u8;
-    if reuse {
+    if reuse
+        && (!narrow_globs.is_empty()
+            || !seg_map.is_empty()
+            || !remat_regs.is_empty()
+            || !slot_consts.is_empty())
+    {
+        // Segmented allocation (glob-range): the same values, but a narrowed
+        // global brings its real touch window, a split temp one interval per
+        // def-range — all of a value's segments bound to ONE home. Hoisted
+        // CONSTANTS (classic and remat) take no allocator value at all: the
+        // GPR emitter reads them as immediates and never maps their home, so
+        // they all share one deliberately-unmapped index assigned after the
+        // real values (a hoisted pinned-STRING length is NOT a constant — its
+        // home is prologue-filled and mapped, so it keeps a real value).
+        let hoist_const_regs: Vec<u16> = hoist_ips
+            .iter()
+            .filter_map(|&hip| match code[hip] {
+                Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .collect();
+        let mut values: Vec<(Vec<(usize, usize)>, NumVal)> = Vec::new();
+        for &r in &reg_order {
+            if ty[&r] == VTy::Num {
+                if hoist_const_regs.contains(&r) || slot_consts.contains_key(&r) {
+                    continue;
+                }
+                match seg_map.get(&r) {
+                    Some(sv) => values.push((sv.clone(), NumVal::Reg(r))),
+                    None => {
+                        let (a, b) = range(r);
+                        values.push((vec![(a, b)], NumVal::Reg(r)));
+                    }
+                }
+            }
+        }
+        for &gi in &glob_order {
+            let iv = match glob_touch.get(&gi) {
+                Some(&t) if narrow_globs.contains(&gi) => t,
+                _ => (s, e),
+            };
+            values.push((vec![iv], NumVal::Glob(gi)));
+        }
+        values.sort_by_key(|v| v.0[0].0);
+        if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+            for (segs, v) in &values {
+                let name = match *v {
+                    NumVal::Reg(r) => format!("r{r}"),
+                    NumVal::Glob(g2) => format!("g{g2}"),
+                };
+                eprintln!("[globrange] [{s},{e}] {name}: {segs:?}");
+            }
+        }
+        let mut assigned = alloc_value_homes(&values);
+        if let Some(h) = &assigned {
+            // The shared hoist-const index must stay inside the xmm range —
+            // out of it, fail exactly like an exhausted pool.
+            let top = h.iter().copied().max().map_or(HOME_XMM_FIRST, |m| m + 1);
+            if !hoist_const_regs.is_empty() && top > HOME_XMM_LAST {
+                assigned = None;
+            }
+        }
+        match assigned {
+            Some(homes) => {
+                let mut top = HOME_XMM_FIRST;
+                for ((_, v), &x) in values.iter().zip(&homes) {
+                    top = top.max(x + 1);
+                    match *v {
+                        NumVal::Reg(r) => {
+                            reg_home.insert(r, Home::Xmm(x));
+                        }
+                        NumVal::Glob(gi) => {
+                            glob_home.insert(gi, x);
+                        }
+                    }
+                }
+                if !hoist_const_regs.is_empty() {
+                    for &r in &hoist_const_regs {
+                        reg_home.insert(r, Home::Xmm(top));
+                    }
+                    top += 1;
+                }
+                first_free_xmm = top;
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    let mut ng: Vec<u32> = narrow_globs.iter().copied().collect();
+                    ng.sort_unstable();
+                    eprintln!(
+                        "[jit] region [{s},{e}] glob-range plan: narrowed={ng:?} split-temps={} remat={} slotc={} dead-out={} homes={}",
+                        seg_map.len(),
+                        remat_regs.len(),
+                        slot_consts.len(),
+                        outside_dead.len(),
+                        top - HOME_XMM_FIRST
+                    );
+                }
+            }
+            None => {
+                // Same decline shape as an XmmAlloc exhaustion below. The
+                // retry is worth asking for only when a hoist THIS FLAG gates
+                // is holding a home: hoisted constants share one unmapped
+                // index here, so releasing the glob-range remat set (which
+                // ignores `allow_hoist`) changes nothing — the re-plan would
+                // be bit-identical and land right back on this arm, with the
+                // `[decline-reason]` line then describing the retry's
+                // hoist-free plan instead of the real one.
+                if allow_hoist && gated_hoists && dv_double_enabled() {
+                    return PlanOutcome::RetryNoHoist;
+                }
+                if std::env::var_os("ZIPP_JITDECLINE").is_some() {
+                    let nregs = reg_order.iter().filter(|r| ty[r] == VTy::Num).count();
+                    let perm = reg_order.iter().filter(|r| ty[r] == VTy::Num && !shareable(**r)).count();
+                    let ro = reg_order.iter().filter(|r| ty[r] == VTy::Num && read_outside.contains(r)).count();
+                    let li = reg_order.iter().filter(|r| ty[r] == VTy::Num && first_seen.get(r) == Some(&false)).count();
+                    let ho = reg_order.iter().filter(|r| ty[r] == VTy::Num && hoisted.contains(r)).count();
+                    eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
+                        glob_order.len(), nregs - perm);
+                }
+                decline!("xmm pool exhausted even with home reuse")
+            }
+        }
+    } else if reuse {
         // Linear-scan: numeric values (regs + globals) by ascending range start,
         // reusing a home once a value's range ends. Loop-carried values (globals
         // and live-in regs) span [s, e] and so keep a permanent home.
@@ -1763,7 +2369,7 @@ fn plan_region_cold_inner(
         // One distinct home per numeric value (best ILP — what loop.js relies on).
         let mut next_xmm = HOME_XMM_FIRST;
         for &r in &reg_order {
-            if ty[&r] == VTy::Num {
+            if ty[&r] == VTy::Num && !slot_consts.contains_key(&r) {
                 if next_xmm > HOME_XMM_LAST {
                     decline!("xmm pool exhausted (registers)");
                 }
@@ -1872,6 +2478,11 @@ fn plan_region_cold_inner(
     let mut live_in_regs = Vec::new();
     let mut live_in_bools = Vec::new();
     for &r in &reg_order {
+        // A slot-materialized const has no home: nothing to flush (its def
+        // stores the boxed const straight to the slot), nothing to entry-load.
+        if slot_consts.contains_key(&r) {
+            continue;
+        }
         match reg_home[&r] {
             Home::Xmm(x) => {
                 num_regs.push((r, x));
@@ -1916,7 +2527,14 @@ fn plan_region_cold_inner(
         // Every flushed global is entry-loaded too. A def-first global used to
         // flush an uninitialised xmm, which surfaced as a raw f64 bit pattern
         // (`g = i * 2` in an 8-trip loop printed 4626604192193053000).
-        live_in_globs.push((gi, x));
+        // A NARROWED global is the exception on both counts: it is neither
+        // flushed (the emitter writes each store through to memory and skips
+        // it at exits) nor entry-loaded (its narrowed home may be lent out
+        // before its window opens; the first touch is a store, so the load
+        // would be dead anyway).
+        if !narrow_globs.contains(&gi) {
+            live_in_globs.push((gi, x));
+        }
     }
 
     PlanOutcome::Plan(Box::new(RegionPlan {
@@ -1940,6 +2558,8 @@ fn plan_region_cold_inner(
         split_recvs,
         write_through,
         split_recv_lg,
+        narrow_globs,
+        slot_consts,
         dv_flag_elide,
         dv_flag_fuse,
         hoist_pins,

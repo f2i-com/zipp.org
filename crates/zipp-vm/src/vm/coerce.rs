@@ -1858,6 +1858,63 @@ mod resolve_const_tests {
 }
 
 #[cfg(test)]
+mod add_values_fresh_index_tests {
+    use super::*;
+
+    /// The JIT chain arms' same-bits refetch elision rests on this: a `+`
+    /// through `add_values` with a heap (string) LHS NEVER returns the LHS's
+    /// own index — every string-producing arm allocates a fresh slot
+    /// (`alloc_concat_flat`/`alloc_cons`/`alloc_concat_str_ascii`). A future
+    /// identity fast path (e.g. `s + ""` returning `s`'s own bits) would
+    /// silently break `jit_concat_chain_fast`'s contract; this pins it.
+    #[test]
+    fn add_values_never_returns_lhs_index() {
+        let src = "var x = 0;";
+        let ast = crate::front::parse_script(src).expect("source parses");
+        let program = crate::compile::compile_program(&ast, src).expect("source compiles");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+
+        let lhs =
+            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("acc".into()))));
+        let small_str =
+            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("tail".into()))));
+        // Large RHS → the cons (rope) arm; small ones → the flat arms.
+        let big_str = Value::heap(
+            vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("y".repeat(4096)))),
+        );
+        let empty = Value::heap(crate::heap::INTERN_EMPTY);
+        let rhss = [
+            small_str,
+            big_str,
+            empty,
+            lhs, // self-concat
+            Value::int(7),
+            Value::int(-2147483648),
+            Value::num(3.5),
+            Value::TRUE,
+            Value::NULL,
+            Value::UNDEFINED,
+        ];
+        for rhs in rhss {
+            let r = vm.add_values(lhs, rhs).expect("string + succeeds");
+            assert!(r.is_heap(), "string + produced a non-string");
+            assert_ne!(
+                r.heap_index(),
+                lhs.heap_index(),
+                "add_values returned its heap LHS's own index — the chain \
+                 fast helper's same-bits elision premise is broken"
+            );
+            // And symmetrically for a heap RHS: `x + s` never returns `s`.
+            let r2 = vm.add_values(rhs, lhs).expect("+ succeeds");
+            if r2.is_heap() {
+                assert_ne!(r2.heap_index(), lhs.heap_index());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod cmp_i128_f64_tests {
     use super::cmp_i128_f64;
     use std::cmp::Ordering::*;

@@ -198,6 +198,15 @@ pub fn __rx_scansession_force(mode: Option<bool>) {
     rxjit::session_force(mode)
 }
 
+/// PATCH (test hook, see rxjit.rs): force the read-only session-entry gate on
+/// or off, overriding the `ZIPP_NO_RX_ACQGATE` env switch. For the
+/// differential harness only.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __rx_acqgate_force(mode: Option<bool>) {
+    rxjit::acqgate_force(mode)
+}
+
 /// PATCH (see rxjit.rs): scan sessions opened — the hoisted advance loop
 /// engaged in place of the per-attempt wrapper. Zero when the `rx-jit`
 /// feature or the x86-64 target is absent.
