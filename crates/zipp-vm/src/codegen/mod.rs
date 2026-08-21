@@ -817,6 +817,24 @@ pub(crate) fn splice_slotgen_enabled() -> bool {
     }
 }
 
+/// Splice-aware INT admission — `ZIPP_NO_INT_SPLICE=1` keeps every `Call` an
+/// INT-tier reject, so a region whose only disqualifier is a proven-splice leaf
+/// call falls to the memory emitter exactly as it did before. Read at plan time
+/// only. (Distinct from `ZIPP_NO_INT_SPLIT`, the B94 receiver split.)
+pub(crate) fn int_splice_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT_SPLICE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Typed splice lanes — `ZIPP_NO_TYPED_SPLICE=1` pins every leaf plan's
 /// `typed_lane` to `None` (the boxed per-op splice loop, byte-identical to
 /// the prior emission). Read at plan time only.
@@ -1967,9 +1985,35 @@ impl Jit {
         // loops) unless it already deoptimised for this loop. Fall back to the
         // double/memory path.
         if !self.region_int_blacklist.contains(&key) {
-            if let Some(code) =
-                compile_region_int(proto, start, end, globals_base_helper, ta_plan, heap_helpers.ta_snapshot, meter)
-            {
+            // Splice-aware admission: a `Call` the leaf planner already proved
+            // inlinable is flattened into a virtual body BEFORE admission runs,
+            // so the callee's arithmetic joins the region's i64 homes instead of
+            // disqualifying it. `None` (no calls, or any decline) leaves the
+            // arguments below exactly as they were.
+            let splice = plan_int_splice(
+                proto,
+                start,
+                end,
+                ta_plan,
+                leaf_plan,
+                heap_helpers.regs_fits,
+                meter.is_some(),
+            );
+            let (iproto, istart, iend, ita) = match &splice {
+                Some(sp) => (&sp.proto, sp.start, sp.end, &sp.ta_plan),
+                None => (proto, start, end, ta_plan),
+            };
+            let entry = splice.as_ref().map(|sp| sp.entry()).unwrap_or_default();
+            if let Some(code) = compile_region_int(
+                iproto,
+                istart,
+                iend,
+                globals_base_helper,
+                ita,
+                heap_helpers.ta_snapshot,
+                &entry,
+                meter,
+            ) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
                 }
@@ -2287,6 +2331,7 @@ mod plan_region;
 mod regalloc;
 mod region_int;
 mod region_int_gpr;
+mod int_splice;
 mod emit;
 mod inline;
 mod region_mem;
@@ -2304,6 +2349,7 @@ pub(crate) use plan_region::*;
 pub(crate) use regalloc::*;
 pub(crate) use region_int::*;
 pub(crate) use region_int_gpr::*;
+pub(crate) use int_splice::*;
 pub(crate) use emit::*;
 pub(crate) use inline::*;
 pub(crate) use region_mem::*;

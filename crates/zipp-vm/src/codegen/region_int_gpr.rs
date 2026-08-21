@@ -1091,7 +1091,7 @@ fn emit_store_ip(ops: &mut dynasmrt::x64::Assembler, ip_slot: i32, v: i32) {
 fn emit_i53_guard_gpr(
     ops: &mut dynasmrt::x64::Assembler,
     h: Loc,
-    ip: usize,
+    resume_ip: i32,
     ip_slot: i32,
     inline: bool,
     flush_exit: dynasmrt::DynamicLabel,
@@ -1117,7 +1117,7 @@ fn emit_i53_guard_gpr(
             ; jbe => done
         );
     }
-    emit_store_ip(ops, ip_slot, (ip + 1) as i32); // resume AFTER this op (result flushed)
+    emit_store_ip(ops, ip_slot, resume_ip); // resume AFTER this op (result flushed)
     dynasm!(ops
         ; jmp => flush_exit
         ; => done
@@ -1209,10 +1209,17 @@ pub(crate) fn compile_region_int_gpr(
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
     plan: &RegionPlan,
+    // See `compile_region_int_maybe_cold`: the deopt resume map + hoisted entry
+    // guards for a SPLICE-FLATTENED body (default = an ordinary region).
+    entry: &IntEntry<'_>,
     meter: Option<crate::codegen::meter::Meter>,
     allow_spill: bool,
 ) -> GprAttempt {
     let (s, e) = (start as usize, end as usize);
+    let rip = |ip: usize| -> i32 {
+        // See `compile_region_int`'s twin: empty ⇒ `ip` is already the resume ip.
+        entry.resume.get(ip.wrapping_sub(s)).map_or(ip as i32, |&r| r as i32)
+    };
     // W10.3 frame spill slots sit AFTER the resume-ip slot (see the frame
     // layout at the prologue below): slot k at [rsp + spill_base + 8k].
     let spill_base = 40 + 32 * ta_plan.pins.len() as i32;
@@ -1312,6 +1319,9 @@ pub(crate) fn compile_region_int_gpr(
         ; sub rsp, frame
         ; mov [rsp + ip_slot], rsi            // rsi becomes a numeric home
     );
+    // Same frame contract as the xmm tier (shadow at the bottom, rsp 16-aligned)
+    // — always, here, since `ta_base` is 32 whether or not the region pins.
+    emit_int_splice_entry_guards(&mut ops, entry, true, entry_bail);
     // Pinned-view snapshots BEFORE any home is loaded (the helper clobbers
     // volatile registers; every home here is either callee-saved or filled
     // later). Same slot layout and guards as the xmm tier.
@@ -1411,6 +1421,8 @@ pub(crate) fn compile_region_int_gpr(
     // ── body ── same fusion/DCE/metering structure as the xmm emitter.
     let mut flag_cmp: Option<(usize, u16, Cmp)> = None;
     for ip in s..=e {
+        let rip_at = rip(ip);
+        let rip_after = rip(ip + 1);
         dynasm!(ops ; => lbl(ip as u32, &in_region));
         let charged = crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
@@ -1570,7 +1582,7 @@ pub(crate) fn compile_region_int_gpr(
                     }
                     wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
                     if !plan.elide_guard.contains(&ip) {
-                        emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                        emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                     }
                 } else {
                 let d = dst_reg(dl); // resident (nothing spilled on this op)
@@ -1637,7 +1649,7 @@ pub(crate) fn compile_region_int_gpr(
                 }
                 wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
                 if !plan.elide_guard.contains(&ip) {
-                    emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                    emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                 }
                 }
             }
@@ -1716,13 +1728,13 @@ pub(crate) fn compile_region_int_gpr(
                         ; jmp => done
                         ; => ovf
                     );
-                    emit_store_ip(&mut ops, ip_slot, ip as i32); // dst not written
+                    emit_store_ip(&mut ops, ip_slot, rip_at); // dst not written
                     dynasm!(ops
                         ; jmp => flush_exit
                         ; => done
                     );
                     wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
-                    emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                    emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                 }
             }
             Instr::Mod { dst, a, b } => {
@@ -1755,7 +1767,7 @@ pub(crate) fn compile_region_int_gpr(
                     ; jmp => done
                     ; => zbail
                 );
-                emit_store_ip(&mut ops, ip_slot, ip as i32); // resume at THIS op (dst unwritten)
+                emit_store_ip(&mut ops, ip_slot, rip_at); // resume at THIS op (dst unwritten)
                 dynasm!(ops
                     ; jmp => flush_exit
                     ; => done
@@ -1781,7 +1793,7 @@ pub(crate) fn compile_region_int_gpr(
                             dynasm!(ops ; add Rq(d), imm); // sign-extended imm32 == i64 add
                             wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
                             if !plan.elide_guard.contains(&ip) {
-                                emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                                emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                             }
                         }
                     }
@@ -1808,7 +1820,7 @@ pub(crate) fn compile_region_int_gpr(
                             }
                             wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
                             if !plan.elide_guard.contains(&ip) {
-                                emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                                emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                             }
                         }
                     }
@@ -1824,7 +1836,7 @@ pub(crate) fn compile_region_int_gpr(
                     ; test rax, rax
                     ; jnz => nonzero
                 );
-                emit_store_ip(&mut ops, ip_slot, ip as i32);
+                emit_store_ip(&mut ops, ip_slot, rip_at);
                 dynasm!(ops
                     ; jmp => flush_exit
                     ; => nonzero
@@ -1836,7 +1848,7 @@ pub(crate) fn compile_region_int_gpr(
                 }
                 wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
                 if !plan.elide_guard.contains(&ip) {
-                    emit_i53_guard_gpr(&mut ops, dl, ip, ip_slot, inline_guards, flush_exit);
+                    emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                 }
             }
             Instr::Lt { dst, a, b }
@@ -1966,7 +1978,7 @@ pub(crate) fn compile_region_int_gpr(
                     ; jmp => done
                     ; => deopt
                 );
-                emit_store_ip(&mut ops, ip_slot, ip as i32); // resume AT this ip
+                emit_store_ip(&mut ops, ip_slot, rip_at); // resume AT this ip
                 dynasm!(ops
                     ; jmp => flush_exit
                     ; => done
@@ -2001,7 +2013,7 @@ pub(crate) fn compile_region_int_gpr(
                     ; jmp => done
                     ; => deopt
                 );
-                emit_store_ip(&mut ops, ip_slot, ip as i32);
+                emit_store_ip(&mut ops, ip_slot, rip_at);
                 dynasm!(ops
                     ; jmp => flush_exit
                     ; => done
@@ -2144,7 +2156,7 @@ pub(crate) fn compile_region_int_gpr(
                     ; jmp => done
                     ; => deopt
                 );
-                emit_store_ip(&mut ops, ip_slot, ip as i32); // resume AT this ip
+                emit_store_ip(&mut ops, ip_slot, rip_at); // resume AT this ip
                 dynasm!(ops
                     ; jmp => flush_exit
                     ; => done
@@ -2288,12 +2300,12 @@ pub(crate) fn compile_region_int_gpr(
                 // canonicalizes lazy operand homes first, so the re-executed
                 // Eq reads the values it would have read.
                 let resume_ip =
-                    if plan.dv_flag_fuse.contains_key(&ip) { ip - 1 } else { ip };
+                    if plan.dv_flag_fuse.contains_key(&ip) { rip(ip - 1) } else { rip_at };
                 dynasm!(ops
                     ; jmp => done
                     ; => deopt
                 );
-                emit_store_ip(&mut ops, ip_slot, resume_ip as i32);
+                emit_store_ip(&mut ops, ip_slot, resume_ip);
                 dynasm!(ops
                     ; jmp => flush_exit
                     ; => done
@@ -2339,7 +2351,7 @@ pub(crate) fn compile_region_int_gpr(
                         ; jmp => done
                         ; => deopt
                     );
-                    emit_store_ip(&mut ops, ip_slot, ip as i32);
+                    emit_store_ip(&mut ops, ip_slot, rip_at);
                     dynasm!(ops
                         ; jmp => flush_exit
                         ; => done
@@ -2403,7 +2415,7 @@ pub(crate) fn compile_region_int_gpr(
                 emit_int_wt_gpr(&mut ops, plan, &map, dst, true);
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
-                emit_store_ip(&mut ops, ip_slot, ip as i32);
+                emit_store_ip(&mut ops, ip_slot, rip_at);
                 dynasm!(ops ; jmp => flush_exit);
             }
             // POST-PLAN hole — same contract as the xmm emitter's twin arm.
@@ -2501,7 +2513,7 @@ pub(crate) fn compile_region_int_gpr(
     // ── entry_bail ── a live-in wasn't admissible; nothing computed, so
     // restore (NO flush) and resume at the header (interpreted).
     dynasm!(ops ; => entry_bail);
-    emit_store_ip(&mut ops, ip_slot, start as i32);
+    emit_store_ip(&mut ops, ip_slot, rip(s));
     emit_gpr_region_restore(&mut ops, frame);
 
     let buf = match ops.finalize() {

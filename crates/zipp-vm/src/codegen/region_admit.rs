@@ -883,7 +883,9 @@ pub(crate) fn compile_region_numeric(
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<(JitFn, bool)> {
     // SROA-rewritten code has no index ops, so an empty TA plan (no snapshot) is correct.
-    if let Some(f) = compile_region_int(proto, start, end, gh, &TaPinPlan::default(), 0, meter) {
+    if let Some(f) =
+        compile_region_int(proto, start, end, gh, &TaPinPlan::default(), 0, &IntEntry::default(), meter)
+    {
         return Some((f, true));
     }
     // SROA-rewritten code has no index ops, so an empty TA plan is correct here.

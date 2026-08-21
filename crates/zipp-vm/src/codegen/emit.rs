@@ -98,9 +98,11 @@ pub(crate) fn emit_int_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPl
 }
 
 /// Guard that the i64 in xmm home `h` is within `[-2^53, 2^53]` (signed); if not,
-/// flush all homes and resume the interpreter at the NEXT ip (the overflowed
-/// value flushes via cvtsi2sd to exactly JS's rounded result, so ip+1 is sound).
-pub(crate) fn emit_i53_guard(ops: &mut dynasmrt::x64::Assembler, h: u8, ip: usize, flush_exit: dynasmrt::DynamicLabel) {
+/// flush all homes and resume the interpreter at `resume_ip` — the ip AFTER this
+/// op for an ordinary region (the overflowed value flushes via cvtsi2sd to
+/// exactly JS's rounded result, so ip+1 is sound), or the caller's replay point
+/// when this op came from a spliced body.
+pub(crate) fn emit_i53_guard(ops: &mut dynasmrt::x64::Assembler, h: u8, resume_ip: i32, flush_exit: dynasmrt::DynamicLabel) {
     // Range trick: x ∈ [-2^53, 2^53] ⟺ (x + 2^53) ≤ 2^54 as UNSIGNED (a value
     // below -2^53 wraps to a huge unsigned and fails too). The two constants are
     // pre-loaded once in the prologue (r13 = 2^53, r14 = 2^54) — avoiding two
@@ -113,7 +115,7 @@ pub(crate) fn emit_i53_guard(ops: &mut dynasmrt::x64::Assembler, h: u8, ip: usiz
         ; cmp rax, r14           // 2^54
         ; jbe => done            // in range → continue
         ; => ovf
-        ; mov DWORD [rsi], (ip + 1) as i32   // resume AFTER this op (result flushed)
+        ; mov DWORD [rsi], resume_ip   // resume AFTER this op (result flushed)
         ; jmp => flush_exit
         ; => done
     );
@@ -148,7 +150,7 @@ pub(crate) fn copy_clobber(lc: &mut LastCopy, h: u8) {
 /// and a 2^53 guard (skipped when the interval analysis proved the result is
 /// always in range). `add = true` ⇒ paddq (commutative); else psubq.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, ip: usize, flush_exit: dynasmrt::DynamicLabel, dst: u16, a: u16, b: u16, add: bool, lc: &mut LastCopy) {
+pub(crate) fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, ip: usize, resume_ip: i32, flush_exit: dynasmrt::DynamicLabel, dst: u16, a: u16, b: u16, add: bool, lc: &mut LastCopy) {
     let (d, ax, bx) = (xh(plan, dst), xh(plan, a), xh(plan, b));
     if add {
         if d == ax || copy_is_noop(*lc, d, ax) {
@@ -172,7 +174,7 @@ pub(crate) fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, i
     // deliberately skips these registers (see `emit_int_wt`).
     emit_int_wt(ops, plan, dst, false);
     if !plan.elide_guard.contains(&ip) {
-        emit_i53_guard(ops, d, ip, flush_exit);
+        emit_i53_guard(ops, d, resume_ip, flush_exit);
     }
 }
 

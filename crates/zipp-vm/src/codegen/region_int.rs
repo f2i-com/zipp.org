@@ -163,6 +163,7 @@ pub(crate) fn int_unadmitted_ips(
 /// resuming is sound. On exit each i64 home is boxed back to an Int Value (if it
 /// fits i32) or a double (else, exact since |x| ≤ 2^53). All comparisons are
 /// SIGNED. Live-ins are guarded Int-tagged at entry (bail otherwise, no flush).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_region_int(
     proto: &FuncProto,
     start: u32,
@@ -170,6 +171,7 @@ pub(crate) fn compile_region_int(
     globals_base_helper: usize,
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
+    entry: &IntEntry<'_>,
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     compile_region_int_maybe_cold(
@@ -180,6 +182,7 @@ pub(crate) fn compile_region_int(
         ta_plan,
         ta_snapshot,
         false,
+        entry,
         meter,
     )
 }
@@ -214,6 +217,7 @@ pub(crate) fn compile_region_int(
 /// sound and still worth up to 4.7x locally. It needs a register plan that
 /// accounts for the cold blocks, not block-granular exits over a plan that
 /// ignored them.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_region_int_maybe_cold(
     proto: &FuncProto,
     start: u32,
@@ -222,6 +226,9 @@ pub(crate) fn compile_region_int_maybe_cold(
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
     cold_exit: bool,
+    // Deopt resume map + hoisted entry guards when `proto` is a SPLICE-FLATTENED
+    // body (`IntEntry::default()` for an ordinary region — byte-identical).
+    entry: &IntEntry<'_>,
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     let unadmitted = int_unadmitted_ips(proto, start, end, ta_plan, false)?;
@@ -258,6 +265,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ta_plan,
                     ta_snapshot,
                     &p,
+                    entry,
                     meter,
                     false, // W10.3: never spill on the first attempt (B96 ordering)
                 ) {
@@ -286,6 +294,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                 ta_plan,
                                 ta_snapshot,
                                 &shared,
+                                entry,
                                 meter,
                                 true,
                             ) {
@@ -392,6 +401,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             // there; declined for ANY reason → fall to MEM exactly as before.
             // The xmm emitter still never sees a split plan unless
             // `ZIPP_INT_SPLIT=1`. Off-switch: `ZIPP_NO_GPR_SPLIT=1`.
+            let mut split_plan = None;
             if !int_split_enabled() && gpr_split_enabled() && gpr_homes_enabled() && cold.is_empty()
             {
                 if let Some(p2) =
@@ -406,6 +416,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                             ta_plan,
                             ta_snapshot,
                             &p2,
+                            entry,
                             meter,
                             false, // W10.3: never spill on the first attempt
                         ) {
@@ -431,6 +442,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                         ta_plan,
                                         ta_snapshot,
                                         &shared,
+                                        entry,
                                         meter,
                                         true,
                                     ) {
@@ -440,13 +452,28 @@ pub(crate) fn compile_region_int_maybe_cold(
                             }
                             _ => {}
                         }
+                        split_plan = Some(p2);
                     }
                 }
             }
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
-                eprintln!("[jit] INT decline [{start},{end}]: plan_region=None");
+            // ── the SPLICED region's own fallback ── a flattened body is
+            // wider than the GPR pool long before it is wider than the xmm
+            // one (the mix loop plans 12 homes against 8 gprs), and for it the
+            // alternative to an xmm split is not a GPR split — it is the
+            // MEMORY tier, ~9x slower per op. B94's refutation priced the xmm
+            // split against a GPR one on a bitwise chain and does not reach
+            // this case, so take the split plan here rather than decline. Only
+            // a flattened region qualifies: every other region reaches this
+            // line exactly as it did before.
+            match split_plan.filter(|_| !entry.resume.is_empty()) {
+                Some(p2) => p2,
+                None => {
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!("[jit] INT decline [{start},{end}]: plan_region=None");
+                    }
+                    return None;
+                }
             }
-            return None;
         }
     };
     if !plan.split_recvs.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -471,6 +498,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             ta_plan,
             ta_snapshot,
             &plan,
+            entry,
             meter,
             false, // W10.3 spilling is scoped to the DV / split-fallback retries above
         ) {
@@ -512,6 +540,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         ta_plan,
                         ta_snapshot,
                         &shared,
+                        entry,
                         meter,
                         false, // W10.3 spilling is scoped to the DV / split-fallback retries
                     ) {
@@ -530,6 +559,15 @@ pub(crate) fn compile_region_int_maybe_cold(
         }
     };
     let (s, e) = (start as usize, end as usize);
+    // Where the interpreter resumes for an exit taken before `ip` runs. The
+    // identity for an ordinary region; for a spliced body the ip that replays
+    // the whole call (see `IntEntry::resume`).
+    let rip = |ip: usize| -> i32 {
+        // Out of range only if `entry.resume` is empty (an unspliced region,
+        // where `ip` IS the resume ip) — the map is built one entry past the
+        // body so that `ip + 1` is always in it.
+        entry.resume.get(ip.wrapping_sub(s)).map_or(ip as i32, |&r| r as i32)
+    };
 
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
     let mut exit_stubs: FxHashMap<u32, dynasmrt::DynamicLabel> = FxHashMap::default();
@@ -577,6 +615,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         let xi = 6 + k as u8;
         dynasm!(ops ; movdqu [rsp + xmm_off + (k as i32) * 16], Rx(xi));
     }
+    emit_int_splice_entry_guards(&mut ops, entry, n_ta > 0, entry_bail);
     // ── pinned-TypedArray snapshots ── BEFORE loading any numeric home (jit_ta_snapshot
     // clobbers volatile xmm0..5, which double as homes; xmm6..15 are already saved and
     // no home is loaded yet). Each slot gets {obj_bits, base, len} (or {0,0,0} → the
@@ -663,6 +702,8 @@ pub(crate) fn compile_region_int_maybe_cold(
     // Redundant-copy tracker (see `LastCopy`).
     let mut lc: LastCopy = None;
     for ip in s..=e {
+        let rip_at = rip(ip);
+        let rip_after = rip(ip + 1);
         dynasm!(ops ; => lbl(ip as u32, &in_region));
         if plan.jump_targets.contains(&ip) {
             lc = None; // control may arrive here with different home contents
@@ -676,7 +717,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         // hand this exact ip back to the interpreter, which runs the block (and
         // the rest of the iteration) itself.
         if cold.contains(&ip) {
-            dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
+            dynasm!(ops ; mov DWORD [rsi], rip_at ; jmp => flush_exit);
             continue;
         }
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
@@ -775,11 +816,11 @@ pub(crate) fn compile_region_int_maybe_cold(
                 }
             }
             Instr::Add { dst, a, b } => {
-                emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, true, &mut lc);
+                emit_ibin(&mut ops, &plan, ip, rip_after, flush_exit, dst, a, b, true, &mut lc);
                 wt_pre = true; // emit_ibin write-throughs before its own guard
             }
             Instr::Sub { dst, a, b } => {
-                emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, false, &mut lc);
+                emit_ibin(&mut ops, &plan, ip, rip_after, flush_exit, dst, a, b, false, &mut lc);
                 wt_pre = true; // emit_ibin write-throughs before its own guard
             }
             Instr::Mul { dst, a, b } => {
@@ -820,12 +861,12 @@ pub(crate) fn compile_region_int_maybe_cold(
                         ; movq Rx(d), rax
                         ; jmp => done
                         ; => ovf
-                        ; mov DWORD [rsi], ip as i32 // resume at THIS op (dst not written)
+                        ; mov DWORD [rsi], rip_at // resume at THIS op (dst not written)
                         ; jmp => flush_exit
                         ; => done
                     );
                     wt_pre = emit_int_wt(&mut ops, &plan, dst, false) || wt_pre;
-                    emit_i53_guard(&mut ops, d, ip, flush_exit);
+                    emit_i53_guard(&mut ops, d, rip_after, flush_exit);
                 }
             }
             Instr::Mod { dst, a, b } => {
@@ -863,7 +904,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; movq Rx(d), rdx
                     ; jmp => done
                     ; => zbail
-                    ; mov DWORD [rsi], ip as i32 // resume at THIS op (dst unwritten)
+                    ; mov DWORD [rsi], rip_at // resume at THIS op (dst unwritten)
                     ; jmp => flush_exit
                     ; => done
                 );
@@ -901,7 +942,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     copy_clobber(&mut lc, d);
                     wt_pre = emit_int_wt(&mut ops, &plan, dst, false);
                     if !plan.elide_guard.contains(&ip) {
-                        emit_i53_guard(&mut ops, d, ip, flush_exit);
+                        emit_i53_guard(&mut ops, d, rip_after, flush_exit);
                     }
                 }
             }
@@ -920,7 +961,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; movq rax, Rx(ax)
                     ; test rax, rax
                     ; jnz => nonzero
-                    ; mov DWORD [rsi], ip as i32
+                    ; mov DWORD [rsi], rip_at
                     ; jmp => flush_exit
                     ; => nonzero
                     ; pxor xmm0, xmm0
@@ -930,7 +971,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 copy_clobber(&mut lc, d);
                 wt_pre = emit_int_wt(&mut ops, &plan, dst, false);
                 if !plan.elide_guard.contains(&ip) {
-                    emit_i53_guard(&mut ops, d, ip, flush_exit);
+                    emit_i53_guard(&mut ops, d, rip_after, flush_exit);
                 }
             }
             Instr::Lt { dst, a, b } => {
@@ -1078,7 +1119,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; movq Rx(d), rax
                     ; jmp => done
                     ; => deopt
-                    ; mov DWORD [rsi], ip as i32         // resume AT this ip
+                    ; mov DWORD [rsi], rip_at         // resume AT this ip
                     ; jmp => flush_exit
                     ; => done
                 );
@@ -1115,7 +1156,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; mov DWORD [rdx + rcx * 4], eax     // store low 32 (== ToInt32(v))
                     ; jmp => done
                     ; => deopt
-                    ; mov DWORD [rsi], ip as i32
+                    ; mov DWORD [rsi], rip_at
                     ; jmp => flush_exit
                     ; => done
                 );
@@ -1182,7 +1223,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; movq Rx(d), rax
                     ; jmp => done
                     ; => deopt
-                    ; mov DWORD [rsi], ip as i32         // resume AT this ip
+                    ; mov DWORD [rsi], rip_at         // resume AT this ip
                     ; jmp => flush_exit
                     ; => done
                 );
@@ -1229,7 +1270,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         ; movq Rx(d), rax
                         ; jmp => done
                         ; => deopt
-                        ; mov DWORD [rsi], ip as i32
+                        ; mov DWORD [rsi], rip_at
                         ; jmp => flush_exit
                         ; => done
                     );
@@ -1256,7 +1297,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                 );
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
-                dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
+                dynasm!(ops ; mov DWORD [rsi], rip_at ; jmp => flush_exit);
             }
             // POST-PLAN hole: this region passed admission AND `plan_region`,
             // but this emitter has no arm for the op. Name the decline through
@@ -1326,7 +1367,8 @@ pub(crate) fn compile_region_int_maybe_cold(
 
     // ── entry_bail ── a live-in wasn't Int-tagged; nothing computed, so restore
     // (NO flush) and resume at the header (interpreted).
-    dynasm!(ops ; => entry_bail ; mov DWORD [rsi], start as i32);
+    let rip_entry = rip(s);
+    dynasm!(ops ; => entry_bail ; mov DWORD [rsi], rip_entry);
     emit_region_restore_n(&mut ops, xmm_off, frame);
 
     let buf = match ops.finalize() {
