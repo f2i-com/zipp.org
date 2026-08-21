@@ -246,6 +246,34 @@ pub(crate) const HOME_XMM_FIRST: u8 = 2;
 pub(crate) const HOME_XMM_LAST: u8 = 15;
 /// Gpr pool for boolean homes (r8..r11, all volatile; the region issues no calls
 /// in its body so they survive). 4 simultaneous bools.
+///
+/// THE REGISTER CONTRACT. These four registers are PLANNER-OWNED for the whole
+/// life of a compiled region. Between the prologue and any exit they may hold
+///   * a `Bool` register home (every tier — `RegionPlan::bool_regs`), filled at
+///     its in-region def or by `emit_bool_entry_load`, read back only by
+///     `flush_exit`;
+///   * a `gpr_const` mirror of a hoisted compare constant (the xmm INT tier),
+///     filled ONCE in the prologue and read by `emit_icmp_flags` in the body;
+///   * a numeric i64 home (the INT-GPR tier hands out whichever of these the
+///     bools left free — see `gpr_home_map`).
+/// NOTHING reloads any of them per iteration, so a body arm that scratches one
+/// silently corrupts a live JS value until the region exits, across the
+/// backedge, for every later iteration.
+///
+/// Therefore: **a region emitter's body may scratch rax/rcx/rdx and xmm0/xmm1
+/// and nothing else** — never r8..r11, and never the pinned rbx/rsi/rdi/r12
+/// (and r13/r14 where the i53 guard constants live). This is the invariant, and
+/// it holds for entry code too: no helper reachable from a region prologue or
+/// body scratches a `BOOL_GPRS` register any more, which is why the bool entry
+/// loads no longer have to run last to be correct.
+///
+/// It has been violated three times, each time as a silent wrong answer:
+/// W14 (the xmm INT tier's dense-Array tag check, `region_int.rs`), and W16's
+/// two — the DOUBLE tier's `Bitwise` INT64_MIN sentinel (`regalloc.rs`) and the
+/// `emit_box_to_home` tag check that the same tier's dense-Array read calls
+/// (`emit.rs`). `tests/bool_home_clobber.rs` is the mechanical guard: it sweeps
+/// one..four live bools across each tier so every one of these four registers
+/// is occupied in turn while the body ops run.
 pub(crate) const BOOL_GPRS: [u8; 4] = [8, 9, 10, 11];
 
 /// A numeric value being allocated an xmm home: a VM register or a global slot.

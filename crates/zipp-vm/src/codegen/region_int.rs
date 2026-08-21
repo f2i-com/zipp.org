@@ -656,8 +656,9 @@ pub(crate) fn compile_region_int_maybe_cold(
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_int_entry_load(&mut ops, x, entry_bail);
     }
-    // Bool homes last: the int/global loads above use r10 as scratch and r10 is
-    // itself a bool home, so loading bools earlier would be undone here.
+    // Bool homes last. This ORDER is no longer load-bearing — no entry-load
+    // helper scratches a BOOL_GPR any more (see the register contract on
+    // `BOOL_GPRS`) — but it is kept: it is the order the other two tiers use.
     for &(r, g) in &plan.live_in_bools {
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_bool_entry_load(&mut ops, g, entry_bail);
@@ -775,21 +776,18 @@ pub(crate) fn compile_region_int_maybe_cold(
                     dynasm!(ops ; mov Rq(d), Rq(sg));
                 }
             },
-            // A pinned-TA receiver's LoadGlobal is a no-op: it has no numeric home;
-            // the element-access emitter reads the receiver via the pin's source.
-            Instr::LoadGlobal { dst, .. } if plan.ta_recv_regs.contains(&dst) => {
-                flag_cmp = prev_flag; // nothing emitted; flags still live
-            }
-            // ── B94 split receiver ── this LoadGlobal is the RECEIVER half of a
-            // recycled register. Its i64 home belongs to the register's numeric
-            // half, so the object goes to the memory slot, which every pinned
-            // access reads via the pin's global and which stays authoritative
-            // for this register throughout the region (mirrors the regalloc arm).
-            Instr::LoadGlobal { dst, idx } if plan.split_recv_lg.contains(&ip) => {
-                dynasm!(ops
-                    ; mov rax, [r12 + (idx as i32) * 8]
-                    ; mov [rbx + dreg(dst)], rax
-                );
+            // ── pinned receiver (ta_recv_regs) / B94 split receiver ── the
+            // object has no numeric home here (the element-access emitter reads
+            // it via the pin's source; a split receiver's i64 home belongs to the
+            // register's NUMERIC half), so it goes to the register's memory slot,
+            // which stays authoritative for this register throughout the region.
+            // `emit_recv_slot_store` carries why the ta_recv half is not a no-op.
+            // Two `mov`s: no flag effects, so a fused compare stays live.
+            Instr::LoadGlobal { dst, idx }
+                if plan.ta_recv_regs.contains(&dst) || plan.split_recv_lg.contains(&ip) =>
+            {
+                emit_recv_slot_store(&mut ops, dst, idx);
+                flag_cmp = prev_flag;
             }
             Instr::LoadGlobal { dst, idx } => {
                 let d = xh(&plan, dst);
@@ -1388,6 +1386,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             plan.hoist_len_ips.len(),
             buf.len()
         );
+        log_pinned_recvs("INT", start, end, proto, &plan);
     }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })

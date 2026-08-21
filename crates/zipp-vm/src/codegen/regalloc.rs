@@ -138,8 +138,9 @@ pub(crate) fn compile_region_regalloc(
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_box_to_home(&mut ops, x, entry_bail);
     }
-    // Bool homes last: the loads above use r10 as scratch and r10 is itself one
-    // of BOOL_GPRS, so loading bools earlier would be undone here.
+    // Bool homes last. This ORDER is no longer load-bearing — no entry-load
+    // helper scratches a BOOL_GPR any more (see the register contract on
+    // `BOOL_GPRS`) — but it is kept: it is the order the other two tiers use.
     for &(r, g) in &plan.live_in_bools {
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_bool_entry_load(&mut ops, g, entry_bail);
@@ -229,21 +230,17 @@ pub(crate) fn compile_region_regalloc(
                     dynasm!(ops ; mov Rq(d), Rq(sg));
                 }
             },
-            // A TA-receiver's LoadGlobal is a no-op: it has no numeric home; the
-            // element-access emitter reads the receiver via the pin's source.
-            Instr::LoadGlobal { dst, .. } if plan.ta_recv_regs.contains(&dst) => {
-                flag_cmp = prev_flag; // nothing emitted; flags still live
-            }
-            // ── B94 split receiver ── this LoadGlobal is the RECEIVER half of a
-            // recycled register. Its xmm home belongs to the register's numeric
-            // half, so the object goes to the memory slot, which every pinned
-            // access reads via `TaPinSrc::Reg` and which stays authoritative for
-            // this register throughout the region.
-            Instr::LoadGlobal { dst, idx } if plan.split_recv_lg.contains(&ip) => {
-                dynasm!(ops
-                    ; mov rax, [r12 + (idx as i32) * 8]
-                    ; mov [rbx + dreg(dst)], rax
-                );
+            // ── pinned receiver / B94 split receiver ── the object has no numeric
+            // home (the element emitter reads it via the pin's source; a split
+            // receiver's xmm home belongs to the register's NUMERIC half), so it
+            // goes to the register's memory slot, which stays authoritative for
+            // this register throughout the region. `emit_recv_slot_store` carries
+            // why the ta_recv half is not a no-op.
+            Instr::LoadGlobal { dst, idx }
+                if plan.ta_recv_regs.contains(&dst) || plan.split_recv_lg.contains(&ip) =>
+            {
+                emit_recv_slot_store(&mut ops, dst, idx);
+                flag_cmp = prev_flag;
             }
             Instr::LoadGlobal { dst, idx } => {
                 let d = xh(&plan, dst);
@@ -287,6 +284,13 @@ pub(crate) fn compile_region_regalloc(
             // answer (0 for NaN/Inf; a modular reduction for the huge case).
             // A legitimate operand of exactly INT64_MIN also bails — correct,
             // just slower, and unreachable from an f64 that is not already huge.
+            //
+            // Scratch is rax/rcx/rdx only. The INT64_MIN sentinel used to be
+            // materialised in r10, which is `BOOL_GPRS[2]`: every `|`, `&`,
+            // `^`, `<<`, `>>`, `>>>` — including the `| 0` an int-flavoured JS
+            // loop writes on every line — destroyed the region's THIRD `Bool`
+            // home, for the rest of the region and across the backedge. That
+            // flushed a raw sentinel into a JS variable holding `false` (W16).
             Instr::Bitwise { dst, a, b, op } => {
                 use crate::bytecode::BitwiseOp as B;
                 let (d, ax, bx) = (xh(&plan, dst), xh(&plan, a), xh(&plan, b));
@@ -295,11 +299,11 @@ pub(crate) fn compile_region_regalloc(
                 let bw_done = ops.new_dynamic_label();
                 dynasm!(ops
                     ; cvttsd2si rax, Rx(ax)
-                    ; mov r10, QWORD i64::MIN
-                    ; cmp rax, r10
+                    ; mov rdx, QWORD i64::MIN
+                    ; cmp rax, rdx
                     ; je => bw_bail
                     ; cvttsd2si rcx, Rx(bx)
-                    ; cmp rcx, r10
+                    ; cmp rcx, rdx
                     ; je => bw_bail
                 );
                 // x86 masks the shift count in cl to 5 bits, which is exactly
@@ -906,6 +910,7 @@ pub(crate) fn compile_region_regalloc(
             ta_plan.pins.len(),
             buf.len()
         );
+        log_pinned_recvs("DOUBLE", start, end, proto, &plan);
     }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })

@@ -87,20 +87,35 @@
 //!
 //! ## What it found
 //!
-//! Five `#[ignore]`d specs below carry minimized cases for four findings on the
-//! tree this was written against — [`open_bool_local_reads_back_as_nan`] and
+//! Five specs below carry minimized cases for four findings on the tree this
+//! was written against — [`open_bool_local_reads_back_as_nan`] and
 //! [`open_bool_live_out_reads_back_false`] (one defect, two faces),
 //! [`open_nested_loop_drops_inner_iterations`],
-//! [`open_cold_out_of_range_read_throws`], and
-//! [`open_fused_double_compare_takes_wrong_branch`]. All reproduce at HEAD
+//! [`open_cold_out_of_range_read_throws`] (FIXED in W16, now un-ignored —
+//! the receiver-slot suite is `tests/cold_pinned_recv.rs`), and
+//! [`open_fused_double_compare_takes_wrong_branch`]. All reproduced at HEAD
 //! 6ed29ac and all are node-confirmed, so none of them is a zipp-vs-node
 //! judgement call.
 //!
-//! A fifth result has no spec because it is about a SWITCH rather than about the
+//! All five are CLOSED (W16) and now run with the normal suite: the two
+//! `open_bool_*` faces of one register defect, and
+//! [`open_nested_loop_drops_inner_iterations`] +
+//! [`open_fused_double_compare_takes_wrong_branch`], which also turned out to be
+//! ONE defect wearing two tiers — a home-reuse live range that stopped at the
+//! last MENTION of a value instead of its last live ip, so a value defined
+//! outside an inner loop and read inside it lost its home to a later temp. And
+//! [`open_cold_out_of_range_read_throws`], whose pinned receiver now stores the
+//! object to its frame slot. No `open_*` spec is `#[ignore]`d any more.
+//!
+//! A fifth result had no spec because it is about a SWITCH rather than about the
 //! default: on 12 of the 28 divergent programs the soak found, the default
 //! answer is right and `ZIPP_NO_FUSED_CMPJUMP=1` alone is wrong. That switch is
-//! specified as a pure fallback, so any A/B measured through it is being
-//! measured against wrong answers.
+//! specified as a pure fallback, so any A/B measured through it was being
+//! measured against wrong answers. W16 found it to be the SAME defect seen from
+//! the other side — unfusing a compare adds a `Bool`, which pushes a live bool
+//! into the register the DOUBLE tier's body was scratching — and closed it with
+//! the two above; `tests/bool_home_clobber.rs` holds its spec, including the
+//! switch-purity case.
 //!
 //! The honesty check that backs that up: over 4,000 generated programs run
 //! against node (`ZIPP_FUZZ_NODE_COUNT=4000`), `ZIPP_NOJIT=1` agreed with node
@@ -2471,12 +2486,11 @@ fn sweep(
 /// divergence — compare the minimized case against the `open_*` specs before
 /// assuming otherwise.
 const KNOWN_OPEN: &[(u64, u64, &str)] = &[
-    // The live-out `Bool` defect, this time on the DOUBLE tier over a
-    // double-element Array. Four different answers for one program: 0x3b from
-    // the interpreter and node, 0x1f at the default threshold, 0x11b at
-    // `ZIPP_JIT_THRESHOLD=1`, 0x2d under `ZIPP_NO_FUSED_CMPJUMP=1` — with `b2`
-    // reading back as NaN in two of them.
-    (0x5A17_2026_0F1E_2D3C, 392, "open_bool_local_reads_back_as_nan"),
+    // (W16 closed the only entry this list ever held — index 392 of seed
+    // 0x5A17…, the live-out `Bool` defect on the DOUBLE tier over a
+    // double-element Array. Its four answers were one register: the tier's
+    // `Bitwise` sentinel and dense-Array tag check both scratched
+    // `BOOL_GPRS[2]`. See `tests/bool_home_clobber.rs`.)
 ];
 
 fn selected_modes(names: &[&str]) -> Vec<&'static Mode> {
@@ -2668,8 +2682,15 @@ fn node_oracle_slice() {
 /// all-Int Array read at a DATA-DEPENDENT index that leaves the array
 /// (`(h * 3) & 63` over 32 elements — the out-of-range reads are what force the
 /// deopt/eviction), and the third bool read only after the loop.
+///
+/// CLOSED IN W16, and the tier trace above was the red herring the minimizer
+/// left behind: the eviction/re-compile is only how the program REACHES the
+/// DOUBLE tier, whose body then destroys `BOOL_GPRS[2] = r10` twice over —
+/// once in `regalloc.rs`'s `Bitwise` arm (the INT64_MIN sentinel) and once in
+/// `emit_box_to_home`, the dense-Array element tag check. Both now scratch rdx.
+/// `tests/bool_home_clobber.rs` carries the class; this stays as the fuzzer's
+/// own minimized case.
 #[test]
-#[ignore = "OPEN: a Bool local reads back as NaN after its region compiles"]
 fn open_bool_local_reads_back_as_nan() {
     if parent_guard() {
         return;
@@ -2719,8 +2740,12 @@ fn assert_matches_node(src: &str) {
 /// returns 23 on the first 22 calls and 4 on every call after, with nothing
 /// about the program changing in between. `ZIPP_NO_FUSED_CMPJUMP=1` returns 5
 /// from the same point — a third answer for the same program.
+///
+/// CLOSED IN W16 with its sibling above, and this face is what named the
+/// mechanism: 23 ^ 4 = 19 is exactly `b2`'s term and 23 ^ 5 = 18 exactly
+/// `b1`'s, i.e. each spelling loses whichever bool the planner put in
+/// `BOOL_GPRS[2]` — nothing about "live-out" or about the re-compile.
 #[test]
-#[ignore = "OPEN: a live-out Bool local reads back false after its region is re-compiled"]
 fn open_bool_live_out_reads_back_false() {
     if parent_guard() {
         return;
@@ -2765,8 +2790,18 @@ console.log(o.join(","));
 /// HEAD 6ed29ac, in every mode except `ZIPP_NOJIT=1` and a threshold high
 /// enough that the loop never compiles — `ZIPP_NO_FUSED_CMPJUMP=1` and
 /// `ZIPP_NO_GPR_HOMES=1` are both wrong in the same way.
+///
+/// CLOSED IN W16, and every word about iteration COUNTS above is the red
+/// herring the arithmetic invited: the inner loop runs exactly 18 times, and
+/// one of every two addends is ZERO. `d0` is defined in the outer loop and read
+/// in the inner one, so it is live across the inner back-edge — but the
+/// home-reuse allocator sized its home from the `[first mention, last mention]`
+/// window `[10, 17]`, handed the same home to the `| 0` literal at ip 21, and
+/// the second inner iteration multiplied 0 by 1024. The literal spelling
+/// `d0 = -191.25` hoists to a permanent home and the `-i` spelling costs one
+/// register fewer than the pool, which is why neither reproduces.
+/// `tests/loop_home_liverange.rs` carries the class.
 #[test]
-#[ignore = "OPEN: a compiled nested loop drops inner iterations"]
 fn open_nested_loop_drops_inner_iterations() {
     if parent_guard() {
         return;
@@ -2805,8 +2840,17 @@ console.log(kernel(9));
 /// which is worth saying out loud: the fused compare/jump path is wrong in at
 /// least two unrelated register-allocation situations, and in some generated
 /// shapes it is the OFF-switch rather than the default that answers wrong.
+///
+/// CLOSED IN W16, and the fused compare was innocent: it is the SAME defect as
+/// [`open_nested_loop_drops_inner_iterations`], one tier over. `d1` is defined
+/// in the outer loop and read in the innermost one, so it is live across two
+/// back-edges, but its home was sized from the mention window `[10, 25]` and
+/// re-let to `h + (7|3)` at ip 30 — a value that reaches 109. Only the FIRST of
+/// each outer iteration's four body passes compared `d1`; the other three
+/// compared `h`, and `h > 100` on the last two. `ZIPP_NO_FUSED_CMPJUMP=1`
+/// answered correctly because unfusing shifts the allocation, not because the
+/// emitter was at fault. `tests/loop_home_liverange.rs` carries the class.
 #[test]
-#[ignore = "OPEN: a fused double compare in a nested loop takes the wrong branch"]
 fn open_fused_double_compare_takes_wrong_branch() {
     if parent_guard() {
         return;
@@ -2831,26 +2875,37 @@ console.log(kernel(9));
     assert_matches_node(SRC);
 }
 
-/// OPEN #2, found by this harness on the tree it was written against.
+/// FIXED (W16) — was OPEN #2, found by this harness on the tree it was written
+/// against. Kept under its original name so the finding stays greppable.
 ///
-/// An out-of-range element read that sits in a COLD block of a compiled loop
-/// throws `TypeError: cannot read property of undefined` instead of yielding
-/// `undefined`. The receiver is a hoisted/pinned global (`pins=1/1` in the
-/// JITLOG); on the cold path its register is not the array, so the region deopts
-/// at that ip and the interpreter resumes reading a property of `undefined`.
+/// An out-of-range element read sitting in a COLD block of a compiled loop threw
+/// `TypeError: cannot read property of undefined` instead of yielding
+/// `undefined`. The receiver was a pinned GLOBAL (`pins=1/1` in the JITLOG), and
+/// a pinned receiver has no numeric home — all three register emitters read it
+/// through the pin's source, so its `LoadGlobal` emitted nothing and its frame
+/// slot was never written. The bounds guard then deopted AT the `GetIndex` ip and
+/// the interpreter re-executed it on the `undefined` the slot still held. The
+/// receiver `LoadGlobal` now stores the object to that slot on every tier
+/// (`emit_recv_slot_store`), which is the invariant B94's split receiver already
+/// held.
 ///
-/// Reproduces at HEAD 6ed29ac and in EVERY compiled mode — no `ZIPP_NO_*` switch
-/// avoids it, only `ZIPP_NOJIT=1` and a threshold high enough that the loop never
-/// compiles. It is not typed-array-specific: a plain dense Array, an
-/// `Int32Array` and a `Float64Array` all throw.
+/// Reproduced at HEAD 6ed29ac in EVERY compiled mode — no `ZIPP_NO_*` switch
+/// avoided it, only `ZIPP_NOJIT=1` and a threshold high enough that the loop
+/// never compiled. It was not typed-array-specific: a plain dense Array, an
+/// `Int32Array` and a `Float64Array` all threw.
 ///
 /// Load-bearing ingredients, each confirmed by removing it: the receiver must be
-/// a GLOBAL (a parameter is fine), the read must be in a conditional block (the
-/// same read on every iteration is fine), and the index must be out of range (an
-/// in-range one is fine). `a[33]` on a 32-element array throws just as `a[9999]`
-/// does.
+/// a GLOBAL (a parameter is fine — its slot is a live-in the interpreter already
+/// filled), the read must be in a conditional block the interpreter has not
+/// reached before the OSR compile (the same read on every iteration is fine —
+/// the pre-OSR iterations leave the slot correct), and the index must be out of
+/// range so the guard actually deopts. `a[33]` on a 32-element array threw just
+/// as `a[9999]` did.
+///
+/// `tests/cold_pinned_recv.rs` carries the wider suite: the DOUBLE and INT-GPR
+/// emitters, a negative index, an out-of-bounds TypedArray STORE, a pinned-string
+/// `charCodeAt`, and the JITLOG mechanism pins that keep those cases non-vacuous.
 #[test]
-#[ignore = "OPEN: a cold out-of-range element read throws TypeError instead of yielding undefined"]
 fn open_cold_out_of_range_read_throws() {
     if parent_guard() {
         return;

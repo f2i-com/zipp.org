@@ -276,9 +276,12 @@ const GPR_SPILL_CAP: usize = 8;
 /// A home whose only regs are hoisted constants is NOT mapped: its regs read as
 /// immediates and flush as compile-time-boxed Values, so it costs no GPR.
 ///
-/// NOTE r10: the xmm tier uses r10 as scratch in entry loads and the dense-array
-/// tag check; every arm in THIS file scratches only rax/rcx/rdx, which is what
-/// makes handing r8..r11 out as numeric homes sound.
+/// NOTE r8..r11: every arm in THIS file scratches only rax/rcx/rdx, which is
+/// what makes handing them out as numeric homes sound. That is now the rule for
+/// EVERY region emitter — see the register contract on `BOOL_GPRS`. (It used to
+/// be this file's local discipline while the xmm tiers scratched r10 in their
+/// entry loads, their dense-Array tag check and the DOUBLE `Bitwise` sentinel;
+/// each of those was a silent wrong answer, fixed in W14 and W16.)
 fn gpr_home_map(
     proto: &FuncProto,
     plan: &RegionPlan,
@@ -1492,20 +1495,15 @@ pub(crate) fn compile_region_int_gpr(
                     dynasm!(ops ; mov Rq(d), Rq(sg));
                 }
             },
-            // A pinned-view receiver's LoadGlobal is a no-op (see the xmm arm).
-            Instr::LoadGlobal { dst, .. } if plan.ta_recv_regs.contains(&dst) => {
+            // ── pinned receiver / B94 split receiver ── the object goes to the
+            // register's memory slot, which stays authoritative for it through
+            // the region (mirrors the xmm arm; `emit_recv_slot_store` carries the
+            // reasoning). rax is outside this emitter's GPR pool.
+            Instr::LoadGlobal { dst, idx }
+                if plan.ta_recv_regs.contains(&dst) || plan.split_recv_lg.contains(&ip) =>
+            {
+                emit_recv_slot_store(&mut ops, dst, idx);
                 flag_cmp = prev_flag;
-            }
-            // ── B94 split receiver ── this LoadGlobal is the RECEIVER half of a
-            // recycled register. Its home belongs to the register's numeric
-            // half, so the object goes to the memory slot, which every pinned
-            // access reads via the pin's global and which stays authoritative
-            // for this register throughout the region (mirrors the xmm arm).
-            Instr::LoadGlobal { dst, idx } if plan.split_recv_lg.contains(&ip) => {
-                dynasm!(ops
-                    ; mov rax, [r12 + (idx as i32) * 8]
-                    ; mov [rbx + dreg(dst)], rax
-                );
             }
             Instr::LoadGlobal { dst, idx } => {
                 let (d, gg) = (g(dst), gx(plan.glob_home[&idx]));
@@ -2533,6 +2531,7 @@ pub(crate) fn compile_region_int_gpr(
             plan.hoist_len_ips.len(),
             buf.len()
         );
+        log_pinned_recvs("INT-GPR", start, end, proto, plan);
     }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     GprAttempt::Emitted(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })

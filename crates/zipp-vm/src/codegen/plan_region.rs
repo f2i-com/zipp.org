@@ -1950,6 +1950,25 @@ fn plan_region_cold_inner(
             *e = ip;
         }
     }
+    // ── control-flow closure of the mention windows ── the two loops above record
+    // where a register is MENTIONED, which is its live range only in straight-line
+    // code. A region is a loop body and routinely contains an INNER loop: a value
+    // defined before it and read inside it stays live across the inner back-edge,
+    // so the rest of the inner body runs while its home is still live, past the
+    // last mention. Without this the reuse allocator handed that home to a value
+    // defined later in the inner body and the read got the clobbered home on every
+    // iteration but the first — a silent wrong answer (W16 defects 2 and 4, one on
+    // the INT tier and one on DOUBLE). `region_live_spans` computes the real live
+    // range; WIDEN with it rather than replace, so an under-modelled use can never
+    // make a range narrower than it already was.
+    for (&r, &(la, lb)) in &region_live_spans(code, s, e, cold, &str_imul_touch) {
+        if let Some(f) = first_ip.get_mut(&r) {
+            *f = (*f).min(la);
+        }
+        if let Some(l) = last_ip.get_mut(&r) {
+            *l = (*l).max(lb);
+        }
+    }
     let range = |r: u16| -> (usize, usize) {
         // Whole-region (permanent home) if loop-carried (live-in, used before
         // defined) OR a HOISTED constant — hoisted values are materialised once
@@ -2627,6 +2646,164 @@ fn plan_region_cold_inner(
         hoist_len_ips,
         strict_entry_globs,
     }))
+}
+
+/// The in-region successors of `ip` — the ips native control can reach from it
+/// WITHOUT leaving `[s, e]`.
+///
+/// A transfer whose target lies outside the region, a `Return`, and a cold ip
+/// (which flushes every home and hands the exact ip back to the interpreter) all
+/// contribute nothing: the native code is entered at `s` alone, so once control
+/// leaves it never re-enters except through a fresh OSR entry, which re-loads
+/// every live-in home from the frame. Target-bearing ops that a region never
+/// admits (`PushHandler`/`PushFinally`/`JumpFinally`) are listed anyway so the
+/// walk stays sound if the admission set ever widens.
+fn region_succs(code: &[Instr], s: usize, e: usize, ip: usize, out: &mut Vec<usize>) {
+    out.clear();
+    let instr = &code[ip];
+    let (target, falls_through) = match *instr {
+        Instr::Jump { target } => (Some(target as usize), false),
+        Instr::Return { .. } | Instr::ReturnUndefined => (None, false),
+        Instr::JumpIfFalse { target, .. }
+        | Instr::JumpIfTrue { target, .. }
+        | Instr::JumpIfNotLt { target, .. }
+        | Instr::JumpIfNotLe { target, .. }
+        | Instr::PushFinally { target, .. }
+        | Instr::JumpFinally { target, .. } => (Some(target as usize), true),
+        Instr::PushHandler { catch_target, .. } => (Some(catch_target as usize), true),
+        _ => (None, true),
+    };
+    if let Some(t) = target {
+        if (s..=e).contains(&t) {
+            out.push(t);
+        }
+    }
+    if falls_through && ip < e {
+        out.push(ip + 1);
+    }
+}
+
+/// Control-flow-correct LIVE span of every register the region `[s, e]` touches:
+/// the (min, max) ip at which the register is live, not merely mentioned.
+///
+/// A `[first mention, last mention]` window is a live range only for
+/// straight-line code, and a region is a loop body that routinely contains an
+/// INNER loop. A value defined before the inner loop and read inside it is still
+/// live on the inner back-edge, so the whole rest of the inner body executes
+/// while its home holds that value — but its mention window closes at the read,
+/// and the home-reuse allocator then hands the home to a value defined later in
+/// the inner body, which clobbers it for the second and every later inner
+/// iteration. That is a silent wrong answer in shipping code:
+///
+/// ```text
+/// for (i = 0; i < n; i++) { d = 255 * -3;                    // mentions: 10
+///   for (j = 0; j < 2; j++) h = (h + ((d * 1024)|0))|0; }    // …and 17
+/// ```
+///
+/// `d`'s window `[10, 17]` looked free from ip 18 on, so the `|0` literal's
+/// register took its home and every SECOND inner iteration multiplied by 0.
+///
+/// Standard backward liveness over `region_succs`. The use/def model is exactly
+/// the one that builds the mention windows (`instr_uses`/`writes_reg` plus the
+/// `extra_touch` pairs that cover the CallMethod/MathOp operands both are blind
+/// to), and callers WIDEN their windows with this rather than replacing them, so
+/// the result is never narrower than the pre-existing allocation — an
+/// under-modelled use can only leave a range where it already was, never shrink
+/// one. A missing def in the model likewise only keeps a value live longer.
+///
+/// `extra_touch` entries are `(ip, reg, is_def)`, matching `str_imul_touch`.
+pub(crate) fn region_live_spans(
+    code: &[Instr],
+    s: usize,
+    e: usize,
+    cold: &FxHashSet<usize>,
+    extra_touch: &[(usize, u16, bool)],
+) -> FxHashMap<u16, (usize, usize)> {
+    let n = e - s + 1;
+    let mut uses: Vec<Vec<u16>> = vec![Vec::new(); n];
+    let mut defs: Vec<Vec<u16>> = vec![Vec::new(); n];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut scratch: Vec<usize> = Vec::new();
+    for ip in s..=e {
+        // A cold ip never runs natively — it flushes and returns this exact ip
+        // to the interpreter. No touches, no in-region successors.
+        if cold.contains(&ip) {
+            continue;
+        }
+        let k = ip - s;
+        uses[k].extend(instr_uses(&code[ip]));
+        if let Some(d) = writes_reg(&code[ip]) {
+            defs[k].push(d);
+        }
+        region_succs(code, s, e, ip, &mut scratch);
+        succs[k].extend(scratch.iter().copied());
+    }
+    for &(ip, r, is_def) in extra_touch {
+        if !(s..=e).contains(&ip) || cold.contains(&ip) {
+            continue;
+        }
+        if is_def { &mut defs[ip - s] } else { &mut uses[ip - s] }.push(r);
+    }
+    let mut live_in: Vec<FxHashSet<u16>> = vec![FxHashSet::default(); n];
+    let mut live_out: Vec<FxHashSet<u16>> = vec![FxHashSet::default(); n];
+    // Monotone fixed point (sets only grow), walked backwards so a straight-line
+    // stretch converges in one pass and each loop nesting level costs one more.
+    // `n + 2` passes is a compile-time bound, not a correctness one: stopping
+    // early would UNDER-approximate liveness (the sets are still growing), so an
+    // unconverged walk hands every register the whole region instead — the same
+    // permanent-home answer a loop-carried value gets.
+    let mut settled = false;
+    for _ in 0..n + 2 {
+        let mut changed = false;
+        for k in (0..n).rev() {
+            let mut out: FxHashSet<u16> = FxHashSet::default();
+            for &t in &succs[k] {
+                out.extend(live_in[t - s].iter().copied());
+            }
+            let mut inn = out.clone();
+            for d in &defs[k] {
+                inn.remove(d);
+            }
+            inn.extend(uses[k].iter().copied());
+            if out != live_out[k] {
+                live_out[k] = out;
+                changed = true;
+            }
+            if inn != live_in[k] {
+                live_in[k] = inn;
+                changed = true;
+            }
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    let mut span: FxHashMap<u16, (usize, usize)> = FxHashMap::default();
+    if !settled {
+        for k in 0..n {
+            for &r in uses[k].iter().chain(defs[k].iter()) {
+                span.insert(r, (s, e));
+            }
+        }
+        return span;
+    }
+    for k in 0..n {
+        let ip = s + k;
+        // `defs` is included on its own account: a def writes the home at `ip`
+        // even when nothing downstream reads it.
+        let touched = live_in[k]
+            .iter()
+            .chain(live_out[k].iter())
+            .chain(uses[k].iter())
+            .chain(defs[k].iter());
+        for &r in touched {
+            let en = span.entry(r).or_insert((ip, ip));
+            en.0 = en.0.min(ip);
+            en.1 = en.1.max(ip);
+        }
+    }
+    span
 }
 
 /// Does the instruction at `d` run on EVERY pass through region `[s, e]`?

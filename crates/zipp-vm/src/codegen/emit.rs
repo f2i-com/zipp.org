@@ -26,14 +26,20 @@ use super::*;
 /// (unequal) and ±Inf (`cvttsd2si` yields the i64::MIN sentinel, which fails both
 /// the round-trip and the range check). Entry code runs once per region entry, so
 /// the extra ~8 instructions never touch the loop body.
+///
+/// Scratch is rcx/rdx/xmm0/xmm1 — NEVER r8..r11, the [`BOOL_GPRS`] the planner
+/// owns (see the register contract on that constant). This used to scratch r10
+/// and rely on every caller loading its bool homes LAST; that hand-maintained
+/// ordering is what the W16 audit removed, so the twins here, in
+/// `emit_int_entry_load_gpr` and in `emit_bool_entry_load` now all agree.
 pub(crate) fn emit_int_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, entry_bail: dynasmrt::DynamicLabel) {
     let as_double = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
-        ; mov r10, rax
-        ; shr r10, 48
-        ; cmp r10d, INT_TAG_HI as i32
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; cmp edx, INT_TAG_HI as i32
         ; jne => as_double         // not Int-tagged — try the integral-double form
         ; movsxd rax, eax          // sign-extend the i32 payload to i64
         ; movq Rx(home), rax
@@ -45,11 +51,11 @@ pub(crate) fn emit_int_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, 
         ; ucomisd xmm0, xmm1
         ; jp => entry_bail         // unordered ⇒ NaN ⇒ a NaN-boxed non-double
         ; jne => entry_bail        // not exactly integral
-        ; mov r10, QWORD 1i64 << 53
-        ; cmp rcx, r10
+        ; mov rdx, QWORD 1i64 << 53
+        ; cmp rcx, rdx
         ; jg => entry_bail
-        ; neg r10
-        ; cmp rcx, r10
+        ; neg rdx
+        ; cmp rcx, rdx
         ; jl => entry_bail         // outside [-2^53, 2^53] — an i64 home is exact only there
         // `ucomisd` reports -0.0 == +0.0, so the round-trip above ACCEPTS -0.0 and
         // would land it in the home as 0 — which exits boxed as Int +0, turning
@@ -349,17 +355,27 @@ pub(crate) fn emit_load_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionP
 
 /// Guard that the Value bits already in `rax` are a number and load them into
 /// xmm home `home` as f64 (Int → cvtsi2sd; double → movq); else jump to `bail`.
-/// Used only at region entry for live-in values (the loop body is guard-free).
+///
+/// Used at region entry for live-in values AND — this is the one that matters —
+/// in the DOUBLE region BODY, by the dense-Array `GetIndex` arm, which must
+/// tag-check every element it reads. Scratch is therefore rdx, NEVER r8..r11:
+/// those are [`BOOL_GPRS`], the planner's register file for `Bool` homes and
+/// `gpr_const` compare mirrors, and nothing reloads them per iteration. See the
+/// register contract on `BOOL_GPRS`. (W16: scratching r10 here destroyed the
+/// third `Bool` home of every DOUBLE region that read a dense Array — the
+/// regalloc twin of the W14 defect, which was fixed in `region_int.rs` only.)
+/// rdx is dead at all three call sites: the two prologue loads take their Value
+/// from rax, and the body's element load has already consumed the pinned base.
 pub(crate) fn emit_box_to_home(ops: &mut dynasmrt::x64::Assembler, home: u8, bail: dynasmrt::DynamicLabel) {
     let int_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
-        ; mov r10, rax
-        ; shr r10, 48
-        ; cmp r10d, INT_TAG_HI as i32
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; cmp edx, INT_TAG_HI as i32
         ; je => int_path
-        ; sub r10d, (INT_TAG_HI + 1) as i32      // 0x7FFA (bool tag)
-        ; cmp r10d, 3                            // high16 ∈ [0x7FFA,0x7FFD] ⇒ not a number
+        ; sub edx, (INT_TAG_HI + 1) as i32       // 0x7FFA (bool tag)
+        ; cmp edx, 3                             // high16 ∈ [0x7FFA,0x7FFD] ⇒ not a number
         ; jbe => bail
         ; movq Rx(home), rax
         ; jmp => done
@@ -636,6 +652,78 @@ pub(crate) fn emit_refetch_pinned(
             ; call rax
             ; mov r14, rax
         );
+    }
+}
+
+/// ── pinned-receiver `LoadGlobal` (all three register emitters) ──
+/// Store the global's live Value into the receiver register's INTERPRETER FRAME
+/// SLOT. Two `mov`s, no flag effects, `rax` the only clobber.
+///
+/// A pinned-access receiver (`RegionPlan::ta_recv_regs`) has NO numeric home:
+/// the element/DataView/charCodeAt emitters read the receiver through the pin's
+/// source, so nothing in the body needs the register and its `LoadGlobal` used
+/// to emit NOTHING at all. That was a silent wrong answer (W16 defect 3). Every
+/// pinned access carries guards that DEOPT **at their own ip** — an OOB or
+/// negative index, a non-Int element tag, a hole, an identity miss — and the
+/// interpreter then re-executes that access, reading the receiver from
+/// `regs[obj]`. `flush_exit` cannot repair the slot: it only boxes NUMERIC
+/// homes back, and this register has none. So the frame slot held whatever the
+/// interpreter last left there, which for an access the interpreter had never
+/// reached (a cold `if` body, entered for the first time under compiled code)
+/// is the frame's initial `undefined`:
+///
+/// ```text
+/// var a = [1,2,3];
+/// function kernel(n) { var t = 4;
+///   for (var i = 0; i < n; i++) { if (i === 17) { t = a[9999]; } }
+///   return t; }
+/// typeof kernel(20)   // "undefined" in node; THREW TypeError here
+/// ```
+///
+/// The bounds guard fired, the region deopted at the `GetIndex` ip, and the
+/// interpreter resumed reading property `9999` of `undefined`.
+///
+/// The fix restores the invariant the B94 split receiver already documents
+/// (`RegionPlan::split_recvs`): the receiver's MEMORY SLOT IS AUTHORITATIVE, so
+/// **every exit is correct without knowing which path reached it**. Doing it AT
+/// the `LoadGlobal` — rather than once in the prologue, or in the deopt stubs —
+/// is what makes it exact: it mirrors the interpreted instruction one-for-one,
+/// so a path that never executes the load never writes the slot (a receiver
+/// read after the region on a branch the loop never took keeps its `undefined`),
+/// and a global re-stored mid-region cannot back-date the slot.
+///
+/// The split-receiver arm's code was already exactly this; both arms now share
+/// it. Cost: two L1-resident `mov`s per executed receiver load — see the wave
+/// report for the measurement.
+pub(crate) fn emit_recv_slot_store(ops: &mut dynasmrt::x64::Assembler, dst: u16, idx: u32) {
+    dynasm!(ops
+        ; mov rax, [r12 + (idx as i32) * 8]
+        ; mov [rbx + dreg(dst)], rax
+    );
+}
+
+/// `[jit] {TIER} region [s,e] pinned receiver rN lg=[..]` under `ZIPP_JITLOG`,
+/// the `ta_recv_regs` twin of the B94 `split receiver` line. The `LoadGlobal`
+/// ips come with it because they are what makes a parity case on this shape
+/// non-vacuous: a native exit resuming at an ip AFTER one of them is exactly
+/// the window in which the receiver's frame slot must hold the object.
+pub(crate) fn log_pinned_recvs(
+    tier: &str,
+    start: u32,
+    end: u32,
+    proto: &FuncProto,
+    plan: &RegionPlan,
+) {
+    if plan.ta_recv_regs.is_empty() || std::env::var_os("ZIPP_JITLOG").is_none() {
+        return;
+    }
+    let mut rs: Vec<u16> = plan.ta_recv_regs.iter().copied().collect();
+    rs.sort_unstable();
+    for r in rs {
+        let lg: Vec<usize> = (start as usize..=end as usize)
+            .filter(|&i| matches!(proto.code[i], Instr::LoadGlobal { dst, .. } if dst == r))
+            .collect();
+        eprintln!("[jit] {tier} region [{start},{end}] pinned receiver r{r} lg={lg:?}");
     }
 }
 
