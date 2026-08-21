@@ -834,6 +834,25 @@ pub(crate) fn typed_splice_enabled() -> bool {
     }
 }
 
+/// W14: multi-receiver B94 live-range splitting — `ZIPP_NO_MULTI_SPLIT=1`
+/// restores the hard budget of ONE non-DataView element split per region and
+/// the narrow `pin_obj` match that only ever recognised element and DataView
+/// receivers (so a recycled pinned-STRING receiver declined the whole region).
+/// Read at plan time only.
+pub(crate) fn multi_split_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_MULTI_SPLIT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Stored-global live-range narrowing + mixed-role temp splitting on the
 /// INT-GPR region tier — `ZIPP_NO_GLOB_RANGE=1` pins every stored global to
 /// its B96 permanent whole-region home and every recycled temp to one
@@ -1020,6 +1039,19 @@ pub const JIT_IC_STRIDE: usize = 64;
 /// the deepest the real-world benches walk).
 pub const JIT_IC_MAX_HOPS: usize = 5;
 
+/// Element type of [`Jit::ic_rot`]. Aliased so that [`IC_ROT_PERIOD`] — the
+/// rotation-escape window a widening would silently stretch — is DERIVED from
+/// the cursor rather than written down beside it.
+type IcRotCursor = u8;
+/// Misses between two rotation-escape windows at a gated site: the wrap period
+/// of [`Jit::ic_rot`]. See that field for why the escape is load-bearing.
+pub const IC_ROT_PERIOD: u64 = 1u64 << (8 * std::mem::size_of::<IcRotCursor>() as u32);
+// A gated site re-samples its live receivers for JIT_IC_WAYS fills once every
+// IC_ROT_PERIOD suppressed misses. 256 is the number behind the measured
+// -25.7% on property-ic-shapes; a frozen site (an unbounded period) measured
+// -0.6%. Widening the cursor is therefore a silent decay, not a refactor.
+const _: () = assert!(IC_ROT_PERIOD == 256);
+
 /// One way of a JIT'd `GetProp`/`SetProp` site's inline cache. `repr(C)` with a
 /// fixed layout the native code indexes directly: `obj_bits @0`, `vals_ptr @8`,
 /// `version @16`, `slot|nhops<<24 @20`, then `nhops` pairs `(hop_idx @24+8k,
@@ -1097,6 +1129,29 @@ pub(crate) fn accessor_way_enabled() -> bool {
         1 => true,
         _ => {
             let v = std::env::var_os("ZIPP_NO_ACCESSOR_WAY").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_ICGATE=1` restores the UNCONDITIONAL inline-cache refill: every
+/// data-fill path in the miss helpers writes a way even at a site that has
+/// already evicted a full round ([`Jit::ic_thrashing`]). That is a site cycling
+/// more receivers than it has ways, where each fill evicts the way about to be
+/// needed, so the site sits at 100% miss instead of the `(n-8)/n` an 8-way
+/// cache can deliver. Latched like the sibling switches — never read on a hot
+/// path, and only ever consulted AFTER `ic_thrashing` has already said yes, so
+/// a healthy site never touches it.
+#[inline]
+pub(crate) fn ic_refill_gate_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ICGATE").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1300,7 +1355,15 @@ pub struct Jit {
     /// only UPDATES existing ways (no growth).
     ic_table: Vec<IcEntry>,
     /// Round-robin fill cursor per site (parallel to `ic_table` / JIT_IC_WAYS).
-    ic_rot: Vec<u8>,
+    ///
+    /// Its WIDTH is load-bearing. A thrashing site's SUPPRESSED miss still
+    /// bumps this cursor ([`Jit::ic_rot_bump`]), so the wrap carries it back
+    /// below `JIT_IC_WAYS` every [`IC_ROT_PERIOD`] misses and the site refills
+    /// `JIT_IC_WAYS` ways from whatever is live NOW. Without that escape a site
+    /// freezes on whatever eight receivers happened to be resident when it
+    /// first tripped — which, at a site reused across several receiver-count
+    /// phases, is eight receivers already dead.
+    ic_rot: Vec<IcRotCursor>,
     /// Per-site emission metadata (parallel to `ic_rot`) — see [`IcSiteMeta`].
     ic_site_meta: Vec<IcSiteMeta>,
     /// `(func_id, op_ip)` of every `GetProp`/`SetProp` that has EVER wanted to
@@ -2154,7 +2217,21 @@ impl Jit {
     /// use it to stop refilling ways that will be evicted before they are hit.
     #[inline]
     pub fn ic_thrashing(&self, site: u32) -> bool {
-        self.ic_rot.get(site as usize).is_some_and(|&r| r >= JIT_IC_WAYS as u8)
+        self.ic_rot.get(site as usize).is_some_and(|&r| r >= JIT_IC_WAYS as IcRotCursor)
+    }
+
+    /// Advance the fill cursor for a miss the gate SUPPRESSED — the rotation
+    /// escape. [`Jit::set_ic`] bumps it on every eviction it performs, so a
+    /// gated site that stopped calling `set_ic` would otherwise leave the
+    /// cursor pinned above `JIT_IC_WAYS` and never fill again. Bumping here
+    /// instead makes [`Jit::ic_thrashing`] periodic with period
+    /// [`IC_ROT_PERIOD`]: the site reopens for `JIT_IC_WAYS` fills, captures
+    /// the receivers that are live now, and closes again.
+    #[inline]
+    pub fn ic_rot_bump(&mut self, site: u32) {
+        if let Some(r) = self.ic_rot.get_mut(site as usize) {
+            *r = r.wrapping_add(1);
+        }
     }
 
     pub fn set_ic(&mut self, site: u32, e: IcEntry) {

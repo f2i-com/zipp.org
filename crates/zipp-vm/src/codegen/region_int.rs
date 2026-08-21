@@ -1057,11 +1057,15 @@ pub(crate) fn compile_region_int_maybe_cold(
                     // — a double, a HOLE (0x7FFC…), a heap value — deopts to the
                     // interpreter AT this ip. That single guard is what makes the
                     // all-Int sample at plan time a hint and not a soundness gate.
+                    // Scratch is rdx (its base value is dead after the load),
+                    // NOT r10: r10 is BOOL_GPRS[2], so inside the BODY it can hold
+                    // a live Bool home or a prologue-filled `gpr_const` compare
+                    // mirror, neither of which anything reloads per iteration.
                     dynasm!(ops
                         ; mov rax, [rdx + rcx * 8]       // items[i] (Value bits)
-                        ; mov r10, rax
-                        ; shr r10, 48
-                        ; cmp r10d, INT_TAG_HI as i32
+                        ; mov rdx, rax
+                        ; shr rdx, 48
+                        ; cmp edx, INT_TAG_HI as i32
                         ; jne => deopt                   // double / HOLE / heap → deopt
                         ; movsxd rax, eax                // Int payload, sign-extended
                     );
@@ -1272,9 +1276,10 @@ pub(crate) fn compile_region_int_maybe_cold(
         // deliberately skips the register and memory is what the interpreter
         // reads on any exit. Arms with an i53 guard already stored (`wt_pre`;
         // the guard resumes at ip+1 expecting the result flushed), and the
-        // receiver LoadGlobal half stored the object itself.
-        if !wt_pre && !plan.split_recv_lg.contains(&ip) {
-            if let Some(d) = writes_reg(&proto.code[ip]) {
+        // receiver LoadGlobal half stored the object itself — `wt_def_at` holds
+        // that second exclusion for all three tiers.
+        if !wt_pre {
+            if let Some(d) = wt_def_at(proto, &plan, ip) {
                 // A non-`>>>` Bitwise result and Math.imul are PROVABLY i32
                 // (`>>>` yields a u32 that can exceed i32) — their write-through
                 // is a branchless int-tag instead of the two-compare generic box.

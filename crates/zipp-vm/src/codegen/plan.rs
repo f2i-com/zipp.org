@@ -136,11 +136,25 @@ pub(crate) struct RegionPlan {
     /// sharer whose value still matters after the region would come back holding
     /// an unrelated temp." Write-through removes it — each slot receives its own
     /// value at its own def, before the home is reused.
+    ///
+    /// DISJOINT from `split_recvs` by construction (see the set's build in
+    /// `plan_region`): a split receiver already has memory-authoritative
+    /// slots from its own mechanism, and the two mechanisms disagree on
+    /// exactly one ip class — the receiver `LoadGlobal` — so the overlap only
+    /// ever created a way for an emitter to write the numeric home over the
+    /// receiver object. Consumers still test both sets with OR; the exclusion
+    /// is defence in depth for the next mechanism that adds a member.
     pub(crate) write_through: FxHashSet<u16>,
     /// Region ips of every split receiver's RECEIVER `LoadGlobal` (the one reading the
     /// pinned array's global slot). These emit a real memory store and are the
     /// only defs of the register that do NOT fill its numeric home — the same
     /// register is also loaded from other globals, and those are numeric defs.
+    ///
+    /// They are therefore the ONE ip class at which no write-through may be
+    /// emitted, for a member of EITHER set: the store that belongs there is the
+    /// receiver object the `LoadGlobal` arm just wrote, and the home holds the
+    /// register's numeric half. Every emitter takes its def from
+    /// `emit::wt_def_at`, which is where that exclusion lives.
     pub(crate) split_recv_lg: FxHashSet<usize>,
     /// Stored globals whose home interval is NARROWED to [first touch, last
     /// touch] instead of B96's forced whole-region [s, e] — so the home is
@@ -424,7 +438,9 @@ pub(crate) fn region_jump_targets(code: &[Instr], s: usize, e: usize) -> FxHashS
 ///
 /// Receiver uses need no condition: memory is authoritative for `r` throughout
 /// (its `LoadGlobal` stores, every numeric def writes through, `flush_exit`
-/// skips it), and every pinned access re-checks receiver identity anyway.
+/// skips it), and every pinned access re-checks receiver identity anyway. The
+/// `LoadGlobal` ip is NOT a numeric def, so nothing may write through there —
+/// its own store is what makes memory current (`emit::wt_def_at`).
 pub(crate) fn split_home_provably_safe(
     code: &[Instr],
     s: usize,

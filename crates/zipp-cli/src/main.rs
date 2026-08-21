@@ -26,14 +26,17 @@ fn main() -> ExitCode {
     // before the engine's own depth guards can raise a catchable RangeError.
     // 256 MiB of RESERVE (committed lazily by the OS) puts the engine's guards
     // firmly in charge.
-    let r = std::thread::Builder::new()
+    let (r, shape) = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || run(&args))
+        // The shape transition tree is a thread-local, so it has to be sampled
+        // on the thread that ran the engine — reading it back here reported a
+        // freshly constructed table (`nodes=2 max_fanout=0 edges=0`) for every
+        // program. The other stats exports are process-global statics.
+        .spawn(move || (run(&args), stats.then(zipp_vm::shape_stats)))
         .expect("spawn zipp worker thread")
         .join()
         .expect("zipp worker thread panicked");
-    if stats {
-        let (n, mx, tot) = zipp_vm::shape_stats();
+    if let Some((n, mx, tot)) = shape {
         eprintln!("[shape] nodes={n} max_fanout={mx} edges={tot}");
     }
     if std::env::var_os("ZIPP_PROF").is_some() {

@@ -2417,9 +2417,10 @@ pub(crate) fn compile_region_int_gpr(
         // deliberately skips the register and memory is what the interpreter
         // reads on any exit. Arms with an i53 guard already stored (`wt_pre`;
         // the guard resumes at ip+1 expecting the result flushed), and the
-        // receiver LoadGlobal half stored the object itself.
-        if !wt_pre && !plan.split_recv_lg.contains(&ip) {
-            if let Some(d) = writes_reg(&proto.code[ip]) {
+        // receiver LoadGlobal half stored the object itself — `wt_def_at` holds
+        // that second exclusion for all three tiers.
+        if !wt_pre {
+            if let Some(d) = wt_def_at(proto, plan, ip) {
                 // A non-`>>>` Bitwise result and Math.imul are PROVABLY i32
                 // (`>>>` yields a u32 that can exceed i32) — their write-through
                 // is a branchless int-tag instead of the two-compare generic box.

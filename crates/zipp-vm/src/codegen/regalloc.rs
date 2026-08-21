@@ -29,7 +29,18 @@ pub(crate) fn compile_region_regalloc(
         let mut srs: Vec<u16> = plan.split_recvs.iter().copied().collect();
         srs.sort_unstable();
         for sr in srs {
-            eprintln!("[jit] DOUBLE region [{start},{end}] B94 split receiver r{sr}");
+            // The receiver `LoadGlobal` ips come with it: they are what tells an
+            // exit taken INSIDE the receiver window from one outside it, which
+            // is the only thing that makes a parity case on this shape
+            // non-vacuous.
+            let mut lg: Vec<usize> = plan
+                .split_recv_lg
+                .iter()
+                .copied()
+                .filter(|&i| matches!(proto.code[i], Instr::LoadGlobal { dst, .. } if dst == sr))
+                .collect();
+            lg.sort_unstable();
+            eprintln!("[jit] DOUBLE region [{start},{end}] B94 split receiver r{sr} lg={lg:?}");
         }
     }
     let mut ops = match dynasmrt::x64::Assembler::new() {
@@ -810,14 +821,20 @@ pub(crate) fn compile_region_regalloc(
                 return None;
             }
         }
-        // ── B94 write-through ── a numeric def of the split receiver must reach
-        // MEMORY as well as its home, because `flush_exit` deliberately skips
-        // this register and memory is what the interpreter reads on any exit.
-        // Two instructions, once per def; the LoadGlobal half already stored.
-        if let Some(d) = writes_reg(&proto.code[ip]) {
-            let is_split = plan.split_recvs.contains(&d) && !plan.split_recv_lg.contains(&ip);
-            if is_split || plan.write_through.contains(&d) {
-                if let Home::Xmm(h) = plan.reg_home[&d] {
+        // ── B94/B97 write-through ── a numeric def of a split receiver (B94) or
+        // of a shared home read after the region (B97) must reach MEMORY as well
+        // as its home, because `flush_exit` deliberately skips these registers
+        // and memory is what the interpreter reads on any exit. Two
+        // instructions, once per def; the receiver `LoadGlobal` half already
+        // stored the object, and `wt_def_at` is what keeps this store off that
+        // ip — for EITHER set, since a register can be in both. A
+        // `dv_flag_elide` ip is NOT that class and deliberately keeps its
+        // write-through: plan_region's "DV endian-flag fusion" admission proves
+        // every exit inside the fused window resumes inside it and re-runs the
+        // killing def, so that store is load-bearing, not symmetrical noise.
+        if let Some(d) = wt_def_at(proto, &plan, ip) {
+            if plan.split_recvs.contains(&d) || plan.write_through.contains(&d) {
+                if let Some(&Home::Xmm(h)) = plan.reg_home.get(&d) {
                     dynasm!(ops
                         ; movq rax, Rx(h)
                         ; mov [rbx + dreg(d)], rax

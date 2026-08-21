@@ -99,6 +99,22 @@ pub(crate) fn wt_share_enabled() -> bool {
 /// therefore refuted: hosting the region on the INT tier as it exists today
 /// makes the phase slower. The real blocker is gpr (not xmm) homes for
 /// bitwise-chain regions, recorded for follow-up. Cached once per process.
+///
+/// W14 RE-CONFIRMED on a second, unrelated shape, and the follow-up is now
+/// measured. The parse-large-js mix loop (three dense-Array receivers + a
+/// pinned-STRING receiver, all four recycled, hand-inlined so the region
+/// reaches the tier — 8x200k iterations of `h = imul(h ^ x, 16777619) >>> 0`):
+///     MEM incumbent .................................... 35ms   (node 32ms)
+///     ZIPP_INT_SPLIT=1, xmm homes ...................... 50ms   REGRESSION
+///     INT-GPR homes (needs ZIPP_GPR_SPILL_SLOTS=1) ..... 13ms   2.7x
+/// So the split itself was never the cost — the xmm HOMES are, exactly as this
+/// note said. The GPR emitter wins the same region by 2.7x, and the only thing
+/// keeping it off there is pool size: the region plans 11-12 homes against an
+/// 8-gpr pool, and the W10.3 frame-slot spill that covers the gap is dark by
+/// default because typedarray-math's fourteen-xmm-home swizzle refuted it.
+/// Those two shapes want opposite answers, so the next step is a per-region
+/// admission for the spill (split-receiver regions, whose homes are already
+/// write-through-backed) rather than flipping `ZIPP_GPR_SPILL_SLOTS` globally.
 pub(crate) fn int_split_enabled() -> bool {
     static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
     match ON.load(std::sync::atomic::Ordering::Relaxed) {
@@ -112,6 +128,15 @@ pub(crate) fn int_split_enabled() -> bool {
         }
     }
 }
+
+/// W14: how many non-DataView B94 receiver splits one region may take. Four is
+/// the parse-large-js mix loop (`kinds`, `ends`, `starts` element receivers plus
+/// the `src` string receiver, all four recycled by the bytecode register
+/// allocator). Each split costs one write-through per numeric def of that
+/// register plus one memory store at its `LoadGlobal`; the cap keeps a
+/// pathological region from paying that on a dozen registers rather than
+/// expressing an emitter limit. `ZIPP_NO_MULTI_SPLIT=1` pins it back to 1.
+pub(crate) const MULTI_SPLIT_BUDGET: usize = 4;
 
 pub(crate) fn arr_pin_loose() -> bool {
     static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
@@ -571,12 +596,20 @@ fn plan_region_cold_inner(
                             .is_some_and(|kid| !admit_bitwise || kid <= 6)))
     };
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
-    // B94 recycled receivers (see `plan::RegionPlan::split_recvs`). At most one
-    // whose pinned accesses are ELEMENT ops; a receiver whose pinned accesses
-    // are all DV `get*` CallMethods is exempt from that limit — each split is
-    // proven and written through independently.
+    // B94 recycled receivers (see `plan::RegionPlan::split_recvs`). A receiver
+    // whose pinned accesses are all DV `get*` CallMethods is exempt from the
+    // budget below — each split is proven and written through independently.
+    //
+    // W14: the non-DV budget was ONE. Nothing in the emitters is per-region
+    // about a split: `split_recvs`/`write_through` are register SETS, the
+    // write-through hook fires on every def of any of them, and `flush_exit`
+    // skips all of them — so the budget was an untested-shape guard, not a
+    // capability limit. It is now `MULTI_SPLIT_BUDGET`, sized to the four
+    // recycled receivers of the parse-large-js mix loop (`kinds`, `ends`,
+    // `starts`, `src`). `ZIPP_NO_MULTI_SPLIT=1` puts it back to one.
     let mut split_recvs: FxHashSet<u16> = FxHashSet::default();
-    let mut non_dv_split_used = false;
+    let non_dv_split_budget = if crate::codegen::multi_split_enabled() { MULTI_SPLIT_BUDGET } else { 1 };
+    let mut non_dv_splits = 0usize;
     let mut write_through: FxHashSet<u16> = FxHashSet::default();
     let mut split_recv_lg: FxHashSet<usize> = FxHashSet::default();
     let mut recv_glob: Option<u32> = None;
@@ -695,6 +728,21 @@ fn plan_region_cold_inner(
                             Instr::CallMethod { obj, .. } if pinned_dv(s + off) => {
                                 Some((obj, true))
                             }
+                            // W14: a pinned flat-ASCII STRING receiver
+                            // (`src.charCodeAt(i)` / `src.length`) and a dense
+                            // all-Int Array `.length` receiver split on exactly
+                            // the same terms — both emitters read identity from
+                            // the pin's GLOBAL, never the register (see the
+                            // charCodeAt and pinned-length arms). `recv_use_at`
+                            // 40 lines below has always listed them; this match
+                            // did not, so a recycled string receiver could never
+                            // reach the split and the whole region declined.
+                            Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
+                                if crate::codegen::multi_split_enabled()
+                                    && (pinned_str(s + off) || pinned_arr_len(s + off)) =>
+                            {
+                                Some((obj, false))
+                            }
                             _ => None,
                         };
                         if let Some((obj, is_dv)) = pin_obj {
@@ -712,11 +760,11 @@ fn plan_region_cold_inner(
                         recv_glob = Some(g);
                     }
                     split_all_dv = all_dv;
-                    // The single-split budget applies to ELEMENT-pinned
-                    // receivers only (B94's exercised case); DV-pinned
-                    // receivers split independently — the DV swizzle loop
-                    // recycles two of them, and a one-split rule declined it.
-                    ok && g0.is_some() && (all_dv || !non_dv_split_used)
+                    // The budget applies to ELEMENT/STRING-pinned receivers
+                    // only (B94's exercised case); DV-pinned receivers split
+                    // independently — the DV swizzle loop recycles two of them,
+                    // and a one-split rule declined it.
+                    ok && g0.is_some() && (all_dv || non_dv_splits < non_dv_split_budget)
                 } {
                     // ── B94 live-range splitting ── the bytecode compiler RECYCLED
                     // this register: pinned receiver over one range, arithmetic temp
@@ -756,7 +804,7 @@ fn plan_region_cold_inner(
                         split_recvs.insert(r);
                         split_recv_lg.extend(recv_lg_ips);
                         if !split_all_dv {
-                            non_dv_split_used = true;
+                            non_dv_splits += 1;
                         }
                     } else {
                         decline!("split receiver: home not provably live at a use");
@@ -764,9 +812,10 @@ fn plan_region_cold_inner(
                 } else {
                     // A receiver register reused for other (numeric) values can't be
                     // cleanly excluded under the non-SSA register model → memory path.
-                    // (B94 handles element-pinned splits one at a time above; a SECOND
-                    // element split in the same region has never been exercised, so it
-                    // still declines. DV-pinned splits are exempt from that budget.)
+                    // (The split above takes up to `MULTI_SPLIT_BUDGET` element/string
+                    // receivers; past that, or when a pin's identity comes from a
+                    // register rather than a global slot, this is the fallback.
+                    // DV-pinned splits are exempt from the budget.)
                     decline!("pinned receiver reg not cleanly excludable");
                 }
             }
@@ -1964,6 +2013,18 @@ fn plan_region_cold_inner(
             && !slot_consts.contains_key(&r)
             && !outside_dead.contains(&r)
         {
+            // A B94 split receiver already has this exact property from its own
+            // mechanism, with its own ip-class exception (the receiver
+            // `LoadGlobal` stores the OBJECT and must not write the home
+            // through). B97 membership adds nothing for it and only creates the
+            // ip where the two mechanisms disagree — every consumer tests the
+            // two sets with OR, so emptying the overlap changes nothing else.
+            if split_recvs.contains(&r) {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[jit] region [{s},{e}] B97 write-through excludes B94 split receiver r{r}");
+                }
+                continue;
+            }
             write_through.insert(r);
         }
     }

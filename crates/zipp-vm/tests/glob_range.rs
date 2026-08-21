@@ -393,23 +393,22 @@ fn globrange_mechanism_narrows_and_engages() {
 /// mid-iteration, AFTER `le`/`v` were written through — and the `catch` then
 /// reads the narrowed slots plus the error's own class and message.
 ///
-/// DEFAULT SETTINGS ONLY, deliberately: this shape is a live example of a
-/// PRE-EXISTING wrong answer on the DOUBLE/regalloc tier, where a recycled
-/// B94 split receiver's numeric half is written over the slot that still has
-/// to hold the receiver object, so the re-executed `CallMethod` finds
-/// `undefined` and reports `TypeError: undefined is not a function (property
-/// "getUint32")` instead of node's RangeError. `regress`ing this file's
-/// glob-range plan is what would expose it: with the mechanism ON the region
-/// hosts on INT-GPR and answers correctly, and this test goes red the moment
-/// a plan change pushes the shape onto DOUBLE. `ZIPP_NO_GLOB_RANGE=1`,
-/// `ZIPP_NO_GPR_HOMES=1` and `ZIPP_NO_DV_GPR=1` all reproduce the TypeError
-/// today (`ZIPP_NO_DV_DOUBLE=1`, which drops the region to MEM, does not) —
-/// which is why the name is kept out of the `globrange_parity_` mode sweep:
-/// the defect lives in the DOUBLE emitter's exit flush, not in this wave, and
-/// `crates/zipp-vm/src/codegen/regalloc.rs` is byte-identical to the wave's
-/// baseline commit.
+/// It used to run at DEFAULT SETTINGS ONLY, because the same shape on the
+/// DOUBLE/regalloc tier was a live wrong answer: a recycled B94 split
+/// receiver's numeric home was stored over the slot that still had to hold the
+/// receiver object, so the re-executed `CallMethod` found a NUMBER and reported
+/// `TypeError: undefined is not a function (property "getUint32")` instead of
+/// node's RangeError. Glob-range hosting it on INT-GPR — an emitter that always
+/// excluded the receiver `LoadGlobal` ip — is what hid it, so this case was
+/// held out of the mode sweep while `ZIPP_NO_GLOB_RANGE=1`,
+/// `ZIPP_NO_GPR_HOMES=1` and `ZIPP_NO_DV_GPR=1` still reproduced it.
+///
+/// The DOUBLE emitter now takes its write-through def from `emit::wt_def_at`
+/// like the other two tiers, so the shape is correct on every tier and the case
+/// belongs in the `globrange_parity_` sweep. `split_recv_writethrough.rs` owns
+/// the defect itself, including this shape run straight at the DOUBLE tier.
 #[test]
-fn globrange_dv_oob_default_settings() {
+fn globrange_parity_dv_oob() {
     assert_matches_node(
         r#"
         "use strict";

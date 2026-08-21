@@ -1898,6 +1898,13 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                         {
                             vm.jit.set_ic(site_idx, e);
                         }
+                    } else if crate::codegen::ic_refill_gate_enabled() {
+                        // Rotation escape. A gated site stops calling `set_ic`,
+                        // which is what normally advances the cursor, so
+                        // without this the freeze is permanent — and a site
+                        // that tripped while the ways held a PREVIOUS phase's
+                        // receivers would then miss on every live one forever.
+                        vm.jit.ic_rot_bump(site_idx);
                     }
                     return val.bits();
                 }
@@ -2041,7 +2048,13 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                         i as u32,
                                         &hops[..=n_hops],
                                     ) {
-                                        vm.jit.set_ic(site_idx, e);
+                                        if vm.jit.ic_thrashing(site_idx)
+                                            && crate::codegen::ic_refill_gate_enabled()
+                                        {
+                                            vm.jit.ic_rot_bump(site_idx);
+                                        } else {
+                                            vm.jit.set_ic(site_idx, e);
+                                        }
                                     }
                                 }
                                 return v.bits();
@@ -2103,7 +2116,11 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     };
     let version = vm.heap.version_of(idx);
     if let Some(e) = crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot) {
-        vm.jit.set_ic(site_idx, e);
+        if vm.jit.ic_thrashing(site_idx) && crate::codegen::ic_refill_gate_enabled() {
+            vm.jit.ic_rot_bump(site_idx);
+        } else {
+            vm.jit.set_ic(site_idx, e);
+        }
     }
     // Record the resolution against the receiver's shape, so the next receiver
     // of the same layout skips the scan above. Only for an OWN data property on
@@ -2409,13 +2426,19 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // SetProp sites only ever hold OWN ways (the region's write fast path
     // skips hop checks; chain setters/non-writables deopted above).
     if let Some(e) = crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot) {
-        vm.jit.set_ic(site_idx, e);
-        // Nursery: this way's HITS store into `idx` with NO call (the probe's
-        // `mov [vals+slot*8], val`), so no barrier can ever see them.
-        // Register the receiver as a persistent minor-trace root instead —
-        // its edges are re-scanned at every minor for as long as the slot
-        // lives (the way itself dies with the slot's version on free/reuse).
-        vm.heap.register_scan_root(idx);
+        if vm.jit.ic_thrashing(site_idx) && crate::codegen::ic_refill_gate_enabled() {
+            vm.jit.ic_rot_bump(site_idx);
+        } else {
+            vm.jit.set_ic(site_idx, e);
+            // Nursery: this way's HITS store into `idx` with NO call (the probe's
+            // `mov [vals+slot*8], val`), so no barrier can ever see them.
+            // Register the receiver as a persistent minor-trace root instead —
+            // its edges are re-scanned at every minor for as long as the slot
+            // lives (the way itself dies with the slot's version on free/reuse).
+            // It covers call-free stores through a FILLED way and nothing else,
+            // so a suppressed fill must not register one.
+            vm.heap.register_scan_root(idx);
+        }
     }
     0
 }

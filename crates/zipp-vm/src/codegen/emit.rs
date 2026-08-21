@@ -176,6 +176,26 @@ pub(crate) fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, i
     }
 }
 
+/// The register a write-through block must store at `ip`, if any: the def
+/// itself, minus the ONE ip class that must never store — a B94 split
+/// receiver's own `LoadGlobal`. That ip's emitted store IS the receiver object,
+/// while the register's home holds its unrelated NUMERIC half, so writing the
+/// home there lands a raw f64 on top of the receiver and any exit resuming
+/// inside the receiver window re-executes on a number.
+///
+/// The rule lives here because all three write-through emitters (`regalloc`,
+/// `region_int`, `region_int_gpr`) re-derived it around their own
+/// `writes_reg` call and one of them derived it wrong for the whole life of
+/// B97: taking the def from here is what keeps a fourth tier from forgetting.
+/// A `dv_flag_elide` ip is deliberately NOT in this class — see the fuse
+/// admission rules in `plan_region` for why its write-through is load-bearing.
+pub(crate) fn wt_def_at(proto: &FuncProto, plan: &RegionPlan, ip: usize) -> Option<u16> {
+    if plan.split_recv_lg.contains(&ip) {
+        return None;
+    }
+    writes_reg(&proto.code[ip])
+}
+
 /// B94 write-through on the INT tier. A numeric def of a split receiver (or a
 /// write-through register) must reach MEMORY as well as its i64 home, because
 /// the int flush_exit deliberately skips these registers — memory is what the
@@ -192,6 +212,9 @@ pub(crate) fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, i
 /// region below the MEM tier it replaced.
 /// Returns whether anything was emitted (the caller must then drop any live
 /// compare-flag fusion: the boxing clobbers FLAGS on the generic path).
+/// `dst` must come from `wt_def_at` wherever it is derived from the
+/// instruction at an ip; the per-arm callers pass a def that cannot be a
+/// receiver `LoadGlobal` (they are arms of other ops).
 pub(crate) fn emit_int_wt(
     ops: &mut dynasmrt::x64::Assembler,
     plan: &RegionPlan,
