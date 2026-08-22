@@ -871,6 +871,66 @@ pub(crate) fn multi_split_enabled() -> bool {
     }
 }
 
+/// W17: B97 write-through home sharing on a `share_homes` re-plan that the
+/// GPR emitter ALONE consumes — `ZIPP_NO_GPR_WT_SHARE=1` restores the pre-wave
+/// plans byte-for-byte. Read at plan time only.
+///
+/// THE CONTRACT, stated once here rather than restated at each retry site.
+/// `admit_wt_share` lets a register that is textually READ OUTSIDE the region
+/// share an xmm home instead of pinning a permanent one: its every def is
+/// written through to `[rbx + dreg(r)]` and `flush_exit` skips it, so the
+/// shared home is invisible in its frame slot. That is sound for a plan iff
+/// the emitter that consumes it implements the write-through. Two emitters do:
+/// REGALLOC (double), which has passed `admit_wt_share=true` since B97, and
+/// `compile_region_int_gpr`, def-complete since W9 (`gpr_home_map` refuses a
+/// plan carrying `write_through` unless `dv_gpr_enabled()`). The xmm INT
+/// emitter does NOT — admitting B97 there silently returned the WRONG ANSWER
+/// (a shareable register loses its entry load, so its home starts as garbage
+/// and the int flush wrote that garbage into the frame slot).
+///
+/// So the licence is not "which tier" but "does THIS plan reach only the GPR
+/// emitter". A `share_homes` re-plan does, at all three of `region_int`'s
+/// retry sites: each hands its plan to `compile_region_int_gpr` and to nothing
+/// else — the xmm fallback below them keeps the ORIGINAL distinct-homes plan.
+/// The DV retry already relied on exactly this (W9) and stays unconditional;
+/// this switch gates only the two sites the wave adds, so OFF reproduces
+/// today's plans exactly.
+///
+/// WHY IT PAYS: the `parse-large-js` mix loop runs at TOP LEVEL, where the
+/// bytecode compiler recycles registers across the script's phases, so three
+/// of the flattened body's temps (two copies of the loop counter `ti`, and one
+/// register that is a `ti` copy in one half of the body and a pinned receiver
+/// in the other) are "read outside" only by that recycling — and each pinned a
+/// whole-region home. Eleven mapped homes against a pool of 8 (+2 once the i53
+/// guard constants are inlined). Releasing those three lands the plan at 9, so
+/// the region reaches the GPR emitter instead of paying three xmm↔gpr
+/// transfers on each of its nine `Bitwise`/`Math.imul` ops per iteration.
+/// Measured: the row's mix phase 67ms -> 20ms, the row 412ms -> 363ms.
+///
+/// DARK (opt-in, `ZIPP_GPR_WT_SHARE=1`). The mechanism is sound in itself, but
+/// releasing those whole-region pins makes a SEPARATE, pre-existing defect
+/// reachable on programs that did not reach it before: a local whose only
+/// in-region definition sits on a conditional branch loses its entry load and
+/// reads its home as garbage (`shareable`/`first_seen` treat "the first
+/// occurrence is a def" as "a def dominates every use"). Two soak programs that
+/// answer correctly without this flag answer WRONG with it, and every one of
+/// the 62 mode-cells is restored by turning it off. Fix that defect first, then
+/// re-verify with a soak and make this default-on — it is a one-line change.
+pub(crate) fn gpr_wt_share_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_GPR_WT_SHARE").is_some()
+                && std::env::var_os("ZIPP_NO_GPR_WT_SHARE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Stored-global live-range narrowing + mixed-role temp splitting on the
 /// INT-GPR region tier — `ZIPP_NO_GLOB_RANGE=1` pins every stored global to
 /// its B96 permanent whole-region home and every recycled temp to one
@@ -1613,6 +1673,20 @@ impl Jit {
         let meter = self.meter;
         match compile_proto(proto, func_id, self_call_helper, self_val_bits, meter) {
             Some(f) => {
+                // Tier A was the ONLY compiled tier with no JITLOG line of its
+                // own, so its reach could be assumed but never measured — and a
+                // generator aimed at it (`jit_tier_fuzz.rs`'s `Stmt::Rec`) had
+                // no way to tell "reached and correct" from "never reached".
+                // Said here rather than inside `compile_proto` so it sits beside
+                // the Tier C line below and reports the same fact: this func_id
+                // now has a compiled whole-function body, on this tier.
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[jit] Tier A fn{func_id} compiled (self-recursive int path, {} ops, self_call={})",
+                        proto.code.len(),
+                        f.self_binding().is_some()
+                    );
+                }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
                 return;

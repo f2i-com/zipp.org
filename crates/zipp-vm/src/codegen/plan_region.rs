@@ -5,14 +5,73 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Is `ZIPP_JITDECLINE=1` set? Latched once per process, so the whole
+/// `[decline-reason]` channel costs one relaxed load rather than an env lookup.
+pub(crate) fn jitdecline_on() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_JITDECLINE").is_some();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// WHICH region the next `[decline-reason]` line is about: `(function name,
+/// start ip, end ip)`.
+///
+/// A decline is named from two places that cannot see each other — `decline!`
+/// fires inside the planner, `decline_emit` fires inside three separate
+/// EMITTERS long after the planner returned — and a bare reason with no region
+/// on it cannot be tied to the region that produced it, which is what made
+/// `ZIPP_JITDECLINE=1` unusable for attributing a decline in a program with
+/// more than one hot function. Stated ONCE here rather than restated at all 34
+/// call sites: `plan_region_cold` records it on the way in, and every emitter
+/// runs strictly after the plan it is emitting, on the same thread.
+///
+/// Diagnostic only: nothing is recorded at all unless `jitdecline_on()`.
+fn set_decline_region(proto: &FuncProto, start: u32, end: u32) {
+    if !jitdecline_on() {
+        return;
+    }
+    DECLINE_REGION.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0.clear();
+        c.0.push_str(if proto.name.is_empty() { "<anon>" } else { proto.name.as_str() });
+        c.1 = start;
+        c.2 = end;
+    });
+}
+
+thread_local! {
+    static DECLINE_REGION: std::cell::RefCell<(String, u32, u32)> =
+        std::cell::RefCell::new((String::new(), u32::MAX, u32::MAX));
+}
+
+/// `fn=<name> [start,end]` for the region `set_decline_region` last recorded.
+fn decline_region() -> String {
+    DECLINE_REGION.with(|c| {
+        let c = c.borrow();
+        if c.1 == u32::MAX {
+            "fn=? [?,?]".to_string()
+        } else {
+            format!("fn={} [{},{}]", c.0, c.1, c.2)
+        }
+    })
+}
+
 /// Decline this region, naming the reason under `ZIPP_JITDECLINE=1`. The planner
 /// has ~25 exit points and `ZIPP_JITLOG` only reports `plan_region=None`, which
 /// says a region missed the fastest tier but not what to fix. Diagnostic only —
 /// the env lookup happens once per declined region-compile, never per iteration.
 macro_rules! decline {
     ($reason:expr) => {{
-        if std::env::var_os("ZIPP_JITDECLINE").is_some() {
-            eprintln!("[decline-reason] {}", $reason);
+        if crate::codegen::plan_region::jitdecline_on() {
+            eprintln!("[decline-reason] {}: {}", decline_region(), $reason);
         }
         return PlanOutcome::Decline;
     }};
@@ -43,8 +102,8 @@ enum PlanOutcome {
 /// only — callers decline exactly as before; the env lookup happens once per
 /// declined region-compile, never per iteration.
 pub(crate) fn decline_emit(reason: impl std::fmt::Display) {
-    if std::env::var_os("ZIPP_JITDECLINE").is_some() {
-        eprintln!("[decline-reason] {reason}");
+    if jitdecline_on() {
+        eprintln!("[decline-reason] {}: {reason}", decline_region());
     }
 }
 
@@ -422,6 +481,10 @@ pub(crate) fn plan_region_cold(
     // predicate below is unchanged when `!admit_bitwise`).
     admit_dv: bool,
 ) -> Option<RegionPlan> {
+    // Every `[decline-reason]` line below — and every one an emitter prints
+    // after this plan is handed to it — belongs to THIS region. See
+    // `set_decline_region`.
+    set_decline_region(proto, start, end);
     match plan_region_cold_inner(
         proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, share_homes,
         cold, true, admit_dv,
@@ -650,10 +713,13 @@ fn plan_region_cold_inner(
             for (off, instr) in code[s..=e].iter().enumerate() {
                 if cold.contains(&(s + off)) { continue; }
                 // The receiver use AT a pinned access is exempt (read via the pin,
-                // not the register). For a pinned-STRING access the obj-use is also
-                // invisible to instr_uses today (CallMethod→vec![]; GetProp→[obj]),
-                // so the CallMethod half is forward-defensive; the GetProp half is
-                // the one that actually exempts a dual-use string receiver.
+                // not the register). Both halves are load-bearing: `instr_uses`
+                // declares the receiver of a `CallMethod` and of a `GetProp`, so
+                // without the exemption a dual-use string receiver looks
+                // used-elsewhere and the whole region declines. (This comment
+                // used to say the `CallMethod` half was forward-defensive
+                // because `instr_uses` reported that op as reading nothing —
+                // that stopped being true when `CallMethod` got an arm.)
                 // Match on the INSTRUCTION first, then the predicate. The
                 // predicates are keyed by ip alone, so on a receiver that carries
                 // BOTH an element access and a `.length` read (`for (i < a.length)
@@ -1339,15 +1405,17 @@ fn plan_region_cold_inner(
             }
         }
     }
-    // ── pinned-STRING / Math.imul operand liveness ── instr_uses + writes_reg are
-    // BLIND to CallMethod and MathOp operands/dsts (verified: both hit their `_`
-    // arm). So the charCodeAt index reg, the Imul operand regs, and the charCodeAt/
-    // Imul result-def ips are invisible — without this the index/operands would be
-    // classed DEAD (their defining Move/Bitwise/LoadInt DCE'd → the inline op reads
-    // an unmaterialised home / `xh` panics), and the home-reuse allocator would
-    // free them at the wrong ip. Collect them LOCALLY (NOT by widening the shared
-    // instr_uses/writes_reg, which SROA / f64-regalloc / leaf-inline depend on) and
-    // feed both `used` (here) and the live-range touch loop (below). `(ip,reg,def)`.
+    // ── pinned-STRING / Math.imul operand liveness ── this predates the arms
+    // `instr_uses`/`writes_reg` now carry for `CallMethod`/`MathOp` (when it was
+    // written both ops hit a catch-all and reported reading and writing
+    // NOTHING, so the charCodeAt index reg, the Imul operand regs and both
+    // result defs were invisible — the index/operands were classed DEAD, their
+    // defining Move/Bitwise/LoadInt was DCE'd, and the inline op then read an
+    // unmaterialised home or panicked in `xh`). The shared tables cover the
+    // plain operand/dst reads today; what stays LOCAL here is the per-IP part
+    // they cannot express — WHICH ip a pinned access reads its operands at, so
+    // the home-reuse allocator does not free a home one ip early. Feeds both
+    // `used` (here) and the live-range touch loop (below). `(ip,reg,def)`.
     let mut str_imul_touch: Vec<(usize, u16, bool)> = Vec::new();
     for (off, instr) in code[s..=e].iter().enumerate() {
         if cold.contains(&(s + off)) { continue; }
@@ -1481,9 +1549,13 @@ fn plan_region_cold_inner(
     //       between them (the `slot_guard_key` straight-line rule — entering
     //       AT the def is fine) — every post-exit path rewrites the register
     //       before reading it.
-    // The use model is over-approximated: an op whose reads `instr_uses` does
-    // not fully model (Call/New/window ops outside its match) counts as a use
-    // of EVERYTHING, and then needs a dominating def like any other use. The
+    // The use model is over-approximated: anything outside `modeled` below
+    // counts as a use of EVERYTHING, and then needs a dominating def like any
+    // other use. `modeled` is now a deliberately NARROW subset of what
+    // `instr_uses` covers — that table became exhaustive in W17, so it models
+    // every op except the closure-capture reads it cannot name; widening
+    // `modeled` to match would enlarge `outside_dead` and is a PERF change for
+    // the home-allocation lane to make and measure, not a correctness one. The
     // def model under-approximates (`writes_reg`), which only shortens gaps'
     // candidates — a missed def means an earlier one is found and the gap
     // grows, strictly more conservative. Members lose their B97 write-through
@@ -1509,9 +1581,12 @@ fn plan_region_cold_inner(
             Some(t) => !(ip > e && t <= e) && !((s..=e).contains(&ip) && t < s),
             None => true,
         });
-        // Ops whose register READS `instr_uses` models completely (its match
-        // arms), plus ops that read no register at all. Anything else is a
-        // universal use.
+        // The subset of ops this proof trusts `instr_uses` for. It is no longer
+        // "everything `instr_uses` has an arm for" — that is now every variant
+        // — but the list this analysis was developed and measured against.
+        // Anything outside it is a universal use. Adding to it is a perf change
+        // (a bigger `outside_dead`), not a correctness one; leaving it narrow is
+        // always sound.
         let modeled = |i: &Instr| -> bool {
             matches!(
                 *i,
@@ -2819,6 +2894,19 @@ pub(crate) fn region_live_spans(
 /// This is the cheap sound approximation of "the def dominates every exit". It
 /// is what makes constant hoisting (and `hoistable_length`) safe without a full
 /// dominator tree.
+///
+/// AUDITED W17 — "which ops name a control-flow target" is stated in FIVE
+/// places and they do not agree. The five branch ops below are also all that
+/// `region_jump_targets` and `split_home_provably_safe::succ` (both in
+/// `plan.rs`) recognise; `succ_of` (below) and `outside_dead`'s `target_of`
+/// additionally recognise `PushFinally`, `JumpFinally` and `PushHandler`. The
+/// narrow three are sound only because of a fact stated nowhere near them: of
+/// those extra ops `region_can_compile` admits ONLY `PushFinally`, and a
+/// `PushFinally` whose target lands inside `[s, e]` drags its handler body —
+/// `IterCloseFinally` / `EndFinally`, neither admitted — into the region, so
+/// the region is rejected before any of these ever runs. Widening the three to
+/// the superset would be strictly conservative (more targets ⇒ fewer hoists,
+/// more unify vetoes) and is the right fix if that admission ever changes.
 pub(crate) fn runs_every_iteration(code: &[Instr], s: usize, e: usize, d: usize) -> bool {
     for (ip, instr) in code.iter().enumerate().take(d).skip(s) {
         let target = match *instr {
@@ -2874,19 +2962,76 @@ pub(crate) fn numeric_operand_uses(i: &Instr) -> Vec<u16> {
     }
 }
 
-/// The VM registers an instruction reads (operands). Used for live-in analysis.
+/// The VM registers an instruction reads (operands). Feeds live-in analysis,
+/// in-region dead-code elimination, home sharing/unification, and — through
+/// `read_outside`, which runs this over the WHOLE enclosing function — the
+/// decision whether a register's frame slot is still observed after the region.
+///
+/// EXHAUSTIVE BY CONSTRUCTION: there is no `_` arm, so a new `Instr` variant is
+/// a BUILD ERROR here until its operands are declared. That is the point. This
+/// table used to end in `_ => vec![]` — "an opcode I have never heard of reads
+/// nothing" — and every consumer then reasoned from a false fact. The live case
+/// was `TypeOf`: `read_outside` missed `typeof x`, so a register whose only
+/// post-region use was a `typeof` looked dead-after-region, became `shareable`,
+/// dropped out of `live_in_regs` (whose invariant is "every flushed home is
+/// entry-loaded") while staying in `num_regs`, and `flush_exit` wrote a home
+/// nothing had ever filled into its slot. `typeof x` on an `undefined` local
+/// answered "number" after a hot loop.
+///
+/// Conventions, so a new arm has one obvious right answer:
+///   * `dst` / `*_dst` fields are WRITES and never appear here (`writes_reg`
+///     covers those). A field that is read-modify-write DOES appear — it is
+///     read: `ArrayAppend::arr`, an iterator cursor `idx`, `MakeCell::reg`,
+///     `DecKey::key`, `DisposeScope::kind_reg`.
+///   * A contiguous ARGUMENT WINDOW (`arg_base` + `argc`) is expanded. The
+///     decorator ops are the exception the naming hides: `DecElem`/`DecClass`
+///     read `argc` (decorator, receiver) PAIRS, so their window is `2 * argc`.
+///   * An op that consumes the activation's `this` reads REGISTER 0 — the
+///     `super`-* family, `FieldInit`. That read appears in no operand field, and
+///     omitting it would let a region home reg 0 and flush over the receiver.
+///   * A `u16::MAX` register field is the "absent" sentinel (`IterNext::next` at
+///     a destructuring site), not a register; it is filtered out.
+///
+/// The ONE read this signature cannot name: `MakeClosure`/`MakeArrow` capture
+/// the cells listed as `UpvalSource::ParentLocal(reg)` in the CALLEE's proto,
+/// which is not reachable from an `&Instr`. Every such register is boxed by a
+/// `MakeCell`/`MakeCellTdz`/`MakeCellFnName` in the SAME function, so those ops
+/// declare their `reg` as a use — `MakeCellTdz` only writes it, but declaring it
+/// is what puts a capture source into the set-valued consumers (`read_outside`,
+/// `used`). No cell or closure op is admitted into a compiled region
+/// (`region_can_compile` rejects them all), so attributing the capture read to
+/// the cell op rather than the closure op cannot mis-order in-region liveness.
 pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
+    /// A contiguous argument window `[base, base + n)`, preceded by any
+    /// explicitly named operands (a callee, a receiver, a key).
+    fn win(head: &[u16], base: u16, n: u16) -> Vec<u16> {
+        let mut v = Vec::with_capacity(head.len() + n as usize);
+        v.extend_from_slice(head);
+        v.extend((0..n).map(|k| base + k));
+        v
+    }
+    /// The activation's `this`.
+    const THIS: u16 = 0;
     match *i {
+        // ── pure transfers ──
         Instr::Move { src, .. } => vec![src],
         Instr::StoreGlobal { src, .. }
         | Instr::StoreGlobalStrict { src, .. }
-        | Instr::StoreGlobalResolved { src, .. } => vec![src],
+        | Instr::StoreGlobalResolved { src, .. }
+        | Instr::StoreGlobalDyn { src, .. }
+        | Instr::EvalScopeSet { src, .. }
+        | Instr::UpvalSet { src, .. }
+        | Instr::StoreUpvalDyn { src, .. }
+        | Instr::TemplateSetCached { src, .. } => vec![src],
+
+        // ── arithmetic / logic ──
         Instr::AddInt { a, .. } | Instr::Neg { a, .. } => vec![a],
         Instr::Add { a, b, .. }
         | Instr::Sub { a, b, .. }
         | Instr::Mul { a, b, .. }
         | Instr::Div { a, b, .. }
         | Instr::Mod { a, b, .. }
+        | Instr::Pow { a, b, .. }
         | Instr::StrConcat { a, b, .. }
         | Instr::StrAppendInPlace { a, b, .. }
         // W11 (B124) fused chain link. In `numeric_operand_uses` above it is
@@ -2899,35 +3044,274 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::Ge { a, b, .. }
         | Instr::Eq { a, b, .. }
         | Instr::Ne { a, b, .. }
+        | Instr::LooseEq { a, b, .. }
+        | Instr::LooseNe { a, b, .. }
         | Instr::JumpIfNotLt { a, b, .. }
         | Instr::JumpIfNotLe { a, b, .. } => vec![a, b],
+        // Unary value ops. `TypeOf`/`TypeOfIs` are the pair this table was
+        // missing; see the note above.
+        Instr::ToNum { a, .. }
+        | Instr::BitNot { a, .. }
+        | Instr::Not { a, .. }
+        | Instr::ToStr { a, .. }
+        | Instr::TypeOf { a, .. }
+        | Instr::TypeOfIs { a, .. }
+        | Instr::IsArray { a, .. }
+        | Instr::JsonParse { a, .. } => vec![a],
+        Instr::JsonStringify { val, space, .. } => vec![val, space],
+
+        // ── control flow ──
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => vec![cond],
-        Instr::GetProp { obj, .. } => vec![obj],
-        Instr::SetProp { obj, val, .. } => vec![obj, val],
+        Instr::Return { src } => vec![src],
+        Instr::Throw { src } => vec![src],
+        // The handler/finally BRACKET ops record their registers for the
+        // unwinder, which WRITES them; `EndFinally` reads the completion back.
+        Instr::EndFinally { kind_reg, val_reg } => vec![kind_reg, val_reg],
+
+        // ── heap property / element ops ──
+        Instr::GetProp { obj, .. }
+        | Instr::DeleteProp { obj, .. }
+        | Instr::WithHas { obj, .. }
+        | Instr::WithGet { obj, .. }
+        | Instr::ObjectKeys { obj, .. }
+        | Instr::ForInKeys { obj, .. }
+        | Instr::ObjectValues { obj, .. }
+        | Instr::ObjectEntries { obj, .. }
+        | Instr::LenOf { obj, .. } => vec![obj],
+        Instr::SetProp { obj, val, .. }
+        | Instr::SetPrivate { obj, val, .. }
+        | Instr::InitDataProp { obj, val, .. }
+        | Instr::AppendDataProp { obj, val, .. }
+        | Instr::DefineField { obj, val, .. }
+        | Instr::SetLiteralProto { obj, val }
+        | Instr::ObjectSpread { target: obj, src: val }
+        | Instr::WithSet { obj, val, .. } => vec![obj, val],
         Instr::GetIndex { obj, key, .. } => vec![obj, key],
         Instr::SetIndex { obj, key, val } => vec![obj, key, val],
         Instr::GetIndexConcat { obj, key, .. } => vec![obj, key],
         Instr::SetIndexConcat { obj, key, val, .. } => vec![obj, key, val],
+        Instr::InitDataPropDyn { obj, key, val } => vec![obj, key, val],
+        Instr::DeleteIndex { obj, key, .. } => vec![obj, key],
+        Instr::DeleteIndexConcat { obj, key, .. } => vec![obj, key],
+        Instr::ForInLive { obj, key, .. } => vec![obj, key],
+        Instr::HasProp { obj, key, .. } => vec![obj, key],
+        Instr::DefineAccessor { obj, key, func, .. } => vec![obj, key, func],
+        Instr::SetFnNameFromKey { func, key, .. } => vec![func, key],
         // ToPropKey reads the receiver (nullish check) and the key. `src` MUST
         // be listed or the dead-code pass drops the load that feeds it; `obj`
         // follows the GetIndex/SetIndex pattern and is exempted at the pinned
         // receiver's use-site scan like theirs.
         Instr::ToPropKey { obj, src, .. } => vec![obj, src],
-        Instr::DeleteIndexConcat { obj, key, .. } => vec![obj, key],
-        Instr::Return { src } => vec![src],
-        // MathOp / CallMethod read a CONTIGUOUS argument window starting at
-        // `arg_base` (plus the receiver for a method call). Reporting no uses
-        // let the home-unification passes treat those registers as dead and
-        // alias over them — see the matching note in `writes_reg`.
-        Instr::MathOp { arg_base, argc, .. } => {
-            (0..argc).map(|k| arg_base + k).collect()
+        Instr::ToConcatKey { src, .. }
+        | Instr::ToObject { src, .. }
+        | Instr::CheckCoercible { src }
+        | Instr::ThisCheck { src }
+        | Instr::IsEvalFn { src, .. }
+        | Instr::ArrayRest { src, .. }
+        | Instr::ObjectRest { src, .. }
+        | Instr::GetIterator { src, .. }
+        | Instr::GetIteratorObj { src, .. }
+        | Instr::IterToArray { src, .. }
+        | Instr::GetAsyncIterator { src, .. }
+        | Instr::CheckIterable { src }
+        | Instr::DateParse { src, .. } => vec![src],
+        Instr::ObjectRestDyn { src, keys_base, n, .. } => win(&[src], keys_base, n),
+
+        // ── calls ──
+        // A call reads a CONTIGUOUS argument window starting at `arg_base`, plus
+        // the callee or receiver. Reporting no uses let the home-unification
+        // passes treat those registers as dead and alias over them — see the
+        // matching note in `writes_reg`.
+        Instr::MathOp { arg_base, argc, .. }
+        | Instr::GlobalFn { arg_base, argc, .. }
+        | Instr::StaticFn { arg_base, argc, .. }
+        | Instr::ArrayCtor { arg_base, argc, .. }
+        | Instr::NewArray { arg_base, argc, .. }
+        | Instr::DateNew { arg_base, argc, .. }
+        | Instr::DateUTC { arg_base, argc, .. }
+        | Instr::Print { arg_base, argc, .. } => win(&[], arg_base, argc),
+        Instr::Call { callee, arg_base, argc, .. }
+        | Instr::TailCall { callee, arg_base, argc }
+        | Instr::New { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),
+        Instr::CallWithThis { callee, this_v, arg_base, argc, .. }
+        | Instr::TailCallWithThis { callee, this_v, arg_base, argc } => {
+            win(&[callee, this_v], arg_base, argc)
         }
-        Instr::CallMethod { obj, arg_base, argc, .. } => {
-            let mut v = vec![obj];
-            v.extend((0..argc).map(|k| arg_base + k));
+        Instr::CallMethod { obj, arg_base, argc, .. } => win(&[obj], arg_base, argc),
+        Instr::CallMethodComputed { obj, key, arg_base, argc, .. } => {
+            win(&[obj, key], arg_base, argc)
+        }
+        Instr::CallSpread { callee, args, .. } | Instr::NewSpread { callee, args, .. } => {
+            vec![callee, args]
+        }
+        Instr::CallMethodSpread { obj, args, .. } => vec![obj, args],
+        Instr::CallMethodComputedSpread { obj, key, args, .. } => vec![obj, key, args],
+        Instr::MathSpread { args, .. } => vec![args],
+        Instr::ArrayFrom { src, mapfn, .. } => vec![src, mapfn],
+        Instr::InstanceOf { val, .. } => vec![val],
+        Instr::InstanceOfDyn { val, ctor, .. } => vec![val, ctor],
+        // `eval(arg)` with the caller's `this`. The eval'd code reaches the
+        // caller's NAMED bindings through the EvalScope / the Dyn global+upval
+        // ops, never through raw registers, so those two are the whole read set.
+        Instr::DirectEval { arg, this_reg, .. } => vec![arg, this_reg],
+
+        // ── `super` ── every form also consumes the activation's `this`
+        // (register 0), which no operand field names.
+        Instr::SuperCtor { ctor, arg_base, argc, .. } => win(&[ctor, THIS], arg_base, argc),
+        Instr::SuperCtorSpread { ctor, args, .. } => vec![ctor, THIS, args],
+        Instr::SuperMethod { base, arg_base, argc, .. } => win(&[base, THIS], arg_base, argc),
+        Instr::SuperMethodComputed { base, key, arg_base, argc, .. } => {
+            win(&[base, key, THIS], arg_base, argc)
+        }
+        Instr::SuperGet { .. } | Instr::SuperGetObj { .. } => vec![THIS],
+        Instr::SuperGetComputed { key, .. } | Instr::SuperGetObjComputed { key, .. } => {
+            vec![key, THIS]
+        }
+        Instr::SuperSet { base, val, .. } => vec![base, val, THIS],
+        Instr::SuperSetComputed { base, key, val, .. } => vec![base, key, val, THIS],
+        Instr::SuperSetObj { val, .. } => vec![val, THIS],
+        Instr::SuperSetObjComputed { key, val } => vec![key, val, THIS],
+        Instr::SuperMethodObj { arg_base, argc, .. } => win(&[THIS], arg_base, argc),
+        Instr::SuperMethodObjComputed { key, arg_base, argc, .. } => {
+            win(&[key, THIS], arg_base, argc)
+        }
+        Instr::SuperMethodSpread { args, .. } => vec![args, THIS],
+        Instr::SuperMethodComputedSpread { key, args, .. } => vec![key, args, THIS],
+        Instr::SetHomeObject { method, home } => vec![method, home],
+
+        // ── classes / decorators ──
+        // `DecElem`/`DecClass` read `argc` (decorator, receiver) PAIRS — the
+        // window is 2 * argc wide, not argc.
+        Instr::DecElem { class, arg_base, argc, .. } => {
+            win(&[class], arg_base, argc.saturating_mul(2))
+        }
+        Instr::DecClass { class, arg_base, argc } => {
+            win(&[class], arg_base, argc.saturating_mul(2))
+        }
+        // DecKey / PushFieldKey / ClassAddMember ToPropertyKey the key IN PLACE:
+        // read-modify-write, so `key` is a use as well as a def.
+        Instr::DecKey { class, key, .. }
+        | Instr::PushFieldKey { class, key }
+        | Instr::ClassAddMember { class, key, .. } => vec![class, key],
+        Instr::ClassStaticField { class, key, val } => vec![class, key, val],
+        Instr::DecInits { recv, .. } => vec![recv],
+        Instr::DecField { val, recv, .. } => vec![val, recv],
+        // The field's value plus the activation's `this` (the instance).
+        Instr::FieldInit { val, .. } => vec![val, THIS],
+        Instr::MakeClass { parent, .. } => parent.into_iter().collect(),
+
+        // ── generators / async / iteration ──
+        Instr::Yield { val, .. }
+        | Instr::Await { val, .. }
+        | Instr::YieldDelegate { val, .. }
+        | Instr::AsyncYieldDelegate { val, .. }
+        | Instr::RequireObject { val } => vec![val],
+        Instr::AsyncIterThrowStep { iter, exc, .. } => vec![iter, exc],
+        Instr::AsyncIterNextStep { iter, idx, sent, next_fn, .. } => {
+            vec![iter, idx, sent, next_fn]
+        }
+        Instr::AsyncIterReturnStep { iter, ret, .. } => vec![iter, ret],
+        Instr::AsyncFromSyncStep { step, iter, .. } => vec![step, iter],
+        Instr::IterDelegate { iter, mode, sent, .. } => vec![iter, mode, sent],
+        // The cursor `idx` is read-modify-write. `next` is the PRIMED next
+        // method, or the `u16::MAX` absent sentinel at a destructuring site.
+        Instr::IterNext { iter, idx, next, .. } => {
+            let mut v = vec![iter, idx];
+            if next != u16::MAX {
+                v.push(next);
+            }
             v
         }
-        _ => vec![],
+        Instr::ForAwaitNext { iter, idx, .. } => vec![iter, idx],
+        Instr::IterPrime { iter, .. }
+        | Instr::IterClose { iter }
+        | Instr::IterCloseQuiet { iter } => vec![iter],
+        Instr::IterCloseFinally { iter, kind_reg } => vec![iter, kind_reg],
+
+        // ── `using` / disposal ──
+        Instr::RegisterDisposable { scope, val }
+        | Instr::RegisterAsyncDisposable { scope, val } => vec![scope, val],
+        Instr::DisposeScope { scope, kind_reg, val_reg } => vec![scope, kind_reg, val_reg],
+        Instr::AsyncDisposeNext { scope, .. } => vec![scope],
+        Instr::MergeDispose { kind_reg, val_reg, err } => vec![kind_reg, val_reg, err],
+
+        // ── closure cells ──
+        // `MakeCellTdz` only WRITES its reg; it is declared a use because it is
+        // the one textual naming of a register a later `MakeClosure`/`MakeArrow`
+        // captures through the callee proto's upvalue list (see the note above).
+        Instr::MakeCell { reg }
+        | Instr::MakeCellTdz { reg }
+        | Instr::MakeCellFnName { reg }
+        | Instr::MarkCellConst { reg } => vec![reg],
+        Instr::CellGet { cell, .. } => vec![cell],
+        Instr::CellSet { cell, src } | Instr::CellSetChecked { cell, src } => vec![cell, src],
+        Instr::MakeArrow { this_reg, .. } => vec![this_reg],
+
+        // ── constructors / literals with register operands ──
+        Instr::NewMap { src, .. }
+        | Instr::NewSet { src, .. }
+        | Instr::NewWeakMap { src, .. }
+        | Instr::NewWeakSet { src, .. } => src.into_iter().collect(),
+        Instr::NewBox { arg, .. } | Instr::MakeSymbol { desc: arg, .. } => {
+            arg.into_iter().collect()
+        }
+        Instr::NewError { arg, opts, errors, .. } => {
+            arg.into_iter().chain(opts).chain(errors).collect()
+        }
+        Instr::NewWeakRef { target, .. } => vec![target],
+        Instr::NewFinalizationRegistry { cleanup, .. } => vec![cleanup],
+        Instr::NewPromise { executor, .. } => vec![executor],
+        Instr::NewRegExp { pattern, flags, .. } => vec![pattern, flags],
+        Instr::BigIntFrom { arg, .. } => vec![arg],
+        Instr::ArrayAppend { arr, val, .. } => vec![arr, val],
+        Instr::SetRaw { arr, raw } => vec![arr, raw],
+        Instr::ImportCall { spec, opts, .. } => std::iter::once(spec).chain(opts).collect(),
+
+        // ── reads NO register ──
+        // Constants and materializations (their only register is `dst`); the
+        // global/upvalue LOADS (a slot index is the operand, not a register);
+        // the jump and handler-bracket ops, which record a target or a register
+        // for the UNWINDER to write; and the generator entry marker.
+        Instr::LoadConst { .. }
+        | Instr::LoadInt { .. }
+        | Instr::LoadUndefined { .. }
+        | Instr::LoadNewTarget { .. }
+        | Instr::LoadCallee { .. }
+        | Instr::LoadClassValue { .. }
+        | Instr::LoadHole { .. }
+        | Instr::LoadNull { .. }
+        | Instr::LoadBool { .. }
+        | Instr::LoadBigInt { .. }
+        | Instr::LoadBigIntBig { .. }
+        | Instr::LoadGlobal { .. }
+        | Instr::LoadGlobalOrUndefined { .. }
+        | Instr::LoadGlobalDyn { .. }
+        | Instr::LoadGlobalOrUndefinedDyn { .. }
+        | Instr::EvalScopeHas { .. }
+        | Instr::CheckGlobalResolvable { .. }
+        | Instr::DeleteGlobal { .. }
+        | Instr::UpvalGet { .. }
+        | Instr::LoadUpvalDyn { .. }
+        | Instr::NewObject { .. }
+        | Instr::MakeFunc { .. }
+        // The capture sources live in the CALLEE proto; they are declared at the
+        // `MakeCell*` that boxes them (see the note above).
+        | Instr::MakeClosure { .. }
+        | Instr::SuperCtorFetch { .. }
+        | Instr::SuperBase { .. }
+        | Instr::OpenUsingScope { .. }
+        | Instr::TemplateGetCached { .. }
+        | Instr::ImportMeta { .. }
+        | Instr::Random { .. }
+        | Instr::Now { .. }
+        | Instr::Jump { .. }
+        | Instr::JumpFinally { .. }
+        | Instr::PushHandler { .. }
+        | Instr::PopHandler
+        | Instr::PushFinally { .. }
+        | Instr::PopFinally
+        | Instr::GenStart
+        | Instr::ReturnUndefined => vec![],
     }
 }
 

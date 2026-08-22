@@ -424,9 +424,17 @@ pub(crate) fn compile_region_int_maybe_cold(
                             // Same B119 relief valve as the main flow: one
                             // shared-home re-plan when only the pool overflowed.
                             GprAttempt::PoolOverflow if gpr_nest_enabled() => {
+                                // W17 `admit_wt_share`: `shared` is handed to
+                                // `compile_region_int_gpr` and to nothing else
+                                // — `split_plan` below keeps `p2`, the
+                                // distinct-homes plan, for the xmm fallback —
+                                // which is exactly the licence B97 sharing
+                                // needs. See `gpr_wt_share_enabled` for the
+                                // contract; `ZIPP_NO_GPR_WT_SHARE=1` restores
+                                // the pre-wave plan.
                                 if let Some(shared) = plan_region_cold(
-                                    proto, start, end, ta_plan, true, true, false, true, &cold,
-                                    false,
+                                    proto, start, end, ta_plan, true, true,
+                                    gpr_wt_share_enabled(), true, &cold, false,
                                 ) {
                                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                                         eprintln!(
@@ -524,7 +532,11 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ta_plan,
                     true,
                     int_split_enabled(),
-                    false,
+                    // W17: same licence as the split-flow retry above —
+                    // `shared` reaches `compile_region_int_gpr` alone, and the
+                    // xmm fallback below keeps the ORIGINAL plan. See
+                    // `gpr_wt_share_enabled`.
+                    gpr_wt_share_enabled(),
                     true,
                     &cold,
                     false,

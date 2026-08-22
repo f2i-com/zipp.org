@@ -107,6 +107,45 @@
 //! [`open_cold_out_of_range_read_throws`], whose pinned receiver now stores the
 //! object to its frame slot. No `open_*` spec is `#[ignore]`d any more.
 //!
+//! ## W17 found a sixth
+//!
+//! [`open_conditional_def_loses_its_entry_load`] and its cold-block twin. A
+//! local whose only in-region definition sits on a CONDITIONAL branch is treated
+//! as though that def dominated every use, loses its entry load, and the
+//! compiled body reads its home as garbage on every pass that skips the branch.
+//! Two lines, wrong on both register tiers with two different answers, avoided
+//! by no `ZIPP_NO_*` switch, and reproducing at the committed HEAD 0ade520.
+//! `plan_region.rs` already names the distinction it turns on — `first_seen ==
+//! true` says the first OCCURRENCE is a def, not that a def RUNS — and guards
+//! the constant-hoisting consumer with `runs_every_iteration`; the `shareable` /
+//! live-in consumer beside it is unguarded. Both specs are `#[ignore]`d because
+//! the defect is open and that file's live-in region belongs to another lane.
+//!
+//! What kept it hidden is worth as much as the bug: reading the local AFTER the
+//! loop makes the program answer correctly, because `read_outside` forced a
+//! permanent home with an entry load. Every hand-written test, every benchmark
+//! row and this file's own return mix read their accumulators afterwards — which
+//! is why 138,300 W15-generator programs never saw it.
+//!
+//! Two generator changes came out of that, and together they are the clearest
+//! evidence in this file that a widening WORKED. `Program::dead_out` leaves one
+//! local out of the return mix so it is genuinely dead after the region, and
+//! [`Stmt::CondDef`] emits `if (cond) { t = <int>; }` — a definition that does
+//! not DOMINATE its uses, half of them behind a condition that never fires.
+//! Measured yield for this class:
+//!
+//! ```text
+//! W15 generator                       138,300 programs …   0 divergences
+//! W17 generator, before `CondDef`     188,000 programs …   1 divergence
+//! W17 generator, with `CondDef`        48,000 programs … 252 divergences
+//! ```
+//!
+//! The one before `CondDef` was luck: a `DeoptKind::TypedOob` guard that
+//! happened to write a temp a later index read. All 252 after it are the SAME
+//! class — every one contains a `CondDef` and not one is anything else — and so
+//! are all 29 of the node-oracle disagreements. The CI slice sees it at exactly
+//! one index of 640, which is why `KNOWN_OPEN` has one entry and not a page.
+//!
 //! A fifth result had no spec because it is about a SWITCH rather than about the
 //! default: on 12 of the 28 divergent programs the soak found, the default
 //! answer is right and `ZIPP_NO_FUSED_CMPJUMP=1` alone is wrong. That switch is
@@ -122,6 +161,93 @@
 //! on every single one, and every one of the five node disagreements was the
 //! compiled tier being wrong. The generator produced no implementation-defined
 //! answers at all.
+//!
+//! W17 re-ran that check over 8,000 programs of the WIDENED generator, with the
+//! `typeof` folds, the f64 NaN/-0 probes, the post-region uses, the script-scope
+//! spelling and its IIFE wrapping all in play. 29 programs disagreed with node,
+//! and every single one of the 29 carries a [`Stmt::CondDef`] — i.e. every one
+//! is [`open_conditional_def_loses_its_entry_load`] and not one is a generator
+//! false positive. That is the property that has to hold for any of this to be
+//! worth running, so it is measured again whenever the generator grows:
+//! `ZIPP_FUZZ_NODE_COUNT=8000 cargo test --release --test jit_tier_fuzz -- //! node_oracle_slice --exact`. Expect it to be RED at raised counts while the
+//! W17 class is open, and expect every failure it prints to carry a
+//! `if (…) { t… = <int>; }`; anything else is new.
+//!
+//! ## W17: the four places it was blind, measured
+//!
+//! The W15 author left a coverage report and an honest list of what it did not
+//! reach. Each entry below is what was actually wrong, and each fact was
+//! measured on this tree with `ZIPP_JITLOG=1 ZIPP_JITDECLINE=1` rather than
+//! reasoned about.
+//!
+//! **Post-region uses did not exist.** Every use the generator emitted was
+//! INSIDE the loop or in the return mix — and the return mix reads a local
+//! through `| 0` or a truthiness test, both of which ERASE representation. A
+//! `Bool` home that reads back as a raw `NaN` is FALSY, so `(b ? 17 : 0)` gives
+//! exactly the answer an honest `false` gives and the digest never moves; that
+//! is why a live `typeof x` after a loop was found by a human reading code and
+//! not by 138,300 generated programs. Two things changed: the mix now folds
+//! `typeof` in for every live local (and `d === d` / `1 / d < 0` for every
+//! double), and [`Post`] generates what happens to a live-out AFTER the loop —
+//! `typeof`, identity, a call boundary, a boxed store, and a SECOND hot loop
+//! whose live-ins are the first region's live-outs.
+//!
+//! **The DOUBLE tier was thin because the tier is all-or-nothing.** 25 DOUBLE
+//! regions per 400 programs, against 686 INT and 2,172 MEM. The cause is a short
+//! list of ops any one of which declines the whole region to MEM: any `MathOp`
+//! (`imul`, `floor`, `abs`, `sqrt`, `fround`, `min`, `max`, `clz32`), any
+//! `Call`, `t === undefined`, `.length`, `charCodeAt`, an Int32Array or
+//! Uint8Array read, an ordinary-Array WRITE. Three of those were in
+//! [`Flavor::Double`]'s own statement menu, so a Double-flavor loop with four
+//! double statements cleared them ~16% of the time. [`gen_double_body`] draws
+//! only from what the tier admits: 25 -> 76 per 400.
+//!
+//! **B94 split receivers were unreachable, not merely rare.** A split needs the
+//! bytecode compiler to RECYCLE a register — pinned element receiver over one
+//! range, number over another — and inside a function it never does: the
+//! generated kernels run to `regs=74`, one per expression node. At SCRIPT scope
+//! the temp numbering restarts per statement and `LoadGlobal r7 <- arr` lands two
+//! instructions after `LoadConst r7 <- 0.25`. [`Scope::Script`] is that axis and
+//! [`gen_split_body`] is the shape built for it: 0 -> 9 per 400, on both register
+//! tiers, sometimes two receivers in one region (which is what
+//! `ZIPP_NO_MULTI_SPLIT` governs). Script scope is not free — a wide script-scope
+//! body recycles a register across two TYPES and the planner declines it — so it
+//! is drawn at 10% outside that flavor.
+//!
+//! **Tier A was not reached at all.** It was reported as "generated but
+//! unverifiable", because a successful Tier A compile logged nothing. It now
+//! logs `[jit] Tier A fn{id} compiled`, and the first thing that line said was
+//! that no generated program had ever been on that tier: `Stmt::Rec` spelled its
+//! body with `| 0`, and `fn_int::can_compile` admits no `Bitwise` op at all, so
+//! every generated recursion had been landing on Tier C. The `| 0`s are gone and
+//! [`tier_a_is_reached`] pins both halves.
+//!
+//! **`ZIPP_FUZZ_BIG` never ran.** 5,000 BIG programs found nothing while 5,000
+//! ordinary ones found ~10 — with the soak driver passing `ZIPP_FUZZ_BIG=1`
+//! through a bash assignment PREFIX that expands to a command name, so every
+//! "BIG" soak had actually run the ordinary generator and the reported
+//! comparison was a comparison of a thing with itself. The driver is fixed, and
+//! BIG is re-aimed: it used to mean a bigger STATEMENT BUDGET, which dilutes the
+//! tight shapes that trip the register allocator; it now means the same tight
+//! bodies run LONGER — more iterations, more repetitions — which moves WHEN a
+//! region compiles, deopts and is evicted.
+//!
+//! And now that it runs, here is what it is worth, measured rather than argued.
+//! Over the same 400 programs the BIG tier mix is FLAT: 2162/551/75 MEM/INT/
+//! DOUBLE regions against 2161/547/76 ordinary, the same 9 split receivers, the
+//! same 8 Tier A compiles. The only things that move are +4% deopts and +11%
+//! evictions — which is exactly what it was re-aimed at and nothing more — and
+//! it costs 5x: 8,000 BIG programs took 145s where 20,000 ordinary ones took
+//! 121s. So BIG is not a general soak mode and a soak budget is better spent on
+//! 5x more distinct programs; it is the EVICTION-DENSITY knob, for when the bug
+//! being hunted is in the evict/re-plan path (W16's live-out `Bool` was reached
+//! that way). It is kept for that and documented at that price, not deleted:
+//! it is now the only lever on how often a region is re-planned.
+//!
+//! Two engine changes came with this, both diagnostic: the Tier A line above,
+//! and `fn=<name> [start,end]` attribution on every `[decline-reason]`, without
+//! which a decline in a program with more than one hot function cannot be tied
+//! to the region that produced it.
 //!
 //! ## Layout
 //!
@@ -183,6 +309,52 @@ const MODES: &[Mode] = &[
     Mode { name: "notierc", env: &[("ZIPP_NO_FNJIT_MEM", "1")] },
     Mode { name: "nocallinline", env: &[("ZIPP_NO_CALL_INLINE", "1")] },
     Mode { name: "gcstress", env: &[("ZIPP_GC_STRESS", "1")] },
+    // ── W17 ── the engine has ~50 `ZIPP_NO_*` switches and this list held 14 of
+    // them. Every one is specified as a PURE FALLBACK, which is a claim the
+    // differential can check for free: a switch that changes an answer is a bug
+    // whichever side is wrong, and W16 found exactly that shape
+    // (`ZIPP_NO_FUSED_CMPJUMP=1` alone answering wrong on 12 of 28 programs, so
+    // every A/B measured through it had been measured against wrong answers).
+    // The rows below are the switches that touch a path these programs actually
+    // execute — register allocation, region admission, the element and property
+    // fast paths, the GC. The regex / JSON / Promise / string-intrinsic switches
+    // stay out, and so does `ZIPP_NO_ITER_REGION`: the generator emits no
+    // `for…of` at all, so that row would cost process time to prove nothing.
+    //
+    // How far "actually execute" was checked, honestly: over a 900-program
+    // sample under `ZIPP_JITLOG=1 ZIPP_JITDECLINE=1`, these rows visibly change
+    // the JIT's own decisions — `nogprsplit`, `nogprnest`, `nogprlazysx`,
+    // `nogprwtshare`, `nodoublebitwise`, `nodoublemod`, `notiercleaf`,
+    // `nomethodinline`, `nosplicealias`, `nopolyeqfast`, `arrpinloose`,
+    // `accalways`. The rest gate EMITTED CODE or a runtime fast path rather than
+    // a plan, so they produce no log line either way and their reach is by code
+    // inspection, not measurement. Both kinds are worth a row — a switch that
+    // changes an answer without changing a plan is the harder bug.
+    //
+    // A mode is a PROCESS, so this list is the soak's cost driver. Measured:
+    // 18 rows to 33 took a 2,000-program soak from ~6.0 to ~6.7 ms/program,
+    // because the modes run as parallel threads. `CI_MODES` is unchanged.
+    Mode { name: "nogprsplit", env: &[("ZIPP_NO_GPR_SPLIT", "1")] },
+    Mode { name: "nogprnest", env: &[("ZIPP_NO_GPR_NEST", "1")] },
+    Mode { name: "nogprlazysx", env: &[("ZIPP_NO_GPR_LAZYSX", "1")] },
+    Mode { name: "nogprspill", env: &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")] },
+    Mode { name: "nogprwtshare", env: &[("ZIPP_NO_GPR_WT_SHARE", "1")] },
+    Mode { name: "nodoublebitwise", env: &[("ZIPP_NO_DOUBLE_BITWISE", "1")] },
+    Mode { name: "nodoublemod", env: &[("ZIPP_NO_DOUBLE_MOD", "1")] },
+    Mode { name: "nocrosscall", env: &[("ZIPP_NO_CROSSCALL", "1")] },
+    Mode { name: "notiercleaf", env: &[("ZIPP_NO_TIERC_LEAF", "1")] },
+    Mode { name: "nomemcmpjump", env: &[("ZIPP_NO_MEM_CMPJUMP", "1")] },
+    Mode { name: "nomethodinline", env: &[("ZIPP_NO_METHOD_INLINE", "1")] },
+    Mode { name: "noleafgetprop", env: &[("ZIPP_NO_LEAF_GETPROP", "1")] },
+    Mode { name: "nosplicealias", env: &[("ZIPP_NO_SPLICE_ALIAS", "1")] },
+    Mode { name: "noshapes", env: &[("ZIPP_NO_SHAPES", "1")] },
+    Mode { name: "noarrkeyfast", env: &[("ZIPP_NO_ARRKEY_FAST", "1")] },
+    Mode { name: "nopolyeqfast", env: &[("ZIPP_NO_POLYEQ_FAST", "1")] },
+    Mode { name: "nonursery", env: &[("ZIPP_NO_NURSERY", "1")] },
+    // Two OPT-IN rows beside `intsplit`, which is where a path gets less
+    // exercise than it needs by construction.
+    Mode { name: "arrpinloose", env: &[("ZIPP_ARR_PIN_LOOSE", "1")] },
+    Mode { name: "accalways", env: &[("ZIPP_ACC_ALWAYS_EMIT", "1")] },
 ];
 
 /// The subset the normal suite runs: the interpreter, both threshold shifts, and
@@ -247,6 +419,12 @@ enum Src {
     Glob(u8),
     Up,
     ALen,
+    /// An f64 accumulator as an OPERAND. Only [`Flavor::DblScan`] produces one,
+    /// which is what keeps every other flavor's calibration byte-identical: a
+    /// double in an int expression is exact (the digest ends in `ToInt32`) but
+    /// it also makes the region non-int, and the INT-tier flavors are built to
+    /// stay int.
+    Dbl(u8),
     Lit(i32),
 }
 
@@ -379,6 +557,18 @@ enum Stmt {
     Prop { k: u8, poly: u32, write: bool },
     Deopt { kind: DeoptKind, at: Cond, k: u8 },
     Try { a: Src, body: Vec<Stmt> },
+    /// A definition that does not DOMINATE its uses: `if (cond) { t{k} = v; }`
+    /// with an int constant, so the region still admits on a register tier and
+    /// the fall-through path reaches every later read of `t{k}` without the def.
+    ///
+    /// This is the shape W17's
+    /// [`open_conditional_def_loses_its_entry_load`] turns on, and W16's two
+    /// `loop_home_liverange` faces were the same family — an analysis keyed on
+    /// where a value is MENTIONED where it needs where the value is LIVE. The
+    /// generator reached it once in 60,000 programs by accident (a
+    /// `DeoptKind::TypedOob` guard that happened to write a temp a later index
+    /// read), which is not reach, it is luck.
+    CondDef { k: u8, at: Cond, v: i32 },
     /// Self-recursion — the ONLY shape that reaches Tier A.
     Rec { a: Src },
     /// A kernel-local object whose fields are read and written in the loop: the
@@ -386,8 +576,67 @@ enum Stmt {
     Sroa { f: u8, op: u8, a: Src },
 }
 
+/// Where the kernel lives.
+///
+/// This is not decoration: it selects a different REGISTER ALLOCATION regime in
+/// the bytecode compiler, and therefore a different set of JIT plans. Inside a
+/// function every expression node gets a fresh register (the generated kernels
+/// run to `regs=74`); at script scope the temp numbering restarts and a
+/// statement's registers are RECYCLED — so a register can be a pinned element
+/// receiver over one range and a number over another, which is exactly and only
+/// the shape B94 live-range splitting exists for. `[jit] … B94 split receiver`
+/// never appeared in 400 programs of `Scope::Kernel`, and appears immediately at
+/// script scope; `tier_coverage_report` counts it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scope {
+    /// The body is `function kernel(n) { … }`, called `reps` times.
+    Kernel,
+    /// The body is the script, run `reps` times by an enclosing `for`.
+    Script,
+}
+
+/// A value a POST-REGION use can name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PostVal {
+    Temp(u8),
+    Bool(u8),
+    Dbl(u8),
+    H,
+    Glob(u8),
+    Up,
+    Elem(Arr, u32),
+}
+
+/// What happens to a value AFTER the loop that computed it.
+///
+/// The gap this closes: every use the generator emitted was INSIDE the region,
+/// or was the return mix — and the return mix reads every local through `| 0` or
+/// a truthiness test, both of which ERASE representation. A `Bool` home that
+/// reads back as a raw `NaN` is falsy, so `(b ? 17 : 0)` gives the same answer
+/// as an honest `false`; a live `typeof x` after a loop was found by a human
+/// reading code, not by 138,300 generated programs.
+#[derive(Clone, Debug)]
+enum Post {
+    /// `typeof x`, folded in as a small int — the representation probe.
+    TypeOf(PostVal),
+    /// Identity against each value the local can legally hold.
+    Identity(PostVal),
+    /// `d === d` and `1 / d < 0`: NaN-ness and the sign of zero, the two f64
+    /// facts `| 0` throws away.
+    DblShape(u8),
+    /// The live-out crosses a CALL boundary, where it must be a well-formed
+    /// boxed value and not a register home.
+    Probe(PostVal),
+    /// The live-out is stored into an Array and read straight back — a boxed
+    /// store of whatever the home actually holds.
+    Escape(PostVal),
+    /// A SECOND hot loop, whose live-INS are the first region's live-OUTs.
+    Loop2 { n: u32, vals: Vec<PostVal> },
+}
+
 #[derive(Clone, Debug)]
 struct Program {
+    scope: Scope,
     strict: bool,
     use_closure: bool,
     n: u32,
@@ -398,6 +647,20 @@ struct Program {
     /// is re-read every iteration and a `length` change mid-loop must be seen.
     bound: Bound,
     body: Vec<Stmt>,
+    /// What happens to the loop's live-outs after it finishes. See [`Post`].
+    post: Vec<Post>,
+    /// One local DELIBERATELY left out of the return mix, so it is genuinely
+    /// DEAD after the region.
+    ///
+    /// The complement of [`Post`], and it earns its place for the same reason:
+    /// the mix used to read every live local, so no generated binding was ever
+    /// dead-out, and `read_outside` is a decision the planner makes differently
+    /// for each. It is what W17's [`open_conditional_def_loses_its_entry_load`]
+    /// needs — the same program with `t` in the mix answers CORRECTLY, because
+    /// being read after the region forced a permanent home with an entry load.
+    /// One binding at a time, because every term dropped from the mix is
+    /// sensitivity lost everywhere else.
+    dead_out: Option<PostVal>,
     /// Fold every mutable datum the body could have touched into the answer, so
     /// a side effect that never reaches `h` still has to agree across tiers.
     /// The shrinker turns it off, because a minimal case reads better without
@@ -451,6 +714,14 @@ enum Flavor {
     /// Field traffic on one global object, which is the only admission shape for
     /// object scalar replacement (`[jit] SROA region`).
     Sroa,
+    /// The DOUBLE/REGALLOC tier's calibrated body — what [`Flavor::Scan`] is to
+    /// the INT tier. See [`gen_double_body`] for the measured admission rules
+    /// and for why [`Flavor::Double`] reached that tier in only 25 of 400
+    /// programs without it.
+    DblScan,
+    /// The B94 SPLIT-RECEIVER shape. Always [`Scope::Script`]. See
+    /// [`gen_split_body`].
+    Split,
 }
 
 struct Gen<'a> {
@@ -505,16 +776,36 @@ fn gen_program(seed: u64, big: bool) -> Program {
         Flavor::Sroa,
         Flavor::Int,
         Flavor::Elem,
+        // W17: the DOUBLE tier's calibrated body, and three more INT-family
+        // slots beside it. `DblScan` alone took 3 of 17 draws, which cost the
+        // INT flavors 18% of their share and INT REGIONS 29% of their count
+        // (686 -> 488 per 400 programs) — a tier traded for a tier. With these
+        // the pool is 20 and the INT family holds the same 55% it held at 14.
+        Flavor::DblScan,
+        Flavor::DblScan,
+        Flavor::DblScan,
+        Flavor::Scan,
+        Flavor::Scan,
+        Flavor::Pressure,
+        Flavor::Split,
+        Flavor::Split,
     ]);
+    // BIG, re-aimed. It used to mean "a bigger STATEMENT budget", and 5,000 BIG
+    // programs found nothing while 5,000 ordinary ones found ~10 with the same
+    // tier mix — a wider body dilutes the tight shapes that trip the register
+    // allocator, which is the opposite of what a soak wants. (It had also never
+    // actually run: the soak driver passed it through a bash assignment prefix
+    // that expands to a command name, so every "BIG" soak ran the ordinary
+    // generator. W16's gate found that.) BIG now means the same tight bodies
+    // run LONGER and NEST DEEPER: more iterations per region, more repetitions,
+    // and one more level of loop nesting — the axes that move WHEN a region
+    // compiles, when it deopts, and when it is evicted and re-planned.
     let n = if big {
-        rng.pick(&[12u32, 40, 120, 400, 400, 1200])
+        rng.pick(&[12u32, 40, 120, 400, 400, 1200, 4000])
     } else {
         rng.pick(&[12u32, 40, 120, 400, 400])
     };
-    // Total kernel iterations stay bounded so one program is always a
-    // sub-millisecond release run: the point is crossing the OSR point many
-    // times, not doing work.
-    let cap: u32 = if big { 20_000 } else { 4_800 };
+    let cap: u32 = if big { 48_000 } else { 4_800 };
     let reps = *[1u32, 3, 12, 40].iter().filter(|r| n * **r <= cap).last().unwrap_or(&1);
     let reps = rng.pick(&[1u32, 3, reps]).max(1);
 
@@ -532,7 +823,7 @@ fn gen_program(seed: u64, big: bool) -> Program {
     } else {
         Bound::N
     };
-    let budget = if big { 4 + rng.below(12) } else { 3 + rng.below(8) };
+    let budget = 3 + rng.below(8);
     let mut g = Gen {
         rng: &mut rng,
         flavor,
@@ -544,29 +835,55 @@ fn gen_program(seed: u64, big: bool) -> Program {
     };
     let body = if flavor == Flavor::Sroa {
         gen_sroa_block(&mut g)
+    } else if flavor == Flavor::Split {
+        gen_split_body(&mut g)
+    } else if flavor == Flavor::DblScan {
+        gen_double_body(&mut g)
     } else if flavor == Flavor::Pressure || flavor == Flavor::Scan {
         gen_pressure_body(&mut g, flavor == Flavor::Scan)
     } else {
         let count = 2 + g.rng.below(5);
         gen_stmts(&mut g, count)
     };
+    // Post-region uses go on MOST programs: a live-out that nothing looks at
+    // afterwards cannot expose a live-out defect, and the tight flavors are
+    // where the register allocator is under the most pressure.
+    let post = if g.rng.chance(72) { gen_post(&mut g, &body) } else { Vec::new() };
+    let dead_out = if g.rng.chance(35) { gen_dead_out(&mut g, &body, &post) } else { None };
+    // Script scope is an orthogonal axis (see `Scope`) and is drawn for every
+    // flavor — but at a LOW rate, because it is not free: a script-scope loop
+    // recycles registers, and a recycled register that carries two TYPES makes
+    // the planner decline ("type conflict on a reused register"), so a wide
+    // script-scope body lands on MEM. Measured: 30% script scope cost 32% of all
+    // INT regions. `Flavor::Split` is the shape built to pay for itself there,
+    // and takes the scope unconditionally.
+    //
+    // Script scope also forces `strict` off — a `"use strict"` directive has to
+    // be the first statement of the file and the data declarations are — and
+    // closure nesting off, which is a function-scope idea to begin with.
+    let script = flavor == Flavor::Split || rng.chance(10);
 
     Program {
-        strict: rng.chance(50),
-        use_closure: rng.chance(35),
+        scope: if script { Scope::Script } else { Scope::Kernel },
+        strict: !script && rng.chance(50),
+        use_closure: !script && rng.chance(35),
         n,
         reps,
         hoists,
         leaf_kinds,
         checksum: true,
         bound: match flavor {
-            Flavor::Scan | Flavor::Sroa => Bound::N,
+            Flavor::Scan | Flavor::Sroa | Flavor::DblScan | Flavor::Split => Bound::N,
             Flavor::Pressure if rng.chance(85) => Bound::N,
             _ => bound,
         },
         body,
-        trim: matches!(flavor, Flavor::Pressure | Flavor::Scan | Flavor::Sroa)
-            && rng.chance(60),
+        post,
+        dead_out,
+        trim: matches!(
+            flavor,
+            Flavor::Pressure | Flavor::Scan | Flavor::Sroa | Flavor::DblScan | Flavor::Split
+        ) && rng.chance(60),
     }
 }
 
@@ -655,6 +972,13 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
     }
     let mut body = defs;
     body.extend(tail);
+    // A def of `t0` that does NOT dominate the reads below it. `t0` is the temp
+    // this shape's compares and folds all read, so one of these makes every
+    // later use reachable without a def — see `Stmt::CondDef`.
+    if g.rng.chance(30) {
+        let st = gen_cond_def(g, 0);
+        body.insert(0, st);
+    }
     for r in 0..nreads {
         // Dense int Arrays carried the defect; the typed, holey and string twins
         // are the controls that must not move.
@@ -705,6 +1029,321 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
     body
 }
 
+/// The DOUBLE / REGALLOC tier's calibrated body — what [`gen_pressure_body`]'s
+/// `strict` mode is to the INT tier, and calibrated the same way: by putting
+/// one construct at a time in a loop and watching whether
+/// `[jit] DOUBLE region … compiled` survives.
+///
+/// [`Flavor::Double`] reached that tier in 25 of 400 programs. The tier is
+/// all-or-nothing about a short list of ops, and the free-form statement menu
+/// draws them constantly — measured on this tree, ONE of these anywhere in the
+/// loop declines the whole region to MEM:
+///
+/// * any `MathOp` — `imul`, `floor`, `abs`, `sqrt`, `fround`, `min`, `max`,
+///   `clz32` (`[decline-reason] regalloc-emit-unhandled: MathOp`). `Stmt::Dbl`
+///   ops 2 and 4 and `Stmt::DblMix` style 1 are three of those, so a
+///   Double-flavor loop with four double statements clears them ~16% of the
+///   time;
+/// * any `Call`;
+/// * `t === undefined` — the coerce-2 element read ("read-only live-in used
+///   where a number isn't required");
+/// * `.length`, `charCodeAt`, an Int32Array or Uint8Array read (the DOUBLE
+///   path's pin kind is 8, Float64), and an ordinary-Array WRITE.
+///
+/// What it DOES admit, each measured: f64 arithmetic (`*`, `/`, `+`),
+/// Float64Array reads AND writes, dense ordinary-Array reads (B95), `d | 0` and
+/// `(d * 1024) | 0`, bools defined from f64 compares, `if`/`else`, `break`,
+/// `continue`, `return`, integer `/` and `%`, and nested loops. This body draws
+/// only from that set.
+fn gen_double_body(g: &mut Gen) -> Vec<Stmt> {
+    let nd = 1 + g.rng.below(DBLS);
+    let nb = g.rng.below(4);
+    let mut out: Vec<Stmt> = Vec::new();
+
+    // The f64 accumulators. Ops 0/1/3 only — 2 (`sqrt`/`abs`) and 4 (`fround`)
+    // are MathOps and would take the region to MEM.
+    //
+    // `d0` never takes ITSELF as the addend, and that is a soundness rule, not a
+    // style one. Every op here is `d = d*0.5 + a`, `d = a*f` or `d = d/3 + a`,
+    // so an integer `a` holds `d` inside ~2·|a| forever — but `d0 = d0*0.5 + d0`
+    // is `d0 *= 1.5`, which reaches `Infinity`, and `+Infinity + -Infinity` is
+    // `NaN`. A NaN operand is the one thing that separates `a < b` from
+    // `!(a >= b)`, and this file emits both spellings on the stated promise that
+    // nothing it compares can be NaN. `d1` may read `d0` — bounded by a bounded
+    // value is still bounded.
+    for k in 0..nd {
+        let op = g.rng.pick(&[0u8, 0, 1, 3]);
+        let a = if k == 0 {
+            g.rng.pick(&[Src::I, Src::H, Src::Temp(0), Src::Lit(3)])
+        } else {
+            g.rng.pick(&[Src::I, Src::H, Src::Temp(0), Src::Dbl(0), Src::Lit(3)])
+        };
+        out.push(Stmt::Dbl { k: k as u8, op, a, f: g.rng.below(6) as u8 });
+    }
+    // Bools from f64 compares — W16's two DOUBLE-tier defects were both a live
+    // Bool losing `BOOL_GPRS[2]`, and a bool defined from a DOUBLE is the only
+    // way to have one on this tier without an int chain beside it.
+    for k in 0..nb {
+        let cmp = g.rng.pick(&[Cmp::Lt, Cmp::Gt, Cmp::Le, Cmp::Ge]);
+        let a = g.rng.pick(&[Src::Dbl(0), Src::Dbl(0), Src::H, Src::I, Src::Temp(0)]);
+        let (k1, k2) = (g.rng.pick(&KONST_POOL), g.rng.pick(&KONST_POOL));
+        let b = g.rng.pick(&[
+            Src::Dbl((nd - 1) as u8),
+            Src::Lit(k1),
+            Src::Lit(k2),
+            Src::I,
+        ]);
+        out.push(Stmt::BoolDef { k: k as u8, a, b, cmp, neg: g.rng.chance(35) });
+    }
+    for k in 0..nb {
+        // Style 0 is a real branch on the bool home, which is what keeps it live
+        // across the element traffic instead of folding it into a select.
+        let style = g.rng.pick(&[0u8, 0, 0, 1, 2]);
+        out.push(Stmt::BoolUse { k: k as u8, c: g.rng.pick(&[1i32, 2, 4, 8, 17]), style });
+    }
+    // Element traffic, from the arrays this tier pins: a Float64Array (kind 8)
+    // and a dense ordinary Array (B95). Reads only, plus the one admitted write.
+    for r in 0..g.rng.below(3) {
+        let arr = g.rng.pick(&[Arr::F64, Arr::F64, Arr::Dbl, Arr::Dense, Arr::Dense2]);
+        let idx = gen_idx(g);
+        // coerce 2 (`=== undefined`) and 3 (`Math.imul`) both decline.
+        let coerce = g.rng.pick(&[0u8, 0, 1]);
+        out.push(Stmt::Read { arr, idx, t: r as u8, coerce });
+    }
+    if g.rng.chance(30) {
+        out.push(Stmt::Write { arr: Arr::F64, idx: gen_idx(g), v: Src::H });
+    }
+    // An inner loop, so a double home has to survive a back-edge — the shape
+    // that carried W16's `loop_home_liverange` class on this exact tier.
+    if g.rng.chance(35) {
+        let k = g.rng.below(DBLS) as u8;
+        // `Src::J`, not `Src::Dbl(0)` — see the boundedness rule above.
+        let inner = vec![
+            Stmt::Dbl { k, op: g.rng.pick(&[0u8, 3]), a: Src::J, f: g.rng.below(6) as u8 },
+            Stmt::DblMix { k, style: g.rng.pick(&[0u8, 2]) },
+        ];
+        out.push(Stmt::Loop {
+            var: 'j',
+            n: g.rng.pick(&[2u32, 3, 4]),
+            label: None,
+            body: inner,
+        });
+    }
+    if g.rng.chance(30) {
+        let cmp = g.rng.pick(&[Cmp::Lt, Cmp::Gt, Cmp::Ge]);
+        out.push(Stmt::If {
+            a: Src::Dbl(0),
+            b: Src::Lit(g.rng.pick(&KONST_POOL)),
+            cmp,
+            neg: g.rng.chance(35),
+            then_: vec![Stmt::Int { op: IntOp::AddInt, a: Src::I, b: Src::I, n: 3 }],
+            else_: if g.rng.chance(40) {
+                vec![Stmt::Int { op: IntOp::Sub, a: Src::I, b: Src::I, n: 1 }]
+            } else {
+                Vec::new()
+            },
+        });
+    }
+    if g.rng.chance(22) {
+        match g.rng.below(3) {
+            0 => out.push(Stmt::Continue { label: None, at: gen_cond(g, 0) }),
+            1 => out.push(Stmt::Break { label: None, at: gen_cond(g, 1) }),
+            _ => out.push(Stmt::Ret { at: gen_cond(g, 2) }),
+        }
+    }
+    if g.rng.chance(25) {
+        let st = gen_cond_def(g, 0);
+        out.insert(0, st);
+    }
+    // Always fold a double into `h`: style 1 is `Math.floor` and declines.
+    for k in 0..nd {
+        out.push(Stmt::DblMix { k: k as u8, style: g.rng.pick(&[0u8, 0, 2]) });
+    }
+    out
+}
+
+/// The B94 SPLIT-RECEIVER shape, calibrated the way [`Flavor::Scan`] was.
+///
+/// `[jit] … B94 split receiver` never appeared in 400 programs of the W15
+/// generator, and the reason turned out to be structural rather than statistical:
+/// a split needs the bytecode compiler to RECYCLE a register — pinned element
+/// receiver over one range, number over another — and inside a function it never
+/// does. The generated kernels run to `regs=74` with every expression node
+/// getting its own register; at script scope the temp numbering restarts per
+/// statement and `LoadGlobal r7 <- arr` sits two instructions after
+/// `LoadConst r7 <- 0.25`. That is the whole difference, and it is why this
+/// flavor is unconditionally [`Scope::Script`].
+///
+/// The second ingredient is SMALLNESS. A wide script-scope body recycles a
+/// register across two TYPES and the planner declines the region outright
+/// ("type conflict on a reused register"); a bool assigned at script scope also
+/// declines it ("branch condition is not a bool", a global is not typed Bool).
+/// So this body is two to four statements: an element read or two, one
+/// accumulator, and at most one extra. Measured on the current tree, that shape
+/// reaches a split on BOTH register tiers — `[jit] INT-GPR region … B94 split
+/// receiver` for the int spelling and `[jit] DOUBLE region … B94 split receiver`
+/// for the f64 one — and two reads produce TWO split receivers at once, which is
+/// what `ZIPP_NO_MULTI_SPLIT` governs.
+fn gen_split_body(g: &mut Gen) -> Vec<Stmt> {
+    let dbl = g.rng.chance(55);
+    let nreads = 1 + g.rng.below(2);
+    let mut out: Vec<Stmt> = Vec::new();
+
+    // An inner loop first, so the outer region carries a nested one — the
+    // enclosing region is where the receiver and the inner counter compete.
+    if g.rng.chance(25) {
+        let inner = if dbl {
+            vec![Stmt::Dbl { k: 0, op: g.rng.pick(&[0u8, 3]), a: Src::J, f: g.rng.below(6) as u8 }]
+        } else {
+            vec![Stmt::Int { op: IntOp::Add, a: Src::J, b: Src::I, n: 1 }]
+        };
+        out.push(Stmt::Loop { var: 'j', n: g.rng.pick(&[2u32, 3]), label: None, body: inner });
+    }
+    for r in 0..nreads {
+        let arr = if dbl {
+            g.rng.pick(&[Arr::F64, Arr::F64, Arr::Dbl, Arr::Dense, Arr::Dense2])
+        } else {
+            g.rng.pick(&[Arr::Dense, Arr::Dense, Arr::Dense2, Arr::I32, Arr::U8, Arr::Str])
+        };
+        // coerce 2 (`=== undefined`) and 3 (`Math.imul`) both decline the DOUBLE
+        // tier; on the int side they are fine and 3 is the fnv chain.
+        let coerce = if dbl { g.rng.pick(&[0u8, 0, 1]) } else { g.rng.pick(&[0u8, 0, 1, 3]) };
+        out.push(Stmt::Read { arr, idx: gen_idx(g), t: r as u8, coerce });
+    }
+    if dbl {
+        out.push(Stmt::Dbl {
+            k: 0,
+            op: g.rng.pick(&[0u8, 0, 1, 3]),
+            a: Src::Temp(0),
+            f: g.rng.below(6) as u8,
+        });
+        out.push(Stmt::DblMix { k: 0, style: g.rng.pick(&[0u8, 0, 2]) });
+    } else {
+        let op = g.rng.pick(&[IntOp::Add, IntOp::XorShl, IntOp::Imul, IntOp::Or, IntOp::Sub]);
+        out.push(Stmt::Int { op, a: Src::Temp(0), b: Src::I, n: g.rng.pick(&[1u8, 3, 5]) });
+    }
+    if g.rng.chance(25) {
+        let k = g.rng.below(2) as u8;
+        let st = gen_cond_def(g, k);
+        out.insert(0, st);
+    }
+    // The receiver's OTHER half: a store through the same array, which is what
+    // makes the split's write-through observable rather than merely planned.
+    if g.rng.chance(28) {
+        let arr = if dbl { Arr::F64 } else { Arr::Dense2 };
+        out.push(Stmt::Write { arr, idx: masked_idx(g), v: Src::H });
+    }
+    // One late type change, so the region actually DEOPTS inside the receiver
+    // window — the exit W16's `cold_pinned_recv` suite is about.
+    if g.rng.chance(22) {
+        let kind = g.rng.pick(&[
+            DeoptKind::ElemDouble,
+            DeoptKind::ElemStr,
+            DeoptKind::ArrShrink,
+            DeoptKind::TypedOob,
+        ]);
+        out.push(Stmt::Deopt { kind, at: gen_cond(g, 2), k: 0 });
+    }
+    out
+}
+
+/// Pick one local the body writes to leave OUT of the return mix. See
+/// `Program::dead_out`.
+///
+/// Never one a post-region use already names — that would make the post
+/// statement the only reader and leave the two axes fighting over one binding.
+fn gen_dead_out(g: &mut Gen, body: &[Stmt], post: &[Post]) -> Option<PostVal> {
+    let mut u = Used::default();
+    collect_stmts(body, &mut u);
+    let mut named = Used::default();
+    collect_post(post, &mut named);
+    let mut cands: Vec<PostVal> = Vec::new();
+    for k in 0..TEMPS {
+        if u.temps[k] && !named.temps[k] {
+            cands.push(PostVal::Temp(k as u8));
+        }
+    }
+    for k in 0..BOOLS {
+        if u.bools[k] && !named.bools[k] {
+            cands.push(PostVal::Bool(k as u8));
+        }
+    }
+    for k in 0..DBLS {
+        if u.dbls[k] && !named.dbls[k] {
+            cands.push(PostVal::Dbl(k as u8));
+        }
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    Some(cands[g.rng.below(cands.len())])
+}
+
+/// What happens to the loop's live-outs after it finishes. See [`Post`].
+///
+/// Values are drawn from what the BODY actually touched, so a probe always
+/// names something the region really carried — probing a binding the loop never
+/// wrote tests the declaration, not the allocator.
+fn gen_post(g: &mut Gen, body: &[Stmt]) -> Vec<Post> {
+    let mut u = Used::default();
+    collect_stmts(body, &mut u);
+    let mut vals: Vec<PostVal> = Vec::new();
+    for k in 0..TEMPS {
+        if u.temps[k] {
+            vals.push(PostVal::Temp(k as u8));
+        }
+    }
+    for k in 0..BOOLS {
+        if u.bools[k] {
+            vals.push(PostVal::Bool(k as u8));
+        }
+    }
+    for k in 0..DBLS {
+        if u.dbls[k] {
+            vals.push(PostVal::Dbl(k as u8));
+        }
+    }
+    for k in 0..GLOBS {
+        if u.globs[k] {
+            vals.push(PostVal::Glob(k as u8));
+        }
+    }
+    if u.up {
+        vals.push(PostVal::Up);
+    }
+    for (i, used) in u.arrs.iter().enumerate() {
+        if *used && Arr::all()[i] != Arr::Str {
+            vals.push(PostVal::Elem(Arr::all()[i], g.rng.pick(&[0u32, 3, 7, 31])));
+        }
+    }
+    vals.push(PostVal::H);
+
+    let n = 1 + g.rng.below(3);
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let v = vals[g.rng.below(vals.len())];
+        let dbl = match v {
+            PostVal::Dbl(k) => Some(k),
+            _ => None,
+        };
+        out.push(match g.rng.below(if dbl.is_some() { 7 } else { 6 }) {
+            0 | 1 => Post::TypeOf(v),
+            2 => Post::Identity(v),
+            3 => Post::Probe(v),
+            4 => Post::Escape(v),
+            5 => {
+                let mut picked: Vec<PostVal> = Vec::new();
+                for _ in 0..1 + g.rng.below(3) {
+                    picked.push(vals[g.rng.below(vals.len())]);
+                }
+                Post::Loop2 { n: g.rng.pick(&[12u32, 40, 120]), vals: picked }
+            }
+            _ => Post::DblShape(dbl.unwrap()),
+        });
+    }
+    out
+}
+
 fn gen_src(g: &mut Gen) -> Src {
     let mut pool: Vec<Src> = vec![
         Src::H,
@@ -749,6 +1388,21 @@ fn gen_cmp_src(g: &mut Gen) -> Src {
     g.rng.pick(&pool)
 }
 
+/// A write index that cannot GROW an ordinary Array without bound.
+///
+/// `Idx::Raw`/`Idx::Minus` over a temp is fine to READ with — an out-of-range
+/// read yields `undefined`, which is the point — but a STORE at
+/// `arr[1503238553]` sets `length` to 1.5 billion and the program's own checksum
+/// loop then never finishes. `gen_stmt` has always masked its writes for exactly
+/// this reason; the same rule is stated here once so the other body builders can
+/// share it.
+fn masked_idx(g: &mut Gen) -> Idx {
+    match gen_idx(g) {
+        Idx::Raw(s) | Idx::Minus(s, _) => Idx::Mask(s, 63),
+        other => other,
+    }
+}
+
 fn gen_idx(g: &mut Gen) -> Idx {
     let base = {
         let mut pool = vec![Src::I, Src::I, Src::H, Src::Hoist(g.rng.below(HOISTS) as u8)];
@@ -773,7 +1427,12 @@ fn gen_idx(g: &mut Gen) -> Idx {
 
 fn gen_cond(g: &mut Gen, kind: u8) -> Cond {
     // kind 0 = continue (may fire often), 1 = break, 2 = return / deopt (must
-    // fire LATE, past the OSR point, or the region never gets hot).
+    // fire LATE, past the OSR point, or the region never gets hot), 3 = NEVER
+    // (`i === 100000`, past every bound this generator emits) — the cold-block
+    // spelling, where the interpreter has no profile for the block at all.
+    if kind == 3 {
+        return Cond { src: Src::I, mask: 0, val: 100_000 };
+    }
     let src = match g.rng.below(if g.depth >= 1 { 4 } else { 3 }) {
         0 => Src::I,
         1 => Src::H,
@@ -791,6 +1450,15 @@ fn gen_cond(g: &mut Gen, kind: u8) -> Cond {
             }
         }
     }
+}
+
+/// `if (cond) { t{k} = v; }` — see [`Stmt::CondDef`]. Half the conditions
+/// NEVER fire (the cold-block spelling) and half fire LATE, past the OSR point,
+/// so the interpreter's profile for the block differs between the two.
+fn gen_cond_def(g: &mut Gen, k: u8) -> Stmt {
+    let kind = if g.rng.chance(50) { 3 } else { 2 };
+    let at = gen_cond(g, kind);
+    Stmt::CondDef { k, at, v: g.rng.pick(&[1i32, 2, 5, 7, 13, 0, -1]) }
 }
 
 fn gen_stmts(g: &mut Gen, count: usize) -> Vec<Stmt> {
@@ -820,6 +1488,9 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
         Flavor::Mixed => 18,
         Flavor::Pressure | Flavor::Scan => 24,
         Flavor::Sroa => 10,
+        // Never consulted — these two build their whole body themselves, the
+        // same way `Flavor::Scan` does — but the match has to be exhaustive.
+        Flavor::DblScan | Flavor::Split => 0,
     };
     let w_bool = match g.flavor {
         Flavor::Int | Flavor::Bits => 20,
@@ -964,10 +1635,7 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
             } else {
                 // Writes always use a masked index so an array cannot grow
                 // without bound; reads deliberately may go out of range.
-                let idx = match gen_idx(g) {
-                    Idx::Raw(s) | Idx::Minus(s, _) => Idx::Mask(s, 63),
-                    other => other,
-                };
+                let idx = masked_idx(g);
                 Stmt::Write { arr, idx, v: gen_src(g) }
             }
         }
@@ -1028,6 +1696,10 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
             }
         }
         7 => {
+            if g.rng.chance(30) {
+                let k = g.rng.below(TEMPS) as u8;
+                return gen_cond_def(g, k);
+            }
             let kind = g.rng.pick(&[
                 DeoptKind::TempStr,
                 DeoptKind::TempUndef,
@@ -1138,6 +1810,10 @@ struct Used {
     fnref: bool,
     rec: bool,
     sroa: bool,
+    /// `probe(x)` — the post-region call-boundary check.
+    probe: bool,
+    /// `w`, the second region's counter.
+    loop2: bool,
     labels: Vec<u32>,
 }
 
@@ -1159,6 +1835,8 @@ impl Used {
             fnref: true,
             rec: true,
             sroa: true,
+            probe: true,
+            loop2: false,
             labels: Vec::new(),
         }
     }
@@ -1167,6 +1845,7 @@ impl Used {
             Src::Hoist(k) => self.hoists[k as usize] = true,
             Src::Temp(k) => self.temps[k as usize] = true,
             Src::Glob(k) => self.globs[k as usize] = true,
+            Src::Dbl(k) => self.dbls[k as usize] = true,
             Src::Up => self.up = true,
             Src::ALen => self.arrs[Arr::Dense.ix()] = true,
             _ => {}
@@ -1201,16 +1880,56 @@ fn collect(prog: &Program) -> Used {
     if !prog.trim {
         let mut u = Used::everything();
         collect_labels(&prog.body, &mut u.labels);
+        // Even with nothing trimmed, these two are OFF unless a post-region use
+        // asks for them: `probe`/`w` are not part of the kernel's frame and
+        // declaring them unused would only add noise to a minimized case.
+        u.probe = false;
+        collect_post(&prog.post, &mut u);
         return u;
     }
     let mut u = Used::default();
     collect_stmts(&prog.body, &mut u);
+    collect_post(&prog.post, &mut u);
     collect_labels(&prog.body, &mut u.labels);
     if let Bound::ArrLen(a) = prog.bound {
         u.arrs[a.ix()] = true;
     }
     u.close(prog);
     u
+}
+
+/// Post-region uses name bindings too, and `Escape` needs `arr2` whether the
+/// body used it or not.
+fn collect_post(ps: &[Post], u: &mut Used) {
+    let val = |u: &mut Used, v: PostVal| match v {
+        PostVal::Temp(k) => u.temps[k as usize] = true,
+        PostVal::Bool(k) => u.bools[k as usize] = true,
+        PostVal::Dbl(k) => u.dbls[k as usize] = true,
+        PostVal::Glob(k) => u.globs[k as usize] = true,
+        PostVal::Up => u.up = true,
+        PostVal::Elem(a, _) => u.arrs[a.ix()] = true,
+        PostVal::H => {}
+    };
+    for p in ps {
+        match p {
+            Post::TypeOf(v) | Post::Identity(v) => val(u, *v),
+            Post::DblShape(k) => u.dbls[*k as usize] = true,
+            Post::Probe(v) => {
+                u.probe = true;
+                val(u, *v);
+            }
+            Post::Escape(v) => {
+                u.arrs[Arr::Dense2.ix()] = true;
+                val(u, *v);
+            }
+            Post::Loop2 { vals, .. } => {
+                u.loop2 = true;
+                for v in vals {
+                    val(u, *v);
+                }
+            }
+        }
+    }
 }
 
 fn collect_labels(ss: &[Stmt], out: &mut Vec<u32>) {
@@ -1314,6 +2033,10 @@ fn collect_stmts(ss: &[Stmt], u: &mut Used) {
                     }
                 }
             }
+            Stmt::CondDef { k, at, .. } => {
+                u.temps[*k as usize] = true;
+                u.src(at.src);
+            }
             Stmt::Rec { a } => {
                 u.rec = true;
                 u.src(*a);
@@ -1333,14 +2056,43 @@ fn collect_stmts(ss: &[Stmt], u: &mut Used) {
 
 // ─────────────────────────────── emitter ───────────────────────────────
 
-fn s_txt(p: &str, s: Src) -> String {
+/// Name prefixes, plus the scope they belong to.
+///
+/// `g` prefixes every module-level binding so many programs can share one file
+/// — that is how the node oracle batches them. `l` prefixes the KERNEL's own
+/// names: empty under [`Scope::Kernel`], where `h`/`i`/`t0`/`b0` really are
+/// function locals and cannot collide with anything, and equal to `g` under
+/// [`Scope::Script`], where the kernel IS the script and its "locals" are
+/// globals like every other binding.
+///
+/// `script` is that scope, which the statement emitter needs for one reason:
+/// `return` is a SyntaxError at top level, so [`Stmt::Ret`] spells itself
+/// `break` there.
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    g: &'a str,
+    l: &'a str,
+    script: bool,
+}
+
+impl std::fmt::Display for Ctx<'_> {
+    /// The GLOBAL prefix — so every `format!("{p}arr")` in this file keeps
+    /// reading exactly as it did before a local prefix existed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.g)
+    }
+}
+
+fn s_txt(p: &Ctx, s: Src) -> String {
+    let l = p.l;
     match s {
-        Src::H => "h".into(),
-        Src::I => "i".into(),
-        Src::J => "j".into(),
-        Src::Q => "q".into(),
-        Src::Hoist(k) => format!("c{k}"),
-        Src::Temp(k) => format!("(t{k} | 0)"),
+        Src::H => format!("{l}h"),
+        Src::I => format!("{l}i"),
+        Src::J => format!("{l}j"),
+        Src::Q => format!("{l}q"),
+        Src::Hoist(k) => format!("{l}c{k}"),
+        Src::Temp(k) => format!("({l}t{k} | 0)"),
+        Src::Dbl(k) => format!("{l}d{k}"),
         Src::Glob(k) => format!("{p}g{k}"),
         Src::Up => format!("{p}up"),
         Src::ALen => format!("{p}arr.length"),
@@ -1348,7 +2100,7 @@ fn s_txt(p: &str, s: Src) -> String {
     }
 }
 
-fn idx_txt(p: &str, i: Idx) -> String {
+fn idx_txt(p: &Ctx, i: Idx) -> String {
     match i {
         Idx::Mask(s, m) => format!("({} & {})", s_txt(p, s), m),
         Idx::Mod(s, m) => format!("({} % {})", s_txt(p, s), m),
@@ -1358,7 +2110,7 @@ fn idx_txt(p: &str, i: Idx) -> String {
     }
 }
 
-fn cmp_txt(p: &str, a: Src, b: Src, cmp: Cmp, neg: bool) -> String {
+fn cmp_txt(p: &Ctx, a: Src, b: Src, cmp: Cmp, neg: bool) -> String {
     let (op, nop) = match cmp {
         Cmp::Lt => ("<", ">="),
         Cmp::Le => ("<=", ">"),
@@ -1380,7 +2132,7 @@ fn cmp_txt(p: &str, a: Src, b: Src, cmp: Cmp, neg: bool) -> String {
     }
 }
 
-fn cond_txt(p: &str, c: Cond) -> String {
+fn cond_txt(p: &Ctx, c: Cond) -> String {
     if c.mask == 0 {
         format!("{} === {}", s_txt(p, c.src), c.val)
     } else {
@@ -1396,57 +2148,60 @@ fn line(o: &mut String, ind: usize, s: &str) {
     o.push('\n');
 }
 
-fn emit_stmt(o: &mut String, ind: usize, p: &str, st: &Stmt) {
+fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
+    let l = p.l;
     match st {
         Stmt::Int { op, a, b, n } => {
             let a = s_txt(p, *a);
             let b = s_txt(p, *b);
             let s = match op {
-                IntOp::Add => format!("h = (h + {a}) | 0;"),
-                IntOp::AddInt => format!("h = (h + {n}) | 0;"),
-                IntOp::Sub => format!("h = (h - {a}) | 0;"),
-                IntOp::Mul => format!("h = (h * {a}) | 0;"),
-                IntOp::Imul => format!("h = Math.imul(h, {a}) | 0;"),
-                IntOp::XorShl => format!("h = (h ^ ({a} << {n})) | 0;"),
-                IntOp::XorShr => format!("h = (h ^ ({a} >>> {n})) | 0;"),
-                IntOp::XorSar => format!("h = (h ^ ({a} >> {n})) | 0;"),
-                IntOp::Or => format!("h = (h | {a}) | 0;"),
-                IntOp::And => format!("h = (h & {a}) | 0;"),
-                IntOp::Div => format!("h = (h / {a}) | 0;"),
-                IntOp::Mod => format!("h = (h % {a}) | 0;"),
-                IntOp::Ternary => format!("h = ({a} < {b} ? h + {n} : h - {n}) | 0;"),
-                IntOp::Clz => format!("h = (h ^ Math.clz32({a})) | 0;"),
-                IntOp::MinMax => format!("h = (h + Math.max({a}, Math.min({b}, {n}))) | 0;"),
-                IntOp::AddRaw => format!("h = h + {a};"),
-                IntOp::SubRaw => format!("h = h - {a};"),
-                IntOp::IncRaw => format!("h += {n};"),
+                IntOp::Add => format!("{l}h = ({l}h + {a}) | 0;"),
+                IntOp::AddInt => format!("{l}h = ({l}h + {n}) | 0;"),
+                IntOp::Sub => format!("{l}h = ({l}h - {a}) | 0;"),
+                IntOp::Mul => format!("{l}h = ({l}h * {a}) | 0;"),
+                IntOp::Imul => format!("{l}h = Math.imul({l}h, {a}) | 0;"),
+                IntOp::XorShl => format!("{l}h = ({l}h ^ ({a} << {n})) | 0;"),
+                IntOp::XorShr => format!("{l}h = ({l}h ^ ({a} >>> {n})) | 0;"),
+                IntOp::XorSar => format!("{l}h = ({l}h ^ ({a} >> {n})) | 0;"),
+                IntOp::Or => format!("{l}h = ({l}h | {a}) | 0;"),
+                IntOp::And => format!("{l}h = ({l}h & {a}) | 0;"),
+                IntOp::Div => format!("{l}h = ({l}h / {a}) | 0;"),
+                IntOp::Mod => format!("{l}h = ({l}h % {a}) | 0;"),
+                IntOp::Ternary => format!("{l}h = ({a} < {b} ? {l}h + {n} : {l}h - {n}) | 0;"),
+                IntOp::Clz => format!("{l}h = ({l}h ^ Math.clz32({a})) | 0;"),
+                IntOp::MinMax => {
+                    format!("{l}h = ({l}h + Math.max({a}, Math.min({b}, {n}))) | 0;")
+                }
+                IntOp::AddRaw => format!("{l}h = {l}h + {a};"),
+                IntOp::SubRaw => format!("{l}h = {l}h - {a};"),
+                IntOp::IncRaw => format!("{l}h += {n};"),
             };
             line(o, ind, &s);
         }
         Stmt::BoolDef { k, a, b, cmp, neg } => {
-            line(o, ind, &format!("b{k} = {};", cmp_txt(p, *a, *b, *cmp, *neg)));
+            line(o, ind, &format!("{l}b{k} = {};", cmp_txt(p, *a, *b, *cmp, *neg)));
         }
         Stmt::BoolUse { k, c, style } => {
             let s = match style {
-                0 => format!("if (b{k}) h = (h + {c}) | 0;"),
-                1 => format!("h = (h + (b{k} ? {c} : 1)) | 0;"),
-                _ => format!("h = (h ^ (b{k} ? {c} : 0)) | 0;"),
+                0 => format!("if ({l}b{k}) {l}h = ({l}h + {c}) | 0;"),
+                1 => format!("{l}h = ({l}h + ({l}b{k} ? {c} : 1)) | 0;"),
+                _ => format!("{l}h = ({l}h ^ ({l}b{k} ? {c} : 0)) | 0;"),
             };
             line(o, ind, &s);
         }
         Stmt::Read { arr, idx, t, coerce } => {
             let ix = idx_txt(p, *idx);
             let load = if *arr == Arr::Str {
-                format!("t{t} = {p}str.charCodeAt({ix});")
+                format!("{l}t{t} = {p}str.charCodeAt({ix});")
             } else {
-                format!("t{t} = {p}{}[{ix}];", arr.name())
+                format!("{l}t{t} = {p}{}[{ix}];", arr.name())
             };
             line(o, ind, &load);
             let s = match coerce {
-                0 => format!("h = (h + (t{t} | 0)) | 0;"),
-                1 => format!("h = (h ^ ((t{t} * 1024) | 0)) | 0;"),
-                2 => format!("h = (h + (t{t} === undefined ? 17 : (t{t} | 0))) | 0;"),
-                _ => format!("h = Math.imul(h ^ (t{t} | 0), 16777619) | 0;"),
+                0 => format!("{l}h = ({l}h + ({l}t{t} | 0)) | 0;"),
+                1 => format!("{l}h = ({l}h ^ (({l}t{t} * 1024) | 0)) | 0;"),
+                2 => format!("{l}h = ({l}h + ({l}t{t} === undefined ? 17 : ({l}t{t} | 0))) | 0;"),
+                _ => format!("{l}h = Math.imul({l}h ^ ({l}t{t} | 0), 16777619) | 0;"),
             };
             line(o, ind, &s);
         }
@@ -1461,7 +2216,7 @@ fn emit_stmt(o: &mut String, ind: usize, p: &str, st: &Stmt) {
             line(o, ind, &s);
         }
         Stmt::ALen { arr } => {
-            line(o, ind, &format!("h = (h + {p}{}.length) | 0;", arr.name()));
+            line(o, ind, &format!("{l}h = ({l}h + {p}{}.length) | 0;", arr.name()));
         }
         Stmt::If { a, b, cmp, neg, then_, else_ } => {
             line(o, ind, &format!("if ({}) {{", cmp_txt(p, *a, *b, *cmp, *neg)));
@@ -1475,65 +2230,74 @@ fn emit_stmt(o: &mut String, ind: usize, p: &str, st: &Stmt) {
             }
         }
         Stmt::Loop { var, n, label, body } => {
-            let lbl = label.map(|l| format!("L{l}: ")).unwrap_or_default();
-            line(o, ind, &format!("{lbl}for ({var} = 0; {var} < {n}; {var}++) {{"));
+            let lbl = label.map(|x| format!("L{x}: ")).unwrap_or_default();
+            line(o, ind, &format!("{lbl}for ({l}{var} = 0; {l}{var} < {n}; {l}{var}++) {{"));
             emit_stmts(o, ind + 2, p, body);
             line(o, ind, "}");
         }
         Stmt::Break { label, at } => {
-            let l = label.map(|l| format!(" L{l}")).unwrap_or_default();
-            line(o, ind, &format!("if ({}) break{l};", cond_txt(p, *at)));
+            let lb = label.map(|x| format!(" L{x}")).unwrap_or_default();
+            line(o, ind, &format!("if ({}) break{lb};", cond_txt(p, *at)));
         }
         Stmt::Continue { label, at } => {
-            let l = label.map(|l| format!(" L{l}")).unwrap_or_default();
-            line(o, ind, &format!("if ({}) continue{l};", cond_txt(p, *at)));
+            let lb = label.map(|x| format!(" L{x}")).unwrap_or_default();
+            line(o, ind, &format!("if ({}) continue{lb};", cond_txt(p, *at)));
         }
         Stmt::Ret { at } => {
-            line(o, ind, &format!("if ({}) return h | 0;", cond_txt(p, *at)));
+            // `return` is a SyntaxError at script scope. `break` is the nearest
+            // legal spelling; it leaves the innermost loop rather than the whole
+            // kernel, which is a DIFFERENT program — but a deterministic one,
+            // and determinism is the only property this file needs of it.
+            let s = if p.script {
+                format!("if ({}) break;", cond_txt(p, *at))
+            } else {
+                format!("if ({}) return {l}h | 0;", cond_txt(p, *at))
+            };
+            line(o, ind, &s);
         }
         Stmt::Leaf { f, a, b } => {
             line(
                 o,
                 ind,
-                &format!("h = (h + {p}leaf{f}({}, {})) | 0;", s_txt(p, *a), s_txt(p, *b)),
+                &format!("{l}h = ({l}h + {p}leaf{f}({}, {})) | 0;", s_txt(p, *a), s_txt(p, *b)),
             );
         }
         Stmt::Deep { a } => {
-            line(o, ind, &format!("h = (h + {p}deep({})) | 0;", s_txt(p, *a)));
+            line(o, ind, &format!("{l}h = ({l}h + {p}deep({})) | 0;", s_txt(p, *a)));
         }
         Stmt::Closure { a } => {
-            line(o, ind, &format!("h = (h + {p}cl({})) | 0;", s_txt(p, *a)));
+            line(o, ind, &format!("{l}h = ({l}h + {p}cl({})) | 0;", s_txt(p, *a)));
         }
         Stmt::Indirect { a } => {
-            line(o, ind, &format!("h = (h + {p}fnref({}, 3)) | 0;", s_txt(p, *a)));
+            line(o, ind, &format!("{l}h = ({l}h + {p}fnref({}, 3)) | 0;", s_txt(p, *a)));
         }
         Stmt::GlobRw { k, a, write } => {
             if *write {
                 line(o, ind, &format!("{p}g{k} = ({p}g{k} + {}) | 0;", s_txt(p, *a)));
             }
-            line(o, ind, &format!("h = (h ^ ({p}g{k} | 0)) | 0;"));
+            line(o, ind, &format!("{l}h = ({l}h ^ ({p}g{k} | 0)) | 0;"));
         }
         Stmt::UpRw { a } => {
             line(o, ind, &format!("{p}up = ({p}up + {}) | 0;", s_txt(p, *a)));
-            line(o, ind, &format!("h = (h ^ {p}up) | 0;"));
+            line(o, ind, &format!("{l}h = ({l}h ^ {p}up) | 0;"));
         }
         Stmt::Dbl { k, op, a, f } => {
             let fv = ["0.5", "1.5", "0.25", "3.5", "1.0009765625", "-0.75"][*f as usize % 6];
             let a = s_txt(p, *a);
             let s = match op {
-                0 => format!("d{k} = d{k} * 0.5 + {a};"),
-                1 => format!("d{k} = {a} * {fv};"),
-                2 => format!("d{k} = Math.sqrt(Math.abs(d{k})) + {fv};"),
-                3 => format!("d{k} = d{k} / 3 + {a};"),
-                _ => format!("d{k} = Math.fround(d{k} * 0.5 + {fv});"),
+                0 => format!("{l}d{k} = {l}d{k} * 0.5 + {a};"),
+                1 => format!("{l}d{k} = {a} * {fv};"),
+                2 => format!("{l}d{k} = Math.sqrt(Math.abs({l}d{k})) + {fv};"),
+                3 => format!("{l}d{k} = {l}d{k} / 3 + {a};"),
+                _ => format!("{l}d{k} = Math.fround({l}d{k} * 0.5 + {fv});"),
             };
             line(o, ind, &s);
         }
         Stmt::DblMix { k, style } => {
             let s = match style {
-                0 => format!("h = (h + ((d{k} * 1024) | 0)) | 0;"),
-                1 => format!("h = (h ^ (Math.floor(d{k}) | 0)) | 0;"),
-                _ => format!("h = (h + (d{k} > 100 ? 7 : 3)) | 0;"),
+                0 => format!("{l}h = ({l}h + (({l}d{k} * 1024) | 0)) | 0;"),
+                1 => format!("{l}h = ({l}h ^ (Math.floor({l}d{k}) | 0)) | 0;"),
+                _ => format!("{l}h = ({l}h + ({l}d{k} > 100 ? 7 : 3)) | 0;"),
             };
             line(o, ind, &s);
         }
@@ -1541,18 +2305,18 @@ fn emit_stmt(o: &mut String, ind: usize, p: &str, st: &Stmt) {
             let sel = if *poly == 0 {
                 format!("{p}objs[0]")
             } else {
-                format!("{p}objs[(i & {poly})]")
+                format!("{p}objs[({l}i & {poly})]")
             };
             if *write {
-                line(o, ind, &format!("{sel}.f{k} = (h & 63);"));
+                line(o, ind, &format!("{sel}.f{k} = ({l}h & 63);"));
             }
-            line(o, ind, &format!("h = (h + ({sel}.f{k} | 0)) | 0;"));
+            line(o, ind, &format!("{l}h = ({l}h + ({sel}.f{k} | 0)) | 0;"));
         }
         Stmt::Deopt { kind, at, k } => {
             let body = match kind {
-                DeoptKind::TempStr => format!("t{k} = \"sx\";"),
-                DeoptKind::TempUndef => format!("t{k} = undefined;"),
-                DeoptKind::TempObj => format!("t{k} = {p}objs[0];"),
+                DeoptKind::TempStr => format!("{l}t{k} = \"sx\";"),
+                DeoptKind::TempUndef => format!("{l}t{k} = undefined;"),
+                DeoptKind::TempObj => format!("{l}t{k} = {p}objs[0];"),
                 DeoptKind::ElemDouble => format!("{p}arr[3] = 0.5;"),
                 DeoptKind::ElemStr => format!("{p}arr[5] = \"sx\";"),
                 DeoptKind::ElemDelete => format!("delete {p}arr[7];"),
@@ -1561,36 +2325,132 @@ fn emit_stmt(o: &mut String, ind: usize, p: &str, st: &Stmt) {
                 DeoptKind::GlobDouble => format!("{p}g{} = 1.5;", (*k as usize) % GLOBS),
                 DeoptKind::ObjExtend => format!("{p}objs[0].zz = 4;"),
                 DeoptKind::FnSwap => format!("{p}fnref = {p}leaf1;"),
-                DeoptKind::TypedOob => format!("t{k} = {p}iarr[9999];"),
+                DeoptKind::TypedOob => format!("{l}t{k} = {p}iarr[9999];"),
             };
             line(o, ind, &format!("if ({}) {{ {body} }}", cond_txt(p, *at)));
         }
+        Stmt::CondDef { k, at, v } => {
+            line(o, ind, &format!("if ({}) {{ {l}t{k} = {v}; }}", cond_txt(p, *at)));
+        }
         Stmt::Rec { a } => {
-            line(o, ind, &format!("h = (h + {p}rec((({}) & 7) + 2)) | 0;", s_txt(p, *a)));
+            line(o, ind, &format!("{l}h = ({l}h + {p}rec((({}) & 7) + 2)) | 0;", s_txt(p, *a)));
         }
         Stmt::Sroa { f, op, a } => {
             let fld = ["x", "y", "z"][*f as usize % 3];
             let txt = match op {
                 0 => format!("{p}so.{fld} = ({p}so.{fld} + {}) | 0;", s_txt(p, *a)),
                 1 => format!("{p}so.{fld} = ({p}so.{fld} ^ {}) | 0;", s_txt(p, *a)),
-                _ => format!("h = (h + {p}so.{fld}) | 0;"),
+                _ => format!("{l}h = ({l}h + {p}so.{fld}) | 0;"),
             };
             line(o, ind, &txt);
         }
         Stmt::Try { a, body } => {
             line(o, ind, "try {");
-            line(o, ind + 2, &format!("h = (h + {p}thrower({})) | 0;", s_txt(p, *a)));
+            line(o, ind + 2, &format!("{l}h = ({l}h + {p}thrower({})) | 0;", s_txt(p, *a)));
             emit_stmts(o, ind + 2, p, body);
             line(o, ind, "} catch (e) {");
-            line(o, ind + 2, "h = (h + 1) | 0;");
+            line(o, ind + 2, &format!("{l}h = ({l}h + 1) | 0;"));
             line(o, ind, "}");
         }
     }
 }
 
-fn emit_stmts(o: &mut String, ind: usize, p: &str, ss: &[Stmt]) {
+fn emit_stmts(o: &mut String, ind: usize, p: &Ctx, ss: &[Stmt]) {
     for s in ss {
         emit_stmt(o, ind, p, s);
+    }
+}
+
+// ───────────────────────── post-region emission ─────────────────────────
+
+/// The value text for a post-region probe. Deliberately NOT wrapped in `| 0`:
+/// the whole point of this axis is a live-out's REPRESENTATION, and `| 0` is
+/// exactly the operator that erases it.
+fn pv_txt(p: &Ctx, v: PostVal) -> String {
+    let l = p.l;
+    match v {
+        PostVal::Temp(k) => format!("{l}t{k}"),
+        PostVal::Bool(k) => format!("{l}b{k}"),
+        PostVal::Dbl(k) => format!("{l}d{k}"),
+        PostVal::H => format!("{l}h"),
+        PostVal::Glob(k) => format!("{p}g{k}"),
+        PostVal::Up => format!("{p}up"),
+        PostVal::Elem(a, ix) => format!("{p}{}[{ix}]", a.name()),
+    }
+}
+
+/// Fold `v` into `h` as a NUMBER — ordinary traffic, so the second region
+/// carries real work as well as probes.
+fn pv_num(p: &Ctx, v: PostVal) -> String {
+    let t = pv_txt(p, v);
+    match v {
+        PostVal::Bool(_) => format!("({t} ? 3 : 5)"),
+        PostVal::Dbl(_) => format!("(({t} * 4) | 0)"),
+        _ => format!("({t} | 0)"),
+    }
+}
+
+/// `typeof x` as a small int. Exhaustive over the six results `typeof` can
+/// give for a value these programs can hold, so the last arm is unreachable
+/// rather than a catch-all bucket.
+fn typeof_code(x: &str) -> String {
+    format!(
+        "(typeof {x} === \"number\" ? 2 : typeof {x} === \"boolean\" ? 3 : typeof {x} === \"string\" ? 5 : typeof {x} === \"undefined\" ? 7 : typeof {x} === \"object\" ? 11 : 13)"
+    )
+}
+
+fn emit_post(o: &mut String, ind: usize, p: &Ctx, ps: &[Post]) {
+    let l = p.l;
+    for st in ps {
+        match st {
+            Post::TypeOf(v) => {
+                let x = pv_txt(p, *v);
+                line(o, ind, &format!("{l}h = ({l}h + {}) | 0;", typeof_code(&x)));
+            }
+            Post::Identity(v) => {
+                let x = pv_txt(p, *v);
+                line(
+                    o,
+                    ind,
+                    &format!(
+                        "{l}h = ({l}h + ({x} === true ? 3 : {x} === false ? 5 : {x} === 0 ? 7 : {x} === undefined ? 11 : 13)) | 0;"
+                    ),
+                );
+            }
+            Post::DblShape(k) => {
+                // The two f64 facts `| 0` throws away: NaN-ness, and the sign of
+                // zero. A raw f64 home that reached the frame slot uncooked
+                // shows up in the first; a `-0` a compiled body normalised to
+                // `0` shows up in the second.
+                line(
+                    o,
+                    ind,
+                    &format!(
+                        "{l}h = ({l}h + ({l}d{k} === {l}d{k} ? 1 : 2) + ((1 / {l}d{k}) < 0 ? 4 : 8)) | 0;"
+                    ),
+                );
+            }
+            Post::Probe(v) => {
+                line(o, ind, &format!("{l}h = ({l}h + {p}probe({})) | 0;", pv_txt(p, *v)));
+            }
+            Post::Escape(v) => {
+                let x = pv_txt(p, *v);
+                line(o, ind, &format!("{p}arr2[5] = {x};"));
+                line(o, ind, &format!("{l}h = ({l}h + ({p}arr2[5] === {x} ? 1 : 2)) | 0;"));
+            }
+            Post::Loop2 { n, vals } => {
+                // A SECOND compiled region whose live-INS are the first
+                // region's live-OUTs. Nothing else in this file asks a value to
+                // survive from one region into another.
+                line(o, ind, &format!("for ({l}w = 0; {l}w < {n}; {l}w++) {{"));
+                let mut terms = vec![format!("{l}h")];
+                for v in vals {
+                    terms.push(pv_num(p, *v));
+                }
+                line(o, ind + 2, &format!("{l}h = ({}) | 0;", terms.join(" + ")));
+                line(o, ind, "}");
+            }
+        }
     }
 }
 
@@ -1600,7 +2460,7 @@ fn int_list(n: usize, f: impl Fn(usize) -> i64) -> String {
     (0..n).map(|i| f(i).to_string()).collect::<Vec<_>>().join(", ")
 }
 
-fn emit_leaf(o: &mut String, p: &str, k: usize, kind: u8) {
+fn emit_leaf(o: &mut String, p: &Ctx, k: usize, kind: u8) {
     let body = match kind {
         0 => "return (a + b * 3) | 0;".to_string(),
         1 => "return Math.imul(a ^ b, 5) | 0;".to_string(),
@@ -1612,10 +2472,22 @@ fn emit_leaf(o: &mut String, p: &str, k: usize, kind: u8) {
     line(o, 0, &format!("function {p}leaf{k}(a, b) {{ {body} }}"));
 }
 
-/// Emit the whole program. `p` prefixes every module-level binding so many
+/// Emit the whole program. `gp` prefixes every module-level binding so many
 /// programs can share one file (that is how the node oracle batches them);
-/// nothing else about the text depends on it.
-fn emit(prog: &Program, p: &str, tag: &str) -> String {
+/// under [`Scope::Script`] it prefixes the kernel's own names too, because
+/// there they ARE module-level bindings.
+///
+/// `iife`: wrap a script-scope program in `(function () { … })()`. For the NODE
+/// oracle only, and value-preserving by construction — every binding a program
+/// touches is its own, so function scope and script scope compute the same
+/// number. It exists because the scope axis is aimed squarely at zipp's
+/// REGISTER ALLOCATOR (the bytecode compiler recycles a statement's temps at
+/// script scope and does not inside a function, which is the whole reason B94
+/// split receivers live there), and node's answer cannot depend on that.
+fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
+    let script = prog.scope == Scope::Script;
+    let p = &Ctx { g: gp, l: if script { gp } else { "" }, script };
+    let l = p.l;
     let u = collect(prog);
     let mut o = String::new();
 
@@ -1716,12 +2588,27 @@ fn emit(prog: &Program, p: &str, tag: &str) -> String {
         line(&mut o, 0, &format!("var {p}so = {{ x: 1, y: 2, z: 3 }};"));
     }
     if u.rec {
+        // NOT one `| 0` in here, on purpose. Tier A (`fn_int::can_compile`)
+        // admits LoadInt / Move / AddInt / Add / Sub / Mul / Mod / compares /
+        // jumps / Return and the self-call, and NOTHING else — a single
+        // `Bitwise` op puts the whole function on Tier C instead. The `| 0`
+        // spelling this shape used to carry is why `[jit] Tier A … compiled`
+        // never appeared for a generated program, and `tier_a_is_reached` now
+        // pins that it does. Still exact: the call site masks `x` into [2, 9],
+        // so every value here is a small integer.
         line(
             &mut o,
             0,
             &format!(
-                "function {p}rec(x) {{ if (x < 2) return x | 0; return ({p}rec(x - 1) + {p}rec(x - 2)) | 0; }}"
+                "function {p}rec(x) {{ if (x < 2) return x; return {p}rec(x - 1) + {p}rec(x - 2); }}"
             ),
+        );
+    }
+    if u.probe {
+        line(
+            &mut o,
+            0,
+            &format!("function {p}probe(x) {{ return {} | 0; }}", typeof_code("x")),
         );
     }
     if u.thrower {
@@ -1734,7 +2621,189 @@ fn emit(prog: &Program, p: &str, tag: &str) -> String {
         );
     }
 
-    // ── up / cl / kernel: module level, or nested inside main (upvalues) ──
+    // ── the kernel's own bindings ── declared once; re-initialised per
+    // repetition, which under `Scope::Kernel` is what a fresh call frame does
+    // for free and under `Scope::Script` has to be written out.
+    let mut decls = String::new();
+    let mut init = String::new();
+    {
+        let d = &mut decls;
+        let z = &mut init;
+        line(d, 0, &format!("var {l}h = 1, {l}i = 0, {l}j = 0, {l}q = 0;"));
+        line(z, 0, &format!("{l}h = 1; {l}i = 0; {l}j = 0; {l}q = 0;"));
+        if u.loop2 {
+            line(d, 0, &format!("var {l}w = 0;"));
+        }
+        for k in 0..TEMPS {
+            if u.temps[k] {
+                line(d, 0, &format!("var {l}t{k} = {};", k + 1));
+                line(z, 0, &format!("{l}t{k} = {};", k + 1));
+            }
+        }
+        for k in 0..BOOLS {
+            if u.bools[k] {
+                line(d, 0, &format!("var {l}b{k} = false;"));
+                line(z, 0, &format!("{l}b{k} = false;"));
+            }
+        }
+        for k in 0..DBLS {
+            if u.dbls[k] {
+                line(d, 0, &format!("var {l}d{k} = {}.5;", k + 1));
+                line(z, 0, &format!("{l}d{k} = {}.5;", k + 1));
+            }
+        }
+        for k in 0..HOISTS {
+            if u.hoists[k] {
+                line(d, 0, &format!("var {l}c{k} = {};", prog.hoists[k]));
+            }
+        }
+    }
+
+    // ── the kernel body: the hot loop, then the post-region uses ──
+    let bound_txt = match prog.bound {
+        Bound::N => {
+            if script {
+                prog.n.to_string()
+            } else {
+                "n".to_string()
+            }
+        }
+        Bound::ArrLen(a) => format!("{p}{}.length", a.name()),
+    };
+    let mut body = String::new();
+    line(&mut body, 0, &format!("for ({l}i = 0; {l}i < {bound_txt}; {l}i++) {{"));
+    emit_stmts(&mut body, 2, p, &prog.body);
+    line(&mut body, 0, "}");
+    emit_post(&mut body, 0, p, &prog.post);
+
+    // Mix every live local into the answer, so a wrong value anywhere in the
+    // frame is visible and not just a wrong `h`.
+    let dead = |v: PostVal| prog.dead_out == Some(v);
+    let mut mix = vec![format!("{l}h")];
+    for k in 0..TEMPS {
+        if u.temps[k] && !dead(PostVal::Temp(k as u8)) {
+            mix.push(format!("(({l}t{k} | 0) * {})", 3 + k));
+            // …and its REPRESENTATION, not only its int32 value. W16's
+            // `open_bool_local_reads_back_as_nan` is why: a Bool home that comes
+            // back as a raw `NaN` is FALSY, so the `(b ? 17 : 0)` term below
+            // reads it as an ordinary `false` and the digest never moves.
+            // `typeof` is the only spelling that separates them, and it is
+            // exactly specified for every value these programs can hold.
+            mix.push(format!("({} * {})", typeof_code(&format!("{l}t{k}")), 64 + k));
+        }
+    }
+    for k in 0..BOOLS {
+        if u.bools[k] && !dead(PostVal::Bool(k as u8)) {
+            mix.push(format!("({l}b{k} ? {} : 0)", 17 + k));
+            mix.push(format!("(typeof {l}b{k} === \"boolean\" ? 0 : {})", 1024 + k));
+        }
+    }
+    for k in 0..DBLS {
+        if u.dbls[k] && !dead(PostVal::Dbl(k as u8)) {
+            mix.push(format!("(({l}d{k} * 1024) | 0)"));
+            mix.push(format!("({l}d{k} === {l}d{k} ? 0 : {})", 2048 + k));
+            mix.push(format!("((1 / {l}d{k}) < 0 ? {} : 0)", 4096 + k));
+        }
+    }
+    if u.sroa {
+        mix.push(format!("({p}so.x | 0)"));
+        mix.push(format!("({p}so.y | 0)"));
+        mix.push(format!("({p}so.z | 0)"));
+    }
+    let mix = format!("({}) | 0", mix.join(" ^ "));
+
+    // ── the checksum over every mutable datum the body could have touched:
+    // side effects that never reach `h` still have to agree across tiers ──
+    let mut tail = vec![format!("{l}acc")];
+    let mut checksum = String::new();
+    if prog.checksum {
+        tail.push(format!("{l}s"));
+        line(&mut checksum, 0, &format!("var {l}s = 0;"));
+        for (zi, a) in Arr::all().into_iter().enumerate() {
+            if !u.arrs[a.ix()] || a == Arr::Str {
+                continue;
+            }
+            line(
+                &mut checksum,
+                0,
+                &format!(
+                    "for (var {l}z{zi} = 0; {l}z{zi} < {p}{n}.length; {l}z{zi}++) {l}s = (Math.imul({l}s, 31) + (({p}{n}[{l}z{zi}] * 1024) | 0)) | 0;",
+                    n = a.name()
+                ),
+            );
+        }
+        if u.objs {
+            line(
+                &mut checksum,
+                0,
+                &format!(
+                    "for (var {l}y = 0; {l}y < {p}objs.length; {l}y++) {l}s = (Math.imul({l}s, 31) + ({p}objs[{l}y].f0 | 0) + ({p}objs[{l}y].f1 | 0) + ({p}objs[{l}y].f2 | 0)) | 0;"
+                ),
+            );
+        }
+    }
+    for k in 0..GLOBS {
+        if u.globs[k] {
+            tail.push(format!("({p}g{k} | 0)"));
+        }
+    }
+    if u.up {
+        tail.push(format!("({p}up | 0)"));
+    }
+    let tail = tail.join(" ^ ");
+
+    if script {
+        // ── SCRIPT SCOPE ── the kernel IS the script, and its bindings are
+        // globals. That is a different register-allocation regime end to end:
+        // the bytecode compiler recycles a statement's temps here and does not
+        // inside a function, and a recycled PINNED RECEIVER is precisely what
+        // B94 splitting exists for. No `"use strict"` (a directive prologue has
+        // to be the first statement of the file, and the data declarations are)
+        // and no closure nesting.
+        let mut inner = String::new();
+        if u.up {
+            line(&mut inner, 0, &format!("var {p}up = 1;"));
+        }
+        if u.cl {
+            line(
+                &mut inner,
+                0,
+                &format!("function {p}cl(x) {{ {p}up = ({p}up + x) | 0; return {p}up & 1023; }}"),
+            );
+        }
+        inner.push_str(&decls);
+        line(&mut inner, 0, &format!("var {l}acc = 1;"));
+        line(&mut inner, 0, &format!("for (var {l}r = 0; {l}r < {}; {l}r++) {{", prog.reps));
+        for ln in init.lines() {
+            line(&mut inner, 2, ln);
+        }
+        for ln in body.lines() {
+            line(&mut inner, 2, ln);
+        }
+        line(&mut inner, 2, &format!("{l}acc = (Math.imul({l}acc, 31) + ({mix})) | 0;"));
+        line(&mut inner, 0, "}");
+        inner.push_str(&checksum);
+        line(
+            &mut inner,
+            0,
+            &format!(
+                "try {{ console.log(\"{tag} \" + (({tail}) >>> 0).toString(16)); }} catch (e) {{ console.log(\"{tag} E:\" + (e && e.constructor ? e.constructor.name : \"?\")); }}"
+            ),
+        );
+        if iife {
+            line(&mut o, 0, "(function () {");
+            for ln in inner.lines() {
+                line(&mut o, 2, ln);
+            }
+            line(&mut o, 0, "})();");
+        } else {
+            o.push_str(&inner);
+        }
+        return o;
+    }
+
+    // ── FUNCTION SCOPE ── up / cl / kernel: module level, or nested inside main
+    // (upvalues).
     let nested = prog.use_closure;
     let ind = if nested { 2 } else { 0 };
     let mut inner = String::new();
@@ -1752,59 +2821,13 @@ fn emit(prog: &Program, p: &str, tag: &str) -> String {
     if prog.strict {
         line(&mut inner, ind + 2, "\"use strict\";");
     }
-    line(&mut inner, ind + 2, "var h = 1, i = 0, j = 0, q = 0;");
-    for k in 0..TEMPS {
-        if u.temps[k] {
-            line(&mut inner, ind + 2, &format!("var t{k} = {};", k + 1));
-        }
+    for ln in decls.lines() {
+        line(&mut inner, ind + 2, ln);
     }
-    for k in 0..BOOLS {
-        if u.bools[k] {
-            line(&mut inner, ind + 2, &format!("var b{k} = false;"));
-        }
+    for ln in body.lines() {
+        line(&mut inner, ind + 2, ln);
     }
-    for k in 0..DBLS {
-        if u.dbls[k] {
-            line(&mut inner, ind + 2, &format!("var d{k} = {}.5;", k + 1));
-        }
-    }
-    for k in 0..HOISTS {
-        if u.hoists[k] {
-            line(&mut inner, ind + 2, &format!("var c{k} = {};", prog.hoists[k]));
-        }
-    }
-
-    let bound_txt = match prog.bound {
-        Bound::N => "n".to_string(),
-        Bound::ArrLen(a) => format!("{p}{}.length", a.name()),
-    };
-    line(&mut inner, ind + 2, &format!("for (i = 0; i < {bound_txt}; i++) {{"));
-    emit_stmts(&mut inner, ind + 4, p, &prog.body);
-    line(&mut inner, ind + 2, "}");
-    // Mix every live local into the answer, so a wrong value anywhere in the
-    // frame is visible and not just a wrong `h`.
-    let mut mix = vec!["h".to_string()];
-    for k in 0..TEMPS {
-        if u.temps[k] {
-            mix.push(format!("((t{k} | 0) * {})", 3 + k));
-        }
-    }
-    for k in 0..BOOLS {
-        if u.bools[k] {
-            mix.push(format!("(b{k} ? {} : 0)", 17 + k));
-        }
-    }
-    for k in 0..DBLS {
-        if u.dbls[k] {
-            mix.push(format!("((d{k} * 1024) | 0)"));
-        }
-    }
-    if u.sroa {
-        mix.push(format!("({p}so.x | 0)"));
-        mix.push(format!("({p}so.y | 0)"));
-        mix.push(format!("({p}so.z | 0)"));
-    }
-    line(&mut inner, ind + 2, &format!("return ({}) | 0;", mix.join(" ^ ")));
+    line(&mut inner, ind + 2, &format!("return {mix};"));
     line(&mut inner, ind, "}");
 
     // ── main ──
@@ -1821,44 +2844,10 @@ fn emit(prog: &Program, p: &str, tag: &str) -> String {
             prog.reps, prog.n
         ),
     );
-    // A checksum over every mutable datum the body could have touched: side
-    // effects that never reach `h` still have to agree across tiers.
-    let mut tail = vec!["acc".to_string()];
-    if prog.checksum {
-        tail.push("s".to_string());
-        line(&mut o, 2, "var s = 0;");
-        for (zi, a) in Arr::all().into_iter().enumerate() {
-            if !u.arrs[a.ix()] || a == Arr::Str {
-                continue;
-            }
-            line(
-                &mut o,
-                2,
-                &format!(
-                    "for (var z{zi} = 0; z{zi} < {p}{n}.length; z{zi}++) s = (Math.imul(s, 31) + (({p}{n}[z{zi}] * 1024) | 0)) | 0;",
-                    n = a.name()
-                ),
-            );
-        }
-        if u.objs {
-            line(
-                &mut o,
-                2,
-                &format!(
-                    "for (var y = 0; y < {p}objs.length; y++) s = (Math.imul(s, 31) + ({p}objs[y].f0 | 0) + ({p}objs[y].f1 | 0) + ({p}objs[y].f2 | 0)) | 0;"
-                ),
-            );
-        }
+    for ln in checksum.lines() {
+        line(&mut o, 2, ln);
     }
-    for k in 0..GLOBS {
-        if u.globs[k] {
-            tail.push(format!("({p}g{k} | 0)"));
-        }
-    }
-    if u.up {
-        tail.push(format!("({p}up | 0)"));
-    }
-    line(&mut o, 2, &format!("return ({}) | 0;", tail.join(" ^ ")));
+    line(&mut o, 2, &format!("return ({tail}) | 0;"));
     line(&mut o, 0, "}");
     if !nested {
         o.push_str(&inner);
@@ -1898,7 +2887,7 @@ fn fuzz_child() {
             println!("<<<FUZZ");
             for i in lo..hi {
                 let prog = gen_program(prog_seed(seed, i), big);
-                let src = emit(&prog, "", &format!("D{i}"));
+                let src = emit(&prog, "", &format!("D{i}"), false);
                 println!("{}", run_digest(&src, &format!("D{i}")));
             }
             println!("FUZZ>>>");
@@ -1912,7 +2901,7 @@ fn fuzz_child() {
             let big = std::env::var_os("ZIPP_FUZZ_BIG").is_some();
             let prog = gen_program(prog_seed(seed, i), big);
             println!("<<<FUZZ");
-            print!("{}", emit(&prog, "", "D"));
+            print!("{}", emit(&prog, "", "D", false));
             println!("FUZZ>>>");
         }
         "file" => {
@@ -1970,11 +2959,15 @@ fn spawn_job(job: &str, m: &Mode, timeout: Duration, jitlog: bool) -> ChildOut {
         }
     }
     cmd.env_remove("ZIPP_JITLOG");
+    cmd.env_remove("ZIPP_JITDECLINE");
     for (k, v) in m.env {
         cmd.env(k, v);
     }
     if jitlog {
         cmd.env("ZIPP_JITLOG", "1");
+        // The two are one diagnostic: JITLOG says which tier took a region,
+        // JITDECLINE says why the faster ones did not.
+        cmd.env("ZIPP_JITDECLINE", "1");
     }
     if std::env::var_os("ZIPP_FUZZ_BIG").is_some() {
         cmd.env("ZIPP_FUZZ_BIG", "1");
@@ -2051,7 +3044,7 @@ fn batch_digests(seed: u64, lo: u64, hi: u64, m: &Mode, big: bool) -> BTreeMap<u
     map.clear();
     for i in lo..hi {
         let prog = gen_program(prog_seed(seed, i), big);
-        let src = emit(&prog, "", "D");
+        let src = emit(&prog, "", "D", false);
         map.insert(i, single_digest(&src, m));
     }
     map
@@ -2108,7 +3101,11 @@ fn tier_trace(src: &str) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
     for l in out.stderr.lines() {
         let l = l.trim();
-        if !l.starts_with("[jit]") && !l.starts_with("[leaf]") {
+        // `[decline-reason]` carries its own `fn=<name> [start,end]` prefix as of
+        // W17, so a decline in this trace names the region it belongs to and can
+        // be read beside the `[jit]` line for the tier that took it instead.
+        if !l.starts_with("[jit]") && !l.starts_with("[leaf]") && !l.starts_with("[decline-reason]")
+        {
             continue;
         }
         let key = match l.find("deopt at ip") {
@@ -2122,7 +3119,7 @@ fn tier_trace(src: &str) -> Vec<String> {
     }
     order
         .into_iter()
-        .take(14)
+        .take(18)
         .map(|k| {
             let n = seen[&k];
             if n > 1 {
@@ -2202,7 +3199,26 @@ fn shrink(prog: &Program, check: &mut impl FnMut(&Program) -> bool) -> Program {
             }
         }
 
-        // 3. loop bounds
+        // 3. post-region uses, deepest-last
+        loop {
+            let n = best.post.len();
+            let mut removed = false;
+            for k in (0..n).rev() {
+                let mut cand = best.clone();
+                cand.post.remove(k);
+                if check(&cand) {
+                    best = cand;
+                    removed = true;
+                    changed = true;
+                    break;
+                }
+            }
+            if !removed {
+                break;
+            }
+        }
+
+        // 4. loop bounds
         for &nn in &[400u32, 120, 40, 20, 12, 9] {
             if nn < best.n {
                 let mut cand = best.clone();
@@ -2231,7 +3247,7 @@ fn shrink(prog: &Program, check: &mut impl FnMut(&Program) -> bool) -> Program {
             }
         }
 
-        // 4. structural knobs
+        // 5. structural knobs
         if !matches!(best.bound, Bound::N) {
             let mut cand = best.clone();
             cand.bound = Bound::N;
@@ -2267,6 +3283,26 @@ fn shrink(prog: &Program, check: &mut impl FnMut(&Program) -> bool) -> Program {
         if !best.trim {
             let mut cand = best.clone();
             cand.trim = true;
+            if check(&cand) {
+                best = cand;
+                changed = true;
+            }
+        }
+        if best.dead_out.is_some() {
+            let mut cand = best.clone();
+            cand.dead_out = None;
+            if check(&cand) {
+                best = cand;
+                changed = true;
+            }
+        }
+        // A script-scope program reads worse than a function-scope one and its
+        // whole point is a DIFFERENT register allocation, so try the function
+        // spelling — but only accept it if the divergence survives, which for a
+        // split-receiver finding it will not.
+        if best.scope == Scope::Script {
+            let mut cand = best.clone();
+            cand.scope = Scope::Kernel;
             if check(&cand) {
                 best = cand;
                 changed = true;
@@ -2448,12 +3484,12 @@ fn sweep(
                 return false;
             }
             evals += 1;
-            let src = emit(p, "", "D");
+            let src = emit(p, "", "D", false);
             let da = single_digest(&src, a);
             let db = single_digest(&src, b);
             da != db
         };
-        let base_src = emit(&prog, "", "D");
+        let base_src = emit(&prog, "", "D", false);
         let mut minimal = prog.clone();
         if single_digest(&base_src, a) != single_digest(&base_src, b) {
             minimal = shrink(&prog, &mut check);
@@ -2462,7 +3498,7 @@ fn sweep(
                 "[fuzz] index {i}: NOT reproducible standalone — batch-order dependent, reporting unshrunk"
             );
         }
-        let src = emit(&minimal, "", "D");
+        let src = emit(&minimal, "", "D", false);
         let digests: Vec<(String, String)> = MODES
             .iter()
             .map(|m| (m.name.to_string(), single_digest(&src, m)))
@@ -2486,6 +3522,15 @@ fn sweep(
 /// divergence — compare the minimized case against the `open_*` specs before
 /// assuming otherwise.
 const KNOWN_OPEN: &[(u64, u64, &str)] = &[
+    // W17. `open_conditional_def_loses_its_entry_load` — a local whose only
+    // in-region def sits on a conditional branch loses its entry load, so every
+    // pass that skips the branch reads its home as garbage. The slice's copy is
+    // `if (i === 100000) { t0 = 5; }` ahead of `d1 = d1 * 0.5 + (t0 | 0)`; the
+    // spec carries the two-line hand-minimized version and the diagnosis.
+    // Reproduces at the committed HEAD 0ade520, so it is not a regression from
+    // anything in flight. ONE index of 640 — delete this line when the spec
+    // goes green, and treat any OTHER index as a new divergence.
+    (0x5A17_2026_0F1E_2D3C, 380, "open_conditional_def_loses_its_entry_load"),
     // (W16 closed the only entry this list ever held — index 392 of seed
     // 0x5A17…, the live-out `Bool` defect on the DOUBLE tier over a
     // double-element Array. Its four answers were one register: the tier's
@@ -2520,7 +3565,13 @@ fn tier_differential_ci_slice() {
     // flip, not a gate) and five at 500, which puts the slice's power against
     // that bug class at p ≈ 1 - e^-5. Five hundred programs across seven modes
     // is ~3s in the dev profile.
-    const COUNT: u64 = 500;
+    // W17 raised it from 500. The slice's power was calibrated in PROGRAMS, but
+    // what it is really calibrated in is INT REGIONS: the pool it draws flavors
+    // from grew from 14 entries to 22 (DOUBLE, split-receiver and INT-family
+    // shapes), so the INT family's share fell 57% -> 50% and INT regions per
+    // program fell with it, 686 -> 537 per 400. 500 * 686/537 = 639 restores the
+    // original absolute reach, and every new axis rides along at the same 28%.
+    const COUNT: u64 = 640;
     let modes = selected_modes(CI_MODES);
     let found: Vec<Divergence> = sweep(SEED, 0, COUNT, &modes, false, false)
         .into_iter()
@@ -2611,7 +3662,7 @@ fn node_oracle_slice() {
     let mut batch = String::new();
     for i in 0..count {
         let prog = gen_program(prog_seed(SEED, i), big);
-        batch.push_str(&emit(&prog, &format!("p{i}_"), &format!("D{i}")));
+        batch.push_str(&emit(&prog, &format!("p{i}_"), &format!("D{i}"), true));
     }
     let dir = std::env::temp_dir().join("zipp-jit-fuzz");
     let _ = std::fs::create_dir_all(&dir);
@@ -2643,7 +3694,7 @@ fn node_oracle_slice() {
             let prog = gen_program(prog_seed(SEED, i), big);
             bad.push(format!(
                 "\nindex {i}: node={theirs} zipp={mine}\n{}",
-                emit(&prog, "", "D")
+                emit(&prog, "", "D", false)
             ));
         }
     }
@@ -2924,6 +3975,121 @@ console.log(typeof kernel(20));
     assert_matches_node(SRC);
 }
 
+/// OPEN #6 (W17), found by the widened generator at seed 170013 index 45378 and
+/// minimized by hand to two lines. **Reproduces at the committed HEAD 0ade520**,
+/// so it is not something this wave's in-flight work introduced.
+///
+/// A local whose ONLY in-region definition sits on a CONDITIONAL branch loses
+/// its entry load, and the compiled body then reads its home as garbage on
+/// every pass that skips the branch:
+///
+/// ```text
+/// function k(n){var h=1,i=0,t=2;for(i=0;i<n;i++){if(i===3){t=7;}h=(h+t)|0;}return h;}
+/// k(40)  →  node and ZIPP_NOJIT=1: 266.  Compiled: 74.
+/// ```
+///
+/// 74 - 42 = 32 over the 32 native iterations, i.e. `t` reads as `1` where it
+/// holds 2 (before `i === 3`) and 7 (after). `ZIPP_NO_GPR_HOMES=1` answers 42 —
+/// a THIRD answer, so both register emitters are wrong, not one. No `ZIPP_NO_*`
+/// switch avoids it; only `ZIPP_NOJIT=1` and a threshold high enough that the
+/// loop never compiles.
+///
+/// The wrong number is not stable, which is the tell that this is a garbage READ
+/// and not a mis-computation: 74 from `zipp.exe js`, `-2013640406` from
+/// `zipp_vm::run` in this test binary, 264 when the same kernel is called a few
+/// times first. Whatever the home last held is what the loop adds.
+///
+/// THE ROOT CAUSE is one sentence, and `plan_region.rs` already contains it —
+/// about a different consumer. `first_seen[r] == true` means "the first
+/// OCCURRENCE of `r` inside the region is a def"; the entry-load and
+/// home-sharing decisions read it as "a def of `r` dominates every use of `r`".
+/// Those are different properties, and the file says so at the CONSTANT-HOISTING
+/// site: *"`first_seen == true` only says the first OCCURRENCE is a def — it
+/// says nothing about whether that def runs. Hoisting a constant whose def sits
+/// on an untaken branch is wrong twice over"*. That site guards itself with
+/// `runs_every_iteration`. `shareable()` and the `live_in_regs` /
+/// `(first_ip, last_ip)` range decision beside it do not:
+///
+/// ```text
+/// let shareable = |r: u16| -> bool {
+///     first_seen.get(&r) != Some(&false)        // ← "first mention is a def"
+///         && !hoisted.contains(&r)
+///         && (… read_outside …)
+/// };
+/// ```
+///
+/// In the bytecode above the region is `[5, 17]` and `t` is `r5`. Its first
+/// occurrence in the region is `LoadInt { dst: 5, val: 7 }` at ip 9 — a def, so
+/// `first_seen[r5] = true`, so `r5` is `shareable`, so it is dropped from
+/// `live_in_regs` and starts as garbage. But ip 9 sits behind the
+/// `JumpIfFalse` at ip 8: the path 5 → 8 → 11 reaches the USE at ip 11
+/// (`Add { dst: 14, a: 3, b: 5 }`) without ever running the def. This is the
+/// same shape as `hoisted_const_on_untaken_branch`, one consumer over.
+///
+/// WHY THE SUITE NEVER SAW IT, and why the generator only just did: reading `t`
+/// AFTER the loop makes the program answer correctly, because `read_outside`
+/// used to force a permanent home with an entry load. Every hand-written test
+/// and every one of the 13 benchmark rows reads its accumulators afterwards; so
+/// does this file's own return mix, which is why 138,300 W15-generator programs
+/// missed it. The generated case that finally hit it needed the extra step of a
+/// `Deopt` statement writing the temp inside a guard.
+///
+/// A SECOND FACE, on the working tree only: W17's `ZIPP_NO_GPR_WT_SHARE` lever
+/// makes `read_outside` registers shareable too (write-through instead of a
+/// pinned home), so the same defect now also reaches a local that IS read after
+/// the loop. `crates/zipp-vm/tests/…`-side note for whoever owns that lever:
+/// the seed-170013 case answers correctly under `ZIPP_NO_GPR_WT_SHARE=1` and
+/// wrongly by default, while the two-line case above is wrong either way. Same
+/// root cause; the lever widens its reach rather than causing it.
+///
+/// `#[ignore]`d because it is OPEN. `plan_region.rs`'s live-in/sharing region is
+/// owned by another lane this wave; un-ignore this when the dominance property
+/// replaces the first-mention one.
+#[test]
+#[ignore = "OPEN (W17): a conditional in-region def is treated as a dominating one"]
+fn open_conditional_def_loses_its_entry_load() {
+    if parent_guard() {
+        return;
+    }
+    const SRC: &str = r#"
+function kernel(n) {
+  var h = 1, i = 0, t = 2;
+  for (i = 0; i < n; i++) {
+    if (i === 3) { t = 7; }
+    h = (h + t) | 0;
+  }
+  return h;
+}
+console.log(kernel(40));
+"#;
+    assert_matches_node(SRC);
+}
+
+/// The same defect with the conditional def in a block the interpreter NEVER
+/// reaches — the cold-side-exit spelling, which is how the fuzzer found it.
+/// Kept separate because it is the one an engine author is likelier to reason
+/// about ("the block never runs, so nothing about it can matter") and because
+/// it is the one that survives every `ZIPP_NO_*` switch unchanged.
+#[test]
+#[ignore = "OPEN (W17): same defect, cold-block spelling"]
+fn open_cold_conditional_def_loses_its_entry_load() {
+    if parent_guard() {
+        return;
+    }
+    const SRC: &str = r#"
+function kernel(n) {
+  var h = 1, i = 0, t = 2;
+  for (i = 0; i < n; i++) {
+    if (i === 100000) { t = 7; }
+    h = (h + t) | 0;
+  }
+  return h;
+}
+console.log(kernel(9), kernel(40), kernel(400));
+"#;
+    assert_matches_node(SRC);
+}
+
 /// The generator must never emit anything whose answer is implementation-defined
 /// — a fuzzer with false positives gets ignored, which is worse than no fuzzer.
 /// This is the lint that keeps a later edit from reintroducing one.
@@ -2972,7 +4138,7 @@ fn generator_emits_only_exact_js() {
     for i in 0..2500u64 {
         let prog = gen_program(prog_seed(0xF00D_1234_5678_9ABC, i), i % 2 == 0);
         n_stmts += count_stmts(&prog.body);
-        let src = emit(&prog, "", "D");
+        let src = emit(&prog, "", "D", false);
         for b in BANNED {
             assert!(!src.contains(b), "generator emitted banned construct {b:?}:\n{src}");
         }
@@ -2998,10 +4164,10 @@ fn generator_is_deterministic() {
         return;
     }
     for i in [0u64, 1, 17, 999, 123456] {
-        let a = emit(&gen_program(prog_seed(42, i), false), "", "D");
-        let b = emit(&gen_program(prog_seed(42, i), false), "", "D");
+        let a = emit(&gen_program(prog_seed(42, i), false), "", "D", false);
+        let b = emit(&gen_program(prog_seed(42, i), false), "", "D", false);
         assert_eq!(a, b, "generator is not deterministic at index {i}");
-        let c = emit(&gen_program(prog_seed(43, i), false), "", "D");
+        let c = emit(&gen_program(prog_seed(43, i), false), "", "D", false);
         assert_ne!(a, c, "different seeds produced the same program at index {i}");
     }
 }
@@ -3034,11 +4200,169 @@ fn tier_coverage_report() {
             *tally.entry(k).or_default() += 1;
         }
     }
+
+    // The HEADLINE, because the raw tally is 120 rows and the question a
+    // widening has to answer is "which tiers, how many". Every row here is a
+    // gap someone named: DOUBLE and Tier A and the split receiver were each
+    // reported as thin-or-absent, and a report that does not add them up cannot
+    // say whether they still are.
+    let count_of = |pred: &dyn Fn(&str) -> bool| -> usize {
+        tally.iter().filter(|(k, _)| pred(k)).map(|(_, n)| *n).sum()
+    };
+    let compiled = |t: &'static str| {
+        move |k: &str| k.starts_with(&format!("[jit] {t} region")) && k.ends_with("compiled")
+    };
+    let headline: [(&str, usize); 9] = [
+        ("MEM regions", count_of(&compiled("MEM"))),
+        ("INT regions", count_of(&compiled("INT"))),
+        ("DOUBLE regions", count_of(&compiled("DOUBLE"))),
+        ("SROA regions", count_of(&|k| k.starts_with("[jit] SROA region"))),
+        ("Tier C fns", count_of(&|k| k.starts_with("[jit] Tier C") && k.contains("compiled"))),
+        ("Tier A fns", count_of(&|k| k.starts_with("[jit] Tier A") && k.contains("compiled"))),
+        ("B94 split receivers", count_of(&|k| k.contains("split receiver"))),
+        ("deopts", count_of(&|k| k.contains("deopt at ip"))),
+        ("evictions", count_of(&|k| k.contains("EVICTED"))),
+    ];
+
+    // Generator-side axes: the engine cannot report these, and an axis that
+    // silently stops being generated is exactly how a widening rots.
+    let mut script = 0usize;
+    let (mut posts, mut loop2, mut dblscan) = (0usize, 0usize, 0usize);
+    for i in 0..count {
+        let prog = gen_program(prog_seed(seed, i), false);
+        if prog.scope == Scope::Script {
+            script += 1;
+        }
+        posts += prog.post.len();
+        loop2 += prog.post.iter().filter(|p| matches!(p, Post::Loop2 { .. })).count();
+        if emit(&prog, "", "D", false).contains("probe(") {
+            dblscan += 1;
+        }
+    }
+
     eprintln!("[fuzz] tier coverage over {count} programs (seed {seed}):");
+    eprintln!("  ── headline ──");
+    for (k, n) in headline {
+        eprintln!("    {n:>7}  {k}");
+    }
+    eprintln!("  ── generator axes ──");
+    eprintln!("    {script:>7}  script-scope programs");
+    eprintln!("    {posts:>7}  post-region uses ({loop2} of them a second region)");
+    eprintln!("    {dblscan:>7}  programs whose live-out crosses a call");
+    eprintln!("  ── every decision, by frequency ──");
     let mut rows: Vec<_> = tally.into_iter().collect();
     rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
     for (k, n) in rows {
         eprintln!("    {n:>7}  {k}");
+    }
+}
+
+/// Tier A is the whole-function self-recursive path, and until W17 it logged
+/// NOTHING on a successful compile — so its reach could be assumed but not
+/// measured. It turned out not to be reached at all: `Stmt::Rec` used to spell
+/// its body with `| 0`, and `fn_int::can_compile` admits no `Bitwise` op, so
+/// every generated recursion landed on Tier C instead. Both halves of that are
+/// pinned here — the engine's new line, and the generator shape that reaches it.
+#[test]
+fn tier_a_is_reached() {
+    if parent_guard() {
+        return;
+    }
+    const SRC: &str = r#"
+function rec(x) { if (x < 2) return x; return rec(x - 1) + rec(x - 2); }
+var h = 1;
+for (var i = 0; i < 400; i++) h = (h + rec((i & 7) + 2)) | 0;
+console.log(h);
+"#;
+    let dir = std::env::temp_dir().join("zipp-jit-fuzz");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(format!("tiera-{}.js", std::process::id()));
+    std::fs::write(&path, SRC).expect("write case");
+    let out = spawn_job(
+        &format!("file:{}", path.display()),
+        mode("base"),
+        Duration::from_secs(60),
+        true,
+    );
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        out.stderr.lines().any(|l| l.contains("[jit] Tier A") && l.contains("compiled")),
+        "no Tier A compile logged for a fib-shaped self-recursion; JITLOG said:\n{}",
+        out.stderr
+    );
+    // …and the generator really does emit that spelling, so this is not a test
+    // of a string that only lives in this file.
+    let mut found = false;
+    for i in 0..400u64 {
+        let s = emit(&gen_program(prog_seed(0x7E1A_2026, i), false), "", "D", false);
+        if s.contains("function rec(x) { if (x < 2) return x; return rec(x - 1) + rec(x - 2); }") {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "the generator no longer emits the Tier A recursion shape");
+}
+
+/// Every axis W17 added must still be GENERATED. Cheap (no engine), and it is
+/// the thing that fails when a later edit turns an axis off by accident — a
+/// widened generator that silently stops widening is worse than none, because
+/// the coverage claim outlives the coverage.
+#[test]
+fn widened_axes_are_still_generated() {
+    if parent_guard() {
+        return;
+    }
+    let (mut script, mut typeof_, mut ident, mut dblshape) = (0, 0, 0, 0);
+    let (mut probe, mut escape, mut loop2, mut dblscan) = (0, 0, 0, 0);
+    let (mut split, mut dead_out, mut cond_def) = (0, 0, 0);
+    for i in 0..1500u64 {
+        let prog = gen_program(prog_seed(0x5A17_2026_0F1E_2D3C, i), false);
+        if prog.scope == Scope::Script {
+            script += 1;
+        }
+        for p in &prog.post {
+            match p {
+                Post::TypeOf(_) => typeof_ += 1,
+                Post::Identity(_) => ident += 1,
+                Post::DblShape(_) => dblshape += 1,
+                Post::Probe(_) => probe += 1,
+                Post::Escape(_) => escape += 1,
+                Post::Loop2 { .. } => loop2 += 1,
+            }
+        }
+        // `Src::Dbl` is produced by `gen_double_body` and by nothing else, so
+        // its text is the flavor's fingerprint.
+        let src = emit(&prog, "", "D", false);
+        if src.contains("d0 = d0 * 0.5 + d0;") || src.contains("d1 = d1 * 0.5 + d0;") {
+            dblscan += 1;
+        }
+        if prog.scope == Scope::Script && prog.body.len() <= 5 {
+            split += 1;
+        }
+        if prog.dead_out.is_some() {
+            dead_out += 1;
+        }
+        if src.contains("t0 = 1; }") || src.contains("t0 = 2; }") || src.contains("t0 = 5; }")
+            || src.contains("t0 = 7; }") || src.contains("t0 = 13; }") || src.contains("t0 = 0; }")
+            || src.contains("t0 = -1; }")
+        {
+            cond_def += 1;
+        }
+    }
+    for (n, what) in [
+        (script, "script-scope programs"),
+        (typeof_, "Post::TypeOf"),
+        (ident, "Post::Identity"),
+        (dblshape, "Post::DblShape"),
+        (probe, "Post::Probe"),
+        (escape, "Post::Escape"),
+        (loop2, "Post::Loop2"),
+        (dblscan, "Flavor::DblScan bodies"),
+        (split, "Flavor::Split bodies"),
+        (dead_out, "dead-out locals"),
+        (cond_def, "Stmt::CondDef (a def that does not dominate)"),
+    ] {
+        assert!(n > 0, "{what} is no longer generated at all (0 in 1500 programs)");
     }
 }
 
@@ -3048,6 +4372,11 @@ fn classify_jitlog(l: &str) -> Option<String> {
         (r, "jit")
     } else if let Some(r) = l.strip_prefix("[leaf] ") {
         (r, "leaf")
+    } else if let Some(r) = l.strip_prefix("[decline-reason] ") {
+        // `fn=<name> [start,end]: <reason>` — the region is what makes the line
+        // attributable and the REASON is what makes it a coverage fact, so keep
+        // the reason and drop the region.
+        (r.split_once(": ").map(|(_, why)| why).unwrap_or(r), "decline")
     } else if let Some(r) = l.strip_prefix("[mi] ") {
         (r, "mi")
     } else {
