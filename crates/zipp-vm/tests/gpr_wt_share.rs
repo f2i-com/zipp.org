@@ -1,4 +1,5 @@
-//! B97 write-through home sharing on a GPR-only re-plan (`ZIPP_NO_GPR_WT_SHARE=1`).
+//! B97 write-through home sharing on a GPR-only re-plan — default-on since W18,
+//! `ZIPP_NO_GPR_WT_SHARE=1` restores the pre-W17 plans byte-for-byte.
 //!
 //! A register that is textually READ OUTSIDE the region used to pin a
 //! whole-region ("permanent") home on every `region_int` plan, because the INT
@@ -23,11 +24,16 @@
 //! cases read the plan back out of a child's `ZIPP_JITLOG`: a parity case that
 //! quietly stopped reaching the GPR emitter would be testing nothing at all.
 //!
-//! NOTE: the mechanism is DARK (opt-in `ZIPP_GPR_WT_SHARE=1`) — releasing
-//! the whole-region pins makes a separate, pre-existing conditional-def
-//! defect reachable on programs that did not reach it before. The parity
-//! cases below therefore assert the DEFAULT build, and the mechanism pins
-//! opt in explicitly.
+//! W18: the mechanism is now DEFAULT-ON. W17 had to ship it dark, because
+//! releasing the whole-region pins made a separate, pre-existing conditional-def
+//! defect reachable on programs that had not reached it before (a local whose
+//! only in-region def sits on a branch lost its entry load). That defect is
+//! closed — `plan_region::region_liveness` now derives the region's true live-in
+//! set and `shareable` asks it instead of `first_seen`, so an unfilled home is
+//! no longer reachable at all; `tests/conditional_def_live_in.rs` is its gate.
+//! The mechanism pins below therefore read the DEFAULT build for the ON side
+//! and `ZIPP_NO_GPR_WT_SHARE=1` for the OFF side, which is what every other
+//! mechanism in this suite does.
 
 const PRELUDE: &str = r#""use strict";
 var N = 30000;
@@ -204,10 +210,11 @@ console.log("seen h=" + h + " seen=" + seen);
     ));
 }
 
-/// The mechanism. With the switch ON the flattened mix loop's re-plan fits the
-/// GPR pool and the region engages there; with it OFF the SAME region declines
-/// on pool overflow and falls to the xmm integer emitter. If the decline stops
-/// appearing with the switch off, this stopped being an off-switch.
+/// The mechanism. On the DEFAULT build the flattened mix loop's re-plan fits the
+/// GPR pool and the region engages there; under `ZIPP_NO_GPR_WT_SHARE=1` the
+/// SAME region declines on pool overflow and falls to the xmm integer emitter.
+/// If the decline stops appearing with the switch off, this stopped being an
+/// off-switch.
 #[test]
 fn gprwt_mechanism_the_flattened_mix_loop_reaches_the_gpr_emitter() {
     // `gprwt_parity_stored_global_read_between_the_calls` is deliberately NOT
@@ -217,7 +224,7 @@ fn gprwt_mechanism_the_flattened_mix_loop_reaches_the_gpr_emitter() {
     for name in
         ["gprwt_parity_top_level_mix_loop", "gprwt_parity_recycled_temps_read_after_the_loop"]
     {
-        let on = jitlog_of(name, &[("ZIPP_GPR_WT_SHARE", "1")]);
+        let on = jitlog_of(name, &[]);
         assert!(on.contains("INT splice ["), "{name}: no region was flattened:\n{on}");
         assert!(
             on.contains("GPR homes engaged"),
@@ -242,7 +249,7 @@ fn gprwt_mechanism_the_flattened_mix_loop_reaches_the_gpr_emitter() {
 /// body. Pin both halves: the first attempt overflows, the retry fits.
 #[test]
 fn gprwt_mechanism_the_shared_home_replan_is_what_fits() {
-    let on = jitlog_of("gprwt_parity_top_level_mix_loop", &[("ZIPP_GPR_WT_SHARE", "1")]);
+    let on = jitlog_of("gprwt_parity_top_level_mix_loop", &[]);
     assert!(
         on.lines().any(|l| l.starts_with("[jit] INT-GPR decline") && l.contains("gprs")),
         "the FIRST (distinct-homes) attempt is expected to overflow:\n{on}"

@@ -107,19 +107,26 @@
 //! [`open_cold_out_of_range_read_throws`], whose pinned receiver now stores the
 //! object to its frame slot. No `open_*` spec is `#[ignore]`d any more.
 //!
-//! ## W17 found a sixth
+//! ## W17 found a sixth — CLOSED in W18
 //!
 //! [`open_conditional_def_loses_its_entry_load`] and its cold-block twin. A
-//! local whose only in-region definition sits on a CONDITIONAL branch is treated
-//! as though that def dominated every use, loses its entry load, and the
-//! compiled body reads its home as garbage on every pass that skips the branch.
+//! local whose only in-region definition sits on a CONDITIONAL branch was
+//! treated as though that def dominated every use, lost its entry load, and the
+//! compiled body read its home as garbage on every pass that skipped the branch.
 //! Two lines, wrong on both register tiers with two different answers, avoided
 //! by no `ZIPP_NO_*` switch, and reproducing at the committed HEAD 0ade520.
-//! `plan_region.rs` already names the distinction it turns on — `first_seen ==
-//! true` says the first OCCURRENCE is a def, not that a def RUNS — and guards
+//! `plan_region.rs` already named the distinction it turns on — `first_seen ==
+//! true` says the first OCCURRENCE is a def, not that a def RUNS — and guarded
 //! the constant-hoisting consumer with `runs_every_iteration`; the `shareable` /
-//! live-in consumer beside it is unguarded. Both specs are `#[ignore]`d because
-//! the defect is open and that file's live-in region belongs to another lane.
+//! live-in consumer beside it was unguarded.
+//!
+//! W18 closed it by deleting the flag from those two consumers rather than
+//! adding a second guard: `region_liveness` (the same backward walk W16 added
+//! for live SPANS) now also returns the region's true live-in set, and one
+//! predicate — `live_in(r)` in `plan_region.rs` — answers "is the value this
+//! register holds at entry still observable?" for `shareable`, `range` and
+//! therefore `live_in_regs`. Both specs run with the normal suite again, and
+//! `KNOWN_OPEN` is empty.
 //!
 //! What kept it hidden is worth as much as the bug: reading the local AFTER the
 //! loop makes the program answer correctly, because `read_outside` forced a
@@ -143,8 +150,9 @@
 //! The one before `CondDef` was luck: a `DeoptKind::TypedOob` guard that
 //! happened to write a temp a later index read. All 252 after it are the SAME
 //! class — every one contains a `CondDef` and not one is anything else — and so
-//! are all 29 of the node-oracle disagreements. The CI slice sees it at exactly
-//! one index of 640, which is why `KNOWN_OPEN` has one entry and not a page.
+//! are all 29 of the node-oracle disagreements. The CI slice saw it at exactly
+//! one index of 640, which is why `KNOWN_OPEN` held one entry and not a page;
+//! W18's fix emptied the list.
 //!
 //! A fifth result had no spec because it is about a SWITCH rather than about the
 //! default: on 12 of the 28 divergent programs the soak found, the default
@@ -169,9 +177,74 @@
 //! is [`open_conditional_def_loses_its_entry_load`] and not one is a generator
 //! false positive. That is the property that has to hold for any of this to be
 //! worth running, so it is measured again whenever the generator grows:
-//! `ZIPP_FUZZ_NODE_COUNT=8000 cargo test --release --test jit_tier_fuzz -- //! node_oracle_slice --exact`. Expect it to be RED at raised counts while the
-//! W17 class is open, and expect every failure it prints to carry a
-//! `if (…) { t… = <int>; }`; anything else is new.
+//! `ZIPP_FUZZ_NODE_COUNT=8000 cargo test --release --test jit_tier_fuzz -- //! node_oracle_slice --exact`. W18 re-ran it at 8,000 after closing the class:
+//! ZERO node disagreements. The same binary with ONLY the `live_in` hunk
+//! reverted — same generator, same seed, same count — disagrees with node on 29
+//! programs, which is the W17 number reproduced first-hand. Any failure it
+//! prints now is new.
+//!
+//! ## W18: the assumption underneath every comparison
+//!
+//! This instrument compares digests ACROSS modes. Every verdict it has ever
+//! reached rests on one unstated assumption: that a mode answers the same thing
+//! twice. W17's gate soak found two generated programs that do not.
+//! `s3127_i361` and `s3129_i318` alternated `D 7840` / `D b08f` roughly 50/50
+//! over runs of ONE binary, on the committed baseline as much as on the wave
+//! tree.
+//!
+//! That is worse than two wrong programs. A fuzzer that cannot tell "these
+//! tiers disagree" from "this program disagrees with itself" is unsound in both
+//! directions at once — a real divergence gets waved off as flakiness, and a
+//! flake gets written up as a tier bug. W17's gate hand-triaged 149 divergences
+//! to find these two, which is the cost of not knowing.
+//!
+//! ROOT CAUSE, and it is the reason this section sits under the one above: they
+//! are not a third defect. Both are
+//! [`open_conditional_def_loses_its_entry_load`] wearing its worst face. `t0`'s
+//! only in-region def sits behind `if (i === …)`, so it looked def-first, became
+//! `shareable`, and dropped out of `live_in_regs`; its home was never filled at
+//! OSR entry and the body read whatever the previous phase had left in that
+//! register. An unfilled home does not hold a WRONG CONSTANT — it holds
+//! whatever is there, and what is there is address-derived, so it differs run to
+//! run. Every one of this file's other findings was a stable wrong answer
+//! because the garbage it read happened to be stable. This class is what the
+//! same defect looks like when it is not.
+//!
+//! What the instrument gained, so the next occurrence costs a minute instead of
+//! a gate:
+//!
+//! * Every candidate divergence is CLASSIFIED before it is shrunk or reported.
+//!   Each of the two disagreeing modes is re-run on its own, in fresh processes
+//!   ([`SELF_RUNS`]); a program that disagrees with itself is reported as
+//!   [`Flake::Nondeterministic`], not as a tier divergence.
+//! * A flaky program is shrunk on the property it actually has — "this mode does
+//!   not answer the same thing twice" — instead of on a cross-mode comparison
+//!   that means nothing for it. On `s3127_i361` that reduces the generated
+//!   program to the two-line kernel in
+//!   [`conditional_def_answers_the_same_thing_every_run`], in 1.6s.
+//! * The per-mode table is taken with TWO runs of each mode ([`mode_table`]), so
+//!   a mode that flakes is caught even when it is not one of the two the shrink
+//!   drove. On `s3127_i361` pre-fix, 17 of the 37 rows visibly disagree with
+//!   themselves — invisible at one sample per row.
+//! * A batch disagreement that no standalone re-run reproduces is labelled
+//!   [`Flake::BatchOrderOnly`] — a HARNESS finding (state carried between
+//!   programs in one process), not an engine one. That case was already
+//!   detected; it was not labelled, and it reused samples the classifier now
+//!   takes anyway, so it costs nothing.
+//!
+//! Cost: zero on a green run. Nothing is re-run until something has already
+//! diverged, and the CI slice is unchanged at ~1s for all 17 tests.
+//!
+//! Measured yield, honestly: re-running all 149 of W17's triaged divergences
+//! against the pre-fix binary, exactly 2 disagree with themselves — the two a
+//! human found by hand. So the hardening auto-classifies 2 of 149. That is a
+//! small number and the right one to report: the win is not volume, it is that
+//! those two stop poisoning the other 147, and that the next one is labelled by
+//! the machine. Against the FIXED tree all 149 are stable.
+//!
+//! One calibration fact worth keeping, because it sets [`SELF_RUNS`]: at 8 runs
+//! per program that scan caught 1 of the 2, at 16 it caught both. A coin-flip
+//! flake is not cheap to see. R = 6 against each of two modes is 2^-10.
 //!
 //! ## W17: the four places it was blind, measured
 //!
@@ -261,9 +334,12 @@
 //!   cannot be changed inside a running process). Same re-exec pattern as
 //!   `int_gpr_homes.rs`.
 //!
-//! On a divergence the parent SHRINKS the program against the two disagreeing
-//! modes — statement deletion, loop-bound reduction, declaration trimming — and
-//! prints the minimal source plus the digest every mode gave it.
+//! On a divergence the parent first CLASSIFIES it (re-running each of the two
+//! disagreeing modes on its own — see [`Flake`]), then SHRINKS the program
+//! against whichever property it actually has: the two modes disagreeing, or
+//! the one mode disagreeing with itself. Statement deletion, loop-bound
+//! reduction, declaration trimming. It prints the minimal source plus what
+//! every mode answered on two runs.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -3407,6 +3483,65 @@ fn reduce_inner_bounds(ss: &mut [Stmt]) -> bool {
 
 // ──────────────────────────── divergence reporting ────────────────────────────
 
+/// How many times ONE mode is re-run on ONE source to decide whether the
+/// program agrees with ITSELF.
+///
+/// This whole instrument compares digests ACROSS modes, so it is only ever as
+/// sound as the assumption underneath it: that one mode answers the same thing
+/// twice. W18 met two generated programs that did not — `s3127_i361` and
+/// `s3129_i318` of the W17 gate soak alternated `D 7840` / `D b08f` over runs
+/// of ONE binary, on the committed baseline as much as on the wave tree. Both
+/// were the [`open_conditional_def_loses_its_entry_load`] defect wearing its
+/// worst face: the home the compiled body read was never filled, so the answer
+/// was whatever the previous phase had left in that register.
+///
+/// An unlabelled flake costs a gate twice. It is reported as a tier divergence
+/// it is not, and — the expensive half — a REAL divergence found beside it can
+/// be waved off as "that flaky one again". W17's gate hand-triaged 149
+/// divergences to find these two. So every candidate is classified BEFORE it is
+/// shrunk or reported, and a flaky one is shrunk on self-disagreement instead
+/// of on a cross-mode comparison that means nothing for it.
+///
+/// A coin-flip flake survives R runs of one mode with probability 2^-(R-1), and
+/// the classifier spends R on EACH of the two modes that disagreed, so R = 6
+/// leaves 2^-10. Measured against the real thing: the two programs above were
+/// caught 2/2 at R = 16 and 1/2 at R = 8, which is why R is not 4. The cost on
+/// a green run is zero — nothing is re-run until something has already
+/// diverged.
+const SELF_RUNS: usize = 6;
+
+/// The same predicate inside the shrinker, where every candidate pays it.
+/// Lower because a miss there is cheap and one-directional: it costs a shrink
+/// STEP (the greedy loop keeps the bigger program), never a wrong verdict — a
+/// step is accepted only when self-disagreement was actually OBSERVED.
+const SELF_RUNS_SHRINK: usize = 4;
+
+/// Bound on shrink candidates for a nondeterministic finding. Far below the
+/// cross-mode shrink's 900 because each candidate costs [`SELF_RUNS_SHRINK`]
+/// processes instead of two, and because a flaky predicate shrinks less per
+/// round anyway.
+const SELF_SHRINK_EVALS: usize = 150;
+
+/// What re-running the SAME source in the SAME mode proved about a finding.
+///
+/// The three are different bugs with different owners, and telling them apart
+/// is the difference between a gate that reports and a gate that guesses.
+enum Flake {
+    /// Every mode that was re-run agreed with itself. The tiers really do
+    /// disagree with each other: a wrong answer in one of them.
+    Stable,
+    /// One mode answered two different things across runs of one binary. The
+    /// cross-mode comparison that flagged this program is meaningless until
+    /// that is fixed. An ENGINE bug, and the most serious kind — a wrong answer
+    /// that is not even stable.
+    Nondeterministic { mode: &'static str, answers: Vec<String> },
+    /// The BATCH run disagreed, but every standalone re-run of both modes
+    /// agrees. The divergence is in running many programs in one process — engine
+    /// state carried between them, or a chunk that died and was refilled — not
+    /// in the program. A HARNESS finding.
+    BatchOrderOnly,
+}
+
 struct Divergence {
     index: u64,
     source: String,
@@ -3415,14 +3550,109 @@ struct Divergence {
     /// A wrong answer without this is a bug report that still needs an
     /// afternoon; with it, the tier is already named.
     trace: Vec<String>,
+    /// Set before the shrink, from re-runs of the two modes that disagreed —
+    /// never inferred from the table below, which is a sample and not a proof.
+    flake: Flake,
+}
+
+impl Divergence {
+    fn is_nondeterministic(&self) -> bool {
+        matches!(self.flake, Flake::Nondeterministic { .. })
+    }
+}
+
+/// Run `m` on `src` up to `runs` times and return the DISTINCT answers in
+/// first-seen order, stopping the moment two of them differ.
+///
+/// Each run is a fresh process (see [`single_digest`]), which is the only way
+/// this question can be asked honestly: a second run inside one process shares
+/// the JIT's compiled regions, its IC state and its heap, so it would answer
+/// the same thing for reasons that have nothing to do with determinism.
+fn self_answers(src: &str, m: &'static Mode, runs: usize) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..runs {
+        let d = single_digest(src, m);
+        if !seen.contains(&d) {
+            seen.push(d);
+            if seen.len() > 1 {
+                return seen;
+            }
+        }
+    }
+    seen
+}
+
+/// The per-mode answer table for a finding, taken with TWO runs of each mode
+/// rather than one.
+///
+/// The second run is what makes the table readable. A single sample from a
+/// flaky program prints a column of plausible-looking digests that invite a
+/// diagnosis of the wrong bug, and it hides a mode that flakes when the two
+/// modes the shrink happened to pick do not. A mode that answers two things is
+/// rendered `x  ≠  y` and returned as a [`Flake::Nondeterministic`] the caller
+/// may adopt if it had no stronger evidence of its own.
+fn mode_table(src: &str) -> (Vec<(String, String)>, Flake) {
+    let mut flake = Flake::Stable;
+    let mut rows = Vec::new();
+    for m in MODES {
+        let ans = self_answers(src, m, 2);
+        if ans.len() > 1 && matches!(flake, Flake::Stable) {
+            flake = Flake::Nondeterministic { mode: m.name, answers: ans.clone() };
+        }
+        rows.push((m.name.to_string(), ans.join("  ≠  ")));
+    }
+    (rows, flake)
 }
 
 fn describe(d: &Divergence, seed: u64) -> String {
     let mut s = String::new();
-    s.push_str(&format!(
-        "\n═══ TIER DIVERGENCE  seed={seed} index={}  ═══\n",
-        d.index
-    ));
+    match &d.flake {
+        Flake::Nondeterministic { mode, answers } => {
+            s.push_str(&format!(
+                "\n═══ NONDETERMINISTIC  seed={seed} index={}  ═══\n",
+                d.index
+            ));
+            s.push_str(&format!(
+                "    mode `{mode}` answered {} across separate runs of ONE binary.\n",
+                answers.join(" / ")
+            ));
+            s.push_str(
+                "    This is NOT a tier divergence: the cross-mode comparison that flagged\n",
+            );
+            s.push_str(
+                "    it says nothing while the program disagrees with itself. Look for an\n",
+            );
+            s.push_str(
+                "    ENGINE read of something never written — an unfilled home at OSR entry,\n",
+            );
+            s.push_str(
+                "    an uninitialised register — not for a tier that computes the wrong\n",
+            );
+            s.push_str("    thing. The table below is two runs per mode.\n");
+        }
+        Flake::BatchOrderOnly => {
+            s.push_str(&format!(
+                "\n═══ BATCH-ORDER DIVERGENCE  seed={seed} index={}  ═══\n",
+                d.index
+            ));
+            s.push_str(
+                "    The batch disagreed; every standalone re-run of both modes agrees.\n",
+            );
+            s.push_str(
+                "    The finding is in running many programs in ONE process (engine state\n",
+            );
+            s.push_str(
+                "    carried across them, or a dead chunk refilled), not in the program —\n",
+            );
+            s.push_str("    a HARNESS bug. Reported unshrunk.\n");
+        }
+        Flake::Stable => {
+            s.push_str(&format!(
+                "\n═══ TIER DIVERGENCE  seed={seed} index={}  ═══\n",
+                d.index
+            ));
+        }
+    }
     for (m, dig) in &d.digests {
         s.push_str(&format!("    {m:<16} {dig}\n"));
     }
@@ -3474,6 +3704,75 @@ fn sweep(
         let a = mode(vals[0].0);
         let b = mode(vals.iter().find(|(_, v)| *v != first).unwrap().0);
         let prog = gen_program(prog_seed(seed, i), big);
+        let base_src = emit(&prog, "", "D", false);
+
+        // ── classify before shrinking ── the cross-mode shrink predicate below
+        // asks "do a and b still disagree?". For a program that disagrees with
+        // ITSELF that question has no stable answer, so the shrink wanders and
+        // the report names the wrong bug. Re-run each of the two modes on its
+        // own first (see `SELF_RUNS`); the samples are reused, so the old
+        // reproduces-standalone check costs nothing extra.
+        let sa = self_answers(&base_src, a, SELF_RUNS);
+        let sb = if sa.len() > 1 { Vec::new() } else { self_answers(&base_src, b, SELF_RUNS) };
+        if let Some((fm, answers)) = match (sa.len() > 1, sb.len() > 1) {
+            (true, _) => Some((a, sa.clone())),
+            (_, true) => Some((b, sb.clone())),
+            _ => None,
+        } {
+            if verbose {
+                eprintln!(
+                    "[fuzz] index {i}: NONDETERMINISTIC — mode {} answered {} across runs of one binary; shrinking on self-disagreement",
+                    fm.name,
+                    answers.join(" / ")
+                );
+            }
+            // Shrink on the property that actually holds: this program does not
+            // answer the same thing twice in `fm`. Sound in the direction that
+            // matters — a step is kept only when the disagreement was OBSERVED,
+            // so no candidate is ever accepted for a divergence it does not have.
+            let mut evals = 0usize;
+            let mut check = |p: &Program| {
+                if evals > SELF_SHRINK_EVALS {
+                    return false;
+                }
+                evals += 1;
+                self_answers(&emit(p, "", "D", false), fm, SELF_RUNS_SHRINK).len() > 1
+            };
+            let minimal = shrink(&prog, &mut check);
+            let src = emit(&minimal, "", "D", false);
+            let (digests, _) = mode_table(&src);
+            let trace = tier_trace(&src);
+            out.push(Divergence {
+                index: i,
+                source: src,
+                digests,
+                trace,
+                flake: Flake::Nondeterministic { mode: fm.name, answers },
+            });
+            continue;
+        }
+
+        // Both modes are self-consistent, so `sa[0]` / `sb[0]` ARE their
+        // standalone answers: if those agree, only the batch disagreed.
+        if sa[0] == sb[0] {
+            if verbose {
+                eprintln!(
+                    "[fuzz] index {i}: NOT reproducible standalone — batch-order dependent, reporting unshrunk"
+                );
+            }
+            // `a` and `b` are self-consistent, but the table covers all 37: if a
+            // THIRD mode disagrees with itself, that is the stronger and more
+            // actionable verdict — an engine finding rather than a harness one —
+            // so it wins. Costs nothing; the table is taken either way.
+            let (digests, table_flake) = mode_table(&base_src);
+            let trace = tier_trace(&base_src);
+            let flake = match table_flake {
+                Flake::Stable => Flake::BatchOrderOnly,
+                other => other,
+            };
+            out.push(Divergence { index: i, source: base_src, digests, trace, flake });
+            continue;
+        }
 
         if verbose {
             eprintln!("[fuzz] index {i}: {} != {} — minimizing…", a.name, b.name);
@@ -3489,22 +3788,15 @@ fn sweep(
             let db = single_digest(&src, b);
             da != db
         };
-        let base_src = emit(&prog, "", "D", false);
-        let mut minimal = prog.clone();
-        if single_digest(&base_src, a) != single_digest(&base_src, b) {
-            minimal = shrink(&prog, &mut check);
-        } else if verbose {
-            eprintln!(
-                "[fuzz] index {i}: NOT reproducible standalone — batch-order dependent, reporting unshrunk"
-            );
-        }
+        let minimal = shrink(&prog, &mut check);
         let src = emit(&minimal, "", "D", false);
-        let digests: Vec<(String, String)> = MODES
-            .iter()
-            .map(|m| (m.name.to_string(), single_digest(&src, m)))
-            .collect();
+        // The table's second run per mode is the wider net: `a` and `b` are
+        // self-consistent, but a THIRD mode may be the flaky one, and shrinking
+        // can also carry a program into a flaky shape. Adopt that verdict — the
+        // evidence for it is the same kind, just cheaper.
+        let (digests, flake) = mode_table(&src);
         let trace = tier_trace(&src);
-        out.push(Divergence { index: i, source: src, digests, trace });
+        out.push(Divergence { index: i, source: src, digests, trace, flake });
     }
     out
 }
@@ -3522,15 +3814,14 @@ fn sweep(
 /// divergence — compare the minimized case against the `open_*` specs before
 /// assuming otherwise.
 const KNOWN_OPEN: &[(u64, u64, &str)] = &[
-    // W17. `open_conditional_def_loses_its_entry_load` — a local whose only
-    // in-region def sits on a conditional branch loses its entry load, so every
-    // pass that skips the branch reads its home as garbage. The slice's copy is
-    // `if (i === 100000) { t0 = 5; }` ahead of `d1 = d1 * 0.5 + (t0 | 0)`; the
-    // spec carries the two-line hand-minimized version and the diagnosis.
-    // Reproduces at the committed HEAD 0ade520, so it is not a regression from
-    // anything in flight. ONE index of 640 — delete this line when the spec
-    // goes green, and treat any OTHER index as a new divergence.
-    (0x5A17_2026_0F1E_2D3C, 380, "open_conditional_def_loses_its_entry_load"),
+    // EMPTY. Every divergence this fuzzer has found is closed and carried by a
+    // green spec below. A failing index here is a NEW divergence, not a known
+    // one — minimize it, root-cause it, and only then consider a line here.
+    //
+    // (W18 removed the list's second-ever entry — index 380 of seed 0x5A17…,
+    // `if (i === 100000) { t0 = 5; }` ahead of `d1 = d1 * 0.5 + (t0 | 0)`: a
+    // conditional in-region def treated as a dominating one, so the local lost
+    // its entry load. `open_conditional_def_loses_its_entry_load` carries it.)
     // (W16 closed the only entry this list ever held — index 392 of seed
     // 0x5A17…, the live-out `Bool` defect on the DOUBLE tier over a
     // double-element Array. Its four answers were one register: the tier's
@@ -3579,10 +3870,34 @@ fn tier_differential_ci_slice() {
         .collect();
     assert!(
         found.is_empty(),
-        "{} of {COUNT} generated programs answer differently across tiers:{}",
+        "{} of {COUNT} generated programs answer differently across tiers{}:{}",
         found.len(),
+        flake_tally(&found),
         found.iter().map(|d| describe(d, SEED)).collect::<String>()
     );
+}
+
+/// The one-line breakdown that goes in front of a failure so the first thing
+/// read is WHICH kind of bug this is. A nondeterministic program is an engine
+/// defect of a different (worse) shape than a tier divergence, and a
+/// batch-order one is not an engine defect at all.
+fn flake_tally(ds: &[Divergence]) -> String {
+    let nd = ds.iter().filter(|d| d.is_nondeterministic()).count();
+    let bo = ds.iter().filter(|d| matches!(d.flake, Flake::BatchOrderOnly)).count();
+    let mut parts = Vec::new();
+    if nd > 0 {
+        parts.push(format!(
+            "{nd} NONDETERMINISTIC (disagree with themselves in one mode — an engine read of something never written, not a tier disagreeing with a tier)"
+        ));
+    }
+    if bo > 0 {
+        parts.push(format!("{bo} BATCH-ORDER ONLY (a harness finding: standalone re-runs agree)"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" — of which {}", parts.join("; "))
+    }
 }
 
 /// The long run. Not in the normal suite — it is minutes, not seconds.
@@ -3619,6 +3934,20 @@ fn tier_differential_soak() {
         "[fuzz] soak seed={seed} start={start} count={count} big={big} modes={}",
         modes.iter().map(|m| m.name).collect::<Vec<_>>().join(",")
     );
+    // WHICH BINARY. A soak transcript is evidence about one build, and in a tree
+    // several people are editing it is easy to read a finding from a run whose
+    // engine is already two fixes behind — W18 spent an hour root-causing a
+    // "live" nondeterministic program that a rebuild had already fixed. The exe
+    // and its mtime make every transcript say what it was actually testing.
+    if let Ok(exe) = std::env::current_exe() {
+        let stamp = std::fs::metadata(&exe)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_else(|| "?".into());
+        eprintln!("[fuzz] engine under test: {} (mtime {stamp})", exe.display());
+    }
     let chunk: u64 = 64;
     let mut all = Vec::new();
     let t0 = Instant::now();
@@ -3632,14 +3961,15 @@ fn tier_differential_soak() {
         all.extend(found);
         i = hi;
         eprintln!(
-            "[fuzz] {}/{} programs, {} divergent, {:.1}s",
+            "[fuzz] {}/{} programs, {} divergent ({} nondeterministic), {:.1}s",
             i - start,
             count,
             all.len(),
+            all.iter().filter(|d| d.is_nondeterministic()).count(),
             t0.elapsed().as_secs_f64()
         );
     }
-    assert!(all.is_empty(), "{} divergent programs (see above)", all.len());
+    assert!(all.is_empty(), "{} divergent programs (see above){}", all.len(), flake_tally(&all));
 }
 
 /// node is the SECONDARY oracle: it catches the case where every zipp tier is
@@ -4034,19 +4364,19 @@ console.log(typeof kernel(20));
 /// missed it. The generated case that finally hit it needed the extra step of a
 /// `Deopt` statement writing the temp inside a guard.
 ///
-/// A SECOND FACE, on the working tree only: W17's `ZIPP_NO_GPR_WT_SHARE` lever
-/// makes `read_outside` registers shareable too (write-through instead of a
-/// pinned home), so the same defect now also reaches a local that IS read after
-/// the loop. `crates/zipp-vm/tests/…`-side note for whoever owns that lever:
-/// the seed-170013 case answers correctly under `ZIPP_NO_GPR_WT_SHARE=1` and
-/// wrongly by default, while the two-line case above is wrong either way. Same
-/// root cause; the lever widens its reach rather than causing it.
+/// A SECOND FACE: W17's GPR write-through-sharing lever makes `read_outside`
+/// registers shareable too (write-through instead of a pinned home), so the same
+/// defect also reached a local that IS read after the loop. Same root cause; the
+/// lever widened its reach rather than causing it, which is why it had to ship
+/// dark. W18 closed the defect and the lever is default-on
+/// (`ZIPP_NO_GPR_WT_SHARE=1` turns it off), so this spec is run in BOTH
+/// positions by `MODES`.
 ///
-/// `#[ignore]`d because it is OPEN. `plan_region.rs`'s live-in/sharing region is
-/// owned by another lane this wave; un-ignore this when the dominance property
-/// replaces the first-mention one.
+/// CLOSED (W18): `plan_region.rs` now derives the region's live-in set from the
+/// same backward liveness walk that produces the live spans, and `shareable` /
+/// `range` ask that one predicate instead of `first_seen`. Before the fix this
+/// answered 74 compiled and 42 under `ZIPP_NO_GPR_HOMES=1`, against 266.
 #[test]
-#[ignore = "OPEN (W17): a conditional in-region def is treated as a dominating one"]
 fn open_conditional_def_loses_its_entry_load() {
     if parent_guard() {
         return;
@@ -4069,9 +4399,8 @@ console.log(kernel(40));
 /// reaches — the cold-side-exit spelling, which is how the fuzzer found it.
 /// Kept separate because it is the one an engine author is likelier to reason
 /// about ("the block never runs, so nothing about it can matter") and because
-/// it is the one that survives every `ZIPP_NO_*` switch unchanged.
+/// it is the one that survived every `ZIPP_NO_*` switch unchanged. CLOSED (W18).
 #[test]
-#[ignore = "OPEN (W17): same defect, cold-block spelling"]
 fn open_cold_conditional_def_loses_its_entry_load() {
     if parent_guard() {
         return;
@@ -4090,9 +4419,116 @@ console.log(kernel(9), kernel(40), kernel(400));
     assert_matches_node(SRC);
 }
 
+/// Assert `src` answers the SAME thing on every one of `runs` fresh processes,
+/// and that the answer is node's.
+///
+/// [`assert_matches_node`] runs the engine ONCE, in-process. That is the right
+/// test for a wrong answer and the wrong one for an unstable answer: it passes
+/// on the run where the garbage happens to be benign. This asks the other
+/// question, and it has to spend processes to ask it — see [`self_answers`].
+fn assert_same_answer_every_run(src: &str, runs: usize) {
+    let ans = self_answers(src, mode("base"), runs);
+    assert_eq!(
+        ans.len(),
+        1,
+        "the same binary answered {} on separate runs of this program — nondeterminism, \
+         not a wrong constant; look for a home the compiled body reads before anything \
+         writes it:{src}",
+        ans.join(" / ")
+    );
+    assert_matches_node(src);
+}
+
+/// W18: [`open_conditional_def_loses_its_entry_load`] wearing the face that
+/// made it dangerous to the instrument itself — the program does not answer the
+/// same thing TWICE.
+///
+/// These two are verbatim from the W17 gate soak (`s3127_i361`, `s3129_i318`),
+/// the programs that cost that gate its triage budget: `D 7840` / `D b08f`
+/// alternating roughly 50/50 over runs of one binary, on the committed baseline
+/// as much as on the wave tree. Sibling specs of the same defect, but they are
+/// kept because they lock a DIFFERENT property, and one no other test in this
+/// file asserts: that an answer is stable at all.
+///
+/// The mechanism, which is why an unfilled home reads as a coin flip rather
+/// than as a fixed wrong constant. `t0`'s only in-region def sits behind
+/// `if (i === …)`, so it looked def-first, became `shareable`, and dropped out
+/// of `live_in_regs`. Its home — `xmm4`, mapped to a GPR by the INT tier's
+/// GPR-home sub-mode — was therefore never filled at OSR entry, and
+/// `(t0 | 0) > 31` read whatever the previous phase had left in that register.
+/// What is left there is address-derived, so it differs run to run: the SAME
+/// wrong-answer defect, but reported as an unstable one. `ZIPP_NO_GPR_HOMES=1`
+/// hid it by moving the garbage to an xmm home that happened to hold a benign
+/// value — which is exactly how a switch-differential can mislead.
+///
+/// The two spellings are both here because they fail in OPPOSITE directions:
+/// the taken-branch one reads garbage as `true` where node says `false`, the
+/// never-taken one as `false` where node says `true`. A fix that only ever
+/// leaves zero in the register would pass one of them.
+#[test]
+fn conditional_def_answers_the_same_thing_every_run() {
+    if parent_guard() {
+        return;
+    }
+    // The branch IS taken (i === 5 of 9), and the wrong answer is the FIRST
+    // call's: the region compiles on that call's last back-edge.
+    const TAKEN: &str = r#"
+function main() {
+  var acc = 1;
+  for (var r = 0; r < 3; r++) acc = (Math.imul(acc, 31) + (kernel(9) | 0)) | 0;
+  return (acc) | 0;
+}
+function kernel(n) {
+  "use strict";
+  var h = 1, i = 0, j = 0, q = 0;
+  var t0 = 1;
+  var b0 = false;
+  for (i = 0; i < n; i++) {
+    if (i === 5) { t0 = -1; }
+    b0 = (t0 | 0) > (31);
+  }
+  return (h ^ (b0 ? 17 : 0) ^ (typeof b0 === "boolean" ? 0 : 1024)) | 0;
+}
+try { console.log("D " + (main() >>> 0).toString(16)); } catch (e) { console.log("D E:" + (e && e.constructor ? e.constructor.name : "?")); }
+"#;
+    // The branch is NEVER taken (i === 65 of 9) — the cold spelling, and the
+    // one where every call answers wrong together.
+    const NEVER: &str = r#"
+function main() {
+  var acc = 1;
+  for (var r = 0; r < 3; r++) acc = (Math.imul(acc, 31) + (kernel(9) | 0)) | 0;
+  return (acc) | 0;
+}
+function kernel(n) {
+  var h = 1, i = 0, j = 0, q = 0;
+  var t0 = 1;
+  var b0 = false;
+  for (i = 0; i < n; i++) {
+    if (i === 65) { t0 = -1; }
+    b0 = (t0 | 0) <= (6);
+  }
+  return (h ^ (b0 ? 17 : 0) ^ (typeof b0 === "boolean" ? 0 : 1024)) | 0;
+}
+try { console.log("D " + (main() >>> 0).toString(16)); } catch (e) { console.log("D E:" + (e && e.constructor ? e.constructor.name : "?")); }
+"#;
+    // 12 fresh processes each. A 50/50 flake escapes that with probability
+    // 2^-11; measured on the pre-fix binary, 16 runs caught both programs and
+    // 8 runs caught one of the two.
+    assert_same_answer_every_run(TAKEN, 12);
+    assert_same_answer_every_run(NEVER, 12);
+}
+
 /// The generator must never emit anything whose answer is implementation-defined
 /// — a fuzzer with false positives gets ignored, which is worse than no fuzzer.
 /// This is the lint that keeps a later edit from reintroducing one.
+///
+/// It is also where W18 ruled the generator OUT as the source of the
+/// run-to-run instability described in the module header: this list already
+/// bans every construct whose value can vary between two runs of one program —
+/// `Math.random`, `Date`, `performance`, `for…in` order, `Object.keys` order —
+/// so a generated program that answers two things is the ENGINE answering two
+/// things. Anything added here that reads a clock, an address, an iteration
+/// order or an entropy source breaks that argument, not just this test.
 #[test]
 fn generator_emits_only_exact_js() {
     if parent_guard() {

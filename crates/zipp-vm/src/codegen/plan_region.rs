@@ -887,6 +887,73 @@ fn plan_region_cold_inner(
             }
         }
     }
+    // Registers that are actually USED as an operand somewhere in the region.
+    // A defined-but-unused reg is DEAD — it must NOT be hoisted, or it would
+    // consume a permanent xmm home for a value that is never read. Computed HERE,
+    // ahead of its first consumer, because the object-ref rule immediately below
+    // asks the same question and there is no reason for the body to be walked
+    // twice to answer it; the dead-code pass further down is the other consumer,
+    // and the two widenings between here and there (a pinned-DV `CallMethod` dst,
+    // the per-ip `str_imul_touch` operands) deliberately apply to that one only —
+    // neither can name a register this base set lacks.
+    let mut used: FxHashSet<u16> = FxHashSet::default();
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        if cold.contains(&(s + off)) { continue; }
+        for u in instr_uses(instr) {
+            used.insert(u);
+        }
+    }
+    // ── object-ref `LoadGlobal` with a dst the region never reads ── a
+    // `LoadGlobal { dst, idx }` whose `dst` this region defines exactly once (here)
+    // and then never reads is a pinned receiver by every property `ta_recv_regs`
+    // names: the value is whatever the global holds — routinely an OBJECT, which
+    // no numeric home can carry — and no body op wants it in a register. So say
+    // it with that set rather than a second way: `dst` is left untyped and
+    // unhomed, `idx` gets no global home either (the `LoadGlobal` arm in the
+    // typing loop below skips its `glob_order` registration), and all three
+    // emitters lower the load to `emit_recv_slot_store` — two `mov`s that make
+    // the register's FRAME SLOT mirror the interpreted instruction one-for-one,
+    // on exactly the paths that execute it.
+    //
+    // W18: this is what SROA field promotion needs, and what it used to FAKE.
+    // `rewrite_for_field_promotion` turned each object-ref load into `LoadInt 0`
+    // and leaned on the dead-code pass below to delete the register — whose
+    // licence is `!read_outside`, true only while `instr_uses` was blind to 185
+    // of 221 opcodes. W17 made that table exhaustive, the licence started being
+    // correctly refused for any register the enclosing function reuses, and the
+    // fake `LoadInt` pinned an xmm home that was entry-loaded from a slot holding
+    // the object: entry bail on every OSR entry, eviction, recompile at MEM
+    // (bench/object.js 0.89ms → 3.84ms). Nothing here weakens `read_outside`;
+    // the slot store makes the question moot, because it writes what the
+    // interpreter would write, where the interpreter would write it.
+    //
+    // Counting defs with `writes_reg` (which has a `_ => None` arm) is exact
+    // here rather than merely conventional: every emitter declines an op it has
+    // no arm for, and every op the numeric emitters DO admit is in that table —
+    // so a def this misses cannot appear at a non-cold ip of a region that
+    // compiles. Cold ips are skipped on both sides: they are side exits, and the
+    // interpreter re-runs them from the frame slot this load keeps authoritative.
+    {
+        let mut def_n: FxHashMap<u16, u32> = FxHashMap::default();
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            if cold.contains(&(s + off)) {
+                continue;
+            }
+            if let Some(d) = writes_reg(instr) {
+                *def_n.entry(d).or_insert(0) += 1;
+            }
+        }
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            if cold.contains(&(s + off)) {
+                continue;
+            }
+            if let Instr::LoadGlobal { dst, .. } = *instr {
+                if def_n.get(&dst) == Some(&1) && !used.contains(&dst) {
+                    ta_recv_regs.insert(dst);
+                }
+            }
+        }
+    }
     let jump_targets = region_jump_targets(code, s, e);
     // Registers read anywhere OUTSIDE `[s, e]` in the enclosing function. Used
     // by the DV flag-fusion veto here, and by the dead-code / home-sharing
@@ -1382,17 +1449,6 @@ fn plan_region_cold_inner(
             }
         }
     }
-    // Registers that are actually USED as an operand somewhere in the region.
-    // A defined-but-unused reg is DEAD (e.g. an object-ref load neutralised to
-    // `LoadInt 0` by the field-promotion rewrite) — it must NOT be hoisted, or it
-    // would consume a permanent xmm home for a value that's never read.
-    let mut used: FxHashSet<u16> = FxHashSet::default();
-    for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
-        for u in instr_uses(instr) {
-            used.insert(u);
-        }
-    }
     // A pinned-DV get* is NOT a pure value op: an out-of-range pos throws
     // RangeError. Keep its dst out of `dead` — the emitter skips a dead-dst op
     // entirely, which would skip the throw (and leave the dst with no home for
@@ -1744,6 +1800,17 @@ fn plan_region_cold_inner(
             // slot value — a silent tier divergence, not a deopt. (The
             // classic pass's `runs_every_iteration` subsumes this; dropping
             // it is exactly what these forms do.)
+            //
+            // W18 audit: this scan IS a real dominance proof (it fails closed
+            // on any target that could enter the window), which is why the
+            // conditional-def defect never reached it — but it is a THIRD
+            // hand-written one beside `runs_every_iteration` and `live_in`.
+            // For a single-def register the exact statement is `!live_in(r)`,
+            // and this scan is a conservative approximation of it. Folding the
+            // two would REMAT MORE (the scan refuses windows the fixpoint
+            // proves safe), so it is a perf change to measure, not a
+            // correctness one to slip in here — and it needs `region_liveness`
+            // moved above this block. Do not hand-roll a FOURTH.
             let mut last_use = ip;
             let mut use_before_def = false;
             let mut note_use = |uip: usize, last_use: &mut usize, before: &mut bool| {
@@ -2033,10 +2100,11 @@ fn plan_region_cold_inner(
     // last mention. Without this the reuse allocator handed that home to a value
     // defined later in the inner body and the read got the clobbered home on every
     // iteration but the first — a silent wrong answer (W16 defects 2 and 4, one on
-    // the INT tier and one on DOUBLE). `region_live_spans` computes the real live
+    // the INT tier and one on DOUBLE). `region_liveness` computes the real live
     // range; WIDEN with it rather than replace, so an under-modelled use can never
     // make a range narrower than it already was.
-    for (&r, &(la, lb)) in &region_live_spans(code, s, e, cold, &str_imul_touch) {
+    let liveness = region_liveness(code, s, e, cold, &str_imul_touch);
+    for (&r, &(la, lb)) in &liveness.spans {
         if let Some(f) = first_ip.get_mut(&r) {
             *f = (*f).min(la);
         }
@@ -2044,6 +2112,34 @@ fn plan_region_cold_inner(
             *l = (*l).max(lb);
         }
     }
+    // ── the ONE live-in predicate ── "is the value this register holds when the
+    // region is ENTERED still observable?". Every consumer that decides whether a
+    // home must be filled from the frame slot, and whether it may be reused or
+    // shared, asks exactly this and nothing else.
+    //
+    // W18 (silent wrong answer): the consumers below used to ask `first_seen`,
+    // which records only whether a register's FIRST OCCURRENCE inside the region
+    // is a def. That is not dominance. In
+    //
+    //     var t = 2; for (i = 0; i < n; i++) { if (i === 3) { t = 7; } h = h + t; }
+    //
+    // `t`'s first occurrence is the `LoadInt` behind the branch, so it looked
+    // def-first, became `shareable`, and dropped out of `live_in_regs` — whose
+    // invariant is "every flushed home is entry-loaded". On the 39 iterations
+    // that skip the branch the `Add` read an unfilled home: k(40) answered 74
+    // (xmm INT) / 42 (GPR) instead of 266. The file already stated the
+    // distinction one screen up, where constant hoisting guards ITS consumer
+    // with `runs_every_iteration` — this states it once, for the rest.
+    //
+    // UNION with the old flag rather than replacement: `first_seen == false` is a
+    // textual test and the fixpoint is a dataflow one, so neither strictly
+    // contains the other in the presence of an under-modelled use. Taking both
+    // can only ever move a register from "shareable" to "permanent + entry
+    // loaded", never the other way — the direction that is never wrong.
+    let entry_live = liveness.entry_live;
+    let live_in = |r: u16| -> bool {
+        first_seen.get(&r) == Some(&false) || entry_live.contains(&r)
+    };
     let range = |r: u16| -> (usize, usize) {
         // Whole-region (permanent home) if loop-carried (live-in, used before
         // defined) OR a HOISTED constant — hoisted values are materialised once
@@ -2059,7 +2155,7 @@ fn plan_region_cold_inner(
         // pass uses.
         // B97: `read_outside` dropped from this list — those registers now share
         // via write-through instead of pinning a permanent home.
-        if first_seen.get(&r) == Some(&false)
+        if live_in(r)
             || hoisted.contains(&r)
             || (!(admit_wt_share && wt_share_enabled())
                 && read_outside.contains(&r)
@@ -2070,16 +2166,18 @@ fn plan_region_cold_inner(
             (first_ip[&r], last_ip[&r])
         }
     };
-    // Registers eligible to SHARE an xmm: not loop-carried, not a hoisted
+    // Registers eligible to SHARE an xmm: not live-in, not a hoisted
     // constant, and not read after the region. They need no entry load either —
-    // an early exit flushing a stale value into their slot is unobservable.
+    // an early exit flushing a stale value into their slot is unobservable, and
+    // NOT being live-in is precisely what says no in-region read can reach the
+    // home before a def has filled it.
     // B97: `read_outside` no longer disqualifies. Such a register may share a home
     // provided it is WRITTEN THROUGH at every def and skipped by `flush_exit` (see
     // `RegionPlan::write_through`) — that is what makes clobbering the home
     // invisible in its frame slot, which is the property the old rule bought by
     // refusing to share at all.
     let shareable = |r: u16| -> bool {
-        first_seen.get(&r) != Some(&false)
+        !live_in(r)
             && !hoisted.contains(&r)
             && ((admit_wt_share && wt_share_enabled())
                 || !read_outside.contains(&r)
@@ -2758,8 +2856,27 @@ fn region_succs(code: &[Instr], s: usize, e: usize, ip: usize, out: &mut Vec<usi
     }
 }
 
+/// What one backward liveness walk over region `[s, e]` tells its consumers.
+///
+/// Both answers come from the SAME fixpoint because they are the same fact seen
+/// from two sides: `spans` is where a register's value is live, `entry_live` is
+/// whether the value it holds ON ENTRY is one of them. Computing them apart is
+/// how W18's defect happened — the span side already modelled control flow (W16)
+/// while the entry side was still reading a first-mention flag.
+pub(crate) struct RegionLiveness {
+    /// Control-flow-correct live span per register: `(min, max)` ip at which it
+    /// is live, not merely mentioned.
+    pub(crate) spans: FxHashMap<u16, (usize, usize)>,
+    /// Registers LIVE AT `s` — some path from the region's single native entry
+    /// reaches a USE of the register without passing a def of it first. This is
+    /// the region's true live-in set, and the one predicate that answers
+    /// "must this register's home be filled from its frame slot at entry?".
+    pub(crate) entry_live: FxHashSet<u16>,
+}
+
 /// Control-flow-correct LIVE span of every register the region `[s, e]` touches:
-/// the (min, max) ip at which the register is live, not merely mentioned.
+/// the (min, max) ip at which the register is live, not merely mentioned — plus
+/// the region's true live-in set (see [`RegionLiveness`]).
 ///
 /// A `[first mention, last mention]` window is a live range only for
 /// straight-line code, and a region is a loop body that routinely contains an
@@ -2786,14 +2903,20 @@ fn region_succs(code: &[Instr], s: usize, e: usize, ip: usize, out: &mut Vec<usi
 /// under-modelled use can only leave a range where it already was, never shrink
 /// one. A missing def in the model likewise only keeps a value live longer.
 ///
+/// `entry_live` is read off the SAME fixpoint as `live_in[s]`. It fails closed
+/// three ways: an unconverged walk, and a `cold` entry ip (whose row is skipped,
+/// so its `live_in` would be a vacuous empty set) both report every touched
+/// register as live-in, and `extra_touch` uses are modelled here exactly as they
+/// are for the spans.
+///
 /// `extra_touch` entries are `(ip, reg, is_def)`, matching `str_imul_touch`.
-pub(crate) fn region_live_spans(
+pub(crate) fn region_liveness(
     code: &[Instr],
     s: usize,
     e: usize,
     cold: &FxHashSet<usize>,
     extra_touch: &[(usize, u16, bool)],
-) -> FxHashMap<u16, (usize, usize)> {
+) -> RegionLiveness {
     let n = e - s + 1;
     let mut uses: Vec<Vec<u16>> = vec![Vec::new(); n];
     let mut defs: Vec<Vec<u16>> = vec![Vec::new(); n];
@@ -2855,13 +2978,19 @@ pub(crate) fn region_live_spans(
         }
     }
     let mut span: FxHashMap<u16, (usize, usize)> = FxHashMap::default();
-    if !settled {
+    // Fail closed: an unconverged walk under-approximates liveness, and a cold
+    // entry ip has no `live_in` row at all (the loop above skips it). Either way
+    // every touched register is reported live at entry — the answer that keeps a
+    // permanent home and an entry load, which is never wrong, only slower.
+    if !settled || cold.contains(&s) {
+        let mut entry_live: FxHashSet<u16> = FxHashSet::default();
         for k in 0..n {
             for &r in uses[k].iter().chain(defs[k].iter()) {
                 span.insert(r, (s, e));
+                entry_live.insert(r);
             }
         }
-        return span;
+        return RegionLiveness { spans: span, entry_live };
     }
     for k in 0..n {
         let ip = s + k;
@@ -2878,7 +3007,7 @@ pub(crate) fn region_live_spans(
             en.1 = en.1.max(ip);
         }
     }
-    span
+    RegionLiveness { spans: span, entry_live: live_in[0].clone() }
 }
 
 /// Does the instruction at `d` run on EVERY pass through region `[s, e]`?

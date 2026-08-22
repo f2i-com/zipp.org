@@ -907,15 +907,47 @@ pub(crate) fn multi_split_enabled() -> bool {
 /// transfers on each of its nine `Bitwise`/`Math.imul` ops per iteration.
 /// Measured: the row's mix phase 67ms -> 20ms, the row 412ms -> 363ms.
 ///
-/// DARK (opt-in, `ZIPP_GPR_WT_SHARE=1`). The mechanism is sound in itself, but
-/// releasing those whole-region pins makes a SEPARATE, pre-existing defect
-/// reachable on programs that did not reach it before: a local whose only
-/// in-region definition sits on a conditional branch loses its entry load and
-/// reads its home as garbage (`shareable`/`first_seen` treat "the first
-/// occurrence is a def" as "a def dominates every use"). Two soak programs that
-/// answer correctly without this flag answer WRONG with it, and every one of
-/// the 62 mode-cells is restored by turning it off. Fix that defect first, then
-/// re-verify with a soak and make this default-on — it is a one-line change.
+/// W17 shipped this DARK (opt-in, `ZIPP_GPR_WT_SHARE=1`) and W18 turned it on
+/// by default. The mechanism was sound in itself all along; what blocked it was
+/// that releasing those whole-region pins made a SEPARATE, pre-existing defect
+/// REACHABLE on programs that had not reached it before — a local whose only
+/// in-region definition sits on a conditional branch lost its entry load and
+/// read its home as garbage, because `shareable`/`first_seen` treated "the first
+/// occurrence is a def" as "a def dominates every use". Two soak programs that
+/// answered correctly without the flag answered WRONG with it, and all 62
+/// mode-cells were restored by turning it off, so it had to stay dark.
+///
+/// W18 closed that defect at its root: `plan_region::region_liveness` derives
+/// the region's true live-in set from the same backward walk that produces the
+/// live spans, and one `live_in(r)` predicate now answers `shareable` and
+/// `range` — a register reachable-with-no-def keeps a permanent home and an
+/// entry load whether or not it is `read_outside`. What made this mechanism
+/// dangerous was never the sharing; it was that sharing exposed an unfilled
+/// home, and an unfilled home is no longer possible.
+///
+/// Evidence for the flip, in the order it was required:
+///   * both `#[ignore]`d `open_conditional_def_loses_its_entry_load` specs, and
+///     `tests/conditional_def_live_in.rs` (9 non-dominating def shapes x
+///     read-after-loop x 2 tiers, re-run under 7 switch modes), pass — and
+///     fail with only the `live_in` hunk reverted;
+///   * the two soak programs W17's gate named (`W17_GATE_*.js` in the wave
+///     scratchpad) now answer correctly WITH the flag on. The `fnv1a`-shaped
+///     one is the sharp case: it answered `6add77f1` by default and `69dd7568`
+///     under the flag before the fix, and `6add77f1` in both positions after;
+///   * 72,000 generated programs over 12 unused seeds and all 37 modes, half
+///     with the flag on and half off, produced the SAME single divergence in
+///     both halves — a pre-existing negative-`%`-index defect that reproduces
+///     at the committed HEAD with no lane's work applied and is wrong with this
+///     flag OFF too, so it is not this mechanism's.
+///
+/// MEASURED ON THE DEFAULT BUILD (W18, 21 paired reps, one binary, the switch
+/// as the only difference): `parse-large-js` 420ms -> 370ms, **-11.6%
+/// [-12.6, -11.1]** — W17's -11.8% [-12.2, -11.3] reproduced now that the row
+/// is the default. `bench/w18_gprwtshare_default_2026-08-22.json`.
+///
+/// `ZIPP_NO_GPR_WT_SHARE=1` restores the pre-W17 plans byte-for-byte, matching
+/// every other perf mechanism in this file: a memoized latch, read at plan time,
+/// never on a hot path.
 pub(crate) fn gpr_wt_share_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
@@ -923,8 +955,7 @@ pub(crate) fn gpr_wt_share_enabled() -> bool {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_GPR_WT_SHARE").is_some()
-                && std::env::var_os("ZIPP_NO_GPR_WT_SHARE").is_none();
+            let on = std::env::var_os("ZIPP_NO_GPR_WT_SHARE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

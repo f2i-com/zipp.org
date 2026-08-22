@@ -924,14 +924,27 @@ pub(crate) fn rewrite_for_field_promotion(
             Instr::SetProp { name, val, .. } => {
                 p.code[ip] = Instr::StoreGlobal { idx: slot_of(name), src: val };
             }
-            // The object-ref loads (`LoadGlobal o → r`) are now DEAD — their only
-            // consumers (the heap ops above) no longer use `r`. Neutralise them to
-            // `LoadInt 0` so the numeric path doesn't try to promote the object
-            // global itself (a heap ref would fail its is-number entry guard, and
-            // the whole region would bail). `r` stays dead/unread.
-            Instr::LoadGlobal { dst, idx } if idx == fp.obj_global => {
-                p.code[ip] = Instr::LoadInt { dst, val: 0 };
-            }
+            // The object-ref loads (`LoadGlobal o → r`) are LEFT EXACTLY AS THEY
+            // ARE. The rewrite above removed their only in-region consumers, so
+            // `r` is now a `LoadGlobal` whose dst the region never reads — the
+            // shape `plan_region` recognises as a PINNED RECEIVER (`ta_recv_regs`):
+            // no numeric home for `r`, no global home for `o`, and the load lowers
+            // to `emit_recv_slot_store`, two `mov`s that keep `r`'s FRAME SLOT
+            // exactly what the interpreted `LoadGlobal` would have left it. That
+            // is the whole contract this rewrite needs, and it needs no claim
+            // about liveness to hold.
+            //
+            // It used to neutralise these to `LoadInt 0` and rely on the region
+            // planner's dead-code pass to delete the register — whose licence is
+            // `!read_outside`, a fact that was only ever true because `instr_uses`
+            // was blind to 185 of 221 opcodes. W17 made that table exhaustive, the
+            // licence started being (correctly) refused for any register the
+            // enclosing function reuses, and the fake `LoadInt` then pinned an xmm
+            // home entry-loaded from a slot holding the OBJECT: entry bail on every
+            // OSR entry, eviction, recompile at MEM (bench/object.js 0.89ms →
+            // 3.84ms). Worse than slow: had the entry guard ever passed, the exit
+            // flush would have written `0` over the object in a slot the
+            // interpreter reads back at the heap op a deopt resumes on.
             _ => {}
         }
     }
