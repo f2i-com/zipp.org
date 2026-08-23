@@ -1,0 +1,1272 @@
+{
+  "schema_version": 2,
+  "created_utc": "2026-08-23T20:02:30.033291+00:00",
+  "git_commit": "c6ffa2002169008171152a69b625c976d9178b06",
+  "workspace_source": "c6ffa2002169008171152a69b625c976d9178b06",
+  "engine_source_before": {
+    "old": "c6ffa2002169008171152a69b625c976d9178b06+dirty.260efc214d0f7119",
+    "new": "c6ffa2002169008171152a69b625c976d9178b06+dirty.260efc214d0f7119"
+  },
+  "engine_source_after": {
+    "old": "c6ffa2002169008171152a69b625c976d9178b06+dirty.260efc214d0f7119",
+    "new": "c6ffa2002169008171152a69b625c976d9178b06+dirty.260efc214d0f7119"
+  },
+  "engine_binary_sha_before": {
+    "old": "a7943e1b68a63f0bda78d0dfc039474ef5105c81c0cfdfafedf7518901e46307",
+    "new": "a7943e1b68a63f0bda78d0dfc039474ef5105c81c0cfdfafedf7518901e46307"
+  },
+  "engine_binary_sha_after": {
+    "old": "a7943e1b68a63f0bda78d0dfc039474ef5105c81c0cfdfafedf7518901e46307",
+    "new": "a7943e1b68a63f0bda78d0dfc039474ef5105c81c0cfdfafedf7518901e46307"
+  },
+  "publishable": true,
+  "provenance_reasons": [],
+  "engine_drift": [],
+  "harness": {
+    "bench_py_sha256": "85f4f17cc6ffad0732a68c32b64893f8598e43e3a8c5f194fc179b00dee66dfd",
+    "run_real_sh_sha256": "b14a7e33fbd9c007e0bd0bdcde861e1ed7b86dc52cec09734f82120905190c5c"
+  },
+  "bench_input_sha256": {
+    "polymorphic-objects": "3d169c3b27aadb2932b86179aeb009883d37a5730b4221113c573234e2694505"
+  },
+  "headline_benches": [
+    "polymorphic-objects"
+  ],
+  "diagnostic_benches": [],
+  "unclassified_benches": [],
+  "row_set_summaries": {
+    "headline": {
+      "benches": [
+        "polymorphic-objects"
+      ],
+      "geomean_paired_ratio": 0.9373166879165444,
+      "ci95": [
+        0.931784198274298,
+        0.9417844324069878
+      ]
+    },
+    "all_measured": {
+      "benches": [
+        "polymorphic-objects"
+      ],
+      "geomean_paired_ratio": 0.9373166879165444,
+      "ci95": [
+        0.931784198274298,
+        0.9417844324069878
+      ]
+    }
+  },
+  "seed": 1511464998,
+  "reps": 21,
+  "metric": "cold",
+  "report_mode": "modern",
+  "headline_metric": "cold",
+  "timeout_s": 300.0,
+  "bootstrap_samples": 10000,
+  "benches": [
+    "polymorphic-objects"
+  ],
+  "bench_dir": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\real",
+  "baseline": "old",
+  "engines": [
+    {
+      "name": "old",
+      "argv": [
+        "target/field-stream-write/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\field-stream-write\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 6879232,
+      "mtime_ns": 1787515318378050200,
+      "sha256": "a7943e1b68a63f0bda78d0dfc039474ef5105c81c0cfdfafedf7518901e46307",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "c6ffa2002169008171152a69b625c976d9178b06+dirty.260efc214d0f7119",
+        "commit": "c6ffa2002169008171152a69b625c976d9178b06",
+        "dirty": true,
+        "diff_digest": "260efc214d0f7119",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {
+        "ZIPP_NO_FIELD_READ_STREAM": "1"
+      }
+    },
+    {
+      "name": "new",
+      "argv": [
+        "target/field-stream-write/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\field-stream-write\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 6879232,
+      "mtime_ns": 1787515318378050200,
+      "sha256": "a7943e1b68a63f0bda78d0dfc039474ef5105c81c0cfdfafedf7518901e46307",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "c6ffa2002169008171152a69b625c976d9178b06+dirty.260efc214d0f7119",
+        "commit": "c6ffa2002169008171152a69b625c976d9178b06",
+        "dirty": true,
+        "diff_digest": "260efc214d0f7119",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {
+        "ZIPP_FIELD_STREAM_AB": "1"
+      }
+    }
+  ],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {
+    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "c5e8b73f10ecc47ad1be38f14ba6b79cd3af06fcd86637f7b6b857ae209a686e,f204d340535055781952b10ed396de20b842f00a19e430852f7e121ad1ce91f6",
+    "RUST_LOG": "warn"
+  },
+  "schedule": [
+    {
+      "rep": 0,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 1,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 2,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 3,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 4,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 5,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 6,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 7,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 8,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 9,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 10,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 11,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 12,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 13,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 14,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 15,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 16,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 17,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 18,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 19,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 20,
+      "bench_order": [
+        "polymorphic-objects"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.012207200052216649,
+      "cold_s": 0.45910179999191314,
+      "adjusted_s": 0.4468945999396965,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011783000023569912,
+      "cold_s": 0.4280819999985397,
+      "adjusted_s": 0.4162989999749698,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.011434499989263713,
+      "cold_s": 0.4328640999738127,
+      "adjusted_s": 0.421429599984549,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010805699974298477,
+      "cold_s": 0.45487410004716367,
+      "adjusted_s": 0.4440684000728652,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.011093000008258969,
+      "cold_s": 0.4648476999718696,
+      "adjusted_s": 0.4537546999636106,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011225299967918545,
+      "cold_s": 0.4239464999991469,
+      "adjusted_s": 0.41272120003122836,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.01097279996611178,
+      "cold_s": 0.42449870001291856,
+      "adjusted_s": 0.4135259000468068,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010771900007966906,
+      "cold_s": 0.45128640002803877,
+      "adjusted_s": 0.44051450002007186,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010710100003052503,
+      "cold_s": 0.45803719997638837,
+      "adjusted_s": 0.44732709997333586,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011376400012522936,
+      "cold_s": 0.4246100999880582,
+      "adjusted_s": 0.4132336999755353,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.011188299977220595,
+      "cold_s": 0.42568659997778013,
+      "adjusted_s": 0.41449830000055954,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.011112699983641505,
+      "cold_s": 0.45232619997113943,
+      "adjusted_s": 0.4412134999874979,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010861900052987039,
+      "cold_s": 0.45557230000849813,
+      "adjusted_s": 0.4447103999555111,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011452600010670722,
+      "cold_s": 0.4290508999838494,
+      "adjusted_s": 0.41759829997317865,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010797300026752055,
+      "cold_s": 0.42280909995315596,
+      "adjusted_s": 0.4120117999264039,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.011123700009193271,
+      "cold_s": 0.4537628999678418,
+      "adjusted_s": 0.44263919995864853,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010574500018265098,
+      "cold_s": 0.452814300020691,
+      "adjusted_s": 0.4422398000024259,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010624299990013242,
+      "cold_s": 0.4237301000393927,
+      "adjusted_s": 0.41310580004937947,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010644400026649237,
+      "cold_s": 0.4227868000161834,
+      "adjusted_s": 0.41214239998953417,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010720400023274124,
+      "cold_s": 0.45240609999746084,
+      "adjusted_s": 0.4416856999741867,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010494699992705137,
+      "cold_s": 0.44761919998563826,
+      "adjusted_s": 0.4371244999929331,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.01055649999761954,
+      "cold_s": 0.4197062000166625,
+      "adjusted_s": 0.40914970001904294,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010470699984580278,
+      "cold_s": 0.42814700002782047,
+      "adjusted_s": 0.4176763000432402,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010574900021310896,
+      "cold_s": 0.45223180000903085,
+      "adjusted_s": 0.44165689998771995,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.011103999975603074,
+      "cold_s": 0.45018839999102056,
+      "adjusted_s": 0.4390844000154175,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011878499994054437,
+      "cold_s": 0.4219691000180319,
+      "adjusted_s": 0.41009060002397746,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.01070620003156364,
+      "cold_s": 0.42103529995074496,
+      "adjusted_s": 0.4103290999191813,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010745300038252026,
+      "cold_s": 0.4523700999561697,
+      "adjusted_s": 0.4416247999179177,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010731499991379678,
+      "cold_s": 0.4431372999679297,
+      "adjusted_s": 0.43240579997655004,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010385000030510128,
+      "cold_s": 0.43310249998467043,
+      "adjusted_s": 0.4227174999541603,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 15,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010929499985650182,
+      "cold_s": 0.4263290999806486,
+      "adjusted_s": 0.4153995999949984,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 15,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.01038460002746433,
+      "cold_s": 0.4487849000142887,
+      "adjusted_s": 0.4384002999868244,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 16,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010891599988099188,
+      "cold_s": 0.45434880000539124,
+      "adjusted_s": 0.44345720001729205,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 16,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010750899964477867,
+      "cold_s": 0.42159079998964444,
+      "adjusted_s": 0.41083990002516657,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 17,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.011284500011242926,
+      "cold_s": 0.4252312000025995,
+      "adjusted_s": 0.4139466999913566,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 17,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010808200051542372,
+      "cold_s": 0.4450741999899037,
+      "adjusted_s": 0.43426599993836135,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 18,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010821999981999397,
+      "cold_s": 0.45477030001347885,
+      "adjusted_s": 0.44394830003147945,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 18,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.01097269996535033,
+      "cold_s": 0.41989050002302974,
+      "adjusted_s": 0.4089178000576794,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 19,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.01086159999249503,
+      "cold_s": 0.41998389997752383,
+      "adjusted_s": 0.4091222999850288,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 19,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010387099988292903,
+      "cold_s": 0.4518893000204116,
+      "adjusted_s": 0.4415022000321187,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 20,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010718800011090934,
+      "cold_s": 0.4455936999875121,
+      "adjusted_s": 0.43487489997642115,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 20,
+      "bench": "polymorphic-objects",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010741500009316951,
+      "cold_s": 0.4235911999712698,
+      "adjusted_s": 0.41284969996195287,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 78,
+      "stdout_sha256": "f6f98bd4cc403c78c8fd53637a4a2672a7c47b19b37d539f7c850978a7644409",
+      "valid_for_stats": true
+    }
+  ],
+  "summary": {
+    "headline_metric": "cold",
+    "rows": {
+      "polymorphic-objects": {
+        "median_ms": {
+          "old": 452.3700999561697,
+          "new": 423.9464999991469
+        },
+        "paired_ratio": 0.9373166879165444,
+        "paired_ratio_ci95": [
+          0.931784198274298,
+          0.9417844324069878
+        ],
+        "metrics": {
+          "cold": {
+            "median_ms": {
+              "old": 452.3700999561697,
+              "new": 423.9464999991469
+            },
+            "paired_ratio": 0.9373166879165444,
+            "paired_ratio_ci95": [
+              0.931784198274298,
+              0.9417844324069878
+            ],
+            "nonpositive_pairs": 0
+          },
+          "startup": {
+            "median_ms": {
+              "old": 10.771900007966906,
+              "new": 10.929499985650182
+            },
+            "paired_ratio": 1.0068030265993302,
+            "paired_ratio_ci95": [
+              0.9963611991708752,
+              1.0440683885780393
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "old": 441.65689998771995,
+              "new": 413.10580004937947
+            },
+            "paired_ratio": 0.934121714163025,
+            "paired_ratio_ci95": [
+              0.9308073030244365,
+              0.9394506288051128
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "geomean_paired_ratio": 0.9373166879165444,
+    "geomean_paired_ratio_ci95": [
+      0.931784198274298,
+      0.9417844324069878
+    ],
+    "metric_geomean_paired_ratio": {
+      "cold": 0.9373166879165444,
+      "startup": 1.0068030265993302,
+      "adjusted": 0.934121714163025
+    },
+    "startup_median_ms": {
+      "old": 10.771900007966906,
+      "new": 10.929499985650182
+    }
+  },
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "failures": []
+}

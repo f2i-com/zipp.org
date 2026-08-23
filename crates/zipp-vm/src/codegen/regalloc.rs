@@ -5,6 +5,245 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Same-binary escape hatch for the guarded pure cyclic field-read reducer.
+/// Read only while compiling a hot loop; there is no per-iteration switch cost.
+fn field_read_stream_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_FIELD_READ_STREAM").is_none()
+}
+
+fn field_sum_stream_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_FIELD_SUM_STREAM").is_none()
+}
+
+/// Codegen-side copy of the helper's exact bytecode screen.  Returning false
+/// merely omits the prefix; the helper repeats the full recognition before it
+/// can commit, so this function is a profitability/admission filter, never a
+/// correctness assumption.
+fn field_cyclic_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
+    use crate::bytecode::BitwiseOp;
+    if end.checked_sub(start) != Some(16) || end + 1 >= proto.code.len() {
+        return false;
+    }
+    let c = &proto.code;
+    let (limit, i) = match (&c[start], &c[start + 1]) {
+        (Instr::LoadGlobal { dst: limit, .. }, Instr::JumpIfNotLt { a: i, b, target })
+            if b == limit && *target as usize == end + 1 =>
+        {
+            (*limit, *i)
+        }
+        _ => return false,
+    };
+    let (elem, k) = match &c[start + 2] {
+        Instr::GetIndex { dst, key, .. } => (*dst, *key),
+        _ => return false,
+    };
+    let (field, sum) = match (&c[start + 3], &c[start + 4]) {
+        (
+            Instr::GetProp {
+                dst: field, obj, ..
+            },
+            Instr::Add {
+                dst: add,
+                a: sum,
+                b,
+            },
+        ) if *obj == elem && b == field => (*add, *sum),
+        _ => return false,
+    };
+    let zero = match &c[start + 5] {
+        Instr::LoadInt { dst, val: 0 } => *dst,
+        _ => return false,
+    };
+    if !matches!(&c[start + 6], Instr::Bitwise { dst, a, b, op: BitwiseOp::Or }
+        if *dst == sum && *a == field && *b == zero)
+        || !matches!(&c[start + 7], Instr::Move { src, .. } if *src == sum)
+        || !matches!(&c[start + 8], Instr::AddInt { dst, a, imm: 1, upd: true } if *dst == k && *a == k)
+        || !matches!(&c[start + 9], Instr::Move { src, .. } if *src == k)
+    {
+        return false;
+    }
+    let (flag, n) = match &c[start + 10] {
+        Instr::Eq { dst, a, b } if *a == k => (*dst, *b),
+        _ => return false,
+    };
+    matches!(&c[start + 11], Instr::JumpIfFalse { cond, target }
+            if *cond == flag && *target as usize == start + 14)
+        && matches!(&c[start + 12], Instr::LoadInt { dst, val: 0 } if *dst == k)
+        && matches!(&c[start + 13], Instr::Move { src, .. } if *src == k)
+        && matches!(&c[start + 14], Instr::AddInt { dst, a, imm: 1, upd: true } if *dst == i && *a == i)
+        && matches!(&c[start + 15], Instr::Move { src, .. } if *src == i)
+        && matches!(&c[start + 16], Instr::Jump { target } if *target as usize == start)
+        && limit != sum
+        && n != sum
+}
+
+/// Script-body sibling: `sum = (sum + objects[i & mask].field) | 0` with a
+/// power-of-two mask and all loop-carried state in globals. Runtime object,
+/// descriptor and pure-accessor checks remain in the helper.
+fn field_mask_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
+    use crate::bytecode::BitwiseOp;
+    if end.checked_sub(start) != Some(17) || end + 1 >= proto.code.len() {
+        return false;
+    }
+    let c = &proto.code;
+    let (i_head, i_global) = match &c[start] {
+        Instr::LoadGlobal { dst, idx } => (*dst, *idx),
+        _ => return false,
+    };
+    let (limit, limit_global) = match &c[start + 1] {
+        Instr::LoadGlobal { dst, idx } => (*dst, *idx),
+        _ => return false,
+    };
+    if !matches!(&c[start + 2], Instr::JumpIfNotLt { a, b, target }
+            if *a == i_head && *b == limit && *target as usize == end + 1)
+    {
+        return false;
+    }
+    let (sum, sum_global) = match &c[start + 3] {
+        Instr::LoadGlobal { dst, idx } => (*dst, *idx),
+        _ => return false,
+    };
+    let (array, array_global) = match &c[start + 4] {
+        Instr::LoadGlobal { dst, idx } => (*dst, *idx),
+        _ => return false,
+    };
+    let i_index = match &c[start + 5] {
+        Instr::LoadGlobal { dst, idx } if *idx == i_global => *dst,
+        _ => return false,
+    };
+    let (mask_reg, mask) = match &c[start + 6] {
+        Instr::LoadInt { dst, val }
+            if *val >= 0 && ((*val as u32).wrapping_add(1)).is_power_of_two() => (*dst, *val),
+        _ => return false,
+    };
+    let index = match &c[start + 7] {
+        Instr::Bitwise { dst, a, b, op: BitwiseOp::And }
+            if *a == i_index && *b == mask_reg => *dst,
+        _ => return false,
+    };
+    let receiver = match &c[start + 8] {
+        Instr::GetIndex { dst, obj, key } if *obj == array && *key == index => *dst,
+        _ => return false,
+    };
+    let field = match &c[start + 9] {
+        Instr::GetProp { dst, obj, .. } if *obj == receiver => *dst,
+        _ => return false,
+    };
+    let add = match &c[start + 10] {
+        Instr::Add { dst, a, b } if *a == sum && *b == field => *dst,
+        _ => return false,
+    };
+    let zero = match &c[start + 11] {
+        Instr::LoadInt { dst, val: 0 } => *dst,
+        _ => return false,
+    };
+    let reduced = match &c[start + 12] {
+        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if *a == add && *b == zero => *dst,
+        _ => return false,
+    };
+    if !matches!(&c[start + 13],
+        Instr::StoreGlobalStrict { idx, src } | Instr::StoreGlobal { idx, src }
+            if *idx == sum_global && *src == reduced)
+    {
+        return false;
+    }
+    let i_tail = match &c[start + 14] {
+        Instr::LoadGlobal { dst, idx } if *idx == i_global => *dst,
+        _ => return false,
+    };
+    matches!(&c[start + 15], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if *dst == i_tail && *a == i_tail)
+        && matches!(&c[start + 16], Instr::StoreGlobalResolved { idx, src }
+            if *idx == i_global && *src == i_tail)
+        && matches!(&c[start + 17], Instr::Jump { target } if *target as usize == start)
+        && array_global != sum_global
+        && array_global != i_global
+        && array_global != limit_global
+        && sum_global != i_global
+        && sum_global != limit_global
+        && i_global != limit_global
+        && mask >= 0
+}
+
+fn global_field_sum_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
+    use crate::bytecode::BitwiseOp;
+    if end.checked_sub(start).is_none_or(|n| n < 13) || end + 1 >= proto.code.len() {
+        return false;
+    }
+    let c = &proto.code;
+    let (i_head, i_global) = match &c[start] {
+        Instr::LoadGlobal { dst, idx } => (*dst, *idx),
+        _ => return false,
+    };
+    let (limit, limit_global) = match &c[start + 1] {
+        Instr::LoadGlobal { dst, idx } => (*dst, *idx),
+        _ => return false,
+    };
+    if !matches!(&c[start + 2], Instr::JumpIfNotLt { a, b, target }
+            if *a == i_head && *b == limit && *target as usize == end + 1)
+    {
+        return false;
+    }
+    let (mut acc, sum_global) = match &c[start + 3] {
+        Instr::LoadGlobal { dst, idx } => (*dst, *idx),
+        _ => return false,
+    };
+    if sum_global == i_global || sum_global == limit_global || i_global == limit_global {
+        return false;
+    }
+    let mut cursor = start + 4;
+    let mut terms = 0usize;
+    while cursor + 6 < end && terms < 8 {
+        let receiver = match &c[cursor] {
+            Instr::LoadGlobal { dst, .. } => *dst,
+            _ => break,
+        };
+        let field = match &c[cursor + 1] {
+            Instr::GetProp { dst, obj, .. } if *obj == receiver => *dst,
+            _ => break,
+        };
+        let next_acc = match &c[cursor + 2] {
+            Instr::Add { dst, a, b } if *a == acc && *b == field => *dst,
+            _ => break,
+        };
+        acc = next_acc;
+        terms += 1;
+        cursor += 3;
+    }
+    if terms == 0 || cursor + 6 != end {
+        return false;
+    }
+    let zero = match &c[cursor] {
+        Instr::LoadInt { dst, val: 0 } => *dst,
+        _ => return false,
+    };
+    let reduced = match &c[cursor + 1] {
+        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if *a == acc && *b == zero => *dst,
+        _ => return false,
+    };
+    if !matches!(&c[cursor + 2],
+        Instr::StoreGlobalStrict { idx, src } | Instr::StoreGlobal { idx, src }
+            if *idx == sum_global && *src == reduced)
+    {
+        return false;
+    }
+    let i_tail = match &c[cursor + 3] {
+        Instr::LoadGlobal { dst, idx } if *idx == i_global => *dst,
+        _ => return false,
+    };
+    matches!(&c[cursor + 4], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if *dst == i_tail && *a == i_tail)
+        && matches!(&c[cursor + 5], Instr::StoreGlobalResolved { idx, src }
+            if *idx == i_global && *src == i_tail)
+        && matches!(&c[cursor + 6], Instr::Jump { target } if *target as usize == start)
+}
+
+fn field_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
+    field_cyclic_read_stream_shape(proto, start, end)
+        || field_mask_read_stream_shape(proto, start, end)
+        || (field_sum_stream_enabled() && global_field_sum_stream_shape(proto, start, end))
+}
+
 /// ── W20 ── the REGISTER tier's inline-cache probe for `GetProp`.
 ///
 /// This is not `emit_ic_probe`, and the reason is the whole difficulty of the
@@ -401,6 +640,35 @@ pub(crate) fn compile_region_regalloc(
         let xi = 6 + k as u8;
         dynasm!(ops ; movdqu [rsp + xmm_off + (k as i32) * 16], Rx(xi));
     }
+    // A pure cyclic field-read loop can finish as one guarded projection and
+    // modular reduction.  This prefix runs before any home is loaded; a guard
+    // miss has changed no JS state and falls through to the byte-identical
+    // ordinary prologue.  Metered VMs must observe every bytecode charge, so
+    // they never receive the prefix.
+    if meter.is_none() && field_read_stream_enabled() && field_read_stream_shape(proto, s, e) {
+        if let Some(h) = heap {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!(
+                    "[jit] DOUBLE region fn{} [{start},{end}] field-read-stream prefix",
+                    h.func_id
+                );
+            }
+            let packed = ((h.func_id as u64) << 32) | ((s as u64) << 16) | e as u64;
+            let fallback = ops.new_dynamic_label();
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, rbx
+                ; mov r8, QWORD packed as i64
+                ; mov rax, QWORD crate::vm::jit_field_read_loop as usize as i64
+                ; call rax
+                ; test rax, rax
+                ; je => fallback
+                ; mov DWORD [rsi], (e + 1) as i32
+            );
+            emit_region_restore_n(&mut ops, xmm_off, frame);
+            dynasm!(ops ; => fallback);
+        }
+    }
     // ── pinned-TypedArray snapshots ── BEFORE loading any numeric home: jit_ta_snapshot
     // is a win64 call that clobbers volatile xmm0..5 (which double as home registers),
     // but xmm6..15 are already saved above and no home is loaded yet. Each slot gets
@@ -478,8 +746,7 @@ pub(crate) fn compile_region_regalloc(
     let mut own_getter_arms = 0usize;
     for ip in s..=e {
         dynasm!(ops ; => lbl(ip as u32, &in_region));
-        let charged =
-            crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
+        let charged = crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         if plan.jump_targets.contains(&ip) {
             lc = None; // control may arrive here with different home contents
         }
@@ -524,22 +791,24 @@ pub(crate) fn compile_region_regalloc(
             // identity, and the receiver's nullish check is subsumed by the pin
             // (see the plan's idx_obj note). Same or-pattern homes, same copy
             // elision.
-            Instr::Move { dst, src } | Instr::ToPropKey { dst, src, .. } => match home(&plan, dst) {
-                Home::Xmm(d) => {
-                    let srx = xh(&plan, src);
-                    if d != srx && !copy_is_noop(lc, d, srx) {
-                        dynasm!(ops ; movaps Rx(d), Rx(srx));
-                        copy_clobber(&mut lc, d);
-                        lc = Some((d, srx));
-                    } else {
-                        flag_cmp = prev_flag; // nothing emitted; flags still live
+            Instr::Move { dst, src } | Instr::ToPropKey { dst, src, .. } => {
+                match home(&plan, dst) {
+                    Home::Xmm(d) => {
+                        let srx = xh(&plan, src);
+                        if d != srx && !copy_is_noop(lc, d, srx) {
+                            dynasm!(ops ; movaps Rx(d), Rx(srx));
+                            copy_clobber(&mut lc, d);
+                            lc = Some((d, srx));
+                        } else {
+                            flag_cmp = prev_flag; // nothing emitted; flags still live
+                        }
+                    }
+                    Home::Gpr(d) => {
+                        let sg = gh(&plan, src);
+                        dynasm!(ops ; mov Rq(d), Rq(sg));
                     }
                 }
-                Home::Gpr(d) => {
-                    let sg = gh(&plan, src);
-                    dynasm!(ops ; mov Rq(d), Rq(sg));
-                }
-            },
+            }
             // ── pinned receiver / B94 split receiver ── the object has no numeric
             // home (the element emitter reads it via the pin's source; a split
             // receiver's xmm home belongs to the register's NUMERIC half), so it
@@ -803,10 +1072,10 @@ pub(crate) fn compile_region_regalloc(
                 };
                 match fused {
                     Some(op) => match (op, if_false) {
-                        (Cmp::Lt, true) => dynasm!(ops ; jbe => t),  // !(b > a)
-                        (Cmp::Le, true) => dynasm!(ops ; jb => t),   // !(b >= a)
-                        (Cmp::Gt, true) => dynasm!(ops ; jbe => t),  // !(a > b)
-                        (Cmp::Ge, true) => dynasm!(ops ; jb => t),   // !(a >= b)
+                        (Cmp::Lt, true) => dynasm!(ops ; jbe => t), // !(b > a)
+                        (Cmp::Le, true) => dynasm!(ops ; jb => t),  // !(b >= a)
+                        (Cmp::Gt, true) => dynasm!(ops ; jbe => t), // !(a > b)
+                        (Cmp::Ge, true) => dynasm!(ops ; jb => t),  // !(a >= b)
                         (Cmp::Lt, false) => dynasm!(ops ; ja => t),
                         (Cmp::Le, false) => dynasm!(ops ; jae => t),
                         (Cmp::Gt, false) => dynasm!(ops ; ja => t),
@@ -1003,7 +1272,13 @@ pub(crate) fn compile_region_regalloc(
             // because raw bytes flushed from a home as Value bits could otherwise
             // alias a NaN-box tag. Scratch stays rax/rcx/rdx/xmm0: r8-r11 are
             // BOOL_GPRS homes (the endian flags live there).
-            Instr::CallMethod { dst, arg_base, argc, name, .. } => {
+            Instr::CallMethod {
+                dst,
+                arg_base,
+                argc,
+                name,
+                ..
+            } => {
                 let kindid = match proto
                     .string_constants
                     .get(name as usize)
@@ -1162,8 +1437,11 @@ pub(crate) fn compile_region_regalloc(
                 // native code never writes — then re-runs the call. The
                 // re-executed window is exactly the pure Eq, whose operands'
                 // homes were flushed holding the values it would have read.
-                let resume_ip =
-                    if plan.dv_flag_fuse.contains_key(&ip) { ip - 1 } else { ip };
+                let resume_ip = if plan.dv_flag_fuse.contains_key(&ip) {
+                    ip - 1
+                } else {
+                    ip
+                };
                 dynasm!(ops
                     ; jmp => done
                     ; => deopt
@@ -1367,5 +1645,12 @@ pub(crate) fn compile_region_regalloc(
         );
     }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some((JitFn { _buf: buf, entry: entry_ptr, self_binding: None }, needs_ic))
+    Some((
+        JitFn {
+            _buf: buf,
+            entry: entry_ptr,
+            self_binding: None,
+        },
+        needs_ic,
+    ))
 }

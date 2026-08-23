@@ -259,6 +259,33 @@ fn rx_session_bt_grow() {
 /// the acqgate force flag is process-global and phases must not race it.
 #[test]
 fn rx_acqgate_threshold_and_streams() {
+    // The rx-jit/session force hooks are process-global, and the other tests
+    // in this integration binary deliberately toggle them. Run this mechanism
+    // contrast alone in a fresh process: the zero-candidate scans are now fast
+    // enough to finish all their slack iterations while a sibling test holds
+    // the JIT forced off. Pin the classical tier too, so an inherited linear
+    // tier selection cannot bypass the counter this test is meant to exercise.
+    const CHILD: &str = "ZIPP_RX_ACQGATE_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "rx_acqgate_threshold_and_streams",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("ZIPP_REGEX_TIER", "classical")
+            .env("ZIPP_RX_JIT_THRESHOLD", "64")
+            .env_remove("ZIPP_NO_RX_JIT")
+            .env_remove("ZIPP_NO_RX_SCANSESSION")
+            .env_remove("ZIPP_NO_RX_ACQGATE")
+            .status()
+            .expect("spawn isolated acqgate mechanism test");
+        assert!(status.success(), "isolated acqgate test failed: {status}");
+        return;
+    }
+
     // Phase A: a compile-eligible pattern whose prefix search finds no
     // candidate. Zero attempts per scan, so under the gate the slot must
     // stay cold no matter how many scans run. Read-only probing makes this

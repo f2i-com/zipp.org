@@ -18,13 +18,13 @@ use crate::{
 use crate::pikevm;
 use crate::util::to_char_sat;
 
-use core::{fmt, str::FromStr};
 #[cfg(not(feature = "std"))]
 use alloc::{
     boxed::Box,
     string::{String, ToString},
     vec::Vec,
 };
+use core::{fmt, str::FromStr};
 
 pub use parse::Error;
 
@@ -703,6 +703,15 @@ impl Regex {
     #[inline]
     pub fn has_named_groups(&self) -> bool {
         !self.cr.group_names.is_empty()
+    }
+
+    /// Number of numbered capture groups in the compiled program. This is a
+    /// structural property of the pattern and is used by allocation-free
+    /// consumers to prove an indexed capture is an own result element before
+    /// they start an otherwise non-replayable drain.
+    #[inline]
+    pub fn capture_count(&self) -> usize {
+        self.cr.groups as usize
     }
 
     /// PATCH (test hook, see rxjit.rs): whether this regex's JIT slot holds

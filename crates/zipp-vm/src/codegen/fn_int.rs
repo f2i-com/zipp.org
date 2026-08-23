@@ -162,6 +162,7 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::DeleteIndexConcat { dst, .. }
         | Instr::StrConcat { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
+        | Instr::StrAppendIndex { dst, .. }
         | Instr::AddRightPair { dst, .. }
         | Instr::Pad2Concat { dst, .. }
         | Instr::Pad2Conditional { dst, .. }
@@ -257,7 +258,11 @@ pub(crate) fn base_case_returns_arg(proto: &FuncProto) -> Option<(Cmp, i32)> {
             }
             Instr::Jump { target } => ip = *target as usize,
             Instr::Return { src } => {
-                return if *src == ret_reg { Some((cmp, k)) } else { None };
+                return if *src == ret_reg {
+                    Some((cmp, k))
+                } else {
+                    None
+                };
             }
             _ => return None,
         }
@@ -423,7 +428,12 @@ pub(crate) fn compile_proto(
                 // register on its cold (interpreter-bound) paths, where the
                 // interpreter resume actually reads it. No-op here.
             }
-            Instr::Call { dst, callee, arg_base, argc } => {
+            Instr::Call {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            } => {
                 // Self-recursive call (can_compile verified callee == self_slot).
                 // Fast path: a DIRECT native call to this function's own entry
                 // with an inline depth guard — no Rust trampoline. Cold paths
@@ -462,8 +472,18 @@ pub(crate) fn compile_proto(
                         dynasm!(ops ; => do_call);
                         emitted_self_call = true;
                         emit_self_call(
-                            &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst,
-                            callee, arg_base, argc, proto.reg_count, self_val_bits,
+                            &mut ops,
+                            ip,
+                            bail,
+                            self_entry,
+                            self_func_id,
+                            self_call_helper,
+                            dst,
+                            callee,
+                            arg_base,
+                            argc,
+                            proto.reg_count,
+                            self_val_bits,
                         );
                         dynasm!(ops
                             ; jmp => after
@@ -476,8 +496,18 @@ pub(crate) fn compile_proto(
                     _ => {
                         emitted_self_call = true;
                         emit_self_call(
-                            &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst,
-                            callee, arg_base, argc, proto.reg_count, self_val_bits,
+                            &mut ops,
+                            ip,
+                            bail,
+                            self_entry,
+                            self_func_id,
+                            self_call_helper,
+                            dst,
+                            callee,
+                            arg_base,
+                            argc,
+                            proto.reg_count,
+                            self_val_bits,
                         );
                     }
                 }
@@ -542,7 +572,11 @@ pub(crate) fn compile_proto(
     } else {
         None
     };
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding })
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -572,7 +606,11 @@ pub(crate) fn dreg(r: u16) -> i32 {
 /// records `ip` into `[rsi]` (bail_ip), then performs the FULL epilogue
 /// (restore stack + callee-saved regs) and returns — a bare `ret` would leave
 /// the prologue's pushes/`sub rsp` on the stack and corrupt the caller.
-pub(crate) fn emit_bail(ops: &mut dynasmrt::x64::Assembler, ip: usize, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_bail(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+) {
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; jmp => done            // success path skips the bail block
@@ -601,7 +639,11 @@ pub(crate) fn guard_int(ops: &mut dynasmrt::x64::Assembler, r: u16, bail: dynasm
 
 /// Guard that `regs[r]` is Int OR Bool (both used as conditions). Int hi =
 /// 0x7FF9, Bool hi = 0x7FFA. Accept either; else jump to `bail`.
-pub(crate) fn guard_int_or_bool(ops: &mut dynasmrt::x64::Assembler, r: u16, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn guard_int_or_bool(
+    ops: &mut dynasmrt::x64::Assembler,
+    r: u16,
+    bail: dynasmrt::DynamicLabel,
+) {
     let ok = ops.new_dynamic_label();
     dynasm!(ops
         ; mov rax, [rbx + dreg(r)]
@@ -723,7 +765,7 @@ pub(crate) fn jump_if_not_cmp(
     // Jump to target when the comparison is FALSE.
     match cmp {
         Cmp::Lt => dynasm!(ops ; jge => target), // !(a<b) ⇔ a>=b
-        Cmp::Le => dynasm!(ops ; jg => target),   // !(a<=b) ⇔ a>b
+        Cmp::Le => dynasm!(ops ; jg => target),  // !(a<=b) ⇔ a>b
         _ => {}
     }
     emit_bail(ops, ip, bail);

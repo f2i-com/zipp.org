@@ -22,7 +22,12 @@ impl<'p> Vm<'p> {
     /// for reference / potential reuse; not on any hot path.
     #[allow(dead_code)]
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn jit_self_call_impl(&mut self, func_id: u32, args: *const u64, argc: usize) -> u64 {
+    pub(crate) fn jit_self_call_impl(
+        &mut self,
+        func_id: u32,
+        args: *const u64,
+        argc: usize,
+    ) -> u64 {
         // An arrow needs its lexically-captured `this` bound at reg 0; this fast
         // path sets reg 0 = UNDEFINED, so deopt arrows to the interpreter (which
         // rebinds correctly). Recursive arrows that read `this` are rare.
@@ -100,7 +105,13 @@ impl<'p> Vm<'p> {
             // The native callee bailed mid-body: finish this activation on the
             // interpreter over the SAME window via a transient frame. The frame
             // base is `new_base` into self.regs (stable — reserved capacity).
-            self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
+            self.frames.push(Frame {
+                super_done: false,
+                args_obj: u32::MAX,
+                eval_scope: u32::MAX,
+                arg_win: u32::MAX,
+                argc: 0,
+                is_eval: false,
                 func: func_id,
                 base: new_base,
                 ip: bail as usize,
@@ -169,15 +180,13 @@ impl<'p> Vm<'p> {
         // pointer); the callee window sits contiguously above it.
         let regs_base = self.regs.as_ptr() as *const u64;
         // SAFETY: caller_base_ptr lies within self.regs' (non-reallocating) buffer.
-        let caller_base =
-            unsafe { (caller_base_ptr).offset_from(regs_base) } as usize;
+        let caller_base = unsafe { (caller_base_ptr).offset_from(regs_base) } as usize;
         let new_base = caller_base + reg_count;
         let needed = new_base + reg_count;
         if self.regs_would_overflow(needed) {
             // Out of reserved register headroom (very deep): treat as stack
             // overflow — throw so the interpreter surfaces a catchable RangeError.
-            let e =
-                self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+            let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
             self.pending_throw = Some(e);
             return crate::codegen::SELF_CALL_DEOPT;
         }
@@ -203,7 +212,9 @@ impl<'p> Vm<'p> {
         // SAFETY: `needed ≤ capacity`; slots `[0, needed)` are live `Value`s —
         // `[0, len)` from the interpreter, `[len, new_base+reg_count)` written by
         // the native frames whose windows we're spanning.
-        unsafe { self.regs.set_len(needed); }
+        unsafe {
+            self.regs.set_len(needed);
+        }
         if needed > self.regs_hw {
             self.regs_hw = needed;
         }
@@ -219,7 +230,13 @@ impl<'p> Vm<'p> {
         // and the recursion can't re-enter native → no livelock; frames grow to
         // MAX_FRAMES → RangeError on runaway.
         self.jit_recurse_depth += 1;
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -233,7 +250,9 @@ impl<'p> Vm<'p> {
         let r = self.run_loop(stop);
         self.jit_recurse_depth -= 1;
         // SAFETY: restore the entry length (allocation unchanged, slots valid).
-        unsafe { self.regs.set_len(saved_len); }
+        unsafe {
+            self.regs.set_len(saved_len);
+        }
         match r {
             Ok(v) => v.bits(),
             // Threw (e.g. RangeError): leave it in pending_throw and signal the
@@ -308,7 +327,7 @@ impl<'p> Vm<'p> {
             HeapObj::Closure { func, .. } => (*func, cv.heap_index()),
             _ => return SELF_CALL_DEOPT,
         };
-        let (entry, uninit_mask) = match self.jit.cross_entry(fid) {
+        let (entry, uninit_mask, json_walk, markdown_inline) = match self.jit.cross_entry(fid) {
             Some(e) => e,
             None => return SELF_CALL_DEOPT,
         };
@@ -334,6 +353,43 @@ impl<'p> Vm<'p> {
         // helper, so a versions-array reallocation cannot dangle its pins.
         // Cost when no collection is due: two field compares.
         self.maybe_gc();
+        // Exact recursive JSON-tree walk: the plan is attached only to the
+        // closed bytecode shape and unmetered Tier-C bodies. The reducer first
+        // validates the complete graph and numeric globals, and commits no
+        // effect on a decline, so falling through here re-runs instruction 0
+        // exactly like any other guarded cross-call prefix.
+        if argc == 1 {
+            if let Some(plan) = json_walk {
+                let root = Value::from_bits(unsafe { *args });
+                let reduced = {
+                    let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+                    self.json_walk_reduce(plan, cv, root)
+                };
+                if let Some(bits) = reduced {
+                    return bits;
+                }
+            }
+            // Exact ASCII Markdown inline scanner: the compile-time plan pins
+            // the complete source, while the reducer revalidates the live
+            // escape helper and String intrinsics. A decline has no effects and
+            // executes instruction 0 through the normal entry below.
+            // This prefix runs before the callee frame exists, so primitive
+            // method resolution still reflects the caller realm. Admit only a
+            // main-realm callee reached from main-realm code; realm calls fall
+            // through and install their proper execution context first.
+            if self.current_realm_id().is_none() && self.get_function_realm(cv) == 0 {
+                if let Some(plan) = markdown_inline {
+                    let input = Value::from_bits(unsafe { *args });
+                    let reduced = {
+                        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+                        self.markdown_inline_reduce(plan, input)
+                    };
+                    if let Some(bits) = reduced {
+                        return bits;
+                    }
+                }
+            }
+        }
         let proto = self.func(fid as usize);
         if proto.lexical_this {
             return SELF_CALL_DEOPT; // arrow: needs its captured `this` at reg 0
@@ -360,8 +416,7 @@ impl<'p> Vm<'p> {
         }
         let needed = new_base + reg_count;
         if self.regs_would_overflow(needed) {
-            let e =
-                self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+            let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
             self.pending_throw = Some(e);
             self.osr_deopt_exempt = true;
             return CALL_THREW;
@@ -449,8 +504,8 @@ impl<'p> Vm<'p> {
             // over the SAME window via a transient frame (regs stay as the
             // native code left them; ip = the recorded resume point).
             if self.frames.len() >= MAX_FRAMES {
-                let e = self
-                    .alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+                let e =
+                    self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
                 self.pending_throw = Some(e);
                 self.regs.truncate(new_base);
                 self.jit_call_depth -= 1;
@@ -459,7 +514,13 @@ impl<'p> Vm<'p> {
             }
             let arg_win = unsafe { args.offset_from(regs_base) } as u32;
             let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-            self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win, argc: argc as u16, is_eval: false,
+            self.frames.push(Frame {
+                super_done: false,
+                args_obj: u32::MAX,
+                eval_scope: u32::MAX,
+                arg_win,
+                argc: argc as u16,
+                is_eval: false,
                 func: fid,
                 base: new_base,
                 ip: bail as usize,
@@ -610,8 +671,7 @@ impl<'p> Vm<'p> {
                     // A plain NATIVE callee (parseInt, …): invoke via
                     // call_value with this=undefined, exactly like the
                     // interpreter's Call op. Everything else deopts.
-                    if cv.is_heap()
-                        && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
+                    if cv.is_heap() && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
                     {
                         let argv: Vec<Value> =
                             (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -748,10 +808,18 @@ impl<'p> Vm<'p> {
         }
         let idx = recv.heap_index();
         let name = if is_apply { "apply" } else { "call" };
-        if self.fn_props.get(&idx).is_some_and(|m| m.pos(name).is_some()) {
+        if self
+            .fn_props
+            .get(&idx)
+            .is_some_and(|m| m.pos(name).is_some())
+        {
             return None;
         }
-        if self.proto_of.get(&idx).is_some_and(|&p| p != Value::heap(self.fn_proto)) {
+        if self
+            .proto_of
+            .get(&idx)
+            .is_some_and(|&p| p != Value::heap(self.fn_proto))
+        {
             return None;
         }
         // Pristine `%Function.prototype%.call`/`.apply`: the own SLOT index is
@@ -770,11 +838,19 @@ impl<'p> Vm<'p> {
                 _ => (fp_ver, u32::MAX, u32::MAX),
             };
         }
-        let slot = if is_apply { self.ci_pristine.2 } else { self.ci_pristine.1 };
+        let slot = if is_apply {
+            self.ci_pristine.2
+        } else {
+            self.ci_pristine.1
+        };
         if slot == u32::MAX {
             return None;
         }
-        let want = if is_apply { crate::vm::native::FN_APPLY } else { crate::vm::native::FN_CALL };
+        let want = if is_apply {
+            crate::vm::native::FN_APPLY
+        } else {
+            crate::vm::native::FN_CALL
+        };
         let pristine = match self.heap.get(self.fn_proto) {
             HeapObj::Object(m) => {
                 let s = slot as usize;
@@ -793,7 +869,11 @@ impl<'p> Vm<'p> {
         // OrdinaryCallBindThis, applied before the body runs: strict targets
         // take `thisArg` raw; sloppy targets with a nullish/primitive `thisArg`
         // decline (global substitution / boxing stays on the frame call).
-        let this_v = if argc >= 1 { self.get(base, arg_base) } else { Value::UNDEFINED };
+        let this_v = if argc >= 1 {
+            self.get(base, arg_base)
+        } else {
+            Value::UNDEFINED
+        };
         if !self.func(fid as usize).is_strict
             && (this_v.is_nullish() || !self.is_object_value(this_v))
         {
@@ -808,7 +888,11 @@ impl<'p> Vm<'p> {
             return Some(bits);
         }
         // `.apply`: materialize the forwarded args from the argArray.
-        let arr = if argc >= 2 { self.get(base, arg_base + 1) } else { Value::UNDEFINED };
+        let arr = if argc >= 2 {
+            self.get(base, arg_base + 1)
+        } else {
+            Value::UNDEFINED
+        };
         let mut buf = [Value::UNDEFINED; Self::MI_MAX_REGS];
         let nargs = if arr.is_nullish() {
             0
@@ -932,7 +1016,11 @@ impl<'p> Vm<'p> {
             if !val.is_number() {
                 return None;
             }
-            let f = if val.is_int() { val.as_int() as f64 } else { val.as_f64() };
+            let f = if val.is_int() {
+                val.as_int() as f64
+            } else {
+                val.as_f64()
+            };
             Value::int(crate::vm::helpers_num2::to_int32(f))
         } else {
             val
@@ -968,5 +1056,4 @@ impl<'p> Vm<'p> {
     /// any heap allocation on the hot path.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) const MI_MAX_REGS: usize = 24;
-
 }

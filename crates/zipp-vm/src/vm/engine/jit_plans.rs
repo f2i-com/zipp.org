@@ -59,6 +59,132 @@ fn own_accessor_inline_enabled() -> bool {
     }
 }
 
+/// Recognise one exact, effect-free scanner leaf. The match is intentionally
+/// instruction-for-instruction: widening any operand relation without also
+/// widening the helper's replay proof must fail closed to the generic leaf.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn span_code_unit_pred_plan(
+    callee: &crate::bytecode::FuncProto,
+    body: &[Instr],
+    argc: u16,
+) -> Option<crate::codegen::SpanCodeUnitPredPlan> {
+    if !crate::codegen::span_code_unit_pred_enabled()
+        || argc != 2
+        || callee.param_count != 2
+        || body.len() != 19
+    {
+        return None;
+    }
+    let load_global = |i: &Instr| match i {
+        Instr::LoadGlobal { dst, idx } => Some((*dst, *idx)),
+        _ => None,
+    };
+    let get_index = |i: &Instr| match i {
+        Instr::GetIndex { dst, obj, key } => Some((*dst, *obj, *key)),
+        _ => None,
+    };
+    let load_int = |i: &Instr| match i {
+        Instr::LoadInt { dst, val } => Some((*dst, *val)),
+        _ => None,
+    };
+    let eq = |i: &Instr| match i {
+        Instr::Eq { dst, a, b } => Some((*dst, *a, *b)),
+        _ => None,
+    };
+    let jump_false = |i: &Instr| match i {
+        Instr::JumpIfFalse { cond, target } => Some((*cond, *target)),
+        _ => None,
+    };
+
+    let (tags_obj, tags_g) = load_global(&body[0])?;
+    let (kind, obj, index) = get_index(&body[1])?;
+    let (four, 4) = load_int(&body[2])? else {
+        return None;
+    };
+    let (first_flag, a, b) = eq(&body[3])?;
+    let (cond, 12) = jump_false(&body[4])? else {
+        return None;
+    };
+    if obj != tags_obj || index != 1 || a != kind || b != four || cond != first_flag {
+        return None;
+    }
+
+    let (ends_obj, ends_g) = load_global(&body[5])?;
+    let (end, obj, key) = get_index(&body[6])?;
+    let (starts_obj, starts_g) = load_global(&body[7])?;
+    let (start, obj2, key2) = get_index(&body[8])?;
+    let (span, sub_a, sub_b) = match &body[9] {
+        Instr::Sub { dst, a, b } => (*dst, *a, *b),
+        _ => return None,
+    };
+    let (one, 1) = load_int(&body[10])? else {
+        return None;
+    };
+    let (span_flag, eq_a, eq_b) = eq(&body[11])?;
+    let (cond, 18) = jump_false(&body[12])? else {
+        return None;
+    };
+    if obj != ends_obj
+        || key != 1
+        || obj2 != starts_obj
+        || key2 != 1
+        || sub_a != end
+        || sub_b != start
+        || eq_a != span
+        || eq_b != one
+        || cond != span_flag
+    {
+        return None;
+    }
+
+    let (source_obj, source_g) = load_global(&body[13])?;
+    let (starts_obj2, starts_g2) = load_global(&body[14])?;
+    let (start2, obj, key) = get_index(&body[15])?;
+    let (unit, call_obj, name, arg_base, call_argc) = match &body[16] {
+        Instr::CallMethod {
+            dst,
+            obj,
+            name,
+            arg_base,
+            argc,
+        } => (*dst, *obj, *name, *arg_base, *argc),
+        _ => return None,
+    };
+    let (ret_flag, eq_a, eq_b) = eq(&body[17])?;
+    let ret = match &body[18] {
+        Instr::Return { src } => *src,
+        _ => return None,
+    };
+    if starts_g2 != starts_g
+        || starts_obj2 == starts_obj
+        || obj != starts_obj2
+        || key != 1
+        || call_obj != source_obj
+        || arg_base != start2
+        || call_argc != 1
+        || callee.string_constants.get(name as usize).map(String::as_str) != Some("charCodeAt")
+        || eq_a != unit
+        || eq_b != 2
+        || ret != ret_flag
+    {
+        return None;
+    }
+
+    let globals = [tags_g, ends_g, starts_g, source_g];
+    if globals.iter().any(|&g| g > u16::MAX as u32) {
+        return None;
+    }
+    let packed_globals = (globals[0] as u64)
+        | ((globals[1] as u64) << 16)
+        | ((globals[2] as u64) << 32)
+        | ((globals[3] as u64) << 48);
+    Some(crate::codegen::SpanCodeUnitPredPlan {
+        packed_globals,
+        helper: crate::vm::helpers_misc::jit_span_code_unit_pred as usize,
+        pair: None,
+    })
+}
+
 impl<'p> Vm<'p> {
     /// Build the TypedArray pin plan for the OSR region `[start, end]` from
     /// LIVE VM state (called right before `compile_region`, frame `base` on
@@ -110,6 +236,7 @@ impl<'p> Vm<'p> {
                 | Instr::HasProp { dst, .. }
                 | Instr::StrConcat { dst, .. }
                 | Instr::StrAppendInPlace { dst, .. }
+                | Instr::StrAppendIndex { dst, .. }
                 | Instr::AddRightPair { dst, .. }
                 | Instr::Pad2Concat { dst, .. }
                 | Instr::Pad2Conditional { dst, .. }
@@ -130,7 +257,8 @@ impl<'p> Vm<'p> {
         for ins in &proto.code[s..=e] {
             if let Instr::StoreGlobal { idx, .. }
             | Instr::StoreGlobalStrict { idx, .. }
-            | Instr::StoreGlobalResolved { idx, .. } = *ins {
+            | Instr::StoreGlobalResolved { idx, .. } = *ins
+            {
                 stored_globals.insert(idx);
             }
         }
@@ -157,27 +285,31 @@ impl<'p> Vm<'p> {
                 // receiver is still observed here and resolves to ARR_PIN_KIND
                 // only when the inline GetIndex/HasProp can use it.
                 Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => (obj, Recv::Ta),
-                Instr::HasProp { obj, brand: false, .. } => (obj, Recv::Ta),
+                Instr::HasProp {
+                    obj, brand: false, ..
+                } => (obj, Recv::Ta),
                 // A whitelisted DataView `get*` receiver pins the same way
                 // (snapshot: data+byteOffset / byteLength).
-                Instr::CallMethod { obj, name, argc, .. }
-                    if (argc == 1 || argc == 2)
-                        && proto
-                            .string_constants
-                            .get(name as usize)
-                            .is_some_and(|k| crate::codegen::dv_get_kind(k).is_some()) =>
+                Instr::CallMethod {
+                    obj, name, argc, ..
+                } if (argc == 1 || argc == 2)
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| crate::codegen::dv_get_kind(k).is_some()) =>
                 {
                     (obj, Recv::Dv)
                 }
                 // A `str.charCodeAt(i)` receiver pins as a flat-ASCII string
                 // (snapshot: bytes ptr + units), so the access inlines to a
                 // direct byte load instead of the per-op `jit_char_code_at` call.
-                Instr::CallMethod { obj, name, argc, .. }
-                    if argc == 1
-                        && proto
-                            .string_constants
-                            .get(name as usize)
-                            .is_some_and(|k| k == "charCodeAt") =>
+                Instr::CallMethod {
+                    obj, name, argc, ..
+                } if argc == 1
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| k == "charCodeAt") =>
                 {
                     (obj, Recv::Str)
                 }
@@ -191,13 +323,14 @@ impl<'p> Vm<'p> {
                 // would be typed Num and homed as an i64. Gated so
                 // `ZIPP_NO_INT_PUSH=1` leaves every plan in the suite
                 // bit-identical, this arm included.
-                Instr::CallMethod { obj, name, argc, .. }
-                    if crate::codegen::int_push_enabled()
-                        && argc == 1
-                        && proto
-                            .string_constants
-                            .get(name as usize)
-                            .is_some_and(|k| k == "push") =>
+                Instr::CallMethod {
+                    obj, name, argc, ..
+                } if crate::codegen::int_push_enabled()
+                    && argc == 1
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| k == "push") =>
                 {
                     (obj, Recv::Ta)
                 }
@@ -236,9 +369,11 @@ impl<'p> Vm<'p> {
                 }
             };
             let live = match src {
-                TaPinSrc::Global(g) => {
-                    self.globals.get(g as usize).copied().unwrap_or(Value::UNDEFINED)
-                }
+                TaPinSrc::Global(g) => self
+                    .globals
+                    .get(g as usize)
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED),
                 TaPinSrc::Reg(r) => self.get(base, r),
             };
             if !live.is_heap() {
@@ -302,7 +437,11 @@ impl<'p> Vm<'p> {
                 }
                 _ => continue,
             };
-            let slot = match plan.pins.iter().position(|p| p.src == src && p.kind == kind) {
+            let slot = match plan
+                .pins
+                .iter()
+                .position(|p| p.src == src && p.kind == kind)
+            {
                 Some(j) => j,
                 None => {
                     if plan.pins.len() >= 8 {
@@ -361,6 +500,173 @@ impl<'p> Vm<'p> {
             plan.insert(ip);
         }
         plan
+    }
+
+    /// Recognise the caller half of an adjacent
+    /// `span_pred(i, a) || span_pred(i, b)` chain.  The callee recognizer has
+    /// already proved the predicate body.  This proof additionally pins the
+    /// two literal arguments, both live-global loads, both call ICs, and the
+    /// exact shared branch.  A fast helper is effect-free; on any runtime shape
+    /// miss the first call is replayed normally, so the skipped second load and
+    /// call are never elided after an observable action.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn span_code_unit_pair_plan(
+        &self,
+        func_id: u32,
+        caller: &crate::bytecode::FuncProto,
+        range_start: usize,
+        range_end: usize,
+        call_ip: usize,
+        callee_bits: u64,
+        callee_ver: u32,
+        callee_fid: u32,
+    ) -> Option<crate::codegen::SpanCodeUnitPairPlan> {
+        if !crate::codegen::span_code_unit_pair_enabled()
+            || call_ip < range_start.checked_add(3)?
+            || call_ip.checked_add(6)? > range_end
+        {
+            return None;
+        }
+        let code = &caller.code;
+        let Instr::LoadGlobal {
+            dst: first_callee_reg,
+            idx: first_callee_global,
+        } = &code[call_ip - 3]
+        else {
+            return None;
+        };
+        let Instr::LoadGlobal {
+            dst: first_i_reg,
+            idx: first_i_global,
+        } = &code[call_ip - 2]
+        else {
+            return None;
+        };
+        let Instr::LoadInt {
+            dst: first_ch_reg,
+            val: first_ch,
+        } = &code[call_ip - 1]
+        else {
+            return None;
+        };
+        let Instr::Call {
+            dst: first_dst,
+            callee: first_callee,
+            arg_base: first_args,
+            argc: first_argc,
+        } = &code[call_ip]
+        else {
+            return None;
+        };
+        let Instr::JumpIfTrue {
+            cond: first_cond,
+            target: join,
+        } = &code[call_ip + 1]
+        else {
+            return None;
+        };
+        let Instr::LoadGlobal {
+            dst: second_callee_reg,
+            idx: second_callee_global,
+        } = &code[call_ip + 2]
+        else {
+            return None;
+        };
+        let Instr::LoadGlobal {
+            dst: second_i_reg,
+            idx: second_i_global,
+        } = &code[call_ip + 3]
+        else {
+            return None;
+        };
+        let Instr::LoadInt {
+            dst: second_ch_reg,
+            val: second_ch,
+        } = &code[call_ip + 4]
+        else {
+            return None;
+        };
+        let Instr::Call {
+            dst: second_dst,
+            callee: second_callee,
+            arg_base: second_args,
+            argc: second_argc,
+        } = &code[call_ip + 5]
+        else {
+            return None;
+        };
+        let Instr::JumpIfFalse {
+            cond: second_cond,
+            ..
+        } = &code[call_ip + 6]
+        else {
+            return None;
+        };
+
+        if *first_argc != 2
+            || *second_argc != 2
+            || *first_callee_reg != *first_callee
+            || *first_i_reg != *first_args
+            || first_args.checked_add(1) != Some(*first_ch_reg)
+            || *first_cond != *first_dst
+            || *join as usize != call_ip + 6
+            || *second_callee_global != *first_callee_global
+            || *second_i_global != *first_i_global
+            || *second_callee_reg != *second_callee
+            || *second_i_reg != *second_args
+            || second_args.checked_add(1) != Some(*second_ch_reg)
+            || *second_dst != *first_dst
+            || *second_cond != *second_dst
+            || !self.global_slot_directly_routable(*first_callee_global)
+            || !self.global_slot_directly_routable(*first_i_global)
+        {
+            return None;
+        }
+
+        // The three setup destinations skipped on the fused route are compiler
+        // temporaries.  Prove that syntactically instead of relying on today's
+        // allocator convention: they must be distinct from the observable bool
+        // result and never be read again anywhere after the shared branch.
+        // `instr_uses` is exhaustive over the bytecode enum; scanning beyond
+        // later redefinitions is intentionally conservative and fail-closed.
+        let skipped = [*second_callee_reg, *second_i_reg, *second_ch_reg];
+        if skipped.iter().any(|&r| r == *second_dst)
+            || skipped[0] == skipped[1]
+            || skipped[0] == skipped[2]
+            || skipped[1] == skipped[2]
+            || code[call_ip + 6..].iter().any(|instr| {
+                crate::codegen::instr_uses(instr)
+                    .iter()
+                    .any(|r| skipped.contains(r))
+            })
+        {
+            return None;
+        }
+
+        // No control edge may enter after either of the first call's literal
+        // setup ops; otherwise the baked first code unit need not be live.
+        if code.iter().filter_map(slot_guard_jump_target).any(|target| {
+            let target = target as usize;
+            target > call_ip - 3 && target <= call_ip
+        }) {
+            return None;
+        }
+
+        // The second call must resolve to the identical live closure/version.
+        // This guard is a compile-time witness only; the first emitted identity
+        // guard is sufficient at runtime because the fast helper invokes no
+        // user code between the two direct global reads.
+        let (bits2, ver2, fid2, _) = self.ic_call_mono(func_id, call_ip + 5)?;
+        if bits2 != callee_bits || ver2 != callee_ver || fid2 != callee_fid {
+            return None;
+        }
+
+        let packed_units = (*first_ch as u32 as u64) | ((*second_ch as u32 as u64) << 32);
+        Some(crate::codegen::SpanCodeUnitPairPlan {
+            packed_units,
+            resume_ip: (call_ip + 6) as u32,
+            helper: crate::vm::helpers_misc::jit_span_code_unit_pair as usize,
+        })
     }
 
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -461,8 +767,10 @@ impl<'p> Vm<'p> {
             // `ri` for real.
             let mut nested = rustc_hash::FxHashMap::default();
             let mut extra_regs = 0u16;
-            let mut nested_upvals: rustc_hash::FxHashMap<u16, u64> = rustc_hash::FxHashMap::default();
-            let mut nested_consts: rustc_hash::FxHashMap<u32, u64> = rustc_hash::FxHashMap::default();
+            let mut nested_upvals: rustc_hash::FxHashMap<u16, u64> =
+                rustc_hash::FxHashMap::default();
+            let mut nested_consts: rustc_hash::FxHashMap<u32, u64> =
+                rustc_hash::FxHashMap::default();
             let body = match callee_leaf_ok(callee) {
                 Some(b) => b,
                 None => {
@@ -523,9 +831,7 @@ impl<'p> Vm<'p> {
                 }
                 Instr::StoreGlobal { idx, .. }
                 | Instr::StoreGlobalStrict { idx, .. }
-                | Instr::StoreGlobalResolved { idx, .. } => {
-                    self.global_slot_directly_routable(idx)
-                }
+                | Instr::StoreGlobalResolved { idx, .. } => self.global_slot_directly_routable(idx),
                 _ => true,
             }) {
                 if log {
@@ -576,12 +882,9 @@ impl<'p> Vm<'p> {
             // could itself be a param (the remap would misroute its read).
             let alias_params = if crate::codegen::splice_alias_enabled() {
                 match crate::codegen::splice_body_defs(&body) {
-                    Some(defs)
-                        if nested.values().all(|g| g.callee_reg > callee.param_count) =>
-                    {
+                    Some(defs) if nested.values().all(|g| g.callee_reg > callee.param_count) => {
                         let mut m = 0u64;
-                        let n_alias =
-                            (argc.min(callee.param_count) as u64).min(63);
+                        let n_alias = (argc.min(callee.param_count) as u64).min(63);
                         for i in 0..n_alias {
                             if defs & (1u64 << (1 + i)) == 0 {
                                 m |= 1u64 << i;
@@ -602,8 +905,7 @@ impl<'p> Vm<'p> {
             let slot_guard = if !crate::codegen::splice_slotgen_enabled() {
                 None
             } else {
-                match self.slot_guard_key(func_id, start as usize, ip, callee_bits, callee_ver)
-                {
+                match self.slot_guard_key(func_id, start as usize, ip, callee_bits, callee_ver) {
                     Ok((g, addr, gen)) => {
                         if log {
                             eprintln!("[leaf] fn{func_id}@{ip} slot_guard=g{g}@gen{gen}");
@@ -654,6 +956,29 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            let mut span_code_unit_pred = span_code_unit_pred_plan(callee, &body, argc);
+            if let Some(pred) = span_code_unit_pred.as_mut() {
+                pred.pair = self.span_code_unit_pair_plan(
+                    func_id,
+                    caller,
+                    start as usize,
+                    end as usize,
+                    ip,
+                    callee_bits,
+                    callee_ver,
+                    fid,
+                );
+            }
+            if log && span_code_unit_pred.is_some() {
+                eprintln!(
+                    "[leaf] fn{func_id}@{ip} callee fn{fid} SPAN-CODEUNIT-PRED"
+                );
+                if span_code_unit_pred.is_some_and(|p| p.pair.is_some()) {
+                    eprintln!(
+                        "[leaf] fn{func_id}@{ip} callee fn{fid} SPAN-CODEUNIT-PAIR"
+                    );
+                }
+            }
             if log {
                 // W11 mechanism proof: the fill mask must come out ~0 on the
                 // hot bodies (tokIs/mix) or the cut silently no-ops.
@@ -682,6 +1007,7 @@ impl<'p> Vm<'p> {
                     alias_params,
                     slot_guard,
                     typed_lane,
+                    span_code_unit_pred,
                 },
             );
         }
@@ -766,7 +1092,11 @@ impl<'p> Vm<'p> {
         if self.globals[g as usize].bits() != callee_bits {
             return Err("live-slot-differs-from-ic");
         }
-        if self.heap.version_of(Value::from_bits(callee_bits).heap_index()) != callee_ver {
+        if self
+            .heap
+            .version_of(Value::from_bits(callee_bits).heap_index())
+            != callee_ver
+        {
             return Err("callee-version-stale");
         }
         // Same absolute-VM-address pattern as `epoch_ptr` below: the Vm (and
@@ -821,9 +1151,13 @@ impl<'p> Vm<'p> {
             // the SAME pair `emit_inline_method_call` binds from, taken from the
             // same instruction, so the two cannot disagree.
             let (obj, name, kind, arg_base, argc) = match caller.code[ip] {
-                Instr::CallMethod { obj, name, arg_base, argc, .. } => {
-                    (obj, name, MiKind::Method, arg_base, argc)
-                }
+                Instr::CallMethod {
+                    obj,
+                    name,
+                    arg_base,
+                    argc,
+                    ..
+                } => (obj, name, MiKind::Method, arg_base, argc),
                 Instr::GetProp { obj, name, .. } => (obj, name, MiKind::Getter, 0, 0),
                 Instr::SetProp { obj, name, .. } => (obj, name, MiKind::Setter, 0, 0),
                 _ => continue,
@@ -858,7 +1192,9 @@ impl<'p> Vm<'p> {
             }
             // Best-effort: the dense elements of the array a `arr[idx]` receiver
             // came from (supplements recording; the temp may be reused).
-            if let Some(arr_reg) = Self::mi_last_getindex_array(&caller.code, start as usize, ip, obj) {
+            if let Some(arr_reg) =
+                Self::mi_last_getindex_array(&caller.code, start as usize, ip, obj)
+            {
                 if let Some(&av) = self.regs.get(base + arr_reg as usize) {
                     if av.is_heap() {
                         if let HeapObj::Array(items) = self.heap.get(av.heap_index()) {
@@ -919,7 +1255,14 @@ impl<'p> Vm<'p> {
                     shapes.len()
                 );
             }
-            plan.insert(ip, MethodInlinePlan { reg_window, win_top, shapes });
+            plan.insert(
+                ip,
+                MethodInlinePlan {
+                    reg_window,
+                    win_top,
+                    shapes,
+                },
+            );
         }
         plan
     }
@@ -970,7 +1313,8 @@ impl<'p> Vm<'p> {
         // The B75/B76 surveys showed `inner-call-has-args` was EVERY remaining
         // nested reject on the call-heavy rows (13 sites in parse-large-js alone).
         // Resolve the wrapper's own call site from ITS live IC.
-        let Some((bits, ver, inner_fid, inner_closure)) = self.ic_call_mono(outer_fid, call_at) else {
+        let Some((bits, ver, inner_fid, inner_closure)) = self.ic_call_mono(outer_fid, call_at)
+        else {
             nested_reject("inner-call-site-not-monomorphic");
             return None;
         };
@@ -1013,14 +1357,17 @@ impl<'p> Vm<'p> {
         let const_off = outer.constants.len() as u32;
         let mut consts = rustc_hash::FxHashMap::default();
         let mut flat: Vec<Instr> = outer_body[..=call_at].to_vec(); // keep the Call as the guard marker
-        // Seed the inner's params from the outer call's arg registers. Params the
-        // call does not fill stay at the emitter's undefined zero-fill.
+                                                                    // Seed the inner's params from the outer call's arg registers. Params the
+                                                                    // call does not fill stay at the emitter's undefined zero-fill.
         let (arg_base, argc) = match outer_body[call_at] {
             Instr::Call { arg_base, argc, .. } => (arg_base, argc),
             _ => return None,
         };
         for k in 0..argc.min(inner.param_count) {
-            flat.push(Instr::Move { dst: off + 1 + k, src: arg_base + k });
+            flat.push(Instr::Move {
+                dst: off + 1 + k,
+                src: arg_base + k,
+            });
         }
         for instr in &inner_body[..inner_body.len() - 1] {
             if let Instr::LoadConst { idx, .. } = *instr {
@@ -1060,7 +1407,11 @@ impl<'p> Vm<'p> {
                 upvals.insert(i, Value::heap(self.closure_upvalue(cidx, i)).bits());
             }
         }
-        let guard = NestedGuard { callee_reg, bits, ver };
+        let guard = NestedGuard {
+            callee_reg,
+            bits,
+            ver,
+        };
         Some((flat, guard, inner.reg_count, upvals, consts))
     }
 
@@ -1068,7 +1419,12 @@ impl<'p> Vm<'p> {
     /// `arr[idx]` receiver came from), so the planner can bake an arm per array
     /// element. `None` if `obj_reg` was last produced by something else.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn mi_last_getindex_array(code: &[Instr], start: usize, ip: usize, obj_reg: u16) -> Option<u16> {
+    pub(crate) fn mi_last_getindex_array(
+        code: &[Instr],
+        start: usize,
+        ip: usize,
+        obj_reg: u16,
+    ) -> Option<u16> {
         let mut arr = None;
         for instr in &code[start..ip] {
             if let Instr::GetIndex { dst, obj, .. } = *instr {
@@ -1218,13 +1574,17 @@ impl<'p> Vm<'p> {
         // ── bake each `super.m()` in the body (Stage 3) ──
         let super_win = reg_window + callee.reg_count;
         let mut supers = rustc_hash::FxHashMap::default();
-        let mut super_kinds: rustc_hash::FxHashMap<
-            usize,
-            rustc_hash::FxHashMap<u32, (u32, bool)>,
-        > = rustc_hash::FxHashMap::default();
+        let mut super_kinds: rustc_hash::FxHashMap<usize, rustc_hash::FxHashMap<u32, (u32, bool)>> =
+            rustc_hash::FxHashMap::default();
         let mut max_super_regs = 0u16;
         for (bi, instr) in body.iter().enumerate() {
-            if let Instr::SuperMethod { home_class_id, name: sname, argc: sargc, .. } = *instr {
+            if let Instr::SuperMethod {
+                home_class_id,
+                name: sname,
+                argc: sargc,
+                ..
+            } = *instr
+            {
                 if sargc != 0 {
                     return None; // v1: 0-arg super only
                 }
@@ -1440,7 +1800,10 @@ impl<'p> Vm<'p> {
                 let (f, addr) = if is_setter {
                     (a.setter, std::ptr::addr_of!(m.attrs[slot].setter) as u64)
                 } else {
-                    (m.val_at(slot), vals_ptr + (slot * std::mem::size_of::<Value>()) as u64)
+                    (
+                        m.val_at(slot),
+                        vals_ptr + (slot * std::mem::size_of::<Value>()) as u64,
+                    )
                 };
                 // A `defineProperty` accessor is an ARBITRARY function, unlike a
                 // class accessor. `ic_plain_fn` is the same screen the
@@ -1486,20 +1849,34 @@ impl<'p> Vm<'p> {
         // re-check must read (see `ic_super_setter_baked`).
         let super_win = reg_window + callee.reg_count;
         let mut supers = rustc_hash::FxHashMap::default();
-        let mut super_kinds: rustc_hash::FxHashMap<
-            usize,
-            rustc_hash::FxHashMap<u32, (u32, bool)>,
-        > = rustc_hash::FxHashMap::default();
+        let mut super_kinds: rustc_hash::FxHashMap<usize, rustc_hash::FxHashMap<u32, (u32, bool)>> =
+            rustc_hash::FxHashMap::default();
         let mut max_super_regs = 0u16;
         for (bi, instr) in body.iter().enumerate() {
             let (sr, sname, is_store) = match *instr {
-                Instr::SuperGet { home_class_id, name: sname, .. } => {
+                Instr::SuperGet {
+                    home_class_id,
+                    name: sname,
+                    ..
+                } => {
                     let skey = &callee.string_constants[sname as usize];
-                    (self.ic_super_getter_baked(fid, bi, home_class_id, skey)?, sname, false)
+                    (
+                        self.ic_super_getter_baked(fid, bi, home_class_id, skey)?,
+                        sname,
+                        false,
+                    )
                 }
-                Instr::SuperSet { home_class_id, name: sname, .. } => {
+                Instr::SuperSet {
+                    home_class_id,
+                    name: sname,
+                    ..
+                } => {
                     let skey = &callee.string_constants[sname as usize];
-                    (self.ic_super_setter_baked(fid, bi, home_class_id, skey)?, sname, true)
+                    (
+                        self.ic_super_setter_baked(fid, bi, home_class_id, skey)?,
+                        sname,
+                        true,
+                    )
                 }
                 _ => continue,
             };
@@ -1614,8 +1991,16 @@ impl<'p> Vm<'p> {
             // GetProp{obj:0} reads need a non-accessor slot; SetProp{obj:0} (a
             // setter's store) needs a non-accessor WRITABLE slot.
             let (fname, need_writable) = match *instr {
-                Instr::GetProp { obj: 0, name: fname, .. } => (fname, false),
-                Instr::SetProp { obj: 0, name: fname, .. } => (fname, true),
+                Instr::GetProp {
+                    obj: 0,
+                    name: fname,
+                    ..
+                } => (fname, false),
+                Instr::SetProp {
+                    obj: 0,
+                    name: fname,
+                    ..
+                } => (fname, true),
                 _ => continue,
             };
             let fkey = &strconsts[fname as usize];
@@ -1704,9 +2089,7 @@ impl<'p> Vm<'p> {
                 I::AddInt { a, .. } | I::Neg { a, .. } => a == dst,
                 // `base` is deliberately NOT compared: the inlined emission
                 // ignores it. The argument window is a real read.
-                I::SuperMethod { arg_base, argc, .. } => {
-                    (0..argc).any(|k| arg_base + k == dst)
-                }
+                I::SuperMethod { arg_base, argc, .. } => (0..argc).any(|k| arg_base + k == dst),
                 I::SuperGet { .. } => false,
                 I::SuperSet { val, .. } => val == dst,
                 // A second capture in the same body may reuse the temp; it writes,
@@ -1851,7 +2234,6 @@ impl<'p> Vm<'p> {
     #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
     #[inline]
     pub(crate) fn bump_regs_hw(&mut self, _needed: usize) {}
-
 }
 
 /// Offset every REGISTER operand of a leaf-body instruction by `off`, so a
@@ -1872,48 +2254,142 @@ fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
     let c = |i: u32| i + const_off;
     Some(match *i {
         Instr::LoadInt { dst, val } => Instr::LoadInt { dst: s(dst), val },
-        Instr::LoadConst { dst, idx } => Instr::LoadConst { dst: s(dst), idx: c(idx) },
+        Instr::LoadConst { dst, idx } => Instr::LoadConst {
+            dst: s(dst),
+            idx: c(idx),
+        },
         Instr::LoadBool { dst, val } => Instr::LoadBool { dst: s(dst), val },
         Instr::LoadUndefined { dst } => Instr::LoadUndefined { dst: s(dst) },
-        Instr::Move { dst, src } => Instr::Move { dst: s(dst), src: s(src) },
+        Instr::Move { dst, src } => Instr::Move {
+            dst: s(dst),
+            src: s(src),
+        },
         Instr::LoadGlobal { dst, idx } => Instr::LoadGlobal { dst: s(dst), idx },
         Instr::StoreGlobal { idx, src } => Instr::StoreGlobal { idx, src: s(src) },
         Instr::StoreGlobalStrict { idx, src } => Instr::StoreGlobalStrict { idx, src: s(src) },
         Instr::StoreGlobalResolved { idx, src } => Instr::StoreGlobalResolved { idx, src: s(src) },
-        Instr::Add { dst, a, b } => Instr::Add { dst: s(dst), a: s(a), b: s(b) },
-        Instr::AddRightPair { dst, a, b, c: r, in_place } => Instr::AddRightPair {
+        Instr::Add { dst, a, b } => Instr::Add {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::AddRightPair {
+            dst,
+            a,
+            b,
+            c: r,
+            in_place,
+        } => Instr::AddRightPair {
             dst: s(dst),
             a: s(a),
             b: s(b),
             c: s(r),
             in_place,
         },
-        Instr::Pad2Concat { dst, src, zero } => {
-            Instr::Pad2Concat { dst: s(dst), src: s(src), zero }
-        }
-        Instr::Pad2Conditional { dst, src } => {
-            Instr::Pad2Conditional { dst: s(dst), src: s(src) }
-        }
-        Instr::Sub { dst, a, b } => Instr::Sub { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Mul { dst, a, b } => Instr::Mul { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Div { dst, a, b } => Instr::Div { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Mod { dst, a, b } => Instr::Mod { dst: s(dst), a: s(a), b: s(b) },
-        Instr::AddInt { dst, a, imm, upd } => Instr::AddInt { dst: s(dst), a: s(a), imm, upd },
-        Instr::Neg { dst, a } => Instr::Neg { dst: s(dst), a: s(a) },
-        Instr::Bitwise { dst, a, b, op } => Instr::Bitwise { dst: s(dst), a: s(a), b: s(b), op },
-        Instr::Eq { dst, a, b } => Instr::Eq { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Ne { dst, a, b } => Instr::Ne { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Lt { dst, a, b } => Instr::Lt { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Le { dst, a, b } => Instr::Le { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Gt { dst, a, b } => Instr::Gt { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Ge { dst, a, b } => Instr::Ge { dst: s(dst), a: s(a), b: s(b) },
-        Instr::GetIndex { dst, obj, key } => Instr::GetIndex { dst: s(dst), obj: s(obj), key: s(key) },
-        Instr::CallMethod { dst, obj, name, arg_base, argc } => {
-            Instr::CallMethod { dst: s(dst), obj: s(obj), name, arg_base: s(arg_base), argc }
-        }
-        Instr::MathOp { dst, op, arg_base, argc } => {
-            Instr::MathOp { dst: s(dst), op, arg_base: s(arg_base), argc }
-        }
+        Instr::Pad2Concat { dst, src, zero } => Instr::Pad2Concat {
+            dst: s(dst),
+            src: s(src),
+            zero,
+        },
+        Instr::Pad2Conditional { dst, src } => Instr::Pad2Conditional {
+            dst: s(dst),
+            src: s(src),
+        },
+        Instr::Sub { dst, a, b } => Instr::Sub {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Mul { dst, a, b } => Instr::Mul {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Div { dst, a, b } => Instr::Div {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Mod { dst, a, b } => Instr::Mod {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::AddInt { dst, a, imm, upd } => Instr::AddInt {
+            dst: s(dst),
+            a: s(a),
+            imm,
+            upd,
+        },
+        Instr::Neg { dst, a } => Instr::Neg {
+            dst: s(dst),
+            a: s(a),
+        },
+        Instr::Bitwise { dst, a, b, op } => Instr::Bitwise {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+            op,
+        },
+        Instr::Eq { dst, a, b } => Instr::Eq {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Ne { dst, a, b } => Instr::Ne {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Lt { dst, a, b } => Instr::Lt {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Le { dst, a, b } => Instr::Le {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Gt { dst, a, b } => Instr::Gt {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Ge { dst, a, b } => Instr::Ge {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::GetIndex { dst, obj, key } => Instr::GetIndex {
+            dst: s(dst),
+            obj: s(obj),
+            key: s(key),
+        },
+        Instr::CallMethod {
+            dst,
+            obj,
+            name,
+            arg_base,
+            argc,
+        } => Instr::CallMethod {
+            dst: s(dst),
+            obj: s(obj),
+            name,
+            arg_base: s(arg_base),
+            argc,
+        },
+        Instr::MathOp {
+            dst,
+            op,
+            arg_base,
+            argc,
+        } => Instr::MathOp {
+            dst: s(dst),
+            op,
+            arg_base: s(arg_base),
+            argc,
+        },
         Instr::UpvalGet { dst, idx } => Instr::UpvalGet { dst: s(dst), idx },
         Instr::UpvalSet { idx, src } => Instr::UpvalSet { idx, src: s(src) },
         _ => return None,
@@ -1954,6 +2430,7 @@ fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
         | Instr::GetIndex { dst, .. }
         | Instr::GetProp { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
+        | Instr::StrAppendIndex { dst, .. }
         | Instr::AddRightPair { dst, .. }
         | Instr::Pad2Concat { dst, .. }
         | Instr::Pad2Conditional { dst, .. }

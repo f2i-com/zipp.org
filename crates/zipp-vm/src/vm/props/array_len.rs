@@ -18,7 +18,10 @@ impl<'p> Vm<'p> {
         }
         Ok(match self.heap.get(obj.heap_index()) {
             HeapObj::Object(m) => m.extensible,
-            _ => self.arr_props.get(&obj.heap_index()).map_or(true, |m| m.extensible),
+            _ => self
+                .arr_props
+                .get(&obj.heap_index())
+                .map_or(true, |m| m.extensible),
         })
     }
 
@@ -36,8 +39,7 @@ impl<'p> Vm<'p> {
         if !m.has_element_key() {
             return None;
         }
-        let mut buf = [0u8; 20];
-        let p = m.pos(crate::heap::index_key(&mut buf, i))?;
+        let p = m.element_pos(i)?;
         Some((m.attrs[p], m.vals[p]))
     }
 
@@ -56,7 +58,9 @@ impl<'p> Vm<'p> {
     /// properties must keep asking [`Self::arr_props`] directly.
     #[inline]
     pub(crate) fn array_elements_overlaid(&self, idx: u32) -> bool {
-        self.arr_props.get(&idx).is_some_and(|m| m.overlays_elements())
+        self.arr_props
+            .get(&idx)
+            .is_some_and(|m| m.overlays_elements())
     }
 
     /// The JS `length` of the array at `arr_idx`: the dense element count, unless
@@ -141,7 +145,11 @@ impl<'p> Vm<'p> {
 
     /// `Object.defineProperties(obj, props)` — define each own enumerable key of
     /// `props` as a descriptor on `obj`.
-    pub(crate) fn object_define_properties(&mut self, obj: Value, props: Value) -> Result<(), Thrown> {
+    pub(crate) fn object_define_properties(
+        &mut self,
+        obj: Value,
+        props: Value,
+    ) -> Result<(), Thrown> {
         // ObjectDefineProperties: props = ToObject(Properties) — null/undefined
         // throw (to_object boxes them like Object(), so guard first); other
         // primitives box (a String's index chars then fail ToPropertyDescriptor).
@@ -160,7 +168,11 @@ impl<'p> Vm<'p> {
             ordered
                 .iter()
                 .filter(|i| live(i) && !is_hidden_key(&m.keys[**i]))
-                .chain(ordered.iter().filter(|i| live(i) && is_hidden_key(&m.keys[**i])))
+                .chain(
+                    ordered
+                        .iter()
+                        .filter(|i| live(i) && is_hidden_key(&m.keys[**i])),
+                )
                 .map(|i| m.keys[*i].clone())
                 .collect()
         };
@@ -201,7 +213,12 @@ impl<'p> Vm<'p> {
         // object (arr_props) — not only a plain Object.
         let keys: Vec<String> = match self.heap.get(pidx) {
             HeapObj::Object(m) => enum_keys(m),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => {
                 self.fn_props.get(&pidx).map(enum_keys).unwrap_or_default()
             }
             // A boxed String (e.g. `Object.create(O, "abc")` → ToObject) exposes its
@@ -329,10 +346,17 @@ impl<'p> Vm<'p> {
         if !obj.is_heap() {
             return Ok(());
         }
-        if let Some(slot) =
-            self.module_namespaces.get(&obj.heap_index()).and_then(|m| m.get(key)).copied()
+        if let Some(slot) = self
+            .module_namespaces
+            .get(&obj.heap_index())
+            .and_then(|m| m.get(key))
+            .copied()
         {
-            let live = self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+            let live = self
+                .globals
+                .get(slot as usize)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
             if live.is_uninitialized() {
                 return Err(Thrown(format!(
                     "ReferenceError: Cannot access '{key}' before initialization"
@@ -353,8 +377,11 @@ impl<'p> Vm<'p> {
             let mut keys: Vec<&String> = m.keys().collect();
             keys.sort();
             for k in keys {
-                let live =
-                    self.globals.get(m[k] as usize).copied().unwrap_or(Value::UNDEFINED);
+                let live = self
+                    .globals
+                    .get(m[k] as usize)
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED);
                 if live.is_uninitialized() {
                     return Err(Thrown(format!(
                         "ReferenceError: Cannot access '{k}' before initialization"
@@ -489,5 +516,4 @@ impl<'p> Vm<'p> {
             Ok(false)
         }
     }
-
 }

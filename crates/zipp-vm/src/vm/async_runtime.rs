@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -33,6 +33,7 @@ mod asyncstats {
     static REUSED: AtomicU64 = AtomicU64::new(0);
     static GREW: AtomicU64 = AtomicU64::new(0);
     static VALUES: AtomicU64 = AtomicU64::new(0);
+    static INLINE_AWAITS: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     fn enabled() -> bool {
@@ -82,6 +83,13 @@ mod asyncstats {
         }
     }
 
+    #[inline]
+    pub(super) fn inline_await() {
+        if enabled() {
+            INLINE_AWAITS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     static REUSE_ON: AtomicU8 = AtomicU8::new(2);
 
     /// `ZIPP_NO_BUF_REUSE=1` restores `Vec::split_off` at every suspension --
@@ -111,9 +119,32 @@ mod asyncstats {
             SUB_SPILLED.load(Ordering::Relaxed),
         )
     }
+
+    pub fn dump_inline_awaits() -> u64 {
+        INLINE_AWAITS.load(Ordering::Relaxed)
+    }
 }
 
 pub use asyncstats::dump as async_stats;
+pub use asyncstats::dump_inline_awaits as async_inline_await_stats;
+
+/// Collapse the next already-settled await job into the current AsyncResume job
+/// when no older microtask is waiting. A bounded trampoline preserves FIFO job
+/// ordering while avoiding register-window parking and heap-state churn.
+#[inline]
+fn async_settled_trampoline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_ASYNC_SETTLED_TRAMPOLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
 
 /// The pristine-%Promise.prototype% proof, resolved to SLOT INDICES. The full
 /// proof (`promise_proto_pristine_uncached`) re-found `then`/`constructor`/
@@ -263,12 +294,20 @@ impl<'p> Vm<'p> {
         // call, per spec — not at the first `.next()`. The generator is then parked
         // AT the marker; the first `.next()` resumes just past it to run the body.
         if self.regs_would_overflow(new_base + reg_count) {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         self.regs.extend_from_slice(&regs);
         self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -346,7 +385,12 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let (state, fid, closure) = match self.heap.get(idx) {
-            HeapObj::Generator { state, func, closure, .. } => (*state, *func, *closure),
+            HeapObj::Generator {
+                state,
+                func,
+                closure,
+                ..
+            } => (*state, *func, *closure),
             _ => return Ok(None),
         };
         match name {
@@ -356,7 +400,9 @@ impl<'p> Vm<'p> {
                 GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
                 // Resume the suspended body with a RETURN completion so any `finally`
                 // spanning the yield runs (and a `finally { yield }` can re-suspend).
-                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, GenResumeMode::Return(arg0)),
+                GenState::Suspended(ip) => {
+                    self.gen_resume(idx, fid, closure, ip, GenResumeMode::Return(arg0))
+                }
             },
             "throw" => match state {
                 // Throwing into a completed generator re-throws the EXACT value at
@@ -369,12 +415,16 @@ impl<'p> Vm<'p> {
                 GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
                 // Resume the suspended body, injecting the throw at the yield point so
                 // an enclosing `try`/`catch` (whose handlers we parked) can catch it.
-                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, GenResumeMode::Throw(arg0)),
+                GenState::Suspended(ip) => {
+                    self.gen_resume(idx, fid, closure, ip, GenResumeMode::Throw(arg0))
+                }
             },
             "next" => match state {
                 GenState::Completed => Ok(Some(self.iter_result(Value::UNDEFINED, true))),
                 GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
-                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, GenResumeMode::Next(arg0)),
+                GenState::Suspended(ip) => {
+                    self.gen_resume(idx, fid, closure, ip, GenResumeMode::Next(arg0))
+                }
             },
             _ => Ok(None),
         }
@@ -397,7 +447,12 @@ impl<'p> Vm<'p> {
         input: GenResumeMode,
     ) -> Result<Option<Value>, Thrown> {
         let (saved, saved_handlers) = match self.heap.get_mut(idx) {
-            HeapObj::Generator { state, regs, handlers, .. } => {
+            HeapObj::Generator {
+                state,
+                regs,
+                handlers,
+                ..
+            } => {
                 *state = GenState::Running;
                 (std::mem::take(regs), std::mem::take(handlers))
             }
@@ -406,17 +461,31 @@ impl<'p> Vm<'p> {
         let reg_count = saved.len();
         let new_base = self.regs.len();
         if self.regs_would_overflow(new_base + reg_count) {
-            if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+            if let HeapObj::Generator {
+                state,
+                regs,
+                handlers,
+                ..
+            } = self.heap.get_mut(idx)
+            {
                 *state = GenState::Suspended(resume_ip);
                 *regs = saved;
                 *handlers = saved_handlers;
             }
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         self.regs.extend_from_slice(&saved);
         self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
             func: fid,
             base: new_base,
             ip: 0, // set below per resume kind
@@ -426,7 +495,11 @@ impl<'p> Vm<'p> {
             new_target: Value::UNDEFINED,
             // The creating call's function value (named fn-expression
             // self-name identity survives suspension).
-            callee: self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED),
+            callee: self
+                .gen_callee
+                .get(&idx)
+                .copied()
+                .unwrap_or(Value::UNDEFINED),
         });
         // Restore the activation's dynamic EvalScope (created by a direct eval
         // in the param prologue or an earlier resume), parked on the generator.
@@ -444,8 +517,9 @@ impl<'p> Vm<'p> {
             Some(Instr::YieldDelegate { .. })
         );
         let outcome = if resumes_delegate {
-            if let Instr::YieldDelegate { mode_dst, val_dst, .. } =
-                self.func(fid as usize).code[resume_ip]
+            if let Instr::YieldDelegate {
+                mode_dst, val_dst, ..
+            } = self.func(fid as usize).code[resume_ip]
             {
                 let (m, v) = match input {
                     GenResumeMode::Next(v) => (0, v),
@@ -459,61 +533,73 @@ impl<'p> Vm<'p> {
             self.run_loop(stop)
         } else {
             match input {
-            GenResumeMode::Next(v) => {
-                // First next() runs from ip 0 (legacy proto with no marker); a later
-                // one resumes just past the Yield/GenStart, delivering the sent value
-                // into a Yield's dst (GenStart delivers nothing).
-                let ip = if resume_ip == usize::MAX {
-                    0
-                } else {
-                    if let Instr::Yield { dst, .. } = self.func(fid as usize).code[resume_ip] {
-                        self.regs[new_base + dst as usize] = v;
-                    }
-                    resume_ip + 1
-                };
-                self.frames[stop].ip = ip;
-                self.run_loop(stop)
-            }
-            GenResumeMode::Throw(e) => {
-                // Throw at the suspension point: unwind into the body's handlers.
-                self.pending_throw = Some(e);
-                if self.unwind_to_handler(e, stop) {
-                    self.pending_throw = None;
+                GenResumeMode::Next(v) => {
+                    // First next() runs from ip 0 (legacy proto with no marker); a later
+                    // one resumes just past the Yield/GenStart, delivering the sent value
+                    // into a Yield's dst (GenStart delivers nothing).
+                    let ip = if resume_ip == usize::MAX {
+                        0
+                    } else {
+                        if let Instr::Yield { dst, .. } = self.func(fid as usize).code[resume_ip] {
+                            self.regs[new_base + dst as usize] = v;
+                        }
+                        resume_ip + 1
+                    };
+                    self.frames[stop].ip = ip;
                     self.run_loop(stop)
-                } else {
-                    // Uncaught in the body: unwind_to_handler already popped the frame
-                    // and truncated its window. Complete the generator and surface the
-                    // throw at the `gen.throw(e)` call site (value via pending_throw).
-                    if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
-                        *state = GenState::Completed;
-                        regs.clear();
-                        handlers.clear();
-                    }
-                    return Err(Thrown(self.throw_message(e)));
                 }
-            }
-            GenResumeMode::Return(v) => {
-                // Return completion at the suspension point: run any `finally` that
-                // spans the yield (route_through_finally, kind 1=return), exactly as
-                // a `return` statement in the body would. EndFinally then completes
-                // the return (or an outer finally), and a `finally { yield }` makes
-                // the generator re-suspend below.
-                if let Some(target) = self.route_through_finally(1, v) {
-                    self.frames[stop].ip = target as usize;
-                    self.run_loop(stop)
-                } else {
-                    // No `finally` pending: discard the spliced window/frame and
-                    // complete the generator with the return value.
-                    self.frames.pop();
-                    self.regs.truncate(new_base);
-                    if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
-                        *state = GenState::Completed;
-                        regs.clear();
-                        handlers.clear();
+                GenResumeMode::Throw(e) => {
+                    // Throw at the suspension point: unwind into the body's handlers.
+                    self.pending_throw = Some(e);
+                    if self.unwind_to_handler(e, stop) {
+                        self.pending_throw = None;
+                        self.run_loop(stop)
+                    } else {
+                        // Uncaught in the body: unwind_to_handler already popped the frame
+                        // and truncated its window. Complete the generator and surface the
+                        // throw at the `gen.throw(e)` call site (value via pending_throw).
+                        if let HeapObj::Generator {
+                            state,
+                            regs,
+                            handlers,
+                            ..
+                        } = self.heap.get_mut(idx)
+                        {
+                            *state = GenState::Completed;
+                            regs.clear();
+                            handlers.clear();
+                        }
+                        return Err(Thrown(self.throw_message(e)));
                     }
-                    return Ok(Some(self.iter_result(v, true)));
                 }
-            }
+                GenResumeMode::Return(v) => {
+                    // Return completion at the suspension point: run any `finally` that
+                    // spans the yield (route_through_finally, kind 1=return), exactly as
+                    // a `return` statement in the body would. EndFinally then completes
+                    // the return (or an outer finally), and a `finally { yield }` makes
+                    // the generator re-suspend below.
+                    if let Some(target) = self.route_through_finally(1, v) {
+                        self.frames[stop].ip = target as usize;
+                        self.run_loop(stop)
+                    } else {
+                        // No `finally` pending: discard the spliced window/frame and
+                        // complete the generator with the return value.
+                        self.frames.pop();
+                        self.regs.truncate(new_base);
+                        if let HeapObj::Generator {
+                            state,
+                            regs,
+                            handlers,
+                            ..
+                        } = self.heap.get_mut(idx)
+                        {
+                            *state = GenState::Completed;
+                            regs.clear();
+                            handlers.clear();
+                        }
+                        return Ok(Some(self.iter_result(v, true)));
+                    }
+                }
             }
         };
         if let Some((y, yield_ip)) = self.pending_yield.take() {
@@ -528,7 +614,13 @@ impl<'p> Vm<'p> {
             // Nursery barrier: the re-parked window may hold young values and
             // the generator may be old (holder-grain — the window is a batch).
             self.heap.write_barrier(idx);
-            if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+            if let HeapObj::Generator {
+                state,
+                regs,
+                handlers,
+                ..
+            } = self.heap.get_mut(idx)
+            {
                 *state = GenState::Suspended(yield_ip);
                 *regs = back;
                 *handlers = parked;
@@ -543,7 +635,13 @@ impl<'p> Vm<'p> {
         }
         match outcome {
             Ok(ret) => {
-                if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                if let HeapObj::Generator {
+                    state,
+                    regs,
+                    handlers,
+                    ..
+                } = self.heap.get_mut(idx)
+                {
                     *state = GenState::Completed;
                     regs.clear();
                     handlers.clear();
@@ -552,7 +650,13 @@ impl<'p> Vm<'p> {
             }
             Err(t) => {
                 self.regs.truncate(new_base);
-                if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                if let HeapObj::Generator {
+                    state,
+                    regs,
+                    handlers,
+                    ..
+                } = self.heap.get_mut(idx)
+                {
                     *state = GenState::Completed;
                     regs.clear();
                     handlers.clear();
@@ -617,7 +721,12 @@ impl<'p> Vm<'p> {
         // resolving an old promise with a young value.
         self.store_barrier(crate::heap::gcoracle::PROMISE_SETTLE, p, val);
         let reactions = match self.heap.get_mut(p) {
-            HeapObj::Promise { state: s, result, reactions, .. } => {
+            HeapObj::Promise {
+                state: s,
+                result,
+                reactions,
+                ..
+            } => {
                 if *s != PromiseState::Pending {
                     return;
                 }
@@ -648,8 +757,10 @@ impl<'p> Vm<'p> {
                     ReactionKind::Fulfill => Resume::Value(val),
                     ReactionKind::Reject => Resume::Throw(val),
                 };
-                self.microtasks
-                    .push_back(Microtask::AsyncResume { activation: r.dependent, input });
+                self.microtasks.push_back(Microtask::AsyncResume {
+                    activation: r.dependent,
+                    input,
+                });
             } else {
                 self.microtasks.push_back(Microtask::Reaction {
                     callback: match kind {
@@ -897,9 +1008,7 @@ impl<'p> Vm<'p> {
         };
         let intrinsic_slot = |key: &str, target: u32| {
             m.pos(key).filter(|&i| {
-                !m.attrs[i].accessor
-                    && m.vals[i].is_heap()
-                    && m.vals[i].heap_index() == target
+                !m.attrs[i].accessor && m.vals[i].is_heap() && m.vals[i].heap_index() == target
             })
         };
         let then_slot = intrinsic_slot("then", self.promise_then_intrinsic)?;
@@ -919,7 +1028,11 @@ impl<'p> Vm<'p> {
                 if !pristine {
                     return None;
                 }
-                Some((i as u32, v.heap_index(), self.heap.version_of(v.heap_index())))
+                Some((
+                    i as u32,
+                    v.heap_index(),
+                    self.heap.version_of(v.heap_index()),
+                ))
             }
         };
         Some(PromisePristineSlots {
@@ -966,7 +1079,8 @@ impl<'p> Vm<'p> {
     pub(crate) fn resolve(&mut self, p: u32, value: Value) {
         if value.is_heap() {
             if value.heap_index() == p {
-                let e = self.alloc_error_from_message("TypeError: Chaining cycle detected for promise");
+                let e =
+                    self.alloc_error_from_message("TypeError: Chaining cycle detected for promise");
                 self.reject(p, e);
                 return;
             }
@@ -1022,7 +1136,13 @@ impl<'p> Vm<'p> {
     /// or schedule a microtask immediately if `p` is already settled. Returns the
     /// dependent promise's heap index. The basis of `.then`/`.catch`/`.finally`
     /// and of internal promise adoption.
-    pub(crate) fn then_internal(&mut self, p: u32, on_f: Value, on_r: Value, into: Option<u32>) -> u32 {
+    pub(crate) fn then_internal(
+        &mut self,
+        p: u32,
+        on_f: Value,
+        on_r: Value,
+        into: Option<u32>,
+    ) -> u32 {
         let dep = into.unwrap_or_else(|| self.alloc_promise());
         // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 5 — `.then`
         // on an old promise with young callbacks / dependent.
@@ -1035,7 +1155,10 @@ impl<'p> Vm<'p> {
         };
         match state {
             PromiseState::Pending => {
-                if let HeapObj::Promise { reactions, handled, .. } = self.heap.get_mut(p) {
+                if let HeapObj::Promise {
+                    reactions, handled, ..
+                } = self.heap.get_mut(p)
+                {
                     asyncstats::subscribe(reactions.is_empty());
                     reactions.push(ReactionPair {
                         on_fulfilled: on_f,
@@ -1096,8 +1219,16 @@ impl<'p> Vm<'p> {
         // getter call and build the plain native dependent directly
         // (tick-identical to the generic path below).
         if self.promise_plain_unobservable(idx) {
-            let on_f = if self.is_callable(on_f) { on_f } else { Value::UNDEFINED };
-            let on_r = if self.is_callable(on_r) { on_r } else { Value::UNDEFINED };
+            let on_f = if self.is_callable(on_f) {
+                on_f
+            } else {
+                Value::UNDEFINED
+            };
+            let on_r = if self.is_callable(on_r) {
+                on_r
+            } else {
+                Value::UNDEFINED
+            };
             let dep = self.then_internal(idx, on_f, on_r, None);
             return Ok(Value::heap(dep));
         }
@@ -1105,15 +1236,26 @@ impl<'p> Vm<'p> {
         // PerformPromiseThen steps 3-4: a NON-CALLABLE handler is Identity /
         // Thrower — `then_internal`'s undefined callback is exactly that
         // pass-through (so `p.then(3, 5)` forwards instead of throwing).
-        let on_f = if self.is_callable(on_f) { on_f } else { Value::UNDEFINED };
-        let on_r = if self.is_callable(on_r) { on_r } else { Value::UNDEFINED };
+        let on_f = if self.is_callable(on_f) {
+            on_f
+        } else {
+            Value::UNDEFINED
+        };
+        let on_r = if self.is_callable(on_r) {
+            on_r
+        } else {
+            Value::UNDEFINED
+        };
         if c == self.promise_ctor_value() {
             let dep = self.then_internal(idx, on_f, on_r, None);
             return Ok(Value::heap(dep));
         }
         let (cap_promise, cap_resolve, cap_reject) = self.new_promise_capability(c)?;
         if cap_promise.is_heap()
-            && matches!(self.heap.get(cap_promise.heap_index()), HeapObj::Promise { .. })
+            && matches!(
+                self.heap.get(cap_promise.heap_index()),
+                HeapObj::Promise { .. }
+            )
         {
             self.then_internal(idx, on_f, on_r, Some(cap_promise.heap_index()));
         } else {
@@ -1174,7 +1316,11 @@ impl<'p> Vm<'p> {
     /// observed. When `onFinally` is not callable it is passed through as both
     /// handlers (matching the spec). The wrappers are native FINALLY_THEN/CATCH
     /// functions bound to `[onFinally, C]` (see `call_native`).
-    pub(crate) fn promise_finally(&mut self, this: Value, on_finally: Value) -> Result<Value, Thrown> {
+    pub(crate) fn promise_finally(
+        &mut self,
+        this: Value,
+        on_finally: Value,
+    ) -> Result<Value, Thrown> {
         if !self.is_object_value(this) {
             return Err(Thrown(
                 "TypeError: Promise.prototype.finally called on a non-object".into(),
@@ -1209,7 +1355,13 @@ impl<'p> Vm<'p> {
     /// Build a suspended `async function` activation and run it synchronously up
     /// to its first `await` (or to completion / a throw). Returns the activation's
     /// result Promise — the value an `async` call evaluates to.
-    pub(crate) fn alloc_async(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
+    pub(crate) fn alloc_async(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this: Value,
+        args: &[Value],
+    ) -> Value {
         let gen_callee = std::mem::replace(&mut self.pending_gen_callee, Value::UNDEFINED);
         // An async arrow captures `this` lexically (call sites pass UNDEFINED/recv).
         let this = self.rebind_arrow_this(func_id, closure, this);
@@ -1266,17 +1418,19 @@ impl<'p> Vm<'p> {
         if std::mem::take(&mut self.pending_module_body_marker) {
             self.module_body_results.insert(result);
         }
-        let idx = self.heap.alloc(HeapObj::AsyncState(Box::new(AsyncStateData {
-            func: func_id,
-            closure,
-            // `usize::MAX` = not-yet-started — distinct from a genuine yield/await
-            // parked at ip 0 (which previously collided with this sentinel and made
-            // the resume re-run from the top).
-            state: GenState::Suspended(usize::MAX),
-            regs,
-            result,
-            handlers: Vec::new(),
-        })));
+        let idx = self
+            .heap
+            .alloc(HeapObj::AsyncState(Box::new(AsyncStateData {
+                func: func_id,
+                closure,
+                // `usize::MAX` = not-yet-started — distinct from a genuine yield/await
+                // parked at ip 0 (which previously collided with this sentinel and made
+                // the resume re-run from the top).
+                state: GenState::Suspended(usize::MAX),
+                regs,
+                result,
+                handlers: Vec::new(),
+            })));
         // GC roots suspended activations from this registry instead of scanning
         // the whole heap every collection; see `Vm::async_activations`.
         self.async_activations.push(idx);
@@ -1346,12 +1500,20 @@ impl<'p> Vm<'p> {
         // Run the parameter prologue up to `GenStart` (see `alloc_generator`).
         let new_base = self.regs.len();
         if self.regs_would_overflow(new_base + reg_count) {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         self.regs.extend_from_slice(&regs);
         self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -1365,7 +1527,10 @@ impl<'p> Vm<'p> {
         self.pending_yield_eval_scope = u32::MAX;
         let (state, regs) = if let Some((_v, genstart_ip)) = self.pending_yield.take() {
             // Suspended at `GenStart`: park at the marker, body runs on first next().
-            (GenState::Suspended(genstart_ip), self.regs.split_off(new_base))
+            (
+                GenState::Suspended(genstart_ip),
+                self.regs.split_off(new_base),
+            )
         } else {
             // The prologue threw (propagate at the call) or, defensively, the body
             // ran to completion (a proto with no `GenStart`).
@@ -1375,15 +1540,17 @@ impl<'p> Vm<'p> {
                 Err(t) => return Err(t),
             }
         };
-        let ag = self.heap.alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
-            func: func_id,
-            closure,
-            state,
-            regs,
-            handlers: Vec::new(),
-            queue: Vec::new(),
-            awaiting_return: false,
-        })));
+        let ag = self
+            .heap
+            .alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
+                func: func_id,
+                closure,
+                state,
+                regs,
+                handlers: Vec::new(),
+                queue: Vec::new(),
+                awaiting_return: false,
+            })));
         self.async_activations.push(ag);
         // OrdinaryCreateFromConstructor: honor the callee's `prototype`
         // object; the HeapObj::AsyncGenerator fallback stays %AsyncGenProto%.
@@ -1408,7 +1575,12 @@ impl<'p> Vm<'p> {
     /// EVERY request — including return/throw on a running or completed
     /// generator — is appended to the FIFO queue; `async_gen_service_queue`
     /// then makes progress unless a step is already in flight).
-    pub(crate) fn async_generator_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Option<Value> {
+    pub(crate) fn async_generator_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Option<Value> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let kind = match name {
             "next" => 0u8,
@@ -1422,9 +1594,11 @@ impl<'p> Vm<'p> {
         // `p` is always young here, so the card fires on any old holder.
         self.heap.write_barrier(idx);
         match self.heap.get_mut(idx) {
-            HeapObj::AsyncGenerator(g) => {
-                g.queue.push(crate::heap::AsyncGenRequest { kind, arg: arg0, promise: p })
-            }
+            HeapObj::AsyncGenerator(g) => g.queue.push(crate::heap::AsyncGenRequest {
+                kind,
+                arg: arg0,
+                promise: p,
+            }),
             _ => return None,
         }
         self.async_gen_service_queue(idx);
@@ -1548,8 +1722,8 @@ impl<'p> Vm<'p> {
         if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
             g.awaiting_return = true;
         }
-        let is_promise = arg.is_heap()
-            && matches!(self.heap.get(arg.heap_index()), HeapObj::Promise { .. });
+        let is_promise =
+            arg.is_heap() && matches!(self.heap.get(arg.heap_index()), HeapObj::Promise { .. });
         let p = if is_promise {
             match self.get_prop(arg, "constructor") {
                 Ok(c) => {
@@ -1672,7 +1846,13 @@ impl<'p> Vm<'p> {
         self.regs.extend_from_slice(&saved);
         self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
             func: fid,
             base: new_base,
             ip: 0,
@@ -1682,7 +1862,11 @@ impl<'p> Vm<'p> {
             new_target: Value::UNDEFINED,
             // The creating call's function value (named fn-expression
             // self-name identity survives suspension).
-            callee: self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED),
+            callee: self
+                .gen_callee
+                .get(&idx)
+                .copied()
+                .unwrap_or(Value::UNDEFINED),
         });
         // Resume after the suspending op, delivering the sent/awaited value. The
         // op at `resume_ip` is a Yield (resumed by `.next(v)`) or Await (resumed
@@ -1706,7 +1890,9 @@ impl<'p> Vm<'p> {
                     // A `.next(v)` resume: deliver v. At an AsyncYieldDelegate also set
                     // its mode register to 0 (next) so the yield* loop continues.
                     match self.func(fid as usize).code[resume_ip] {
-                        Instr::AsyncYieldDelegate { mode_dst, val_dst, .. } => {
+                        Instr::AsyncYieldDelegate {
+                            mode_dst, val_dst, ..
+                        } => {
                             self.regs[new_base + mode_dst as usize] = Value::int(0);
                             self.regs[new_base + val_dst as usize] = v;
                         }
@@ -1726,8 +1912,9 @@ impl<'p> Vm<'p> {
                     // may re-suspend / override the completion there); with none,
                     // the generator completes with `v` (the Ok arm below resolves
                     // the front request `{v, done: true}`).
-                    if let Instr::AsyncYieldDelegate { mode_dst, val_dst, .. } =
-                        self.func(fid as usize).code[resume_ip]
+                    if let Instr::AsyncYieldDelegate {
+                        mode_dst, val_dst, ..
+                    } = self.func(fid as usize).code[resume_ip]
                     {
                         self.regs[new_base + mode_dst as usize] = Value::int(2);
                         self.regs[new_base + val_dst as usize] = v;
@@ -1817,9 +2004,10 @@ impl<'p> Vm<'p> {
             }
             Err(t) => {
                 self.regs.truncate(new_base);
-                let reason = self.pending_throw.take().unwrap_or_else(|| {
-                    self.alloc_error_from_message(&t.0)
-                });
+                let reason = self
+                    .pending_throw
+                    .take()
+                    .unwrap_or_else(|| self.alloc_error_from_message(&t.0));
                 let front = match self.heap.get_mut(idx) {
                     HeapObj::AsyncGenerator(g) => {
                         g.state = GenState::Completed;
@@ -1858,7 +2046,11 @@ impl<'p> Vm<'p> {
     pub(crate) fn settle_subscribe(&mut self, p: u32, activation: u32) {
         // Nursery barrier + B6 oracle: §1 case 5's await form — an old promise
         // gaining a young suspended activation as its reaction.
-        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, Value::heap(activation));
+        self.store_barrier(
+            crate::heap::gcoracle::PROMISE_REACT,
+            p,
+            Value::heap(activation),
+        );
         let (state, result) = match self.heap.get(p) {
             HeapObj::Promise { state, result, .. } => (*state, *result),
             _ => {
@@ -1871,7 +2063,10 @@ impl<'p> Vm<'p> {
         };
         match state {
             PromiseState::Pending => {
-                if let HeapObj::Promise { reactions, handled, .. } = self.heap.get_mut(p) {
+                if let HeapObj::Promise {
+                    reactions, handled, ..
+                } = self.heap.get_mut(p)
+                {
                     asyncstats::subscribe(reactions.is_empty());
                     reactions.push(ReactionPair {
                         on_fulfilled: Value::UNDEFINED,
@@ -1914,7 +2109,9 @@ impl<'p> Vm<'p> {
         c: Value,
     ) -> Result<(Value, Value, Value), Thrown> {
         if !self.is_constructor(c) {
-            return Err(Thrown("TypeError: NewPromiseCapability requires a constructor".into()));
+            return Err(Thrown(
+                "TypeError: NewPromiseCapability requires a constructor".into(),
+            ));
         }
         // Save/restore for a nested capability; clear so the executor's
         // already-called check starts fresh.
@@ -1933,7 +2130,9 @@ impl<'p> Vm<'p> {
             }
         };
         if !self.is_callable(resolve) || !self.is_callable(reject) {
-            return Err(Thrown("TypeError: Promise resolve or reject is not callable".into()));
+            return Err(Thrown(
+                "TypeError: Promise resolve or reject is not callable".into(),
+            ));
         }
         Ok((promise, resolve, reject))
     }
@@ -2002,7 +2201,8 @@ impl<'p> Vm<'p> {
         };
         if let Some(pr) = promise_resolve {
             if !self.is_callable(pr) {
-                let err = self.alloc_error_from_message("TypeError: Promise.resolve is not a function");
+                let err =
+                    self.alloc_error_from_message("TypeError: Promise.resolve is not a function");
                 self.reject(result, err);
                 return Ok(Value::heap(result));
             }
@@ -2072,7 +2272,8 @@ impl<'p> Vm<'p> {
             Ok(m) if self.is_callable(m) => m,
             Ok(_) => {
                 let disp = self.display(iterable);
-                let e = self.alloc_error_from_message(&format!("TypeError: {disp} is not iterable"));
+                let e =
+                    self.alloc_error_from_message(&format!("TypeError: {disp} is not iterable"));
                 self.reject(result, e);
                 return Ok(Value::heap(result));
             }
@@ -2125,16 +2326,18 @@ impl<'p> Vm<'p> {
         // iteration decrements it — when it hits 0 the combinator resolves/rejects.
         // results/settled grow as the iterator is stepped (LAZY, so an abrupt
         // Call(promiseResolve)/Invoke(.then) can IteratorClose the live iterator).
-        let comb = self.heap.alloc(HeapObj::Combinator(Box::new(crate::heap::CombinatorData {
-            kind,
-            results: Vec::new(),
-            remaining: 1,
-            result,
-            settled: Vec::new(),
-            cap_resolve,
-            cap_reject,
-            keys: comb_keys,
-        })));
+        let comb = self
+            .heap
+            .alloc(HeapObj::Combinator(Box::new(crate::heap::CombinatorData {
+                kind,
+                results: Vec::new(),
+                remaining: 1,
+                result,
+                settled: Vec::new(),
+                cap_resolve,
+                cap_reject,
+                keys: comb_keys,
+            })));
         loop {
             // IteratorStep; a throwing next() leaves the iterator done → no close.
             let val = if let Some(pos) = fast_pos {
@@ -2196,7 +2399,12 @@ impl<'p> Vm<'p> {
             }
             let index = match self.heap.get_mut(comb) {
                 HeapObj::Combinator(__c) => {
-                    let crate::heap::CombinatorData { results, settled, remaining, .. } = &mut **__c;
+                    let crate::heap::CombinatorData {
+                        results,
+                        settled,
+                        remaining,
+                        ..
+                    } = &mut **__c;
                     let i = results.len() as u32;
                     results.push(Value::UNDEFINED);
                     settled.push(false);
@@ -2246,7 +2454,11 @@ impl<'p> Vm<'p> {
             // every Promise.all element sees the SAME reject function, Promise.race
             // uses the capability pair directly, and Promise.any shares the resolve.
             let element_resolver = |vm: &mut Self, is_reject: bool| {
-                Value::heap(vm.heap.alloc(HeapObj::CombinatorResolver { combinator: comb, index, is_reject }))
+                Value::heap(vm.heap.alloc(HeapObj::CombinatorResolver {
+                    combinator: comb,
+                    index,
+                    is_reject,
+                }))
             };
             let res_f = match kind {
                 CombKind::Race | CombKind::Any => cap_resolve,
@@ -2323,7 +2535,13 @@ impl<'p> Vm<'p> {
         use crate::heap::CombKind;
         let (ckind, remaining, cap_resolve, cap_reject) = match self.heap.get(comb) {
             HeapObj::Combinator(__c) => {
-                let crate::heap::CombinatorData { kind, remaining, cap_resolve, cap_reject, .. } = &**__c;
+                let crate::heap::CombinatorData {
+                    kind,
+                    remaining,
+                    cap_resolve,
+                    cap_reject,
+                    ..
+                } = &**__c;
                 (*kind, *remaining, *cap_resolve, *cap_reject)
             }
             _ => return,
@@ -2382,11 +2600,22 @@ impl<'p> Vm<'p> {
     /// Perform one combinator step: the input at `index` settled (`kind`) with
     /// `value`. Updates the shared state and settles the combinator's promise
     /// when its rule is met (the one-shot `settle` guard absorbs later inputs).
-    pub(crate) fn combinator_step(&mut self, comb: u32, index: u32, kind: ReactionKind, value: Value) {
+    pub(crate) fn combinator_step(
+        &mut self,
+        comb: u32,
+        index: u32,
+        kind: ReactionKind,
+        value: Value,
+    ) {
         use crate::heap::CombKind;
         let (ckind, cap_resolve, cap_reject) = match self.heap.get(comb) {
             HeapObj::Combinator(__c) => {
-                let crate::heap::CombinatorData { kind, cap_resolve, cap_reject, .. } = &**__c;
+                let crate::heap::CombinatorData {
+                    kind,
+                    cap_resolve,
+                    cap_reject,
+                    ..
+                } = &**__c;
                 (*kind, *cap_resolve, *cap_reject)
             }
             _ => return,
@@ -2439,7 +2668,9 @@ impl<'p> Vm<'p> {
                 // old; the settled value / record it stores may be young.
                 self.heap.write_barrier_val(comb, stored);
                 if let HeapObj::Combinator(__c) = self.heap.get_mut(comb) {
-                    let crate::heap::CombinatorData { results, remaining, .. } = &mut **__c;
+                    let crate::heap::CombinatorData {
+                        results, remaining, ..
+                    } = &mut **__c;
                     results[index as usize] = stored;
                     *remaining -= 1;
                 }
@@ -2487,10 +2718,10 @@ impl<'p> Vm<'p> {
         map.define("errors", errs, attr);
         let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
         self.error_data.insert(idx); // [[ErrorData]] internal slot
-        // Link [[Prototype]] to %AggregateError.prototype% (error_protos[7]) so the
-        // internally-created error is a real AggregateError instance:
-        // getPrototypeOf === AggregateError.prototype and `.constructor` resolves to
-        // AggregateError (instanceof already held via the error-ctor name check).
+                                     // Link [[Prototype]] to %AggregateError.prototype% (error_protos[7]) so the
+                                     // internally-created error is a real AggregateError instance:
+                                     // getPrototypeOf === AggregateError.prototype and `.constructor` resolves to
+                                     // AggregateError (instanceof already held via the error-ctor name check).
         if self.error_protos[7] != 0 {
             self.proto_of.insert(idx, Value::heap(self.error_protos[7]));
         }
@@ -2504,11 +2735,22 @@ impl<'p> Vm<'p> {
     /// uncaught throw (rejects it). Mirrors `generator_method`'s resume path, but
     /// restores the activation's `try` handlers so a rejection can be caught.
     pub(crate) fn drive_async(&mut self, idx: u32, input: Resume) {
+        self.drive_async_inner(idx, input, false);
+    }
+
+    /// AsyncResume is already a microtask job. If it reaches another settled
+    /// promise while no older job is queued, the next resume job is known to be
+    /// next in FIFO order and can stay inside this bounded trampoline.
+    fn drive_async_resumed(&mut self, idx: u32, input: Resume) {
+        self.drive_async_inner(idx, input, true);
+    }
+
+    fn drive_async_inner(&mut self, idx: u32, input: Resume, allow_trampoline: bool) {
         let (state, fid, closure, result) = match self.heap.get(idx) {
             HeapObj::AsyncState(a) => (a.state, a.func, a.closure, a.result),
             _ => return,
         };
-        let resume_ip = match state {
+        let mut resume_ip = match state {
             GenState::Completed | GenState::Running => return,
             GenState::Suspended(ip) => ip,
         };
@@ -2537,64 +2779,104 @@ impl<'p> Vm<'p> {
         self.regs.extend_from_slice(&saved);
         self.bump_regs_hw(new_base + reg_count);
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false,
-            func: fid,
-            base: new_base,
-            ip: 0,
-            ret_dst: 0,
-            closure,
-            handlers: saved_handlers,
-            new_target: Value::UNDEFINED,
-            // The creating call's function value (named fn-expression
-            // self-name identity survives suspension).
-            callee: self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED),
-        });
-        // A mapped `arguments` object aliases this resumption's register window.
-        self.relink_mapped_args(idx, stop, new_base);
-        // Position the resume point and deliver the awaited value / rejection.
-        let outcome = if resume_ip == usize::MAX {
-            self.run_loop(stop)
+        let mut resume_input = input;
+        let mut resume_handlers = saved_handlers;
+        // Periodically re-queue even when the queue stays empty. This restores a
+        // GC checkpoint for allocation-heavy loops without giving up the common
+        // settled-promise fast path.
+        let mut inline_budget = if allow_trampoline && async_settled_trampoline_enabled() {
+            1024usize
         } else {
-            match input {
-                Resume::Value(v) => {
-                    if let Instr::Await { dst, .. } =
-                        self.func(fid as usize).code[resume_ip]
-                    {
-                        self.regs[new_base + dst as usize] = v;
-                    }
-                    self.frames[stop].ip = resume_ip + 1;
-                    self.run_loop(stop)
-                }
-                Resume::Throw(e) => {
-                    // Throw the rejection in at the await point: unwind to a
-                    // handler within this activation (down to `stop`). If caught,
-                    // resume at the catch; otherwise it propagates out as the
-                    // function's rejection (pending_throw stays set for the Err
-                    // arm below).
-                    self.pending_throw = Some(e);
-                    if self.unwind_to_handler(e, stop) {
-                        self.pending_throw = None;
-                        self.run_loop(stop)
-                    } else {
-                        Err(Thrown(String::new()))
-                    }
-                }
-                // Resume::Return is only produced for an async GENERATOR at a yield*
-                // delegate; a plain async function never receives it. Treat the value
-                // like a normal await resumption defensively.
-                Resume::Return(v) => {
-                    if let Instr::Await { dst, .. } =
-                        self.func(fid as usize).code[resume_ip]
-                    {
-                        self.regs[new_base + dst as usize] = v;
-                    }
-                    self.frames[stop].ip = resume_ip + 1;
-                    self.run_loop(stop)
-                }
-            }
+            0
         };
-        // Suspended again at an await?
-        if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
+        let outcome = loop {
+            self.frames.push(Frame {
+                super_done: false,
+                args_obj: u32::MAX,
+                eval_scope: u32::MAX,
+                arg_win: u32::MAX,
+                argc: 0,
+                is_eval: false,
+                func: fid,
+                base: new_base,
+                ip: 0,
+                ret_dst: 0,
+                closure,
+                handlers: resume_handlers,
+                new_target: Value::UNDEFINED,
+                // The creating call's function value (named fn-expression
+                // self-name identity survives suspension).
+                callee: self
+                    .gen_callee
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED),
+            });
+            // A mapped `arguments` object aliases every resumed frame window.
+            self.relink_mapped_args(idx, stop, new_base);
+            // Position the resume point and deliver the awaited value/rejection.
+            let outcome = if resume_ip == usize::MAX {
+                self.run_loop(stop)
+            } else {
+                match resume_input {
+                    Resume::Value(v) | Resume::Return(v) => {
+                        if let Instr::Await { dst, .. } = self.func(fid as usize).code[resume_ip] {
+                            self.regs[new_base + dst as usize] = v;
+                        }
+                        self.frames[stop].ip = resume_ip + 1;
+                        self.run_loop(stop)
+                    }
+                    Resume::Throw(e) => {
+                        // Throw the rejection in at the await point. A caught
+                        // rejection resumes at its parked handler; otherwise it
+                        // becomes the async function's rejected result.
+                        self.pending_throw = Some(e);
+                        if self.unwind_to_handler(e, stop) {
+                            self.pending_throw = None;
+                            self.run_loop(stop)
+                        } else {
+                            Err(Thrown(String::new()))
+                        }
+                    }
+                }
+            };
+            let Some((awaited, await_ip, handlers)) = self.pending_await.take() else {
+                break outcome;
+            };
+
+            let settled = if inline_budget != 0 && self.microtasks.is_empty() && awaited.is_heap() {
+                match self.heap.get(awaited.heap_index()) {
+                    HeapObj::Promise {
+                        state: PromiseState::Fulfilled,
+                        result,
+                        ..
+                    } => Some(Resume::Value(*result)),
+                    HeapObj::Promise {
+                        state: PromiseState::Rejected,
+                        result,
+                        ..
+                    } => Some(Resume::Throw(*result)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(next_input) = settled {
+                if matches!(next_input, Resume::Throw(_)) {
+                    if let HeapObj::Promise { handled, .. } =
+                        self.heap.get_mut(awaited.heap_index())
+                    {
+                        *handled = true;
+                    }
+                }
+                inline_budget -= 1;
+                asyncstats::inline_await();
+                resume_ip = await_ip;
+                resume_input = next_input;
+                resume_handlers = handlers;
+                continue;
+            }
+
             let back = self.repark_window(saved, new_base);
             // Nursery barrier: re-parked window into a possibly-old holder.
             self.heap.write_barrier(idx);
@@ -2606,7 +2888,7 @@ impl<'p> Vm<'p> {
             let p = self.to_promise(awaited);
             self.settle_subscribe(p, idx);
             return;
-        }
+        };
         // Otherwise the activation finished — settle `result`.
         match outcome {
             Ok(ret) => {
@@ -2648,7 +2930,13 @@ impl<'p> Vm<'p> {
     /// activation (Stage 2).
     pub(crate) fn run_microtask(&mut self, t: Microtask) {
         match t {
-            Microtask::Reaction { callback, arg, dependent, kind, finally } => {
+            Microtask::Reaction {
+                callback,
+                arg,
+                dependent,
+                kind,
+                finally,
+            } => {
                 if finally {
                     // Run cb (no args) for its side effect, then forward the
                     // original value/reason — unless cb itself throws.
@@ -2673,8 +2961,11 @@ impl<'p> Vm<'p> {
                     return;
                 }
                 if callback.is_heap() {
-                    if let HeapObj::BoundResolver { promise, is_reject, pair } =
-                        self.heap.get(callback.heap_index())
+                    if let HeapObj::BoundResolver {
+                        promise,
+                        is_reject,
+                        pair,
+                    } = self.heap.get(callback.heap_index())
                     {
                         let (pr, isr, pid) = (*promise, *is_reject, *pair);
                         // [[AlreadyResolved]]: only the pair's FIRST call acts.
@@ -2690,8 +2981,9 @@ impl<'p> Vm<'p> {
                     // A combinator reaction (Promise.all/allSettled/race/any). The
                     // kind comes from the reaction list (is_reject is for the
                     // direct-call path only).
-                    if let HeapObj::CombinatorResolver { combinator, index, .. } =
-                        self.heap.get(callback.heap_index())
+                    if let HeapObj::CombinatorResolver {
+                        combinator, index, ..
+                    } = self.heap.get(callback.heap_index())
                     {
                         let (c, i) = (*combinator, *index);
                         self.combinator_step(c, i, kind, arg);
@@ -2713,21 +3005,29 @@ impl<'p> Vm<'p> {
                 if matches!(self.heap.get(activation), HeapObj::AsyncGenerator(_)) {
                     self.drive_async_gen(activation, input);
                 } else {
-                    self.drive_async(activation, input);
+                    self.drive_async_resumed(activation, input);
                 }
             }
             // PromiseResolveThenableJob: run then.call(thenable, resolveFn, rejectFn).
             // The resolving functions settle `promise` (one-shot via settle's Pending
             // guard, so a thenable that calls both / twice is handled). A throwing
             // `then` rejects the promise (a no-op if it already settled).
-            Microtask::ThenableJob { thenable, then, promise } => {
+            Microtask::ThenableJob {
+                thenable,
+                then,
+                promise,
+            } => {
                 let pair = self.new_resolver_pair();
-                let res = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise, is_reject: false, pair }),
-                );
-                let rej = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise, is_reject: true, pair }),
-                );
+                let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                    promise,
+                    is_reject: false,
+                    pair,
+                }));
+                let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                    promise,
+                    is_reject: true,
+                    pair,
+                }));
                 if let Err(Thrown(msg)) = self.call_value(then, thenable, &[res, rej]) {
                     let e = match self.pending_throw.take() {
                         Some(v) => v,
@@ -2810,9 +3110,7 @@ impl<'p> Vm<'p> {
                 (a, b) => a.or(b),
             };
             let Some(due) = due else {
-                if self.agent_role == agents::AgentRole::Worker
-                    && !self.async_waiters.is_empty()
-                {
+                if self.agent_role == agents::AgentRole::Worker && !self.async_waiters.is_empty() {
                     // Worker with only infinite-deadline waiters: park until a
                     // notify lands in the mailbox (re-check under the lock —
                     // a wake may have arrived since the drain above).
@@ -2900,5 +3198,4 @@ impl<'p> Vm<'p> {
     }
 
     // ── property / index access ──
-
 }

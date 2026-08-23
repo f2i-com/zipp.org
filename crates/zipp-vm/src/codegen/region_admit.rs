@@ -41,7 +41,13 @@ pub(crate) struct RxScalarMatchallPlan {
     pub(crate) close_ip: usize,
     pub(crate) end_finally_ip: usize,
     pub(crate) iter_reg: Reg,
+    pub(crate) i_global: u32,
+    pub(crate) n_global: u32,
+    pub(crate) lines_global: u32,
+    pub(crate) re_global: u32,
     pub(crate) result_global: u32,
+    pub(crate) count_global: u32,
+    pub(crate) sum_global: u32,
     pub(crate) capture: u32,
     pub(crate) tonum_dst: Reg,
 }
@@ -140,11 +146,20 @@ pub(crate) fn rx_scalar_exec_plan(
         return None;
     }
     let call_result_reg = match code[s + 7] {
-        Instr::CallMethod { dst, obj, name, arg_base, argc }
-            if obj == re_reg
-                && arg_base == input_reg
-                && argc == 1
-                && proto.string_constants.get(name as usize).map(String::as_str) == Some("exec") =>
+        Instr::CallMethod {
+            dst,
+            obj,
+            name,
+            arg_base,
+            argc,
+        } if obj == re_reg
+            && arg_base == input_reg
+            && argc == 1
+            && proto
+                .string_constants
+                .get(name as usize)
+                .map(String::as_str)
+                == Some("exec") =>
         {
             dst
         }
@@ -154,7 +169,10 @@ pub(crate) fn rx_scalar_exec_plan(
         Instr::StoreGlobal { idx, src }
         | Instr::StoreGlobalStrict { idx, src }
         | Instr::StoreGlobalResolved { idx, src }
-            if src == call_result_reg => idx,
+            if src == call_result_reg =>
+        {
+            idx
+        }
         _ => return None,
     };
     let result_test_reg = match code[s + 9] {
@@ -186,8 +204,15 @@ pub(crate) fn rx_scalar_exec_plan(
     };
     // Suppressing result_global's per-iteration store is sound only when no
     // other source load/store can alias it before the pending result is flushed.
-    if [i_global, n_global, re_global, lines_global, count_global, sum_global]
-        .contains(&result_global)
+    if [
+        i_global,
+        n_global,
+        re_global,
+        lines_global,
+        count_global,
+        sum_global,
+    ]
+    .contains(&result_global)
     {
         return None;
     }
@@ -234,7 +259,12 @@ pub(crate) fn rx_scalar_exec_plan(
         _ => return None,
     };
     let final_sum = match code[s + 36] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if a == accum && b == zero => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if a == accum && b == zero => dst,
         _ => return None,
     };
     let i2 = match code[s + 38] {
@@ -331,12 +361,23 @@ pub(crate) fn rx_scalar_matchall_plan(
         _ => return None,
     };
     let iter = match code[s + 8] {
-        Instr::CallMethod { dst, obj, name, arg_base, argc }
-            if obj == line
-                && arg_base == re
-                && argc == 1
-                && proto.string_constants.get(name as usize).map(String::as_str)
-                    == Some("matchAll") => dst,
+        Instr::CallMethod {
+            dst,
+            obj,
+            name,
+            arg_base,
+            argc,
+        } if obj == line
+            && arg_base == re
+            && argc == 1
+            && proto
+                .string_constants
+                .get(name as usize)
+                .map(String::as_str)
+                == Some("matchAll") =>
+        {
+            dst
+        }
         _ => return None,
     };
     if !matches!(code[s + 9], Instr::GetIterator { dst, src } if dst == iter && src == iter) {
@@ -351,8 +392,13 @@ pub(crate) fn rx_scalar_matchall_plan(
         _ => return None,
     };
     let (result, done) = match code[s + 12] {
-        Instr::IterNext { value_dst, done_dst, iter: it, idx, next: nx }
-            if it == iter && idx == cursor && nx == next => (value_dst, done_dst),
+        Instr::IterNext {
+            value_dst,
+            done_dst,
+            iter: it,
+            idx,
+            next: nx,
+        } if it == iter && idx == cursor && nx == next => (value_dst, done_dst),
         _ => return None,
     };
     if !matches!(code[s + 13], Instr::JumpIfTrue { cond, target }
@@ -361,16 +407,21 @@ pub(crate) fn rx_scalar_matchall_plan(
         return None;
     }
     let (kind, completion) = match code[s + 14] {
-        Instr::PushFinally { target, kind_reg, val_reg } if target == start + 30 => {
-            (kind_reg, val_reg)
-        }
+        Instr::PushFinally {
+            target,
+            kind_reg,
+            val_reg,
+        } if target == start + 30 => (kind_reg, val_reg),
         _ => return None,
     };
     let result_global = match code[s + 15] {
         Instr::StoreGlobal { idx, src }
         | Instr::StoreGlobalStrict { idx, src }
         | Instr::StoreGlobalResolved { idx, src }
-            if src == result => idx,
+            if src == result =>
+        {
+            idx
+        }
         _ => return None,
     };
     let (count, count_global) = match code[s + 16] {
@@ -391,14 +442,28 @@ pub(crate) fn rx_scalar_matchall_plan(
         Instr::LoadGlobal { dst, idx } => (dst, idx),
         _ => return None,
     };
-    // The publication store at +15 is the only source operation scalarization
-    // suppresses. If its binding aliases ANY other template global, the store
-    // changes a later read/update (or the next outer condition/call); deferring
-    // it to exhaustion would be observably wrong. Other non-result aliases are
-    // harmless because their source loads/stores remain emitted in order.
-    if [i_global, n_global, lines_global, re_global, count_global, sum_global]
-        .contains(&result_global)
-    {
+    // The outer reducer publishes count/sum only after the remaining dense
+    // array is scanned. Require every template binding to be distinct so its
+    // combined update and deferred result store cannot alter a source read.
+    let globals = [
+        i_global,
+        n_global,
+        lines_global,
+        re_global,
+        result_global,
+        count_global,
+        sum_global,
+    ];
+    for (idx, global) in globals.iter().enumerate() {
+        if globals[idx + 1..].contains(global) {
+            return None;
+        }
+    }
+    // The Win64 scalar-step helper carries the eight compile-time operands in
+    // two packed u64s (the sole stack-argument slot is shared with every MEM
+    // region call). A program with more than 65K globals is valid, but stays
+    // on the ordinary path rather than truncating a binding index.
+    if globals.iter().any(|&global| global > u16::MAX as u32) {
         return None;
     }
     let result_obj = match code[s + 20] {
@@ -465,7 +530,13 @@ pub(crate) fn rx_scalar_matchall_plan(
         close_ip: s + 30,
         end_finally_ip: s + 31,
         iter_reg: iter,
+        i_global,
+        n_global,
+        lines_global,
+        re_global,
         result_global,
+        count_global,
+        sum_global,
         capture,
         tonum_dst: capture_num,
     })
@@ -571,6 +642,7 @@ pub(crate) fn region_can_compile(
             // int/regalloc paths don't list them, so they decline → mem path).
             | Instr::StrConcat { .. }
             | Instr::StrAppendInPlace { .. }
+            | Instr::StrAppendIndex { .. }
             | Instr::AddRightPair { .. }
             | Instr::Pad2Concat { .. }
             | Instr::Pad2Conditional { .. }
@@ -1260,6 +1332,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) concat: usize,
     /// Helper for in-place `a + b` (`StrAppendInPlace`).
     pub(crate) str_append: usize,
+    /// Pure ASCII prefix for fused `a += obj[key]`.
+    pub(crate) str_append_index: usize,
     /// Helper for a generic `obj.m(args…)` via the interpreter's per-site IC.
     pub(crate) call_method_ic: usize,
     /// Guarded direct `RegExp.prototype.test` / `exec` CallMethod helper.

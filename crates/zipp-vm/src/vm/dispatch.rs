@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -29,7 +29,9 @@ impl<'p> Vm<'p> {
         // MAX_FRAMES ever fires. Cap the nesting so it throws a catchable
         // RangeError (staging/sm/extensions/recursion.js) instead of crashing.
         if self.run_loop_depth >= MAX_RUN_LOOP_DEPTH {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         self.run_loop_depth += 1;
         let r = self.run_loop_body(stop_depth);
@@ -91,7 +93,11 @@ impl<'p> Vm<'p> {
                         self.regs[base + reg as usize] = tv;
                         self.frames[top].ip = target as usize;
                     }
-                    Handler::Finally { target, kind_reg, val_reg } => {
+                    Handler::Finally {
+                        target,
+                        kind_reg,
+                        val_reg,
+                    } => {
                         self.regs[base + kind_reg as usize] = Value::int(2); // throw
                         self.regs[base + val_reg as usize] = tv;
                         self.frames[top].ip = target as usize;
@@ -123,7 +129,11 @@ impl<'p> Vm<'p> {
         let base = self.frames[top].base;
         while let Some(h) = self.frames[top].handlers.last().copied() {
             match h {
-                Handler::Finally { target, kind_reg, val_reg } => {
+                Handler::Finally {
+                    target,
+                    kind_reg,
+                    val_reg,
+                } => {
                     self.frames[top].handlers.pop();
                     self.regs[base + kind_reg as usize] = Value::int(kind);
                     self.regs[base + val_reg as usize] = value;
@@ -150,7 +160,12 @@ impl<'p> Vm<'p> {
         let base = self.frames[top].base;
         while self.frames[top].handlers.len() > floor {
             let h = self.frames[top].handlers.pop().unwrap();
-            if let Handler::Finally { target: ftarget, kind_reg, val_reg } = h {
+            if let Handler::Finally {
+                target: ftarget,
+                kind_reg,
+                val_reg,
+            } = h
+            {
                 self.regs[base + kind_reg as usize] = Value::int(3 | ((floor as i32) << 2));
                 self.regs[base + val_reg as usize] = Value::int(target as i32);
                 return Some(ftarget);
@@ -247,81 +262,85 @@ impl<'p> Vm<'p> {
                     if self.jit.should_yield_to_region(func_id) {
                         self.jit.compile_defer(func_id);
                     } else {
-                    let proto: *const crate::bytecode::FuncProto =
-                        self.func(func_id as usize);
-                    // SAFETY: program functions are immutable during execution.
-                    let proto_ref = unsafe { &*proto };
-                    // A global op whose slot is still UNINITIALIZED may be
-                    // own-prop-backed — `this.x = v` / `globalThis.x = v` /
-                    // eval-created bindings live as own properties of the global
-                    // OBJECT, and the interpreter's LoadGlobal falls back to them.
-                    // The emitted `mov rax, [r12 + idx*8]` cannot: it reads the
-                    // uninitialized sentinel, so `x++` silently produced NaN.
-                    //
-                    // The region compiler (`region_globals_ok` below) and the
-                    // leaf-inline planner (`build_leaf_inline_plan`) already refuse
-                    // for exactly this reason. Tier C did not, which is why the
-                    // whole-function path had the bug and the loop path did not.
-                    //
-                    // "Once a slot holds a real value it can never go back" was the
-                    // stated justification for checking here and never again. It is
-                    // FALSE — `delete implicitG` puts the sentinel back — so
-                    // `try_run_jit` now revalidates at entry against the global-route
-                    // epoch. This stays as the cheap first filter.
-                    //
-                    // A STORE carries a second condition: a real own property on the
-                    // global object (non-writable, accessor, frozen) makes the write
-                    // an OrdinarySet the raw slot store would bypass. Both live in
-                    // `global_slot_directly_routable`, shared with the entry check so
-                    // the two cannot drift.
-                    let globals_ok = proto_ref.code.iter().all(|ins| match *ins {
-                        Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
-                            self.global_slot_directly_routable(idx)
+                        let proto: *const crate::bytecode::FuncProto = self.func(func_id as usize);
+                        // SAFETY: program functions are immutable during execution.
+                        let proto_ref = unsafe { &*proto };
+                        // A global op whose slot is still UNINITIALIZED may be
+                        // own-prop-backed — `this.x = v` / `globalThis.x = v` /
+                        // eval-created bindings live as own properties of the global
+                        // OBJECT, and the interpreter's LoadGlobal falls back to them.
+                        // The emitted `mov rax, [r12 + idx*8]` cannot: it reads the
+                        // uninitialized sentinel, so `x++` silently produced NaN.
+                        //
+                        // The region compiler (`region_globals_ok` below) and the
+                        // leaf-inline planner (`build_leaf_inline_plan`) already refuse
+                        // for exactly this reason. Tier C did not, which is why the
+                        // whole-function path had the bug and the loop path did not.
+                        //
+                        // "Once a slot holds a real value it can never go back" was the
+                        // stated justification for checking here and never again. It is
+                        // FALSE — `delete implicitG` puts the sentinel back — so
+                        // `try_run_jit` now revalidates at entry against the global-route
+                        // epoch. This stays as the cheap first filter.
+                        //
+                        // A STORE carries a second condition: a real own property on the
+                        // global object (non-writable, accessor, frozen) makes the write
+                        // an OrdinarySet the raw slot store would bypass. Both live in
+                        // `global_slot_directly_routable`, shared with the entry check so
+                        // the two cannot drift.
+                        let globals_ok = proto_ref.code.iter().all(|ins| match *ins {
+                            Instr::LoadGlobal { idx, .. }
+                            | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                                self.global_slot_directly_routable(idx)
+                            }
+                            Instr::StoreGlobal { idx, .. }
+                            | Instr::StoreGlobalStrict { idx, .. }
+                            | Instr::StoreGlobalResolved { idx, .. } => {
+                                self.global_slot_directly_routable(idx)
+                            }
+                            _ => true,
+                        });
+                        if !globals_ok {
+                            self.jit.compile_defer(func_id);
+                        } else {
+                            // The self-function's current global Value (a heap Func),
+                            // stable since hoist_functions ran at startup. Embedded so a
+                            // JIT'd `LoadGlobal(self_slot)` stores the REAL function (not
+                            // a placeholder) â€” required for a deopted self-Call to
+                            // resolve the callee correctly in the interpreter.
+                            let self_val = proto_ref
+                                .name_global
+                                .and_then(|s| self.globals.get(s as usize).copied())
+                                .unwrap_or(Value::UNDEFINED)
+                                .bits();
+                            let heap_helper_addrs = self.jit_heap_helper_addrs();
+                            let const_strs = self.jit_build_const_strs(func_id);
+                            // Tier-C leaf-inline plan for the whole function (from the live
+                            // ICs). Built BEFORE the &mut self.jit borrow. Opt out with
+                            // ZIPP_NO_TIERC_LEAF (region leaf inlining is unaffected).
+                            let leaf_plan = if std::env::var_os("ZIPP_NO_TIERC_LEAF").is_none() {
+                                self.build_leaf_inline_plan(
+                                    func_id,
+                                    0,
+                                    (proto_ref.code.len() - 1) as u32,
+                                )
+                            } else {
+                                rustc_hash::FxHashMap::default()
+                            };
+                            // Tier-C cross-call plan (B83) — also built before &mut self.jit.
+                            let cross_plan = self.build_cross_call_plan(func_id);
+                            self.jit.compile(
+                                func_id,
+                                proto_ref,
+                                jit_self_call_at as usize,
+                                self_val,
+                                jit_globals_base as usize,
+                                heap_helper_addrs,
+                                &const_strs,
+                                &leaf_plan,
+                                &cross_plan,
+                            );
                         }
-                        Instr::StoreGlobal { idx, .. }
-                        | Instr::StoreGlobalStrict { idx, .. }
-                        | Instr::StoreGlobalResolved { idx, .. } => {
-                            self.global_slot_directly_routable(idx)
-                        }
-                        _ => true,
-                    });
-                    if !globals_ok {
-                        self.jit.compile_defer(func_id);
-                    } else {
-                    // The self-function's current global Value (a heap Func),
-                    // stable since hoist_functions ran at startup. Embedded so a
-                    // JIT'd `LoadGlobal(self_slot)` stores the REAL function (not
-                    // a placeholder) â€” required for a deopted self-Call to
-                    // resolve the callee correctly in the interpreter.
-                    let self_val = proto_ref
-                        .name_global
-                        .and_then(|s| self.globals.get(s as usize).copied())
-                        .unwrap_or(Value::UNDEFINED)
-                        .bits();
-                    let heap_helper_addrs = self.jit_heap_helper_addrs();
-                    let const_strs = self.jit_build_const_strs(func_id);
-                    // Tier-C leaf-inline plan for the whole function (from the live
-                    // ICs). Built BEFORE the &mut self.jit borrow. Opt out with
-                    // ZIPP_NO_TIERC_LEAF (region leaf inlining is unaffected).
-                    let leaf_plan = if std::env::var_os("ZIPP_NO_TIERC_LEAF").is_none() {
-                        self.build_leaf_inline_plan(func_id, 0, (proto_ref.code.len() - 1) as u32)
-                    } else {
-                        rustc_hash::FxHashMap::default()
-                    };
-                    // Tier-C cross-call plan (B83) — also built before &mut self.jit.
-                    let cross_plan = self.build_cross_call_plan(func_id);
-                    self.jit.compile(
-                        func_id,
-                        proto_ref,
-                        jit_self_call_at as usize,
-                        self_val,
-                        jit_globals_base as usize,
-                        heap_helper_addrs,
-                        &const_strs,
-                        &leaf_plan,
-                        &cross_plan,
-                    );
-                    }
                     }
                 }
             }
@@ -413,7 +432,7 @@ impl<'p> Vm<'p> {
                                 return Err(Thrown(
                                     "ReferenceError: class binding accessed before initialization"
                                         .into(),
-                                ))
+                                ));
                             }
                         }
                         ip += 1;
@@ -495,8 +514,11 @@ impl<'p> Vm<'p> {
                                 // not enough to find the reference in minified
                                 // code. Built only on the throw path.
                                 let f = self.func(func_id as usize);
-                                let fname: &str =
-                                    if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                                let fname: &str = if f.name.is_empty() {
+                                    "<anonymous>"
+                                } else {
+                                    &f.name
+                                };
                                 return Err(Thrown(format!(
                                     "ReferenceError: {name} is not defined (in {fname})"
                                 )));
@@ -970,8 +992,7 @@ impl<'p> Vm<'p> {
                                 .rposition(|&i| i == idx)
                             {
                                 self.strict_unresolvable_globals.remove(p);
-                                let name =
-                                    self.global_slot_name(idx).unwrap_or_else(|| "?".into());
+                                let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
                                 return Err(Thrown(format!(
                                     "ReferenceError: {name} is not defined"
                                 )));
@@ -1090,7 +1111,13 @@ impl<'p> Vm<'p> {
                     // helper owns both the bounded primitive fast arm and the
                     // literal two-Add fallback, so interpreter/JIT semantics
                     // cannot drift.
-                    Instr::AddRightPair { dst, a, b, c, in_place } => {
+                    Instr::AddRightPair {
+                        dst,
+                        a,
+                        b,
+                        c,
+                        in_place,
+                    } => {
                         let av = self.get(base, a);
                         let bv = self.get(base, b);
                         let cv = self.get(base, c);
@@ -1135,6 +1162,37 @@ impl<'p> Vm<'p> {
                         let r = match self.str_append_inplace(av, bv) {
                             Some(r) => r,
                             None => self.add(base, a, b)?,
+                        };
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    // Exact adjacent `GetIndex` + proven-linear append fusion.
+                    // The ASCII hit performs no observable operation between
+                    // the indexed read and append. A miss writes the compiler-
+                    // dead scratch before running the historical append so it
+                    // remains a GC root exactly like the original GetIndex dst.
+                    Instr::StrAppendIndex {
+                        dst,
+                        a,
+                        obj,
+                        key,
+                        scratch,
+                    } => {
+                        let av = self.get(base, a);
+                        let ov = self.get(base, obj);
+                        let kv = self.get(base, key);
+                        let r = match self.str_append_index_ascii_fast(av, ov, kv) {
+                            Some(r) => r,
+                            None => {
+                                let bv = self.get_index(ov, kv)?;
+                                self.set(base, scratch, bv);
+                                let av = self.get(base, a);
+                                let bv = self.get(base, scratch);
+                                match self.str_append_inplace(av, bv) {
+                                    Some(r) => r,
+                                    None => self.add_values(av, bv)?,
+                                }
+                            }
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -1212,7 +1270,9 @@ impl<'p> Vm<'p> {
                         let r = if va.is_number() {
                             va
                         } else if self.is_bigint_prim(va) {
-                            return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
+                            return Err(Thrown(
+                                "TypeError: Cannot convert a BigInt value to a number".into(),
+                            ));
                         } else {
                             Value::num(self.to_number_strict(va)?)
                         };
@@ -1474,8 +1534,12 @@ impl<'p> Vm<'p> {
                         // ToString (invokes toString/valueOf; throws TypeError for a Symbol).
                         // EXACT bytes for a string argument (raw lone surrogates
                         // inside JSON string literals are preserved).
-                        let s: Vec<u8> = if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
-                            self.heap.str_wtf8_cow(arg.heap_index()).unwrap().into_owned()
+                        let s: Vec<u8> = if arg.is_heap() && self.heap.is_str_like(arg.heap_index())
+                        {
+                            self.heap
+                                .str_wtf8_cow(arg.heap_index())
+                                .unwrap()
+                                .into_owned()
                         } else {
                             self.to_js_string(arg)?.into_bytes()
                         };
@@ -1506,8 +1570,7 @@ impl<'p> Vm<'p> {
                                 && matches!(self.heap.get(vv.heap_index()), HeapObj::Array(_))
                             {
                                 let m = self.get_prop(vv, "@@iterator")?;
-                                if m.bits() != self.default_array_iter.bits()
-                                    && self.is_callable(m)
+                                if m.bits() != self.default_array_iter.bits() && self.is_callable(m)
                                 {
                                     let elems = self.iterate_to_vec(vv)?;
                                     if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
@@ -1557,14 +1620,23 @@ impl<'p> Vm<'p> {
                                     HeapObj::Array(_) => array_src = Some(vv.heap_index()),
                                     HeapObj::Set(items) => {
                                         // Skip tombstoned (deleted) slots.
-                                        let elems: Vec<Value> =
-                                            items.iter().copied().filter(|v| !v.is_hole()).collect();
+                                        let elems: Vec<Value> = items
+                                            .iter()
+                                            .copied()
+                                            .filter(|v| !v.is_hole())
+                                            .collect();
                                         if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
                                             d.extend(elems);
                                         }
                                     }
                                     HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                                        chars = Some(self.heap.str_cow(vv.heap_index()).unwrap().chars().collect());
+                                        chars = Some(
+                                            self.heap
+                                                .str_cow(vv.heap_index())
+                                                .unwrap()
+                                                .chars()
+                                                .collect(),
+                                        );
                                     }
                                     HeapObj::Map { keys, vals } => {
                                         // Skip tombstoned (deleted) entries.
@@ -1576,10 +1648,16 @@ impl<'p> Vm<'p> {
                                                 .collect(),
                                         );
                                     }
-                                    _ => return Err(Thrown("TypeError: spread value is not iterable".into())),
+                                    _ => {
+                                        return Err(Thrown(
+                                            "TypeError: spread value is not iterable".into(),
+                                        ));
+                                    }
                                 }
                             } else {
-                                return Err(Thrown("TypeError: spread value is not iterable".into()));
+                                return Err(Thrown(
+                                    "TypeError: spread value is not iterable".into(),
+                                ));
                             }
                             if let Some(src_idx) = array_src {
                                 let elems = self.spread_array_elements(src_idx)?;
@@ -1588,8 +1666,10 @@ impl<'p> Vm<'p> {
                                 }
                             }
                             if let Some(chars) = chars {
-                                let elems: Vec<Value> =
-                                    chars.into_iter().map(|c| self.alloc_str(c.to_string())).collect();
+                                let elems: Vec<Value> = chars
+                                    .into_iter()
+                                    .map(|c| self.alloc_str(c.to_string()))
+                                    .collect();
                                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                     dst_items.extend(elems);
                                 }
@@ -1597,7 +1677,9 @@ impl<'p> Vm<'p> {
                             if let Some(pairs) = map_pairs {
                                 let elems: Vec<Value> = pairs
                                     .into_iter()
-                                    .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))
+                                    .map(|(k, v)| {
+                                        Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v])))
+                                    })
                                     .collect();
                                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                     dst_items.extend(elems);
@@ -1623,11 +1705,16 @@ impl<'p> Vm<'p> {
                         self.object_assign(&[t, s])?; // mutates target in place
                         ip += 1;
                     }
-                    Instr::ObjectRest { dst, src, exclude_start, exclude_count } => {
+                    Instr::ObjectRest {
+                        dst,
+                        src,
+                        exclude_start,
+                        exclude_count,
+                    } => {
                         let s = self.get(base, src);
                         let consts = &self.func(func_id as usize).string_constants;
-                        let excluded =
-                            &consts[exclude_start as usize..exclude_start as usize + exclude_count as usize];
+                        let excluded = &consts[exclude_start as usize
+                            ..exclude_start as usize + exclude_count as usize];
                         // Only an ORDINARY object (or a string, handled below)
                         // can be walked straight off its ObjMap. Every other
                         // source — a Proxy's traps, but equally an Array's or a
@@ -1682,7 +1769,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::ObjectRestDyn { dst, src, keys_base, n } => {
+                    Instr::ObjectRestDyn {
+                        dst,
+                        src,
+                        keys_base,
+                        n,
+                    } => {
                         let s = self.get(base, src);
                         // Resolve the excluded sibling keys (ToPropertyKey) from regs.
                         let mut excluded: Vec<String> = Vec::with_capacity(n as usize);
@@ -1734,7 +1826,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::MakeClass { dst, class_id, parent } => {
+                    Instr::MakeClass {
+                        dst,
+                        class_id,
+                        parent,
+                    } => {
                         let cd = self.class_def(class_id as usize).clone();
                         // A STATIC member named "prototype" is a TypeError at class
                         // definition (a literal `static prototype` is an early
@@ -1799,21 +1895,22 @@ impl<'p> Vm<'p> {
                         // Materialize each method as a callable value once
                         // (instances share these): a plain Func, or a Closure over
                         // this frame when the method closes over an enclosing local.
-                        let materialize =
-                            |vm: &mut Self, defs: &[(String, u32)]| -> Vec<(String, Value)> {
-                                defs.iter()
-                                    .map(|(n, fid)| {
-                                        // A computed-key PLACEHOLDER (position-only:
-                                        // "\u{1}cm{fid}", no compiled function of its
-                                        // own) — ClassAddMember renames it in place
-                                        // with the materialized member.
-                                        if *fid == u32::MAX {
-                                            return (n.clone(), Value::UNDEFINED);
-                                        }
-                                        (n.clone(), vm.materialize_callable(*fid, base, cur_closure))
-                                    })
-                                    .collect()
-                            };
+                        let materialize = |vm: &mut Self,
+                                           defs: &[(String, u32)]|
+                         -> Vec<(String, Value)> {
+                            defs.iter()
+                                .map(|(n, fid)| {
+                                    // A computed-key PLACEHOLDER (position-only:
+                                    // "\u{1}cm{fid}", no compiled function of its
+                                    // own) — ClassAddMember renames it in place
+                                    // with the materialized member.
+                                    if *fid == u32::MAX {
+                                        return (n.clone(), Value::UNDEFINED);
+                                    }
+                                    (n.clone(), vm.materialize_callable(*fid, base, cur_closure))
+                                })
+                                .collect()
+                        };
                         let methods = materialize(self, &cd.methods);
                         let getters = materialize(self, &cd.getters);
                         let setters = materialize(self, &cd.setters);
@@ -1893,7 +1990,8 @@ impl<'p> Vm<'p> {
                             .chain(static_setters.iter())
                         {
                             if mv.is_heap() {
-                                self.method_brand.insert(mv.heap_index(), lex_brands.clone());
+                                self.method_brand
+                                    .insert(mv.heap_index(), lex_brands.clone());
                             }
                         }
                         let mut statics = ObjMap::new();
@@ -1910,7 +2008,8 @@ impl<'p> Vm<'p> {
                         for (n, fid) in &cd.statics {
                             let fv = self.materialize_callable(*fid, base, cur_closure);
                             if fv.is_heap() {
-                                self.method_brand.insert(fv.heap_index(), lex_brands.clone());
+                                self.method_brand
+                                    .insert(fv.heap_index(), lex_brands.clone());
                             }
                             statics.define(n, fv, method_attr);
                         }
@@ -1986,7 +2085,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::DecKey { class, elem, key, class_id: _ } => {
+                    Instr::DecKey {
+                        class,
+                        elem,
+                        key,
+                        class_id: _,
+                    } => {
                         let cv = self.get(base, class);
                         let kraw = self.get(base, key);
                         // ToPropertyKey HERE and write the result back, so the
@@ -2001,7 +2105,13 @@ impl<'p> Vm<'p> {
                         self.dec_record_key(cv, elem as usize, k);
                         ip += 1;
                     }
-                    Instr::DecElem { class, elem, arg_base, argc, class_id } => {
+                    Instr::DecElem {
+                        class,
+                        elem,
+                        arg_base,
+                        argc,
+                        class_id,
+                    } => {
                         let cv = self.get(base, class);
                         // The register block is (decorator, receiver) PAIRS: a
                         // `@a.b` decorator is called as a method of `a`.
@@ -2016,7 +2126,11 @@ impl<'p> Vm<'p> {
                         self.dec_apply_element(cv, class_id, elem as usize, &decs)?;
                         ip += 1;
                     }
-                    Instr::DecClass { class, arg_base, argc } => {
+                    Instr::DecClass {
+                        class,
+                        arg_base,
+                        argc,
+                    } => {
                         let cv = self.get(base, class);
                         let decs: Vec<(Value, Value)> = (0..argc)
                             .map(|i| {
@@ -2030,12 +2144,22 @@ impl<'p> Vm<'p> {
                         self.set(base, class, out);
                         ip += 1;
                     }
-                    Instr::DecInits { class_id, which, elem, recv } => {
+                    Instr::DecInits {
+                        class_id,
+                        which,
+                        elem,
+                        recv,
+                    } => {
                         let r = self.get(base, recv);
                         self.dec_run_inits(class_id, which, elem as usize, r)?;
                         ip += 1;
                     }
-                    Instr::DecField { class_id, elem, val, recv } => {
+                    Instr::DecField {
+                        class_id,
+                        elem,
+                        val,
+                        recv,
+                    } => {
                         // `v = init(v)` per initializer, innermost decorator
                         // first. The running value goes back into its register
                         // after every step so it stays a GC root across the next
@@ -2049,7 +2173,12 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::ClassAddMember { class, key, func, kind } => {
+                    Instr::ClassAddMember {
+                        class,
+                        key,
+                        func,
+                        kind,
+                    } => {
                         let write_back = kind & crate::bytecode::KEY_WRITEBACK != 0;
                         let kind = kind & !crate::bytecode::KEY_WRITEBACK;
                         let cv = self.get(base, class);
@@ -2179,7 +2308,12 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::New { dst, callee, arg_base, argc } => {
+                    Instr::New {
+                        dst,
+                        callee,
+                        arg_base,
+                        argc,
+                    } => {
                         let cv = self.get(base, callee);
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
@@ -2215,7 +2349,11 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::FieldInit { key_index, val, class_id } => {
+                    Instr::FieldInit {
+                        key_index,
+                        val,
+                        class_id,
+                    } => {
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
                         // The computed key was evaluated once at class definition.
@@ -2237,12 +2375,14 @@ impl<'p> Vm<'p> {
                                 })
                         } else {
                             match self.heap.get(this.heap_index()) {
-                                HeapObj::Object(m) => m.class.and_then(|cidx| {
-                                    match self.heap.get(cidx) {
-                                        HeapObj::Class(c) => c.computed_field_keys.get(key_index as usize).copied(),
+                                HeapObj::Object(m) => {
+                                    m.class.and_then(|cidx| match self.heap.get(cidx) {
+                                        HeapObj::Class(c) => {
+                                            c.computed_field_keys.get(key_index as usize).copied()
+                                        }
                                         _ => None,
-                                    }
-                                }),
+                                    })
+                                }
                                 _ => None,
                             }
                         };
@@ -2284,7 +2424,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, f);
                         ip += 1;
                     }
-                    Instr::SuperCtor { ctor, home_class_id, arg_base, argc } => {
+                    Instr::SuperCtor {
+                        ctor,
+                        home_class_id,
+                        arg_base,
+                        argc,
+                    } => {
                         // IsConstructor is checked AFTER the argument registers
                         // were evaluated (the fetch happened before them).
                         let parent = self.get(base, ctor);
@@ -2299,7 +2444,11 @@ impl<'p> Vm<'p> {
                             args.push(self.get(base, arg_base + i));
                         }
                         // `super(...)` keeps the derived activation's new.target.
-                        let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
+                        let nt = self
+                            .frames
+                            .last()
+                            .map(|f| f.new_target)
+                            .unwrap_or(Value::UNDEFINED);
                         // super() PRODUCES `this`; completion enforces the once-only
                         // rule, rebinds reg 0 (return-override), lifts the this-TDZ
                         // and runs this class's deferred field initializers.
@@ -2307,7 +2456,11 @@ impl<'p> Vm<'p> {
                         self.super_ctor_complete(base, this, produced, home_class_id)?;
                         ip += 1;
                     }
-                    Instr::SuperCtorSpread { ctor, home_class_id, args } => {
+                    Instr::SuperCtorSpread {
+                        ctor,
+                        home_class_id,
+                        args,
+                    } => {
                         let parent = self.get(base, ctor);
                         if !self.is_constructor(parent) {
                             return Err(Thrown(
@@ -2317,7 +2470,11 @@ impl<'p> Vm<'p> {
                         let this = self.get(base, 0);
                         let args_v = self.get(base, args);
                         let arg_vec = self.array_snapshot(args_v.heap_index());
-                        let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
+                        let nt = self
+                            .frames
+                            .last()
+                            .map(|f| f.new_target)
+                            .unwrap_or(Value::UNDEFINED);
                         let produced = self.run_class_ctor(parent, this, &arg_vec, nt)?;
                         self.super_ctor_complete(base, this, produced, home_class_id)?;
                         ip += 1;
@@ -2326,11 +2483,19 @@ impl<'p> Vm<'p> {
                         // GetSuperBase at MakeSuperPropertyReference time — the
                         // compiler places this BEFORE the args/RHS of the
                         // reference's use; the consumer reads the captured value.
-                        let v = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        let v = self
+                            .super_base(home_class_id, self.func(func_id as usize).super_static);
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::SuperMethod { dst, base: base_reg, home_class_id, name, arg_base, argc } => {
+                    Instr::SuperMethod {
+                        dst,
+                        base: base_reg,
+                        home_class_id,
+                        name,
+                        arg_base,
+                        argc,
+                    } => {
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
@@ -2343,13 +2508,20 @@ impl<'p> Vm<'p> {
                         // nested run_loop (and its per-call args Vec).
                         {
                             let is_static = self.func(func_id as usize).super_static;
-                            if let Some((fid, closure, callee)) = self
-                                .ic_super_method(func_id, ip, home_class_id, is_static, key)
+                            if let Some((fid, closure, callee)) =
+                                self.ic_super_method(func_id, ip, home_class_id, is_static, key)
                             {
                                 let this = self.get(base, 0);
                                 self.setup_call(
-                                    fid, closure, this, base, arg_base, argc, dst,
-                                    ip + 1, callee,
+                                    fid,
+                                    closure,
+                                    this,
+                                    base,
+                                    arg_base,
+                                    argc,
+                                    dst,
+                                    ip + 1,
+                                    callee,
                                 )?;
                                 break;
                             }
@@ -2368,7 +2540,9 @@ impl<'p> Vm<'p> {
                         let this = self.get(base, 0);
                         let m = self.get_member(proto, key, this)?;
                         if !self.is_callable(m) {
-                            return Err(Thrown(format!("TypeError: super.{key} is not a function")));
+                            return Err(Thrown(format!(
+                                "TypeError: super.{key} is not a function"
+                            )));
                         }
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
@@ -2378,17 +2552,25 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperMethodSpread { dst, home_class_id, name, args } => {
+                    Instr::SuperMethodSpread {
+                        dst,
+                        home_class_id,
+                        name,
+                        args,
+                    } => {
                         // `super.name(...args)` â€” like SuperMethod but the arguments come
                         // from a spread array; `this` = the current receiver.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
-                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        let proto = self
+                            .super_base(home_class_id, self.func(func_id as usize).super_static);
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
                         let m = self.get_member(proto, key, this)?;
                         if !self.is_callable(m) {
-                            return Err(Thrown(format!("TypeError: super.{key} is not a function")));
+                            return Err(Thrown(format!(
+                                "TypeError: super.{key} is not a function"
+                            )));
                         }
                         let args_v = self.get(base, args);
                         let arg_vec = self.array_snapshot(args_v.heap_index());
@@ -2396,13 +2578,19 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperMethodComputedSpread { dst, home_class_id, key, args } => {
+                    Instr::SuperMethodComputedSpread {
+                        dst,
+                        home_class_id,
+                        key,
+                        args,
+                    } => {
                         // `super[key](...args)` — computed SuperMethodSpread:
                         // ToPropertyKey(key), resolve on the super base with
                         // `this` = the current receiver, spread-call.
                         let kv = self.get(base, key);
                         // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
-                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        let proto = self
+                            .super_base(home_class_id, self.func(func_id as usize).super_static);
                         let ks = self.coerce_index_key(kv)?;
                         let ks = self.key_of(ks);
                         self.require_object_coercible(proto)?;
@@ -2419,7 +2607,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperGet { dst, home_class_id, name } => {
+                    Instr::SuperGet {
+                        dst,
+                        home_class_id,
+                        name,
+                    } => {
                         // `super.name` read: resolve on the super base (the home
                         // object's [[Prototype]]) with `this` = the current receiver
                         // (so a getter sees it). For a base class the base is
@@ -2431,24 +2623,36 @@ impl<'p> Vm<'p> {
                         // `this` = the current receiver and ret_dst = dst.
                         {
                             let is_static = self.func(func_id as usize).super_static;
-                            match self.ic_super_get(func_id, ip, home_class_id, is_static, key)
-                            {
+                            match self.ic_super_get(func_id, ip, home_class_id, is_static, key) {
                                 GetAct::Value(v) => {
                                     self.set(base, dst, v);
                                     ip += 1;
                                     continue;
                                 }
-                                GetAct::Accessor { fid, closure, getter } => {
+                                GetAct::Accessor {
+                                    fid,
+                                    closure,
+                                    getter,
+                                } => {
                                     let this = self.get(base, 0);
                                     self.setup_call(
-                                        fid, closure, this, base, 0, 0, dst, ip + 1, getter,
+                                        fid,
+                                        closure,
+                                        this,
+                                        base,
+                                        0,
+                                        0,
+                                        dst,
+                                        ip + 1,
+                                        getter,
                                     )?;
                                     break;
                                 }
                                 GetAct::None => {}
                             }
                         }
-                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        let proto = self
+                            .super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -2456,13 +2660,18 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperGetComputed { dst, home_class_id, key } => {
+                    Instr::SuperGetComputed {
+                        dst,
+                        home_class_id,
+                        key,
+                    } => {
                         let kv = self.get(base, key);
                         // GetSuperBase runs at MakeSuperPropertyReference time —
                         // BEFORE GetValue's ToPropertyKey coercion (whose
                         // toString may retarget the home object's prototype):
                         // prop-expr-getsuperbase-before-topropertykey-*.
-                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        let proto = self
+                            .super_base(home_class_id, self.func(func_id as usize).super_static);
                         let ks = self.to_property_key(kv)?;
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
@@ -2471,7 +2680,14 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperMethodComputed { dst, base: base_reg, home_class_id: _, key, arg_base, argc } => {
+                    Instr::SuperMethodComputed {
+                        dst,
+                        base: base_reg,
+                        home_class_id: _,
+                        key,
+                        arg_base,
+                        argc,
+                    } => {
                         let kv = self.get(base, key);
                         // The base was captured right after the key ran, BEFORE
                         // the argument list (SuperBase).
@@ -2489,7 +2705,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperSet { base: base_reg, home_class_id, name, val } => {
+                    Instr::SuperSet {
+                        base: base_reg,
+                        home_class_id,
+                        name,
+                        val,
+                    } => {
                         let key =
                             self.func(func_id as usize).string_constants[name as usize].as_str();
                         let this = self.get(base, 0);
@@ -2501,12 +2722,22 @@ impl<'p> Vm<'p> {
                         // (which go to the RECEIVER) stay on the slow path. The
                         // entry is version-guarded on the same chain the
                         // SuperBase op captured, so a retargeted base misses it.
-                        if let SetAct::Setter { fid, closure, setter } =
-                            self.ic_super_set(func_id, ip, home_class_id, is_static, key)
+                        if let SetAct::Setter {
+                            fid,
+                            closure,
+                            setter,
+                        } = self.ic_super_set(func_id, ip, home_class_id, is_static, key)
                         {
                             self.setup_call(
-                                fid, closure, this, base, val, 1, RET_DISCARD,
-                                ip + 1, setter,
+                                fid,
+                                closure,
+                                this,
+                                base,
+                                val,
+                                1,
+                                RET_DISCARD,
+                                ip + 1,
+                                setter,
                             )?;
                             break;
                         }
@@ -2517,7 +2748,12 @@ impl<'p> Vm<'p> {
                         self.super_set_obj(proto, &key, this, v, strict)?;
                         ip += 1;
                     }
-                    Instr::SuperSetComputed { base: base_reg, home_class_id: _, key, val } => {
+                    Instr::SuperSetComputed {
+                        base: base_reg,
+                        home_class_id: _,
+                        key,
+                        val,
+                    } => {
                         let kv = self.get(base, key);
                         // The base was captured right after the key ran, BEFORE
                         // the RHS (SuperBase) — but still before ToPropertyKey's
@@ -2582,7 +2818,12 @@ impl<'p> Vm<'p> {
                         self.super_set_obj(proto, &ks, this, v, strict)?;
                         ip += 1;
                     }
-                    Instr::SuperMethodObj { dst, name, arg_base, argc } => {
+                    Instr::SuperMethodObj {
+                        dst,
+                        name,
+                        arg_base,
+                        argc,
+                    } => {
                         let key =
                             self.func(func_id as usize).string_constants[name as usize].as_str();
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
@@ -2590,7 +2831,9 @@ impl<'p> Vm<'p> {
                         let this = self.get(base, 0);
                         let m = self.get_member(proto, &key, this)?;
                         if !self.is_callable(m) {
-                            return Err(Thrown(format!("TypeError: super.{key} is not a function")));
+                            return Err(Thrown(format!(
+                                "TypeError: super.{key} is not a function"
+                            )));
                         }
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
@@ -2600,7 +2843,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::SuperMethodObjComputed { dst, key, arg_base, argc } => {
+                    Instr::SuperMethodObjComputed {
+                        dst,
+                        key,
+                        arg_base,
+                        argc,
+                    } => {
                         let kv = self.get(base, key);
                         // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
@@ -2609,7 +2857,9 @@ impl<'p> Vm<'p> {
                         let this = self.get(base, 0);
                         let m = self.get_member(proto, &ks, this)?;
                         if !self.is_callable(m) {
-                            return Err(Thrown(format!("TypeError: super[{ks}] is not a function")));
+                            return Err(Thrown(format!(
+                                "TypeError: super[{ks}] is not a function"
+                            )));
                         }
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
@@ -2619,7 +2869,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::ArrayCtor { dst, arg_base, argc } => {
+                    Instr::ArrayCtor {
+                        dst,
+                        arg_base,
+                        argc,
+                    } => {
                         let mut virtual_len: Option<u32> = None;
                         let arr = if argc == 1 && self.get(base, arg_base).is_number() {
                             // `Array(n)` â†’ n HOLES (absent elements), not n undefineds.
@@ -2658,7 +2912,9 @@ impl<'p> Vm<'p> {
                             if !sv.is_nullish() {
                                 let adder = self.get_member(m, "set", m)?;
                                 if !self.is_callable(adder) {
-                                    return Err(Thrown("TypeError: Map.prototype.set is not callable".into()));
+                                    return Err(Thrown(
+                                        "TypeError: Map.prototype.set is not callable".into(),
+                                    ));
                                 }
                                 // AddEntriesFromIterable: step the iterator lazily;
                                 // each entry must be an Object; read k/v and call the
@@ -2677,11 +2933,17 @@ impl<'p> Vm<'p> {
                                     }
                                     let k = match self.get_index(e, Value::int(0)) {
                                         Ok(k) => k,
-                                        Err(err) => { self.iterator_close_quiet(iter); return Err(err); }
+                                        Err(err) => {
+                                            self.iterator_close_quiet(iter);
+                                            return Err(err);
+                                        }
                                     };
                                     let v = match self.get_index(e, Value::int(1)) {
                                         Ok(v) => v,
-                                        Err(err) => { self.iterator_close_quiet(iter); return Err(err); }
+                                        Err(err) => {
+                                            self.iterator_close_quiet(iter);
+                                            return Err(err);
+                                        }
                                     };
                                     if let Err(err) = self.call_value(adder, m, &[k, v]) {
                                         self.iterator_close_quiet(iter);
@@ -2700,7 +2962,9 @@ impl<'p> Vm<'p> {
                             if !sv.is_nullish() {
                                 let adder = self.get_member(set_v, "add", set_v)?;
                                 if !self.is_callable(adder) {
-                                    return Err(Thrown("TypeError: Set.prototype.add is not callable".into()));
+                                    return Err(Thrown(
+                                        "TypeError: Set.prototype.add is not callable".into(),
+                                    ));
                                 }
                                 // Lazy iteration + IteratorClose on an abrupt adder.
                                 let iter = self.get_iterator_object(sv)?;
@@ -2724,9 +2988,10 @@ impl<'p> Vm<'p> {
                         // `set` adder (so non-registered symbol keys validate via
                         // CanBeHeldWeakly, the adder is observably called, and an
                         // abrupt closes the iterator).
-                        let wm = Value::heap(
-                            self.heap.alloc(HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() }),
-                        );
+                        let wm = Value::heap(self.heap.alloc(HeapObj::WeakMap {
+                            keys: Vec::new(),
+                            vals: Vec::new(),
+                        }));
                         if let Some(s) = src {
                             let sv = self.get(base, s);
                             if !sv.is_nullish() {
@@ -2784,7 +3049,9 @@ impl<'p> Vm<'p> {
                             }
                             _ => {
                                 // Boolean box: ToBoolean(arg) (no arg -> false).
-                                Value::bool(arg.map(|a| self.truthy(self.get(base, a))).unwrap_or(false))
+                                Value::bool(
+                                    arg.map(|a| self.truthy(self.get(base, a))).unwrap_or(false),
+                                )
                             }
                         };
                         let b = Value::heap(self.heap.alloc(HeapObj::Boxed { kind, value }));
@@ -2798,9 +3065,10 @@ impl<'p> Vm<'p> {
                                 "TypeError: FinalizationRegistry: cleanup callback must be callable".into(),
                             ));
                         }
-                        let fr = Value::heap(
-                            self.heap.alloc(HeapObj::FinalizationRegistry { cleanup: cb, tokens: Vec::new() }),
-                        );
+                        let fr = Value::heap(self.heap.alloc(HeapObj::FinalizationRegistry {
+                            cleanup: cb,
+                            tokens: Vec::new(),
+                        }));
                         self.set(base, dst, fr);
                         ip += 1;
                     }
@@ -2816,15 +3084,22 @@ impl<'p> Vm<'p> {
                         }
                         let p = self.alloc_promise();
                         let pair = self.new_resolver_pair();
-                        let res = Value::heap(
-                            self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false, pair }),
-                        );
-                        let rej = Value::heap(
-                            self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true, pair }),
-                        );
+                        let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                            promise: p,
+                            is_reject: false,
+                            pair,
+                        }));
+                        let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                            promise: p,
+                            is_reject: true,
+                            pair,
+                        }));
                         // A throwing executor rejects the promise — via the pair's
                         // [[Reject]], a no-op once resolve/reject already fired.
-                        if self.call_value(exec, Value::UNDEFINED, &[res, rej]).is_err() {
+                        if self
+                            .call_value(exec, Value::UNDEFINED, &[res, rej])
+                            .is_err()
+                        {
                             let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
                             if self.resolver_pair_fire(pair) {
                                 self.reject(p, reason);
@@ -2841,7 +3116,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
-                    Instr::CallMethodSpread { dst, obj, name, args } => {
+                    Instr::CallMethodSpread {
+                        dst,
+                        obj,
+                        name,
+                        args,
+                    } => {
                         let recv = self.get(base, obj);
                         // `func()` returns `&'p`, so the interned name key outlives
                         // any `&mut self` below â€” and resolves eval functions too.
@@ -2861,7 +3141,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
-                    Instr::CallMethodComputedSpread { dst, obj, key, args } => {
+                    Instr::CallMethodComputedSpread {
+                        dst,
+                        obj,
+                        key,
+                        args,
+                    } => {
                         // `obj[key](...args)` â€” bind `this` = obj (unlike CallSpread on
                         // the GET result). Builtin method first, else resolve off the
                         // receiver via the computed key and call with `this = recv`.
@@ -2880,23 +3165,44 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
-                    Instr::MathOp { dst, op, arg_base, argc } => {
+                    Instr::MathOp {
+                        dst,
+                        op,
+                        arg_base,
+                        argc,
+                    } => {
                         let r = self.eval_math(op, base, arg_base, argc)?;
                         self.set(base, dst, Value::num(r));
                         ip += 1;
                     }
-                    Instr::GlobalFn { dst, op, arg_base, argc } => {
+                    Instr::GlobalFn {
+                        dst,
+                        op,
+                        arg_base,
+                        argc,
+                    } => {
                         use crate::bytecode::GlobalFn as G;
-                        let a0 = if argc >= 1 { self.get(base, arg_base) } else { Value::UNDEFINED };
+                        let a0 = if argc >= 1 {
+                            self.get(base, arg_base)
+                        } else {
+                            Value::UNDEFINED
+                        };
                         let v = match op {
                             G::Number => {
-                                if argc == 0 { Value::num(0.0) } else { Value::num(self.to_number_coerce(a0)?) }
+                                if argc == 0 {
+                                    Value::num(0.0)
+                                } else {
+                                    Value::num(self.to_number_coerce(a0)?)
+                                }
                             }
                             G::String => {
                                 if argc == 0 {
                                     self.alloc_str(String::new())
                                 } else if a0.is_heap()
-                                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Symbol { .. })
+                                    && matches!(
+                                        self.heap.get(a0.heap_index()),
+                                        HeapObj::Symbol { .. }
+                                    )
                                 {
                                     // `String(symbol)` is allowed (unlike ToString,
                                     // which throws) and yields "Symbol(desc)".
@@ -2938,9 +3244,7 @@ impl<'p> Vm<'p> {
                             // and propagates abrupt completions (a throwing valueOf, a
                             // Symbol arg â†’ TypeError), so route through to_number_coerce.
                             G::IsNaN => Value::bool(self.to_number_coerce(a0)?.is_nan()),
-                            G::IsFinite => {
-                                Value::bool(self.to_number_coerce(a0)?.is_finite())
-                            }
+                            G::IsFinite => Value::bool(self.to_number_coerce(a0)?.is_finite()),
                         };
                         self.set(base, dst, v);
                         ip += 1;
@@ -2951,7 +3255,18 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
-                    Instr::HasProp { dst, key, obj, brand } => {
+                    Instr::HasProp {
+                        dst,
+                        key,
+                        obj,
+                        brand,
+                    } => {
+                        if !brand {
+                            if let Some(exit) = self.try_in_probe_reduce(func_id, ip) {
+                                ip = exit;
+                                continue;
+                            }
+                        }
                         let k = self.get(base, key);
                         let o = self.get(base, obj);
                         // Fast path: `i in arr` PRESENT on a dense array — the hot
@@ -3020,9 +3335,8 @@ impl<'p> Vm<'p> {
                     }
                     Instr::WithHas { dst, obj, name } => {
                         let o = self.get(base, obj);
-                        let key = self.func(func_id as usize)
-                            .string_constants[name as usize]
-                            .as_str();
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         // HasBindingFor a with environment: [[HasProperty]] (own or
                         // inherited), then the @@unscopables filter â€” an own/inherited
                         // `@@unscopables` object whose `key` entry is truthy hides the
@@ -3031,8 +3345,7 @@ impl<'p> Vm<'p> {
                         // [[HasProperty]] must dispatch a Proxy `has` trap
                         // (and propagate its abrupt completion).
                         let kv = self.key_to_value(&key);
-                        let mut found =
-                            self.is_object_value(o) && self.has_property_dyn(o, kv)?;
+                        let mut found = self.is_object_value(o) && self.has_property_dyn(o, kv)?;
                         if found {
                             let unsc = self.get_prop(o, "@@unscopables")?;
                             if self.is_object_value(unsc) {
@@ -3045,11 +3358,15 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(found));
                         ip += 1;
                     }
-                    Instr::WithGet { dst, obj, name, strict } => {
+                    Instr::WithGet {
+                        dst,
+                        obj,
+                        name,
+                        strict,
+                    } => {
                         let o = self.get(base, obj);
-                        let key = self.func(func_id as usize)
-                            .string_constants[name as usize]
-                            .as_str();
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         // GetBindingValue: HasProperty AGAIN (the WithHas
                         // @@unscopables getter may have deleted the binding).
                         let kv = self.key_to_value(&key);
@@ -3066,11 +3383,15 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::WithSet { obj, name, val, strict } => {
+                    Instr::WithSet {
+                        obj,
+                        name,
+                        val,
+                        strict,
+                    } => {
                         let o = self.get(base, obj);
-                        let key = self.func(func_id as usize)
-                            .string_constants[name as usize]
-                            .as_str();
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         // SetMutableBinding step 2 re-checks HasProperty
                         // UNCONDITIONALLY (observable through a Proxy `has`
                         // trap, even in sloppy mode); strict mode then throws
@@ -3079,9 +3400,7 @@ impl<'p> Vm<'p> {
                         let still_exists =
                             self.is_object_value(o) && self.has_property_dyn(o, kv)?;
                         if strict && !still_exists {
-                            return Err(Thrown(format!(
-                                "ReferenceError: {key} is not defined"
-                            )));
+                            return Err(Thrown(format!("ReferenceError: {key} is not defined")));
                         }
                         let v = self.get(base, val);
                         self.set_prop(o, &key, v, strict)?;
@@ -3118,7 +3437,8 @@ impl<'p> Vm<'p> {
                             // absent. A plain-object RHS reached the same TypeError
                             // by accident (kind 0 below), but a callable RHS — a
                             // Proxy over a function, say — silently answered `false`.
-                            if hi != Value::UNDEFINED && hi != Value::NULL && !self.is_callable(hi) {
+                            if hi != Value::UNDEFINED && hi != Value::NULL && !self.is_callable(hi)
+                            {
                                 return Err(Thrown(
                                     "TypeError: Symbol.hasInstance handler is not callable".into(),
                                 ));
@@ -3142,7 +3462,9 @@ impl<'p> Vm<'p> {
                         let kind = if c.is_heap() {
                             match self.heap.get(c.heap_index()) {
                                 HeapObj::Class(_) => 1u8,
-                                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } => 2,
+                                HeapObj::Func(_)
+                                | HeapObj::Closure { .. }
+                                | HeapObj::Bound { .. } => 2,
                                 // Built-in constructor globals (Map/Set/Date/WeakMap/â€¦)
                                 // are objects but constructable: use prototype-chain check.
                                 HeapObj::Object(m) if m.is_ctor => 2,
@@ -3189,14 +3511,20 @@ impl<'p> Vm<'p> {
                             // (`x instanceof {}`, `x instanceof 5`, `x instanceof null`).
                             _ => {
                                 return Err(Thrown(
-                                    "TypeError: Right-hand side of 'instanceof' is not callable".into(),
-                                ))
+                                    "TypeError: Right-hand side of 'instanceof' is not callable"
+                                        .into(),
+                                ));
                             }
                         };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
-                    Instr::StaticFn { dst, op, arg_base, argc } => {
+                    Instr::StaticFn {
+                        dst,
+                        op,
+                        arg_base,
+                        argc,
+                    } => {
                         use crate::bytecode::StaticFn as S;
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
@@ -3224,8 +3552,12 @@ impl<'p> Vm<'p> {
                                 // (PromiseResolve step 2) — a changed constructor gets
                                 // a fresh adopting promise.
                                 if a0.is_heap()
-                                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Promise { .. })
-                                    && self.get_prop(a0, "constructor")? == self.promise_ctor_value()
+                                    && matches!(
+                                        self.heap.get(a0.heap_index()),
+                                        HeapObj::Promise { .. }
+                                    )
+                                    && self.get_prop(a0, "constructor")?
+                                        == self.promise_ctor_value()
                                 {
                                     a0
                                 } else {
@@ -3257,8 +3589,9 @@ impl<'p> Vm<'p> {
                             }
                             S::ObjectDefineProperty => {
                                 self.require_object_coercible(a0)?; // Type(O) must be Object
-                                let key =
-                                    self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                                let key = self.to_property_key(
+                                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                                )?;
                                 let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                                 self.object_define_property(a0, &key, desc)?;
                                 a0
@@ -3266,7 +3599,8 @@ impl<'p> Vm<'p> {
                             S::ObjectDefineProperties => {
                                 if !self.is_object_value(a0) {
                                     return Err(Thrown(
-                                        "TypeError: Object.defineProperties called on non-object".into(),
+                                        "TypeError: Object.defineProperties called on non-object"
+                                            .into(),
                                     ));
                                 }
                                 let props = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -3276,8 +3610,9 @@ impl<'p> Vm<'p> {
                             S::ObjectGetOwnPropertyDescriptor => {
                                 self.require_object_coercible(a0)?; // ToObject(O)
                                 let o = self.to_object(a0)?;
-                                let key =
-                                    self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                                let key = self.to_property_key(
+                                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                                )?;
                                 self.defer_check(o, &key)?;
                                 self.ns_tdz_check(o, &key)?; // uninit export throws
                                 match self.proxy_gopd(o, &key)? {
@@ -3298,10 +3633,13 @@ impl<'p> Vm<'p> {
                             S::ObjectCreate => {
                                 if a0 != Value::NULL && !self.is_object_value(a0) {
                                     return Err(Thrown(
-                                        "TypeError: Object prototype may only be an Object or null".into(),
+                                        "TypeError: Object prototype may only be an Object or null"
+                                            .into(),
                                     ));
                                 }
-                                let o = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
+                                let o = Value::heap(
+                                    self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))),
+                                );
                                 if a0 != Value::UNDEFINED {
                                     self.proto_of.insert(o.heap_index(), a0);
                                 }
@@ -3327,14 +3665,24 @@ impl<'p> Vm<'p> {
                         use crate::bytecode::MathFn as M;
                         let av = self.get(base, args);
                         let elems = self.array_snapshot(av.heap_index());
-                        let nums: Vec<f64> =
-                            elems.iter().map(|&v| self.to_number(v)).collect::<Result<_, _>>()?;
+                        let nums: Vec<f64> = elems
+                            .iter()
+                            .map(|&v| self.to_number(v))
+                            .collect::<Result<_, _>>()?;
                         let r = match op {
                             M::Max => nums.iter().fold(f64::NEG_INFINITY, |a, &b| {
-                                if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
+                                if a.is_nan() || b.is_nan() {
+                                    f64::NAN
+                                } else {
+                                    a.max(b)
+                                }
                             }),
                             M::Min => nums.iter().fold(f64::INFINITY, |a, &b| {
-                                if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }
+                                if a.is_nan() || b.is_nan() {
+                                    f64::NAN
+                                } else {
+                                    a.min(b)
+                                }
                             }),
                             M::Hypot => nums.iter().map(|&v| v * v).sum::<f64>().sqrt(),
                             // A non-variadic Math fn spread is unusual; apply to elem 0.
@@ -3420,7 +3768,8 @@ impl<'p> Vm<'p> {
                                     let last = proto.code.len() - 1;
                                     let mut e = (ip as usize).min(last);
                                     for p in (ip as usize + 1)..=last {
-                                        if matches!(proto.code[p], Instr::Jump { target } if target as usize == t) {
+                                        if matches!(proto.code[p], Instr::Jump { target } if target as usize == t)
+                                        {
                                             e = p;
                                         }
                                     }
@@ -3604,12 +3953,20 @@ impl<'p> Vm<'p> {
                                 // that holds a non-BigInt TypedArray NOW. The
                                 // hint is verified per access by an identity
                                 // guard, so a stale/wrong hint is always safe.
-                                let ta_plan = self.build_ta_pin_plan(func_id, t as u32, region_end as u32, base);
+                                let ta_plan = self.build_ta_pin_plan(
+                                    func_id,
+                                    t as u32,
+                                    region_end as u32,
+                                    base,
+                                );
                                 // Q4 leaf-call inline plan: monomorphic plain-leaf
                                 // callees at this region's Call sites (read-only —
                                 // built before the &proto borrow below).
-                                let leaf_plan =
-                                    self.build_leaf_inline_plan(func_id, t as u32, region_end as u32);
+                                let leaf_plan = self.build_leaf_inline_plan(
+                                    func_id,
+                                    t as u32,
+                                    region_end as u32,
+                                );
                                 // Q7 method-call inline plan (reads the live receiver
                                 // exemplar at each CallMethod's obj reg — needs `base`).
                                 let method_plan = self.build_method_inline_plan(
@@ -3636,7 +3993,8 @@ impl<'p> Vm<'p> {
                                                 )
                                             });
                                             if stores {
-                                                let v = crate::value::Value::from_bits(shape.recv_bits);
+                                                let v =
+                                                    crate::value::Value::from_bits(shape.recv_bits);
                                                 if v.is_heap() {
                                                     self.heap.register_scan_root(v.heap_index());
                                                 }
@@ -3746,7 +4104,11 @@ impl<'p> Vm<'p> {
                         }
                     }
 
-                    Instr::Print { arg_base, argc, to_stderr } => {
+                    Instr::Print {
+                        arg_base,
+                        argc,
+                        to_stderr,
+                    } => {
                         let mut parts = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
                             let v = self.get(base, arg_base + i);
@@ -3775,6 +4137,10 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::ObjectKeys { dst, obj } => {
+                        if let Some(exit) = self.try_object_keys_len_reduce(func_id, ip) {
+                            ip = exit;
+                            continue;
+                        }
                         let o = self.get(base, obj);
                         self.require_object_coercible(o)?; // ToObject(O)
                         let o = self.to_object(o)?;
@@ -3783,6 +4149,18 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::ForInKeys { dst, obj } => {
+                        if let Some(exit) = self.try_sparse_forin_fold_reduce(func_id, ip) {
+                            ip = exit;
+                            continue;
+                        }
+                        if let Some(exit) = self.try_forin_count_reduce(func_id, ip) {
+                            ip = exit;
+                            continue;
+                        }
+                        if let Some(exit) = self.try_forin_sum_reduce(func_id, ip) {
+                            ip = exit;
+                            continue;
+                        }
                         let o = self.get(base, obj);
                         // ForIn/OfHeadEvaluation: a null/undefined receiver iterates
                         // nothing (no ToObject error), so yield an empty key list.
@@ -3857,18 +4235,18 @@ impl<'p> Vm<'p> {
                         let mut cells = Vec::with_capacity(sources.len());
                         for src in sources {
                             let cell = match *src {
-                                UpvalSource::ParentLocal(reg) => {
-                                    self.get(base, reg).heap_index()
-                                }
+                                UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
                                 UpvalSource::ParentUpval(idx) => {
                                     self.closure_upvalue(cur_closure, idx)
                                 }
                             };
                             cells.push(cell);
                         }
-                        let v = Value::heap(
-                            self.heap.alloc(HeapObj::Closure { func: func_id, upvalues: cells, this_val: Value::UNDEFINED }),
-                        );
+                        let v = Value::heap(self.heap.alloc(HeapObj::Closure {
+                            func: func_id,
+                            upvalues: cells,
+                            this_val: Value::UNDEFINED,
+                        }));
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);
                         }
@@ -3876,7 +4254,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::MakeArrow { dst, func_id, this_reg } => {
+                    Instr::MakeArrow {
+                        dst,
+                        func_id,
+                        this_reg,
+                    } => {
                         // Like MakeClosure, but the resulting closure also captures the
                         // defining frame's effective `this` (register `this_reg` =
                         // `this_override.unwrap_or(0)` at the definition site â€” usually
@@ -3887,14 +4269,18 @@ impl<'p> Vm<'p> {
                         for src in sources {
                             let cell = match *src {
                                 UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
-                                UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                                UpvalSource::ParentUpval(idx) => {
+                                    self.closure_upvalue(cur_closure, idx)
+                                }
                             };
                             cells.push(cell);
                         }
                         let this_val = self.get(base, this_reg);
-                        let v = Value::heap(
-                            self.heap.alloc(HeapObj::Closure { func: func_id, upvalues: cells, this_val }),
-                        );
+                        let v = Value::heap(self.heap.alloc(HeapObj::Closure {
+                            func: func_id,
+                            upvalues: cells,
+                            this_val,
+                        }));
                         // An arrow inside an object method inherits that method's
                         // [[HomeObject]] lexically (so `super.x` in the arrow resolves).
                         let callee = self.frames[frame_idx].callee;
@@ -4012,7 +4398,9 @@ impl<'p> Vm<'p> {
                         // immutable binding) throws in sloppy code too, so this
                         // precedes the strict-only fn-name check.
                         if !self.const_cells.is_empty() && self.const_cells.contains(&cell) {
-                            return Err(Thrown("TypeError: Assignment to constant variable.".into()));
+                            return Err(Thrown(
+                                "TypeError: Assignment to constant variable.".into(),
+                            ));
                         }
                         // A named function expression's own-name binding is
                         // immutable: strict writer → TypeError, sloppy → no-op.
@@ -4068,7 +4456,9 @@ impl<'p> Vm<'p> {
                         let cell = self.closure_upvalue(cur_closure, idx);
                         // Captured `const` (see UpvalSet) — throws in both modes.
                         if !self.const_cells.is_empty() && self.const_cells.contains(&cell) {
-                            return Err(Thrown("TypeError: Assignment to constant variable.".into()));
+                            return Err(Thrown(
+                                "TypeError: Assignment to constant variable.".into(),
+                            ));
                         }
                         // Immutable own-name binding (see UpvalSet).
                         if !self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell) {
@@ -4092,7 +4482,11 @@ impl<'p> Vm<'p> {
                         self.heap.cell_set(cell, v);
                         ip += 1;
                     }
-                    Instr::NewArray { dst, arg_base, argc } => {
+                    Instr::NewArray {
+                        dst,
+                        arg_base,
+                        argc,
+                    } => {
                         let mut items = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
                             items.push(self.get(base, arg_base + i));
@@ -4104,9 +4498,9 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::NewObject { dst, hint } => {
-                        let v = Value::heap(
-                            self.heap.alloc(HeapObj::Object(Box::new(ObjMap::with_capacity(hint as usize)))),
-                        );
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
+                            ObjMap::with_capacity(hint as usize),
+                        ))));
                         // OrdinaryObjectCreate uses the CURRENT realm's %Object.prototype%.
                         self.realm_born(v.heap_index(), self.obj_proto);
                         self.set(base, dst, v);
@@ -4123,7 +4517,13 @@ impl<'p> Vm<'p> {
                         self.require_object_coercible(v)?;
                         ip += 1;
                     }
-                    Instr::NewError { dst, kind, arg, opts, errors } => {
+                    Instr::NewError {
+                        dst,
+                        kind,
+                        arg,
+                        opts,
+                        errors,
+                    } => {
                         // The message is coerced with a real ToString (observable user
                         // `toString` / `@@toPrimitive`, abrupt completion) for EVERY
                         // error kind: a Symbol message throws TypeError and a throwing
@@ -4172,8 +4572,9 @@ impl<'p> Vm<'p> {
                         // even when the arg is absent (`new AggregateError()`) so that
                         // IterableToList(undefined) throws the required TypeError.
                         if kind == 7 {
-                            let errors_arg =
-                                errors.map(|er| self.get(base, er)).unwrap_or(Value::UNDEFINED);
+                            let errors_arg = errors
+                                .map(|er| self.get(base, er))
+                                .unwrap_or(Value::UNDEFINED);
                             self.install_agg_errors(v, errors_arg)?;
                         }
                         self.set(base, dst, v);
@@ -4217,13 +4618,22 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::NewRegExp { dst, pattern, flags, is_construct } => {
+                    Instr::NewRegExp {
+                        dst,
+                        pattern,
+                        flags,
+                        is_construct,
+                    } => {
                         let p = self.get(base, pattern);
                         let f = self.get(base, flags);
                         // `RegExp(re)` (NOT `new`) with no flags returns `re`
                         // unchanged when re's `constructor` is RegExp (ctor step 2.b).
                         let mut short = None;
-                        if !is_construct && f.is_undefined() && self.regexp_ctor != 0 && self.is_regexp(p)? {
+                        if !is_construct
+                            && f.is_undefined()
+                            && self.regexp_ctor != 0
+                            && self.is_regexp(p)?
+                        {
                             let c = self.get_prop(p, "constructor")?;
                             if self.same_value(c, Value::heap(self.regexp_ctor)) {
                                 short = Some(p);
@@ -4243,7 +4653,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::GetIndexConcat { dst, obj, name, key } => {
+                    Instr::GetIndexConcat {
+                        dst,
+                        obj,
+                        name,
+                        key,
+                    } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let r = self.get_index_concat(o, name, k, func_id)?;
@@ -4292,8 +4707,7 @@ impl<'p> Vm<'p> {
                                 && matches!(self.heap.get(p.heap_index()), HeapObj::Symbol { .. })
                             {
                                 return Err(Thrown(
-                                    "TypeError: Cannot convert a Symbol value to a string"
-                                        .into(),
+                                    "TypeError: Cannot convert a Symbol value to a string".into(),
                                 ));
                             }
                             p
@@ -4301,7 +4715,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, out);
                         ip += 1;
                     }
-                    Instr::SetIndexConcat { obj, name, key, val } => {
+                    Instr::SetIndexConcat {
+                        obj,
+                        name,
+                        key,
+                        val,
+                    } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let v = self.get(base, val);
@@ -4309,7 +4728,12 @@ impl<'p> Vm<'p> {
                         self.set_index_concat(o, name, k, v, strict, func_id)?;
                         ip += 1;
                     }
-                    Instr::ImportCall { dst, spec, phase, opts } => {
+                    Instr::ImportCall {
+                        dst,
+                        spec,
+                        phase,
+                        opts,
+                    } => {
                         // import(spec [, opts]) / import.defer / import.source.
                         // Spec order: ToString(spec); then a non-undefined non-object
                         // `opts` â†’ TypeError; `import.source` â†’ SyntaxError (source
@@ -4365,8 +4789,7 @@ impl<'p> Vm<'p> {
                                             .deferred_namespace_for(&p, mtype.as_deref())
                                         {
                                             Ok(ns) => {
-                                                let canon = std::fs::canonicalize(&p)
-                                                    .unwrap_or(p);
+                                                let canon = std::fs::canonicalize(&p).unwrap_or(p);
                                                 if ns.is_heap()
                                                     && self
                                                         .deferred_ns_state
@@ -4426,15 +4849,15 @@ impl<'p> Vm<'p> {
                                                 let tv = self.alloc_str(t.clone());
                                                 bargs.push(tv);
                                             }
-                                            let tgt = Value::heap(self.heap.alloc(
-                                                HeapObj::Native(native::MODULE_DYN_IMPORT),
-                                            ));
-                                            let cb =
-                                                Value::heap(self.heap.alloc(HeapObj::Bound {
-                                                    target: tgt,
-                                                    this: Value::heap(p),
-                                                    args: bargs,
-                                                }));
+                                            let tgt =
+                                                Value::heap(self.heap.alloc(HeapObj::Native(
+                                                    native::MODULE_DYN_IMPORT,
+                                                )));
+                                            let cb = Value::heap(self.heap.alloc(HeapObj::Bound {
+                                                target: tgt,
+                                                this: Value::heap(p),
+                                                args: bargs,
+                                            }));
                                             // The reaction's dependent is a fresh
                                             // dummy — the native settles the REAL
                                             // promise itself (it may need to chain
@@ -4488,9 +4911,9 @@ impl<'p> Vm<'p> {
                                 match body {
                                     Some(bp) if bp.is_heap() => {
                                         let _gc = self.gc_lock_guard();
-                                        let ret_ns = Value::heap(self.heap.alloc(
-                                            HeapObj::Native(native::SPECIES_GET),
-                                        ));
+                                        let ret_ns = Value::heap(
+                                            self.heap.alloc(HeapObj::Native(native::SPECIES_GET)),
+                                        );
                                         // `this`-returning native bound to the
                                         // namespace: the fulfill callback's
                                         // return value settles the dependent.
@@ -4537,7 +4960,12 @@ impl<'p> Vm<'p> {
                         self.set_index(cv, k, vv, true)?;
                         ip += 1;
                     }
-                    Instr::DefineAccessor { obj, key, func, is_setter } => {
+                    Instr::DefineAccessor {
+                        obj,
+                        key,
+                        func,
+                        is_setter,
+                    } => {
                         let o = self.get(base, obj);
                         let kv = self.get(base, key);
                         let f = self.get(base, func);
@@ -4553,9 +4981,8 @@ impl<'p> Vm<'p> {
                     }
                     Instr::GetProp { dst, obj, name } => {
                         let o = self.get(base, obj);
-                        let key = self.func(func_id as usize)
-                            .string_constants[name as usize]
-                            .as_str();
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         // PrivateFieldGet brand check: reading a private member
                         // (`obj.#x`) from an object whose class did not declare it
                         // is a TypeError (has_property_str walks instance own fields
@@ -4637,10 +5064,12 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
-                            GetAct::Accessor { fid, closure, getter } => {
-                                self.setup_call(
-                                    fid, closure, o, base, 0, 0, dst, ip + 1, getter,
-                                )?;
+                            GetAct::Accessor {
+                                fid,
+                                closure,
+                                getter,
+                            } => {
+                                self.setup_call(fid, closure, o, base, 0, 0, dst, ip + 1, getter)?;
                                 break;
                             }
                             GetAct::None => {}
@@ -4654,8 +5083,11 @@ impl<'p> Vm<'p> {
                             Ok(v) => v,
                             Err(Thrown(msg)) => {
                                 let f = self.func(func_id as usize);
-                                let name: &str =
-                                    if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                                let name: &str = if f.name.is_empty() {
+                                    "<anonymous>"
+                                } else {
+                                    &f.name
+                                };
                                 Err(Thrown(format!("{msg} (in {name})")))?
                             }
                         };
@@ -4665,18 +5097,21 @@ impl<'p> Vm<'p> {
                     Instr::DefineField { obj, name, val } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key = self.func(func_id as usize)
-                            .string_constants[name as usize]
-                            .as_str();
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         self.define_field(o, &key, v)?;
                         ip += 1;
                     }
-                    Instr::SetProp { obj, name, val, strict: site_strict } => {
+                    Instr::SetProp {
+                        obj,
+                        name,
+                        val,
+                        strict: site_strict,
+                    } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key = self.func(func_id as usize)
-                            .string_constants[name as usize]
-                            .as_str();
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         // Private stores route to the side table / accessors
                         // (field-init emission, compound/update writes). One
                         // byte-compare on the hot path.
@@ -4698,12 +5133,9 @@ impl<'p> Vm<'p> {
                                     // an existing entry is PrivateFieldSet and
                                     // unaffected.
                                     if o.is_heap()
-                                        && !self
-                                            .private_fields
-                                            .get(&o.heap_index())
-                                            .is_some_and(|m| {
-                                                m.keys().any(|(b, n)| *b == b2 && n == &key)
-                                            })
+                                        && !self.private_fields.get(&o.heap_index()).is_some_and(
+                                            |m| m.keys().any(|(b, n)| *b == b2 && n == &key),
+                                        )
                                         && !self.target_is_extensible(o)
                                     {
                                         return Err(Thrown(
@@ -4741,21 +5173,17 @@ impl<'p> Vm<'p> {
                                     .and_then(|c| c.first())
                                     .copied()
                                 {
-                                    let declares = self
-                                        .brand_private_names
-                                        .get(&own)
-                                        .is_some_and(|ns| ns.iter().any(|(n, k)| n == &key && *k == 8));
+                                    let declares =
+                                        self.brand_private_names.get(&own).is_some_and(|ns| {
+                                            ns.iter().any(|(n, k)| n == &key && *k == 8)
+                                        });
                                     if declares {
                                         // PrivateFieldAdd on the class object:
                                         // the initializer may have sealed it
                                         // (preventExtensions(C) before the add).
-                                        if !self
-                                            .private_fields
-                                            .get(&o.heap_index())
-                                            .is_some_and(|m| {
-                                                m.keys().any(|(b, n)| *b == own && n == &key)
-                                            })
-                                            && !self.target_is_extensible(o)
+                                        if !self.private_fields.get(&o.heap_index()).is_some_and(
+                                            |m| m.keys().any(|(b, n)| *b == own && n == &key),
+                                        ) && !self.target_is_extensible(o)
                                         {
                                             return Err(Thrown(
                                                 "TypeError: cannot define private elements on a non-extensible object".into(),
@@ -4783,10 +5211,21 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
-                            SetAct::Setter { fid, closure, setter } => {
+                            SetAct::Setter {
+                                fid,
+                                closure,
+                                setter,
+                            } => {
                                 self.setup_call(
-                                    fid, closure, o, base, val, 1, RET_DISCARD,
-                                    ip + 1, setter,
+                                    fid,
+                                    closure,
+                                    o,
+                                    base,
+                                    val,
+                                    1,
+                                    RET_DISCARD,
+                                    ip + 1,
+                                    setter,
                                 )?;
                                 break;
                             }
@@ -4803,9 +5242,8 @@ impl<'p> Vm<'p> {
                         // are always strict.
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key = self.func(func_id as usize)
-                            .string_constants[name as usize]
-                            .as_str();
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         if let Some((b, kind, owner)) = self.resolve_private(&key) {
                             // Declaring-class-resolved, KIND-aware write (spec
                             // PrivateSet).
@@ -5005,24 +5443,35 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(ok));
                         ip += 1;
                     }
-                    Instr::DeleteProp { dst, obj, name, strict } => {
+                    Instr::DeleteProp {
+                        dst,
+                        obj,
+                        name,
+                        strict,
+                    } => {
                         let o = self.get(base, obj);
                         // `delete obj.x` does ToObject(base) â€” null/undefined throw a
                         // TypeError (RequireObjectCoercible); other primitives box and
                         // delete returns true.
                         self.require_object_coercible(o)?;
-                        let key = self.func(func_id as usize)
-                            .string_constants[name as usize]
-                            .as_str();
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         let r = self.delete_property(o, &key)?;
                         // Strict mode: a delete that evaluates to false throws.
                         if strict && r == Value::bool(false) {
-                            return Err(Thrown(format!("TypeError: Cannot delete property '{key}'")));
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot delete property '{key}'"
+                            )));
                         }
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::DeleteIndex { dst, obj, key, strict } => {
+                    Instr::DeleteIndex {
+                        dst,
+                        obj,
+                        key,
+                        strict,
+                    } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let ks = self.to_property_key(k)?; // ToPropertyKey (symbol â†’ prop_key, object â†’ ToString)
@@ -5032,12 +5481,20 @@ impl<'p> Vm<'p> {
                         self.require_object_coercible(o)?;
                         let r = self.delete_property(o, &ks)?;
                         if strict && r == Value::bool(false) {
-                            return Err(Thrown(format!("TypeError: Cannot delete property '{ks}'")));
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot delete property '{ks}'"
+                            )));
                         }
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::DeleteIndexConcat { dst, obj, name, key, strict } => {
+                    Instr::DeleteIndexConcat {
+                        dst,
+                        obj,
+                        name,
+                        key,
+                        strict,
+                    } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let r = self.delete_index_concat(o, name, k, strict, func_id)?;
@@ -5067,7 +5524,8 @@ impl<'p> Vm<'p> {
                                     // Lazily created, host-defined: ordinary
                                     // extensible null-proto object (GC-rooted
                                     // via module_metas).
-                                    let m = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                                    let m =
+                                        self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                                     self.proto_of.insert(m, Value::NULL);
                                     self.module_metas.insert(k, m);
                                     m
@@ -5075,7 +5533,8 @@ impl<'p> Vm<'p> {
                             },
                             None => {
                                 if self.import_meta == 0 {
-                                    let idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                                    let idx =
+                                        self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
                                     self.proto_of.insert(idx, Value::NULL);
                                     self.import_meta = idx;
                                 }
@@ -5097,7 +5556,22 @@ impl<'p> Vm<'p> {
                         );
                         ip += 1;
                     }
-                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, derived_ctor, class_name_ok, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site, tail } => {
+                    Instr::DirectEval {
+                        dst,
+                        arg,
+                        new_target_ok,
+                        this_reg,
+                        home_class,
+                        super_static,
+                        derived_ctor,
+                        class_name_ok,
+                        ban_arguments,
+                        strict_caller,
+                        super_home_obj,
+                        var_env_is_global,
+                        site,
+                        tail,
+                    } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
@@ -5120,8 +5594,9 @@ impl<'p> Vm<'p> {
                                 HeapObj::EvalScope(m) => m.get("eval").copied(),
                                 _ => None,
                             });
-                        let live =
-                            shadow.or_else(|| self.global_by_name("eval")).unwrap_or(Value::UNDEFINED);
+                        let live = shadow
+                            .or_else(|| self.global_by_name("eval"))
+                            .unwrap_or(Value::UNDEFINED);
                         if !(live.is_heap() && live.heap_index() == self.eval_fn_idx) {
                             if tail && self.try_tail_reuse(base, live, Value::UNDEFINED, &[a0])? {
                                 break; // re-snapshot the frame coordinates
@@ -5167,8 +5642,12 @@ impl<'p> Vm<'p> {
                             // the static-field-initializer's `this_reg`) and the
                             // caller's strictness.
                             let caller_this = self.get(base, this_reg);
-                            let inherit = (home_class != u32::MAX)
-                                .then_some((home_class, super_static, derived_ctor, class_name_ok));
+                            let inherit = (home_class != u32::MAX).then_some((
+                                home_class,
+                                super_static,
+                                derived_ctor,
+                                class_name_ok,
+                            ));
                             // The caller activation's new.target and (for an
                             // object-literal method) its [[HomeObject]]. Read it
                             // through frame_new_target so an eval in an ARROW body
@@ -5320,7 +5799,11 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
 
-                    Instr::TailCall { callee, arg_base, argc } => {
+                    Instr::TailCall {
+                        callee,
+                        arg_base,
+                        argc,
+                    } => {
                         // Proper tail call: REUSE this frame for a PLAIN
                         // function/closure callee (constant stack). Any other
                         // callee (native/bound/class/generator/async/primitive)
@@ -5335,7 +5818,12 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::TailCallWithThis { callee, this_v, arg_base, argc } => {
+                    Instr::TailCallWithThis {
+                        callee,
+                        this_v,
+                        arg_base,
+                        argc,
+                    } => {
                         // Tail-position with-resolved call: frame reuse with
                         // `this` = the with-object; non-plain callees fall
                         // through to the CallWithThis emitted after.
@@ -5348,7 +5836,13 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::CallWithThis { dst, callee, this_v, arg_base, argc } => {
+                    Instr::CallWithThis {
+                        dst,
+                        callee,
+                        this_v,
+                        arg_base,
+                        argc,
+                    } => {
                         // A `with`-resolved identifier call: `this` = the
                         // with-object. A plain user function pushes a frame in
                         // THIS dispatch loop (deep with-call recursion must be
@@ -5372,8 +5866,15 @@ impl<'p> Vm<'p> {
                             let p = self.func(fid as usize);
                             if !p.is_generator && !p.is_async {
                                 self.setup_call(
-                                    fid, closure, this_val, base, arg_base, argc, dst,
-                                    ip + 1, callee_v,
+                                    fid,
+                                    closure,
+                                    this_val,
+                                    base,
+                                    arg_base,
+                                    argc,
+                                    dst,
+                                    ip + 1,
+                                    callee_v,
                                 )?;
                                 break;
                             }
@@ -5384,7 +5885,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::Call { dst, callee, arg_base, argc } => {
+                    Instr::Call {
+                        dst,
+                        callee,
+                        arg_base,
+                        argc,
+                    } => {
                         let callee_v = self.get(base, callee);
                         // ── interpreter call IC ── a repeat callee (identity +
                         // heap-version guarded) resolved to a plain user
@@ -5417,8 +5923,11 @@ impl<'p> Vm<'p> {
                         }
                         // A native resolve/reject function (from `new Promise`).
                         if callee_v.is_heap() {
-                            if let HeapObj::BoundResolver { promise, is_reject, pair } =
-                                self.heap.get(callee_v.heap_index())
+                            if let HeapObj::BoundResolver {
+                                promise,
+                                is_reject,
+                                pair,
+                            } = self.heap.get(callee_v.heap_index())
                             {
                                 let (p, isr, pid) = (*promise, *is_reject, *pair);
                                 let arg = if argc >= 1 {
@@ -5447,7 +5956,11 @@ impl<'p> Vm<'p> {
                             // "not a function". %Function.prototype% is also a callable.
                             if matches!(
                                 self.heap.get(callee_v.heap_index()),
-                                HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::CombinatorResolver { .. }
+                                HeapObj::Bound { .. }
+                                    | HeapObj::Wrapped { .. }
+                                    | HeapObj::Native(_)
+                                    | HeapObj::NativeClosure { .. }
+                                    | HeapObj::CombinatorResolver { .. }
                             ) || (self.fn_proto != 0 && callee_v.heap_index() == self.fn_proto)
                             {
                                 let argv: Vec<Value> =
@@ -5481,8 +5994,11 @@ impl<'p> Vm<'p> {
                             Ok(v) => v,
                             Err(Thrown(msg)) => {
                                 let f = self.func(func_id as usize);
-                                let name: &str =
-                                    if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                                let name: &str = if f.name.is_empty() {
+                                    "<anonymous>"
+                                } else {
+                                    &f.name
+                                };
                                 // Minified code names everything `t`/`e`, so the
                                 // enclosing function's string literals are what
                                 // actually identify it. Opt-in: they are long.
@@ -5503,13 +6019,13 @@ impl<'p> Vm<'p> {
                         };
                         // An `async function*` returns an AsyncGenerator (checked
                         // before the plain-generator/async cases since it is both).
-                        if self.func(fid as usize).is_generator
-                            && self.func(fid as usize).is_async
+                        if self.func(fid as usize).is_generator && self.func(fid as usize).is_async
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                             self.pending_gen_callee = callee_v;
-                            let ag = self.alloc_async_generator(fid, closure, Value::UNDEFINED, &argv)?;
+                            let ag =
+                                self.alloc_async_generator(fid, closure, Value::UNDEFINED, &argv)?;
                             self.set(base, dst, ag);
                             ip += 1;
                             continue;
@@ -5549,7 +6065,13 @@ impl<'p> Vm<'p> {
                         break;
                     }
 
-                    Instr::CallMethod { dst, obj, name, arg_base, argc } => {
+                    Instr::CallMethod {
+                        dst,
+                        obj,
+                        name,
+                        arg_base,
+                        argc,
+                    } => {
                         let recv = self.get(base, obj);
                         // `program` outlives the VM, so borrow the method name
                         // with the program's lifetime (NOT self's) â€” avoids
@@ -5559,6 +6081,24 @@ impl<'p> Vm<'p> {
                         // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
+                        // An exact allocation-only loop of
+                        // `sum += array.slice(...).length` or
+                        // `sum += array.concat([literal...]).length` can be
+                        // collapsed after proving the live method/species/
+                        // spreadability protocol is pristine. A failed proof is
+                        // read-only and falls through to the unchanged call path.
+                        if matches!(key, "slice" | "concat") {
+                            if let Some(exit) = self.try_array_copy_len_reduce(
+                                func_id,
+                                ip,
+                                base,
+                                recv,
+                                key,
+                            ) {
+                                ip = exit;
+                                continue;
+                            }
+                        }
                         // PrivateMethodCall brand check (`obj.#m()`): the receiver must
                         // carry the declaring class's brand, else a TypeError. Gated on
                         // is_private_key so ordinary calls (push/map/…) only pay a
@@ -5617,8 +6157,7 @@ impl<'p> Vm<'p> {
                         // implementation directly. Exact arity keeps the JIT
                         // helper ABI and this sibling byte-for-byte aligned.
                         if private_callee.is_none()
-                            && ((key == "matchAll" && argc == 1)
-                                || (key == "replace" && argc == 2))
+                            && ((key == "matchAll" && argc == 1) || (key == "replace" && argc == 2))
                             && string_regexp_call_direct_enabled()
                         {
                             let arg0 = self.get(base, arg_base);
@@ -5656,12 +6195,9 @@ impl<'p> Vm<'p> {
                             } else {
                                 self.get(base, arg_base)
                             };
-                            if let Some(result) = self.regexp_call_direct(
-                                recv,
-                                input,
-                                key == "test",
-                                false,
-                            )? {
+                            if let Some(result) =
+                                self.regexp_call_direct(recv, input, key == "test", false)?
+                            {
                                 self.set(base, dst, result);
                                 ip += 1;
                                 continue;
@@ -5677,8 +6213,15 @@ impl<'p> Vm<'p> {
                                 self.ic_call_method(func_id, ip, recv, key)
                             {
                                 self.setup_call(
-                                    fid, closure, recv, base, arg_base, argc, dst,
-                                    ip + 1, callee,
+                                    fid,
+                                    closure,
+                                    recv,
+                                    base,
+                                    arg_base,
+                                    argc,
+                                    dst,
+                                    ip + 1,
+                                    callee,
                                 )?;
                                 break;
                             }
@@ -5730,7 +6273,9 @@ impl<'p> Vm<'p> {
                         }
                         // Builtin methods (array/string) execute inline and
                         // produce a result without pushing a frame.
-                        if let Some(result) = self.try_builtin_method(recv, key, base, arg_base, argc)? {
+                        if let Some(result) =
+                            self.try_builtin_method(recv, key, base, arg_base, argc)?
+                        {
                             self.set(base, dst, result);
                             ip += 1;
                             continue;
@@ -5747,8 +6292,11 @@ impl<'p> Vm<'p> {
                                 Ok(v) => v,
                                 Err(Thrown(msg)) => {
                                     let f = self.func(func_id as usize);
-                                    let name: &str =
-                                        if f.name.is_empty() { "<anonymous>" } else { &f.name };
+                                    let name: &str = if f.name.is_empty() {
+                                        "<anonymous>"
+                                    } else {
+                                        &f.name
+                                    };
                                     Err(Thrown(format!("{msg} (in {name})")))?
                                 }
                             },
@@ -5785,24 +6333,23 @@ impl<'p> Vm<'p> {
                         if prop.is_heap()
                             && (matches!(
                                 self.heap.get(prop.heap_index()),
-                                HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+                                HeapObj::Native(_)
+                                    | HeapObj::NativeClosure { .. }
                                     | HeapObj::Bound { .. }
                                     | HeapObj::BoundResolver { .. }
                                     | HeapObj::Proxy { .. }
                             ) || (self.fn_proto != 0 && prop.heap_index() == self.fn_proto))
                         {
-                            let r = self
-                                .with_argv(base, arg_base, argc, |vm, argv| {
-                                    vm.call_value(prop, recv, argv)
-                                })?;
+                            let r = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                vm.call_value(prop, recv, argv)
+                            })?;
                             self.set(base, dst, r);
                             ip += 1;
                             continue;
                         }
                         let (fid, closure) = self.resolve_callable_named(prop, key)?;
                         // An `async function*` method returns an AsyncGenerator.
-                        if self.func(fid as usize).is_generator
-                            && self.func(fid as usize).is_async
+                        if self.func(fid as usize).is_generator && self.func(fid as usize).is_async
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -5836,11 +6383,27 @@ impl<'p> Vm<'p> {
                         // Pass the resolved method VALUE as the callee (so LoadCallee and
                         // object-method `super` â€” which reads [[HomeObject]] keyed by the
                         // executing function value â€” find it, even for a no-upvalue method).
-                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, prop)?;
+                        self.setup_call(
+                            fid,
+                            closure,
+                            recv,
+                            base,
+                            arg_base,
+                            argc,
+                            dst,
+                            ip + 1,
+                            prop,
+                        )?;
                         break;
                     }
 
-                    Instr::CallMethodComputed { dst, obj, key, arg_base, argc } => {
+                    Instr::CallMethodComputed {
+                        dst,
+                        obj,
+                        key,
+                        arg_base,
+                        argc,
+                    } => {
                         let recv = self.get(base, obj);
                         let k = self.get(base, key);
                         // `obj["push"](x)` etc: a builtin array/string method first.
@@ -5860,7 +6423,8 @@ impl<'p> Vm<'p> {
                         if method.is_heap()
                             && (matches!(
                                 self.heap.get(method.heap_index()),
-                                HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+                                HeapObj::Native(_)
+                                    | HeapObj::NativeClosure { .. }
                                     | HeapObj::Bound { .. }
                                     | HeapObj::BoundResolver { .. }
                                     | HeapObj::Proxy { .. }
@@ -5874,8 +6438,7 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let (fid, closure) = self.resolve_callable_named(method, &kstr)?;
-                        if self.func(fid as usize).is_generator
-                            && self.func(fid as usize).is_async
+                        if self.func(fid as usize).is_generator && self.func(fid as usize).is_async
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -5903,7 +6466,17 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, method)?;
+                        self.setup_call(
+                            fid,
+                            closure,
+                            recv,
+                            base,
+                            arg_base,
+                            argc,
+                            dst,
+                            ip + 1,
+                            method,
+                        )?;
                         break;
                     }
 
@@ -5917,11 +6490,15 @@ impl<'p> Vm<'p> {
                         self.pending_throw = Some(v);
                         return Err(Thrown(msg));
                     }
-                    Instr::PushHandler { catch_target, catch_reg } => {
+                    Instr::PushHandler {
+                        catch_target,
+                        catch_reg,
+                    } => {
                         let top = self.frames.len() - 1;
-                        self.frames[top]
-                            .handlers
-                            .push(Handler::Catch { target: catch_target, reg: catch_reg });
+                        self.frames[top].handlers.push(Handler::Catch {
+                            target: catch_target,
+                            reg: catch_reg,
+                        });
                         ip += 1;
                     }
                     Instr::PopHandler => {
@@ -5929,11 +6506,17 @@ impl<'p> Vm<'p> {
                         self.frames[top].handlers.pop();
                         ip += 1;
                     }
-                    Instr::PushFinally { target, kind_reg, val_reg } => {
+                    Instr::PushFinally {
+                        target,
+                        kind_reg,
+                        val_reg,
+                    } => {
                         let top = self.frames.len() - 1;
-                        self.frames[top]
-                            .handlers
-                            .push(Handler::Finally { target, kind_reg, val_reg });
+                        self.frames[top].handlers.push(Handler::Finally {
+                            target,
+                            kind_reg,
+                            val_reg,
+                        });
                         ip += 1;
                     }
                     Instr::PopFinally => {
@@ -5969,7 +6552,8 @@ impl<'p> Vm<'p> {
                                 return Err(Thrown(self.throw_message(v)));
                             }
                             3 => {
-                                let jump_target = self.regs[base + val_reg as usize].as_int() as u32;
+                                let jump_target =
+                                    self.regs[base + val_reg as usize].as_int() as u32;
                                 let floor = (raw >> 2) as usize;
                                 match self.route_jump_through_finally(jump_target, floor) {
                                     Some(target) => ip = target as usize,
@@ -6003,7 +6587,8 @@ impl<'p> Vm<'p> {
                         } else {
                             if !self.is_object_value(v) {
                                 return Err(Thrown(
-                                    "TypeError: a 'using' declaration value is not an object".into(),
+                                    "TypeError: a 'using' declaration value is not an object"
+                                        .into(),
                                 ));
                             }
                             let method = self.get_member(v, "@@dispose", v)?;
@@ -6025,14 +6610,17 @@ impl<'p> Vm<'p> {
                             ip += 1;
                         }
                     }
-                    Instr::DisposeScope { scope, kind_reg, val_reg } => {
+                    Instr::DisposeScope {
+                        scope,
+                        kind_reg,
+                        val_reg,
+                    } => {
                         // DisposeResources: run this scope's disposers LIFO, merging
                         // any throw with the incoming completion (kind&3==2 â‡’ the
                         // block already threw) into a SuppressedError chain; rewrite
                         // kind/val so the following EndFinally re-raises the merge.
                         let id = self.get(base, scope).as_int() as u32;
-                        let disposers =
-                            self.using_resources.remove(&id).unwrap_or_default();
+                        let disposers = self.using_resources.remove(&id).unwrap_or_default();
                         let raw = self.regs[base + kind_reg as usize].as_int();
                         let incoming = if raw & 3 == 2 {
                             Some(self.regs[base + val_reg as usize])
@@ -6105,10 +6693,7 @@ impl<'p> Vm<'p> {
                         // its result is left in `res` for the caller to Await. A sync
                         // throw propagates (caught by the loop's handler).
                         let id = self.get(base, scope).as_int() as u32;
-                        let entry = self
-                            .using_resources
-                            .get_mut(&id)
-                            .and_then(|d| d.pop());
+                        let entry = self.using_resources.get_mut(&id).and_then(|d| d.pop());
                         match entry {
                             None => {
                                 self.set(base, done, Value::bool(true));
@@ -6127,7 +6712,11 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
-                    Instr::MergeDispose { kind_reg, val_reg, err } => {
+                    Instr::MergeDispose {
+                        kind_reg,
+                        val_reg,
+                        err,
+                    } => {
                         // DisposeResources error chaining for the async loop's catch
                         // arm: chain into a SuppressedError if a throw is already
                         // pending, else make the completion a throw of `err`.
@@ -6135,7 +6724,8 @@ impl<'p> Vm<'p> {
                         let raw = self.regs[base + kind_reg as usize].as_int();
                         if raw & 3 == 2 {
                             let prior = self.regs[base + val_reg as usize];
-                            let merged = self.build_suppressed_error(&[e, prior, Value::UNDEFINED])?;
+                            let merged =
+                                self.build_suppressed_error(&[e, prior, Value::UNDEFINED])?;
                             self.regs[base + val_reg as usize] = merged;
                         } else {
                             self.regs[base + kind_reg as usize] = Value::int(2);
@@ -6171,9 +6761,15 @@ impl<'p> Vm<'p> {
                                 accessor: false,
                                 setter: Value::UNDEFINED,
                             };
-                            self.arr_props.entry(cooked).or_insert_with(ObjMap::new_side_table).define("raw", r, attr);
+                            self.arr_props
+                                .entry(cooked)
+                                .or_insert_with(ObjMap::new_side_table)
+                                .define("raw", r, attr);
                             for idx in [raw_idx, cooked] {
-                                self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).freeze();
+                                self.arr_props
+                                    .entry(idx)
+                                    .or_insert_with(ObjMap::new_side_table)
+                                    .freeze();
                                 self.array_length_nonwritable.insert(idx);
                             }
                         }
@@ -6235,7 +6831,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::num(f));
                         ip += 1;
                     }
-                    Instr::DateNew { dst, arg_base, argc } => {
+                    Instr::DateNew {
+                        dst,
+                        arg_base,
+                        argc,
+                    } => {
                         let args: Vec<Value> =
                             (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                         let ms = self.date_new_ms(&args)?;
@@ -6243,7 +6843,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::DateUTC { dst, arg_base, argc } => {
+                    Instr::DateUTC {
+                        dst,
+                        arg_base,
+                        argc,
+                    } => {
                         let args: Vec<Value> =
                             (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                         let ms = self.date_utc_ms(&args)?;
@@ -6328,7 +6932,13 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::AsyncIterNextStep { dst, iter, idx, sent, next_fn } => {
+                    Instr::AsyncIterNextStep {
+                        dst,
+                        iter,
+                        idx,
+                        sent,
+                        next_fn,
+                    } => {
                         // Like ForAwaitNext, but CALLS the cached next method (next_fn,
                         // captured once at GetIterator time) with the `.next(v)` sent
                         // value (yield* sent-value forwarding + no re-get of `next`).
@@ -6362,8 +6972,12 @@ impl<'p> Vm<'p> {
                                 let mut cursor = array_index(self.get(base, idx)).unwrap_or(0);
                                 // A Set's / Map's tombstoned (deleted) slots are skipped.
                                 while match self.heap.get(it.heap_index()) {
-                                    HeapObj::Set(items) => cursor < items.len() && items[cursor].is_hole(),
-                                    HeapObj::Map { keys, .. } => cursor < keys.len() && keys[cursor].is_hole(),
+                                    HeapObj::Set(items) => {
+                                        cursor < items.len() && items[cursor].is_hole()
+                                    }
+                                    HeapObj::Map { keys, .. } => {
+                                        cursor < keys.len() && keys[cursor].is_hole()
+                                    }
                                     _ => false,
                                 } {
                                     cursor += 1;
@@ -6396,7 +7010,7 @@ impl<'p> Vm<'p> {
                                             return Err(Thrown(format!(
                                                 "TypeError: {} is not iterable",
                                                 self.display(it)
-                                            )))
+                                            )));
                                         }
                                     };
                                     if cursor < len {
@@ -6412,7 +7026,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
-                    Instr::AsyncIterReturnStep { dst, has_dst, iter, ret } => {
+                    Instr::AsyncIterReturnStep {
+                        dst,
+                        has_dst,
+                        iter,
+                        ret,
+                    } => {
                         let it = self.get(base, iter);
                         let r = self.get(base, ret);
                         let m = self.get_member(it, "return", it)?;
@@ -6456,7 +7075,14 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, res);
                         ip += 1;
                     }
-                    Instr::IterDelegate { value_dst, done_dst, ret_dst, iter, mode, sent } => {
+                    Instr::IterDelegate {
+                        value_dst,
+                        done_dst,
+                        ret_dst,
+                        iter,
+                        mode,
+                        sent,
+                    } => {
                         let iter_v = self.get(base, iter);
                         let mode_code = self.get(base, mode).as_int();
                         let sent_v = self.get(base, sent);
@@ -6581,8 +7207,7 @@ impl<'p> Vm<'p> {
                                 && matches!(
                                     self.heap.get(value.heap_index()),
                                     HeapObj::Promise { .. }
-                                )
-                            {
+                                ) {
                                 match self.get_prop(value, "constructor") {
                                     Ok(c) => {
                                         let intrinsic = self
@@ -6697,7 +7322,13 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, nv);
                         ip += 1;
                     }
-                    Instr::IterNext { value_dst, done_dst, iter, idx, next } => {
+                    Instr::IterNext {
+                        value_dst,
+                        done_dst,
+                        iter,
+                        idx,
+                        next,
+                    } => {
                         let it = self.get(base, iter);
                         if !it.is_heap() {
                             return Err(Thrown(format!(
@@ -6723,13 +7354,12 @@ impl<'p> Vm<'p> {
                             || !self.array_js_len.contains_key(&it.heap_index())
                         {
                             if !self.array_elements_overlaid(it.heap_index()) {
-                                let cur =
-                                    array_index(self.get(base, idx)).unwrap_or(0);
+                                let cur = array_index(self.get(base, idx)).unwrap_or(0);
                                 let hit = match self.heap.get(it.heap_index()) {
                                     HeapObj::Array(items) => match items.get(cur) {
                                         Some(v) if !v.is_hole() => Some(Some(*v)),
-                                        Some(_) => None,      // hole → generic path
-                                        None => Some(None),   // exhausted
+                                        Some(_) => None,    // hole → generic path
+                                        None => Some(None), // exhausted
                                     },
                                     _ => None,
                                 };
@@ -6785,7 +7415,14 @@ impl<'p> Vm<'p> {
                         // without it `for (v of segmenter.segment(s))` fell
                         // through to the positional walk below and reported the
                         // iterator itself as "not iterable".
-                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } | HeapObj::Intl { .. }) {
+                        if matches!(
+                            self.heap.get(it.heap_index()),
+                            HeapObj::Object(_)
+                                | HeapObj::Proxy { .. }
+                                | HeapObj::Iterator { .. }
+                                | HeapObj::IterHelper { .. }
+                                | HeapObj::Intl { .. }
+                        ) {
                             let next = if next != u16::MAX {
                                 self.get(base, next)
                             } else {
@@ -6801,7 +7438,9 @@ impl<'p> Vm<'p> {
                                     && matches!(self.heap.get(next.heap_index()),
                                                 HeapObj::Native(n) if *n == crate::vm::native::ITER_NEXT)
                                 {
-                                    if let Some(step) = self.regexp_string_iter_step(it.heap_index()) {
+                                    if let Some(step) =
+                                        self.regexp_string_iter_step(it.heap_index())
+                                    {
                                         let (val, done) = step?;
                                         self.set(base, value_dst, val);
                                         self.set(base, done_dst, Value::bool(done));
@@ -6863,7 +7502,9 @@ impl<'p> Vm<'p> {
                         // A Set's / Map's tombstoned (deleted) slots are skipped.
                         while match self.heap.get(it.heap_index()) {
                             HeapObj::Set(items) => cursor < items.len() && items[cursor].is_hole(),
-                            HeapObj::Map { keys, .. } => cursor < keys.len() && keys[cursor].is_hole(),
+                            HeapObj::Map { keys, .. } => {
+                                cursor < keys.len() && keys[cursor].is_hole()
+                            }
                             _ => false,
                         } {
                             cursor += 1;
@@ -6915,7 +7556,7 @@ impl<'p> Vm<'p> {
                                 return Err(Thrown(format!(
                                     "TypeError: {} is not iterable",
                                     self.display(it)
-                                )))
+                                )));
                             }
                         };
                         if cursor < len {
@@ -6969,8 +7610,12 @@ impl<'p> Vm<'p> {
                                 let mut cursor = array_index(self.get(base, idx)).unwrap_or(0);
                                 // A Set's / Map's tombstoned (deleted) slots are skipped.
                                 while match self.heap.get(it.heap_index()) {
-                                    HeapObj::Set(items) => cursor < items.len() && items[cursor].is_hole(),
-                                    HeapObj::Map { keys, .. } => cursor < keys.len() && keys[cursor].is_hole(),
+                                    HeapObj::Set(items) => {
+                                        cursor < items.len() && items[cursor].is_hole()
+                                    }
+                                    HeapObj::Map { keys, .. } => {
+                                        cursor < keys.len() && keys[cursor].is_hole()
+                                    }
                                     _ => false,
                                 } {
                                     cursor += 1;
@@ -7003,7 +7648,7 @@ impl<'p> Vm<'p> {
                                             return Err(Thrown(format!(
                                                 "TypeError: {} is not iterable",
                                                 self.display(it)
-                                            )))
+                                            )));
                                         }
                                     };
                                     if cursor < len {
@@ -7058,7 +7703,9 @@ impl<'p> Vm<'p> {
         self.tail_reuse_streak += 1;
         if self.tail_reuse_streak > MAX_TAIL_REUSE_STREAK {
             self.tail_reuse_streak = 0;
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         let (callee_regs, callee_params, rest_reg, arguments_reg, p_strict, p_lex, simple) = {
             let p = self.func(fid as usize);
@@ -7092,7 +7739,9 @@ impl<'p> Vm<'p> {
         };
         self.regs.truncate(base);
         if self.regs_would_overflow(base + callee_regs) {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         self.regs.resize(base + callee_regs, Value::UNDEFINED);
         self.regs[base] = this_val;
@@ -7150,10 +7799,11 @@ impl<'p> Vm<'p> {
             char_code_at: jit_char_code_at as usize,
             concat: jit_concat as usize,
             str_append: jit_str_append as usize,
+            str_append_index: crate::vm::coerce::jit_str_append_index_ascii as usize,
             call_method_ic: jit_call_method_ic as usize,
             regexp_call_direct: crate::vm::helpers_misc::jit_regexp_call_direct as usize,
-            string_regexp_call_direct:
-                crate::vm::helpers_misc::jit_string_regexp_call_direct as usize,
+            string_regexp_call_direct: crate::vm::helpers_misc::jit_string_regexp_call_direct
+                as usize,
             has_own_call: crate::vm::helpers_misc::jit_has_own_call as usize,
             call_ic: jit_call_ic as usize,
             cross_call: crate::vm::helpers_misc::jit_cross_call as usize,
@@ -7178,17 +7828,17 @@ impl<'p> Vm<'p> {
             upval_get: jit_upval_get as usize,
             forin_live: jit_forin_live as usize,
             iter_next: crate::vm::helpers_misc::jit_iter_next as usize,
-            regexp_scalar_get_iterator:
-                crate::vm::helpers_misc::jit_regexp_scalar_get_iterator as usize,
-            regexp_scalar_iter_prime:
-                crate::vm::helpers_misc::jit_regexp_scalar_iter_prime as usize,
+            regexp_scalar_get_iterator: crate::vm::helpers_misc::jit_regexp_scalar_get_iterator
+                as usize,
+            regexp_scalar_iter_prime: crate::vm::helpers_misc::jit_regexp_scalar_iter_prime
+                as usize,
             regexp_scalar_step: crate::vm::helpers_misc::jit_regexp_scalar_step as usize,
-            regexp_scalar_capture_num:
-                crate::vm::helpers_misc::jit_regexp_scalar_capture_num as usize,
+            regexp_scalar_capture_num: crate::vm::helpers_misc::jit_regexp_scalar_capture_num
+                as usize,
             regexp_scalar_flush: crate::vm::helpers_misc::jit_regexp_scalar_flush as usize,
             regexp_scalar_exec: crate::vm::helpers_misc::jit_regexp_scalar_exec as usize,
-            regexp_scalar_exec_flush:
-                crate::vm::helpers_misc::jit_regexp_scalar_exec_flush as usize,
+            regexp_scalar_exec_flush: crate::vm::helpers_misc::jit_regexp_scalar_exec_flush
+                as usize,
             push_finally: crate::vm::helpers_misc::jit_push_finally as usize,
             pop_finally: crate::vm::helpers_misc::jit_pop_finally as usize,
             to_num: crate::vm::helpers_misc::jit_to_num as usize,
@@ -7199,8 +7849,7 @@ impl<'p> Vm<'p> {
             static_fn: crate::vm::helpers_misc::jit_static_fn as usize,
             to_concat_key: crate::vm::helpers_misc::jit_to_concat_key as usize,
             set_index_concat: crate::vm::helpers_misc::jit_set_index_concat as usize,
-            set_index_concat_pure:
-                crate::vm::helpers_misc::jit_set_index_concat_pure as usize,
+            set_index_concat_pure: crate::vm::helpers_misc::jit_set_index_concat_pure as usize,
             delete_index: crate::vm::helpers_misc::jit_delete_index as usize,
             delete_index_concat: crate::vm::helpers_misc::jit_delete_index_concat as usize,
             is_array: jit_is_array as usize,
@@ -7250,6 +7899,26 @@ impl<'p> Vm<'p> {
                 return None;
             }
         }
+        // An ordinary frame call can compile its CALLER before this callee's
+        // IC becomes monomorphic, so it reaches Tier C through `try_run_jit`
+        // rather than the native cross-call helper. Consume the same exact,
+        // unmetered Markdown plan here after the shared global-route checks.
+        // A failed runtime guard is pure and falls through to native ip 0.
+        // The frame is active here, so `current_realm_id` names the renderer's
+        // realm. The reducer currently proves main-realm String/helper images;
+        // child-realm bodies execute the ordinary Tier-C path.
+        if self.current_realm_id().is_none() {
+            if let Some((_, _, _, Some(plan))) = self.jit.cross_entry(func_id) {
+                let input = self.get(base, 1);
+                let reduced = {
+                    let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
+                    self.markdown_inline_reduce(plan, input)
+                };
+                if let Some(bits) = reduced {
+                    return Some((Value::from_bits(bits), crate::codegen::NO_BAIL));
+                }
+            }
+        }
         // SAFETY: `jitfn` points into self.jit.compiled (stable for the call).
         // `regs_ptr` is valid for the frame's reg_count slots. A self-call op
         // routes through `jit_self_call` (passed the `vm` pointer below) which
@@ -7283,10 +7952,7 @@ impl<'p> Vm<'p> {
     /// VM's life in `jit_const_strings` (compiled code isn't GC-traced). Mirrors
     /// the OSR region's const_strs build (over the whole function body here).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn jit_build_const_strs(
-        &mut self,
-        func_id: u32,
-    ) -> rustc_hash::FxHashMap<u32, u64> {
+    pub(crate) fn jit_build_const_strs(&mut self, func_id: u32) -> rustc_hash::FxHashMap<u32, u64> {
         let pending: Vec<u32> = {
             let proto = self.func(func_id as usize);
             proto
@@ -7327,7 +7993,12 @@ impl<'p> Vm<'p> {
     /// prologue). The numeric region issues NO calls that push frames or grow
     /// `self.regs`/`self.globals`, so the raw pointers stay valid for the call.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn try_run_osr(&mut self, func_id: u32, entry_ip: u32, base: usize) -> Option<usize> {
+    pub(crate) fn try_run_osr(
+        &mut self,
+        func_id: u32,
+        entry_ip: u32,
+        base: usize,
+    ) -> Option<usize> {
         // Global-route revalidation, as in `try_run_jit`. Scoped to the whole
         // FUNCTION rather than the region's `[header, back-edge)` slice: declining a
         // region because a global elsewhere in the body went backwards is
@@ -7343,7 +8014,11 @@ impl<'p> Vm<'p> {
         // so the mmap'd code stays alive for the in-flight run).
         let (entry, field_plan, is_mem) = {
             let region = self.jit.get_region(func_id, entry_ip)?;
-            (region.entry(), region.field_plan().cloned(), region.is_mem())
+            (
+                region.entry(),
+                region.field_plan().cloned(),
+                region.is_mem(),
+            )
         };
 
         // â”€â”€ pre-run sync â”€â”€ load the promoted object's fields into the scratch
@@ -7366,9 +8041,8 @@ impl<'p> Vm<'p> {
                 return None;
             }
             for &(name_idx, slot) in &p.fields {
-                let key = self.func(p.func_id as usize).string_constants
-                    [name_idx as usize]
-                    .as_str();
+                let key =
+                    self.func(p.func_id as usize).string_constants[name_idx as usize].as_str();
                 let v = self.get_prop(obj, &key).unwrap_or(Value::UNDEFINED);
                 self.globals[slot as usize] = v;
             }
@@ -7422,9 +8096,8 @@ impl<'p> Vm<'p> {
         if let Some(ref p) = field_plan {
             let obj = self.globals[p.obj_global as usize];
             for &(name_idx, slot) in &p.fields {
-                let key = self.func(p.func_id as usize).string_constants
-                    [name_idx as usize]
-                    .as_str();
+                let key =
+                    self.func(p.func_id as usize).string_constants[name_idx as usize].as_str();
                 let v = self.globals[slot as usize];
                 let _ = self.set_prop(obj, &key, v, false);
             }
@@ -7518,12 +8191,18 @@ impl<'p> Vm<'p> {
     // builds while release elides the bounds check.
     #[inline(always)]
     pub(crate) fn get(&self, base: usize, r: u16) -> Value {
-        debug_assert!((base + r as usize) < self.regs.len(), "reg read out of bounds");
+        debug_assert!(
+            (base + r as usize) < self.regs.len(),
+            "reg read out of bounds"
+        );
         unsafe { *self.regs.get_unchecked(base + r as usize) }
     }
     #[inline(always)]
     pub(crate) fn set(&mut self, base: usize, r: u16, v: Value) {
-        debug_assert!((base + r as usize) < self.regs.len(), "reg write out of bounds");
+        debug_assert!(
+            (base + r as usize) < self.regs.len(),
+            "reg write out of bounds"
+        );
         unsafe {
             *self.regs.get_unchecked_mut(base + r as usize) = v;
         }
@@ -7556,20 +8235,66 @@ impl<'p> Vm<'p> {
         if nt != Value::UNDEFINED || !callee.is_heap() {
             return nt;
         }
-        self.closure_new_target.get(&callee.heap_index()).copied().unwrap_or(nt)
+        self.closure_new_target
+            .get(&callee.heap_index())
+            .copied()
+            .unwrap_or(nt)
     }
 
     /// The per-iteration for-in liveness re-check (EnumerateObjectProperties): is
-    /// the snapshotted key `kv` still present on `o`? Shared by the interpreter
-    /// `ForInLive` arm and the JIT `jit_forin_live` helper so both are byte-
-    /// identical. NON-observable, so it errs on "live": a primitive receiver, a
-    /// Proxy anywhere on the chain (its has/ownKeys traps must NOT fire here — the
-    /// snapshot already ran the spec'd ownKeys/gopd protocol), and globalThis'
-    /// reserved builtin bindings all stay visited. No getter / Proxy trap fires
-    /// and the call does not re-enter the dispatch loop, so it never runs a GC
-    /// safe point (`key_of`'s transient `String` is a Rust alloc, not a VM-heap
-    /// one).
-    pub(crate) fn forin_live(&mut self, o: Value, kv: Value) -> bool {
+    /// the snapshotted key `kv` still present on the receiver stored in `snapshot`?
+    /// Shared by the interpreter `ForInLive` arm and the JIT `jit_forin_live`
+    /// helper so both are byte-identical. A narrowly eligible ordinary Array can
+    /// answer from the receiver/default-prototype versions captured by
+    /// `ForInKeys`; a mismatch falls through to the exact old lookup below.
+    /// NON-observable, so malformed internal state and opaque Proxy chains err on
+    /// "live". No getter / Proxy trap fires and the call does not re-enter the
+    /// dispatch loop, so it never runs a GC safe point (`key_of`'s transient
+    /// `String` is a Rust alloc, not a VM-heap one).
+    pub(crate) fn forin_live(&mut self, snapshot: Value, kv: Value) -> bool {
+        // The ForInKeys Array is engine-private and cannot be replaced or
+        // mutated by JavaScript. Copy the prefix values before any later heap
+        // access so no borrow of its backing Vec crosses the ordinary path.
+        let (
+            o,
+            receiver_version,
+            array_proto,
+            array_proto_version,
+            object_proto,
+            object_proto_version,
+        ) = if snapshot.is_heap() {
+            match self.heap.get(snapshot.heap_index()) {
+                HeapObj::Array(items) if items.len() >= crate::bytecode::FORIN_SNAPSHOT_PREFIX => {
+                    (items[0], items[1], items[2], items[3], items[4], items[5])
+                }
+                _ => return true,
+            }
+        } else {
+            return true;
+        };
+
+        // A version hit proves that none of the three levels which supplied the
+        // snapshot has lost a key or changed descriptors/prototype. The complete
+        // structural licence was checked once while this immutable snapshot was
+        // built; every operation which can revoke it bumps one of these versions.
+        // Repeating HashMap/HeapObj shape probes here would merely replace the
+        // old per-key property lookup with another per-key property lookup.
+        // Adds/overwrites which leave versions stable cannot make a snapshotted
+        // key disappear and are therefore harmless.
+        if crate::codegen::forin_version_fast_enabled()
+            && !receiver_version.is_undefined()
+            && o.is_heap()
+            && array_proto.is_heap()
+            && object_proto.is_heap()
+            && receiver_version == Value::int(self.heap.version_of(o.heap_index()) as i32)
+            && array_proto_version
+                == Value::int(self.heap.version_of(array_proto.heap_index()) as i32)
+            && object_proto_version
+                == Value::int(self.heap.version_of(object_proto.heap_index()) as i32)
+        {
+            return true;
+        }
+
         // Own-hit fast probe, alloc-free: view the snapshotted key's bytes in
         // place (a flat ASCII/UTF-8 string — surrogate-bearing keys take the
         // generic path) and ask the receiver's own map directly. has_property
@@ -7675,13 +8400,22 @@ impl<'p> Vm<'p> {
 
     /// Materialize a class member function as a callable value: a plain `Func`
     /// when it captures nothing, else a `Closure` over the defining frame's cells.
-    pub(crate) fn materialize_callable(&mut self, fid: u32, base: usize, cur_closure: u32) -> Value {
+    pub(crate) fn materialize_callable(
+        &mut self,
+        fid: u32,
+        base: usize,
+        cur_closure: u32,
+    ) -> Value {
         let sources = self.func(fid as usize).upvalues.clone();
         let v = if sources.is_empty() {
             Value::heap(self.heap.alloc(HeapObj::Func(fid)))
         } else {
             let cells = self.capture_upvalue_cells(&sources, base, cur_closure);
-            Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: cells, this_val: Value::UNDEFINED }))
+            Value::heap(self.heap.alloc(HeapObj::Closure {
+                func: fid,
+                upvalues: cells,
+                this_val: Value::UNDEFINED,
+            }))
         };
         // A class member materialized while createRealm-child code runs carries
         // the child's realm tag (no-op in the main realm).
@@ -7701,7 +8435,10 @@ impl<'p> Vm<'p> {
                 _ => {}
             }
         }
-        Err(Thrown(format!("TypeError: {} is not a function", self.display(v))))
+        Err(Thrown(format!(
+            "TypeError: {} is not a function",
+            self.display(v)
+        )))
     }
 
     /// `resolve_callable`, but naming the property that was called.
@@ -7718,9 +8455,8 @@ impl<'p> Vm<'p> {
         v: Value,
         name: &str,
     ) -> Result<(u32, u32), Thrown> {
-        self.resolve_callable(v).map_err(|Thrown(msg)| {
-            Thrown(format!("{msg} (property \"{name}\")"))
-        })
+        self.resolve_callable(v)
+            .map_err(|Thrown(msg)| Thrown(format!("{msg} (property \"{name}\")")))
     }
 
     /// `resolve_callable`, except a NON-callable born in a createRealm child (a
@@ -7762,7 +8498,9 @@ impl<'p> Vm<'p> {
         callee_val: Value,
     ) -> Result<(), Thrown> {
         if self.frames.len() >= MAX_FRAMES {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         // ONE proto fetch for every layout field this call needs (each
         // `func()` is a bounds-checked double index; this runs per call).
@@ -7802,7 +8540,9 @@ impl<'p> Vm<'p> {
         // Never grow past the pinned capacity (would realloc and dangle a live
         // native window pointer) â€” throw a catchable RangeError instead.
         if self.regs_would_overflow(new_base + callee_regs) {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
 
@@ -7848,10 +8588,24 @@ impl<'p> Vm<'p> {
         // function with no formals and no `arguments` reference otherwise retains
         // nothing about its call.
         let arg_win = (caller_base + arg_base as usize) as u32;
-        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, arg_win, argc, is_eval: false, func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj,
+            eval_scope: u32::MAX,
+            arg_win,
+            argc,
+            is_eval: false,
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: dst,
+            closure,
+            handlers: Vec::new(),
+            new_target,
+            callee: callee_val,
+        });
         Ok(())
     }
-
 }
 
 /// A CANONICAL non-negative integer property key, read straight off the key's
@@ -7896,17 +8650,47 @@ mod forin_canon_tests {
     #[test]
     fn agrees_with_canonical_index_str() {
         let cases = [
-            "", "0", "00", "01", "1", "10", "007", "-0", "-1", "1.0", "1.5", " 1", "1 ", "+1",
-            "0x10", "1e3", "length", "x", "4294967294", "4294967295", "4294967296",
-            "18446744073709551615", "18446744073709551616", "99999999999999999999999",
-            "\u{0}1", "1\u{0}",
+            "",
+            "0",
+            "00",
+            "01",
+            "1",
+            "10",
+            "007",
+            "-0",
+            "-1",
+            "1.0",
+            "1.5",
+            " 1",
+            "1 ",
+            "+1",
+            "0x10",
+            "1e3",
+            "length",
+            "x",
+            "4294967294",
+            "4294967295",
+            "4294967296",
+            "18446744073709551615",
+            "18446744073709551616",
+            "99999999999999999999999",
+            "\u{0}1",
+            "1\u{0}",
         ];
         for c in cases {
-            assert_eq!(canonical_index_bytes(c), canonical_index_str(c), "key {c:?}");
+            assert_eq!(
+                canonical_index_bytes(c),
+                canonical_index_str(c),
+                "key {c:?}"
+            );
         }
         for i in 0..2000usize {
             let s = i.to_string();
-            assert_eq!(canonical_index_bytes(&s), canonical_index_str(&s), "key {s:?}");
+            assert_eq!(
+                canonical_index_bytes(&s),
+                canonical_index_str(&s),
+                "key {s:?}"
+            );
         }
     }
 }

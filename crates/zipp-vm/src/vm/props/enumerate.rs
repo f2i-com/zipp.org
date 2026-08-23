@@ -25,7 +25,7 @@ fn enum_hoist_enabled() -> bool {
 }
 
 impl<'p> Vm<'p> {
-        pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
+    pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
         self.defer_check_all(obj)?;
         // A namespace with a still-uninitialized export throws from the per-key
         // [[GetOwnProperty]] walk (Object.keys/values/entries + for-in).
@@ -136,14 +136,17 @@ impl<'p> Vm<'p> {
             let dense_overlaid = !enum_hoist_enabled()
                 || self.arr_props.get(&idx).is_some_and(|m| {
                     m.has_element_key()
-                        && m.keys.iter().any(|k| {
-                            canonical_index_str(k).is_some_and(|n| n < len)
-                        })
+                        && m.keys
+                            .iter()
+                            .any(|k| canonical_index_str(k).is_some_and(|n| n < len))
                 });
             let mut ks: Vec<String> = Vec::new();
             for i in 0..len {
-                let overridden =
-                    if dense_overlaid { self.array_index_override(idx, i) } else { None };
+                let overridden = if dense_overlaid {
+                    self.array_index_override(idx, i)
+                } else {
+                    None
+                };
                 // A hole (an absent element) with no defineProperty'd override is not
                 // an own property — skip it.
                 if overridden.is_none()
@@ -331,7 +334,8 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_)
                     | HeapObj::Closure { .. }
                     | HeapObj::Bound { .. }
-                    | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. }
             )
         {
             let idx = obj.heap_index();
@@ -413,8 +417,11 @@ impl<'p> Vm<'p> {
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Array(items) => {
-                    let mut v: Vec<(String, Value)> =
-                        items.iter().enumerate().map(|(i, x)| (i.to_string(), *x)).collect();
+                    let mut v: Vec<(String, Value)> = items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, x)| (i.to_string(), *x))
+                        .collect();
                     // Enumerable named own properties (arr.foo / match-result fields).
                     if let Some(m) = self.arr_props.get(&obj.heap_index()) {
                         for (i, k) in m.keys.iter().enumerate() {
@@ -432,7 +439,8 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }
                 | HeapObj::Bound { .. }
-                | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => match self.fn_props.get(&obj.heap_index()) {
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. } => match self.fn_props.get(&obj.heap_index()) {
                     Some(m) => spec_key_order(&m.keys)
                         .into_iter()
                         .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
@@ -523,7 +531,13 @@ impl<'p> Vm<'p> {
         // `out` holds heap key strings while object_enum_own / object_own_property_names
         // re-enter and allocate — suspend GC for the scope.
         let _gc = self.gc_lock_guard();
-        let mut out: Vec<Value> = Vec::new();
+        // The key Array is engine-private. Prefix it with receiver/version and
+        // the two default-prototype anchor/version pairs so `ForInLive` can prove
+        // that THIS snapshot's keyset is still live without re-parsing/probing
+        // the current key. Slot 1 stays Undefined when the narrow guard is
+        // ineligible/off, making the old per-key path the fail-closed default.
+        let mut out: Vec<Value> = vec![Value::UNDEFINED; crate::bytecode::FORIN_SNAPSHOT_PREFIX];
+        out[0] = obj;
         // The shadow set (a nearer level's own key — enumerable or not — hides
         // the same name on farther prototypes) is built LAZILY: the dominant
         // chain shape (own keys, then prototypes whose properties are all
@@ -546,8 +560,10 @@ impl<'p> Vm<'p> {
             // bindings, TDZ checks) take the generic path below.
             let plain = matches!(self.heap.get(idx), HeapObj::Object(_))
                 && !(idx == self.global_this && self.global_this != 0)
-                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
-                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx));
+                && !(!self.module_namespaces.is_empty()
+                    && self.module_namespaces.contains_key(&idx))
+                && !(!self.deferred_ns_state.is_empty()
+                    && self.deferred_ns_state.contains_key(&idx));
             if plain {
                 // Slots to yield, in spec own-key order, while the map is borrowed.
                 let (emit, visible) = match self.heap.get(idx) {
@@ -648,6 +664,31 @@ impl<'p> Vm<'p> {
                 break;
             }
         }
+        // Narrow V1 licence: a genuine non-arguments Array on the untouched
+        // %Array.prototype% -> %Object.prototype% chain. Receiver and both anchor
+        // versions cover every deletion, descriptor/keyset change and
+        // setPrototypeOf that can make a snapshotted key disappear. Exotic/custom
+        // chains retain the exact old liveness walk.
+        if crate::codegen::forin_version_fast_enabled()
+            && obj.is_heap()
+            && matches!(self.heap.get(obj.heap_index()), HeapObj::Array(_))
+            && !self.arguments_objs.contains_key(&obj.heap_index())
+            && !self.proto_of.contains_key(&obj.heap_index())
+            && self.arr_proto != 0
+            && self.obj_proto != 0
+            && !self.proto_of.contains_key(&self.arr_proto)
+            && !self.proto_of.contains_key(&self.obj_proto)
+        {
+            // Versions deliberately use an internal Int payload even above
+            // i32::MAX: generated code compares their low u32 directly with the
+            // heap's parallel versions array, and the Rust fallback constructs
+            // the same representation. The prototype Values root both anchors.
+            out[1] = Value::int(self.heap.version_of(obj.heap_index()) as i32);
+            out[2] = Value::heap(self.arr_proto);
+            out[3] = Value::int(self.heap.version_of(self.arr_proto) as i32);
+            out[4] = Value::heap(self.obj_proto);
+            out[5] = Value::int(self.heap.version_of(self.obj_proto) as i32);
+        }
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
     }
 
@@ -669,7 +710,13 @@ impl<'p> Vm<'p> {
 
     /// Build a data property descriptor object `{value, writable, enumerable,
     /// configurable}` (for `Object.getOwnPropertyDescriptor`).
-    pub(crate) fn make_data_descriptor(&mut self, value: Value, w: bool, e: bool, c: bool) -> Value {
+    pub(crate) fn make_data_descriptor(
+        &mut self,
+        value: Value,
+        w: bool,
+        e: bool,
+        c: bool,
+    ) -> Value {
         let mut m = ObjMap::new();
         m.set("value", value);
         m.set("writable", Value::bool(w));
@@ -679,7 +726,13 @@ impl<'p> Vm<'p> {
     }
 
     /// Build an accessor descriptor object `{get, set, enumerable, configurable}`.
-    pub(crate) fn make_accessor_descriptor(&mut self, get: Value, set: Value, e: bool, c: bool) -> Value {
+    pub(crate) fn make_accessor_descriptor(
+        &mut self,
+        get: Value,
+        set: Value,
+        e: bool,
+        c: bool,
+    ) -> Value {
         let mut m = ObjMap::new();
         m.set("get", get);
         m.set("set", set);
@@ -687,5 +740,4 @@ impl<'p> Vm<'p> {
         m.set("configurable", Value::bool(c));
         Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
     }
-
 }

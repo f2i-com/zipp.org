@@ -44,7 +44,11 @@ pub(crate) struct IntSplice {
 
 impl IntSplice {
     pub(crate) fn entry(&self) -> IntEntry<'_> {
-        IntEntry { resume: &self.resume, guards: &self.guards, regs_fits: self.regs_fits }
+        IntEntry {
+            resume: &self.resume,
+            guards: &self.guards,
+            regs_fits: self.regs_fits,
+        }
     }
 }
 
@@ -108,8 +112,9 @@ pub(crate) fn plan_int_splice(
     if e <= s || e >= proto.code.len() {
         return None;
     }
-    let calls: Vec<usize> =
-        (s..=e).filter(|&ip| matches!(proto.code[ip], Instr::Call { .. })).collect();
+    let calls: Vec<usize> = (s..=e)
+        .filter(|&ip| matches!(proto.code[ip], Instr::Call { .. }))
+        .collect();
     if calls.is_empty() {
         return None; // nothing to flatten — the untouched path stays untouched
     }
@@ -126,7 +131,15 @@ pub(crate) fn plan_int_splice(
     let mut guards: Vec<(u64, u32)> = Vec::new();
     let mut prev_end = s; // spans must not overlap
     for &c in &calls {
-        let Instr::Call { dst, callee, arg_base, argc } = proto.code[c] else { unreachable!() };
+        let Instr::Call {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        } = proto.code[c]
+        else {
+            unreachable!()
+        };
         let Some(lp) = leaf_plan.get(&c) else {
             decline!("@{c} no leaf plan (not monomorphic / not inline-eligible)");
         };
@@ -144,7 +157,10 @@ pub(crate) fn plan_int_splice(
         if lp.uninit_mask != 0 {
             // A local read before it is written would read `undefined` (and reg
             // 0 is `this`); neither has an i64 home.
-            decline!("@{c} body reads an uninitialized local (mask {:#x})", lp.uninit_mask);
+            decline!(
+                "@{c} body reads an uninitialized local (mask {:#x})",
+                lp.uninit_mask
+            );
         }
         let Some(guard) = lp.slot_guard else {
             // Without the slot-generation proof there is nothing to hoist: the
@@ -197,7 +213,14 @@ pub(crate) fn plan_int_splice(
         if !guards.contains(&guard) {
             guards.push(guard);
         }
-        sites.push(Site { call_ip: c, def_ip, dst, arg_base, win: win as u16, plan: lp });
+        sites.push(Site {
+            call_ip: c,
+            def_ip,
+            dst,
+            arg_base,
+            win: win as u16,
+            plan: lp,
+        });
     }
 
     // ── liveness over the TRANSFORMED region ──
@@ -209,9 +232,14 @@ pub(crate) fn plan_int_splice(
     let reads_outside = reads_outside_region(proto, s, e)?;
     let live_out = region_live_out(proto, s, e, &sites, &reads_outside)?;
     for site in &sites {
-        let Instr::LoadGlobal { dst: callee, .. } = proto.code[site.def_ip] else { unreachable!() };
+        let Instr::LoadGlobal { dst: callee, .. } = proto.code[site.def_ip] else {
+            unreachable!()
+        };
         if live_out[site.def_ip - s].contains(&callee) {
-            decline!("@{} callee register r{callee} is live past its def", site.call_ip);
+            decline!(
+                "@{} callee register r{callee} is live past its def",
+                site.call_ip
+            );
         }
         if matches!(site.plan.body.last(), Some(Instr::ReturnUndefined))
             && live_out[site.call_ip - s].contains(&site.dst)
@@ -287,7 +315,10 @@ pub(crate) fn plan_int_splice(
             access.insert(ip, j);
         }
     }
-    let new_ta = TaPinPlan { pins: ta_plan.pins.clone(), access };
+    let new_ta = TaPinPlan {
+        pins: ta_plan.pins.clone(),
+        access,
+    };
     let mut sp = proto.clone();
     sp.reg_count = sp.reg_count.max(win_top as u16);
     sp.code = code;
@@ -338,7 +369,10 @@ fn emit_splice(
     };
     for i in 0..n {
         if !alias(i) {
-            flat.push(Instr::Move { dst: w + 1 + i, src: site.arg_base + i });
+            flat.push(Instr::Move {
+                dst: w + 1 + i,
+                src: site.arg_base + i,
+            });
             resume.push(r);
         }
     }
@@ -374,7 +408,10 @@ fn emit_splice(
         // write is simply not made.
         Instr::ReturnUndefined => {}
         Instr::Return { src } => {
-            flat.push(Instr::Move { dst: site.dst, src: map(src) });
+            flat.push(Instr::Move {
+                dst: site.dst,
+                src: map(src),
+            });
             resume.push(r);
         }
         _ => decline!("@{} body terminator is not a Return", site.call_ip),
@@ -402,29 +439,96 @@ fn map_body_instr(
                 return None; // a double constant cannot be an i64 home
             }
             constants.push(v);
-            Instr::LoadConst { dst: m(dst), idx: (constants.len() - 1) as u32 }
+            Instr::LoadConst {
+                dst: m(dst),
+                idx: (constants.len() - 1) as u32,
+            }
         }
-        Instr::Move { dst, src } => Instr::Move { dst: m(dst), src: m(src) },
+        Instr::Move { dst, src } => Instr::Move {
+            dst: m(dst),
+            src: m(src),
+        },
         Instr::LoadGlobal { dst, idx } => Instr::LoadGlobal { dst: m(dst), idx },
         Instr::StoreGlobal { idx, src } => Instr::StoreGlobal { idx, src: m(src) },
         Instr::StoreGlobalStrict { idx, src } => Instr::StoreGlobalStrict { idx, src: m(src) },
         Instr::StoreGlobalResolved { idx, src } => Instr::StoreGlobalResolved { idx, src: m(src) },
-        Instr::Add { dst, a, b } => Instr::Add { dst: m(dst), a: m(a), b: m(b) },
-        Instr::Sub { dst, a, b } => Instr::Sub { dst: m(dst), a: m(a), b: m(b) },
-        Instr::Mul { dst, a, b } => Instr::Mul { dst: m(dst), a: m(a), b: m(b) },
-        Instr::Mod { dst, a, b } => Instr::Mod { dst: m(dst), a: m(a), b: m(b) },
-        Instr::AddInt { dst, a, imm, upd } => Instr::AddInt { dst: m(dst), a: m(a), imm, upd },
-        Instr::Neg { dst, a } => Instr::Neg { dst: m(dst), a: m(a) },
-        Instr::Bitwise { dst, a, b, op } => Instr::Bitwise { dst: m(dst), a: m(a), b: m(b), op },
-        Instr::Eq { dst, a, b } => Instr::Eq { dst: m(dst), a: m(a), b: m(b) },
-        Instr::Ne { dst, a, b } => Instr::Ne { dst: m(dst), a: m(a), b: m(b) },
-        Instr::Lt { dst, a, b } => Instr::Lt { dst: m(dst), a: m(a), b: m(b) },
-        Instr::Le { dst, a, b } => Instr::Le { dst: m(dst), a: m(a), b: m(b) },
-        Instr::Gt { dst, a, b } => Instr::Gt { dst: m(dst), a: m(a), b: m(b) },
-        Instr::Ge { dst, a, b } => Instr::Ge { dst: m(dst), a: m(a), b: m(b) },
-        Instr::MathOp { dst, op: MathFn::Imul, arg_base, argc: 2 } => {
-            Instr::MathOp { dst: m(dst), op: MathFn::Imul, arg_base: m(arg_base), argc: 2 }
-        }
+        Instr::Add { dst, a, b } => Instr::Add {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::Sub { dst, a, b } => Instr::Sub {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::Mul { dst, a, b } => Instr::Mul {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::Mod { dst, a, b } => Instr::Mod {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::AddInt { dst, a, imm, upd } => Instr::AddInt {
+            dst: m(dst),
+            a: m(a),
+            imm,
+            upd,
+        },
+        Instr::Neg { dst, a } => Instr::Neg {
+            dst: m(dst),
+            a: m(a),
+        },
+        Instr::Bitwise { dst, a, b, op } => Instr::Bitwise {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+            op,
+        },
+        Instr::Eq { dst, a, b } => Instr::Eq {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::Ne { dst, a, b } => Instr::Ne {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::Lt { dst, a, b } => Instr::Lt {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::Le { dst, a, b } => Instr::Le {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::Gt { dst, a, b } => Instr::Gt {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::Ge { dst, a, b } => Instr::Ge {
+            dst: m(dst),
+            a: m(a),
+            b: m(b),
+        },
+        Instr::MathOp {
+            dst,
+            op: MathFn::Imul,
+            arg_base,
+            argc: 2,
+        } => Instr::MathOp {
+            dst: m(dst),
+            op: MathFn::Imul,
+            arg_base: m(arg_base),
+            argc: 2,
+        },
         _ => return None,
     })
 }
@@ -444,7 +548,11 @@ fn int_op_can_exit(i: &Instr) -> bool {
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. }
             | Instr::Bitwise { .. }
-            | Instr::MathOp { op: MathFn::Imul, argc: 2, .. }
+            | Instr::MathOp {
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            }
             | Instr::Eq { .. }
             | Instr::Ne { .. }
             | Instr::Lt { .. }
@@ -540,7 +648,9 @@ fn reads_outside_region(proto: &FuncProto, s: usize, e: usize) -> Option<FxHashS
             continue;
         }
         let Some((uses, _)) = splice_ud(ins) else {
-            log_decline(format_args!("unmodelled op @{ip} outside the region: {ins:?}"));
+            log_decline(format_args!(
+                "unmodelled op @{ip} outside the region: {ins:?}"
+            ));
             return None;
         };
         set.extend(uses);
@@ -568,7 +678,9 @@ fn region_live_out(
     for ip in s..=e {
         let mut t = splice_ud(&proto.code[ip])?;
         if let Some(site) = sites.iter().find(|st| st.call_ip == ip) {
-            let Instr::Call { arg_base, argc, .. } = proto.code[ip] else { unreachable!() };
+            let Instr::Call { arg_base, argc, .. } = proto.code[ip] else {
+                unreachable!()
+            };
             t.0 = (0..argc).map(|k| arg_base + k).collect();
             t.1 = match site.plan.body.last() {
                 Some(Instr::ReturnUndefined) => None,
@@ -600,7 +712,10 @@ fn region_live_out(
                     out.extend(reads_outside.iter().copied());
                 }
             }
-            if matches!(proto.code[ip], Instr::Return { .. } | Instr::ReturnUndefined) {
+            if matches!(
+                proto.code[ip],
+                Instr::Return { .. } | Instr::ReturnUndefined
+            ) {
                 fallthrough = false;
             }
             if fallthrough {
@@ -670,6 +785,9 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::Ne { dst, a, b }
         | Instr::LooseEq { dst, a, b }
         | Instr::LooseNe { dst, a, b } => r(vec![a, b], Some(dst)),
+        Instr::StrAppendIndex {
+            dst, a, obj, key, ..
+        } => r(vec![a, obj, key], Some(dst)),
         Instr::AddRightPair { dst, a, b, c, .. } => r(vec![a, b, c], Some(dst)),
         Instr::Pad2Concat { dst, src, .. } => r(vec![src], Some(dst)),
         Instr::Pad2Conditional { dst, src } => r(vec![src], Some(dst)),
@@ -693,14 +811,20 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => r(vec![iter], None),
         Instr::CallSpread { dst, callee, args } => r(vec![callee, args], Some(dst)),
         Instr::CallMethodSpread { dst, obj, args, .. } => r(vec![obj, args], Some(dst)),
-        Instr::TailCall { callee, arg_base, argc } => {
+        Instr::TailCall {
+            callee,
+            arg_base,
+            argc,
+        } => {
             let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
             v.push(callee);
             r(v, None)
         }
-        Instr::ArrayCtor { dst, arg_base, argc } => {
-            r((0..argc).map(|k| arg_base + k).collect(), Some(dst))
-        }
+        Instr::ArrayCtor {
+            dst,
+            arg_base,
+            argc,
+        } => r((0..argc).map(|k| arg_base + k).collect(), Some(dst)),
         Instr::GetIndex { dst, obj, key } => r(vec![obj, key], Some(dst)),
         Instr::GetIndexConcat { dst, obj, key, .. } => r(vec![obj, key], Some(dst)),
         Instr::SetIndex { obj, key, val } => r(vec![obj, key, val], None),
@@ -711,23 +835,56 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         Instr::LenOf { dst, obj } => r(vec![obj], Some(dst)),
         Instr::UpvalGet { dst, .. } => r(vec![], Some(dst)),
         Instr::UpvalSet { src, .. } => r(vec![src], None),
-        Instr::MathOp { dst, arg_base, argc, .. }
-        | Instr::GlobalFn { dst, arg_base, argc, .. }
-        | Instr::StaticFn { dst, arg_base, argc, .. }
-        | Instr::NewArray { dst, arg_base, argc } => {
-            r((0..argc).map(|k| arg_base + k).collect(), Some(dst))
+        Instr::MathOp {
+            dst,
+            arg_base,
+            argc,
+            ..
         }
-        Instr::Call { dst, callee, arg_base, argc } => {
+        | Instr::GlobalFn {
+            dst,
+            arg_base,
+            argc,
+            ..
+        }
+        | Instr::StaticFn {
+            dst,
+            arg_base,
+            argc,
+            ..
+        }
+        | Instr::NewArray {
+            dst,
+            arg_base,
+            argc,
+        } => r((0..argc).map(|k| arg_base + k).collect(), Some(dst)),
+        Instr::Call {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        } => {
             let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
             v.push(callee);
             r(v, Some(dst))
         }
-        Instr::New { dst, callee, arg_base, argc } => {
+        Instr::New {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        } => {
             let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
             v.push(callee);
             r(v, Some(dst))
         }
-        Instr::CallMethod { dst, obj, arg_base, argc, .. } => {
+        Instr::CallMethod {
+            dst,
+            obj,
+            arg_base,
+            argc,
+            ..
+        } => {
             let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
             v.push(obj);
             r(v, Some(dst))

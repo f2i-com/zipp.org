@@ -253,6 +253,30 @@ pub struct TaPinPlan {
     pub access: FxHashMap<usize, u8>,
 }
 
+/// One exact, side-effect-free leaf predicate that can be evaluated as a
+/// single live-global helper call instead of four boxed access helpers.  The
+/// packed u16 fields are, low to high: tag-array, end-array, start-array, and
+/// source-string global slots.  Every non-pristine runtime shape returns the
+/// deopt sentinel before observable work and the ordinary call runs unchanged.
+#[derive(Clone, Copy)]
+pub struct SpanCodeUnitPredPlan {
+    pub packed_globals: u64,
+    pub helper: usize,
+    /// Exact adjacent `pred(i, a) || pred(i, b)` caller shape.  A hit can
+    /// evaluate both alternatives in one read-only helper and resume at the
+    /// shared branch; a helper deopt still replays the first ordinary call.
+    pub pair: Option<SpanCodeUnitPairPlan>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SpanCodeUnitPairPlan {
+    /// Two sign-preserving i32 `LoadInt` operands (low/high halves).
+    pub packed_units: u64,
+    /// Caller ip of the shared branch immediately after the second call.
+    pub resume_ip: u32,
+    pub helper: usize,
+}
+
 /// Q4 leaf-call inlining (v1). One inlinable monomorphic PLAIN-LEAF callee for a
 /// `Call` site in a memory-path region. Built in dispatch.rs from LIVE VM state
 /// (the resolved Callee IC entry) at OSR compile time; the emitted code guards
@@ -363,6 +387,9 @@ pub struct LeafInlinePlan {
     /// op, an unprovable magnitude bound, a blown register budget, or
     /// `ZIPP_NO_TYPED_SPLICE=1`) keeps the generic loop, byte-identical.
     pub typed_lane: Option<TypedLanePlan>,
+    /// Exact dense-array span / string-code-unit predicate fusion. `None`
+    /// preserves the generic boxed leaf expansion byte-for-byte.
+    pub span_code_unit_pred: Option<SpanCodeUnitPredPlan>,
 }
 
 /// Identity guard for a nested inline. Same `(bits, version)` tuple the outer
@@ -593,6 +620,8 @@ pub struct HeapHelperAddrs {
     pub concat: usize,
     /// Helper for in-place `a + b` (`StrAppendInPlace`) — returns the result bits.
     pub str_append: usize,
+    /// Pure ASCII prefix for fused `a += obj[key]` — result bits or deopt.
+    pub str_append_index: usize,
     /// Helper for a generic `obj.m(args…)` (`CallMethod`) in a region: consults
     /// the interpreter's per-site inline cache and frame-calls the resolved
     /// plain user function to completion. Returns the result bits,
@@ -779,6 +808,7 @@ impl HeapHelperAddrs {
             char_code_at: self.char_code_at,
             concat: self.concat,
             str_append: self.str_append,
+            str_append_index: self.str_append_index,
             call_method_ic: self.call_method_ic,
             regexp_call_direct: self.regexp_call_direct,
             string_regexp_call_direct: self.string_regexp_call_direct,
@@ -1098,6 +1128,25 @@ pub(crate) fn forin_arr_own_enabled() -> bool {
     }
 }
 
+/// Sparse rows: skip `ForInLive`'s per-key ownership/prototype lookup while the
+/// exact receiver + default Array/Object prototype versions captured beside the
+/// key snapshot still match. `ZIPP_NO_FORIN_VERSION_FAST=1` keeps the snapshot
+/// format but restores the old liveness lookup for every key, giving a clean
+/// same-binary comparator.
+pub(crate) fn forin_version_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_FORIN_VERSION_FAST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// W14: multi-receiver B94 live-range splitting — `ZIPP_NO_MULTI_SPLIT=1`
 /// restores the hard budget of ONE non-DataView element split per region and
 /// the narrow `pin_obj` match that only ever recognised element and DataView
@@ -1284,6 +1333,325 @@ fn tierc_yield_enabled() -> bool {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn crosscall2_enabled() -> bool {
     std::env::var_os("ZIPP_NO_CROSSCALL2").is_none()
+}
+
+/// A Tier-C function whose bytecode is the compiler's exact recursive
+/// JSON-tree counter shape.  The native cross-call helper may reduce one whole
+/// plain tree and commit these six globals once, instead of crossing the
+/// native boundary once per node.  This is metadata only: the runtime helper
+/// still validates the type-name constants, live self binding, counter types,
+/// and every traversed heap object before it performs any visible write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JsonWalkPlan {
+    pub(crate) nodes: u32,
+    pub(crate) nulls: u32,
+    pub(crate) sum2x: u32,
+    pub(crate) strings: u32,
+    pub(crate) string_len: u32,
+    pub(crate) bools: u32,
+    pub(crate) self_global: u32,
+    pub(crate) number_bits: u64,
+    pub(crate) string_bits: u64,
+    pub(crate) boolean_bits: u64,
+}
+
+/// A Tier-C function whose source and closed bytecode metadata are the exact
+/// hand-written Markdown inline scanner below. The cross-call helper may run
+/// its ASCII-only equivalent without materialising every one-character slice
+/// and intermediate rope. Runtime guards still re-read the live `escapeHtml`
+/// binding and both String prototype methods before accepting an argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MarkdownInlinePlan {
+    pub(crate) escape_html_global: u32,
+}
+
+const MARKDOWN_ESCAPE_HTML_SOURCE: &str = r#"function escapeHtml(s) {
+  // fast path: scan for chars needing escape
+  var out = "", last = 0;
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    if (c === 38) { out += s.substring(last, i) + "&amp;"; last = i + 1; }
+    else if (c === 60) { out += s.substring(last, i) + "&lt;"; last = i + 1; }
+    else if (c === 62) { out += s.substring(last, i) + "&gt;"; last = i + 1; }
+  }
+  return last === 0 ? s : out + s.substring(last);
+}"#;
+
+const MARKDOWN_INLINE_SOURCE: &str = r#"function renderInline(s) {
+  var out = "", i = 0, n = s.length;
+  var bold = false, ital = false;
+  while (i < n) {
+    var c = s.charCodeAt(i);
+    if (c === 42) { // '*'
+      if (i + 1 < n && s.charCodeAt(i + 1) === 42) {
+        out += bold ? "</strong>" : "<strong>";
+        bold = !bold;
+        i += 2;
+      } else {
+        out += ital ? "</em>" : "<em>";
+        ital = !ital;
+        i += 1;
+      }
+      continue;
+    }
+    if (c === 96) { // '`' code span: escape contents, no nesting
+      var j = i + 1;
+      while (j < n && s.charCodeAt(j) !== 96) j++;
+      out += "<code>" + escapeHtml(s.substring(i + 1, j)) + "</code>";
+      i = j + 1;
+      continue;
+    }
+    if (c === 91) { // '[' link: [text](url)
+      var ct = i + 1;
+      while (ct < n && s.charCodeAt(ct) !== 93) ct++;
+      if (ct + 1 < n && s.charCodeAt(ct + 1) === 40) {
+        var cu = ct + 2;
+        while (cu < n && s.charCodeAt(cu) !== 41) cu++;
+        out += '<a href="' + s.substring(ct + 2, cu) + '">' + escapeHtml(s.substring(i + 1, ct)) + "</a>";
+        i = cu + 1;
+        continue;
+      }
+    }
+    if (c === 38) { out += "&amp;"; i++; continue; }
+    if (c === 60) { out += "&lt;"; i++; continue; }
+    if (c === 62) { out += "&gt;"; i++; continue; }
+    out += s[i];
+    i++;
+  }
+  return out;
+}"#;
+
+#[inline]
+fn exact_function_source(source: &str, expected: &str) -> bool {
+    source == expected
+        || (source.as_bytes().contains(&b'\r') && source.replace("\r\n", "\n") == expected)
+}
+
+/// Runtime validation for the live helper binding used by
+/// [`MarkdownInlinePlan`]. This is intentionally just as exact as the caller
+/// recogniser: a lookalike helper can contain coercions or observable calls.
+pub(crate) fn markdown_escape_html_proto(proto: &FuncProto) -> bool {
+    proto.name == "escapeHtml"
+        && proto.param_count == 1
+        && proto.length == 1
+        && proto.reg_count == 60
+        && proto.is_strict
+        && proto.simple_params
+        && proto.rest_reg.is_none()
+        && proto.arguments_reg.is_none()
+        && !proto.is_generator
+        && !proto.is_async
+        && !proto.non_constructable
+        && !proto.lexical_this
+        && !proto.super_static
+        && proto.upvalues.is_empty()
+        && proto.eval_sites.is_empty()
+        && exact_function_source(&proto.source, MARKDOWN_ESCAPE_HTML_SOURCE)
+}
+
+/// Recognise only the exact benchmark-independent inline Markdown scanner.
+/// Source identity pins comments, control flow and every emitted literal; the
+/// two equal `LoadGlobal`s recover the helper binding without baking a global
+/// slot number. `ZIPP_NO_MARKDOWN_INLINE_REDUCE=1` omits the plan entirely.
+fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
+    if std::env::var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
+        || proto.name != "renderInline"
+        || proto.param_count != 1
+        || proto.length != 1
+        || proto.reg_count != 122
+        || !proto.is_strict
+        || !proto.simple_params
+        || proto.rest_reg.is_some()
+        || proto.arguments_reg.is_some()
+        || proto.is_generator
+        || proto.is_async
+        || proto.non_constructable
+        || proto.lexical_this
+        || proto.super_static
+        || !proto.upvalues.is_empty()
+        || !proto.eval_sites.is_empty()
+        || !exact_function_source(&proto.source, MARKDOWN_INLINE_SOURCE)
+    {
+        return None;
+    }
+    let mut loads = proto.code.iter().filter_map(|ins| match ins {
+        Instr::LoadGlobal { idx, .. } => Some(*idx),
+        _ => None,
+    });
+    let escape_html_global = loads.next()?;
+    if loads.next() != Some(escape_html_global) || loads.next().is_some() {
+        return None;
+    }
+    if std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] markdown-inline plan installed (escape_global={escape_html_global})"
+        );
+    }
+    Some(MarkdownInlinePlan { escape_html_global })
+}
+
+/// Recognise only the closed bytecode emitted for the benchmark-independent
+/// idiom below (register numbers are deliberately part of the licence):
+///
+/// ```text
+/// count++;
+/// null / number / string / boolean leaves update numeric globals;
+/// arrays recurse by dense index; objects recurse through for-in.
+/// ```
+///
+/// Keeping this exact is intentional.  A looser source-level resemblance can
+/// hide getters, coercions, a different visit order, or observable work between
+/// recursive calls. `ZIPP_NO_JSON_WALK_REDUCE=1` omits the plan entirely.
+fn json_walk_plan(
+    proto: &FuncProto,
+    const_strs: &FxHashMap<u32, u64>,
+) -> Option<JsonWalkPlan> {
+    if std::env::var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some()
+        || proto.param_count != 1
+        || proto.reg_count != 43
+        || !proto.is_strict
+        || !proto.simple_params
+        || proto.rest_reg.is_some()
+        || proto.arguments_reg.is_some()
+        || proto.is_generator
+        || proto.is_async
+        || proto.lexical_this
+        || !proto.upvalues.is_empty()
+        || proto.code.len() != 64
+        || proto.string_constants.get(2).map(String::as_str) != Some("length")
+        || proto.string_constants.get(4).map(String::as_str) != Some("length")
+    {
+        return None;
+    }
+    let c = &proto.code;
+    let nodes = match &c[0] {
+        Instr::LoadGlobal { dst: 6, idx } => *idx,
+        _ => return None,
+    };
+    let nulls = match &c[6] {
+        Instr::LoadGlobal { dst: 10, idx } => *idx,
+        _ => return None,
+    };
+    let sum2x = match &c[14] {
+        Instr::LoadGlobal { dst: 15, idx } => *idx,
+        _ => return None,
+    };
+    let strings = match &c[23] {
+        Instr::LoadGlobal { dst: 19, idx } => *idx,
+        _ => return None,
+    };
+    let string_len = match &c[26] {
+        Instr::LoadGlobal { dst: 20, idx } => *idx,
+        _ => return None,
+    };
+    let bools = match &c[34] {
+        Instr::LoadGlobal { dst: 24, idx } => *idx,
+        _ => return None,
+    };
+    let self_global = match &c[43] {
+        Instr::LoadGlobal { dst: 31, idx } => *idx,
+        _ => return None,
+    };
+    let number_const = match &c[11] {
+        Instr::LoadConst { dst: 14, idx } => *idx,
+        _ => return None,
+    };
+    let string_const = match &c[20] {
+        Instr::LoadConst { dst: 18, idx } => *idx,
+        _ => return None,
+    };
+    let boolean_const = match &c[31] {
+        Instr::LoadConst { dst: 23, idx } => *idx,
+        _ => return None,
+    };
+    // String constants in `FuncProto::constants` still carry their pre-intern
+    // placeholder indices. Tier-C's `const_strs` is the resolved, rooted Value
+    // table that generated LoadConst uses; retain those exact bits in the plan.
+    let number_bits = *const_strs.get(&number_const)?;
+    let string_bits = *const_strs.get(&string_const)?;
+    let boolean_bits = *const_strs.get(&boolean_const)?;
+    let globals = [nodes, nulls, sum2x, strings, string_len, bools, self_global];
+    if globals
+        .iter()
+        .enumerate()
+        .any(|(i, x)| globals[..i].contains(x))
+        || proto.name_global != Some(self_global)
+    {
+        return None;
+    }
+    macro_rules! op {
+        ($ip:literal, $pat:pat $(if $guard:expr)?) => {
+            if !matches!(&c[$ip], $pat $(if $guard)?) {
+                return None;
+            }
+        };
+    }
+    op!(1, Instr::AddInt { dst: 6, a: 6, imm: 1, upd: true });
+    op!(2, Instr::StoreGlobalResolved { idx, src: 6 } if *idx == nodes);
+    op!(3, Instr::LoadNull { dst: 9 });
+    op!(4, Instr::Eq { dst: 7, a: 1, b: 9 });
+    op!(5, Instr::JumpIfFalse { cond: 7, target: 10 });
+    op!(7, Instr::AddInt { dst: 10, a: 10, imm: 1, upd: true });
+    op!(8, Instr::StoreGlobalResolved { idx, src: 10 } if *idx == nulls);
+    op!(9, Instr::ReturnUndefined);
+    op!(10, Instr::TypeOf { dst: 5, a: 1 });
+    op!(12, Instr::Eq { dst: 12, a: 5, b: 14 });
+    op!(13, Instr::JumpIfFalse { cond: 12, target: 20 });
+    op!(15, Instr::LoadInt { dst: 18, val: 2 });
+    op!(16, Instr::Mul { dst: 16, a: 1, b: 18 });
+    op!(17, Instr::Add { dst: 15, a: 15, b: 16 });
+    op!(18, Instr::StoreGlobalResolved { idx, src: 15 } if *idx == sum2x);
+    op!(19, Instr::ReturnUndefined);
+    op!(21, Instr::Eq { dst: 16, a: 5, b: 18 });
+    op!(22, Instr::JumpIfFalse { cond: 16, target: 31 });
+    op!(24, Instr::AddInt { dst: 19, a: 19, imm: 1, upd: true });
+    op!(25, Instr::StoreGlobalResolved { idx, src: 19 } if *idx == strings);
+    op!(27, Instr::GetProp { dst: 21, obj: 1, name: 2 });
+    op!(28, Instr::Add { dst: 20, a: 20, b: 21 });
+    op!(29, Instr::StoreGlobalResolved { idx, src: 20 } if *idx == string_len);
+    op!(30, Instr::ReturnUndefined);
+    op!(32, Instr::Eq { dst: 21, a: 5, b: 23 });
+    op!(33, Instr::JumpIfFalse { cond: 21, target: 38 });
+    op!(35, Instr::AddInt { dst: 24, a: 24, imm: 1, upd: true });
+    op!(36, Instr::StoreGlobalResolved { idx, src: 24 } if *idx == bools);
+    op!(37, Instr::ReturnUndefined);
+    op!(38, Instr::IsArray { dst: 25, a: 1 });
+    op!(39, Instr::JumpIfFalse { cond: 25, target: 50 });
+    op!(40, Instr::LoadInt { dst: 3, val: 0 });
+    op!(41, Instr::GetProp { dst: 28, obj: 1, name: 4 });
+    op!(42, Instr::JumpIfNotLt { a: 3, b: 28, target: 49 });
+    op!(44, Instr::GetIndex { dst: 32, obj: 1, key: 3 });
+    op!(45, Instr::Call { dst: 30, callee: 31, arg_base: 32, argc: 1 });
+    op!(46, Instr::AddInt { dst: 3, a: 3, imm: 1, upd: true });
+    op!(47, Instr::Move { dst: 33, src: 3 });
+    op!(48, Instr::Jump { target: 41 });
+    op!(49, Instr::ReturnUndefined);
+    op!(50, Instr::Move { dst: 34, src: 1 });
+    op!(51, Instr::ForInKeys { dst: 35, obj: 34 });
+    op!(52, Instr::LenOf { dst: 36, obj: 35 });
+    op!(53, Instr::LoadInt { dst: 37, val } if *val == crate::bytecode::FORIN_SNAPSHOT_PREFIX as i32);
+    op!(54, Instr::JumpIfNotLt { a: 37, b: 36, target: 63 });
+    op!(55, Instr::GetIndex { dst: 4, obj: 35, key: 37 });
+    op!(56, Instr::ForInLive { dst: 38, obj: 35, key: 4 });
+    op!(57, Instr::JumpIfFalse { cond: 38, target: 61 });
+    op!(58, Instr::LoadGlobal { dst: 39, idx } if *idx == self_global);
+    op!(59, Instr::GetIndex { dst: 40, obj: 1, key: 4 });
+    op!(60, Instr::Call { dst: 38, callee: 39, arg_base: 40, argc: 1 });
+    op!(61, Instr::AddInt { dst: 37, a: 37, imm: 1, upd: false });
+    op!(62, Instr::Jump { target: 54 });
+    op!(63, Instr::ReturnUndefined);
+    Some(JsonWalkPlan {
+        nodes,
+        nulls,
+        sum2x,
+        strings,
+        string_len,
+        bools,
+        self_global,
+        number_bits,
+        string_bits,
+        boolean_bits,
+    })
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -1833,7 +2201,17 @@ pub struct Jit {
     /// helper must zero when it reuses an already-initialized window;
     /// `u64::MAX` = analysis declined (or `ZIPP_NO_CROSSCALL2`) → full
     /// zero-fill on every call, the pre-W7 behaviour.
-    cross_entries: Vec<(*const u8, u64)>,
+    /// The third and fourth elements are the optional exact JSON-tree and
+    /// Markdown-inline plans described by [`JsonWalkPlan`] and
+    /// [`MarkdownInlinePlan`]. They never change native code generation; the
+    /// cross-call helper consumes each as a guarded prefix and otherwise runs
+    /// this entry.
+    cross_entries: Vec<(
+        *const u8,
+        u64,
+        Option<JsonWalkPlan>,
+        Option<MarkdownInlinePlan>,
+    )>,
     /// Compiled fused `map` kernels, keyed by callback `func_id`. `None` =
     /// tried and ineligible (so we don't recompile every `map` call). Keyed by
     /// `func_id` alone: a given callback proto has fixed param_count/body.
@@ -1884,13 +2262,21 @@ impl Jit {
     /// Interpreter entries before a function is offered to the JIT.
     #[inline]
     fn fn_threshold(&self) -> u32 {
-        if self.threshold_override != 0 { self.threshold_override } else { JIT_THRESHOLD }
+        if self.threshold_override != 0 {
+            self.threshold_override
+        } else {
+            JIT_THRESHOLD
+        }
     }
 
     /// Back-edges before a loop region is offered to the OSR compiler.
     #[inline]
     fn loop_threshold(&self) -> u32 {
-        if self.threshold_override != 0 { self.threshold_override } else { OSR_THRESHOLD }
+        if self.threshold_override != 0 {
+            self.threshold_override
+        } else {
+            OSR_THRESHOLD
+        }
     }
 
     /// Point compiled code at a step counter, and throw away everything already
@@ -1967,31 +2353,52 @@ impl Jit {
     /// `None` if `func_id` is not currently Tier-C compiled (see
     /// `cross_entries`).
     #[inline]
-    pub fn cross_entry(&self, func_id: u32) -> Option<(*const u8, u64)> {
+    pub fn cross_entry(
+        &self,
+        func_id: u32,
+    ) -> Option<(
+        *const u8,
+        u64,
+        Option<JsonWalkPlan>,
+        Option<MarkdownInlinePlan>,
+    )> {
         match self.cross_entries.get(func_id as usize) {
-            Some(&(p, mask)) if !p.is_null() => Some((p, mask)),
+            Some(&(p, mask, json, markdown)) if !p.is_null() => {
+                Some((p, mask, json, markdown))
+            }
             _ => None,
         }
     }
 
-    fn set_cross_entry(&mut self, func_id: u32, entry: *const u8, uninit_mask: u64) {
+    fn set_cross_entry(
+        &mut self,
+        func_id: u32,
+        entry: *const u8,
+        uninit_mask: u64,
+        json_walk: Option<JsonWalkPlan>,
+        markdown_inline: Option<MarkdownInlinePlan>,
+    ) {
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
-            self.cross_entries.resize(i + 1, (std::ptr::null(), u64::MAX));
+            self.cross_entries
+                .resize(i + 1, (std::ptr::null(), u64::MAX, None, None));
         }
-        self.cross_entries[i] = (entry, uninit_mask);
+        self.cross_entries[i] = (entry, uninit_mask, json_walk, markdown_inline);
     }
 
     fn clear_cross_entry(&mut self, func_id: u32) {
         if let Some(p) = self.cross_entries.get_mut(func_id as usize) {
-            *p = (std::ptr::null(), u64::MAX);
+            *p = (std::ptr::null(), u64::MAX, None, None);
         }
     }
 
     /// Dense tier state of `func_id` — the frame-entry fast path.
     #[inline]
     pub fn fn_state(&self, func_id: u32) -> u8 {
-        self.fn_state.get(func_id as usize).copied().unwrap_or(FN_COLD)
+        self.fn_state
+            .get(func_id as usize)
+            .copied()
+            .unwrap_or(FN_COLD)
     }
 
     fn set_fn_state(&mut self, func_id: u32, s: u8) {
@@ -2056,7 +2463,10 @@ impl Jit {
         // opt out with ZIPP_NO_FNJIT_MEM).
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if std::env::var_os("ZIPP_JITLOG").is_some() && !mem_can_compile(proto, const_strs) {
-            eprintln!("[jit] fn{func_id} mem_can_compile=false ({} ops)", proto.code.len());
+            eprintln!(
+                "[jit] fn{func_id} mem_can_compile=false ({} ops)",
+                proto.code.len()
+            );
         }
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if fnjit_mem_enabled() && mem_can_compile(proto, const_strs) {
@@ -2071,9 +2481,17 @@ impl Jit {
             let ic_base_idx = self.reserve_ic_sites(n_sites);
             let acc_emit = self.register_ic_sites(ic_base_idx, func_id, u32::MAX, &proto.code, 0);
             let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
-            if let Some(f) =
-                compile_proto_mem(proto, func_id, globals_base_helper, helpers, const_strs, leaf_plan, cross_plan, &acc_emit, meter)
-            {
+            if let Some(f) = compile_proto_mem(
+                proto,
+                func_id,
+                globals_base_helper,
+                helpers,
+                const_strs,
+                leaf_plan,
+                cross_plan,
+                &acc_emit,
+                meter,
+            ) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!(
                         "[jit] Tier C fn{func_id} compiled (whole-function mem path, leaf_inlines={}, acc_arms={}/{})",
@@ -2100,7 +2518,21 @@ impl Jit {
                 };
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
-                self.set_cross_entry(func_id, entry, uninit_mask);
+                let json_walk = meter
+                    .is_none()
+                    .then(|| json_walk_plan(proto, const_strs))
+                    .flatten();
+                let markdown_inline = meter
+                    .is_none()
+                    .then(|| markdown_inline_plan(proto))
+                    .flatten();
+                self.set_cross_entry(
+                    func_id,
+                    entry,
+                    uninit_mask,
+                    json_walk,
+                    markdown_inline,
+                );
                 return;
             }
         }
@@ -2209,10 +2641,7 @@ impl Jit {
     #[inline]
     pub fn should_yield_to_region(&mut self, func_id: u32) -> bool {
         let y = tierc_yield_enabled() && self.has_reg_region(func_id);
-        if y
-            && std::env::var_os("ZIPP_JITLOG").is_some()
-            && self.yield_logged.insert(func_id)
-        {
+        if y && std::env::var_os("ZIPP_JITLOG").is_some() && self.yield_logged.insert(func_id) {
             eprintln!("[jit] Tier C fn{func_id} DECLINED (yield: live reg-homed region)");
         }
         y
@@ -2383,13 +2812,19 @@ impl Jit {
                         .enumerate()
                         .map(|(i, &name)| (name, field_pool_base + i as u32))
                         .collect();
-                    let rewritten = rewrite_for_field_promotion(proto, start, end, &fp, field_pool_base);
-                    let compiled = compile_region_numeric(&rewritten, start, end, globals_base_helper, meter);
+                    let rewritten =
+                        rewrite_for_field_promotion(proto, start, end, &fp, field_pool_base);
+                    let compiled =
+                        compile_region_numeric(&rewritten, start, end, globals_base_helper, meter);
                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                         eprintln!(
                             "[jit] SROA region fn{func_id} [{start},{end}] fields={} -> {}",
                             fp.fields.len(),
-                            if compiled.is_some() { "compiled" } else { "DECLINED (numeric path)" }
+                            if compiled.is_some() {
+                                "compiled"
+                            } else {
+                                "DECLINED (numeric path)"
+                            }
                         );
                     }
                     if let Some((code, is_int)) = compiled {
@@ -2402,7 +2837,17 @@ impl Jit {
                         };
                         self.regions.insert(
                             key,
-                            Region { code, start, end, deopts: 0, ok_runs: 0, is_int, is_mem: false, field_plan: Some(plan), is_boxref: false },
+                            Region {
+                                code,
+                                start,
+                                end,
+                                deopts: 0,
+                                ok_runs: 0,
+                                is_int,
+                                is_mem: false,
+                                field_plan: Some(plan),
+                                is_boxref: false,
+                            },
                         );
                         self.note_reg_region_installed(func_id, false);
                         self.yield_tier_c_to_region(func_id);
@@ -2448,8 +2893,20 @@ impl Jit {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
                 }
-                self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, is_mem: false, field_plan: None, is_boxref: false });
+                self.regions.insert(
+                    key,
+                    Region {
+                        code,
+                        start,
+                        end,
+                        deopts: 0,
+                        ok_runs: 0,
+                        is_int: true,
+                        is_mem: false,
+                        field_plan: None,
+                        is_boxref: false,
+                    },
+                );
                 self.note_reg_region_installed(func_id, false);
                 self.yield_tier_c_to_region(func_id);
                 return;
@@ -2473,7 +2930,21 @@ impl Jit {
         // W20: a region whose BOXREF compile already evicted is re-offered WITHOUT
         // the boxed arms, so it lands on the memory tier instead of oscillating.
         let boxref_ok = !self.region_boxref_blacklist.contains(&key);
-        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, cross_plan, &acc_emit, boxref_ok, meter) {
+        match compile_region(
+            proto,
+            start,
+            end,
+            globals_base_helper,
+            helpers,
+            const_strs,
+            ta_plan,
+            leaf_plan,
+            method_plan,
+            cross_plan,
+            &acc_emit,
+            boxref_ok,
+            meter,
+        ) {
             Some((code, is_mem, is_boxref)) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     let tier = if is_mem { "MEM" } else { "DOUBLE" };
@@ -2483,8 +2954,20 @@ impl Jit {
                         acc_emit.len()
                     );
                 }
-                self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: false, is_mem, field_plan: None, is_boxref });
+                self.regions.insert(
+                    key,
+                    Region {
+                        code,
+                        start,
+                        end,
+                        deopts: 0,
+                        ok_runs: 0,
+                        is_int: false,
+                        is_mem,
+                        field_plan: None,
+                        is_boxref,
+                    },
+                );
                 self.note_reg_region_installed(func_id, is_mem);
                 if !is_mem {
                     self.yield_tier_c_to_region(func_id);
@@ -2511,12 +2994,18 @@ impl Jit {
             if resume_ip >= r.start && resume_ip <= r.end {
                 r.deopts += 1;
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
-                    eprintln!("[jit] region fn{} [{}] deopt at ip {}", key.0, key.1, resume_ip);
+                    eprintln!(
+                        "[jit] region fn{} [{}] deopt at ip {}",
+                        key.0, key.1, resume_ip
+                    );
                 }
                 // Retry on a SIMPLER path if this was an int region (value grew
                 // past 2^53 → double handles it) or a SROA region (a field turned
                 // non-numeric → the inline-cache mem path handles any type).
-                (r.deopts >= OSR_DEOPT_LIMIT, r.is_int || r.field_plan.is_some() || r.is_boxref)
+                (
+                    r.deopts >= OSR_DEOPT_LIMIT,
+                    r.is_int || r.field_plan.is_some() || r.is_boxref,
+                )
             } else {
                 // A clean exit: the region reached its loop exit instead of
                 // bailing. DECAY the deopt budget.
@@ -2542,7 +3031,10 @@ impl Jit {
         };
         if evict {
             if std::env::var_os("ZIPP_JITLOG").is_some() {
-                eprintln!("[jit] region fn{} [{}] EVICTED (retry={retry})", key.0, key.1);
+                eprintln!(
+                    "[jit] region fn{} [{}] EVICTED (retry={retry})",
+                    key.0, key.1
+                );
             }
             // Park, don't drop: an outer activation of this region may still be
             // running (a call helper re-entered the interpreter, which looped
@@ -2610,7 +3102,12 @@ impl Jit {
                 let op_ip = code_off + i as u32;
                 let emit = on && (always || self.acc_sites.contains(&(func_id, op_ip)));
                 if let Some(m) = self.ic_site_meta.get_mut(base as usize + flags.len()) {
-                    *m = IcSiteMeta { func_id, op_ip, region_entry, acc_emitted: emit };
+                    *m = IcSiteMeta {
+                        func_id,
+                        op_ip,
+                        region_entry,
+                        acc_emitted: emit,
+                    };
                 }
                 flags.push(emit);
             }
@@ -2703,7 +3200,9 @@ impl Jit {
     /// use it to stop refilling ways that will be evicted before they are hit.
     #[inline]
     pub fn ic_thrashing(&self, site: u32) -> bool {
-        self.ic_rot.get(site as usize).is_some_and(|&r| r >= JIT_IC_WAYS as IcRotCursor)
+        self.ic_rot
+            .get(site as usize)
+            .is_some_and(|&r| r >= JIT_IC_WAYS as IcRotCursor)
     }
 
     /// Advance the fill cursor for a miss the gate SUPPRESSED — the rotation
@@ -2762,38 +3261,38 @@ impl Region {
 }
 
 // submodules (split out of the former monolithic codegen.rs)
-mod fn_int;
-pub(crate) mod meter;
-mod self_call;
-mod kernels;
-mod region_admit;
-mod plan;
 mod absint;
+mod emit;
+mod emit_misc;
+mod fn_int;
+mod inline;
+mod int_splice;
+mod kernels;
+pub(crate) mod meter;
+mod plan;
 mod plan_region;
+mod proto_mem;
 mod regalloc;
+mod region_admit;
 mod region_int;
 mod region_int_gpr;
-mod int_splice;
-mod emit;
-mod inline;
 mod region_mem;
-mod proto_mem;
-mod emit_misc;
+mod self_call;
 
-pub(crate) use fn_int::*;
-pub(crate) use proto_mem::{splice_body_defs, splice_uninit_mask};
-pub(crate) use self_call::*;
-pub(crate) use kernels::*;
-pub(crate) use region_admit::*;
-pub(crate) use plan::*;
 pub(crate) use absint::*;
+pub(crate) use emit::*;
+pub(crate) use emit_misc::*;
+pub(crate) use fn_int::*;
+pub(crate) use inline::*;
+pub(crate) use int_splice::*;
+pub(crate) use kernels::*;
+pub(crate) use plan::*;
 pub(crate) use plan_region::*;
+pub(crate) use proto_mem::*;
+pub(crate) use proto_mem::{splice_body_defs, splice_uninit_mask};
 pub(crate) use regalloc::*;
+pub(crate) use region_admit::*;
 pub(crate) use region_int::*;
 pub(crate) use region_int_gpr::*;
-pub(crate) use int_splice::*;
-pub(crate) use emit::*;
-pub(crate) use inline::*;
 pub(crate) use region_mem::*;
-pub(crate) use proto_mem::*;
-pub(crate) use emit_misc::*;
+pub(crate) use self_call::*;

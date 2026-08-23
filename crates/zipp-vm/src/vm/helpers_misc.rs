@@ -3,10 +3,9 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-
 
 /// High bit of a heap index marks a "string constant pending interning" slot
 /// in a `LoadConst` Value (see `resolve_const`). Real heap indices never set
@@ -426,8 +425,12 @@ pub(crate) extern "win64" fn jit_str_substring(
     let (mut x, mut y) = (ax, bx.unwrap_or(len));
     if mode & 1 != 0 {
         // slice: negative counts from the end, then clamp; empty if start >= end.
-        if x < 0 { x += len; }
-        if y < 0 { y += len; }
+        if x < 0 {
+            x += len;
+        }
+        if y < 0 {
+            y += len;
+        }
         x = x.clamp(0, len);
         y = y.clamp(0, len);
         if x >= y {
@@ -441,7 +444,8 @@ pub(crate) extern "win64" fn jit_str_substring(
             core::mem::swap(&mut x, &mut y);
         }
     }
-    vm.ascii_slice_value(r.heap_index(), x as usize..y as usize).bits()
+    vm.ascii_slice_value(r.heap_index(), x as usize..y as usize)
+        .bits()
 }
 
 /// Win64 helper for the 1-argument Map/Set lookups — `m.get(k)`, `m.has(k)`,
@@ -533,11 +537,8 @@ pub(crate) extern "win64" fn jit_strict_eq(
     b_bits: u64,
 ) -> u64 {
     let vm = unsafe { &*(vm as *const Vm) };
-    crate::vm::collections::strict_eq(
-        &vm.heap,
-        Value::from_bits(a_bits),
-        Value::from_bits(b_bits),
-    ) as u64
+    crate::vm::collections::strict_eq(&vm.heap, Value::from_bits(a_bits), Value::from_bits(b_bits))
+        as u64
 }
 
 /// Win64 helper: full JS truthiness for a region `Not` / `JumpIfFalse/True`
@@ -678,6 +679,55 @@ pub(crate) extern "win64" fn jit_set_prop_acc(
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_sparse_get_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JIT_SPARSE_GET").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Read one absent Array index through the exact default intrinsic chain.
+/// `None` means the shape can run user code or has a custom chain and the JIT
+/// must replay in the interpreter; `Some(undefined)` is a proven chain miss.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn jit_default_array_proto_index(vm: &Vm<'_>, i: usize) -> Option<Value> {
+    if vm.arr_proto == 0
+        || vm.obj_proto == 0
+        || vm.proto_of.contains_key(&vm.arr_proto)
+        || vm.proto_of.contains_key(&vm.obj_proto)
+    {
+        return None;
+    }
+    for proto in [vm.arr_proto, vm.obj_proto] {
+        let HeapObj::Object(m) = vm.heap.get(proto) else {
+            return None;
+        };
+        // Built-in prototype anchors are ordinary, classless objects. Keep the
+        // guard explicit so this helper never silently skips an engine-extended
+        // class lookup if their representation changes later.
+        if m.class.is_some() {
+            return None;
+        }
+        if let Some(p) = m.element_pos(i) {
+            if m.attrs[p].accessor {
+                return None; // invoking the getter is observable user code
+            }
+            return Some(m.vals[p]);
+        }
+    }
+    Some(Value::UNDEFINED)
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_get_index(
     vm: *mut core::ffi::c_void,
     arr_bits: u64,
@@ -737,18 +787,17 @@ pub(crate) extern "win64" fn jit_get_index(
     // a fractional/huge numeric key or a BigInt element kind → interpreter.
     if matches!(vm.heap.get(arr.heap_index()), HeapObj::TypedArray { .. }) {
         return match array_index(key) {
-            Some(i) => ta_fast_get_bits(vm, arr.heap_index(), i)
-                .unwrap_or(crate::codegen::SELF_CALL_DEOPT),
+            Some(i) => {
+                ta_fast_get_bits(vm, arr.heap_index(), i).unwrap_or(crate::codegen::SELF_CALL_DEOPT)
+            }
             None => crate::codegen::SELF_CALL_DEOPT,
         };
     }
-    // An array whose side table can shadow an ELEMENT — a defineProperty'd index
-    // whose value or accessor lives in arr_props, a sparse overlay, or an
-    // integrity level — deopts so the interpreter's override-aware get_index runs
-    // (keeps JIT/interpreter parity). Named properties that cannot name an element
-    // do NOT disqualify it: a RegExp match result carries `index`/`input`/`groups`
-    // and used to deopt every single `m[i]` because of them.
-    if arr.is_heap() && vm.array_elements_overlaid(arr.heap_index()) {
+    let sparse_get = jit_sparse_get_enabled();
+    // Off is the exact pre-W25 receiver-level refusal. On, the Array arm below
+    // probes the one authoritative override slot and can keep a sparse-data
+    // read inside the compiled region; accessors still deopt before invocation.
+    if !sparse_get && vm.array_elements_overlaid(arr.heap_index()) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     match vm.heap.get(arr.heap_index()) {
@@ -786,34 +835,46 @@ pub(crate) extern "win64" fn jit_get_index(
             // the reference this helper is validated against, and a JIT that
             // answers `undefined` where the interpreter walks the chain is exactly
             // the wrong-answer class the tier-differential fuzzer exists to catch.
-            Some(i) if i < items.len() => {
-                if items[i].is_hole() {
-                    if crate::codegen::hole_undef_enabled()
-                        && !vm.array_proto_has_index
-                        && !vm.proto_of.contains_key(&arr.heap_index())
-                    {
+            Some(i) => {
+                // Mapped arguments are represented as Arrays but a live index
+                // aliases a formal register, not necessarily either backing
+                // store. They are never eligible for this read-only shortcut.
+                if sparse_get && vm.arguments_objs.contains_key(&arr.heap_index()) {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                if sparse_get {
+                    if let Some((attr, raw)) = vm.array_index_override(arr.heap_index(), i) {
+                        return if attr.accessor {
+                            crate::codegen::SELF_CALL_DEOPT
+                        } else {
+                            raw.bits()
+                        };
+                    }
+                }
+                if i < items.len() && !items[i].is_hole() {
+                    return items[i].bits();
+                }
+                // An absent own index with a custom receiver prototype may hit a
+                // Proxy/getter and is interpreter-only. Under the still-valid
+                // protector retain the historical hole-undef gate exactly.
+                if vm.proto_of.contains_key(&arr.heap_index()) {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                if !vm.array_proto_has_index {
+                    return if crate::codegen::hole_undef_enabled() {
                         Value::UNDEFINED.bits()
                     } else {
                         crate::codegen::SELF_CALL_DEOPT
-                    }
-                } else {
-                    items[i].bits()
+                    };
                 }
-            }
-            // Out of range / negative / non-integral. `undefined` is only right
-            // when nothing up the chain can supply that index — this returned it
-            // unconditionally, so with `Array.prototype[5] = "P"` a JIT'd `a[5]`
-            // read `undefined` while the interpreter and node both read `"P"`.
-            // Same guard the `i in a` inline uses: the protector flag (set the
-            // moment an integer-like key is defined on Array/Object.prototype)
-            // plus "no setPrototypeOf'd custom prototype".
-            _ => {
-                if vm.array_proto_has_index || vm.proto_of.contains_key(&arr.heap_index()) {
-                    crate::codegen::SELF_CALL_DEOPT
-                } else {
-                    Value::UNDEFINED.bits()
+                if sparse_get {
+                    return jit_default_array_proto_index(vm, i)
+                        .map_or(crate::codegen::SELF_CALL_DEOPT, Value::bits);
                 }
+                crate::codegen::SELF_CALL_DEOPT
             }
+            // Negative / non-integral keys retain the interpreter path.
+            None => crate::codegen::SELF_CALL_DEOPT,
         },
         // Flat ASCII string `s[i]`: mirror the interpreter's get_index Str path
         // EXACTLY (the ASCII branch). The i-th unit is the i-th byte, and a
@@ -864,7 +925,11 @@ pub(crate) extern "win64" fn jit_set_index(
     // through this helper — growth/holes/length exotica), and pinned
     // TypedArray inline stores are numbers only, so this call IS the barrier
     // for JIT'd `a[i] = v`.
-    vm.store_barrier(crate::heap::gcoracle::JIT_SET_INDEX, arr.heap_index(), Value::from_bits(val_bits));
+    vm.store_barrier(
+        crate::heap::gcoracle::JIT_SET_INDEX,
+        arr.heap_index(),
+        Value::from_bits(val_bits),
+    );
     // ── plain-object computed write: `o[k] = v` overwriting an EXISTING own
     // writable data slot ────────────────────────────────────────────────────
     // Deliberately narrower than the read arm. Only an in-place value store on a
@@ -885,8 +950,7 @@ pub(crate) extern "win64" fn jit_set_index(
             && !vm.arr_props.contains_key(&oidx)
         {
             let mut writable_slot = None;
-            if let Some(std::borrow::Cow::Borrowed(bytes)) =
-                vm.heap.str_wtf8_cow(key.heap_index())
+            if let Some(std::borrow::Cow::Borrowed(bytes)) = vm.heap.str_wtf8_cow(key.heap_index())
             {
                 if let Ok(k) = std::str::from_utf8(bytes) {
                     if let HeapObj::Object(m) = vm.heap.get(oidx) {
@@ -978,7 +1042,12 @@ pub(crate) extern "win64" fn jit_set_index(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn ta_fast_get_bits(vm: &Vm, ta_idx: u32, i: usize) -> Option<u64> {
     let (buffer, kind, byte_offset) = match vm.heap.get(ta_idx) {
-        HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+        HeapObj::TypedArray {
+            buffer,
+            kind,
+            byte_offset,
+            ..
+        } => (*buffer, *kind, *byte_offset),
         _ => return None,
     };
     if kind >= 9 {
@@ -1021,13 +1090,22 @@ fn ta_fast_get_bits(vm: &Vm, ta_idx: u32, i: usize) -> Option<u64> {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn ta_fast_set(vm: &mut Vm, ta_idx: u32, i: usize, val: Value) -> u64 {
     let (buffer, kind, byte_offset) = match vm.heap.get(ta_idx) {
-        HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+        HeapObj::TypedArray {
+            buffer,
+            kind,
+            byte_offset,
+            ..
+        } => (*buffer, *kind, *byte_offset),
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
     if kind >= 9 || !val.is_number() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let f = if val.is_int() { val.as_int() as f64 } else { val.as_f64() };
+    let f = if val.is_int() {
+        val.as_int() as f64
+    } else {
+        val.as_f64()
+    };
     if i >= vm.ta_effective_len(ta_idx).unwrap_or(0) {
         return 0; // silent OOB no-op (matches ta_element_set after coercion)
     }
@@ -1047,16 +1125,25 @@ fn ta_fast_set(vm: &mut Vm, ta_idx: u32, i: usize, val: Value) -> u64 {
 /// A pinned-TypedArray region snapshot: receiver identity bits, raw element
 /// base pointer (buffer data + byteOffset) and element count. `repr(C)` with
 /// the fixed layout the region's stack slot uses (`obj_bits @0, base @8,
-/// len @16`).
+/// len @16, flags @24`).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[repr(C)]
 pub struct TaSnap {
     pub obj_bits: u64,
     pub base: u64,
     pub len: u64,
+    /// Bit 0: the bytes live in this VM's non-shared `AbData::Local` store.
+    ///
+    /// Every JIT pin slot was already 32 bytes, so publishing this fourth
+    /// qword changes no frame layout. The nested-DataView reduction uses it to
+    /// reject SharedArrayBuffer: another agent may mutate shared bytes while a
+    /// collapsed loop would otherwise assume that one measured pass repeats.
+    pub flags: u64,
 }
 
-/// Win64 helper: (re)derive a pinned TypedArray's `{obj_bits, base, len}` into
+pub(crate) const TA_SNAP_LOCAL: u64 = 1;
+
+/// Win64 helper: (re)derive a pinned TypedArray's `{obj_bits, base, len, flags}` into
 /// a region stack slot. Validates: heap TypedArray of the EXPECTED kind, buffer
 /// attached and the view in bounds (`ta_effective_len`); ineligible → all-zero
 /// (the region's per-access identity guard then never matches and the access
@@ -1068,7 +1155,7 @@ pub struct TaSnap {
 /// Runs no user code and never allocates.
 ///
 /// # Safety
-/// `vm` is a valid `*mut Vm`; `out` points to a writable 24-byte slot.
+/// `vm` is a valid `*mut Vm`; `out` points to a writable 32-byte slot.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_ta_snapshot(
     vm: *mut core::ffi::c_void,
@@ -1100,6 +1187,7 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
                         obj_bits: ta_bits,
                         base: bytes.as_ptr() as u64,
                         len: js.units() as u64,
+                        flags: TA_SNAP_LOCAL,
                     })
                 }
                 _ => None,
@@ -1123,6 +1211,7 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
                     obj_bits: ta_bits,
                     base: items.as_ptr() as u64,
                     len: items.len() as u64,
+                    flags: TA_SNAP_LOCAL,
                 }),
                 _ => None,
             };
@@ -1132,18 +1221,20 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             // view must be attached and (on a shrunk resizable buffer) still
             // in bounds — mirroring dataview_method's IsViewOutOfBounds.
             let (buffer, byte_offset, byte_length) = match vm.heap.get(idx) {
-                HeapObj::DataView { buffer, byte_offset, byte_length } => {
-                    (*buffer, *byte_offset, *byte_length)
-                }
+                HeapObj::DataView {
+                    buffer,
+                    byte_offset,
+                    byte_length,
+                } => (*buffer, *byte_offset, *byte_length),
                 _ => return None,
             };
-            let base = match vm.heap.get_mut(buffer) {
+            let (base, flags) = match vm.heap.get_mut(buffer) {
                 HeapObj::ArrayBuffer { data, detached }
                     if !*detached && byte_offset + byte_length <= data.len() =>
                 {
                     match data {
-                        crate::heap::AbData::Local(v) => v.as_mut_ptr(),
-                        crate::heap::AbData::Shared(m) => m.base_ptr(),
+                        crate::heap::AbData::Local(v) => (v.as_mut_ptr(), TA_SNAP_LOCAL),
+                        crate::heap::AbData::Shared(m) => (m.base_ptr(), 0),
                     }
                 }
                 _ => return None,
@@ -1152,22 +1243,26 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
                 obj_bits: ta_bits,
                 base: unsafe { base.add(byte_offset) } as u64,
                 len: byte_length as u64,
+                flags,
             });
         }
         let (buffer, k, byte_offset) = match vm.heap.get(idx) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => {
-                (*buffer, *kind, *byte_offset)
-            }
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
             _ => return None,
         };
         if k as u32 != kind || k >= 9 {
             return None;
         }
         let len = vm.ta_effective_len(idx)?;
-        let base = match vm.heap.get_mut(buffer) {
+        let (base, flags) = match vm.heap.get_mut(buffer) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => match data {
-                crate::heap::AbData::Local(v) => v.as_mut_ptr(),
-                crate::heap::AbData::Shared(m) => m.base_ptr(),
+                crate::heap::AbData::Local(v) => (v.as_mut_ptr(), TA_SNAP_LOCAL),
+                crate::heap::AbData::Shared(m) => (m.base_ptr(), 0),
             },
             _ => return None,
         };
@@ -1178,9 +1273,15 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             obj_bits: ta_bits,
             base: unsafe { base.add(byte_offset) } as u64,
             len: len as u64,
+            flags,
         })
     })()
-    .unwrap_or(TaSnap { obj_bits: 0, base: 0, len: 0 });
+    .unwrap_or(TaSnap {
+        obj_bits: 0,
+        base: 0,
+        len: 0,
+        flags: 0,
+    });
     // SAFETY: caller passes a valid slot pointer.
     unsafe { core::ptr::write(out, snap) };
 }
@@ -1225,9 +1326,11 @@ pub(crate) extern "win64" fn jit_dv_get(
     // SAFETY: read-only view; the running region holds no conflicting borrow.
     let vm = unsafe { &*(vm as *const Vm) };
     let (buffer, byte_offset, byte_length) = match vm.heap.get(dv.heap_index()) {
-        HeapObj::DataView { buffer, byte_offset, byte_length } => {
-            (*buffer, *byte_offset, *byte_length)
-        }
+        HeapObj::DataView {
+            buffer,
+            byte_offset,
+            byte_length,
+        } => (*buffer, *byte_offset, *byte_length),
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
     let pos = match array_index(posv) {
@@ -1319,7 +1422,8 @@ pub(crate) extern "win64" fn jit_array_push(
     // Nursery barrier: `arr.push(youngObj)` on a retained array is B119's
     // dominant old→young idiom — the dedicated push lane must barrier like
     // the `jit_set_index` lane does.
-    vm.heap.write_barrier_val(arr.heap_index(), Value::from_bits(val_bits));
+    vm.heap
+        .write_barrier_val(arr.heap_index(), Value::from_bits(val_bits));
     match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
             items.push(Value::from_bits(val_bits));
@@ -1351,10 +1455,7 @@ pub(crate) extern "win64" fn jit_array_push(
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_array_push_gate(
-    vm: *mut core::ffi::c_void,
-    arr_bits: u64,
-) -> u64 {
+pub(crate) extern "win64" fn jit_array_push_gate(vm: *mut core::ffi::c_void, arr_bits: u64) -> u64 {
     let arr = Value::from_bits(arr_bits);
     if !arr.is_heap() {
         return 0;
@@ -1445,6 +1546,7 @@ pub(crate) extern "win64" fn jit_array_push_pinned(
                 obj_bits: arr_bits,
                 base: items.as_ptr() as u64,
                 len: items.len() as u64,
+                flags: TA_SNAP_LOCAL,
             };
             let n = items.len();
             // SAFETY: caller passes its own pin slot, 32 bytes, writable.
@@ -1488,6 +1590,186 @@ pub(crate) extern "win64" fn jit_char_code_at(
         },
         _ => crate::codegen::SELF_CALL_DEOPT, // rope/non-string → interpreter
     }
+}
+
+/// Evaluate the exact pure leaf shape
+///
+/// `tags[i] === 4 && ends[i] - starts[i] === 1 &&
+///  source.charCodeAt(starts[i]) === ch`
+///
+/// in one read-only Win64 crossing. `packed_globals` carries four u16 global
+/// slots (tags, ends, starts, source). The planner only emits this helper for an
+/// instruction-for-instruction body match and directly-routable globals.
+/// Runtime eligibility remains deliberately narrower than JavaScript: present
+/// Int elements in ordinary non-overlaid dense Arrays and a flat String. Any
+/// receiver/key/value shape that could consult a prototype, accessor, proxy,
+/// coercion, or rope returns `SELF_CALL_DEOPT`; the leaf call then runs through
+/// its unchanged helper and observes the full program exactly once.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_span_code_unit_pred(
+    vm: *mut core::ffi::c_void,
+    packed_globals: u64,
+    i_bits: u64,
+    ch_bits: u64,
+) -> u64 {
+    #[inline]
+    fn dense_present(vm: &Vm<'_>, arr: Value, i: usize) -> Option<Value> {
+        if !arr.is_heap() {
+            return None;
+        }
+        let idx = arr.heap_index();
+        if vm.arguments_objs.contains_key(&idx) || vm.array_elements_overlaid(idx) {
+            return None;
+        }
+        match vm.heap.get(idx) {
+            HeapObj::Array(items) if i < items.len() && !items[i].is_hole() => Some(items[i]),
+            _ => None,
+        }
+    }
+
+    let i = Value::from_bits(i_bits);
+    let ch = Value::from_bits(ch_bits);
+    if !i.is_int() || i.as_int() < 0 || !ch.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let i = i.as_int() as usize;
+    // SAFETY: read-only view; the emitted leaf body holds no conflicting heap
+    // borrow and this helper neither allocates nor invokes user code.
+    let vm = unsafe { &*(vm as *const Vm) };
+    let global = |shift: u32| -> Option<Value> {
+        let g = ((packed_globals >> shift) & 0xffff) as usize;
+        vm.globals.get(g).copied()
+    };
+
+    let Some(tags) = global(0) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    let Some(kind) = dense_present(vm, tags, i) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    if !kind.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if kind.as_int() != 4 {
+        return Value::bool(false).bits();
+    }
+
+    let (Some(ends), Some(starts)) = (global(16), global(32)) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    let (Some(end), Some(start)) = (
+        dense_present(vm, ends, i),
+        dense_present(vm, starts, i),
+    ) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    if !end.is_int() || !start.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if end.as_int() as i64 - start.as_int() as i64 != 1 {
+        return Value::bool(false).bits();
+    }
+
+    let Some(source) = global(48) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    if !source.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let unit = match vm.heap.get(source.heap_index()) {
+        HeapObj::Str(s) => s.unit_at(start.as_int() as usize),
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    Value::bool(unit.is_some_and(|u| u as i32 == ch.as_int())).bits()
+}
+
+/// Adjacent-OR sibling of `jit_span_code_unit_pred`.  `packed_units` carries
+/// the two sign-preserving i32 literals from the caller's `LoadInt` ops.  The
+/// planner proves the exact `pred(i, a) || pred(i, b)` control shape, so one
+/// traversal of the pristine span arrays is sufficient.  As with the singleton
+/// helper, every shape that could expose JavaScript behaviour deopts before an
+/// observable action and replays the first ordinary call.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_span_code_unit_pair(
+    vm: *mut core::ffi::c_void,
+    packed_globals: u64,
+    i_bits: u64,
+    packed_units: u64,
+) -> u64 {
+    #[inline]
+    fn dense_present(vm: &Vm<'_>, arr: Value, i: usize) -> Option<Value> {
+        if !arr.is_heap() {
+            return None;
+        }
+        let idx = arr.heap_index();
+        if vm.arguments_objs.contains_key(&idx) || vm.array_elements_overlaid(idx) {
+            return None;
+        }
+        match vm.heap.get(idx) {
+            HeapObj::Array(items) if i < items.len() && !items[i].is_hole() => Some(items[i]),
+            _ => None,
+        }
+    }
+
+    let i = Value::from_bits(i_bits);
+    if !i.is_int() || i.as_int() < 0 {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let i = i.as_int() as usize;
+    // SAFETY: read-only view; the helper neither allocates nor invokes user
+    // code, and emitted code holds no conflicting heap borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    let global = |shift: u32| -> Option<Value> {
+        let g = ((packed_globals >> shift) & 0xffff) as usize;
+        vm.globals.get(g).copied()
+    };
+
+    let Some(tags) = global(0) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    let Some(kind) = dense_present(vm, tags, i) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    if !kind.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if kind.as_int() != 4 {
+        return Value::bool(false).bits();
+    }
+
+    let (Some(ends), Some(starts)) = (global(16), global(32)) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    let (Some(end), Some(start)) = (
+        dense_present(vm, ends, i),
+        dense_present(vm, starts, i),
+    ) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    if !end.is_int() || !start.is_int() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    if end.as_int() as i64 - start.as_int() as i64 != 1 {
+        return Value::bool(false).bits();
+    }
+
+    let Some(source) = global(48) else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    if !source.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let unit = match vm.heap.get(source.heap_index()) {
+        HeapObj::Str(s) => s.unit_at(start.as_int() as usize),
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    let first = packed_units as u32 as i32;
+    let second = (packed_units >> 32) as u32 as i32;
+    Value::bool(unit.is_some_and(|u| {
+        let unit = u as i32;
+        unit == first || unit == second
+    }))
+    .bits()
 }
 
 /// `dst = a + b` for the OSR region's `StrConcat` op: the `+` operator (rope
@@ -1999,7 +2281,10 @@ pub(crate) mod crossstats {
 
     /// `(fast_fills, full_fills)`
     pub fn dump() -> (u64, u64) {
-        (FILL_FAST.load(Ordering::Relaxed), FILL_FULL.load(Ordering::Relaxed))
+        (
+            FILL_FAST.load(Ordering::Relaxed),
+            FILL_FULL.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -2359,26 +2644,19 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                         return crate::codegen::SELF_CALL_DEOPT;
                                     }
                                     if gate == crate::codegen::AccWayGate::Fill {
-                                        hops[n_hops] =
-                                            (next, vm.heap.version_of(next));
+                                        hops[n_hops] = (next, vm.heap.version_of(next));
                                         let getter = m2.vals[i];
                                         let baked = vm
                                             .ic_plain_fn(getter)
-                                            .filter(|&(fid, _)| {
-                                                !vm.func(fid as usize).lexical_this
-                                            })
-                                            .map(|(fid, closure)| {
-                                                (getter.bits(), fid, closure)
-                                            });
-                                        if let Some(e) =
-                                            crate::codegen::IcEntry::accessor(
-                                                obj_bits,
-                                                vm.heap.version_of(idx),
-                                                i as u32,
-                                                &hops[..=n_hops],
-                                                baked,
-                                            )
-                                        {
+                                            .filter(|&(fid, _)| !vm.func(fid as usize).lexical_this)
+                                            .map(|(fid, closure)| (getter.bits(), fid, closure));
+                                        if let Some(e) = crate::codegen::IcEntry::accessor(
+                                            obj_bits,
+                                            vm.heap.version_of(idx),
+                                            i as u32,
+                                            &hops[..=n_hops],
+                                            baked,
+                                        ) {
                                             vm.jit.set_ic(site_idx, e);
                                         }
                                     }
@@ -2436,7 +2714,10 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             }
             // A SPARSE array's JS length lives in the virtual-length side
             // table (still uncached — correct value, plain helper miss).
-            let n = vm.array_js_len.get(&idx).map_or(items.len(), |&n| n as usize);
+            let n = vm
+                .array_js_len
+                .get(&idx)
+                .map_or(items.len(), |&n| n as usize);
             return len_value(n).bits();
         }
         // `ta.length` in a region. A TypedArray's `length` is an ACCESSOR
@@ -2455,7 +2736,10 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // length from the buffer, and a detached buffer reports 0 — both go
             // to the interpreter so this stays a single unambiguous read.
             if vm.ta_tracking.contains(&idx)
-                || matches!(vm.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. })
+                || matches!(
+                    vm.heap.get(buffer),
+                    HeapObj::ArrayBuffer { detached: true, .. }
+                )
                 || !vm.ta_length_is_intrinsic(idx)
             {
                 return crate::codegen::SELF_CALL_DEOPT;
@@ -2634,7 +2918,11 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1, the JIT miss
     // route. IC-HIT stores make no call — that is what `register_scan_root`
     // at the fill below is for.
-    vm.store_barrier(crate::heap::gcoracle::JIT_SET_PROP, idx, Value::from_bits(val_bits));
+    vm.store_barrier(
+        crate::heap::gcoracle::JIT_SET_PROP,
+        idx,
+        Value::from_bits(val_bits),
+    );
     let key = &vm.func(func_id as usize).string_constants[name_idx as usize];
     // Keys with exotic write interception (the inherited `__proto__` setter,
     // restricted names, private names, canonical-index-ish keys) and exotic
@@ -2904,7 +3192,11 @@ pub(crate) extern "win64" fn jit_math_two(code: u32, a_bits: u64, b_bits: u64) -
                 f64::NAN
             } else if a == b {
                 // tie (incl. ±0): prefer the negative-signed operand
-                if a.is_sign_negative() { a } else { b }
+                if a.is_sign_negative() {
+                    a
+                } else {
+                    b
+                }
             } else {
                 a.min(b)
             }
@@ -2913,7 +3205,11 @@ pub(crate) extern "win64" fn jit_math_two(code: u32, a_bits: u64, b_bits: u64) -
             if a.is_nan() || b.is_nan() {
                 f64::NAN
             } else if a == b {
-                if a.is_sign_positive() { a } else { b }
+                if a.is_sign_positive() {
+                    a
+                } else {
+                    b
+                }
             } else {
                 a.max(b)
             }
@@ -3496,7 +3792,10 @@ pub(crate) mod iterstats {
 
     /// `(native_steps, deopts)`
     pub fn dump() -> (u64, u64) {
-        (NATIVE_STEPS.load(Ordering::Relaxed), DEOPTS.load(Ordering::Relaxed))
+        (
+            NATIVE_STEPS.load(Ordering::Relaxed),
+            DEOPTS.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -3539,16 +3838,16 @@ pub(crate) extern "win64" fn jit_regexp_scalar_iter_prime(
 
 /// Result-array-allocation-free success step for the exact matchAll scalar
 /// region (Annex-B strings still allocate). The helper runs its GC safe point
-/// before copying frame-rooted Values into Rust locals. On exhaustion it MUST
-/// flush the final pending result before
-/// returning `done=true`: generated code branches directly to outer IP 405,
-/// so no later native instruction can perform that materialization.
+/// before copying frame-rooted Values into Rust locals. Ordinary iterator
+/// exhaustion materializes its current pending result; the guarded outer-array
+/// reducer instead retains one final result for the region epilogue to flush.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_regexp_scalar_step(
     vm: *mut core::ffi::c_void,
     it_bits: u64,
     next_bits: u64,
-    result_global: u32,
+    result_capture_count_sum: u64,
+    i_n_lines_re: u64,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
     vm.maybe_gc();
@@ -3565,14 +3864,40 @@ pub(crate) extern "win64" fn jit_regexp_scalar_step(
         super::proxy_regexp::rxstats::count_scalar_guard_decline();
         return crate::codegen::SELF_CALL_DEOPT;
     }
+    let result_global = (result_capture_count_sum >> 48) as u16 as u32;
+    let capture = (result_capture_count_sum >> 32) as u16 as u32;
+    let count_global = (result_capture_count_sum >> 16) as u16 as u32;
+    let sum_global = result_capture_count_sum as u16 as u32;
+    let i_global = (i_n_lines_re >> 48) as u16 as u32;
+    let n_global = (i_n_lines_re >> 32) as u16 as u32;
+    let lines_global = (i_n_lines_re >> 16) as u16 as u32;
+    let re_global = i_n_lines_re as u16 as u32;
+
+    // After one complete preflight this bypasses every remaining
+    // per-subject matchAll/species-clone/iterator pipeline in the OUTER loop.
+    // A miss is a pure prefix and falls through to the established scalar path.
+    if let Some(super::proxy_regexp::RegexpScalarStep::Done) = vm
+        .regexp_dense_array_matchall_reduce(
+            it.heap_index(),
+            result_global,
+            count_global,
+            sum_global,
+            capture,
+            i_global,
+            n_global,
+            lines_global,
+            re_global,
+        )
+    {
+        iterstats::native_step();
+        return Value::bool(true).bits();
+    }
     match vm.regexp_string_iter_step_scalar(it.heap_index()) {
         super::proxy_regexp::RegexpScalarStep::Success => {
             iterstats::native_step();
             Value::bool(false).bits()
         }
         super::proxy_regexp::RegexpScalarStep::Done => {
-            // Ordering is load-bearing: the scalar region's done edge skips
-            // directly to IP 405, where source code may observe the final km.
             vm.regexp_scalar_flush(it.heap_index(), result_global, false);
             iterstats::native_step();
             Value::bool(true).bits()
@@ -3645,10 +3970,7 @@ pub(crate) extern "win64" fn jit_regexp_scalar_exec(
     // The live frame still roots both operands and any previous pending
     // subject. No Value is retained solely in an untraced Rust local yet.
     vm.maybe_gc();
-    match vm.regexp_scalar_exec_step(
-        Value::from_bits(recv_bits),
-        Value::from_bits(input_bits),
-    ) {
+    match vm.regexp_scalar_exec_step(Value::from_bits(recv_bits), Value::from_bits(input_bits)) {
         super::proxy_regexp::RegexpScalarExecStep::Success(values) => {
             for (g, value) in values.into_iter().enumerate() {
                 let dst = ((packed_dsts >> (16 * g)) & 0xFFFF) as usize;
@@ -3859,7 +4181,10 @@ pub(crate) extern "win64" fn jit_to_num(vm: *mut core::ffi::c_void, bits: u64) -
     if !v.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    if !matches!(vm.heap.get(v.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+    if !matches!(
+        vm.heap.get(v.heap_index()),
+        HeapObj::Str(_) | HeapObj::Cons { .. }
+    ) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     match vm.to_number_strict(v) {
@@ -3887,7 +4212,11 @@ pub(crate) extern "win64" fn jit_push_finally(vm: *mut core::ffi::c_void, packed
     let kind_reg = ((packed >> 16) & 0xFFFF) as u16;
     let val_reg = (packed & 0xFFFF) as u16;
     let top = vm.frames.len() - 1;
-    vm.frames[top].handlers.push(Handler::Finally { target, kind_reg, val_reg });
+    vm.frames[top].handlers.push(Handler::Finally {
+        target,
+        kind_reg,
+        val_reg,
+    });
     0
 }
 
@@ -4020,9 +4349,7 @@ pub(crate) extern "win64" fn jit_len_of(vm: *mut core::ffi::c_void, obj_bits: u6
             ),
             HeapObj::Str(s) => len_value(s.units()),
             HeapObj::Cons { len, .. } => len_value(*len),
-            HeapObj::Map { keys, .. } => {
-                len_value(keys.iter().filter(|k| !k.is_hole()).count())
-            }
+            HeapObj::Map { keys, .. } => len_value(keys.iter().filter(|k| !k.is_hole()).count()),
             HeapObj::Set(items) => len_value(items.iter().filter(|v| !v.is_hole()).count()),
             _ => Value::int(0),
         }
@@ -4147,9 +4474,16 @@ pub(crate) fn parse_bigint_str(s: &str) -> Option<crate::vm::bigint::BigVal> {
     // A NonDecimalIntegerLiteral (0x/0o/0b) must NOT carry a sign — only a decimal
     // StrIntegerLiteral may. The digit run must be non-empty and contain only valid
     // radix digits (from_str_radix would otherwise accept an embedded sign).
-    let non_decimal = [("0x", 16u32), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)]
-        .iter()
-        .find_map(|(p, r)| body.strip_prefix(p).map(|d| (*r, d)));
+    let non_decimal = [
+        ("0x", 16u32),
+        ("0X", 16),
+        ("0o", 8),
+        ("0O", 8),
+        ("0b", 2),
+        ("0B", 2),
+    ]
+    .iter()
+    .find_map(|(p, r)| body.strip_prefix(p).map(|d| (*r, d)));
     let v: BigVal = if let Some((radix, digits)) = non_decimal {
         if signed || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return None;
@@ -4195,7 +4529,10 @@ mod chain_fast_tests {
 
     fn fixture(src: &str) -> (crate::bytecode::Program, ()) {
         let ast = crate::front::parse_script(src).expect("source parses");
-        (crate::compile::compile_program(&ast, src).expect("source compiles"), ())
+        (
+            crate::compile::compile_program(&ast, src).expect("source compiles"),
+            (),
+        )
     }
 
     /// The non-negotiable pins, called straight through the helper's win64
@@ -4213,7 +4550,10 @@ mod chain_fast_tests {
         let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;
 
         // In-place int arm: same bits, content exact, NO VM-heap alloc.
-        let acc = Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("ab".into()))));
+        let acc = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("ab".into()))),
+        );
         let len0 = vm.heap.len();
         let r = jit_concat_chain_fast(vm_ptr, acc.bits(), Value::int(42).bits(), 0);
         assert_eq!(r, acc.bits(), "int leaf must append in place");
@@ -4224,8 +4564,10 @@ mod chain_fast_tests {
         assert_eq!(vm.display(acc), "ab42-7");
 
         // In-place str arm (distinct slot): same bits, no VM-heap alloc.
-        let leaf =
-            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("cd".into()))));
+        let leaf = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("cd".into()))),
+        );
         let len0 = vm.heap.len();
         let r = jit_concat_chain_fast(vm_ptr, acc.bits(), leaf.bits(), 0);
         assert_eq!(r, acc.bits(), "distinct flat-Str leaf must append in place");
@@ -4234,10 +4576,16 @@ mod chain_fast_tests {
         assert_eq!(vm.display(leaf), "cd", "leaf must be untouched");
 
         // Same-index leaf (`a += a`): generic path, FRESH index, both intact.
-        let alias =
-            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("xy".into()))));
+        let alias = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("xy".into()))),
+        );
         let r = jit_concat_chain_fast(vm_ptr, alias.bits(), alias.bits(), 0);
-        assert_ne!(r, alias.bits(), "self-alias must not take the split-borrow arm");
+        assert_ne!(
+            r,
+            alias.bits(),
+            "self-alias must not take the split-borrow arm"
+        );
         let rv = Value::from_bits(r);
         assert_eq!(vm.display(rv), "xyxy");
         assert_eq!(vm.display(alias), "xy");
@@ -4247,13 +4595,21 @@ mod chain_fast_tests {
         let interned = Value::heap(b'x' as u32);
         assert_eq!(vm.display(interned), "x");
         let r = jit_concat_chain_fast(vm_ptr, interned.bits(), Value::int(5).bits(), 0);
-        assert_ne!(r, interned.bits(), "interned accumulator must not grow in place");
+        assert_ne!(
+            r,
+            interned.bits(),
+            "interned accumulator must not grow in place"
+        );
         assert_eq!(vm.display(Value::from_bits(r)), "x5");
         assert_eq!(vm.display(interned), "x");
 
         // Rope accumulator: generic path (rope semantics inherited).
-        let li = vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("aaa".into())));
-        let ri = vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("bbb".into())));
+        let li = vm
+            .heap
+            .alloc(HeapObj::Str(crate::heap::JsStr::new("aaa".into())));
+        let ri = vm
+            .heap
+            .alloc(HeapObj::Str(crate::heap::JsStr::new("bbb".into())));
         let rope = Value::heap(vm.heap.alloc_cons(li, ri, 6));
         let r = jit_concat_chain_fast(vm_ptr, rope.bits(), Value::int(5).bits(), 0);
         assert_ne!(r, rope.bits(), "rope accumulator must fall through");
@@ -4261,16 +4617,24 @@ mod chain_fast_tests {
 
         // Exotic leaf (double) on a mutable builder: generic path, fresh
         // index (the debug_assert premise in the helper runs here too).
-        let acc2 =
-            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("n=".into()))));
+        let acc2 = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("n=".into()))),
+        );
         let r = jit_concat_chain_fast(vm_ptr, acc2.bits(), Value::num(3.5).bits(), 0);
         assert_ne!(r, acc2.bits(), "exotic leaf must take the generic path");
         assert_eq!(vm.display(Value::from_bits(r)), "n=3.5");
-        assert_eq!(vm.display(acc2), "n=", "builder untouched by the generic path");
+        assert_eq!(
+            vm.display(acc2),
+            "n=",
+            "builder untouched by the generic path"
+        );
 
         // Capacity hint: content-preserving re-seat, then in-place appends.
-        let acc3 =
-            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("ts".into()))));
+        let acc3 = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("ts".into()))),
+        );
         let r = jit_concat_chain_fast(vm_ptr, acc3.bits(), Value::int(7).bits(), 256);
         assert_eq!(r, acc3.bits());
         assert_eq!(vm.display(acc3), "ts7");
@@ -4287,7 +4651,8 @@ mod chain_fast_tests {
         assert_eq!(vm.heap.len(), len0, "the trim allocated on the VM heap");
         assert_eq!(vm.display(acc3), "ts78");
         let acc4 = Value::heap(
-            vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xD83D))),
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xD83D))),
         );
         let r = jit_concat_chain_fast(vm_ptr, acc4.bits(), Value::int(1).bits(), last);
         assert_eq!(r, acc4.bits());
@@ -4303,10 +4668,12 @@ mod chain_fast_tests {
         // Non-ASCII + WTF-8 seam: a lone high surrogate builder and a lone
         // low surrogate leaf canonicalize into ONE astral pair, exact units.
         let hi = Value::heap(
-            vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xD83D))),
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xD83D))),
         );
         let lo = Value::heap(
-            vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xDE00))),
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xDE00))),
         );
         let len0 = vm.heap.len();
         let r = jit_concat_chain_fast(vm_ptr, hi.bits(), lo.bits(), 0);
@@ -4320,8 +4687,10 @@ mod chain_fast_tests {
             }
             other => panic!("builder degenerated to {other:?}"),
         }
-        let snowman =
-            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("é☃".into()))));
+        let snowman = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("é☃".into()))),
+        );
         let r = jit_concat_chain_fast(vm_ptr, hi.bits(), snowman.bits(), 0);
         assert_eq!(r, hi.bits());
         assert_eq!(vm.display(hi), "\u{1F600}é☃");
@@ -4376,14 +4745,26 @@ mod chain_fast_tests {
         };
         let (fi, fs, rs) = (field("fast_int="), field("fast_str="), field("reseat="));
         let tr = field("trim=");
-        assert!(fi > 50_000, "int-leaf fast arm barely engaged: fast_int={fi}\n{line}");
-        assert!(fs > 100_000, "str-leaf fast arm barely engaged: fast_str={fs}\n{line}");
-        assert!(rs > 10_000, "first-link capacity hint barely engaged: reseat={rs}\n{line}");
+        assert!(
+            fi > 50_000,
+            "int-leaf fast arm barely engaged: fast_int={fi}\n{line}"
+        );
+        assert!(
+            fs > 100_000,
+            "str-leaf fast arm barely engaged: fast_str={fs}\n{line}"
+        );
+        assert!(
+            rs > 10_000,
+            "first-link capacity hint barely engaged: reseat={rs}\n{line}"
+        );
         // Every re-seated chain must also reach its LAST link and give the
         // slack back — a reseat count far above the trim count is the
         // permanent-over-allocation regression (measured at +194 MB of
         // retained RSS on the 26-leaf shape when the trim was missing).
-        assert!(tr > 10_000, "last-link trim barely engaged: trim={tr}\n{line}");
+        assert!(
+            tr > 10_000,
+            "last-link trim barely engaged: trim={tr}\n{line}"
+        );
         assert!(
             tr * 2 > rs,
             "most re-seated chains never trimmed: reseat={rs} trim={tr}\n{line}"
@@ -4395,7 +4776,10 @@ mod chain_fast_tests {
     #[test]
     #[ignore = "evidence harness: run explicitly with ZIPP_ICSTATS=1"]
     fn chain_fast_row_counters() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bench/real/regex-log-scan.js");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../bench/real/regex-log-scan.js"
+        );
         let src = std::fs::read_to_string(path).expect("bench row readable");
         let out = crate::run(&src).expect("row compiles");
         assert!(out.error.is_none(), "row error: {:?}", out.error);

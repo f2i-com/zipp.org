@@ -199,6 +199,36 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether an Array receiver's live `slice` / `concat` method Get resolves
+    /// to the matching main-realm intrinsic. These two copy methods participate
+    /// in the allocation-loop reducer, so their ordinary name-dispatched path
+    /// must share the same override contract: an own shadow, custom prototype,
+    /// deleted slot, accessor, or replacement function falls through to the
+    /// generic Get + call path.
+    pub(crate) fn array_copy_method_is_intrinsic(&self, idx: u32, name: &str) -> bool {
+        if !matches!(name, "slice" | "concat")
+            || !matches!(self.heap.get(idx), HeapObj::Array(_))
+            || self.arr_props.get(&idx).is_some_and(|m| m.pos(name).is_some())
+            || self
+                .proto_of
+                .get(&idx)
+                .is_some_and(|&proto| proto != Value::heap(self.arr_proto))
+            || self.arr_proto == 0
+        {
+            return false;
+        }
+        match self.heap.get(self.arr_proto) {
+            HeapObj::Object(map) => map.pos(name).is_some_and(|slot| {
+                !map.attrs[slot].accessor
+                    && map.vals[slot].is_heap()
+                    && matches!(self.heap.get(map.vals[slot].heap_index()), HeapObj::Native(id)
+                        if native::proto_method(*id)
+                            .is_some_and(|(method, kind, _)| method == name && kind == 0))
+            }),
+            _ => false,
+        }
+    }
+
     /// Does a primitive string's method Get resolve to the exact main-realm
     /// intrinsic for the two regex-heavy methods served by the direct lane?
     ///
@@ -496,6 +526,12 @@ impl<'p> Vm<'p> {
             _ => {}
         }
         match self.heap.get(idx) {
+            HeapObj::Array(_)
+                if matches!(name, "slice" | "concat")
+                    && !self.array_copy_method_is_intrinsic(idx, name) =>
+            {
+                Ok(None)
+            }
             HeapObj::Array(_) => self.array_method(idx, name, args),
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
             HeapObj::Map { .. } => self.map_method(idx, name, args),

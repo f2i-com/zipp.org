@@ -16,14 +16,18 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         return false;
     }
     if proto.is_generator || proto.is_async {
-        if std::env::var_os("ZIPP_JITLOG").is_some() { eprintln!("[tierC-reject] generator/async"); }
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!("[tierC-reject] generator/async");
+        }
         return false;
     }
     // A rest parameter's array / the `arguments` object are built by the
     // interpreter's call setup, not by emitted code — the native entry would skip
     // them. Stay interpreted.
     if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
-        if std::env::var_os("ZIPP_JITLOG").is_some() { eprintln!("[tierC-reject] rest/arguments"); }
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!("[tierC-reject] rest/arguments");
+        }
         return false;
     }
     // Under `ZIPP_JITDUMP` the scan runs to completion and reports EVERY op this
@@ -114,6 +118,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // allocates (grows the heap) ⇒ the emitter refetches r13/r14 when
             // the function pins them.
             | Instr::StrAppendInPlace { .. }
+            | Instr::StrAppendIndex { .. }
             | Instr::AddRightPair { .. }
             | Instr::Pad2Concat { .. }
             | Instr::Pad2Conditional { .. }
@@ -359,6 +364,9 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             | Instr::Ge { dst, a, b }
             | Instr::Eq { dst, a, b }
             | Instr::Ne { dst, a, b } => (u2(a, b), Some(dst)),
+            Instr::StrAppendIndex {
+                dst, a, obj, key, ..
+            } => (u3(a, obj, key), Some(dst)),
             Instr::AddRightPair { dst, a, b, c, .. } => (u3(a, b, c), Some(dst)),
             Instr::Pad2Concat { dst, src, .. } => (u1(src), Some(dst)),
             Instr::Pad2Conditional { dst, src } => (u1(src), Some(dst)),
@@ -372,20 +380,32 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::GetIndex { dst, obj, key } => (u2(obj, key), Some(dst)),
             Instr::GetProp { dst, obj, .. } => (u1(obj), Some(dst)),
             Instr::SetProp { obj, val, .. } => (u2(obj, val), None),
-            Instr::MathOp { dst, arg_base, argc, .. } => {
-                (Uses::range(arg_base, argc), Some(dst))
-            }
-            Instr::Call { dst, callee, arg_base, argc } => {
-                (Uses::range(arg_base, argc).plus(callee), Some(dst))
-            }
+            Instr::MathOp {
+                dst,
+                arg_base,
+                argc,
+                ..
+            } => (Uses::range(arg_base, argc), Some(dst)),
+            Instr::Call {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            } => (Uses::range(arg_base, argc).plus(callee), Some(dst)),
             // Frame-reuse prefix: the interpreter reads callee + args (USES
             // must be exact per the contract above); it defines nothing.
-            Instr::TailCall { callee, arg_base, argc } => {
-                (Uses::range(arg_base, argc).plus(callee), None)
-            }
-            Instr::CallMethod { dst, obj, arg_base, argc, .. } => {
-                (Uses::range(arg_base, argc).plus(obj), Some(dst))
-            }
+            Instr::TailCall {
+                callee,
+                arg_base,
+                argc,
+            } => (Uses::range(arg_base, argc).plus(callee), None),
+            Instr::CallMethod {
+                dst,
+                obj,
+                arg_base,
+                argc,
+                ..
+            } => (Uses::range(arg_base, argc).plus(obj), Some(dst)),
             Instr::Jump { .. } | Instr::ReturnUndefined => (u0(), None),
             Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => (u1(cond), None),
             Instr::JumpIfNotLt { a, b, .. } | Instr::JumpIfNotLe { a, b, .. } => (u2(a, b), None),
@@ -398,42 +418,62 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
 /// A tiny inline use-list (compile-time only; avoids per-op Vec churn).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod smallvec {
-        pub(super) struct Uses {
-            regs: [u16; 3],
-            len: u8,
-            /// Contiguous extra range `[base, base+count)` (call/math args).
-            range: (u16, u16),
-        }
-        impl Uses {
-            pub(super) fn new() -> Uses {
-                Uses { regs: [0; 3], len: 0, range: (0, 0) }
-            }
-            pub(super) fn one(a: u16) -> Uses {
-                Uses { regs: [a, 0, 0], len: 1, range: (0, 0) }
-            }
-            pub(super) fn two(a: u16, b: u16) -> Uses {
-                Uses { regs: [a, b, 0], len: 2, range: (0, 0) }
-            }
-            pub(super) fn three(a: u16, b: u16, c: u16) -> Uses {
-                Uses { regs: [a, b, c], len: 3, range: (0, 0) }
-            }
-            pub(super) fn range(base: u16, count: u16) -> Uses {
-                Uses { regs: [0; 3], len: 0, range: (base, count) }
-            }
-            pub(super) fn plus(mut self, r: u16) -> Uses {
-                self.regs[self.len as usize] = r;
-                self.len += 1;
-                self
-            }
-            pub(super) fn for_each(&self, mut f: impl FnMut(u16)) {
-                for k in 0..self.len as usize {
-                    f(self.regs[k]);
-                }
-                for r in self.range.0..self.range.0 + self.range.1 {
-                    f(r);
-                }
+    pub(super) struct Uses {
+        regs: [u16; 3],
+        len: u8,
+        /// Contiguous extra range `[base, base+count)` (call/math args).
+        range: (u16, u16),
+    }
+    impl Uses {
+        pub(super) fn new() -> Uses {
+            Uses {
+                regs: [0; 3],
+                len: 0,
+                range: (0, 0),
             }
         }
+        pub(super) fn one(a: u16) -> Uses {
+            Uses {
+                regs: [a, 0, 0],
+                len: 1,
+                range: (0, 0),
+            }
+        }
+        pub(super) fn two(a: u16, b: u16) -> Uses {
+            Uses {
+                regs: [a, b, 0],
+                len: 2,
+                range: (0, 0),
+            }
+        }
+        pub(super) fn three(a: u16, b: u16, c: u16) -> Uses {
+            Uses {
+                regs: [a, b, c],
+                len: 3,
+                range: (0, 0),
+            }
+        }
+        pub(super) fn range(base: u16, count: u16) -> Uses {
+            Uses {
+                regs: [0; 3],
+                len: 0,
+                range: (base, count),
+            }
+        }
+        pub(super) fn plus(mut self, r: u16) -> Uses {
+            self.regs[self.len as usize] = r;
+            self.len += 1;
+            self
+        }
+        pub(super) fn for_each(&self, mut f: impl FnMut(u16)) {
+            for k in 0..self.len as usize {
+                f(self.regs[k]);
+            }
+            for r in self.range.0..self.range.0 + self.range.1 {
+                f(r);
+            }
+        }
+    }
 }
 
 /// Passes 1-3 of the mask analysis (see `cross_uninit_mask`'s doc).
@@ -476,9 +516,7 @@ fn do_mask_passes(
                 Instr::JumpIfFalse { target, .. }
                 | Instr::JumpIfTrue { target, .. }
                 | Instr::JumpIfNotLt { target, .. }
-                | Instr::JumpIfNotLe { target, .. } => {
-                    (Some(ip + 1), Some(target as usize))
-                }
+                | Instr::JumpIfNotLe { target, .. } => (Some(ip + 1), Some(target as usize)),
                 Instr::Return { .. } | Instr::ReturnUndefined => (None, None),
                 _ => (Some(ip + 1), None),
             };
@@ -761,7 +799,7 @@ pub(crate) fn compile_proto_mem(
                 // i32::MAX and is then boxed as an (exact) double.
                 use crate::bytecode::BitwiseOp as B;
                 load_toint32(&mut ops, a, bail);
-                dynasm!(ops ; mov r8d, eax);             // stash a
+                dynasm!(ops ; mov r8d, eax); // stash a
                 load_toint32(&mut ops, b, bail);
                 dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
                 match op {
@@ -848,9 +886,22 @@ pub(crate) fn compile_proto_mem(
                 // and the interpreter).
                 dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div, false)
             }
-            Instr::MathOp { dst, op, arg_base, argc } => emit_math_op(
-                &mut ops, ip, bail, epilogue, dst, op, arg_base, argc,
-                heap.math_unary, heap.math_two,
+            Instr::MathOp {
+                dst,
+                op,
+                arg_base,
+                argc,
+            } => emit_math_op(
+                &mut ops,
+                ip,
+                bail,
+                epilogue,
+                dst,
+                op,
+                arg_base,
+                argc,
+                heap.math_unary,
+                heap.math_two,
             ),
             Instr::Add { dst, a, b } => {
                 // Int+Int fast path, then f64, then the `jit_concat` fallback
@@ -929,10 +980,26 @@ pub(crate) fn compile_proto_mem(
                 }
                 match cmp {
                     Cmp::Eq => region_poly_eq(
-                        &mut ops, ip, bail, epilogue, dst, a, b, false, heap.strict_eq,
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        dst,
+                        a,
+                        b,
+                        false,
+                        heap.strict_eq,
                     ),
                     Cmp::Ne => region_poly_eq(
-                        &mut ops, ip, bail, epilogue, dst, a, b, true, heap.strict_eq,
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        dst,
+                        a,
+                        b,
+                        true,
+                        heap.strict_eq,
                     ),
                     _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp),
                 }
@@ -968,10 +1035,28 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::JumpIfNotLt { a, b, target } => {
-                djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Lt, labels[target as usize]);
+                djump_if_not_cmp(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    a,
+                    b,
+                    Cmp::Lt,
+                    labels[target as usize],
+                );
             }
             Instr::JumpIfNotLe { a, b, target } => {
-                djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Le, labels[target as usize]);
+                djump_if_not_cmp(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    a,
+                    b,
+                    Cmp::Le,
+                    labels[target as usize],
+                );
             }
             Instr::GetIndex { dst, obj, key } => {
                 // Generic element read `a[i]` via the win64 helper (dense arrays,
@@ -1174,7 +1259,12 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
-            Instr::SetProp { obj, name, val, strict: _ } => {
+            Instr::SetProp {
+                obj,
+                name,
+                val,
+                strict: _,
+            } => {
                 // 8-way inline cache, CALL-FREE on hit. The region arm verbatim,
                 // minus the setter-inline prefix and the TA refetch. Unlike
                 // GetProp the helper only ever fills OWN ways here (identity +
@@ -1248,7 +1338,13 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
-            Instr::CallMethod { dst, obj, name, arg_base, argc } => {
+            Instr::CallMethod {
+                dst,
+                obj,
+                name,
+                arg_base,
+                argc,
+            } => {
                 // The intrinsic set (mem_can_compile gated) — the region path's
                 // dedicated pure win64 helpers, minus its pin fast paths (Tier C
                 // has no pins). Every helper here takes receiver + arg bits and
@@ -1256,8 +1352,7 @@ pub(crate) fn compile_proto_mem(
                 // substring/slice does allocate its result and therefore
                 // re-fetches the versions pointer explicitly below.
                 let key = proto.string_constants[name as usize].as_str();
-                let substring_arity_ok = argc == 2
-                    || (argc == 1 && substring1_intrinsic_enabled());
+                let substring_arity_ok = argc == 2 || (argc == 1 && substring1_intrinsic_enabled());
                 if substring_arity_ok && matches!(key, "substring" | "slice") {
                     // substring/slice: args read from the contiguous window;
                     // mode bit 1 tells the helper the end argument is absent.
@@ -1342,7 +1437,12 @@ pub(crate) fn compile_proto_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
             }
-            Instr::Call { dst, callee, arg_base, argc } => {
+            Instr::Call {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            } => {
                 // General `f(args…)` (`this = undefined`) via the interpreter-IC
                 // call helper. Packing: r9 = (callee<<16) | arg_base; argc on the
                 // stack. The callee runs user code + allocates + can trigger a
@@ -1364,8 +1464,7 @@ pub(crate) fn compile_proto_mem(
                 let cross = cross_plan.contains(&ip) && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if cross {
-                    let packed_cross: u64 =
-                        (argc as u64) | ((proto.reg_count.max(1) as u64) << 16);
+                    let packed_cross: u64 = (argc as u64) | ((proto.reg_count.max(1) as u64) << 16);
                     let cross_fallback = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
@@ -1399,6 +1498,15 @@ pub(crate) fn compile_proto_mem(
                 // to the SAME helper (a pure prefix). Tier C has no TA pins → no
                 // ta_refetch.
                 if let Some(lp) = leaf_plan.get(&ip) {
+                    // Pair fusion skips caller bytecodes, so metered execution
+                    // keeps the ordinary single-predicate path and its charges.
+                    let span_pair_resume = if blocks.is_none() {
+                        lp.span_code_unit_pred
+                            .and_then(|p| p.pair)
+                            .map(|p| labels[p.resume_ip as usize])
+                    } else {
+                        None
+                    };
                     emit_inline_leaf_call(
                         &mut ops,
                         ip,
@@ -1421,6 +1529,7 @@ pub(crate) fn compile_proto_mem(
                         packed_args,
                         refetch,
                         None,
+                        span_pair_resume,
                     );
                 } else {
                     emit_region_call_ic(
@@ -1463,7 +1572,32 @@ pub(crate) fn compile_proto_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::AddRightPair { dst, a, b, c, in_place } => {
+            Instr::StrAppendIndex {
+                dst, a, obj, key, ..
+            } => {
+                // Pure ASCII prefix; the deopt sentinel means no mutation and
+                // re-executes the fused opcode's exact generic fallback.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov r8, [rbx + dreg(obj)]
+                    ; mov r9, [rbx + dreg(key)]
+                    ; mov rax, QWORD heap.str_append_index as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::AddRightPair {
+                dst,
+                a,
+                b,
+                c,
+                in_place,
+            } => {
                 // Exact right-associated pair through the same helper as the
                 // interpreter and region MEM path. It may allocate or run user
                 // coercion code, so always refetch pinned state after a served
@@ -1751,12 +1885,19 @@ pub(crate) fn compile_proto_mem(
     // probe reads past the reserved table (OOB / cross-site corruption).
     debug_assert_eq!(
         (ic_site - heap.ic_base_idx) as usize,
-        proto.code.iter().filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. })).count(),
+        proto
+            .code
+            .iter()
+            .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
+            .count(),
         "Tier C ic_site cursor desynced from reserved sites"
     );
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding: None,
+    })
 }
-

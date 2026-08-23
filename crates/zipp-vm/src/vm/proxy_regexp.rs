@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -282,12 +282,20 @@ impl<'p> Vm<'p> {
                 "TypeError: Cannot create proxy with a non-object as target or handler".into(),
             ));
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Proxy { target, handler, revoked: false })))
+        Ok(Value::heap(self.heap.alloc(HeapObj::Proxy {
+            target,
+            handler,
+            revoked: false,
+        })))
     }
 
     pub(crate) fn proxy_parts(&self, idx: u32) -> Option<(Value, Value, bool)> {
         match self.heap.get(idx) {
-            HeapObj::Proxy { target, handler, revoked } => Some((*target, *handler, *revoked)),
+            HeapObj::Proxy {
+                target,
+                handler,
+                revoked,
+            } => Some((*target, *handler, *revoked)),
             _ => None,
         }
     }
@@ -306,14 +314,20 @@ impl<'p> Vm<'p> {
     /// Look up a Proxy handler trap by name; `Ok(Some(fn))` if it's callable,
     /// `Ok(None)` to fall through to the target. A non-callable non-undefined trap
     /// is a TypeError. (`revoked` is checked by the caller.)
-    pub(crate) fn proxy_trap(&mut self, handler: Value, name: &str) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn proxy_trap(
+        &mut self,
+        handler: Value,
+        name: &str,
+    ) -> Result<Option<Value>, Thrown> {
         let t = self.get_prop(handler, name)?;
         if t.is_undefined() || t.is_null() {
             Ok(None)
         } else if self.is_callable(t) {
             Ok(Some(t))
         } else {
-            Err(Thrown(format!("TypeError: proxy handler's {name} trap is not a function")))
+            Err(Thrown(format!(
+                "TypeError: proxy handler's {name} trap is not a function"
+            )))
         }
     }
 
@@ -352,7 +366,9 @@ impl<'p> Vm<'p> {
             m.pos("exec").is_some()
                 || m.pos("flags").is_some()
                 || m.pos("@@replace").is_some()
-                || Self::FLAG_ACCESSORS.iter().any(|(name, _)| m.pos(name).is_some())
+                || Self::FLAG_ACCESSORS
+                    .iter()
+                    .any(|(name, _)| m.pos(name).is_some())
         }) {
             return false;
         }
@@ -381,9 +397,9 @@ impl<'p> Vm<'p> {
         // there — `"aaaa".replace(/a/g, "b")` must end with `lastIndex === 0`,
         // and a sticky `re` with `lastIndex === 5` must resume at 5.
         let (sticky, global, last_index) = match self.heap.get(re) {
-            HeapObj::RegExp { flags, last_index, .. } => {
-                (flags.contains('y'), flags.contains('g'), *last_index)
-            }
+            HeapObj::RegExp {
+                flags, last_index, ..
+            } => (flags.contains('y'), flags.contains('g'), *last_index),
             _ => return false,
         };
         if sticky {
@@ -569,7 +585,9 @@ impl<'p> Vm<'p> {
     /// a slot could still be an equivalent intrinsic identity).
     #[inline]
     fn matchall_fast_from_slots(&self) -> bool {
-        let Some(c) = self.matchall_fast_slots else { return false };
+        let Some(c) = self.matchall_fast_slots else {
+            return false;
+        };
         if self.heap.version_of(self.regexp_proto) != c.proto_version
             || self.heap.version_of(self.regexp_ctor) != c.ctor_version
         {
@@ -626,7 +644,13 @@ impl<'p> Vm<'p> {
             (m.attrs[i].accessor == accessor
                 && v.is_heap()
                 && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id))
-                .then(|| (i as u32, v.heap_index(), self.heap.version_of(v.heap_index())))
+            .then(|| {
+                (
+                    i as u32,
+                    v.heap_index(),
+                    self.heap.version_of(v.heap_index()),
+                )
+            })
         };
         let m = match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => m,
@@ -671,7 +695,11 @@ impl<'p> Vm<'p> {
         if let Some(i) = self.as_regexp(v) {
             return Ok(i);
         }
-        let p = if v.is_undefined() { self.alloc_str(String::new()) } else { v };
+        let p = if v.is_undefined() {
+            self.alloc_str(String::new())
+        } else {
+            v
+        };
         Ok(self.build_regexp(p, Value::UNDEFINED)?.heap_index())
     }
 
@@ -940,7 +968,11 @@ impl<'p> Vm<'p> {
         // re-entries — hold GC off for the whole protocol.
         let _gc = self.gc_lock_guard();
         let functional = self.is_callable(replace_value);
-        let replace_str = if functional { String::new() } else { self.to_js_string(replace_value)? };
+        let replace_str = if functional {
+            String::new()
+        } else {
+            self.to_js_string(replace_value)?
+        };
         // flags / global / fullUnicode are observable (Get, ToString).
         let flags_v = self.get_prop(rx, "flags")?;
         let flags = self.to_js_string(flags_v)?;
@@ -971,8 +1003,7 @@ impl<'p> Vm<'p> {
             if self.to_js_string(match0)?.is_empty() {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 // ToLength: clamp to 2^53-1 BEFORE the advance.
-                let this_index =
-                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+                let this_index = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
                 let next = advance_string_index(&u16s, this_index, full_unicode);
                 self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
@@ -1091,7 +1122,10 @@ impl<'p> Vm<'p> {
         if next_pos < length_s {
             push_units(&mut accumulated, &u16s[next_pos..]);
         }
-        Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(accumulated))))
+        Ok(Value::heap(
+            self.heap
+                .alloc_js(crate::heap::JsStr::from_wtf8(accumulated)),
+        ))
     }
 
     /// RegExpExec (ES 22.2.7.1): the exec PROTOCOL. When the regex has a callable
@@ -1118,7 +1152,11 @@ impl<'p> Vm<'p> {
             let is_object = r.is_heap()
                 && !matches!(
                     self.heap.get(r.heap_index()),
-                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                    HeapObj::Str(_)
+                        | HeapObj::Cons { .. }
+                        | HeapObj::Symbol { .. }
+                        | HeapObj::BigInt(_)
+                        | HeapObj::BigIntBig(_)
                 );
             if r != Value::NULL && !is_object {
                 return Err(Thrown(
@@ -1174,8 +1212,7 @@ impl<'p> Vm<'p> {
             if is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 // ToLength: clamp to 2^53-1 BEFORE the advance.
-                let this_index =
-                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+                let this_index = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
                 let next = advance_string_index(&u16s, this_index, full_unicode);
                 self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
@@ -1236,7 +1273,11 @@ impl<'p> Vm<'p> {
         let flags = self.to_js_string(flags_v)?;
         // unicodeMatching (`u`/`v`) selects code-point AdvanceStringIndex.
         let unicode_matching = flags.contains('u') || flags.contains('v');
-        let new_flags = if flags.contains('y') { flags } else { format!("{flags}y") };
+        let new_flags = if flags.contains('y') {
+            flags
+        } else {
+            format!("{flags}y")
+        };
         let new_flags_v = self.alloc_str(new_flags);
         let splitter = self.construct(c, &[rx, new_flags_v])?;
         let lim: u64 = if limit == Value::UNDEFINED {
@@ -1568,9 +1609,16 @@ impl<'p> Vm<'p> {
             }
         } else {
             self.heap.flatten(s_idx);
-            (matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii()), 0)
+            (
+                matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii()),
+                0,
+            )
         };
-        let u16s: Vec<u16> = if is_ascii { Vec::new() } else { self.value_units(input_val) };
+        let u16s: Vec<u16> = if is_ascii {
+            Vec::new()
+        } else {
+            self.value_units(input_val)
+        };
         let subj_units = if is_ascii {
             if slim_exec_enabled() {
                 ascii_units
@@ -1592,9 +1640,10 @@ impl<'p> Vm<'p> {
                 _ => "",
             };
             match self.heap.get(re_idx) {
-                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => {
-                    twin.find_from_ascii(subj, start).next()
-                }
+                HeapObj::RegExp {
+                    ascii_twin: Some(Some(twin)),
+                    ..
+                } => twin.find_from_ascii(subj, start).next(),
                 HeapObj::RegExp { regex, .. } => regex.find_from_ascii(subj, start).next(),
                 _ => None,
             }
@@ -1708,12 +1757,20 @@ impl<'p> Vm<'p> {
             let mut ranges: [Option<(u32, u32)>; 13] = [None; 13];
             ranges[0] = Some((mstart as u32, mend as u32));
             // lastParen: the LAST participating capture, "" when none did.
-            ranges[1] = m.captures.iter().rev().find_map(|c| c.clone()).map(|r| (r.start as u32, r.end as u32));
+            ranges[1] = m
+                .captures
+                .iter()
+                .rev()
+                .find_map(|c| c.clone())
+                .map(|r| (r.start as u32, r.end as u32));
             ranges[2] = Some((0, mstart as u32));
             ranges[3] = Some((mend as u32, subj_units as u32));
             for i in 0..9 {
-                ranges[4 + i] =
-                    m.captures.get(i).and_then(|c| c.clone()).map(|r| (r.start as u32, r.end as u32));
+                ranges[4 + i] = m
+                    .captures
+                    .get(i)
+                    .and_then(|c| c.clone())
+                    .map(|r| (r.start as u32, r.end as u32));
             }
             // `regexp_last_lazy` being `Some` is what routes slots >= 1
             // through materialisation first, so the 13 tail slots are
@@ -1729,7 +1786,11 @@ impl<'p> Vm<'p> {
                 self.regexp_last.push(input_val);
                 self.regexp_last.resize(14, Value::UNDEFINED);
             }
-            self.regexp_last_lazy = Some(RegexpLastLazy { subj: input_val, subj_idx: s_idx, ranges });
+            self.regexp_last_lazy = Some(RegexpLastLazy {
+                subj: input_val,
+                subj_idx: s_idx,
+                ranges,
+            });
         } else {
             // Cannot defer: slice all thirteen eagerly through `mk`.
             let empty = self.alloc_str(String::new());
@@ -1847,11 +1908,10 @@ impl<'p> Vm<'p> {
                 Value::heap(gidx)
             };
             let indices_arr = self.heap.alloc(HeapObj::Array(idx_elems));
-            self.arr_props.entry(indices_arr).or_insert_with(ObjMap::new_side_table).define(
-                "groups",
-                idx_groups,
-                attr,
-            );
+            self.arr_props
+                .entry(indices_arr)
+                .or_insert_with(ObjMap::new_side_table)
+                .define("groups", idx_groups, attr);
             Value::heap(indices_arr)
         } else {
             Value::UNDEFINED
@@ -1986,14 +2046,23 @@ impl<'p> Vm<'p> {
                     break None;
                 }
                 match self.heap.get(re_idx) {
-                    HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => {
+                    HeapObj::RegExp {
+                        ascii_twin: Some(Some(twin)),
+                        ..
+                    } => {
                         break twin.find_from_ascii(subj, start).next();
                     }
                     // Twin compile failed once: the base program is byte-safe too.
-                    HeapObj::RegExp { ascii_twin: Some(None), regex, .. } => {
+                    HeapObj::RegExp {
+                        ascii_twin: Some(None),
+                        regex,
+                        ..
+                    } => {
                         break regex.find_from_ascii(subj, start).next();
                     }
-                    HeapObj::RegExp { ascii_twin: None, .. } if !built_twin => {}
+                    HeapObj::RegExp {
+                        ascii_twin: None, ..
+                    } if !built_twin => {}
                     HeapObj::RegExp { regex, .. } => {
                         break regex.find_from_ascii(subj, start).next();
                     }
@@ -2175,7 +2244,10 @@ impl<'p> Vm<'p> {
             }
         }
         let (bytes, subject_ascii): (Vec<u8>, bool) = match self.heap.get(s_idx) {
-            HeapObj::Str(js) => (js.as_bytes()[r].to_vec(), js.is_ascii() && ascii_slice_fast()),
+            HeapObj::Str(js) => (
+                js.as_bytes()[r].to_vec(),
+                js.is_ascii() && ascii_slice_fast(),
+            ),
             _ => (Vec::new(), false),
         };
         let js = if subject_ascii {
@@ -2284,14 +2356,14 @@ impl<'p> Vm<'p> {
         });
         flags_ok
             && Self::FLAG_ACCESSORS.iter().all(|(name, want)| {
-            let ok = proto.pos(name).is_some_and(|p| {
-                proto.attrs[p].accessor
-                    && proto.vals[p].is_heap()
-                    && matches!(self.heap.get(proto.vals[p].heap_index()),
+                let ok = proto.pos(name).is_some_and(|p| {
+                    proto.attrs[p].accessor
+                        && proto.vals[p].is_heap()
+                        && matches!(self.heap.get(proto.vals[p].heap_index()),
                                 HeapObj::Native(n) if n == want)
-            });
-            ok
-        })
+                });
+                ok
+            })
     }
 
     pub(crate) fn regexp_pristine_flags(&self, re: u32, receiver: Value) -> Option<String> {
@@ -2343,7 +2415,11 @@ impl<'p> Vm<'p> {
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
         }
-        if self.arr_props.get(&re).is_some_and(|m| m.pos(name).is_some()) {
+        if self
+            .arr_props
+            .get(&re)
+            .is_some_and(|m| m.pos(name).is_some())
+        {
             return false;
         }
         match self.heap.get(self.regexp_proto) {
@@ -2363,7 +2439,11 @@ impl<'p> Vm<'p> {
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
             _ => return false,
         }
-        if self.arr_props.get(&re).is_some_and(|m| m.pos("exec").is_some()) {
+        if self
+            .arr_props
+            .get(&re)
+            .is_some_and(|m| m.pos("exec").is_some())
+        {
             return false;
         }
         match self.heap.get(self.regexp_proto) {
@@ -2445,7 +2525,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn ensure_regexp_ascii_twin(&mut self, re_idx: u32) {
         let (source, flags) = match self.heap.get(re_idx) {
             // Already computed (twin or recorded failure): nothing to do.
-            HeapObj::RegExp { ascii_twin: Some(_), .. } => return,
+            HeapObj::RegExp {
+                ascii_twin: Some(_),
+                ..
+            } => return,
             HeapObj::RegExp { source, flags, .. } => (source.clone(), flags.clone()),
             _ => return,
         };
@@ -2453,13 +2536,11 @@ impl<'p> Vm<'p> {
         let unicode_mode = flags.contains('u') || flags.contains('v');
         let compile_cps: Vec<u32> = match (self.regexp_exact_source.get(&re_idx), unicode_mode) {
             (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
-            (Some(b), false) => nonunicode_pattern_chars(
-                &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
-            ),
+            (Some(b), false) => {
+                nonunicode_pattern_chars(&crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>())
+            }
             (None, true) => source.chars().map(u32::from).collect(),
-            (None, false) => nonunicode_pattern_chars(
-                &source.encode_utf16().collect::<Vec<u16>>(),
-            ),
+            (None, false) => nonunicode_pattern_chars(&source.encode_utf16().collect::<Vec<u16>>()),
         };
         // Through the byteopt half of the compile cache (species clones of
         // the same pattern share one twin too).
@@ -2470,23 +2551,27 @@ impl<'p> Vm<'p> {
             // The cache key owns its text, so the shared source is materialised
             // here — once per twin build, never per match.
             .then(|| (source.to_string(), rflags.clone(), true));
-        let twin: Option<std::sync::Arc<regress::Regex>> =
-            match cache_key.as_ref().and_then(|k| self.regex_compile_cache.get(k)) {
-                Some(rc) => Some(rc.clone()),
-                None => {
-                    let compiled =
-                        regress::Regex::from_unicode_byteopt(compile_cps.iter().copied(), rflags.as_str())
-                            .ok()
-                            .map(std::sync::Arc::new);
-                    if let (Some(k), Some(rc)) = (cache_key, compiled.as_ref()) {
-                        if self.regex_compile_cache.len() >= 512 {
-                            self.regex_compile_cache.clear();
-                        }
-                        self.regex_compile_cache.insert(k, rc.clone());
+        let twin: Option<std::sync::Arc<regress::Regex>> = match cache_key
+            .as_ref()
+            .and_then(|k| self.regex_compile_cache.get(k))
+        {
+            Some(rc) => Some(rc.clone()),
+            None => {
+                let compiled = regress::Regex::from_unicode_byteopt(
+                    compile_cps.iter().copied(),
+                    rflags.as_str(),
+                )
+                .ok()
+                .map(std::sync::Arc::new);
+                if let (Some(k), Some(rc)) = (cache_key, compiled.as_ref()) {
+                    if self.regex_compile_cache.len() >= 512 {
+                        self.regex_compile_cache.clear();
                     }
-                    compiled
+                    self.regex_compile_cache.insert(k, rc.clone());
                 }
-            };
+                compiled
+            }
+        };
         if let HeapObj::RegExp { ascii_twin, .. } = self.heap.get_mut(re_idx) {
             *ascii_twin = Some(twin);
         }
@@ -2534,8 +2619,14 @@ impl<'p> Vm<'p> {
         &mut self,
         it_idx: u32,
     ) -> Option<Result<(Value, bool), Thrown>> {
-        let &RegexpIterRec { matcher: regexp, subject: string, subj_units, fbits, done, .. } =
-            self.regexp_string_iters.get(&it_idx)?;
+        let &RegexpIterRec {
+            matcher: regexp,
+            subject: string,
+            subj_units,
+            fbits,
+            done,
+            ..
+        } = self.regexp_string_iters.get(&it_idx)?;
         if fbits & ITFB_FUSED != 0 && !done && matchall_step_enabled() {
             if let Some(r) =
                 self.regexp_string_iter_step_fused(it_idx, regexp, string, fbits, subj_units)
@@ -2579,24 +2670,22 @@ impl<'p> Vm<'p> {
             return None;
         }
         let v = p.vals[slot];
-        (v.is_heap()
-            && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == native))
-        .then_some(v)
+        (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == native))
+            .then_some(v)
     }
 
     /// Pure guard for the source `GetIterator` at the exact scalar outer-loop
     /// IP. A miss has executed no getter/call and therefore resumes that same
     /// bytecode; a hit is identity because the live @@iterator is ITER_SELF.
     pub(crate) fn regexp_scalar_get_iterator_identity(&self, it: Value) -> Option<Value> {
-        let rec = it.is_heap().then(|| self.regexp_string_iters.get(&it.heap_index())).flatten()?;
+        let rec = it
+            .is_heap()
+            .then(|| self.regexp_string_iters.get(&it.heap_index()))
+            .flatten()?;
         if rec.fbits & ITFB_FUSED == 0 || rec.scalar_pending.is_some() {
             return None;
         }
-        self.regexp_string_iter_intrinsic_method(
-            it,
-            "@@iterator",
-            crate::vm::native::ITER_SELF,
-        )?;
+        self.regexp_string_iter_intrinsic_method(it, "@@iterator", crate::vm::native::ITER_SELF)?;
         Some(it)
     }
 
@@ -2604,7 +2693,10 @@ impl<'p> Vm<'p> {
     /// the actual live data-property Value only when it is the pristine
     /// ITER_NEXT native; a replacement/accessor declines before observation.
     pub(crate) fn regexp_scalar_iter_prime(&self, it: Value) -> Option<Value> {
-        let rec = it.is_heap().then(|| self.regexp_string_iters.get(&it.heap_index())).flatten()?;
+        let rec = it
+            .is_heap()
+            .then(|| self.regexp_string_iters.get(&it.heap_index()))
+            .flatten()?;
         if rec.fbits & ITFB_FUSED == 0 || rec.scalar_pending.is_some() {
             return None;
         }
@@ -2620,7 +2712,8 @@ impl<'p> Vm<'p> {
         if !rx_scalar_matchall_enabled() {
             return RegexpScalarStep::Decline;
         }
-        let (regexp, string, subj_units, fbits, done) = match self.regexp_string_iters.get(&it_idx) {
+        let (regexp, string, subj_units, fbits, done) = match self.regexp_string_iters.get(&it_idx)
+        {
             Some(r) => (r.matcher, r.subject, r.subj_units, r.fbits, r.done),
             None => return RegexpScalarStep::Decline,
         };
@@ -2632,7 +2725,11 @@ impl<'p> Vm<'p> {
         {
             return RegexpScalarStep::Decline;
         }
-        let s_idx = if string.is_heap() { string.heap_index() } else { return RegexpScalarStep::Decline };
+        let s_idx = if string.is_heap() {
+            string.heap_index()
+        } else {
+            return RegexpScalarStep::Decline;
+        };
         if !matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii()) {
             return RegexpScalarStep::Decline;
         }
@@ -2720,7 +2817,9 @@ impl<'p> Vm<'p> {
                 let replaced = self
                     .regexp_string_iters
                     .get_mut(&it_idx)
-                    .and_then(|r| r.scalar_pending.replace(p))
+                    .expect("active scalar matchAll iterator must remain registered")
+                    .scalar_pending
+                    .replace(p)
                     .is_some();
                 if replaced {
                     rxstats::count_scalar_elided();
@@ -2759,11 +2858,7 @@ impl<'p> Vm<'p> {
 
     /// Apply the exact unary-`+` consumer to capture `capture` (1-based)
     /// directly from the pending subject range. No capture string/Array exists.
-    pub(crate) fn regexp_scalar_capture_number(
-        &self,
-        it_idx: u32,
-        capture: u32,
-    ) -> Option<Value> {
+    pub(crate) fn regexp_scalar_capture_number(&self, it_idx: u32, capture: u32) -> Option<Value> {
         let r = self.regexp_string_iters.get(&it_idx)?;
         let p = r.scalar_pending?;
         if capture == 0 {
@@ -2791,6 +2886,303 @@ impl<'p> Vm<'p> {
         let piece = s.get(start as usize..end as usize)?;
         rxstats::count_scalar_capture_num();
         Some(Value::num(super::coerce::string_to_number(piece)))
+    }
+
+    /// Consume the remaining OUTER iterations of the exact scalar matchAll
+    /// region in one guarded pass. It eliminates every later
+    /// `String#matchAll` lookup, species clone and iterator allocation.
+    ///
+    /// The complete remaining dense Array is preflighted before the first
+    /// regex attempt. Matching itself mutates no JS-visible state; count/sum,
+    /// the outer index, Annex-B statics and the final pending `km` are published
+    /// only after every scan succeeds. Therefore every `None` is a pure prefix
+    /// and the established scalar step can replay the current IterNext.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn regexp_dense_array_matchall_reduce(
+        &mut self,
+        it_idx: u32,
+        result_global: u32,
+        count_global: u32,
+        sum_global: u32,
+        capture: u32,
+        i_global: u32,
+        n_global: u32,
+        lines_global: u32,
+        re_global: u32,
+    ) -> Option<RegexpScalarStep> {
+        if !rx_dense_array_matchall_reduce_enabled() {
+            return None;
+        }
+        let globals = [
+            result_global,
+            count_global,
+            sum_global,
+            i_global,
+            n_global,
+            lines_global,
+            re_global,
+        ];
+        if globals.iter().any(|&g| g as usize >= self.globals.len()) {
+            return None;
+        }
+        // Admission already proves this, but it is the soundness boundary for
+        // deferred publication; keep the runtime helper independently total.
+        for (at, global) in globals.iter().enumerate() {
+            if globals[at + 1..].contains(global) {
+                return None;
+            }
+        }
+        let (i_value, n_value, count_value, sum_value) = (
+            self.globals[i_global as usize],
+            self.globals[n_global as usize],
+            self.globals[count_global as usize],
+            self.globals[sum_global as usize],
+        );
+        if !i_value.is_int() || !n_value.is_int() || !count_value.is_int() || !sum_value.is_int() {
+            return None;
+        }
+        let (i_raw, n_raw) = (i_value.as_int(), n_value.as_int());
+        if i_raw < 0 || n_raw <= i_raw {
+            return None;
+        }
+        let (i, n) = (i_raw as usize, n_raw as usize);
+
+        let lines = self.globals[lines_global as usize];
+        let source = self.globals[re_global as usize];
+        if !lines.is_heap() || !source.is_heap() {
+            return None;
+        }
+        let (lines_idx, source_idx) = (lines.heap_index(), source.heap_index());
+
+        // These iterator facts were established by the just-completed direct
+        // matchAll/GetIterator/IterPrime guards. Re-read them so this helper is
+        // safe even if called from a future emitter with weaker assumptions.
+        let (matcher_idx, current_subject, current_units, fbits, done, has_pending) =
+            self.regexp_string_iters.get(&it_idx).map(|r| {
+                (
+                    r.matcher,
+                    r.subject,
+                    r.subj_units,
+                    r.fbits,
+                    r.done,
+                    r.scalar_pending.is_some(),
+                )
+            })?;
+        if done
+            || has_pending
+            || fbits & (ITFB_GLOBAL | ITFB_FUSED) != (ITFB_GLOBAL | ITFB_FUSED)
+            || fbits & (ITFB_UNICODE | ITFB_STICKY | ITFB_INDICES) != 0
+            || !current_subject.is_heap()
+            || !self.matchall_fast_from_slots()
+        {
+            return None;
+        }
+
+        // Re-prove the SOURCE instance, not merely the engine-private clone:
+        // skipping later matchAll calls also skips their instance-specific own
+        // property and prototype checks.
+        if !self.regexp_matchall_fast_ok_cached(source_idx) {
+            return None;
+        }
+        self.ensure_regexp_ascii_twin(source_idx);
+        let (source_regex, scan_regex, source_flags, start) = match self.heap.get(source_idx) {
+            HeapObj::RegExp {
+                regex,
+                flags,
+                last_index,
+                ascii_twin,
+                ..
+            } if last_index.is_number()
+                && flags.contains('g')
+                && !flags
+                    .bytes()
+                    .any(|b| matches!(b, b'd' | b'u' | b'v' | b'y')) =>
+            {
+                let d = last_index.as_f64().trunc();
+                let d = if d.is_nan() { 0.0 } else { d };
+                let start = d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize;
+                let scan = match ascii_twin {
+                    Some(Some(twin)) => twin.clone(),
+                    Some(None) => regex.clone(),
+                    None => return None,
+                };
+                (regex.clone(), scan, flags.clone(), start)
+            }
+            _ => return None,
+        };
+        if start > u32::MAX as usize
+            || capture == 0
+            || capture as usize > scan_regex.capture_count()
+            || scan_regex.capture_count() > 4
+            || scan_regex.has_named_groups()
+        {
+            return None;
+        }
+        // The current iterator must really be the pristine clone of `source`
+        // and still sit at its initial copied lastIndex (no step has committed).
+        let matcher_ok = match self.heap.get(matcher_idx) {
+            HeapObj::RegExp {
+                regex,
+                flags,
+                last_index,
+                ..
+            } if last_index.is_number() => {
+                let d = last_index.as_f64().trunc();
+                let d = if d.is_nan() { 0.0 } else { d };
+                std::sync::Arc::ptr_eq(regex, &source_regex)
+                    && flags.as_ref() == source_flags.as_ref()
+                    && d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize == start
+            }
+            _ => false,
+        };
+        if !matcher_ok {
+            return None;
+        }
+
+        // Full preflight: every `lines[k]` is an own dense element and already
+        // a flat ASCII primitive string. No flattening, getter, Proxy trap or
+        // prototype lookup can occur after this point. Strings and Array dense
+        // elements cannot change because the admitted body contains no call or
+        // write; the helper itself does not run user code.
+        if self.array_elements_overlaid(lines_idx) || self.array_js_len.contains_key(&lines_idx) {
+            return None;
+        }
+        let mut maximum_matches = 0usize;
+        match self.heap.get(lines_idx) {
+            HeapObj::Array(items)
+                if n <= items.len() && items[i].bits() == current_subject.bits() =>
+            {
+                for value in &items[i..n] {
+                    if value.is_hole() || !value.is_heap() {
+                        return None;
+                    }
+                    match self.heap.get(value.heap_index()) {
+                        HeapObj::Str(js)
+                            if js.is_ascii() && js.as_bytes().len() < u32::MAX as usize =>
+                        {
+                            maximum_matches =
+                                maximum_matches.saturating_add(js.as_bytes().len() + 1);
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        }
+        if !matches!(
+            self.heap.get(current_subject.heap_index()),
+            HeapObj::Str(js) if js.is_ascii() && js.as_bytes().len() == current_units
+        ) {
+            return None;
+        }
+        let count_headroom = i32::MAX as i64 - count_value.as_int() as i64;
+        if maximum_matches > count_headroom as usize {
+            return None;
+        }
+
+        let mut count = count_value.as_int();
+        let mut sum = sum_value.as_int();
+        let mut matches = 0u64;
+        let mut final_match: Option<(Value, usize, RegexpScalarMatch)> = None;
+        for pos in i..n {
+            let subject = match self.heap.get(lines_idx) {
+                HeapObj::Array(items) => items[pos],
+                _ => unreachable!("dense Array preflight is immutable inside the helper"),
+            };
+            let subject_idx = subject.heap_index();
+            let text = match self.heap.get(subject_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => unreachable!("flat-string preflight is immutable inside the helper"),
+            };
+            let exhausted = scan_regex.scan_ascii(text, start, usize::MAX, &mut |range, caps| {
+                debug_assert!(caps.len() <= 4);
+                let number = match caps.get(capture as usize - 1).and_then(|r| r.as_ref()) {
+                    Some(r) => super::coerce::string_to_number(&text[r.clone()]),
+                    None => f64::NAN,
+                };
+                count = count.checked_add(1).expect("preflighted count headroom");
+                sum = crate::vm::helpers_num2::to_int32(sum as f64 + number);
+                matches += 1;
+                let mut packed = RegexpScalarMatch {
+                    mstart: range.start as u32,
+                    mend: range.end as u32,
+                    ncaps: caps.len() as u8,
+                    caps: [u32::MAX; 8],
+                };
+                for (group, cap) in caps.iter().enumerate() {
+                    if let Some(cap) = cap {
+                        packed.caps[2 * group] = cap.start as u32;
+                        packed.caps[2 * group + 1] = cap.end as u32;
+                    }
+                }
+                final_match = Some((subject, text.len(), packed));
+            });
+            debug_assert!(
+                exhausted,
+                "an unbounded drained scan must exhaust its subject"
+            );
+        }
+
+        // Commit the pure reduction. Returning `done=true` sends generated
+        // code to the ordinary outer tail, whose unchanged `i++` turns n-1
+        // into n before the loop condition exits.
+        self.globals[count_global as usize] = Value::int(count);
+        self.globals[sum_global as usize] = Value::int(sum);
+        self.globals[i_global as usize] = Value::int(n_raw - 1);
+
+        if let Some((subject, subject_units, packed)) = final_match {
+            // Only the final Annex-B record is observable: the exact admitted
+            // body has no call, property access or static read between matches.
+            let mut caps = std::mem::take(&mut self.matchall_caps_scratch);
+            debug_assert!(caps.is_empty());
+            caps.reserve(packed.ncaps as usize);
+            for group in 0..packed.ncaps as usize {
+                let (s, e) = (packed.caps[2 * group], packed.caps[2 * group + 1]);
+                caps.push((s != u32::MAX).then(|| s as usize..e as usize));
+            }
+            let matched =
+                regress::Match::from_scan_parts(packed.mstart as usize..packed.mend as usize, caps);
+            let subject_idx = subject.heap_index();
+            let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+                vm.ascii_slice_value(subject_idx, r)
+            };
+            self.regexp_record_statics(
+                &matched,
+                subject,
+                subject_idx,
+                packed.mstart as usize,
+                packed.mend as usize,
+                subject_units,
+                true,
+                &mk,
+            );
+            let mut caps = matched.captures;
+            caps.clear();
+            self.matchall_caps_scratch = caps;
+
+            let record = self
+                .regexp_string_iters
+                .get_mut(&it_idx)
+                .expect("preflighted matchAll iterator must survive an allocation-free reduction");
+            record.subject = subject;
+            record.subj_units = subject_units;
+            debug_assert!(record.scalar_pending.is_none());
+            record.scalar_pending = Some(packed);
+            record.done = true;
+        } else if let Some(record) = self.regexp_string_iters.get_mut(&it_idx) {
+            record.done = true;
+        }
+        // MatchAll's engine-private clone is exhausted and would reset to zero.
+        if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(matcher_idx) {
+            *last_index = Value::int(0);
+        }
+        if let Some(dead) = self.matchall_batches.remove(&it_idx) {
+            let mut flat = dead.flat;
+            flat.clear();
+            self.matchall_flat_scratch = flat;
+        }
+        rxstats::count_scalar_array_reduce(matches, (n - i) as u64);
+        Some(RegexpScalarStep::Done)
     }
 
     /// Materialise the one pending result into the exact skipped global
@@ -2824,14 +3216,8 @@ impl<'p> Vm<'p> {
         let mka =
             |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.ascii_slice_value(s_idx, r) };
         let _gc = self.gc_lock_guard();
-        let out = self.regexp_build_result(
-            &m,
-            string,
-            p.mstart as usize,
-            p.mend as usize,
-            false,
-            &mka,
-        );
+        let out =
+            self.regexp_build_result(&m, string, p.mstart as usize, p.mend as usize, false, &mka);
         let mut caps = m.captures;
         caps.clear();
         self.matchall_caps_scratch = caps;
@@ -2858,8 +3244,16 @@ impl<'p> Vm<'p> {
             return RegexpScalarExecStep::Decline;
         }
         let (flags_ok, last_index_ok, matcher_ok, twin_ready) = match self.heap.get(re_idx) {
-            HeapObj::RegExp { regex, flags, last_index, ascii_twin, .. } => (
-                !flags.bytes().any(|b| matches!(b, b'g' | b'y' | b'u' | b'v' | b'd')),
+            HeapObj::RegExp {
+                regex,
+                flags,
+                last_index,
+                ascii_twin,
+                ..
+            } => (
+                !flags
+                    .bytes()
+                    .any(|b| matches!(b, b'g' | b'y' | b'u' | b'v' | b'd')),
                 last_index.is_number(),
                 !regex.has_named_groups(),
                 ascii_twin.is_some(),
@@ -2890,15 +3284,19 @@ impl<'p> Vm<'p> {
                 _ => return RegexpScalarExecStep::Decline,
             };
             let regex: &regress::Regex = match self.heap.get(re_idx) {
-                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => twin,
-                HeapObj::RegExp { ascii_twin: Some(None), regex, .. } => regex,
+                HeapObj::RegExp {
+                    ascii_twin: Some(Some(twin)),
+                    ..
+                } => twin,
+                HeapObj::RegExp {
+                    ascii_twin: Some(None),
+                    regex,
+                    ..
+                } => regex,
                 _ => return RegexpScalarExecStep::Decline,
             };
             let _ = regex.scan_ascii(subj, 0, 1, &mut |range, captures| {
-                if captures.len() != 4
-                    || range.start > range.end
-                    || range.end > subj_units
-                {
+                if captures.len() != 4 || range.start > range.end || range.end > subj_units {
                     malformed = true;
                     return;
                 }
@@ -3330,7 +3728,10 @@ impl<'p> Vm<'p> {
                 _ => "",
             };
             let re = match self.heap.get(regexp) {
-                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => &**twin,
+                HeapObj::RegExp {
+                    ascii_twin: Some(Some(twin)),
+                    ..
+                } => &**twin,
                 // Twin compile failed once: the base program is byte-safe too.
                 HeapObj::RegExp { regex, .. } => &**regex,
                 _ => return false,
@@ -3353,10 +3754,19 @@ impl<'p> Vm<'p> {
                 }
             })
         };
-        debug_assert!(exhausted || !flat.is_empty(), "a capped drain always carries matches");
+        debug_assert!(
+            exhausted || !flat.is_empty(),
+            "a capped drain always carries matches"
+        );
         self.matchall_batches.insert(
             it_idx,
-            MatchBatch { expected_li: li as u32, next: 0, ncaps, exhausted, flat },
+            MatchBatch {
+                expected_li: li as u32,
+                next: 0,
+                ncaps,
+                exhausted,
+                flat,
+            },
         );
         true
     }
@@ -3438,7 +3848,12 @@ impl<'p> Vm<'p> {
 
     /// AdvanceStringIndex reading the units from heap string `s` (for the lazy
     /// matchAll driver, which doesn't keep an encoded unit buffer around).
-    pub(crate) fn advance_index_on_value(&mut self, s: Value, index: usize, unicode: bool) -> usize {
+    pub(crate) fn advance_index_on_value(
+        &mut self,
+        s: Value,
+        index: usize,
+        unicode: bool,
+    ) -> usize {
         if unicode && s.is_heap() {
             self.heap.flatten(s.heap_index());
             if let HeapObj::Str(js) = self.heap.get(s.heap_index()) {
@@ -3490,7 +3905,11 @@ impl<'p> Vm<'p> {
         // of them is a functional replacer too, and testing only the two
         // compiled shapes ToString'd it into a literal template instead.
         let callable = self.is_callable(repl);
-        let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
+        let repl_str = if callable {
+            String::new()
+        } else {
+            self.to_js_string(repl)?
+        };
         // No match ⇒ the result is the subject unchanged (T0.4): return it as-is,
         // after the observable `ToString(replaceValue)` above, skipping the full
         // subject copy/rebuild. Strings are immutable, so the same heap value is
@@ -3509,9 +3928,8 @@ impl<'p> Vm<'p> {
         // must not update the statics.
         if let Some(m) = matches.last() {
             let (mstart, mend) = (m.start(), m.end());
-            let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
-                vm.units_value(&u16s[r])
-            };
+            let mk =
+                |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.units_value(&u16s[r]) };
             self.regexp_record_statics(
                 m,
                 Value::heap(s_idx),
@@ -3580,7 +3998,10 @@ impl<'p> Vm<'p> {
                 let groups: Vec<Option<String>> = m
                     .captures
                     .iter()
-                    .map(|c| c.as_ref().map(|r| String::from_utf16_lossy(&u16s[r.clone()])))
+                    .map(|c| {
+                        c.as_ref()
+                            .map(|r| String::from_utf16_lossy(&u16s[r.clone()]))
+                    })
                     .collect();
                 let named: Vec<(String, Option<String>)> = m
                     .named_groups()
@@ -3601,7 +4022,9 @@ impl<'p> Vm<'p> {
             last = en;
         }
         push_units(&mut out, &u16s[last..]);
-        Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out))))
+        Ok(Value::heap(
+            self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)),
+        ))
     }
 
     /// `regex_replace` for an all-ASCII subject: regress `find_from_ascii`
@@ -3623,7 +4046,10 @@ impl<'p> Vm<'p> {
                 _ => "",
             };
             let regex: Option<&regress::Regex> = match self.heap.get(re) {
-                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => Some(twin),
+                HeapObj::RegExp {
+                    ascii_twin: Some(Some(twin)),
+                    ..
+                } => Some(twin),
                 HeapObj::RegExp { regex, .. } => Some(regex),
                 _ => None,
             };
@@ -3643,7 +4069,11 @@ impl<'p> Vm<'p> {
         // of them is a functional replacer too, and testing only the two
         // compiled shapes ToString'd it into a literal template instead.
         let callable = self.is_callable(repl);
-        let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
+        let repl_str = if callable {
+            String::new()
+        } else {
+            self.to_js_string(repl)?
+        };
         // No match ⇒ the result is the subject unchanged (T0.4): return it as-is,
         // after the observable `ToString(replaceValue)`, skipping the subject
         // memcpy + rebuild. (~46% of the regex bench's section-3 lines have no
@@ -3752,11 +4182,12 @@ impl<'p> Vm<'p> {
             last = en;
         }
         out.extend_from_slice(subject[last..].as_bytes());
-        Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out))))
+        Ok(Value::heap(
+            self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)),
+        ))
     }
 
     // ── TypedArrays / ArrayBuffer / DataView ──
-
 }
 
 /// The pattern characters fed to the regress parser for a NON-`u`/`v` regex,
@@ -3830,7 +4261,9 @@ pub(crate) fn nonunicode_pattern_chars(units: &[u16]) -> Vec<u32> {
                 && i + 2 < units.len()
                 && units[i + 1] == '?' as u16
                 && units[i + 2] == '<' as u16
-                && units.get(i + 3).map_or(true, |&n| n != '=' as u16 && n != '!' as u16) =>
+                && units
+                    .get(i + 3)
+                    .map_or(true, |&n| n != '=' as u16 && n != '!' as u16) =>
             {
                 out.extend_from_slice(&['(' as u32, '?' as u32, '<' as u32]);
                 in_name = true;
@@ -3915,6 +4348,24 @@ pub(crate) fn rx_scalar_matchall_enabled() -> bool {
     }
 }
 
+/// Whole-outer-loop dense-string-array reducer for the exact scalar matchAll
+/// plan. `ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE=1` restores the ordinary scalar
+/// iterator path on the same binary.
+#[inline]
+pub(crate) fn rx_dense_array_matchall_reduce_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Exact MEM-only non-global exec scalarization.  Every dependent switch is
 /// part of the isolation contract: turning off the direct call, canonical
 /// string-number grammar, compact result representation, or slim ASCII exec
@@ -3983,7 +4434,7 @@ pub(crate) fn string_regexp_call_direct_enabled() -> bool {
 /// `m[i]`/`m.index`/`m.input`/`m.groups` should show near-zero materialisations.
 /// Off, this costs one relaxed atomic load per event.
 pub(crate) mod rxstats {
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);
     static COMPACT: AtomicU64 = AtomicU64::new(0);
@@ -4141,6 +4592,21 @@ pub(crate) mod rxstats {
         }
     }
 
+    /// Account for the observable operations represented by one successful
+    /// outer-array reduction without putting an atomic/branch in its match loop.
+    #[inline]
+    pub(crate) fn count_scalar_array_reduce(matches: u64, subjects: u64) {
+        if enabled() {
+            SCALAR_SUCCESS.fetch_add(matches, Ordering::Relaxed);
+            SCALAR_CAPTURE_NUM.fetch_add(matches, Ordering::Relaxed);
+            let elided = matches.saturating_sub((matches != 0) as u64);
+            SCALAR_ELIDED.fetch_add(elided, Ordering::Relaxed);
+            // Each global iterator would expose one step per match plus its
+            // terminal done step. Preserve the diagnostic accounting.
+            STEP_FUSED.fetch_add(matches.saturating_add(subjects), Ordering::Relaxed);
+        }
+    }
+
     /// A scalar helper guard that declined before any observable operation.
     #[inline]
     pub(crate) fn count_scalar_guard_decline() {
@@ -4263,7 +4729,6 @@ pub(crate) mod rxstats {
             SCALAR_EXEC_SLOW_FLUSH.load(Ordering::Relaxed),
         )
     }
-
 }
 
 /// Assemble a RegExp `flags` string in the canonical order `dgimsuvy`,

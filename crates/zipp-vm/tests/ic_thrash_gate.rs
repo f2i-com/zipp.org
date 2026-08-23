@@ -271,6 +271,9 @@ fn pin_child(gate_off: bool) -> (String, u64) {
     cmd.args(["--exact", "icgate_pin_child", "--ignored", "--nocapture", "--test-threads", "1"]);
     cmd.env("ZIPP_ICSTATS", "1");
     cmd.env("ZIPP_ICGATE_PIN_CHILD", "1");
+    // This is an IC mechanism pin: keep the field-write stream reducer from
+    // consuming the measured loop before its SetProp site reaches the IC.
+    cmd.env("ZIPP_NO_FIELD_WRITE_STREAM", "1");
     if gate_off {
         cmd.env("ZIPP_NO_ICGATE", "1");
     } else {

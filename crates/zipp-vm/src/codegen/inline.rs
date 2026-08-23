@@ -5,6 +5,41 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// `ZIPP_NO_SPAN_CODEUNIT_PRED=1` restores the generic boxed leaf expansion.
+/// Read once while plans are built; never consulted by emitted hot code.
+#[inline]
+pub(crate) fn span_code_unit_pred_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_SPAN_CODEUNIT_PRED").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_SPAN_CODEUNIT_PAIR=1` keeps the single-predicate fusion but drops
+/// the caller-level `pred(i, a) || pred(i, b)` collapse.  Like the parent gate,
+/// this is latched once at plan time and is absent from emitted hot code.
+#[inline]
+pub(crate) fn span_code_unit_pair_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_SPAN_CODEUNIT_PAIR").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Emit a generic `CallMethod` / `Call` region op as a `jit_call_method_ic` /
 /// `jit_call_ic` helper call (vm/helpers_misc.rs). The helper consults the
 /// interpreter's per-site inline cache, frame-calls the resolved plain user
@@ -113,6 +148,10 @@ pub(crate) fn emit_inline_leaf_call(
     packed_args: u64,
     refetch: Option<(usize, usize)>,
     ta_refetch: Option<(usize, &TaPinPlan)>,
+    // `Some` only for an exact adjacent predicate pair.  A fused helper result
+    // resumes at the pair's shared branch; helper fallback still falls through
+    // to the first call's next bytecode.
+    span_pair_resume: Option<dynasmrt::DynamicLabel>,
 ) {
     let fallback = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -167,6 +206,58 @@ pub(crate) fn emit_inline_leaf_call(
         ; cmp QWORD [rsp + leaf_flag_off], 0
         ; je => fallback
     );
+    // A common pure scanner predicate has four helper crossings in its generic
+    // expansion: three dense-array reads and one `charCodeAt`.  The exact body
+    // recognizer records its four live global slots; one read-only helper can
+    // evaluate the complete predicate without scratch binding or boxed
+    // intermediates.  Any non-pristine receiver/key/value returns the deopt
+    // sentinel before observable work, so the unchanged call helper replays the
+    // original short-circuit program.
+    if let Some(pred) = plan.span_code_unit_pred {
+        let pair = pred.pair.zip(span_pair_resume);
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, QWORD pred.packed_globals as i64
+            ; mov r8, [rbx + dreg(arg_base)]
+        );
+        let span_helper = if let Some((pair, _)) = pair {
+            dynasm!(ops ; mov r9, QWORD pair.packed_units as i64);
+            pair.helper
+        } else {
+            dynasm!(ops ; mov r9, [rbx + dreg(arg_base + 1)]);
+            pred.helper
+        };
+        dynasm!(ops
+            ; mov rax, QWORD span_helper as i64
+            ; call rax
+            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => fallback
+            ; mov [rbx + dreg(dst)], rax
+        );
+        if let Some((_, resume)) = pair {
+            dynasm!(ops ; jmp => resume);
+        } else {
+            dynasm!(ops ; jmp => done);
+        }
+        dynasm!(ops ; => fallback);
+        let helper_bail = ops.new_dynamic_label();
+        emit_region_call_ic(
+            ops,
+            call_ip,
+            helper_bail,
+            epilogue,
+            helper,
+            packed_fip,
+            packed_args,
+            argc,
+            dst,
+            refetch,
+            ta_refetch,
+        );
+        dynasm!(ops ; => done);
+        return;
+    }
     // ── typed lane ── a fully scheduled register-resident emission replaces
     // the boxed loop below when the planner proved the body numeric; every
     // guard/bail inside it jumps to `fallback` (a pure prefix — nothing is
@@ -180,8 +271,17 @@ pub(crate) fn emit_inline_leaf_call(
         );
         let helper_bail = ops.new_dynamic_label();
         emit_region_call_ic(
-            ops, call_ip, helper_bail, epilogue, helper, packed_fip, packed_args, argc, dst,
-            refetch, ta_refetch,
+            ops,
+            call_ip,
+            helper_bail,
+            epilogue,
+            helper,
+            packed_fip,
+            packed_args,
+            argc,
+            dst,
+            refetch,
+            ta_refetch,
         );
         dynasm!(ops ; => done);
         return;
@@ -262,8 +362,9 @@ pub(crate) fn emit_inline_leaf_call(
     // `blabels[target]`. Body index == callee ip (the body is the contiguous
     // truncated prefix `full[..=term]`). Control converges on the single trailing
     // Return; the sink is never reached for a well-formed body (no target == len).
-    let blabels: Vec<dynasmrt::DynamicLabel> =
-        (0..=plan.body.len()).map(|_| ops.new_dynamic_label()).collect();
+    let blabels: Vec<dynasmrt::DynamicLabel> = (0..=plan.body.len())
+        .map(|_| ops.new_dynamic_label())
+        .collect();
     let mut ret_reg: Option<u16> = None;
     // Pending captured-variable writes: upvalue index → the scratch register
     // holding the value to commit after the body. See the `UpvalSet` arm.
@@ -326,19 +427,59 @@ pub(crate) fn emit_inline_leaf_call(
             }
             Instr::Add { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Add, true)
+                dbinop(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    DOp::Add,
+                    true,
+                )
             }
             Instr::Sub { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Sub, true)
+                dbinop(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    DOp::Sub,
+                    true,
+                )
             }
             Instr::Mul { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Mul, true)
+                dbinop(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    DOp::Mul,
+                    true,
+                )
             }
             Instr::Div { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Div, false)
+                dbinop(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    DOp::Div,
+                    false,
+                )
             }
             Instr::Mod { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
@@ -440,11 +581,26 @@ pub(crate) fn emit_inline_leaf_call(
                 load_toint32(ops, rg(b), bail);
                 dynasm!(ops ; mov ecx, eax ; mov eax, r8d);
                 match op {
-                    B::And => { dynasm!(ops ; and eax, ecx); box_eax(ops, rg(d)); }
-                    B::Or => { dynasm!(ops ; or eax, ecx); box_eax(ops, rg(d)); }
-                    B::Xor => { dynasm!(ops ; xor eax, ecx); box_eax(ops, rg(d)); }
-                    B::Shl => { dynasm!(ops ; shl eax, cl); box_eax(ops, rg(d)); }
-                    B::Shr => { dynasm!(ops ; sar eax, cl); box_eax(ops, rg(d)); }
+                    B::And => {
+                        dynasm!(ops ; and eax, ecx);
+                        box_eax(ops, rg(d));
+                    }
+                    B::Or => {
+                        dynasm!(ops ; or eax, ecx);
+                        box_eax(ops, rg(d));
+                    }
+                    B::Xor => {
+                        dynasm!(ops ; xor eax, ecx);
+                        box_eax(ops, rg(d));
+                    }
+                    B::Shl => {
+                        dynasm!(ops ; shl eax, cl);
+                        box_eax(ops, rg(d));
+                    }
+                    B::Shr => {
+                        dynasm!(ops ; sar eax, cl);
+                        box_eax(ops, rg(d));
+                    }
                     B::Ushr => {
                         let as_dbl = ops.new_dynamic_label();
                         let done_u = ops.new_dynamic_label();
@@ -467,7 +623,12 @@ pub(crate) fn emit_inline_leaf_call(
                 }
                 emit_region_bail(ops, call_ip, bail, epilogue);
             }
-            Instr::MathOp { dst: d, op, arg_base: ab, argc: ac } => {
+            Instr::MathOp {
+                dst: d,
+                op,
+                arg_base: ab,
+                argc: ac,
+            } => {
                 let bail = ops.new_dynamic_label();
                 if ac == 1 {
                     load_num_xmm(ops, rg(ab), 0, bail);
@@ -595,7 +756,12 @@ pub(crate) fn emit_inline_leaf_call(
             // ── str.charCodeAt(i) ── `callee_leaf_ok` admitted only this 1-arg
             // method. Uses `cc_helper` (jit_char_code_at) — NEVER the fallback
             // `helper` (call_ic). Read-only, no alloc → no refetch.
-            Instr::CallMethod { dst: d, obj, arg_base: ab, .. } => {
+            Instr::CallMethod {
+                dst: d,
+                obj,
+                arg_base: ab,
+                ..
+            } => {
                 let bail = ops.new_dynamic_label();
                 dynasm!(ops
                     ; mov rcx, rdi
@@ -681,11 +847,31 @@ pub(crate) fn emit_inline_leaf_call(
             // block internally (record CALL ip → epilogue).
             Instr::Eq { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                region_poly_eq(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), false, strict_eq);
+                region_poly_eq(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    false,
+                    strict_eq,
+                );
             }
             Instr::Ne { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                region_poly_eq(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), true, strict_eq);
+                region_poly_eq(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    true,
+                    strict_eq,
+                );
             }
             Instr::Lt { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
@@ -757,7 +943,16 @@ pub(crate) fn emit_inline_leaf_call(
     // ip via the bail label `emit_region_call_ic` creates internally.
     let helper_bail = ops.new_dynamic_label();
     emit_region_call_ic(
-        ops, call_ip, helper_bail, epilogue, helper, packed_fip, packed_args, argc, dst, refetch,
+        ops,
+        call_ip,
+        helper_bail,
+        epilogue,
+        helper,
+        packed_fip,
+        packed_args,
+        argc,
+        dst,
+        refetch,
         ta_refetch,
     );
     dynasm!(ops ; => done);
@@ -807,7 +1002,11 @@ pub(crate) fn emit_mi_body(
             }
             // `this.<field>` — an own DATA slot, baked behind the receiver guard
             // (the version guard guarantees `vals_ptr`/`slot` are still valid).
-            Instr::GetProp { dst: d, obj: 0, name } => {
+            Instr::GetProp {
+                dst: d,
+                obj: 0,
+                name,
+            } => {
                 let slot = field_slots.get(&name).copied().unwrap_or(0);
                 dynasm!(ops
                     ; mov rcx, QWORD vals_ptr as i64
@@ -817,19 +1016,59 @@ pub(crate) fn emit_mi_body(
             }
             Instr::Add { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Add, true)
+                dbinop(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    DOp::Add,
+                    true,
+                )
             }
             Instr::Sub { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Sub, true)
+                dbinop(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    DOp::Sub,
+                    true,
+                )
             }
             Instr::Mul { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Mul, true)
+                dbinop(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    DOp::Mul,
+                    true,
+                )
             }
             Instr::Div { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
-                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Div, false)
+                dbinop(
+                    ops,
+                    call_ip,
+                    bail,
+                    epilogue,
+                    rg(d),
+                    rg(a),
+                    rg(b),
+                    DOp::Div,
+                    false,
+                )
             }
             Instr::Mod { dst: d, a, b } => {
                 let bail = ops.new_dynamic_label();
@@ -931,11 +1170,26 @@ pub(crate) fn emit_mi_body(
                 load_toint32(ops, rg(b), bail);
                 dynasm!(ops ; mov ecx, eax ; mov eax, r8d);
                 match op {
-                    B::And => { dynasm!(ops ; and eax, ecx); box_eax(ops, rg(d)); }
-                    B::Or => { dynasm!(ops ; or eax, ecx); box_eax(ops, rg(d)); }
-                    B::Xor => { dynasm!(ops ; xor eax, ecx); box_eax(ops, rg(d)); }
-                    B::Shl => { dynasm!(ops ; shl eax, cl); box_eax(ops, rg(d)); }
-                    B::Shr => { dynasm!(ops ; sar eax, cl); box_eax(ops, rg(d)); }
+                    B::And => {
+                        dynasm!(ops ; and eax, ecx);
+                        box_eax(ops, rg(d));
+                    }
+                    B::Or => {
+                        dynasm!(ops ; or eax, ecx);
+                        box_eax(ops, rg(d));
+                    }
+                    B::Xor => {
+                        dynasm!(ops ; xor eax, ecx);
+                        box_eax(ops, rg(d));
+                    }
+                    B::Shl => {
+                        dynasm!(ops ; shl eax, cl);
+                        box_eax(ops, rg(d));
+                    }
+                    B::Shr => {
+                        dynasm!(ops ; sar eax, cl);
+                        box_eax(ops, rg(d));
+                    }
                     B::Ushr => {
                         let as_dbl = ops.new_dynamic_label();
                         let done_u = ops.new_dynamic_label();
@@ -1021,8 +1275,16 @@ pub(crate) fn emit_mi_body(
                 // Emit the super body (v1: no nested super → empty supers map).
                 let no_supers: FxHashMap<usize, SuperInline> = FxHashMap::default();
                 let sret = emit_mi_body(
-                    ops, call_ip, epilogue, fallback, &s.body, &no_supers, &s.field_slots,
-                    &s.consts, vals_ptr, s.win_off,
+                    ops,
+                    call_ip,
+                    epilogue,
+                    fallback,
+                    &s.body,
+                    &no_supers,
+                    &s.field_slots,
+                    &s.consts,
+                    vals_ptr,
+                    s.win_off,
                 );
                 match sret {
                     Some(r) => dynasm!(ops
@@ -1094,8 +1356,16 @@ pub(crate) fn emit_mi_body(
                 // ret_reg is discarded.
                 let no_supers: FxHashMap<usize, SuperInline> = FxHashMap::default();
                 let _ = emit_mi_body(
-                    ops, call_ip, epilogue, fallback, &s.body, &no_supers, &s.field_slots,
-                    &s.consts, vals_ptr, s.win_off,
+                    ops,
+                    call_ip,
+                    epilogue,
+                    fallback,
+                    &s.body,
+                    &no_supers,
+                    &s.field_slots,
+                    &s.consts,
+                    vals_ptr,
+                    s.win_off,
                 );
             }
             // `this.<field> = val` (a trivial setter's store) — a baked in-place
@@ -1103,7 +1373,12 @@ pub(crate) fn emit_mi_body(
             // accessor_fast_set). The body's ONLY effect; method_inline_body_ok
             // admits it ONLY as the last op before the terminator, so any earlier
             // op's number-guard bail re-runs the whole call cleanly.
-            Instr::SetProp { obj: 0, name, val, strict: _ } => {
+            Instr::SetProp {
+                obj: 0,
+                name,
+                val,
+                strict: _,
+            } => {
                 let slot = field_slots.get(&name).copied().unwrap_or(0);
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(rg(val))]
@@ -1177,9 +1452,15 @@ pub(crate) fn emit_inline_method_call(
     // specific instance's identity+version (the ABA / own-shadow / freeze /
     // setPrototypeOf / vals-realloc discriminator); a miss tries the next arm,
     // all-miss falls to the helper, which re-resolves correctly.
-    let arm_labels: Vec<_> = (0..plan.shapes.len()).map(|_| ops.new_dynamic_label()).collect();
+    let arm_labels: Vec<_> = (0..plan.shapes.len())
+        .map(|_| ops.new_dynamic_label())
+        .collect();
     for (si, shape) in plan.shapes.iter().enumerate() {
-        let miss = if si + 1 < plan.shapes.len() { arm_labels[si + 1] } else { fallback };
+        let miss = if si + 1 < plan.shapes.len() {
+            arm_labels[si + 1]
+        } else {
+            fallback
+        };
         dynasm!(ops
             ; => arm_labels[si]
             ; mov r10, QWORD shape.recv_bits as i64
@@ -1295,7 +1576,16 @@ pub(crate) fn emit_inline_method_call(
     dynasm!(ops ; => fallback);
     let helper_bail = ops.new_dynamic_label();
     emit_region_call_ic(
-        ops, call_ip, helper_bail, epilogue, helper, packed_fip, packed_args, argc, dst, refetch,
+        ops,
+        call_ip,
+        helper_bail,
+        epilogue,
+        helper,
+        packed_fip,
+        packed_args,
+        argc,
+        dst,
+        refetch,
         ta_refetch,
     );
     dynasm!(ops ; => done);
@@ -1328,9 +1618,15 @@ pub(crate) fn emit_inline_accessor(
         ; cmp QWORD [rsp + method_flag_off], 0
         ; je => after
     );
-    let arm_labels: Vec<_> = (0..plan.shapes.len()).map(|_| ops.new_dynamic_label()).collect();
+    let arm_labels: Vec<_> = (0..plan.shapes.len())
+        .map(|_| ops.new_dynamic_label())
+        .collect();
     for (si, shape) in plan.shapes.iter().enumerate() {
-        let miss = if si + 1 < plan.shapes.len() { arm_labels[si + 1] } else { after };
+        let miss = if si + 1 < plan.shapes.len() {
+            arm_labels[si + 1]
+        } else {
+            after
+        };
         dynasm!(ops
             ; => arm_labels[si]
             ; mov r10, QWORD shape.recv_bits as i64
@@ -1386,8 +1682,16 @@ pub(crate) fn emit_inline_accessor(
             }
         }
         let ret = emit_mi_body(
-            ops, call_ip, epilogue, after, &shape.body, &shape.supers, &shape.field_slots,
-            &shape.consts, shape.vals_ptr, w,
+            ops,
+            call_ip,
+            epilogue,
+            after,
+            &shape.body,
+            &shape.supers,
+            &shape.field_slots,
+            &shape.consts,
+            shape.vals_ptr,
+            w,
         );
         if !is_setter {
             match ret {
@@ -1472,64 +1776,146 @@ pub(crate) enum LaneOp32 {
 pub(crate) enum LaneStep {
     /// `jit_cell_get(cell)`; deopt sentinel → fallback; optionally park the
     /// boxed bits in a scratch-window slot (multi-upval entry).
-    UpvalCall { cell_bits: u64, park_slot: Option<u16> },
+    UpvalCall {
+        cell_bits: u64,
+        park_slot: Option<u16>,
+    },
     /// Tag-guard the fetched cell bits as Int and sign-extend into a home.
-    UpvalBind { park_slot: Option<u16>, d: u8 },
+    UpvalBind {
+        park_slot: Option<u16>,
+        d: u8,
+    },
     /// Load a caller arg slot, tag-guard Int, sign-extend into a home.
-    ParamLoad { slot: u16, d: u8 },
+    ParamLoad {
+        slot: u16,
+        d: u8,
+    },
     /// The nested-splice identity guard, fused with its feeding `LoadGlobal`:
     /// re-read `globals[g]` (the value the guarded register would hold) and
     /// compare bits + heap slot version, exactly the generic `Call` arm.
-    CalleeGuard { gidx: u32, bits: u64, ver: u32 },
+    CalleeGuard {
+        gidx: u32,
+        bits: u64,
+        ver: u32,
+    },
     /// `Rq(d) = imm64` (an int immediate too wide for an ALU imm32 field).
-    GImm { d: u8, v: i64 },
+    GImm {
+        d: u8,
+        v: i64,
+    },
     /// Exact i64 add/sub (bounds proven ≤ 2^53 at plan time).
-    IAdd { d: u8, a: u8, b: LaneOp32, sub: bool },
+    IAdd {
+        d: u8,
+        a: u8,
+        b: LaneOp32,
+        sub: bool,
+    },
     /// `d = imm - b` (the one non-commutative imm-lhs shape).
-    IAddImmRev { d: u8, imm: i64, b: u8 },
+    IAddImmRev {
+        d: u8,
+        imm: i64,
+        b: u8,
+    },
     /// 32-bit ALU op on ToInt32'd operands; result re-extended per op
     /// (movsxd for signed results, the 32-bit write's zero-extension for
     /// `>>>`). Shift counts are pre-masked (&31) when immediate.
-    Bit32 { d: u8, a: LaneOp32, b: LaneOp32, op: crate::bytecode::BitwiseOp },
+    Bit32 {
+        d: u8,
+        a: LaneOp32,
+        b: LaneOp32,
+        op: crate::bytecode::BitwiseOp,
+    },
     /// `movsxd Rq(d), low32(s)` — the `|0` wrap of a wide exact integer.
-    SignExt { d: u8, s: u8 },
+    SignExt {
+        d: u8,
+        s: u8,
+    },
     /// `mov Rd(d), low32(s)` — zero-extend (the `>>>0` wrap).
-    ZeroExt { d: u8, s: u8 },
+    ZeroExt {
+        d: u8,
+        s: u8,
+    },
     /// `Math.imul`: 32-bit signed multiply of ToInt32'd operands.
-    Imul32 { d: u8, a: LaneOp32, b: LaneOp32 },
+    Imul32 {
+        d: u8,
+        a: LaneOp32,
+        b: LaneOp32,
+    },
     /// ToInt32 of an f64 home, IN-RANGE ONLY: out-of-i32 (the modular-wrap
     /// case, NaN, ±Inf) jumps to fallback and the whole call re-runs.
-    ToI32F64 { d: u8, s: u8 },
+    ToI32F64 {
+        d: u8,
+        s: u8,
+    },
     /// `Rx(d) = f64(Rq(s))` — exact, |v| ≤ 2^53 by the Int invariant.
-    CvtIX { d: u8, s: u8 },
+    CvtIX {
+        d: u8,
+        s: u8,
+    },
     /// `Rx(d) = <raw f64 bits>` via rax.
-    XImm { d: u8, bits: u64 },
+    XImm {
+        d: u8,
+        bits: u64,
+    },
     /// Scalar f64 op, bytecode-op-for-op (never algebraically fused).
-    FBin { d: u8, a: u8, b: u8, op: DOp },
+    FBin {
+        d: u8,
+        a: u8,
+        b: u8,
+        op: DOp,
+    },
     /// Exit: store pre-folded boxed bits into the caller's `dst`.
-    RetImm { bits: u64 },
+    RetImm {
+        bits: u64,
+    },
     /// Exit: box an Int home (`narrow` = proven i32 ⇒ direct Int tag).
-    RetInt { s: u8, narrow: bool },
+    RetInt {
+        s: u8,
+        narrow: bool,
+    },
     /// Exit: store an f64 home's raw bits (the `store_xmm` convention).
-    RetF64 { s: u8 },
+    RetF64 {
+        s: u8,
+    },
     /// Exit upval commit staging: box into a scratch-window slot.
-    BoxIntToSlot { s: u8, slot: u16, narrow: bool },
-    BoxF64ToSlot { s: u8, slot: u16 },
-    ImmToSlot { bits: u64, slot: u16 },
+    BoxIntToSlot {
+        s: u8,
+        slot: u16,
+        narrow: bool,
+    },
+    BoxF64ToSlot {
+        s: u8,
+        slot: u16,
+    },
+    ImmToSlot {
+        bits: u64,
+        slot: u16,
+    },
     /// Exit upval commit: `jit_cell_set(cell, [slot])`.
-    CellCommit { cell_bits: u64, slot: u16 },
+    CellCommit {
+        cell_bits: u64,
+        slot: u16,
+    },
     /// W19 (MI-LANE): `this.<field>` — a baked `[vals_ptr + slot*8]` load,
     /// tag-guarded Int and sign-extended into a GPR home. Shape-identical to
     /// `ParamLoad`, with a baked absolute address in place of a window slot
     /// (the receiver's identity+version guard, already emitted by the arm,
     /// is what makes `vals_ptr`/`slot` valid).
-    FieldLoadInt { vals_ptr: u64, slot: u32, d: u8 },
+    FieldLoadInt {
+        vals_ptr: u64,
+        slot: u32,
+        d: u8,
+    },
     /// The same load guarded as a boxed DOUBLE — high-16 OUTSIDE the tag band
     /// `[INT_TAG_HI, TAG_HI]`, i.e. exactly `load_num_xmm`'s non-Int arm —
     /// into an xmm home. Which of the two is emitted is decided at plan time
     /// from the slot's live representation; the other tagging misses the
     /// guard and re-runs the call through the helper.
-    FieldLoadF64 { vals_ptr: u64, slot: u32, d: u8 },
+    FieldLoadF64 {
+        vals_ptr: u64,
+        slot: u32,
+        d: u8,
+    },
     /// W19 (MI-LANE): the `super.m()` / `super.v` guard block — class epoch,
     /// one version compare per super-chain hop (`hop_pool[at..at+len]`), and
     /// the holder-slot re-read. Produces NO value: the flattened super body
@@ -1594,7 +1980,12 @@ fn lane_use_def(ins: &Instr) -> Option<(([u16; 3], u8), Option<u16>)> {
         | Instr::Div { dst, a, b }
         | Instr::Bitwise { dst, a, b, .. } => u2(a, b, Some(dst)),
         Instr::AddInt { dst, a, .. } => u1(a, Some(dst)),
-        Instr::MathOp { dst, arg_base, argc, .. } => {
+        Instr::MathOp {
+            dst,
+            arg_base,
+            argc,
+            ..
+        } => {
             if argc == 2 {
                 u2(arg_base, arg_base + 1, Some(dst))
             } else {
@@ -1756,7 +2147,12 @@ impl LaneBuilder<'_> {
     /// dying sources may be reused). `exclude` shields an UNTRACKED temp
     /// (a just-allocated ToInt32 destination has no binder yet, so liveness
     /// alone would hand its home out again within the same op).
-    fn alloc_gpr(&self, from: usize, prefer: &[u8], exclude: Option<u8>) -> Result<u8, &'static str> {
+    fn alloc_gpr(
+        &self,
+        from: usize,
+        prefer: &[u8],
+        exclude: Option<u8>,
+    ) -> Result<u8, &'static str> {
         for &h in prefer.iter().chain(LANE_GPR_HOMES.iter()) {
             if Some(h) != exclude && !self.home_live(from, true, h) {
                 return Ok(h);
@@ -1795,9 +2191,16 @@ impl LaneBuilder<'_> {
                 return Err("param-not-passed");
             }
             let h = self.alloc_gpr(i, &[], None)?;
-            self.steps.push(LaneStep::ParamLoad { slot: self.arg_base + pi, d: h });
+            self.steps.push(LaneStep::ParamLoad {
+                slot: self.arg_base + pi,
+                d: h,
+            });
             self.n_guards += 1;
-            let sid = self.push_slot(Av::Int { h, lo: IV32.0, hi: IV32.1 });
+            let sid = self.push_slot(Av::Int {
+                h,
+                lo: IV32.0,
+                hi: IV32.1,
+            });
             self.binds.insert(v, sid);
             return Ok(sid);
         }
@@ -1855,7 +2258,11 @@ impl LaneBuilder<'_> {
         }
         let (alo, ahi) = self.iv_of(sa);
         let (blo, bhi) = self.iv_of(sb);
-        let iv = if sub { (alo - bhi, ahi - blo) } else { (alo + blo, ahi + bhi) };
+        let iv = if sub {
+            (alo - bhi, ahi - blo)
+        } else {
+            (alo + blo, ahi + bhi)
+        };
         if iv.0 < -I53 || iv.1 > I53 {
             return Err("i53-overflow");
         }
@@ -1864,13 +2271,23 @@ impl LaneBuilder<'_> {
             (Av::Int { h: ha, .. }, Av::Int { h: hb, .. }) => {
                 let prefer = self.dying_homes(i, &[sa, sb], true);
                 let d = self.alloc_gpr(i + 1, &prefer, None)?;
-                LaneStep::IAdd { d, a: ha, b: LaneOp32::R(hb), sub }
+                LaneStep::IAdd {
+                    d,
+                    a: ha,
+                    b: LaneOp32::R(hb),
+                    sub,
+                }
             }
             (Av::Int { h: ha, .. }, Av::ImmI(vb)) => {
                 let prefer = self.dying_homes(i, &[sa], true);
                 if vb >= i32::MIN as i64 && vb <= i32::MAX as i64 {
                     let d = self.alloc_gpr(i + 1, &prefer, None)?;
-                    LaneStep::IAdd { d, a: ha, b: LaneOp32::I(vb as i32), sub }
+                    LaneStep::IAdd {
+                        d,
+                        a: ha,
+                        b: LaneOp32::I(vb as i32),
+                        sub,
+                    }
                 } else {
                     // Materialize the wide imm, then reg-reg (the template
                     // reads both sources before writing d, so d may even
@@ -1878,7 +2295,12 @@ impl LaneBuilder<'_> {
                     let t = self.alloc_gpr(i, &[], None)?;
                     self.steps.push(LaneStep::GImm { d: t, v: vb });
                     let d = self.alloc_gpr(i + 1, &prefer, None)?;
-                    LaneStep::IAdd { d, a: ha, b: LaneOp32::R(t), sub }
+                    LaneStep::IAdd {
+                        d,
+                        a: ha,
+                        b: LaneOp32::R(t),
+                        sub,
+                    }
                 }
             }
             (Av::ImmI(va), Av::Int { h: hb, .. }) => {
@@ -1890,11 +2312,21 @@ impl LaneBuilder<'_> {
                     let t = self.alloc_gpr(i, &[], None)?;
                     self.steps.push(LaneStep::GImm { d: t, v: va });
                     let d = self.alloc_gpr(i + 1, &prefer, None)?;
-                    LaneStep::IAdd { d, a: hb, b: LaneOp32::R(t), sub: false }
+                    LaneStep::IAdd {
+                        d,
+                        a: hb,
+                        b: LaneOp32::R(t),
+                        sub: false,
+                    }
                 } else {
                     let d = self.alloc_gpr(i + 1, &prefer, None)?;
                     if !sub {
-                        LaneStep::IAdd { d, a: hb, b: LaneOp32::I(va as i32), sub: false }
+                        LaneStep::IAdd {
+                            d,
+                            a: hb,
+                            b: LaneOp32::I(va as i32),
+                            sub: false,
+                        }
                     } else {
                         LaneStep::IAddImmRev { d, imm: va, b: hb }
                     }
@@ -1907,7 +2339,11 @@ impl LaneBuilder<'_> {
             _ => unreachable!(),
         };
         self.steps.push(step);
-        let sid = self.push_slot(Av::Int { h: d, lo: iv.0, hi: iv.1 });
+        let sid = self.push_slot(Av::Int {
+            h: d,
+            lo: iv.0,
+            hi: iv.1,
+        });
         self.binds.insert(dst, sid);
         Ok(())
     }
@@ -1951,7 +2387,10 @@ impl LaneBuilder<'_> {
                     scratch
                 }
                 Av::ImmI(v) => {
-                    slf.steps.push(LaneStep::XImm { d: scratch, bits: (v as f64).to_bits() });
+                    slf.steps.push(LaneStep::XImm {
+                        d: scratch,
+                        bits: (v as f64).to_bits(),
+                    });
                     scratch
                 }
                 Av::ImmF(bits) => {
@@ -1969,8 +2408,17 @@ impl LaneBuilder<'_> {
             prefer.extend(self.dying_homes(i, &[sb], false));
         }
         // A non-commutative op must never compute in-place over b.
-        let d = self.alloc_xmm(i + 1, &prefer, if !comm && xb >= 2 { Some(xb) } else { None })?;
-        self.steps.push(LaneStep::FBin { d, a: xa, b: xb, op });
+        let d = self.alloc_xmm(
+            i + 1,
+            &prefer,
+            if !comm && xb >= 2 { Some(xb) } else { None },
+        )?;
+        self.steps.push(LaneStep::FBin {
+            d,
+            a: xa,
+            b: xb,
+            op,
+        });
         let sid = self.push_slot(Av::F64 { h: d });
         self.binds.insert(dst, sid);
         Ok(())
@@ -1995,7 +2443,11 @@ impl LaneBuilder<'_> {
     }
 
     fn bind_int(&mut self, dst: u16, h: u8, iv: (i64, i64)) {
-        let sid = self.push_slot(Av::Int { h, lo: iv.0, hi: iv.1 });
+        let sid = self.push_slot(Av::Int {
+            h,
+            lo: iv.0,
+            hi: iv.1,
+        });
         self.binds.insert(dst, sid);
     }
 }
@@ -2060,19 +2512,51 @@ fn mi_shift_regs(ins: &Instr, off: u16) -> Result<Instr, &'static str> {
     Ok(match *ins {
         Instr::LoadInt { dst, val } => Instr::LoadInt { dst: s(dst), val },
         Instr::LoadBool { dst, val } => Instr::LoadBool { dst: s(dst), val },
-        Instr::Move { dst, src } => Instr::Move { dst: s(dst), src: s(src) },
-        Instr::Add { dst, a, b } => Instr::Add { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Sub { dst, a, b } => Instr::Sub { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Mul { dst, a, b } => Instr::Mul { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Div { dst, a, b } => Instr::Div { dst: s(dst), a: s(a), b: s(b) },
-        Instr::Mod { dst, a, b } => Instr::Mod { dst: s(dst), a: s(a), b: s(b) },
-        Instr::AddInt { dst, a, imm, upd } => {
-            Instr::AddInt { dst: s(dst), a: s(a), imm, upd }
-        }
-        Instr::Neg { dst, a } => Instr::Neg { dst: s(dst), a: s(a) },
-        Instr::Bitwise { dst, a, b, op } => {
-            Instr::Bitwise { dst: s(dst), a: s(a), b: s(b), op }
-        }
+        Instr::Move { dst, src } => Instr::Move {
+            dst: s(dst),
+            src: s(src),
+        },
+        Instr::Add { dst, a, b } => Instr::Add {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Sub { dst, a, b } => Instr::Sub {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Mul { dst, a, b } => Instr::Mul {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Div { dst, a, b } => Instr::Div {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::Mod { dst, a, b } => Instr::Mod {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+        },
+        Instr::AddInt { dst, a, imm, upd } => Instr::AddInt {
+            dst: s(dst),
+            a: s(a),
+            imm,
+            upd,
+        },
+        Instr::Neg { dst, a } => Instr::Neg {
+            dst: s(dst),
+            a: s(a),
+        },
+        Instr::Bitwise { dst, a, b, op } => Instr::Bitwise {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+            op,
+        },
         _ => return Err("mi-super-op-unshiftable"),
     })
 }
@@ -2135,7 +2619,9 @@ fn mi_flatten(
                     return Err("mi-too-many-supers");
                 }
                 let off = next_off;
-                next_off = off.checked_add(s.callee_reg_count).ok_or("mi-reg-overflow")?;
+                next_off = off
+                    .checked_add(s.callee_reg_count)
+                    .ok_or("mi-reg-overflow")?;
                 if next_off > 512 {
                     return Err("mi-reg-overflow");
                 }
@@ -2193,7 +2679,15 @@ fn mi_flatten(
             ref other => flat.push(other.clone()),
         }
     }
-    Ok((flat, consts, MiLaneCtx { vals_ptr, fields, guards }))
+    Ok((
+        flat,
+        consts,
+        MiLaneCtx {
+            vals_ptr,
+            fields,
+            guards,
+        },
+    ))
 }
 
 /// Schedule a typed lane for one METHOD-inline arm. `Err` declines with the
@@ -2224,9 +2718,10 @@ pub(crate) fn build_mi_lane(
     // precisely so the boxed path can re-run cleanly; a lane has guards after
     // it too (the exit box has none, but a later op's would), so exclude the
     // shape outright rather than reason about sinking.
-    if body.iter().any(|i| {
-        matches!(i, Instr::SetProp { obj: 0, .. } | Instr::SuperSet { .. })
-    }) {
+    if body
+        .iter()
+        .any(|i| matches!(i, Instr::SetProp { obj: 0, .. } | Instr::SuperSet { .. }))
+    {
         return Err("mi-effectful-body");
     }
     // ── v1: the lane must have something to WIN ── its value is removing the
@@ -2304,7 +2799,15 @@ pub(crate) fn build_typed_lane(
     nested: &FxHashMap<usize, NestedGuard>,
 ) -> Result<TypedLanePlan, &'static str> {
     build_lane_inner(
-        body, param_count, argc, arg_base, reg_window, callee_reg_count, upvals, consts, nested,
+        body,
+        param_count,
+        argc,
+        arg_base,
+        reg_window,
+        callee_reg_count,
+        upvals,
+        consts,
+        nested,
         None,
     )
 }
@@ -2387,16 +2890,34 @@ fn build_lane_inner(
             return Err("park-slot-overflow");
         }
         let cell_bits = *upvals.get(&idx).ok_or("upval-cell-missing")?;
-        let park = if parked { Some(reg_window + k as u16) } else { None };
-        b.steps.push(LaneStep::UpvalCall { cell_bits, park_slot: park });
+        let park = if parked {
+            Some(reg_window + k as u16)
+        } else {
+            None
+        };
+        b.steps.push(LaneStep::UpvalCall {
+            cell_bits,
+            park_slot: park,
+        });
         b.n_guards += 1;
     }
     for (k, &idx) in entry_idx.iter().enumerate() {
-        let park = if parked { Some(reg_window + k as u16) } else { None };
+        let park = if parked {
+            Some(reg_window + k as u16)
+        } else {
+            None
+        };
         let h = b.alloc_gpr(0, &[], None)?;
-        b.steps.push(LaneStep::UpvalBind { park_slot: park, d: h });
+        b.steps.push(LaneStep::UpvalBind {
+            park_slot: park,
+            d: h,
+        });
         b.n_guards += 1;
-        let sid = b.push_slot(Av::Int { h, lo: IV32.0, hi: IV32.1 });
+        let sid = b.push_slot(Av::Int {
+            h,
+            lo: IV32.0,
+            hi: IV32.1,
+        });
         b.uentry.insert(idx, sid);
     }
     // ── the straight-line body walk ──
@@ -2435,14 +2956,22 @@ fn build_lane_inner(
                 let &(slot, is_int) = ctx.fields.get(&name).ok_or("mi-field-unbaked")?;
                 if is_int {
                     let h = b.alloc_gpr(i, &[], None)?;
-                    b.steps.push(LaneStep::FieldLoadInt { vals_ptr: ctx.vals_ptr, slot, d: h });
+                    b.steps.push(LaneStep::FieldLoadInt {
+                        vals_ptr: ctx.vals_ptr,
+                        slot,
+                        d: h,
+                    });
                     b.n_guards += 1;
                     // The Int tag's payload IS an i32, so the interval is exact.
                     b.binds.remove(&dst);
                     b.bind_int(dst, h, IV32);
                 } else {
                     let h = b.alloc_xmm(i, &[], None)?;
-                    b.steps.push(LaneStep::FieldLoadF64 { vals_ptr: ctx.vals_ptr, slot, d: h });
+                    b.steps.push(LaneStep::FieldLoadF64 {
+                        vals_ptr: ctx.vals_ptr,
+                        slot,
+                        d: h,
+                    });
                     b.n_guards += 1;
                     b.binds.remove(&dst);
                     let sid = b.push_slot(Av::F64 { h });
@@ -2479,7 +3008,11 @@ fn build_lane_inner(
                     Some(Av::Callee { g }) => g,
                     _ => return Err("callee-not-a-global-load"),
                 };
-                b.steps.push(LaneStep::CalleeGuard { gidx, bits: g.bits, ver: g.ver });
+                b.steps.push(LaneStep::CalleeGuard {
+                    gidx,
+                    bits: g.bits,
+                    ver: g.ver,
+                });
                 b.n_guards += 1;
                 b.binds.remove(&callee);
             }
@@ -2570,7 +3103,11 @@ fn build_lane_inner(
                     continue;
                 }
                 let a32 = b.to32(i, sa, None)?;
-                let avoid = if let LaneOp32::R(r) = a32 { Some(r) } else { None };
+                let avoid = if let LaneOp32::R(r) = a32 {
+                    Some(r)
+                } else {
+                    None
+                };
                 let mut b32 = b.to32(i, sb, avoid)?;
                 if let (B::Shl | B::Shr | B::Ushr, LaneOp32::I(k)) = (op, b32) {
                     b32 = LaneOp32::I(k & 31);
@@ -2591,15 +3128,33 @@ fn build_lane_inner(
                 b.binds.remove(&dst);
                 let prefer = b.dying_homes(i, &[sa, sb], true);
                 let d = b.alloc_gpr(i + 1, &prefer, None)?;
-                b.steps.push(LaneStep::Bit32 { d, a: a32, b: b32, op });
-                let iv = if matches!(op, B::Ushr) { (0, u32::MAX as i64) } else { IV32 };
+                b.steps.push(LaneStep::Bit32 {
+                    d,
+                    a: a32,
+                    b: b32,
+                    op,
+                });
+                let iv = if matches!(op, B::Ushr) {
+                    (0, u32::MAX as i64)
+                } else {
+                    IV32
+                };
                 b.bind_int(dst, d, iv);
             }
-            Instr::MathOp { dst, op: MathFn::Imul, arg_base: ab, argc: 2 } => {
+            Instr::MathOp {
+                dst,
+                op: MathFn::Imul,
+                arg_base: ab,
+                argc: 2,
+            } => {
                 let sa = b.resolve(i, ab)?;
                 let sb = b.resolve(i, ab + 1)?;
                 let a32 = b.to32(i, sa, None)?;
-                let avoid = if let LaneOp32::R(r) = a32 { Some(r) } else { None };
+                let avoid = if let LaneOp32::R(r) = a32 {
+                    Some(r)
+                } else {
+                    None
+                };
                 let b32 = b.to32(i, sb, avoid)?;
                 if let (LaneOp32::I(va), LaneOp32::I(vb)) = (a32, b32) {
                     let sid = b.push_slot(Av::ImmI(va.wrapping_mul(vb) as i64));
@@ -2685,11 +3240,19 @@ fn build_lane_inner(
     }
     for (k, &(idx, _)) in pending.iter().enumerate() {
         let cell_bits = *upvals.get(&idx).ok_or("upval-cell-missing")?;
-        b.steps.push(LaneStep::CellCommit { cell_bits, slot: reg_window + k as u16 });
+        b.steps.push(LaneStep::CellCommit {
+            cell_bits,
+            slot: reg_window + k as u16,
+        });
     }
     let n_ops = b.steps.len() as u16;
     let n_guards = b.n_guards;
-    Ok(TypedLanePlan { steps: b.steps, hop_pool: b.hop_pool, n_ops, n_guards })
+    Ok(TypedLanePlan {
+        steps: b.steps,
+        hop_pool: b.hop_pool,
+        n_ops,
+        n_guards,
+    })
 }
 
 /// Emit a scheduled typed lane. Every guard/bail jumps to `fallback` (the
@@ -2706,7 +3269,10 @@ fn emit_typed_lane(
     use crate::bytecode::BitwiseOp as B;
     for step in &lane.steps {
         match *step {
-            LaneStep::UpvalCall { cell_bits, park_slot } => {
+            LaneStep::UpvalCall {
+                cell_bits,
+                park_slot,
+            } => {
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, QWORD cell_bits as i64
@@ -3132,7 +3698,17 @@ mod lane_tests {
             body.push(Instr::Add { dst: 3, a: 3, b: 3 });
         }
         body.push(Instr::Return { src: 3 });
-        let r = build_typed_lane(&body, 2, 2, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        let r = build_typed_lane(
+            &body,
+            2,
+            2,
+            10,
+            20,
+            8,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+        );
         assert_eq!(r.err(), Some("i53-overflow"));
         // Control: one doubling fewer keeps every bound ≤ 2^53 and schedules.
         let mut ok = vec![Instr::Add { dst: 3, a: 1, b: 2 }];
@@ -3140,7 +3716,17 @@ mod lane_tests {
             ok.push(Instr::Add { dst: 3, a: 3, b: 3 });
         }
         ok.push(Instr::Return { src: 3 });
-        let r = build_typed_lane(&ok, 2, 2, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        let r = build_typed_lane(
+            &ok,
+            2,
+            2,
+            10,
+            20,
+            8,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+        );
         assert!(r.is_ok(), "bounded chain declined: {:?}", r.err());
     }
 
@@ -3149,20 +3735,85 @@ mod lane_tests {
     #[test]
     fn register_budget_declines() {
         let body = vec![
-            Instr::Bitwise { dst: 7, a: 1, b: 2, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 8, a: 3, b: 4, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 9, a: 5, b: 6, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 10, a: 1, b: 3, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 11, a: 2, b: 5, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 12, a: 4, b: 6, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 7, a: 7, b: 8, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 7, a: 7, b: 9, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 7, a: 7, b: 10, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 7, a: 7, b: 11, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::Bitwise { dst: 7, a: 7, b: 12, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise {
+                dst: 7,
+                a: 1,
+                b: 2,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 8,
+                a: 3,
+                b: 4,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 9,
+                a: 5,
+                b: 6,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 10,
+                a: 1,
+                b: 3,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 11,
+                a: 2,
+                b: 5,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 12,
+                a: 4,
+                b: 6,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 7,
+                a: 7,
+                b: 8,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 7,
+                a: 7,
+                b: 9,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 7,
+                a: 7,
+                b: 10,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 7,
+                a: 7,
+                b: 11,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::Bitwise {
+                dst: 7,
+                a: 7,
+                b: 12,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
             Instr::Return { src: 7 },
         ];
-        let r = build_typed_lane(&body, 6, 6, 10, 20, 16, &no_upvals(), &no_consts(), &no_nested());
+        let r = build_typed_lane(
+            &body,
+            6,
+            6,
+            10,
+            20,
+            16,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+        );
         assert_eq!(r.err(), Some("gpr-budget"));
     }
 
@@ -3171,7 +3822,17 @@ mod lane_tests {
     #[test]
     fn unpassed_param_declines() {
         let body = vec![Instr::Add { dst: 3, a: 1, b: 2 }, Instr::Return { src: 3 }];
-        let r = build_typed_lane(&body, 2, 0, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        let r = build_typed_lane(
+            &body,
+            2,
+            0,
+            10,
+            20,
+            8,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+        );
         assert_eq!(r.err(), Some("param-not-passed"));
     }
 
@@ -3179,7 +3840,17 @@ mod lane_tests {
     #[test]
     fn out_of_set_op_declines() {
         let body = vec![Instr::Mod { dst: 3, a: 1, b: 2 }, Instr::Return { src: 3 }];
-        let r = build_typed_lane(&body, 2, 2, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        let r = build_typed_lane(
+            &body,
+            2,
+            2,
+            10,
+            20,
+            8,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+        );
         assert_eq!(r.err(), Some("op-outside-lane-set"));
     }
 
@@ -3191,10 +3862,25 @@ mod lane_tests {
         let body = vec![
             Instr::Div { dst: 3, a: 1, b: 2 },
             Instr::Div { dst: 4, a: 2, b: 1 },
-            Instr::Bitwise { dst: 5, a: 3, b: 4, op: crate::bytecode::BitwiseOp::Xor },
+            Instr::Bitwise {
+                dst: 5,
+                a: 3,
+                b: 4,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
             Instr::Return { src: 5 },
         ];
-        let r = build_typed_lane(&body, 2, 2, 10, 20, 8, &no_upvals(), &no_consts(), &no_nested());
+        let r = build_typed_lane(
+            &body,
+            2,
+            2,
+            10,
+            20,
+            8,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+        );
         let lane = r.expect("two-div xor must schedule");
         let temps: Vec<u8> = lane
             .steps
@@ -3205,7 +3891,10 @@ mod lane_tests {
             })
             .collect();
         assert_eq!(temps.len(), 2, "both operands convert");
-        assert_ne!(temps[0], temps[1], "shared temp home would clobber operand a");
+        assert_ne!(
+            temps[0], temps[1],
+            "shared temp home would clobber operand a"
+        );
     }
 
     /// The mulberry/ri shape (upval PRNG state + imul/shift mixing + f64
@@ -3219,22 +3908,65 @@ mod lane_tests {
         consts.insert(0u32, Value::num(4294967296.0).bits());
         let body = vec![
             Instr::UpvalGet { dst: 3, idx: 0 },
-            Instr::AddInt { dst: 4, a: 3, imm: 0x6D2B79F5u32 as i32, upd: false },
+            Instr::AddInt {
+                dst: 4,
+                a: 3,
+                imm: 0x6D2B79F5u32 as i32,
+                upd: false,
+            },
             Instr::LoadInt { dst: 5, val: 0 },
-            Instr::Bitwise { dst: 4, a: 4, b: 5, op: crate::bytecode::BitwiseOp::Or },
+            Instr::Bitwise {
+                dst: 4,
+                a: 4,
+                b: 5,
+                op: crate::bytecode::BitwiseOp::Or,
+            },
             Instr::UpvalSet { idx: 0, src: 4 },
             Instr::UpvalGet { dst: 6, idx: 0 },
             Instr::LoadInt { dst: 7, val: 15 },
-            Instr::Bitwise { dst: 8, a: 6, b: 7, op: crate::bytecode::BitwiseOp::Ushr },
-            Instr::Bitwise { dst: 9, a: 6, b: 8, op: crate::bytecode::BitwiseOp::Xor },
-            Instr::MathOp { dst: 10, op: MathFn::Imul, arg_base: 8, argc: 2 },
+            Instr::Bitwise {
+                dst: 8,
+                a: 6,
+                b: 7,
+                op: crate::bytecode::BitwiseOp::Ushr,
+            },
+            Instr::Bitwise {
+                dst: 9,
+                a: 6,
+                b: 8,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            Instr::MathOp {
+                dst: 10,
+                op: MathFn::Imul,
+                arg_base: 8,
+                argc: 2,
+            },
             Instr::LoadInt { dst: 11, val: 0 },
-            Instr::Bitwise { dst: 12, a: 10, b: 11, op: crate::bytecode::BitwiseOp::Ushr },
+            Instr::Bitwise {
+                dst: 12,
+                a: 10,
+                b: 11,
+                op: crate::bytecode::BitwiseOp::Ushr,
+            },
             Instr::LoadConst { dst: 13, idx: 0 },
-            Instr::Div { dst: 14, a: 12, b: 13 },
-            Instr::Mul { dst: 15, a: 14, b: 1 },
+            Instr::Div {
+                dst: 14,
+                a: 12,
+                b: 13,
+            },
+            Instr::Mul {
+                dst: 15,
+                a: 14,
+                b: 1,
+            },
             Instr::LoadInt { dst: 16, val: 0 },
-            Instr::Bitwise { dst: 17, a: 15, b: 16, op: crate::bytecode::BitwiseOp::Or },
+            Instr::Bitwise {
+                dst: 17,
+                a: 15,
+                b: 16,
+                op: crate::bytecode::BitwiseOp::Or,
+            },
             Instr::Return { src: 17 },
         ];
         let r = build_typed_lane(&body, 1, 1, 10, 20, 18, &upvals, &consts, &no_nested());
@@ -3243,6 +3975,9 @@ mod lane_tests {
         assert!(lane.n_guards >= 3, "guards={}", lane.n_guards);
         assert!(lane.n_ops > 0);
         // The upval write must commit: a box step + a cell_set call.
-        assert!(lane.steps.iter().any(|s| matches!(s, LaneStep::CellCommit { .. })));
+        assert!(lane
+            .steps
+            .iter()
+            .any(|s| matches!(s, LaneStep::CellCommit { .. })));
     }
 }

@@ -61,6 +61,10 @@ pub(crate) struct RegionPlan {
     /// ~7 dead ops/iteration in the object benchmark, and dropping them also frees
     /// their xmm homes (often taking the loop off the slower home-reuse path).
     pub(crate) dead: FxHashSet<u16>,
+    /// Registers whose post-region textual uses are all dominated by a later
+    /// post-region def. Their in-region value is therefore unobservable after
+    /// any forward exit. Computed by the planner's fail-closed CFG/gap proof.
+    pub(crate) outside_dead: FxHashSet<u16>,
     /// Arithmetic region ips whose 2^53 overflow guard is PROVABLY unnecessary
     /// (interval analysis showed the result always lands in `[-2^53, 2^53]`, e.g.
     /// a loop counter bounded by the loop condition's constant). INT path only;
@@ -315,7 +319,11 @@ pub(crate) struct XmmAlloc {
 
 impl XmmAlloc {
     pub(crate) fn new() -> XmmAlloc {
-        XmmAlloc { next: HOME_XMM_FIRST, active: Vec::new(), free: Vec::new() }
+        XmmAlloc {
+            next: HOME_XMM_FIRST,
+            active: Vec::new(),
+            free: Vec::new(),
+        }
     }
 
     /// Allocate a home for the interval `[start, end]`, or `None` if the pool is
@@ -381,7 +389,8 @@ pub(crate) fn alloc_value_homes(values: &[(Vec<(usize, usize)>, NumVal)]) -> Opt
         lb = lb.max(live);
     }
     fn overlaps(segs: &[(usize, usize)], taken: &[(usize, usize)]) -> bool {
-        segs.iter().any(|&(a, b)| taken.iter().any(|&(c, d)| a <= d && c <= b))
+        segs.iter()
+            .any(|&(a, b)| taken.iter().any(|&(c, d)| a <= d && c <= b))
     }
     // DFS over values in order, lowest feasible home first. All empty homes
     // are interchangeable, so only the LOWEST-indexed empty one is ever tried
@@ -614,7 +623,8 @@ pub(crate) fn unify_homes_with_globals(
         }
         if let Instr::StoreGlobal { idx, .. }
         | Instr::StoreGlobalStrict { idx, .. }
-        | Instr::StoreGlobalResolved { idx, .. } = code[ip] {
+        | Instr::StoreGlobalResolved { idx, .. } = code[ip]
+        {
             g_stores.entry(idx).or_default().push(ip);
         }
     }
@@ -624,7 +634,8 @@ pub(crate) fn unify_homes_with_globals(
         if ty.get(&r) != Some(&VTy::Num)
             || first_seen.get(&r) != Some(&true) // live-in regs keep their own home
             || dead.contains(&r)
-            || hoisted.contains(&r) // hoisted consts materialise in the prologue
+            || hoisted.contains(&r)
+        // hoisted consts materialise in the prologue
         {
             continue;
         }

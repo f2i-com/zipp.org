@@ -100,6 +100,714 @@ pub(crate) fn dv_gpr_enabled() -> bool {
     }
 }
 
+/// Collapse repeated executions of a statically pure nested integer reduction
+/// after executing one real inner pass. The first pass supplies the exact
+/// modulo-2^32 accumulator delta; the generated tail applies that affine delta
+/// to the remaining outer iterations. `ZIPP_NO_DV_NESTED_REDUCE=1` restores
+/// the ordinary outer backedge for a same-binary comparison.
+fn dv_nested_reduce_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_DV_NESTED_REDUCE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Fail-closed description of the canonical nested-loop shape emitted for a
+/// pure DataView integer reduction. This is compile-time metadata only: the
+/// generated code still executes one complete outer iteration before using it.
+#[derive(Clone, Copy, Debug)]
+struct DvNestedReducePlan {
+    accumulator_global: u32,
+    outer_global: u32,
+    outer_limit: i64,
+    outer_step: i32,
+    pin: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DvDepNum {
+    /// Coefficient of the entering accumulator in Z/(2^32).
+    coeff: u32,
+    /// Conservative absolute bound while JS Number arithmetic is still live.
+    bound: Option<u64>,
+    /// Exact value for compiler constants (needed for `x | 0`).
+    known: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DvDep {
+    Num(DvDepNum),
+    Bool,
+    Other,
+}
+
+const DV_MAX_SAFE_INT: u64 = 1u64 << 53;
+const DV_I32_ABS_BOUND: u64 = 1u64 << 31;
+
+fn dv_store_global(instr: &Instr) -> Option<(u32, u16)> {
+    match *instr {
+        Instr::StoreGlobal { idx, src }
+        | Instr::StoreGlobalStrict { idx, src }
+        | Instr::StoreGlobalResolved { idx, src } => Some((idx, src)),
+        _ => None,
+    }
+}
+
+fn dv_control_target(instr: &Instr) -> Option<usize> {
+    match *instr {
+        Instr::Jump { target }
+        | Instr::JumpIfFalse { target, .. }
+        | Instr::JumpIfTrue { target, .. }
+        | Instr::JumpIfNotLt { target, .. }
+        | Instr::JumpIfNotLe { target, .. }
+        | Instr::PushFinally { target, .. }
+        | Instr::JumpFinally { target, .. } => Some(target as usize),
+        Instr::PushHandler { catch_target, .. } => Some(catch_target as usize),
+        _ => None,
+    }
+}
+
+fn dv_int_constant(proto: &FuncProto, instr: &Instr) -> Option<(u16, i64)> {
+    match *instr {
+        Instr::LoadInt { dst, val } => Some((dst, val as i64)),
+        Instr::LoadConst { dst, idx } => {
+            let v = *proto.constants.get(idx as usize)?;
+            v.is_int().then(|| (dst, v.as_int() as i64))
+        }
+        _ => None,
+    }
+}
+
+fn dv_dep_num_const(v: i64) -> DvDep {
+    DvDep::Num(DvDepNum {
+        coeff: 0,
+        bound: Some(v.unsigned_abs()),
+        known: Some(v),
+    })
+}
+
+fn dv_dep_add(a: DvDep, b: DvDep, sub: bool) -> Option<DvDep> {
+    let (DvDep::Num(a), DvDep::Num(b)) = (a, b) else {
+        return None;
+    };
+    let coeff = if sub {
+        a.coeff.wrapping_sub(b.coeff)
+    } else {
+        a.coeff.wrapping_add(b.coeff)
+    };
+    let bound = a.bound?.checked_add(b.bound?);
+    if coeff != 0 && bound.is_none_or(|n| n > DV_MAX_SAFE_INT) {
+        return None;
+    }
+    let known = match (a.known, b.known) {
+        (Some(x), Some(y)) => {
+            if sub {
+                x.checked_sub(y)
+            } else {
+                x.checked_add(y)
+            }
+        }
+        _ => None,
+    };
+    Some(DvDep::Num(DvDepNum {
+        coeff,
+        bound,
+        known,
+    }))
+}
+
+fn dv_bitwise_known(op: crate::bytecode::BitwiseOp, a: i64, b: i64) -> i64 {
+    use crate::bytecode::BitwiseOp as B;
+    let ai = a as u32 as i32;
+    let bi = b as u32 as i32;
+    match op {
+        B::And => (ai & bi) as i64,
+        B::Or => (ai | bi) as i64,
+        B::Xor => (ai ^ bi) as i64,
+        B::Shl => ai.wrapping_shl((bi & 31) as u32) as i64,
+        B::Shr => (ai >> (bi & 31)) as i64,
+        B::Ushr => ((ai as u32) >> (bi & 31)) as i64,
+    }
+}
+
+fn dv_dep_bitwise(op: crate::bytecode::BitwiseOp, a: DvDep, b: DvDep) -> Option<DvDep> {
+    use crate::bytecode::BitwiseOp as B;
+    let (DvDep::Num(a), DvDep::Num(b)) = (a, b) else {
+        return None;
+    };
+    if a.coeff == 0 && b.coeff == 0 {
+        let known = a
+            .known
+            .zip(b.known)
+            .map(|(x, y)| dv_bitwise_known(op, x, y));
+        let bound = if matches!(op, B::Ushr) {
+            Some(u32::MAX as u64)
+        } else {
+            Some(DV_I32_ABS_BOUND)
+        };
+        return Some(DvDep::Num(DvDepNum {
+            coeff: 0,
+            bound,
+            known,
+        }));
+    }
+
+    // The only accumulator-bearing bitwise forms admitted are exact ToInt32
+    // identities. They preserve the affine low-32 relation while bounding the
+    // value for the next JS-number addition.
+    let identity = match op {
+        B::Or | B::Xor => {
+            if a.coeff != 0 && b.known == Some(0) {
+                Some(a.coeff)
+            } else if b.coeff != 0 && a.known == Some(0) {
+                Some(b.coeff)
+            } else {
+                None
+            }
+        }
+        B::And => {
+            if a.coeff != 0 && b.known == Some(-1) {
+                Some(a.coeff)
+            } else if b.coeff != 0 && a.known == Some(-1) {
+                Some(b.coeff)
+            } else {
+                None
+            }
+        }
+        B::Shl | B::Shr | B::Ushr if a.coeff != 0 && b.known == Some(0) => Some(a.coeff),
+        _ => None,
+    }?;
+    Some(DvDep::Num(DvDepNum {
+        coeff: identity,
+        bound: Some(if matches!(op, B::Ushr) {
+            u32::MAX as u64
+        } else {
+            DV_I32_ABS_BOUND
+        }),
+        known: None,
+    }))
+}
+
+/// Prove that one inner iteration maps the accumulator to
+/// `accumulator + invariant (mod 2^32)`, never feeding it into control, an
+/// address, or unsafe (>2^53) intermediate arithmetic. The outer reduction can
+/// then measure one whole-pass delta instead of re-deriving the expression.
+fn dv_inner_additive_proof(
+    proto: &FuncProto,
+    body_start: usize,
+    body_end: usize,
+    region_end: usize,
+    outside_dead: &FxHashSet<u16>,
+    accumulator_global: u32,
+    inner_global: u32,
+    ta_plan: &TaPinPlan,
+    pin: usize,
+) -> bool {
+    let mut regs: FxHashMap<u16, DvDep> = FxHashMap::default();
+    let mut globs: FxHashMap<u32, DvDep> = FxHashMap::default();
+    globs.insert(
+        accumulator_global,
+        DvDep::Num(DvDepNum {
+            coeff: 1,
+            bound: Some(DV_I32_ABS_BOUND),
+            known: None,
+        }),
+    );
+    globs.insert(
+        inner_global,
+        DvDep::Num(DvDepNum {
+            coeff: 0,
+            // The canonical loop compares this positive-step induction
+            // against an Int32 literal before every admitted body execution.
+            bound: Some(DV_I32_ABS_BOUND),
+            known: None,
+        }),
+    );
+    let mut stored_acc = false;
+
+    for ip in body_start..=body_end {
+        let ok = match proto.code[ip] {
+            Instr::LoadInt { dst, val } => {
+                regs.insert(dst, dv_dep_num_const(val as i64));
+                true
+            }
+            Instr::LoadConst { dst, idx } => {
+                let Some(v) = proto
+                    .constants
+                    .get(idx as usize)
+                    .copied()
+                    .filter(|v| v.is_int())
+                else {
+                    return false;
+                };
+                regs.insert(dst, dv_dep_num_const(v.as_int() as i64));
+                true
+            }
+            Instr::Move { dst, src } => match regs.get(&src).copied() {
+                Some(v) => {
+                    regs.insert(dst, v);
+                    true
+                }
+                None => false,
+            },
+            Instr::LoadGlobal { dst, idx } => {
+                regs.insert(dst, globs.get(&idx).copied().unwrap_or(DvDep::Other));
+                true
+            }
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src } => match regs.get(&src).copied() {
+                Some(v) => {
+                    if idx == accumulator_global {
+                        let DvDep::Num(n) = v else { return false };
+                        // Every straight-line inner iteration must publish a
+                        // signed Int32 again. That re-establishes this proof's
+                        // entry bound before the next inner/outer iteration.
+                        if n.coeff != 1 || n.bound.is_none_or(|b| b > DV_I32_ABS_BOUND) {
+                            return false;
+                        }
+                        stored_acc = true;
+                    }
+                    globs.insert(idx, v);
+                    true
+                }
+                None => false,
+            },
+            Instr::Add { dst, a, b } | Instr::Sub { dst, a, b } => {
+                let Some(av) = regs.get(&a).copied() else {
+                    return false;
+                };
+                let Some(bv) = regs.get(&b).copied() else {
+                    return false;
+                };
+                match dv_dep_add(av, bv, matches!(proto.code[ip], Instr::Sub { .. })) {
+                    Some(v) => {
+                        regs.insert(dst, v);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Instr::AddInt { dst, a, imm, .. } => {
+                let Some(av) = regs.get(&a).copied() else {
+                    return false;
+                };
+                match dv_dep_add(av, dv_dep_num_const(imm as i64), false) {
+                    Some(v) => {
+                        regs.insert(dst, v);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Instr::Bitwise { dst, a, b, op } => {
+                let Some(av) = regs.get(&a).copied() else {
+                    return false;
+                };
+                let Some(bv) = regs.get(&b).copied() else {
+                    return false;
+                };
+                match dv_dep_bitwise(op, av, bv) {
+                    Some(v) => {
+                        regs.insert(dst, v);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            Instr::Eq { dst, a, b } | Instr::Ne { dst, a, b } => {
+                let independent = |v: DvDep| match v {
+                    DvDep::Num(n) => n.coeff == 0,
+                    DvDep::Bool | DvDep::Other => true,
+                };
+                if regs.get(&a).copied().is_some_and(independent)
+                    && regs.get(&b).copied().is_some_and(independent)
+                {
+                    regs.insert(dst, DvDep::Bool);
+                    true
+                } else {
+                    false
+                }
+            }
+            Instr::CallMethod {
+                dst,
+                arg_base,
+                argc,
+                ..
+            } => {
+                let Some(&j) = ta_plan.access.get(&ip) else {
+                    return false;
+                };
+                if j as usize != pin || !(argc == 1 || argc == 2) {
+                    return false;
+                }
+                let independent = |v: DvDep| match v {
+                    DvDep::Num(n) => n.coeff == 0,
+                    DvDep::Bool => true,
+                    DvDep::Other => false,
+                };
+                if !regs.get(&arg_base).copied().is_some_and(independent)
+                    || (argc == 2 && !regs.get(&(arg_base + 1)).copied().is_some_and(independent))
+                {
+                    return false;
+                }
+                let Some(kind) = proto
+                    .string_constants
+                    .get(match proto.code[ip] {
+                        Instr::CallMethod { name, .. } => name as usize,
+                        _ => unreachable!(),
+                    })
+                    .and_then(|name| dv_get_kind(name))
+                else {
+                    return false;
+                };
+                let bound = match kind {
+                    0 => 1u64 << 7,
+                    1 => u8::MAX as u64,
+                    3 => 1u64 << 15,
+                    4 => u16::MAX as u64,
+                    5 => 1u64 << 31,
+                    6 => u32::MAX as u64,
+                    _ => return false,
+                };
+                regs.insert(
+                    dst,
+                    DvDep::Num(DvDepNum {
+                        coeff: 0,
+                        bound: Some(bound),
+                        known: None,
+                    }),
+                );
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+
+    let acc_ok = stored_acc
+        && matches!(
+            globs.get(&accumulator_global),
+            Some(DvDep::Num(DvDepNum { coeff: 1, bound: Some(b), .. })) if *b <= DV_I32_ABS_BOUND
+        );
+    let scratch_globs_ok = globs.iter().all(|(&g, dep)| {
+        g == accumulator_global
+            || !matches!(dep, DvDep::Num(DvDepNum { coeff, .. }) if *coeff != 0)
+    });
+    let tainted_regs_dead = regs.iter().all(|(&r, dep)| {
+        !matches!(dep, DvDep::Num(DvDepNum { coeff, .. }) if *coeff != 0)
+            || (!proto.code[region_end + 1..]
+                .iter()
+                .any(|i| instr_uses(i).contains(&r)))
+            || outside_dead.contains(&r)
+    });
+    acc_ok && scratch_globs_ok && tainted_regs_dead
+}
+
+/// Recognise the compiler's canonical
+/// `for (outer < literal) { for (inner < literal) reduction; }` region. The
+/// proof intentionally accepts only one inner backedge, constant positive
+/// induction steps, integer DataView getters, one carried accumulator, and
+/// scratch globals overwritten before their first read each outer iteration.
+fn dv_nested_reduce_plan(
+    proto: &FuncProto,
+    s: usize,
+    e: usize,
+    ta_plan: &TaPinPlan,
+    plan: &RegionPlan,
+    entry: &IntEntry<'_>,
+    meter: Option<crate::codegen::meter::Meter>,
+) -> Option<DvNestedReducePlan> {
+    if !dv_nested_reduce_enabled()
+        || meter.is_some()
+        || !entry.resume.is_empty()
+        || e < s + 12
+        || !matches!(proto.code[e], Instr::Jump { target } if target as usize == s)
+        || proto.code[e + 1..]
+            .iter()
+            .any(|i| dv_control_target(i).is_some_and(|t| t <= e))
+    {
+        return None;
+    }
+
+    // Canonical outer header: LoadGlobal induction; integer literal bound;
+    // JumpIfNotLt to the instruction just outside the region.
+    let (outer_reg, outer_global) = match proto.code[s] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let (limit_reg, outer_limit) = dv_int_constant(proto, &proto.code[s + 1])?;
+    if !matches!(
+        proto.code[s + 2],
+        Instr::JumpIfNotLt { a, b, target }
+            if a == outer_reg && b == limit_reg && target as usize == e + 1
+    ) {
+        return None;
+    }
+
+    // Canonical outer increment immediately before its backedge.
+    let outer_step = match (&proto.code[e - 3], &proto.code[e - 2], &proto.code[e - 1]) {
+        (Instr::LoadGlobal { dst: load, idx }, Instr::AddInt { dst, a, imm, .. }, store)
+            if *idx == outer_global && *dst == *load && *a == *load && *imm > 0 =>
+        {
+            let (sgi, src) = dv_store_global(store)?;
+            (sgi == outer_global && src == *dst).then_some(*imm)?
+        }
+        _ => return None,
+    };
+
+    // Exactly one inner backedge, directly before the outer increment.
+    let inner_back = e - 4;
+    let inner_start = match proto.code[inner_back] {
+        Instr::Jump { target } if target as usize > s + 2 && (target as usize) < inner_back => {
+            target as usize
+        }
+        _ => return None,
+    };
+    let (inner_reg, inner_global) = match proto.code[inner_start] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    if inner_global == outer_global || inner_start < s + 5 {
+        return None;
+    }
+
+    // Outer prefix is exactly the compiler's `inner = <int literal>` pair.
+    let (inner_init_reg, _) = dv_int_constant(proto, &proto.code[inner_start - 2])?;
+    let (init_global, init_src) = dv_store_global(&proto.code[inner_start - 1])?;
+    if inner_start - 2 != s + 3 || init_global != inner_global || init_src != inner_init_reg {
+        return None;
+    }
+
+    // One inner condition. Its rhs is a compile-time integer expression and
+    // its false edge skips the induction backedge to the outer increment.
+    let mut inner_cond = None;
+    let mut constants: FxHashMap<u16, i64> = FxHashMap::default();
+    for ip in inner_start + 1..inner_back {
+        match proto.code[ip] {
+            Instr::JumpIfNotLt { a, b, target }
+                if a == inner_reg && target as usize == inner_back + 1 =>
+            {
+                if !constants.contains_key(&b) {
+                    return None;
+                }
+                inner_cond = Some(ip);
+                break;
+            }
+            ref instr => {
+                if let Some((dst, v)) = dv_int_constant(proto, instr) {
+                    constants.insert(dst, v);
+                } else {
+                    match *instr {
+                        Instr::Move { dst, src } => {
+                            constants.insert(dst, *constants.get(&src)?);
+                        }
+                        Instr::Add { dst, a, b }
+                        | Instr::Sub { dst, a, b }
+                        | Instr::Mul { dst, a, b } => {
+                            let (x, y) = (*constants.get(&a)?, *constants.get(&b)?);
+                            let v = match *instr {
+                                Instr::Add { .. } => x.checked_add(y)?,
+                                Instr::Sub { .. } => x.checked_sub(y)?,
+                                _ => x.checked_mul(y)?,
+                            };
+                            constants.insert(dst, v);
+                        }
+                        Instr::AddInt { dst, a, imm, .. } => {
+                            constants.insert(dst, constants.get(&a)?.checked_add(imm as i64)?);
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+    let inner_cond = inner_cond?;
+
+    // Canonical positive inner induction. (`o += 4` currently compiles as a
+    // LoadInt + Add pair; `o++` uses AddInt.)
+    let inner_step_start =
+        if let (Instr::LoadGlobal { dst: load, idx }, Instr::AddInt { dst, a, imm, .. }, store) = (
+            &proto.code[inner_back - 3],
+            &proto.code[inner_back - 2],
+            &proto.code[inner_back - 1],
+        ) {
+            let (sgi, src) = dv_store_global(store)?;
+            if *idx == inner_global
+                && *dst == *load
+                && *a == *load
+                && *imm > 0
+                && sgi == inner_global
+                && src == *dst
+            {
+                inner_back - 3
+            } else {
+                return None;
+            }
+        } else {
+            let (load, c, dst) = match (
+                &proto.code[inner_back - 4],
+                &proto.code[inner_back - 3],
+                &proto.code[inner_back - 2],
+            ) {
+                (Instr::LoadGlobal { dst: load, idx }, c, Instr::Add { dst, a, b })
+                    if *idx == inner_global =>
+                {
+                    let (cr, cv) = dv_int_constant(proto, c)?;
+                    if cv <= 0 || !((*a == *load && *b == cr) || (*b == *load && *a == cr)) {
+                        return None;
+                    }
+                    (*load, cr, *dst)
+                }
+                _ => return None,
+            };
+            let (sgi, src) = dv_store_global(&proto.code[inner_back - 1])?;
+            if sgi != inner_global || src != dst || load == c {
+                return None;
+            }
+            inner_back - 4
+        };
+    if inner_cond + 1 > inner_step_start.saturating_sub(1) {
+        return None;
+    }
+
+    // The only writes to either induction are the canonical init/increments.
+    // A body assignment such as `outer = 5` can otherwise turn a terminating
+    // source loop into a reset cycle that no affine tail may fast-forward.
+    for ip in s..=e {
+        let Some((g, _)) = dv_store_global(&proto.code[ip]) else {
+            continue;
+        };
+        if (g == outer_global && ip != e - 1)
+            || (g == inner_global && ip != inner_start - 1 && ip != inner_back - 1)
+        {
+            return None;
+        }
+    }
+
+    // No hidden control flow and no use of the outer induction inside the
+    // repeated body: every collapsed outer iteration observes identical data.
+    let mut n_cond = 0usize;
+    let mut n_back = 0usize;
+    for ip in s..=e {
+        match proto.code[ip] {
+            Instr::JumpIfNotLt { .. } => n_cond += 1,
+            Instr::Jump { .. } => n_back += 1,
+            Instr::JumpIfFalse { .. } | Instr::JumpIfTrue { .. } | Instr::JumpIfNotLe { .. } => {
+                return None
+            }
+            _ => {}
+        }
+        if ip > s + 2
+            && ip < e - 3
+            && matches!(proto.code[ip], Instr::LoadGlobal { idx, .. } if idx == outer_global)
+        {
+            return None;
+        }
+    }
+    if n_cond != 2 || n_back != 2 {
+        return None;
+    }
+
+    let body_start = inner_cond + 1;
+    let body_end = inner_step_start - 1;
+    let mut first_write: FxHashMap<u32, bool> = FxHashMap::default();
+    let mut written: FxHashSet<u32> = FxHashSet::default();
+    let mut stored_inner: FxHashSet<u32> = FxHashSet::default();
+    let mut call_pin = None;
+    for ip in s + 3..=inner_back - 1 {
+        match proto.code[ip] {
+            Instr::LoadGlobal { idx, .. } => {
+                first_write.entry(idx).or_insert(false);
+            }
+            ref instr => {
+                if let Some((idx, _)) = dv_store_global(instr) {
+                    first_write.entry(idx).or_insert(true);
+                    written.insert(idx);
+                    if (body_start..=body_end).contains(&ip) {
+                        stored_inner.insert(idx);
+                    }
+                }
+            }
+        }
+        if let Instr::CallMethod { name, argc, .. } = proto.code[ip] {
+            if !(body_start..=body_end).contains(&ip) || !(argc == 1 || argc == 2) {
+                return None;
+            }
+            let &j = ta_plan.access.get(&ip)?;
+            let j = j as usize;
+            if ta_plan.pins.get(j)?.kind != DV_PIN_KIND
+                || proto
+                    .string_constants
+                    .get(name as usize)
+                    .and_then(|k| dv_get_kind(k))
+                    .is_none_or(|kind| kind > 6)
+                || call_pin.is_some_and(|old| old != j)
+            {
+                return None;
+            }
+            call_pin = Some(j);
+        }
+    }
+    let pin = call_pin?;
+
+    // The sole carried body global is the accumulator. Every other written
+    // scratch global is overwritten before its first read each outer pass.
+    let mut accs: Vec<u32> = stored_inner
+        .iter()
+        .copied()
+        .filter(|g| *g != outer_global && *g != inner_global && first_write.get(g) == Some(&false))
+        .collect();
+    accs.sort_unstable();
+    accs.dedup();
+    if accs.len() != 1 {
+        return None;
+    }
+    let accumulator_global = accs[0];
+    for &g in &written {
+        if g != accumulator_global && g != outer_global && first_write.get(&g) != Some(&true) {
+            return None;
+        }
+    }
+    for ip in s..=e {
+        if let Some((idx, _)) = dv_store_global(&proto.code[ip]) {
+            if idx == accumulator_global && !(body_start..=body_end).contains(&ip) {
+                return None;
+            }
+        }
+    }
+    if !dv_inner_additive_proof(
+        proto,
+        body_start,
+        body_end,
+        e,
+        &plan.outside_dead,
+        accumulator_global,
+        inner_global,
+        ta_plan,
+        pin,
+    ) {
+        return None;
+    }
+
+    Some(DvNestedReducePlan {
+        accumulator_global,
+        outer_global,
+        outer_limit,
+        outer_step,
+        pin,
+    })
+}
+
 /// Kill switch: `ZIPP_NO_GPR_NEST=1` disables ONLY the B119 shared-home
 /// re-plan after a [`GprAttempt::PoolOverflow`] (see `compile_region_int`) —
 /// a region that fits the pool one-home-per-value still engages, restoring
@@ -644,7 +1352,15 @@ fn gpr_home_map(
     // Engage only where the mode pays: at least one op that would round-trip
     // xmm↔gpr on the xmm tier.
     let pays = proto.code[s..=e].iter().any(|i| {
-        matches!(i, Instr::Bitwise { .. } | Instr::MathOp { op: MathFn::Imul, argc: 2, .. })
+        matches!(
+            i,
+            Instr::Bitwise { .. }
+                | Instr::MathOp {
+                    op: MathFn::Imul,
+                    argc: 2,
+                    ..
+                }
+        )
     });
     if !pays {
         return Err(false);
@@ -731,7 +1447,10 @@ fn gpr_home_map(
     // the ablation discipline greps and diffs these lines across modes.
     let base_pool_len = pool.len();
     let map: FxHashMap<u8, Loc> = if used.len() <= pool.len() {
-        used.into_iter().zip(pool).map(|(x, h)| (x, Loc::R(h))).collect()
+        used.into_iter()
+            .zip(pool)
+            .map(|(x, h)| (x, Loc::R(h)))
+            .collect()
     } else if allow_spill && gpr_spill_slots_enabled() {
         // ── W10.3 spill slots ── the overflow is no longer final: rank homes
         // by weighted use count, keep the hottest resident, park the coldest
@@ -933,7 +1652,10 @@ fn spill_census(
             }
             if let Some(&Home::Xmm(x)) = plan.reg_home.get(&r) {
                 if universe.contains(&x) {
-                    { let e2 = w.entry(x).or_insert(0); *e2 = e2.saturating_add(wt); }
+                    {
+                        let e2 = w.entry(x).or_insert(0);
+                        *e2 = e2.saturating_add(wt);
+                    }
                 }
             }
         };
@@ -952,7 +1674,10 @@ fn spill_census(
                 if !plan.ta_recv_regs.contains(&dst) && !plan.split_recv_lg.contains(&ip) {
                     if let Some(&x) = plan.glob_home.get(&idx) {
                         if universe.contains(&x) {
-                            { let e2 = w.entry(x).or_insert(0); *e2 = e2.saturating_add(wt); }
+                            {
+                                let e2 = w.entry(x).or_insert(0);
+                                *e2 = e2.saturating_add(wt);
+                            }
                         }
                     }
                 }
@@ -962,7 +1687,10 @@ fn spill_census(
             | Instr::StoreGlobalResolved { idx, .. } => {
                 if let Some(&x) = plan.glob_home.get(&idx) {
                     if universe.contains(&x) {
-                        { let e2 = w.entry(x).or_insert(0); *e2 = e2.saturating_add(wt); }
+                        {
+                            let e2 = w.entry(x).or_insert(0);
+                            *e2 = e2.saturating_add(wt);
+                        }
                     }
                 }
             }
@@ -1148,7 +1876,12 @@ fn lazy_sx_sets(
                     }
                 }
             }
-            Instr::MathOp { dst, op: MathFn::Imul, argc: 2, .. } => {
+            Instr::MathOp {
+                dst,
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } => {
                 if let Some(&Loc::R(dh)) = map.get(&xh(plan, dst)) {
                     bit.insert(dh);
                 }
@@ -1623,7 +2356,10 @@ pub(crate) fn compile_region_int_gpr(
     }
     let rip = |ip: usize| -> i32 {
         // See `compile_region_int`'s twin: empty => `ip` is already the resume ip.
-        entry.resume.get(ip.wrapping_sub(s)).map_or(ip as i32, |&r| r as i32)
+        entry
+            .resume
+            .get(ip.wrapping_sub(s))
+            .map_or(ip as i32, |&r| r as i32)
     };
     // W10.3 frame spill slots sit AFTER the resume-ip slot (see the frame
     // layout at the prologue below): slot k at [rsp + spill_base + 8k].
@@ -1645,6 +2381,51 @@ pub(crate) fn compile_region_int_gpr(
     let shadow =
         gpr_deopt_shadow_plan(proto, plan, ta_plan, entry, s, e, &map, spill_base, n_spill)
             .unwrap_or_default();
+    let dv_reduce_candidate = dv_nested_reduce_plan(proto, s, e, ta_plan, plan, entry, meter);
+    let dv_reduce = dv_reduce_candidate.filter(|p| {
+        let Some(&ax) = plan.glob_home.get(&p.accumulator_global) else {
+            return false;
+        };
+        let Some(&ox) = plan.glob_home.get(&p.outer_global) else {
+            return false;
+        };
+        ax != ox
+            && matches!(map.get(&ax), Some(Loc::R(_)))
+            && matches!(map.get(&ox), Some(Loc::R(_)))
+            && !plan.narrow_globs.contains(&p.accumulator_global)
+            && !plan.narrow_globs.contains(&p.outer_global)
+            && shadow.glob_slot(p.accumulator_global).is_none()
+            && shadow.glob_slot(p.outer_global).is_none()
+            && plan
+                .live_in_globs
+                .iter()
+                .any(|&(g, _)| g == p.accumulator_global)
+            && plan.live_in_globs.iter().any(|&(g, _)| g == p.outer_global)
+            && plan.hoist_pins.contains(&(p.pin as u8))
+            // A shared physical home would be correct only until flush_exit
+            // wrote it to every logical global. Require unique live-out homes.
+            && plan.globs.iter().filter(|&&(_, x)| x == ax).count() == 1
+            && plan.globs.iter().filter(|&&(_, x)| x == ox).count() == 1
+    });
+    if std::env::var_os("ZIPP_JITLOG").is_some()
+        && dv_reduce_candidate.is_some()
+        && dv_reduce.is_none()
+    {
+        let p = dv_reduce_candidate.unwrap();
+        eprintln!(
+            "[jit] INT-GPR region [{start},{end}] DataView nested reduction allocation decline mapped-acc={} mapped-outer={} narrow-acc={} narrow-outer={} shadow-acc={} shadow-outer={}",
+            plan.glob_home
+                .get(&p.accumulator_global)
+                .is_some_and(|x| map.contains_key(x)),
+            plan.glob_home
+                .get(&p.outer_global)
+                .is_some_and(|x| map.contains_key(x)),
+            plan.narrow_globs.contains(&p.accumulator_global),
+            plan.narrow_globs.contains(&p.outer_global),
+            shadow.glob_slot(p.accumulator_global).is_some(),
+            shadow.glob_slot(p.outer_global).is_some(),
+        );
+    }
     // Home location of raw xmm-index `x` / dst register `r` (dsts are never
     // hoisted-const, so their home is always mapped).
     let gx = |x: u8| map[&x];
@@ -1688,6 +2469,12 @@ pub(crate) fn compile_region_int_gpr(
                 shadow.recv_resets
             );
         }
+        if let Some(p) = dv_reduce {
+            eprintln!(
+                "[jit] INT-GPR region [{start},{end}] DataView nested reduction acc=g{} outer=g{} limit={} step={} pin={}",
+                p.accumulator_global, p.outer_global, p.outer_limit, p.outer_step, p.pin
+            );
+        }
     }
 
     let mut ops = match dynasmrt::x64::Assembler::new() {
@@ -1714,10 +2501,13 @@ pub(crate) fn compile_region_int_gpr(
     // ≡ 8 (mod 16) — the pin-snapshot
     // `call rax` sites below run after `sub rsp, frame` and need rsp ≡ 0.
     let n_ta = ta_plan.pins.len() as i32;
-    let n_raw_slots = n_spill.saturating_add(shadow.len());
+    let n_raw_slots = n_spill
+        .saturating_add(shadow.len())
+        .saturating_add(usize::from(dv_reduce.is_some()));
     let frame = 40 + 32 * n_ta + ((8 * n_raw_slots as i32 + 15) & !15);
     let ta_base = 32i32;
     let ip_slot = 32 + 32 * n_ta;
+    let dv_reduce_slot = spill_base + 8 * (n_spill.saturating_add(shadow.len())) as i32;
     debug_assert_eq!(spill_base, 40 + 32 * n_ta);
     dynasm!(ops
         ; push rbx
@@ -1847,6 +2637,31 @@ pub(crate) fn compile_region_int_gpr(
                 ),
             }
         }
+    }
+    // One raw low-32 accumulator snapshot licences the tail fast-forward.
+    // `-1` is outside the stored u32 domain and means either SharedArrayBuffer
+    // or an invalid pin; those executions retain the ordinary backedge.
+    if let Some(p) = dv_reduce {
+        let acc_x = plan.glob_home[&p.accumulator_global];
+        let Loc::R(acc) = map[&acc_x] else {
+            unreachable!()
+        };
+        let local = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov QWORD [rsp + dv_reduce_slot], -1
+            ; cmp QWORD [rsp + ta_base + 32 * p.pin as i32 + 24], 1
+            ; jne => local
+            // The dependency proof starts from a signed Int32 accumulator.
+            // INT entry admits wider exact integers too, so validate that
+            // premise at runtime before licensing the collapse.
+            ; mov rax, Rq(acc)
+            ; movsxd rcx, eax
+            ; cmp rcx, rax
+            ; jne => local
+            ; mov eax, eax                    // save zero-extended low 32
+            ; mov [rsp + dv_reduce_slot], rax
+            ; => local
+        );
     }
     // (No addint_imm_home / gpr_const fills: immediates encode directly here.)
     dynasm!(ops ; jmp => lbl(start, &in_region));
@@ -1987,9 +2802,8 @@ pub(crate) fn compile_region_int_gpr(
                 let add = matches!(proto.code[ip], Instr::Add { .. });
                 let dl = g(dst);
                 let (sa, sb) = (src(a), src(b));
-                let spilled = matches!(dl, Loc::S(_))
-                    || matches!(sa, Src::S(_))
-                    || matches!(sb, Src::S(_));
+                let spilled =
+                    matches!(dl, Loc::S(_)) || matches!(sa, Src::S(_)) || matches!(sb, Src::S(_));
                 if spilled {
                     // ── W10.3 ── any spilled participant stages through rax:
                     // load a canonical (a slot IS canonical), fold b in, store
@@ -2025,75 +2839,93 @@ pub(crate) fn compile_region_int_gpr(
                     }
                     wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                     if !plan.elide_guard.contains(&ip) {
-                        emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
+                        emit_i53_guard_gpr(
+                            &mut ops,
+                            dl,
+                            rip_after,
+                            ip_slot,
+                            inline_guards,
+                            flush_exit,
+                        );
                     }
                 } else {
-                let d = dst_reg(dl); // resident (nothing spilled on this op)
-                // W8: 64-bit arithmetic needs canonical operands (dst is
-                // never lazy — an Add/Sub def is WIDE).
-                if let Src::R(h) = src(a) {
-                    emit_canon_home(&mut ops, h, &lazy);
-                }
-                if let Src::R(h) = src(b) {
-                    emit_canon_home(&mut ops, h, &lazy);
-                }
-                match (src(a), src(b)) {
-                    (Src::R(ag), Src::R(bg)) => {
-                        if d == ag {
-                            if add {
-                                dynasm!(ops ; add Rq(d), Rq(bg));
-                            } else {
-                                dynasm!(ops ; sub Rq(d), Rq(bg));
-                            }
-                        } else if d == bg {
-                            if add {
-                                dynasm!(ops ; add Rq(d), Rq(ag)); // commutative
-                            } else {
-                                // dst == b (and ≠ a): compute in rax first.
-                                dynasm!(ops ; mov rax, Rq(ag) ; sub rax, Rq(bg) ; mov Rq(d), rax);
-                            }
-                        } else if add {
-                            dynasm!(ops ; mov Rq(d), Rq(ag) ; add Rq(d), Rq(bg));
-                        } else {
-                            dynasm!(ops ; mov Rq(d), Rq(ag) ; sub Rq(d), Rq(bg));
-                        }
+                    let d = dst_reg(dl); // resident (nothing spilled on this op)
+                                         // W8: 64-bit arithmetic needs canonical operands (dst is
+                                         // never lazy — an Add/Sub def is WIDE).
+                    if let Src::R(h) = src(a) {
+                        emit_canon_home(&mut ops, h, &lazy);
                     }
-                    (a_, b_) => {
-                        // At least one hoisted-const immediate.
-                        match (a_, b_) {
-                            (Src::R(ag), Src::I(bi)) => {
-                                if d != ag {
-                                    dynasm!(ops ; mov Rq(d), Rq(ag));
-                                }
+                    if let Src::R(h) = src(b) {
+                        emit_canon_home(&mut ops, h, &lazy);
+                    }
+                    match (src(a), src(b)) {
+                        (Src::R(ag), Src::R(bg)) => {
+                            if d == ag {
                                 if add {
-                                    dynasm!(ops ; add Rq(d), bi);
+                                    dynasm!(ops ; add Rq(d), Rq(bg));
                                 } else {
-                                    dynasm!(ops ; sub Rq(d), bi);
+                                    dynasm!(ops ; sub Rq(d), Rq(bg));
                                 }
-                            }
-                            (Src::I(ai), Src::R(bg)) => {
+                            } else if d == bg {
                                 if add {
-                                    if d != bg {
-                                        dynasm!(ops ; mov Rq(d), Rq(bg));
+                                    dynasm!(ops ; add Rq(d), Rq(ag)); // commutative
+                                } else {
+                                    // dst == b (and ≠ a): compute in rax first.
+                                    dynasm!(ops ; mov rax, Rq(ag) ; sub rax, Rq(bg) ; mov Rq(d), rax);
+                                }
+                            } else if add {
+                                dynasm!(ops ; mov Rq(d), Rq(ag) ; add Rq(d), Rq(bg));
+                            } else {
+                                dynasm!(ops ; mov Rq(d), Rq(ag) ; sub Rq(d), Rq(bg));
+                            }
+                        }
+                        (a_, b_) => {
+                            // At least one hoisted-const immediate.
+                            match (a_, b_) {
+                                (Src::R(ag), Src::I(bi)) => {
+                                    if d != ag {
+                                        dynasm!(ops ; mov Rq(d), Rq(ag));
                                     }
-                                    dynasm!(ops ; add Rq(d), ai);
-                                } else {
-                                    dynasm!(ops ; mov rax, ai ; sub rax, Rq(bg) ; mov Rq(d), rax);
+                                    if add {
+                                        dynasm!(ops ; add Rq(d), bi);
+                                    } else {
+                                        dynasm!(ops ; sub Rq(d), bi);
+                                    }
                                 }
+                                (Src::I(ai), Src::R(bg)) => {
+                                    if add {
+                                        if d != bg {
+                                            dynasm!(ops ; mov Rq(d), Rq(bg));
+                                        }
+                                        dynasm!(ops ; add Rq(d), ai);
+                                    } else {
+                                        dynasm!(ops ; mov rax, ai ; sub rax, Rq(bg) ; mov Rq(d), rax);
+                                    }
+                                }
+                                (Src::I(ai), Src::I(bi)) => {
+                                    // Two i32 immediates: fold (no i64 overflow possible).
+                                    let v = if add {
+                                        ai as i64 + bi as i64
+                                    } else {
+                                        ai as i64 - bi as i64
+                                    };
+                                    dynasm!(ops ; mov rax, QWORD v ; mov Rq(d), rax);
+                                }
+                                _ => unreachable!(),
                             }
-                            (Src::I(ai), Src::I(bi)) => {
-                                // Two i32 immediates: fold (no i64 overflow possible).
-                                let v = if add { ai as i64 + bi as i64 } else { ai as i64 - bi as i64 };
-                                dynasm!(ops ; mov rax, QWORD v ; mov Rq(d), rax);
-                            }
-                            _ => unreachable!(),
                         }
                     }
-                }
-                wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
-                if !plan.elide_guard.contains(&ip) {
-                    emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
-                }
+                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                    if !plan.elide_guard.contains(&ip) {
+                        emit_i53_guard_gpr(
+                            &mut ops,
+                            dl,
+                            rip_after,
+                            ip_slot,
+                            inline_guards,
+                            flush_exit,
+                        );
+                    }
                 }
             }
             Instr::Mul { dst, a, b } => {
@@ -2114,26 +2946,27 @@ pub(crate) fn compile_region_int_gpr(
                             Loc::S(dd) => dynasm!(ops ; mov rax, QWORD c ; mov [rsp + dd], rax),
                         }
                     } else {
-                    let vg = g(val_reg);
-                    match (dl, vg) {
-                        (Loc::R(d), Loc::R(vr)) => {
-                            if d != vr {
-                                emit_home_copy(&mut ops, d, Src::R(vr), &lazy); // d is never lazy (WIDE def)
-                            } else {
-                                emit_canon_home(&mut ops, d, &lazy);
+                        let vg = g(val_reg);
+                        match (dl, vg) {
+                            (Loc::R(d), Loc::R(vr)) => {
+                                if d != vr {
+                                    emit_home_copy(&mut ops, d, Src::R(vr), &lazy);
+                                // d is never lazy (WIDE def)
+                                } else {
+                                    emit_canon_home(&mut ops, d, &lazy);
+                                }
+                                dynasm!(ops ; shl Rq(d), shift as i8);
                             }
-                            dynasm!(ops ; shl Rq(d), shift as i8);
-                        }
-                        _ => {
-                            // W10.3: stage through rax (slots are canonical).
-                            emit_src64_canon(&mut ops, loc_src(vg), 0, &lazy);
-                            dynasm!(ops ; shl rax, shift as i8);
-                            match dl {
-                                Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
-                                Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
+                            _ => {
+                                // W10.3: stage through rax (slots are canonical).
+                                emit_src64_canon(&mut ops, loc_src(vg), 0, &lazy);
+                                dynasm!(ops ; shl rax, shift as i8);
+                                match dl {
+                                    Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
+                                    Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
+                                }
                             }
                         }
-                    }
                     }
                 } else if plan.elide_guard.contains(&ip) {
                     emit_src64_canon(&mut ops, src(a), 0, &lazy); // rax
@@ -2234,9 +3067,17 @@ pub(crate) fn compile_region_int_gpr(
                                 dynasm!(ops ; mov Rq(d), Rq(ag));
                             }
                             dynasm!(ops ; add Rq(d), imm); // sign-extended imm32 == i64 add
-                            wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                            wt_pre =
+                                emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                             if !plan.elide_guard.contains(&ip) {
-                                emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
+                                emit_i53_guard_gpr(
+                                    &mut ops,
+                                    dl,
+                                    rip_after,
+                                    ip_slot,
+                                    inline_guards,
+                                    flush_exit,
+                                );
                             }
                         }
                     }
@@ -2261,9 +3102,17 @@ pub(crate) fn compile_region_int_gpr(
                             if let Loc::R(d) = dl {
                                 dynasm!(ops ; mov Rq(d), rax);
                             }
-                            wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                            wt_pre =
+                                emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                             if !plan.elide_guard.contains(&ip) {
-                                emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
+                                emit_i53_guard_gpr(
+                                    &mut ops,
+                                    dl,
+                                    rip_after,
+                                    ip_slot,
+                                    inline_guards,
+                                    flush_exit,
+                                );
                             }
                         }
                     }
@@ -2322,8 +3171,61 @@ pub(crate) fn compile_region_int_gpr(
                 flag_cmp = Some((ip, dst, cmp));
             }
             Instr::Jump { target } => {
-                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                dynasm!(ops ; jmp => t);
+                if ip == e && dv_reduce.is_some() {
+                    let p = dv_reduce.unwrap();
+                    let acc_x = plan.glob_home[&p.accumulator_global];
+                    let outer_x = plan.glob_home[&p.outer_global];
+                    let (Loc::R(acc), Loc::R(outer)) = (map[&acc_x], map[&outer_x]) else {
+                        unreachable!()
+                    };
+                    let normal = ops.new_dynamic_label();
+                    let finish = ops.new_dynamic_label();
+                    let out = region_target(
+                        (e + 1) as u32,
+                        start,
+                        end,
+                        &in_region,
+                        &mut exit_stubs,
+                        &mut ops,
+                    );
+                    // The ordinary body has completed one full outer pass.
+                    // Its accumulator now equals `start + delta (mod 2^32)`.
+                    // Apply delta to ceil((limit-current)/step) more passes,
+                    // update the induction to the exact first failing value,
+                    // and take the region's normal out-edge. rax/rcx/rdx are
+                    // this emitter's permanent scratch registers.
+                    emit_canon_home(&mut ops, outer, &lazy);
+                    dynasm!(ops
+                        ; cmp QWORD [rsp + dv_reduce_slot], -1
+                        ; je => normal
+                        ; mov rdx, Rq(outer)
+                        ; cmp rdx, p.outer_limit as i32
+                        ; jge => finish
+                        ; mov rax, QWORD p.outer_limit
+                        ; sub rax, rdx
+                        ; add rax, p.outer_step - 1
+                        ; mov rcx, p.outer_step
+                        ; cqo
+                        ; idiv rcx                         // rax = remaining passes
+                        ; imul rdx, rax, p.outer_step      // exact outer advance
+                        ; add Rq(outer), rdx
+                        ; mov ecx, Rd(acc)
+                        ; sub ecx, DWORD [rsp + dv_reduce_slot] // one-pass delta
+                        ; imul ecx, eax                    // modulo-2^32 repeat
+                        ; add Rd(acc), ecx
+                        ; movsxd Rq(acc), Rd(acc)          // signed `| 0` result
+                        ; => finish
+                        ; jmp => out
+                        ; => normal
+                    );
+                    let t =
+                        region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                    dynasm!(ops ; jmp => t);
+                } else {
+                    let t =
+                        region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                    dynasm!(ops ; jmp => t);
+                }
             }
             Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
                 let if_false = matches!(proto.code[ip], Instr::JumpIfFalse { .. });
@@ -2449,8 +3351,8 @@ pub(crate) fn compile_region_int_gpr(
                     ; jae => deopt
                     ; mov rdx, [rsp + off + 8]
                 );
-                emit_src64(&mut ops, src(val), 0);       // rax = value (low 32 used;
-                                                         // a lazy home's low 32 is right)
+                emit_src64(&mut ops, src(val), 0); // rax = value (low 32 used;
+                                                   // a lazy home's low 32 is right)
                 dynasm!(ops
                     ; mov DWORD [rdx + rcx * 4], eax     // store low 32 (== ToInt32(v))
                     ; jmp => done
@@ -2593,7 +3495,7 @@ pub(crate) fn compile_region_int_gpr(
                     ; jae => deopt                       // OOB → deopt (interp yields NaN)
                     ; mov rdx, [rsp + off + 8]           // pinned bytes base
                     ; movzx Rd(d), BYTE [rdx + rcx]      // ASCII code unit, 0..255 —
-                );                                       // zext == sext: canonical
+                ); // zext == sext: canonical
                 store_dst(&mut ops, dl);
                 dynasm!(ops
                     ; jmp => done
@@ -2624,11 +3526,16 @@ pub(crate) fn compile_region_int_gpr(
             // OOB pos, TypeError for a detached buffer — a detached/shrunk/
             // non-DV receiver snapshots {0,0,0} and misses identity). Scratch:
             // rax/rcx/rdx only (r8-r11 may be Bool or numeric homes).
-            Instr::CallMethod { dst, arg_base, argc, name, .. }
-                if ta_plan
-                    .access
-                    .get(&ip)
-                    .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND) =>
+            Instr::CallMethod {
+                dst,
+                arg_base,
+                argc,
+                name,
+                ..
+            } if ta_plan
+                .access
+                .get(&ip)
+                .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND) =>
             {
                 let kindid = match proto
                     .string_constants
@@ -2637,10 +3544,7 @@ pub(crate) fn compile_region_int_gpr(
                 {
                     Some(k) if k <= 6 => k,
                     _ => {
-                        decline_emit(format_args!(
-                            "int-gpr-emit-unhandled: {:?}",
-                            proto.code[ip]
-                        ));
+                        decline_emit(format_args!("int-gpr-emit-unhandled: {:?}", proto.code[ip]));
                         return GprAttempt::OutOfScope;
                     }
                 };
@@ -2740,13 +3644,16 @@ pub(crate) fn compile_region_int_gpr(
                     dynasm!(ops ; => loaded);
                 }
                 store_dst(&mut ops, dl); // W10.3 spilled dst: park the qword
-                // A FUSED access resumes at the ELIDED Eq (ip-1): the
-                // interpreter recomputes the flag into the frame slot — which
-                // native code never writes — then re-runs the call. flush_exit
-                // canonicalizes lazy operand homes first, so the re-executed
-                // Eq reads the values it would have read.
-                let resume_ip =
-                    if plan.dv_flag_fuse.contains_key(&ip) { rip(ip - 1) } else { rip_at };
+                                         // A FUSED access resumes at the ELIDED Eq (ip-1): the
+                                         // interpreter recomputes the flag into the frame slot — which
+                                         // native code never writes — then re-runs the call. flush_exit
+                                         // canonicalizes lazy operand homes first, so the re-executed
+                                         // Eq reads the values it would have read.
+                let resume_ip = if plan.dv_flag_fuse.contains_key(&ip) {
+                    rip(ip - 1)
+                } else {
+                    rip_at
+                };
                 dynasm!(ops
                     ; jmp => done
                     ; => deopt
@@ -2769,17 +3676,20 @@ pub(crate) fn compile_region_int_gpr(
             // ── pinned length ── str.length / arr.length from the snapshot.
             Instr::GetProp { dst, .. }
                 if ta_plan.access.get(&ip).map_or(false, |&j| {
-                    matches!(ta_plan.pins[j as usize].kind, STR_PIN_KIND | ARR_INT_PIN_KIND)
+                    matches!(
+                        ta_plan.pins[j as usize].kind,
+                        STR_PIN_KIND | ARR_INT_PIN_KIND
+                    )
                 }) =>
             {
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
                 let dl = g(dst);
                 let d = dst_reg(dl); // W10.3: a spilled dst stages in rax
-                // W7: a hoisted pin's length read collapses to a bare snapshot
-                // load (identity entry-guarded; length region-invariant). The
-                // fully hoisted STRING case never reaches here (body op
-                // skipped); this is the multi-def / on-a-branch / Array residue.
+                                     // W7: a hoisted pin's length read collapses to a bare snapshot
+                                     // load (identity entry-guarded; length region-invariant). The
+                                     // fully hoisted STRING case never reaches here (body op
+                                     // skipped); this is the multi-def / on-a-branch / Array residue.
                 if plan.hoist_pins.contains(&(j as u8)) {
                     dynasm!(ops ; mov Rq(d), [rsp + off + 16]);
                     store_dst(&mut ops, dl);
@@ -2812,7 +3722,13 @@ pub(crate) fn compile_region_int_gpr(
             // reads operands' low 32s, so any representation serves). The
             // 3-operand imm form and the in-place 2-operand form keep the
             // whole op to ONE instruction on the chain.
-            Instr::MathOp { dst, arg_base, op: MathFn::Imul, argc: 2, .. } => {
+            Instr::MathOp {
+                dst,
+                arg_base,
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } => {
                 let dl = g(dst);
                 // W10.3: a spilled dst stages in eax (imul has no mem-dst
                 // form); spilled operands use the r32, r/m32 (,imm) forms —
@@ -2858,9 +3774,9 @@ pub(crate) fn compile_region_int_gpr(
                     dynasm!(ops ; movsxd Rq(d), Rd(d));
                 }
                 store_dst(&mut ops, dl); // W10.3 spilled dst: park the qword
-                // The generic writes_reg hook covers MathOp dsts, but this arm
-                // writes through explicitly like the DV arm (membership no-op
-                // otherwise). An imul result is ToInt32 — provably i32.
+                                         // The generic writes_reg hook covers MathOp dsts, but this arm
+                                         // writes through explicitly like the DV arm (membership no-op
+                                         // otherwise). An imul result is ToInt32 — provably i32.
                 let emitted = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, true);
                 if shadow.reg_slot(dst).is_some() {
                     wt_pre = emitted;
@@ -2893,11 +3809,14 @@ pub(crate) fn compile_region_int_gpr(
                     Instr::Bitwise { op, .. } if !matches!(op, crate::bytecode::BitwiseOp::Ushr)
                 ) || matches!(
                     proto.code[ip],
-                    Instr::MathOp { op: MathFn::Imul, argc: 2, .. }
+                    Instr::MathOp {
+                        op: MathFn::Imul,
+                        argc: 2,
+                        ..
+                    }
                 );
                 let shadowed = shadow.reg_slot(d).is_some();
-                if emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, d, known_i32)
-                    && !shadowed
+                if emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, d, known_i32) && !shadowed
                 {
                     flag_cmp = None; // the incumbent boxing path clobbered FLAGS
                 }
@@ -3002,7 +3921,11 @@ pub(crate) fn compile_region_int_gpr(
         log_pinned_recvs("INT-GPR", start, end, proto, plan);
     }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    GprAttempt::Emitted(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    GprAttempt::Emitted(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding: None,
+    })
 }
 
 /// Compare flags for the GPR/immediate operand forms (SIGNED, i64 — an i32

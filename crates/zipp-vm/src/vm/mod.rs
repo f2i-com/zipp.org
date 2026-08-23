@@ -22,7 +22,8 @@
 #![allow(unused_imports)]
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
-    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap, PropAttr, PromiseState, ReactionPair, Reactions,
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -216,11 +217,24 @@ pub(crate) enum Resume {
 /// applied to the settled `arg`, settling `dependent`. `AsyncResume` resumes a
 /// suspended async activation.
 pub(crate) enum Microtask {
-    Reaction { callback: Value, arg: Value, dependent: u32, kind: ReactionKind, finally: bool },
-    AsyncResume { activation: u32, input: Resume },
+    Reaction {
+        callback: Value,
+        arg: Value,
+        dependent: u32,
+        kind: ReactionKind,
+        finally: bool,
+    },
+    AsyncResume {
+        activation: u32,
+        input: Resume,
+    },
     /// PromiseResolveThenableJob: resolving `promise` with a thenable defers
     /// `then.call(thenable, resolveFn, rejectFn)` to this microtask (spec ordering).
-    ThenableJob { thenable: Value, then: Value, promise: u32 },
+    ThenableJob {
+        thenable: Value,
+        then: Value,
+        promise: u32,
+    },
 }
 
 /// Native (built-in) function ids — the discriminant carried by `HeapObj::Native`.
@@ -1028,7 +1042,8 @@ pub struct Vm<'p> {
     /// `import_module`; a re-export back into an in-progress module (a self/mutual
     /// cycle) resolves against this own-exports snapshot instead of recursing. Holds
     /// only slot indices into `globals` (a GC root), so it needs no separate rooting.
-    module_own: std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, u32>>,
+    module_own:
+        std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, u32>>,
     /// Per-namespace AMBIGUOUS export names (a name supplied by two different
     /// `export *` sources): excluded from the namespace; resolving one by name
     /// through `export {x} from` / `import {x}` is a SyntaxError.
@@ -1122,15 +1137,13 @@ pub struct Vm<'p> {
     module_errors: std::collections::HashMap<std::path::PathBuf, Value>,
     /// Per-module DEFERRED namespace singleton (`import defer * as ns`):
     /// canonical path → the deferred namespace object. Values are GC ROOTS.
-    deferred_ns_cache:
-        std::collections::HashMap<(std::path::PathBuf, Option<String>), Value>,
+    deferred_ns_cache: std::collections::HashMap<(std::path::PathBuf, Option<String>), Value>,
     /// Deferred namespaces NOT YET evaluated: object idx → module path.
     /// Removed when a triggering access evaluates the module.
     /// Value carries the module TYPE alongside the path (`with { type: "json" }`):
     /// the trigger re-imports through `import_module`, and dropping the type there
     /// re-parsed a JSON module as JavaScript.
-    deferred_ns_state:
-        std::collections::HashMap<u32, (std::path::PathBuf, Option<String>)>,
+    deferred_ns_state: std::collections::HashMap<u32, (std::path::PathBuf, Option<String>)>,
     /// Async modules waiting on pending dependencies: capability-promise
     /// index → the state needed to run the body once the last dependency
     /// settles. Keys are GC roots (the capability promise must survive).
@@ -1469,86 +1482,89 @@ pub struct Vm<'p> {
 #[derive(Debug)]
 pub struct Thrown(pub String);
 
-
 // submodules (split from the former monolithic vm.rs)
+mod access;
+mod async_runtime;
+mod builtins;
 pub(crate) mod clock;
+mod dispatch;
+mod engine;
 pub(crate) mod host_api;
+mod indexing_date;
 /// Step budget, cooperative abort, and the optional execution trace. Off by
 /// default: the hook it adds to the inner dispatch loop is not something a
 /// `zipp js file.js` run should pay for.
 #[cfg(feature = "instrument")]
 pub mod instrument;
-mod engine;
-mod dispatch;
-mod async_runtime;
-mod indexing_date;
-mod setup;
+mod mathjson;
 mod natives;
 mod props;
-mod mathjson;
-mod access;
-mod builtins;
+mod setup;
 pub(crate) use builtins::builtin_stats;
-mod values;
-mod temporal;
-mod intl;
-mod locale_tag;
+mod agents;
+mod array_ops;
+pub(crate) mod bigint;
 mod cldr_alias;
 mod cldr_alias_data;
 mod cldr_en;
-mod dtf_pattern;
-mod segmenter;
-mod special_casing;
-mod iterhelpers;
-mod proxy_regexp;
-mod typedarray;
-mod construct;
-mod misc_methods;
-mod array_ops;
-mod string_ops;
 mod coerce;
 mod collections;
-pub(crate) mod bigint;
-pub(crate) mod native;
-mod agents;
-mod helpers_misc;
-mod helpers_datetime;
-mod helpers_numeric;
-mod helpers_json;
-pub(crate) mod helpers_num2;
+mod construct;
+mod dtf_pattern;
+mod enum_stream;
+mod field_stream;
 mod gc;
-pub(crate) use gc::gc_stats;
-pub(crate) use gc::gc_gen_stats;
-pub(crate) use gc::gc_nursery_stats;
-pub(crate) use gc::gc_young_budget_stats;
-pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
-pub(crate) use proxy_regexp::rxstats::dump_call_direct as regexp_call_direct_stats;
-pub(crate) use proxy_regexp::rxstats::dump_scalar_exec as regexp_scalar_exec_stats;
-pub(crate) use proxy_regexp::rxstats::dump_scalar_matchall as regexp_scalar_matchall_stats;
-pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_call_direct_stats;
-pub(crate) use proxy_regexp::regexp_call_direct_enabled;
-pub(crate) use proxy_regexp::rx_scalar_exec_enabled;
-pub(crate) use proxy_regexp::rx_scalar_matchall_enabled;
-pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
+mod helpers_datetime;
+mod helpers_json;
+mod helpers_misc;
+pub(crate) mod helpers_num2;
+mod helpers_numeric;
+mod intl;
+mod iterhelpers;
+mod locale_tag;
+mod misc_methods;
+pub(crate) mod native;
+mod proxy_regexp;
+mod segmenter;
+mod special_casing;
+mod string_ops;
+mod temporal;
+mod typedarray;
+mod values;
+pub(crate) use async_runtime::async_inline_await_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use coerce::concat_pair_stats;
 pub(crate) use coerce::pad2_concat_stats;
 pub(crate) use coerce::pad2_concat_stats_enabled;
 pub(crate) use coerce::pad2_conditional_stats;
+pub(crate) use gc::gc_gen_stats;
+pub(crate) use gc::gc_nursery_stats;
+pub(crate) use gc::gc_stats;
+pub(crate) use gc::gc_young_budget_stats;
 pub(crate) use helpers_misc::call_inline_stats;
 pub(crate) use helpers_misc::concat_set_stats;
 pub(crate) use helpers_misc::cross_fill_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;
+pub(crate) use proxy_regexp::regexp_call_direct_enabled;
+pub(crate) use proxy_regexp::rx_scalar_exec_enabled;
+pub(crate) use proxy_regexp::rx_scalar_matchall_enabled;
+pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
+pub(crate) use proxy_regexp::rxstats::dump_call_direct as regexp_call_direct_stats;
+pub(crate) use proxy_regexp::rxstats::dump_scalar_exec as regexp_scalar_exec_stats;
+pub(crate) use proxy_regexp::rxstats::dump_scalar_matchall as regexp_scalar_matchall_stats;
+pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_call_direct_stats;
+pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 pub(crate) mod prof;
 pub(crate) use prof::dump as prof_stats;
-mod ic;
 pub(crate) mod decorators;
+mod ic;
 
 pub(crate) use bigint::*;
-pub(crate) use ic::{GetAct, SetAct, RET_DISCARD};
-pub(crate) use helpers_misc::*;
+pub(crate) use field_stream::*;
 pub(crate) use helpers_datetime::*;
-pub(crate) use helpers_numeric::*;
 pub(crate) use helpers_json::*;
+pub(crate) use helpers_misc::*;
 pub(crate) use helpers_num2::*;
+pub(crate) use helpers_numeric::*;
+pub(crate) use ic::{GetAct, SetAct, RET_DISCARD};

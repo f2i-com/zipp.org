@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -14,7 +14,13 @@ impl<'p> Vm<'p> {
     /// native call per element. Falls back to `call_value` per element otherwise.
     /// The window is always released (truncate) before returning — including on a
     /// callback error — so a thrown callback never leaks register slots.
-    pub(crate) fn array_each(&mut self, idx: u32, cb: Value, mode: EachMode, this_arg: Value) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn array_each(
+        &mut self,
+        idx: u32,
+        cb: Value,
+        mode: EachMode,
+        this_arg: Value,
+    ) -> Result<Option<Value>, Thrown> {
         // IsCallable(callback) precedes iteration: map/filter/forEach on an EMPTY
         // array with a non-callable callback must still throw TypeError.
         if !self.is_callable(cb) {
@@ -50,8 +56,11 @@ impl<'p> Vm<'p> {
         // running CreateDataPropertyOrThrow per element.
         let kernel_ok = this_arg.is_undefined() && species_target.is_none();
         let collect = matches!(mode, EachMode::Map | EachMode::Filter);
-        let mut out: Vec<Value> =
-            if collect { Vec::with_capacity(snapshot.len()) } else { Vec::new() };
+        let mut out: Vec<Value> = if collect {
+            Vec::with_capacity(snapshot.len())
+        } else {
+            Vec::new()
+        };
 
         // Fused native map kernel: inline the callback into a native loop over
         // the snapshot for the leading run of integer elements — eliminating the
@@ -71,8 +80,7 @@ impl<'p> Vm<'p> {
         {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                 if ups.is_empty() {
-                    let proto: *const crate::bytecode::FuncProto =
-                        self.func(fid as usize);
+                    let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                     // SAFETY: program functions are immutable during execution;
                     // the raw ptr dodges the self.jit (&mut) vs self.program (&)
                     // borrow conflict (same pattern as native_cb_entry).
@@ -81,20 +89,18 @@ impl<'p> Vm<'p> {
                     let reg_count = (proto_ref.reg_count as usize).max(min_window);
                     // A callback that declares the 3rd (array) param or uses
                     // `arguments` must see the receiver — not the kernel's path.
-                    let kernel_entry = if proto_ref.param_count >= 3
-                        || proto_ref.arguments_reg.is_some()
-                    {
-                        None
-                    } else {
-                        self.jit.map_kernel(fid, proto_ref)
-                    };
+                    let kernel_entry =
+                        if proto_ref.param_count >= 3 || proto_ref.arguments_reg.is_some() {
+                            None
+                        } else {
+                            self.jit.map_kernel(fid, proto_ref)
+                        };
                     if let Some(entry) = kernel_entry {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
                             let len = snapshot.len();
-                            let window_ptr =
-                                unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+                            let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                             let snap_ptr = snapshot.as_ptr() as *const u64;
                             let out_ptr = out.as_mut_ptr() as *mut u64;
                             // SAFETY: `entry` is a valid win64 map kernel; the
@@ -132,28 +138,25 @@ impl<'p> Vm<'p> {
         {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                 if ups.is_empty() {
-                    let proto: *const crate::bytecode::FuncProto =
-                        self.func(fid as usize);
+                    let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                     // SAFETY: as the map branch above.
                     let proto_ref = unsafe { &*proto };
                     let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
                     let reg_count = (proto_ref.reg_count as usize).max(min_window);
                     // Skip the kernel when the predicate could observe the 3rd
                     // (array) param or `arguments` (see the map branch).
-                    let kernel_entry = if proto_ref.param_count >= 3
-                        || proto_ref.arguments_reg.is_some()
-                    {
-                        None
-                    } else {
-                        self.jit.filter_kernel(fid, proto_ref)
-                    };
+                    let kernel_entry =
+                        if proto_ref.param_count >= 3 || proto_ref.arguments_reg.is_some() {
+                            None
+                        } else {
+                            self.jit.filter_kernel(fid, proto_ref)
+                        };
                     if let Some(entry) = kernel_entry {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
                             let len = snapshot.len();
-                            let window_ptr =
-                                unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+                            let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                             let snap_ptr = snapshot.as_ptr() as *const u64;
                             let out_ptr = out.as_mut_ptr() as *mut u64;
                             let mut kept: usize = 0;
@@ -182,7 +185,11 @@ impl<'p> Vm<'p> {
         // Per-element path for `[start, len)` — the whole array when no kernel
         // ran, or just the tail after a kernel bail (or nothing if it completed).
         let run_tail = start < snapshot.len();
-        let mut native = if run_tail { self.native_cb_entry(cb) } else { None };
+        let mut native = if run_tail {
+            self.native_cb_entry(cb)
+        } else {
+            None
+        };
         let win = self.regs.len();
         if let Some((_, callee_regs, _)) = native {
             if self.regs_would_overflow(win + callee_regs) {
@@ -267,7 +274,12 @@ impl<'p> Vm<'p> {
 
     /// Allocate a built-in iterator over a snapshot of `items` with prototype `proto`.
     pub(crate) fn make_iterator(&mut self, items: Vec<Value>, proto: u32) -> Value {
-        Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto, live: None }))
+        Value::heap(self.heap.alloc(HeapObj::Iterator {
+            items,
+            index: 0,
+            proto,
+            live: None,
+        }))
     }
 
     /// Allocate a LIVE Map/Set iterator over the backing collection `coll` (its heap
@@ -450,9 +462,7 @@ impl<'p> Vm<'p> {
                 continue;
             };
             let v = match mapper {
-                Some((cb, ta)) => {
-                    self.call_value(cb, ta, &[got, Value::num(k as f64), source])?
-                }
+                Some((cb, ta)) => self.call_value(cb, ta, &[got, Value::num(k as f64), source])?,
                 None => got,
             };
             if depth > 0 && self.value_is_array_throwing(v)? {
@@ -468,8 +478,7 @@ impl<'p> Vm<'p> {
             } else {
                 if out.len() >= crate::vm::MAX_DENSE_ARRAY_LEN {
                     return Err(Thrown(
-                        "RangeError: array length exceeds the engine's dense-array limit"
-                            .into(),
+                        "RangeError: array length exceeds the engine's dense-array limit".into(),
                     ));
                 }
                 out.push(v);
@@ -486,7 +495,11 @@ impl<'p> Vm<'p> {
     /// has_property dispatch), keeping the iterator methods at dense-snapshot speed;
     /// an array-like object, or an array with accessor/override indices, falls back
     /// to the general HasProperty + Get protocol (invoking inherited/accessor getters).
-    pub(crate) fn array_iter_get(&mut self, this: Value, k: usize) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn array_iter_get(
+        &mut self,
+        this: Value,
+        k: usize,
+    ) -> Result<Option<Value>, Thrown> {
         // Fast path: only a PRESENT (non-hole, in-range) own element of a real array
         // with no side table. A hole or out-of-range index is NOT resolved here — it
         // falls through to the general HasProperty+Get protocol below, which walks the
@@ -583,7 +596,11 @@ impl<'p> Vm<'p> {
     /// `array_iter_get` (which visits a prototype-inherited index). Re-reads the heap
     /// each call, so a callback's mid-iteration mutation (delete / length change) is
     /// observed.
-    pub(crate) fn array_dense_or_proto_get(&mut self, idx: u32, i: usize) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn array_dense_or_proto_get(
+        &mut self,
+        idx: u32,
+        i: usize,
+    ) -> Result<Option<Value>, Thrown> {
         if let HeapObj::Array(items) = self.heap.get(idx) {
             if let Some(v) = items.get(i) {
                 if !v.is_hole() {
@@ -631,7 +648,9 @@ impl<'p> Vm<'p> {
         };
         let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
         if !self.is_callable(cb) {
-            return Err(Thrown(format!("TypeError: {name} callback is not a function")));
+            return Err(Thrown(format!(
+                "TypeError: {name} callback is not a function"
+            )));
         }
         let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         let idxv = |k: usize| Value::num(k as f64);
@@ -674,14 +693,17 @@ impl<'p> Vm<'p> {
                 // maps successfully.
                 if len > MAX_EAGER_ITER_RESULT {
                     return Err(Thrown(
-                        "RangeError: array length exceeds the engine's dense-array limit"
-                            .into(),
+                        "RangeError: array length exceeds the engine's dense-array limit".into(),
                     ));
                 }
                 // A HOLE placeholder keeps an ABSENT source index absent in the
                 // result (`1 in [1,,3].map(f)` is false); an UNDEFINED one made
                 // the result dense.
-                let mut out = if target.is_some() { Vec::new() } else { vec![Value::HOLE; len] };
+                let mut out = if target.is_some() {
+                    Vec::new()
+                } else {
+                    vec![Value::HOLE; len]
+                };
                 for k in 0..len {
                     if let Some(val) = self.array_iter_get(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
@@ -749,7 +771,11 @@ impl<'p> Vm<'p> {
                 let total: u64 = if backward { full_len } else { len as u64 };
                 let mut i: u64 = 0;
                 while i < total {
-                    let k = if backward { (total - 1 - i) as usize } else { i as usize };
+                    let k = if backward {
+                        (total - 1 - i) as usize
+                    } else {
+                        i as usize
+                    };
                     let val = self.array_iter_get(this, k)?.unwrap_or(Value::UNDEFINED);
                     let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                     if self.truthy(r) {
@@ -795,8 +821,7 @@ impl<'p> Vm<'p> {
                             acc = val;
                             started = true;
                         } else {
-                            acc =
-                                self.call_value(cb, Value::UNDEFINED, &[acc, val, kv, this])?;
+                            acc = self.call_value(cb, Value::UNDEFINED, &[acc, val, kv, this])?;
                         }
                     }
                     if !started {
@@ -806,8 +831,11 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(Some(acc));
                 }
-                let order: Vec<usize> =
-                    if right { (0..len).rev().collect() } else { (0..len).collect() };
+                let order: Vec<usize> = if right {
+                    (0..len).rev().collect()
+                } else {
+                    (0..len).collect()
+                };
                 let mut acc = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let mut started = args.len() >= 2;
                 for k in order {
@@ -819,11 +847,7 @@ impl<'p> Vm<'p> {
                         acc = val;
                         started = true;
                     } else {
-                        acc = self.call_value(
-                            cb,
-                            Value::UNDEFINED,
-                            &[acc, val, idxv(k), this],
-                        )?;
+                        acc = self.call_value(cb, Value::UNDEFINED, &[acc, val, idxv(k), this])?;
                     }
                 }
                 if !started {
@@ -876,12 +900,20 @@ impl<'p> Vm<'p> {
         // fromIndex (ToIntegerOrInfinity), coerced AFTER reading length so its
         // valueOf side effects observe the current length.
         let has_from = args.len() >= 2;
-        let from_raw = if has_from { self.to_integer_or_zero(args[1])? } else { 0 };
+        let from_raw = if has_from {
+            self.to_integer_or_zero(args[1])?
+        } else {
+            0
+        };
         match name {
             "lastIndexOf" => {
                 // Default search start is len-1; n>=0 → min(n, len-1); n<0 → len+n.
                 let mut k = if has_from {
-                    if from_raw >= 0 { from_raw.min(len - 1) } else { len + from_raw }
+                    if from_raw >= 0 {
+                        from_raw.min(len - 1)
+                    } else {
+                        len + from_raw
+                    }
                 } else {
                     len - 1
                 };
@@ -900,7 +932,11 @@ impl<'p> Vm<'p> {
             }
             // indexOf / includes share the forward start: n>=0 → n; n<0 → len+n (≥0).
             _ => {
-                let mut k = if from_raw >= 0 { from_raw } else { (len + from_raw).max(0) };
+                let mut k = if from_raw >= 0 {
+                    from_raw
+                } else {
+                    (len + from_raw).max(0)
+                };
                 let is_includes = name == "includes";
                 while k < len {
                     // includes visits every index (a hole reads as undefined);
@@ -918,7 +954,11 @@ impl<'p> Vm<'p> {
                     }
                     k += 1;
                 }
-                Ok(Some(if is_includes { Value::bool(false) } else { Value::int(-1) }))
+                Ok(Some(if is_includes {
+                    Value::bool(false)
+                } else {
+                    Value::int(-1)
+                }))
             }
         }
     }
@@ -941,10 +981,20 @@ impl<'p> Vm<'p> {
         } else {
             lenf.floor().min(9_007_199_254_740_991.0) as i64
         };
-        let rel = |i: i64| -> i64 { if i < 0 { (len + i).max(0) } else { i.min(len) } };
+        let rel = |i: i64| -> i64 {
+            if i < 0 {
+                (len + i).max(0)
+            } else {
+                i.min(len)
+            }
+        };
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let mut to = rel(self.to_integer_or_zero(arg0)?);
-        let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
+        let s0 = if args.len() >= 2 {
+            self.to_integer_or_zero(args[1])?
+        } else {
+            0
+        };
         let mut from = rel(s0);
         let e0 = if args.len() >= 3 && args[2] != Value::UNDEFINED {
             self.to_integer_or_zero(args[2])?
@@ -997,9 +1047,19 @@ impl<'p> Vm<'p> {
         } else {
             lenf.floor().min(9_007_199_254_740_991.0) as i64
         };
-        let rel = |i: i64| -> i64 { if i < 0 { (len + i).max(0) } else { i.min(len) } };
+        let rel = |i: i64| -> i64 {
+            if i < 0 {
+                (len + i).max(0)
+            } else {
+                i.min(len)
+            }
+        };
         let value = args.first().copied().unwrap_or(Value::UNDEFINED);
-        let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
+        let s0 = if args.len() >= 2 {
+            self.to_integer_or_zero(args[1])?
+        } else {
+            0
+        };
         let mut k = rel(s0);
         let e0 = if args.len() >= 3 && args[2] != Value::UNDEFINED {
             self.to_integer_or_zero(args[2])?
@@ -1149,11 +1209,17 @@ impl<'p> Vm<'p> {
                 while lower != middle {
                     let upper = len - lower - 1;
                     let lower_exists = self.al_has(this, lower)?;
-                    let lower_val =
-                        if lower_exists { self.al_get(this, lower)? } else { Value::UNDEFINED };
+                    let lower_val = if lower_exists {
+                        self.al_get(this, lower)?
+                    } else {
+                        Value::UNDEFINED
+                    };
                     let upper_exists = self.al_has(this, upper)?;
-                    let upper_val =
-                        if upper_exists { self.al_get(this, upper)? } else { Value::UNDEFINED };
+                    let upper_val = if upper_exists {
+                        self.al_get(this, upper)?
+                    } else {
+                        Value::UNDEFINED
+                    };
                     match (lower_exists, upper_exists) {
                         (true, true) => {
                             self.al_set(this, lower, upper_val)?;
@@ -1213,12 +1279,7 @@ impl<'p> Vm<'p> {
                             }
                             k += 1;
                         }
-                        self.set_prop(
-                            a,
-                            "length",
-                            Value::num(actual_delete.max(0) as f64),
-                            true,
-                        )?;
+                        self.set_prop(a, "length", Value::num(actual_delete.max(0) as f64), true)?;
                         a
                     }
                     None => {
@@ -1292,7 +1353,12 @@ impl<'p> Vm<'p> {
         Ok(Some(r))
     }
 
-    pub(crate) fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn array_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         // Suspend GC for the whole method: callback-driven arms (map/filter/
         // reduce/sort/…) hold un-rooted working sets across interpreter re-entry,
         // and the array-like path builds an un-rooted temp array. Non-callback
@@ -1328,7 +1394,10 @@ impl<'p> Vm<'p> {
             // HasProperty/DeletePropertyOrThrow + Set(O,"length",…) protocol, so a
             // plain `{0:…, length:n}` receiver is mutated correctly (real arrays use
             // the dense fast paths in the match below).
-            if matches!(name, "pop" | "push" | "shift" | "unshift" | "reverse" | "splice") {
+            if matches!(
+                name,
+                "pop" | "push" | "shift" | "unshift" | "reverse" | "splice"
+            ) {
                 return self.array_like_mutate(Value::heap(idx), name, args);
             }
             // indexOf/lastIndexOf/includes via the generic HasProperty/Get protocol —
@@ -1357,13 +1426,25 @@ impl<'p> Vm<'p> {
                     "values" => 1,
                     _ => 2,
                 };
-                return Ok(Some(self.make_live_iterator(idx, kind, self.array_iter_proto)));
+                return Ok(Some(self.make_live_iterator(
+                    idx,
+                    kind,
+                    self.array_iter_proto,
+                )));
             }
             if matches!(
                 name,
-                "join" | "toString" | "slice" | "at"
-                    | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
-                    | "toSpliced" | "toLocaleString"
+                "join"
+                    | "toString"
+                    | "slice"
+                    | "at"
+                    | "flat"
+                    | "flatMap"
+                    | "with"
+                    | "toReversed"
+                    | "toSorted"
+                    | "toSpliced"
+                    | "toLocaleString"
             ) {
                 // toSorted: IsCallable(comparefn) precedes ANY length / element read
                 // (a non-callable comparator is a TypeError before the length getter).
@@ -1390,7 +1471,8 @@ impl<'p> Vm<'p> {
                     }
                     let mut out = Vec::with_capacity(len);
                     for k in 0..len {
-                        let v = self.get_index(Value::heap(idx), Value::num((len - 1 - k) as f64))?;
+                        let v =
+                            self.get_index(Value::heap(idx), Value::num((len - 1 - k) as f64))?;
                         out.push(v);
                     }
                     return Ok(Some(self.alloc_array_current_realm(out)));
@@ -1437,7 +1519,10 @@ impl<'p> Vm<'p> {
                                 "TypeError: flatMap mapper is not a function".into(),
                             ));
                         }
-                        (1i64, Some((arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED))))
+                        (
+                            1i64,
+                            Some((arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED))),
+                        )
                     } else if args.is_empty() || arg0 == Value::UNDEFINED {
                         (1i64, None)
                     } else {
@@ -1445,13 +1530,7 @@ impl<'p> Vm<'p> {
                     };
                     let target = self.array_species_create(Value::heap(idx), 0)?;
                     let mut out = Vec::new();
-                    self.flatten_into_array(
-                        &mut out,
-                        Value::heap(idx),
-                        source_len,
-                        depth,
-                        mapper,
-                    )?;
+                    self.flatten_into_array(&mut out, Value::heap(idx), source_len, depth, mapper)?;
                     return match target {
                         Some(a) => {
                             for (i, v) in out.into_iter().enumerate() {
@@ -1543,9 +1622,7 @@ impl<'p> Vm<'p> {
                     // Step 12: newLen > 2^53-1 is a TypeError; step 13 ArrayCreate
                     // rejects > 2^32-1 with a RangeError.
                     if new_len > 9_007_199_254_740_991 {
-                        return Err(Thrown(
-                            "TypeError: Array length exceeds the maximum".into(),
-                        ));
+                        return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
                     }
                     if new_len > 4_294_967_295 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
@@ -1591,11 +1668,22 @@ impl<'p> Vm<'p> {
                     let toii = |raw: f64| if raw.is_nan() { 0.0 } else { raw.trunc() };
                     let s_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                     let rel_start = toii(self.to_number_coerce(s_arg)?);
-                    let k0 = if rel_start < 0.0 { (len + rel_start).max(0.0) } else { rel_start.min(len) };
+                    let k0 = if rel_start < 0.0 {
+                        (len + rel_start).max(0.0)
+                    } else {
+                        rel_start.min(len)
+                    };
                     let e_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                    let rel_end =
-                        if e_arg == Value::UNDEFINED { len } else { toii(self.to_number_coerce(e_arg)?) };
-                    let fin = if rel_end < 0.0 { (len + rel_end).max(0.0) } else { rel_end.min(len) };
+                    let rel_end = if e_arg == Value::UNDEFINED {
+                        len
+                    } else {
+                        toii(self.to_number_coerce(e_arg)?)
+                    };
+                    let fin = if rel_end < 0.0 {
+                        (len + rel_end).max(0.0)
+                    } else {
+                        rel_end.min(len)
+                    };
                     let count = (fin - k0).max(0.0);
                     if count > 4_294_967_295.0 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
@@ -1739,7 +1827,11 @@ impl<'p> Vm<'p> {
         // which the fast Vec path would miss. Route such cases to the abstract path.
         if name == "pop" || name == "shift" {
             if let HeapObj::Array(items) = self.heap.get(idx) {
-                let probe = if name == "pop" { items.len().checked_sub(1) } else { Some(0) };
+                let probe = if name == "pop" {
+                    items.len().checked_sub(1)
+                } else {
+                    Some(0)
+                };
                 if probe.map_or(false, |p| items.get(p).is_some_and(|v| v.is_hole())) {
                     return self.array_like_mutate(Value::heap(idx), name, args);
                 }
@@ -1772,8 +1864,10 @@ impl<'p> Vm<'p> {
         // e.g. a push at length 2^32-1 stores a NAMED prop ("4294967295" is not an
         // array index) and then the length set to 2^32 throws RangeError, per
         // ArraySetLength. The dense Vec fast paths below would use items.len().
-        if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice" | "reverse")
-            && self.array_js_len.contains_key(&idx)
+        if matches!(
+            name,
+            "push" | "pop" | "shift" | "unshift" | "splice" | "reverse"
+        ) && self.array_js_len.contains_key(&idx)
         {
             return self.array_like_mutate(Value::heap(idx), name, args);
         }
@@ -1795,19 +1889,23 @@ impl<'p> Vm<'p> {
                 Ok(Some(last))
             }
             "pop" => {
-                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    return Ok(Some(items.pop().unwrap_or(Value::UNDEFINED)));
-                }
-                Ok(Some(Value::UNDEFINED))
+                let value = match self.heap.get_mut(idx) {
+                    HeapObj::Array(items) => items.pop().unwrap_or(Value::UNDEFINED),
+                    _ => Value::UNDEFINED,
+                };
+                // ForInKeys snapshots the keyset. A pop can remove its last
+                // index, so invalidate the snapshot-version liveness guard.
+                self.heap.bump_version(idx);
+                Ok(Some(value))
             }
             "shift" => {
-                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    if items.is_empty() {
-                        return Ok(Some(Value::UNDEFINED));
-                    }
-                    return Ok(Some(items.remove(0)));
-                }
-                Ok(Some(Value::UNDEFINED))
+                let value = match self.heap.get_mut(idx) {
+                    HeapObj::Array(items) if !items.is_empty() => items.remove(0),
+                    _ => Value::UNDEFINED,
+                };
+                // Shifting can remove the old last index (and move holes).
+                self.heap.bump_version(idx);
+                Ok(Some(value))
             }
             "unshift" => {
                 // Nursery barrier (see `push`).
@@ -1871,7 +1969,11 @@ impl<'p> Vm<'p> {
                         self.array_dense_or_proto_get(idx, k)?
                     };
                     let v = v.unwrap_or(Value::UNDEFINED);
-                    parts.push(if v.is_nullish() { String::new() } else { self.to_js_string(v)? });
+                    parts.push(if v.is_nullish() {
+                        String::new()
+                    } else {
+                        self.to_js_string(v)?
+                    });
                 }
                 Ok(Some(self.alloc_str(parts.join(&sep))))
             }
@@ -1888,7 +1990,11 @@ impl<'p> Vm<'p> {
                         // A hole reads as undefined (never leak the sentinel).
                         HeapObj::Array(items) => {
                             let el = items[abs as usize];
-                            if el.is_hole() { Value::UNDEFINED } else { el }
+                            if el.is_hole() {
+                                Value::UNDEFINED
+                            } else {
+                                el
+                            }
                         }
                         _ => Value::UNDEFINED,
                     }
@@ -1915,7 +2021,11 @@ impl<'p> Vm<'p> {
                 // Optional fromIndex (ToInteger; negative counts from the end).
                 let from = if args.len() >= 2 {
                     let f = self.to_integer_or_zero(args[1])?;
-                    if f < 0 { (len + f).max(0) } else { f.min(len) }
+                    if f < 0 {
+                        (len + f).max(0)
+                    } else {
+                        f.min(len)
+                    }
                 } else {
                     0
                 } as usize;
@@ -1945,7 +2055,11 @@ impl<'p> Vm<'p> {
                 // (clamped to 0); +Infinity → past the end (never found); -Infinity → 0.
                 let from = if args.len() >= 2 {
                     let n = self.to_integer_or_zero(args[1])?;
-                    if n >= 0 { n } else { len.saturating_add(n).max(0) }
+                    if n >= 0 {
+                        n
+                    } else {
+                        len.saturating_add(n).max(0)
+                    }
                 } else {
                     0
                 };
@@ -1980,7 +2094,11 @@ impl<'p> Vm<'p> {
                 // counts from the end. ToInteger.
                 let from = if args.len() >= 2 {
                     let f = self.to_integer_or_zero(args[1])?;
-                    if f < 0 { len + f } else { f.min(len - 1) }
+                    if f < 0 {
+                        len + f
+                    } else {
+                        f.min(len - 1)
+                    }
                 } else {
                     len - 1
                 };
@@ -2006,6 +2124,9 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                     items.reverse();
                 }
+                // A hole can move onto a snapshotted index, making that key
+                // disappear even though the array length is unchanged.
+                self.heap.bump_version(idx);
                 Ok(Some(Value::heap(idx))) // reverses in place, returns the array
             }
             "concat" => {
@@ -2051,9 +2172,7 @@ impl<'p> Vm<'p> {
                                 out.extend(snap);
                             } else {
                                 for k in 0..elen {
-                                    let v = self
-                                        .array_iter_get(e, k)?
-                                        .unwrap_or(Value::HOLE);
+                                    let v = self.array_iter_get(e, k)?.unwrap_or(Value::HOLE);
                                     self.concat_emit(species_target, &mut out, &mut n, v)?;
                                 }
                             }
@@ -2112,7 +2231,11 @@ impl<'p> Vm<'p> {
                     HeapObj::Array(items) => items.len() as i32,
                     _ => 0,
                 };
-                let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
+                let s0 = if args.len() >= 2 {
+                    self.to_integer_or_zero(args[1])?
+                } else {
+                    0
+                };
                 // An absent OR explicitly-`undefined` end defaults to the length.
                 let e0 = if args.len() >= 3 && args[2] != Value::UNDEFINED {
                     self.to_integer_or_zero(args[2])?
@@ -2132,7 +2255,11 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(idx)))
             }
             "slice" => {
-                let s0 = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)? };
+                let s0 = if args.is_empty() {
+                    0
+                } else {
+                    self.to_integer_or_zero(arg0)?
+                };
                 // An absent OR explicitly-`undefined` end defaults to the length.
                 let e0 = if args.len() < 2 || args[1] == Value::UNDEFINED {
                     None
@@ -2148,14 +2275,11 @@ impl<'p> Vm<'p> {
                     None => len,
                     Some(e) => norm_index(e.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len),
                 };
-                let clean =
-                    !self.arr_props.contains_key(&idx) && !self.array_has_holes(idx);
+                let clean = !self.arr_props.contains_key(&idx) && !self.array_has_holes(idx);
                 let slice: Vec<Value> = if start < end {
                     if clean {
                         match self.heap.get(idx) {
-                            HeapObj::Array(items) => {
-                                items[start as usize..end as usize].to_vec()
-                            }
+                            HeapObj::Array(items) => items[start as usize..end as usize].to_vec(),
                             _ => Vec::new(),
                         }
                     } else {
@@ -2175,17 +2299,31 @@ impl<'p> Vm<'p> {
                 };
                 // slice does ArraySpeciesCreate(O, count) where count == slice.len().
                 let n = slice.len();
-                Ok(Some(self.array_from_species_len(Value::heap(idx), slice, n, true)?))
+                Ok(Some(self.array_from_species_len(
+                    Value::heap(idx),
+                    slice,
+                    n,
+                    true,
+                )?))
             }
-            "map" => {
-                self.array_each(idx, arg0, EachMode::Map, args.get(1).copied().unwrap_or(Value::UNDEFINED))
-            }
-            "filter" => {
-                self.array_each(idx, arg0, EachMode::Filter, args.get(1).copied().unwrap_or(Value::UNDEFINED))
-            }
-            "forEach" => {
-                self.array_each(idx, arg0, EachMode::ForEach, args.get(1).copied().unwrap_or(Value::UNDEFINED))
-            }
+            "map" => self.array_each(
+                idx,
+                arg0,
+                EachMode::Map,
+                args.get(1).copied().unwrap_or(Value::UNDEFINED),
+            ),
+            "filter" => self.array_each(
+                idx,
+                arg0,
+                EachMode::Filter,
+                args.get(1).copied().unwrap_or(Value::UNDEFINED),
+            ),
+            "forEach" => self.array_each(
+                idx,
+                arg0,
+                EachMode::ForEach,
+                args.get(1).copied().unwrap_or(Value::UNDEFINED),
+            ),
             // Short-circuiting callback searches. They stop at the first match, so
             // they use call_value directly (the all-elements array_each driver
             // doesn't fit); the callback receives (element, index).
@@ -2194,7 +2332,9 @@ impl<'p> Vm<'p> {
                 // IsCallable(callback) is checked before any iteration, so an empty
                 // array with a non-callable predicate still throws (spec step 3/4).
                 if !self.is_callable(cb) {
-                    return Err(Thrown(format!("TypeError: {name} predicate is not a function")));
+                    return Err(Thrown(format!(
+                        "TypeError: {name} predicate is not a function"
+                    )));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
@@ -2233,7 +2373,9 @@ impl<'p> Vm<'p> {
             "reduce" => {
                 let cb = arg0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown("TypeError: Reduce callback is not a function".into()));
+                    return Err(Thrown(
+                        "TypeError: Reduce callback is not a function".into(),
+                    ));
                 }
                 let snapshot = self.array_snapshot(idx);
                 let has_init = args.len() >= 2;
@@ -2263,8 +2405,7 @@ impl<'p> Vm<'p> {
                 {
                     if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                         if ups.is_empty() {
-                            let proto: *const crate::bytecode::FuncProto =
-                                self.func(fid as usize);
+                            let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
                             // SAFETY: immutable program functions; raw ptr dodges
                             // the jit-vs-program borrow conflict (as elsewhere).
                             let proto_ref = unsafe { &*proto };
@@ -2298,9 +2439,14 @@ impl<'p> Vm<'p> {
                                         *const u64,
                                         usize,
                                         *mut u64,
-                                    ) -> usize = unsafe { core::mem::transmute(entry) };
-                                    let processed =
-                                        kernel(window_ptr, snap_ptr, count, &mut acc_bits as *mut u64);
+                                    )
+                                        -> usize = unsafe { core::mem::transmute(entry) };
+                                    let processed = kernel(
+                                        window_ptr,
+                                        snap_ptr,
+                                        count,
+                                        &mut acc_bits as *mut u64,
+                                    );
                                     acc = Value::from_bits(acc_bits);
                                     self.regs.truncate(win);
                                     start += processed;
@@ -2313,7 +2459,11 @@ impl<'p> Vm<'p> {
                 // Per-element tail: the whole array if no kernel ran, or just the
                 // remainder after a kernel bail (nothing if it completed).
                 let run_tail = start < snapshot.len();
-                let mut native = if run_tail { self.native_cb_entry(cb) } else { None };
+                let mut native = if run_tail {
+                    self.native_cb_entry(cb)
+                } else {
+                    None
+                };
                 let win = self.regs.len();
                 if let Some((_, callee_regs, _)) = native {
                     if self.regs_would_overflow(win + callee_regs) {
@@ -2415,7 +2565,9 @@ impl<'p> Vm<'p> {
             "reduceRight" => {
                 let cb = arg0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown("TypeError: Reduce callback is not a function".into()));
+                    return Err(Thrown(
+                        "TypeError: Reduce callback is not a function".into(),
+                    ));
                 }
                 let snapshot = self.array_snapshot(idx);
                 let mut i = snapshot.len();
@@ -2485,7 +2637,9 @@ impl<'p> Vm<'p> {
             "findLast" | "findLastIndex" => {
                 let cb = arg0;
                 if !self.is_callable(cb) {
-                    return Err(Thrown(format!("TypeError: {name} predicate is not a function")));
+                    return Err(Thrown(format!(
+                        "TypeError: {name} predicate is not a function"
+                    )));
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
@@ -2494,7 +2648,9 @@ impl<'p> Vm<'p> {
                 // skip), so an absent/hole index is the inherited value or undefined.
                 let len = self.array_snapshot(idx).len();
                 for i in (0..len).rev() {
-                    let v = self.array_dense_or_proto_get(idx, i)?.unwrap_or(Value::UNDEFINED);
+                    let v = self
+                        .array_dense_or_proto_get(idx, i)?
+                        .unwrap_or(Value::UNDEFINED);
                     let r = self.call_value(cb, this_arg, &[v, Value::int(i as i32), receiver])?;
                     if self.truthy(r) {
                         return Ok(Some(if name == "findLast" {
@@ -2504,7 +2660,11 @@ impl<'p> Vm<'p> {
                         }));
                     }
                 }
-                Ok(Some(if name == "findLast" { Value::UNDEFINED } else { Value::int(-1) }))
+                Ok(Some(if name == "findLast" {
+                    Value::UNDEFINED
+                } else {
+                    Value::int(-1)
+                }))
             }
             "toSorted" => {
                 // Like sort() but returns a NEW array; the receiver is unchanged.
@@ -2523,7 +2683,11 @@ impl<'p> Vm<'p> {
                     let mut keyed: Vec<(Option<String>, Value)> =
                         Vec::with_capacity(snapshot.len());
                     for v in std::mem::take(&mut snapshot) {
-                        let key = if v == Value::UNDEFINED { None } else { Some(self.to_js_string(v)?) };
+                        let key = if v == Value::UNDEFINED {
+                            None
+                        } else {
+                            Some(self.to_js_string(v)?)
+                        };
                         keyed.push((key, v));
                     }
                     keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
@@ -2561,7 +2725,11 @@ impl<'p> Vm<'p> {
                     _ => 0,
                 };
                 let s = self.to_integer_or_zero(arg0)?;
-                let start = if s < 0 { (len as i64 + s).max(0) as usize } else { (s as usize).min(len) };
+                let start = if s < 0 {
+                    (len as i64 + s).max(0) as usize
+                } else {
+                    (s as usize).min(len)
+                };
                 // deleteCount: 0 args → 0; 1 arg → len-start; else ToInteger(arg1).
                 let del = if args.is_empty() {
                     0
@@ -2617,15 +2785,12 @@ impl<'p> Vm<'p> {
             // iteration are observed (the spec iterator is a generator over O).
             "values" => Ok(Some(self.make_live_iterator(idx, 1, self.array_iter_proto))),
             "keys" => Ok(Some(self.make_live_iterator(idx, 0, self.array_iter_proto))),
-            "entries" => {
-                Ok(Some(self.make_live_iterator(idx, 2, self.array_iter_proto)))
-            }
+            "entries" => Ok(Some(self.make_live_iterator(idx, 2, self.array_iter_proto))),
             "toLocaleString" => {
                 // Join each element's own toLocaleString(locales, options) with
                 // ","; nullish → "". The two arguments are forwarded per ECMA-402
                 // sup-array.prototype.toLocaleString.
-                let snapshot = if self.arr_props.contains_key(&idx) || self.array_has_holes(idx)
-                {
+                let snapshot = if self.arr_props.contains_key(&idx) || self.array_has_holes(idx) {
                     self.array_snapshot_get(idx)?
                 } else {
                     self.array_snapshot(idx)
@@ -2684,8 +2849,16 @@ impl<'p> Vm<'p> {
                 // Like splice() but returns the modified COPY; receiver unchanged.
                 let mut out = self.array_snapshot_get(idx)?;
                 let len = out.len();
-                let s = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
-                let start = if s < 0 { (len as i64 + s).max(0) as usize } else { (s as usize).min(len) };
+                let s = if arg0.is_number() {
+                    arg0.as_f64() as i64
+                } else {
+                    0
+                };
+                let start = if s < 0 {
+                    (len as i64 + s).max(0) as usize
+                } else {
+                    (s as usize).min(len)
+                };
                 let del = if args.is_empty() {
                     // No start argument: skipCount/actualSkipCount are 0 — the
                     // result is an unchanged copy, NOT a delete-everything.
@@ -2693,7 +2866,11 @@ impl<'p> Vm<'p> {
                 } else if args.len() < 2 {
                     len - start
                 } else {
-                    let d = if args[1].is_number() { args[1].as_f64() as i64 } else { 0 };
+                    let d = if args[1].is_number() {
+                        args[1].as_f64() as i64
+                    } else {
+                        0
+                    };
                     (d.max(0) as usize).min(len - start)
                 };
                 let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
@@ -2719,7 +2896,11 @@ impl<'p> Vm<'p> {
                 };
                 let i32c = |n: i64| n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 let t0 = self.to_integer_or_zero(arg0)?;
-                let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
+                let s0 = if args.len() >= 2 {
+                    self.to_integer_or_zero(args[1])?
+                } else {
+                    0
+                };
                 // An absent OR explicitly-`undefined` end defaults to the length.
                 let e0 = if args.len() >= 3 && args[2] != Value::UNDEFINED {
                     self.to_integer_or_zero(args[2])?
@@ -2785,7 +2966,11 @@ impl<'p> Vm<'p> {
         } else {
             let mut keyed: Vec<(Option<String>, Value)> = Vec::with_capacity(items.len());
             for v in std::mem::take(items) {
-                let key = if v == Value::UNDEFINED { None } else { Some(self.to_js_string(v)?) };
+                let key = if v == Value::UNDEFINED {
+                    None
+                } else {
+                    Some(self.to_js_string(v)?)
+                };
                 keyed.push((key, v));
             }
             keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
@@ -2805,7 +2990,11 @@ impl<'p> Vm<'p> {
     /// (on `<= 0`, and on the NaN that SortCompare maps to +0) the LEFT run's
     /// element wins, preserving original order. The comparator re-enters the VM
     /// (`call_value`) and may throw — from the call or from its own ToNumber.
-    pub(crate) fn comparator_sort(&mut self, items: &mut [Value], cmp: Value) -> Result<(), Thrown> {
+    pub(crate) fn comparator_sort(
+        &mut self,
+        items: &mut [Value],
+        cmp: Value,
+    ) -> Result<(), Thrown> {
         let n = items.len();
         if n < 2 {
             return Ok(());
@@ -2836,13 +3025,14 @@ impl<'p> Vm<'p> {
                 // Merge a[lo..mid] and a[mid..hi] into b[lo..hi], stably.
                 let (mut l, mut r, mut k) = (lo, mid, lo);
                 while l < mid && r < hi {
-                    let c = match self.run_cb_elem(native, win, cmp, &[a[l], a[r]], Value::UNDEFINED) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            err = Some(e);
-                            break 'outer;
-                        }
-                    };
+                    let c =
+                        match self.run_cb_elem(native, win, cmp, &[a[l], a[r]], Value::UNDEFINED) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                err = Some(e);
+                                break 'outer;
+                            }
+                        };
                     // SortCompare steps 5-7: the comparator result goes through
                     // ToNumber (a string/boolean coerces, an object's valueOf runs,
                     // a BigInt/Symbol is a TypeError) and a NaN result becomes +0 —
@@ -2893,5 +3083,4 @@ impl<'p> Vm<'p> {
         items.copy_from_slice(&a);
         Ok(())
     }
-
 }

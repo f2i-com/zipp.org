@@ -9,6 +9,25 @@ use super::*;
 // shadows the glob rather than clashing with it).
 use crate::parse::ast;
 
+/// Compiler-latched same-binary switch for the exact `GetIndex` + proven-
+/// linear append fusion. With `ZIPP_NO_APPEND_INDEX_FUSE=1`, bytecode remains
+/// the historical two-op sequence.
+#[inline]
+fn append_index_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_APPEND_INDEX_FUSE").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
 /// Compile a parsed program into bytecode.
 /// Is constant Value `v` a (pending) string literal? String constants are encoded
 /// as `Value::heap(STRING_CONST_BIT | si)` (see `add_string_const`).
@@ -19,7 +38,12 @@ pub(crate) fn is_string_const(v: Value) -> bool {
 /// Does global slot `g`'s last write BEFORE `before` initialise it to a string
 /// literal? Recognises the `s = "…"` shape the compiler emits as an adjacent
 /// `LoadConst{dst:r}; StoreGlobal{idx:g, src:r}`.
-pub(crate) fn global_inits_string(code: &[Instr], constants: &[Value], g: u32, before: usize) -> bool {
+pub(crate) fn global_inits_string(
+    code: &[Instr],
+    constants: &[Value],
+    g: u32,
+    before: usize,
+) -> bool {
     let mut store_ip = None;
     for (ip, instr) in code.iter().enumerate().take(before) {
         if let Instr::StoreGlobal { idx, .. } = *instr {
@@ -37,9 +61,11 @@ pub(crate) fn global_inits_string(code: &[Instr], constants: &[Value], g: u32, b
         _ => return false,
     };
     match code[sp - 1] {
-        Instr::LoadConst { dst, idx } if dst == src => {
-            constants.get(idx as usize).copied().map(is_string_const).unwrap_or(false)
-        }
+        Instr::LoadConst { dst, idx } if dst == src => constants
+            .get(idx as usize)
+            .copied()
+            .map(is_string_const)
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -51,9 +77,9 @@ pub(crate) fn global_inits_string(code: &[Instr], constants: &[Value], g: u32, b
 /// unnoticed.
 pub(crate) fn instr_touches(i: &Instr, r: Reg) -> bool {
     match *i {
-        Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } | Instr::LoadGlobal { dst, .. } => {
-            dst == r
-        }
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::LoadGlobal { dst, .. } => dst == r,
         Instr::Move { dst, src } => dst == r || src == r,
         Instr::StoreGlobal { src, .. }
         | Instr::StoreGlobalStrict { src, .. }
@@ -73,6 +99,13 @@ pub(crate) fn instr_touches(i: &Instr, r: Reg) -> bool {
         | Instr::Ge { dst, a, b }
         | Instr::Eq { dst, a, b }
         | Instr::Ne { dst, a, b } => dst == r || a == r || b == r,
+        Instr::StrAppendIndex {
+            dst,
+            a,
+            obj,
+            key,
+            scratch,
+        } => dst == r || a == r || obj == r || key == r || scratch == r,
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => cond == r,
         Instr::JumpIfNotLt { a, b, .. } | Instr::JumpIfNotLe { a, b, .. } => a == r || b == r,
         Instr::Jump { .. } => false,
@@ -163,7 +196,9 @@ pub(crate) fn loop_inplace_safe(
         match *instr {
             Instr::StoreGlobal { idx, .. }
             | Instr::StoreGlobalStrict { idx, .. }
-            | Instr::StoreGlobalResolved { idx, .. } if idx == g => {
+            | Instr::StoreGlobalResolved { idx, .. }
+                if idx == g =>
+            {
                 if ip < start {
                     st_before += 1
                 } else if ip <= end {
@@ -196,7 +231,11 @@ pub(crate) fn loop_inplace_safe(
         if ip != k && !is_simple_loop_op(&code[ip]) {
             return false;
         }
-        if ip != load_ip && ip != k && ip != store_ip && (instr_touches(&code[ip], a) || instr_touches(&code[ip], dst)) {
+        if ip != load_ip
+            && ip != k
+            && ip != store_ip
+            && (instr_touches(&code[ip], a) || instr_touches(&code[ip], dst))
+        {
             return false;
         }
     }
@@ -260,6 +299,7 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
         | Instr::Ne { a, b, .. }
         | Instr::JumpIfNotLt { a, b, .. }
         | Instr::JumpIfNotLe { a, b, .. } => a == r || b == r,
+        Instr::StrAppendIndex { a, obj, key, .. } => a == r || obj == r || key == r,
         Instr::AddRightPair { a, b, c, .. } => a == r || b == r || c == r,
         Instr::Pad2Concat { src, .. } | Instr::Pad2Conditional { src, .. } => src == r,
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => cond == r,
@@ -273,9 +313,23 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
         Instr::GetIndexConcat { obj, key, .. } => obj == r || key == r,
         Instr::SetIndexConcat { obj, key, val, .. } => obj == r || key == r || val == r,
         Instr::ToConcatKey { src, .. } => src == r,
-        Instr::Call { callee, arg_base, argc, .. } => callee == r || in_args(arg_base, argc),
-        Instr::TailCall { callee, arg_base, argc } => callee == r || in_args(arg_base, argc),
-        Instr::CallMethod { obj, arg_base, argc, .. } => obj == r || in_args(arg_base, argc),
+        Instr::Call {
+            callee,
+            arg_base,
+            argc,
+            ..
+        } => callee == r || in_args(arg_base, argc),
+        Instr::TailCall {
+            callee,
+            arg_base,
+            argc,
+        } => callee == r || in_args(arg_base, argc),
+        Instr::CallMethod {
+            obj,
+            arg_base,
+            argc,
+            ..
+        } => obj == r || in_args(arg_base, argc),
         Instr::MathOp { arg_base, argc, .. } | Instr::StaticFn { arg_base, argc, .. } => {
             in_args(arg_base, argc)
         }
@@ -334,6 +388,7 @@ pub(crate) fn accum_touches(i: &Instr, r: Reg) -> bool {
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }
         | Instr::ToConcatKey { dst, .. } => dst == r,
+        Instr::StrAppendIndex { dst, scratch, .. } => dst == r || scratch == r,
         Instr::AddRightPair { dst, .. }
         | Instr::Pad2Concat { dst, .. }
         | Instr::Pad2Conditional { dst, .. } => dst == r,
@@ -405,6 +460,9 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }
         | Instr::ToConcatKey { dst, .. } => dst == r,
+        // The fused opcode's externally modelled write is only `dst`: its
+        // native hit intentionally omits the compiler-proved-dead scratch.
+        Instr::StrAppendIndex { dst, .. } => dst == r,
         Instr::AddRightPair { dst, .. }
         | Instr::Pad2Concat { dst, .. }
         | Instr::Pad2Conditional { dst, .. } => dst == r,
@@ -412,12 +470,12 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
     }
 }
 
-/// Is `code[move_ip]`'s destination `t` UNOBSERVABLE — i.e. can no read of
-/// `t` anywhere in the function see the value this `Move` stored? True when
+/// Is `code[write_ip]`'s destination `t` UNOBSERVABLE — i.e. can no read of
+/// `t` anywhere in the function see the value this write stored? True when
 /// every read of `t` is covered by a DOMINATING write found by scanning
 /// straight-line code backwards from the read: the scan fails (conservatively)
 /// at a jump target (control can enter with `t` from elsewhere), at our own
-/// `move_ip`, or at ANY op outside the enumerated set — which includes every
+/// `write_ip`, or at ANY op outside the enumerated set — which includes every
 /// `PushHandler`/`PushFinally`-style op carrying a hidden control target.
 ///
 /// This exists because the register allocator REUSES statement-value slots:
@@ -425,16 +483,22 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
 /// different branch uses as a genuine scratch, so "never read anywhere" is
 /// too blunt — the reuse always re-writes the register first, and this scan
 /// proves exactly that.
-fn move_dst_unobservable(code: &[Instr], targets: &[bool], t: Reg, move_ip: usize) -> bool {
+fn write_dst_unobservable(
+    code: &[Instr],
+    targets: &[bool],
+    t: Reg,
+    write_ip: usize,
+    ignored_read: Option<usize>,
+) -> bool {
     'reads: for (rp, instr) in code.iter().enumerate() {
-        if rp == move_ip || !accum_may_read(instr, t) {
+        if rp == write_ip || Some(rp) == ignored_read || !accum_may_read(instr, t) {
             continue;
         }
         let mut ip = rp;
         while ip > 0 {
             ip -= 1;
-            if ip == move_ip {
-                return false; // reached our Move with no covering write
+            if ip == write_ip {
+                return false; // reached our write with no covering write
             }
             if accum_writes(&code[ip], t) {
                 continue 'reads; // covered on the only fall-through path
@@ -560,7 +624,10 @@ pub(crate) fn rewrite_local_accumulators(f: &mut FuncProto) {
                     | Instr::JumpIfFalse { target, .. }
                     | Instr::JumpIfTrue { target, .. }
                     | Instr::JumpIfNotLt { target, .. }
-                    | Instr::JumpIfNotLe { target, .. } => target as usize,
+                    | Instr::JumpIfNotLe { target, .. }
+                    | Instr::PushFinally { target, .. }
+                    | Instr::JumpFinally { target, .. } => target as usize,
+                    Instr::PushHandler { catch_target, .. } => catch_target as usize,
                     _ => continue,
                 };
                 if t < n {
@@ -577,7 +644,9 @@ pub(crate) fn rewrite_local_accumulators(f: &mut FuncProto) {
                 // proof, not a "never read" one).
                 if ip >= start {
                     if let Instr::Move { dst, src } = f.code[ip] {
-                        if src == r && dst != r && move_dst_unobservable(&f.code, &targets, dst, ip)
+                        if src == r
+                            && dst != r
+                            && write_dst_unobservable(&f.code, &targets, dst, ip, None)
                         {
                             continue;
                         }
@@ -615,7 +684,12 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
         for k in start..=j {
             let (dst, a) = match f.code[k] {
                 Instr::Add { dst, a, .. }
-                | Instr::AddRightPair { dst, a, in_place: false, .. } => (dst, a),
+                | Instr::AddRightPair {
+                    dst,
+                    a,
+                    in_place: false,
+                    ..
+                } => (dst, a),
                 _ => continue,
             };
             // result `dst` stored back to some global `g` in the body
@@ -632,9 +706,9 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
                 None => continue,
             };
             // operand `a` loaded from that same global `g` in the body
-            let load_ip = (start..=j).find(|&m| {
-                matches!(f.code[m], Instr::LoadGlobal { dst: ld, idx } if ld == a && idx == g)
-            });
+            let load_ip = (start..=j).find(
+                |&m| matches!(f.code[m], Instr::LoadGlobal { dst: ld, idx } if ld == a && idx == g),
+            );
             let load_ip = match load_ip {
                 Some(m) => m,
                 None => continue,
@@ -642,8 +716,18 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
             if !global_inits_string(&f.code, &f.constants, g, start) {
                 continue;
             }
-            let in_place =
-                loop_inplace_safe(&f.code, g, start, j, is_top_level, load_ip, k, store_ip, a, dst);
+            let in_place = loop_inplace_safe(
+                &f.code,
+                g,
+                start,
+                j,
+                is_top_level,
+                load_ip,
+                k,
+                store_ip,
+                a,
+                dst,
+            );
             rewrites.push((k, in_place));
         }
     }
@@ -656,8 +740,20 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
                     Instr::StrConcat { dst, a, b }
                 };
             }
-            Instr::AddRightPair { dst, a, b, c, in_place: false } if in_place => {
-                f.code[k] = Instr::AddRightPair { dst, a, b, c, in_place: true };
+            Instr::AddRightPair {
+                dst,
+                a,
+                b,
+                c,
+                in_place: false,
+            } if in_place => {
+                f.code[k] = Instr::AddRightPair {
+                    dst,
+                    a,
+                    b,
+                    c,
+                    in_place: true,
+                };
             }
             Instr::AddRightPair { .. } => {
                 // The generic fused op is already admitted by MEM/Tier C; no
@@ -668,6 +764,75 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
     }
 }
 
+/// Fuse the exact adjacent shape
+///
+/// `scratch = obj[key]; dst = StrAppendInPlace(a, scratch)`
+///
+/// after the accumulator passes have licensed the mutation. Instruction count
+/// stays fixed (the consumed append becomes a self-Move), so every branch target
+/// remains valid. The scratch write may be omitted on the native ASCII hit only
+/// after a whole-function dominating-write proof establishes that no other read
+/// can observe it; the interpreter retains it as the slow path's GC root.
+pub(crate) fn rewrite_append_indexes(f: &mut FuncProto) {
+    if !append_index_fuse_enabled() || f.code.len() < 2 {
+        return;
+    }
+    let n = f.code.len();
+    let mut targets = vec![false; n];
+    for instr in &f.code {
+        let target = match *instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. }
+            | Instr::PushFinally { target, .. }
+            | Instr::JumpFinally { target, .. } => target as usize,
+            Instr::PushHandler { catch_target, .. } => catch_target as usize,
+            _ => continue,
+        };
+        if target < n {
+            targets[target] = true;
+        }
+    }
+    let mut rewrites = Vec::new();
+    for ip in 0..n - 1 {
+        let (scratch, obj, key, dst, a) = match (&f.code[ip], &f.code[ip + 1]) {
+            (
+                Instr::GetIndex {
+                    dst: scratch,
+                    obj,
+                    key,
+                },
+                Instr::StrAppendInPlace { dst, a, b },
+            ) if scratch == b => (*scratch, *obj, *key, *dst, *a),
+            _ => continue,
+        };
+        // The GetIndex write must not overwrite an operand the following
+        // append reads, and no control-flow edge may enter at that append after
+        // it becomes the inert second half of the fused pair.
+        if scratch == obj
+            || scratch == key
+            || scratch == dst
+            || scratch == a
+            || targets[ip + 1]
+            || !write_dst_unobservable(&f.code, &targets, scratch, ip, Some(ip + 1))
+        {
+            continue;
+        }
+        rewrites.push((ip, dst, a, obj, key, scratch));
+    }
+    for (ip, dst, a, obj, key, scratch) in rewrites {
+        f.code[ip] = Instr::StrAppendIndex {
+            dst,
+            a,
+            obj,
+            key,
+            scratch,
+        };
+        f.code[ip + 1] = Instr::Move { dst, src: dst };
+    }
+}
 
 /// The `type` import attribute of an import/export-from declaration's
 /// `with { ... }` clause, if present.

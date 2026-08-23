@@ -1,0 +1,1270 @@
+{
+  "schema_version": 2,
+  "created_utc": "2026-08-23T19:51:30.260808+00:00",
+  "git_commit": "c6ffa2002169008171152a69b625c976d9178b06",
+  "workspace_source": "c6ffa2002169008171152a69b625c976d9178b06",
+  "engine_source_before": {
+    "old": "c6ffa2002169008171152a69b625c976d9178b06+dirty.cc788093b1986b3e",
+    "new": "c6ffa2002169008171152a69b625c976d9178b06+dirty.cc788093b1986b3e"
+  },
+  "engine_source_after": {
+    "old": "c6ffa2002169008171152a69b625c976d9178b06+dirty.cc788093b1986b3e",
+    "new": "c6ffa2002169008171152a69b625c976d9178b06+dirty.cc788093b1986b3e"
+  },
+  "engine_binary_sha_before": {
+    "old": "2013e66d1e74ad534c898f897451df19b1e084e1a21d24366edfa32c1a45a993",
+    "new": "2013e66d1e74ad534c898f897451df19b1e084e1a21d24366edfa32c1a45a993"
+  },
+  "engine_binary_sha_after": {
+    "old": "2013e66d1e74ad534c898f897451df19b1e084e1a21d24366edfa32c1a45a993",
+    "new": "2013e66d1e74ad534c898f897451df19b1e084e1a21d24366edfa32c1a45a993"
+  },
+  "publishable": true,
+  "provenance_reasons": [],
+  "engine_drift": [],
+  "harness": {
+    "bench_py_sha256": "85f4f17cc6ffad0732a68c32b64893f8598e43e3a8c5f194fc179b00dee66dfd",
+    "run_real_sh_sha256": "b14a7e33fbd9c007e0bd0bdcde861e1ed7b86dc52cec09734f82120905190c5c"
+  },
+  "bench_input_sha256": {
+    "property-ic-shapes": "0ef46cf000e039e12b7ea2b91b3c2c514578824f4b322948882cb80a4297995c"
+  },
+  "headline_benches": [],
+  "diagnostic_benches": [
+    "property-ic-shapes"
+  ],
+  "unclassified_benches": [],
+  "row_set_summaries": {
+    "diagnostic": {
+      "benches": [
+        "property-ic-shapes"
+      ],
+      "geomean_paired_ratio": 0.016543433840203705,
+      "ci95": [
+        0.016335953927258482,
+        0.016700689587725363
+      ]
+    },
+    "all_measured": {
+      "benches": [
+        "property-ic-shapes"
+      ],
+      "geomean_paired_ratio": 0.016543433840203705,
+      "ci95": [
+        0.016335953927258482,
+        0.016700689587725363
+      ]
+    }
+  },
+  "seed": 1511464998,
+  "reps": 21,
+  "metric": "cold",
+  "report_mode": "modern",
+  "headline_metric": "cold",
+  "timeout_s": 300.0,
+  "bootstrap_samples": 10000,
+  "benches": [
+    "property-ic-shapes"
+  ],
+  "bench_dir": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\real",
+  "baseline": "old",
+  "engines": [
+    {
+      "name": "old",
+      "argv": [
+        "target/field-stream-write/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\field-stream-write\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 6877696,
+      "mtime_ns": 1787514644309280800,
+      "sha256": "2013e66d1e74ad534c898f897451df19b1e084e1a21d24366edfa32c1a45a993",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "c6ffa2002169008171152a69b625c976d9178b06+dirty.cc788093b1986b3e",
+        "commit": "c6ffa2002169008171152a69b625c976d9178b06",
+        "dirty": true,
+        "diff_digest": "cc788093b1986b3e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {
+        "ZIPP_NO_FIELD_READ_STREAM": "1",
+        "ZIPP_NO_FIELD_WRITE_STREAM": "1"
+      }
+    },
+    {
+      "name": "new",
+      "argv": [
+        "target/field-stream-write/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\field-stream-write\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 6877696,
+      "mtime_ns": 1787514644309280800,
+      "sha256": "2013e66d1e74ad534c898f897451df19b1e084e1a21d24366edfa32c1a45a993",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "c6ffa2002169008171152a69b625c976d9178b06+dirty.cc788093b1986b3e",
+        "commit": "c6ffa2002169008171152a69b625c976d9178b06",
+        "dirty": true,
+        "diff_digest": "cc788093b1986b3e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {
+        "ZIPP_FIELD_STREAM_AB": "1"
+      }
+    }
+  ],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {
+    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "c5e8b73f10ecc47ad1be38f14ba6b79cd3af06fcd86637f7b6b857ae209a686e,f204d340535055781952b10ed396de20b842f00a19e430852f7e121ad1ce91f6",
+    "RUST_LOG": "warn"
+  },
+  "schedule": [
+    {
+      "rep": 0,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 1,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 2,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 3,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 4,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 5,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 6,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 7,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 8,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 9,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 10,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 11,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 12,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 13,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 14,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 15,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 16,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 17,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 18,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 19,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 20,
+      "bench_order": [
+        "property-ic-shapes"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.01671399996848777,
+      "cold_s": 0.836933099955786,
+      "adjusted_s": 0.8202190999872983,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.01076829998055473,
+      "cold_s": 0.013242100016213953,
+      "adjusted_s": 0.002473800035659224,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.009204600006341934,
+      "cold_s": 0.012856299988925457,
+      "adjusted_s": 0.003651699982583523,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.008936800004448742,
+      "cold_s": 0.8335159000125714,
+      "adjusted_s": 0.8245791000081226,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010583199968095869,
+      "cold_s": 0.8228891000035219,
+      "adjusted_s": 0.812305900035426,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.01015049999114126,
+      "cold_s": 0.012189299974124879,
+      "adjusted_s": 0.002038799982983619,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.00877679995028302,
+      "cold_s": 0.012627500051166862,
+      "adjusted_s": 0.0038507001008838415,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009003399987705052,
+      "cold_s": 0.8184109999565408,
+      "adjusted_s": 0.8094075999688357,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010301199974492192,
+      "cold_s": 0.8276878999895416,
+      "adjusted_s": 0.8173867000150494,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010678600054234266,
+      "cold_s": 0.013692800013814121,
+      "adjusted_s": 0.003014199959579855,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010028299991972744,
+      "cold_s": 0.013626700034365058,
+      "adjusted_s": 0.0035984000423923135,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009457800013478845,
+      "cold_s": 0.8292644000030123,
+      "adjusted_s": 0.8198065999895334,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.01142900000559166,
+      "cold_s": 0.8288979000062682,
+      "adjusted_s": 0.8174689000006765,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010657000006176531,
+      "cold_s": 0.013594300020486116,
+      "adjusted_s": 0.002937300014309585,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.00957110000308603,
+      "cold_s": 0.013593000010587275,
+      "adjusted_s": 0.0040219000075012445,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009831599949393421,
+      "cold_s": 0.8283962999703363,
+      "adjusted_s": 0.8185647000209428,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010807300044689327,
+      "cold_s": 0.8278108999948017,
+      "adjusted_s": 0.8170035999501124,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010692099982406944,
+      "cold_s": 0.014082900015637279,
+      "adjusted_s": 0.0033908000332303345,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010401499981526285,
+      "cold_s": 0.01387520000571385,
+      "adjusted_s": 0.003473700024187565,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009629999985918403,
+      "cold_s": 0.8219899999676272,
+      "adjusted_s": 0.8123599999817088,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.012693100026808679,
+      "cold_s": 0.8345721000223421,
+      "adjusted_s": 0.8218789999955334,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010837400041054934,
+      "cold_s": 0.013917499978560954,
+      "adjusted_s": 0.00308009993750602,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.01004229998216033,
+      "cold_s": 0.013386700011324137,
+      "adjusted_s": 0.0033444000291638076,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.00974000000860542,
+      "cold_s": 0.8194623999879695,
+      "adjusted_s": 0.8097223999793641,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.011265399982221425,
+      "cold_s": 0.8250678000040352,
+      "adjusted_s": 0.8138024000218138,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011529100011102855,
+      "cold_s": 0.015398600022308528,
+      "adjusted_s": 0.0038695000112056732,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.016396100050769746,
+      "cold_s": 0.014256900001782924,
+      "adjusted_s": -0.0021392000489868224,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010595900006592274,
+      "cold_s": 0.8217253999901004,
+      "adjusted_s": 0.8111294999835081,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.01100080000469461,
+      "cold_s": 0.8377198999514803,
+      "adjusted_s": 0.8267190999467857,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011397399997804314,
+      "cold_s": 0.013990500010550022,
+      "adjusted_s": 0.0025931000127457082,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 15,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.01031490002060309,
+      "cold_s": 0.014429600036237389,
+      "adjusted_s": 0.004114700015634298,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 15,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010062100016511977,
+      "cold_s": 0.8332118999678642,
+      "adjusted_s": 0.8231497999513522,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 16,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010873300023376942,
+      "cold_s": 0.8251768000191078,
+      "adjusted_s": 0.8143034999957308,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 16,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010807099984958768,
+      "cold_s": 0.013694100023712963,
+      "adjusted_s": 0.002887000038754195,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 17,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010052300000097603,
+      "cold_s": 0.013185099989641458,
+      "adjusted_s": 0.003132799989543855,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 17,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009825000015553087,
+      "cold_s": 0.8199293999932706,
+      "adjusted_s": 0.8101043999777175,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 18,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.011150699981953949,
+      "cold_s": 0.8210370999877341,
+      "adjusted_s": 0.8098864000057802,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 18,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010639199987053871,
+      "cold_s": 0.014634199964348227,
+      "adjusted_s": 0.003994999977294356,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 19,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010338500025682151,
+      "cold_s": 0.013663600024301559,
+      "adjusted_s": 0.0033250999986194074,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 19,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009352999972179532,
+      "cold_s": 0.823519799974747,
+      "adjusted_s": 0.8141668000025675,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 20,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.01190310000674799,
+      "cold_s": 0.8285398000152782,
+      "adjusted_s": 0.8166367000085302,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 20,
+      "bench": "property-ic-shapes",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010292200022377074,
+      "cold_s": 0.013429699989501387,
+      "adjusted_s": 0.003137499967124313,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 748,
+      "stdout_sha256": "5d7b478ff62f633009a6884ece34e7d64e80537e68019d9573d20ea2a3870e90",
+      "valid_for_stats": true
+    }
+  ],
+  "summary": {
+    "headline_metric": "cold",
+    "rows": {
+      "property-ic-shapes": {
+        "median_ms": {
+          "old": 827.6878999895416,
+          "new": 13.663600024301559
+        },
+        "paired_ratio": 0.016543433840203705,
+        "paired_ratio_ci95": [
+          0.01633595392725849,
+          0.016700689587725366
+        ],
+        "metrics": {
+          "cold": {
+            "median_ms": {
+              "old": 827.6878999895416,
+              "new": 13.663600024301559
+            },
+            "paired_ratio": 0.016543433840203705,
+            "paired_ratio_ci95": [
+              0.01633595392725849,
+              0.016700689587725366
+            ],
+            "nonpositive_pairs": 0
+          },
+          "startup": {
+            "median_ms": {
+              "old": 10.583199968095869,
+              "new": 10.401499981526285
+            },
+            "paired_ratio": 1.0231348584411906,
+            "paired_ratio_ci95": [
+              0.9735038093852199,
+              1.031036958243103
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "old": 816.6367000085302,
+              "new": 3.3250999986194074
+            },
+            "paired_ratio": null,
+            "paired_ratio_ci95": null,
+            "nonpositive_pairs": 1
+          }
+        }
+      }
+    },
+    "geomean_paired_ratio": 0.016543433840203705,
+    "geomean_paired_ratio_ci95": [
+      0.016335953927258482,
+      0.016700689587725363
+    ],
+    "metric_geomean_paired_ratio": {
+      "cold": 0.016543433840203705,
+      "startup": 1.0231348584411906,
+      "adjusted": null
+    },
+    "startup_median_ms": {
+      "old": 10.583199968095869,
+      "new": 10.401499981526285
+    }
+  },
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "failures": []
+}

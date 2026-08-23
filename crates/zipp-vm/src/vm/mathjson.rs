@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -27,11 +27,188 @@ fn json_leaf_fast_enabled() -> bool {
 }
 
 impl<'p> Vm<'p> {
+    /// Guarded whole-tree execution for the exact Tier-C [`JsonWalkPlan`].
+    ///
+    /// The bytecode shape has no observable work except numeric global updates
+    /// and reads from the visited tree.  We therefore accumulate privately,
+    /// validate the *entire* graph, and commit only after traversal succeeds.
+    /// Any getter/proxy/custom prototype/sparse element/cycle/unsupported leaf
+    /// returns `None` with zero visible effects, so the ordinary native body can
+    /// execute from instruction 0. Aliases are intentionally revisited: that is
+    /// what the recursive JavaScript function does.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn json_walk_reduce(
+        &mut self,
+        plan: crate::codegen::JsonWalkPlan,
+        callee: Value,
+        root: Value,
+    ) -> Option<u64> {
+        // The three typeof comparison constants are heap-resolved after the JIT
+        // plan was built. Validate their live contents here rather than trusting
+        // source text or constant-pool positions.
+        let nc = Value::from_bits(plan.number_bits);
+        let sc = Value::from_bits(plan.string_bits);
+        let bc = Value::from_bits(plan.boolean_bits);
+        let const_is = |vm: &Self, v: Value, want: &str| {
+            v.is_heap()
+                && vm
+                    .heap
+                    .str_cow(v.heap_index())
+                    .is_some_and(|s| s.as_ref() == want)
+        };
+        if !const_is(self, nc, "number")
+            || !const_is(self, sc, "string")
+            || !const_is(self, bc, "boolean")
+            || self.globals.get(plan.self_global as usize).copied()? != callee
+        {
+            return None;
+        }
+
+        let slots = [
+            plan.nodes,
+            plan.nulls,
+            plan.sum2x,
+            plan.strings,
+            plan.string_len,
+            plan.bools,
+        ];
+        let mut acc = [0.0; 6];
+        for (i, &g) in slots.iter().enumerate() {
+            let v = *self.globals.get(g as usize)?;
+            if !v.is_number() {
+                return None; // would run ToNumeric / `+` coercion in JS
+            }
+            acc[i] = v.as_f64();
+        }
+
+        // Every ordinary object in the admitted graph inherits from the default
+        // Object prototype. `for-in` would also visit inherited enumerable keys;
+        // admit the direct own-slot walk only while that whole default tail is
+        // the usual terminal, barren object.
+        let object_proto_barren = self.obj_proto != 0
+            && !self.proto_of.contains_key(&self.obj_proto)
+            && matches!(self.heap.get(self.obj_proto), HeapObj::Object(m)
+                if m.keys.iter().enumerate().all(|(i, k)|
+                    is_hidden_key(k) || !m.attrs[i].enumerable));
+
+        // `(value, exit, depth)` implements DFS without Rust recursion. Exit markers
+        // keep only the current ancestry in `active`, detecting cycles while
+        // allowing shared subtrees to be counted once per incoming edge. Very
+        // deep inputs deliberately decline: completing them without JS frames
+        // could otherwise hide the recursive body's observable RangeError.
+        const MAX_REDUCED_DEPTH: usize = 256;
+        // The ordinary recursive body consumes one VM frame per tree level.
+        // Leave enough headroom for the deepest tree this reducer admits; when
+        // a caller has already filled the stack, completing iteratively here
+        // would incorrectly suppress the ordinary path's RangeError.
+        if self.frames.len().saturating_add(MAX_REDUCED_DEPTH) >= MAX_FRAMES {
+            return None;
+        }
+        let mut work: Vec<(Value, bool, usize)> = vec![(root, false, 0)];
+        let mut active = rustc_hash::FxHashSet::<u32>::default();
+        while let Some((v, exit, depth)) = work.pop() {
+            if exit {
+                active.remove(&v.heap_index());
+                continue;
+            }
+            if depth >= MAX_REDUCED_DEPTH {
+                return None;
+            }
+            // `nodes++` precedes every branch in the JavaScript body.
+            acc[0] += 1.0;
+            if v.is_null() {
+                acc[1] += 1.0;
+                continue;
+            }
+            if v.is_number() {
+                // Keep the exact left-to-right f64 operation grouping:
+                // `numSum2x = numSum2x + (v * 2)`.
+                acc[2] += v.as_f64() * 2.0;
+                continue;
+            }
+            if v.is_bool() {
+                acc[5] += 1.0;
+                continue;
+            }
+            if !v.is_heap() {
+                return None;
+            }
+            let idx = v.heap_index();
+            if let Some(n) = self.heap.str_units(idx) {
+                acc[3] += 1.0;
+                acc[4] += n as f64;
+                continue;
+            }
+            if !active.insert(idx) {
+                return None;
+            }
+            work.push((v, true, depth));
+            match self.heap.get(idx) {
+                HeapObj::Array(items) => {
+                    // The source loop reads the live `length` then every index.
+                    // Dense, non-overlaid, ordinary Arrays make those reads pure
+                    // and identical to the backing vector. Named own properties
+                    // are irrelevant because the array branch never for-ins.
+                    if self.proto_of.contains_key(&idx)
+                        || self.arguments_objs.contains_key(&idx)
+                        || self.array_elements_overlaid(idx)
+                        || self.array_js_len.contains_key(&idx)
+                        || items.iter().any(|v| v.is_hole())
+                    {
+                        return None;
+                    }
+                    for &child in items.iter().rev() {
+                        work.push((child, false, depth + 1));
+                    }
+                }
+                HeapObj::Object(map) => {
+                    if !object_proto_barren
+                        || idx == self.global_this
+                        || self.proto_of.contains_key(&idx)
+                        || map.class.is_some()
+                        || map.is_raw_json
+                        || self.module_namespaces.contains_key(&idx)
+                        || self.deferred_ns_state.contains_key(&idx)
+                    {
+                        return None;
+                    }
+                    // With no integer-index key, insertion order is exactly
+                    // for-in's own-key order. Rejecting that rare shape avoids a
+                    // per-object sort/allocation and preserves floating-add order.
+                    for i in (0..map.keys.len()).rev() {
+                        let key = &map.keys[i];
+                        if is_hidden_key(key) || !map.attrs[i].enumerable {
+                            continue;
+                        }
+                        if map.attrs[i].accessor || canonical_index_str(key).is_some() {
+                            return None;
+                        }
+                        work.push((map.vals[i], false, depth + 1));
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        for (i, &g) in slots.iter().enumerate() {
+            // This replaces the Tier-C body's ordinary bytecode store. Do not
+            // bump `global_gens`: generated StoreGlobalResolved does not either.
+            self.globals[g as usize] = Value::num(acc[i]);
+        }
+        Some(Value::UNDEFINED.bits())
+    }
+
     /// Evaluate a `Math.<fn>` call over `argc` argument registers (coerced to
     /// numbers). Mirrors JS semantics where they differ from Rust's f64 methods:
     /// `round` is half-up (so −2.5 → −2, not −3); `sign` preserves ±0 and maps
     /// NaN→NaN; `min`/`max` are NaN-sticky (any NaN arg ⇒ NaN).
-    pub(crate) fn eval_math(&mut self, op: crate::bytecode::MathFn, base: usize, arg_base: u16, argc: u16) -> Result<f64, Thrown> {
+    pub(crate) fn eval_math(
+        &mut self,
+        op: crate::bytecode::MathFn,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<f64, Thrown> {
         // Snapshot the argument registers FIRST (a ToNumber coercion below may run a
         // user valueOf that re-enters the VM and pushes registers), then delegate to
         // the shared value-form evaluator, which ToNumber-coerces each argument.
@@ -50,7 +227,11 @@ impl<'p> Vm<'p> {
 
     /// Evaluate a Math method over an argument SLICE (the value-form `Math.abs`
     /// invoked as a native), mirroring `eval_math`'s register-based variant.
-    pub(crate) fn eval_math_args(&mut self, op: crate::bytecode::MathFn, args: &[Value]) -> Result<f64, Thrown> {
+    pub(crate) fn eval_math_args(
+        &mut self,
+        op: crate::bytecode::MathFn,
+        args: &[Value],
+    ) -> Result<f64, Thrown> {
         use crate::bytecode::MathFn as M;
         let at = |args: &[Value], i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
         Ok(match op {
@@ -71,20 +252,32 @@ impl<'p> Vm<'p> {
                     acc = match op {
                         // f64 min/max treat -0 and +0 as equal; spec orders -0 < +0,
                         // so tie-break on the sign (Min prefers -0, Max prefers +0).
-                        M::Min => if v.is_nan() || acc.is_nan() {
-                            f64::NAN
-                        } else if v == acc {
-                            if v.is_sign_negative() { v } else { acc }
-                        } else {
-                            acc.min(v)
-                        },
-                        M::Max => if v.is_nan() || acc.is_nan() {
-                            f64::NAN
-                        } else if v == acc {
-                            if v.is_sign_positive() { v } else { acc }
-                        } else {
-                            acc.max(v)
-                        },
+                        M::Min => {
+                            if v.is_nan() || acc.is_nan() {
+                                f64::NAN
+                            } else if v == acc {
+                                if v.is_sign_negative() {
+                                    v
+                                } else {
+                                    acc
+                                }
+                            } else {
+                                acc.min(v)
+                            }
+                        }
+                        M::Max => {
+                            if v.is_nan() || acc.is_nan() {
+                                f64::NAN
+                            } else if v == acc {
+                                if v.is_sign_positive() {
+                                    v
+                                } else {
+                                    acc
+                                }
+                            } else {
+                                acc.max(v)
+                            }
+                        }
                         _ => {
                             // Math.hypot: a ±Infinity argument forces +Infinity even
                             // when another argument is NaN (spec step 3).
@@ -96,7 +289,11 @@ impl<'p> Vm<'p> {
                     };
                 }
                 if matches!(op, M::Hypot) {
-                    if hypot_inf { f64::INFINITY } else { acc.sqrt() }
+                    if hypot_inf {
+                        f64::INFINITY
+                    } else {
+                        acc.sqrt()
+                    }
                 } else {
                     acc
                 }
@@ -176,7 +373,11 @@ impl<'p> Vm<'p> {
     pub(crate) fn json_indent(&self, space: Value) -> String {
         if space.is_number() {
             let n = space.as_f64();
-            let n = if n.is_finite() && n > 0.0 { (n as usize).min(10) } else { 0 };
+            let n = if n.is_finite() && n > 0.0 {
+                (n as usize).min(10)
+            } else {
+                0
+            };
             " ".repeat(n)
         } else if space.is_heap() {
             match self.heap.str_cow(space.heap_index()) {
@@ -203,7 +404,9 @@ impl<'p> Vm<'p> {
         // as false, so check explicitly before the PropertyList branch).
         if replacer.is_heap() {
             if let HeapObj::Proxy { revoked: true, .. } = self.heap.get(replacer.heap_index()) {
-                return Err(Thrown("TypeError: Cannot perform IsArray on a revoked Proxy".into()));
+                return Err(Thrown(
+                    "TypeError: Cannot perform IsArray on a revoked Proxy".into(),
+                ));
             }
         }
         // An array (or Proxy-wrapping-array) replacer is a PropertyList: read its
@@ -268,8 +471,9 @@ impl<'p> Vm<'p> {
         allowlist: Option<&[String]>,
     ) -> Result<Option<String>, Thrown> {
         let mut out = String::new();
-        if self.json_value_into(holder, key, v, indent, depth, visited, replacer, allowlist, &mut out)?
-        {
+        if self.json_value_into(
+            holder, key, v, indent, depth, visited, replacer, allowlist, &mut out,
+        )? {
             Ok(Some(out))
         } else {
             Ok(None)
@@ -294,7 +498,9 @@ impl<'p> Vm<'p> {
             if proto == 0 {
                 return false;
             }
-            let tj = vm.get_prop(Value::heap(proto), "toJSON").unwrap_or(Value::UNDEFINED);
+            let tj = vm
+                .get_prop(Value::heap(proto), "toJSON")
+                .unwrap_or(Value::UNDEFINED);
             vm.is_callable(tj)
         };
         let r = has(self, self.obj_proto) || has(self, self.arr_proto);
@@ -369,8 +575,9 @@ impl<'p> Vm<'p> {
                     .into_iter()
                     .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
                     .collect();
-                let all_prim =
-                    slots.iter().all(|&i| !m.attrs[i].accessor && !m.vals[i].is_heap());
+                let all_prim = slots
+                    .iter()
+                    .all(|&i| !m.attrs[i].accessor && !m.vals[i].is_heap());
                 Some((slots, all_prim))
             }
             _ => None,
@@ -477,10 +684,13 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
-            | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
             | HeapObj::Symbol { .. } => return Ok(false),
             HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
-                return Err(Thrown("TypeError: Do not know how to serialize a BigInt".into()))
+                return Err(Thrown(
+                    "TypeError: Do not know how to serialize a BigInt".into(),
+                ))
             }
             // A boxed primitive serializes as ToString / ToNumber / its boolean —
             // observably invoking the wrapper's toString/valueOf (which may throw).
@@ -542,11 +752,21 @@ impl<'p> Vm<'p> {
         // and detect cycles via `visited`. The PropertyList allowlist is GLOBAL — it
         // filters object keys at EVERY nesting level, including objects inside arrays.
         if visited.contains(&idx) {
-            return Err(Thrown("TypeError: Converting circular structure to JSON".into()));
+            return Err(Thrown(
+                "TypeError: Converting circular structure to JSON".into(),
+            ));
         }
         visited.push(idx);
-        let pad = if indent.is_empty() { String::new() } else { indent.repeat(depth + 1) };
-        let pad_close = if indent.is_empty() { String::new() } else { indent.repeat(depth) };
+        let pad = if indent.is_empty() {
+            String::new()
+        } else {
+            indent.repeat(depth + 1)
+        };
+        let pad_close = if indent.is_empty() {
+            String::new()
+        } else {
+            indent.repeat(depth)
+        };
         if self.value_is_array(v) {
             // len = ToLength(Get(val, "length"))
             let lenv = self.get_prop(v, "length")?;
@@ -603,9 +823,17 @@ impl<'p> Vm<'p> {
                     String::new()
                 };
                 // An omitted array element serializes as `null` (NOT skipped).
-                let wrote = match self
-                    .json_value_into(v, &ks, e, indent, depth + 1, visited, replacer, allowlist, out)
-                {
+                let wrote = match self.json_value_into(
+                    v,
+                    &ks,
+                    e,
+                    indent,
+                    depth + 1,
+                    visited,
+                    replacer,
+                    allowlist,
+                    out,
+                ) {
                     Ok(w) => w,
                     Err(e) => {
                         visited.pop();
@@ -635,14 +863,12 @@ impl<'p> Vm<'p> {
             // elided, guarded by the map version (a delete shifts slots and
             // bumps it). `ZIPP_NO_JSON_LEAF_FAST=1` restores the cloning walk
             // below.
-            let slot_plan = if json_leaf_fast_enabled()
-                && allowlist.is_none()
-                && !self.is_callable(replacer)
-            {
-                self.json_object_slots_fast(idx)
-            } else {
-                None
-            };
+            let slot_plan =
+                if json_leaf_fast_enabled() && allowlist.is_none() && !self.is_callable(replacer) {
+                    self.json_object_slots_fast(idx)
+                } else {
+                    None
+                };
             if let Some((slots, all_prim)) = slot_plan {
                 let sep = if indent.is_empty() { ":" } else { ": " };
                 out.push('{');
@@ -675,7 +901,15 @@ impl<'p> Vm<'p> {
                         // no replacer (no toJSON probe, no replacer call) —
                         // pass "" like the array path does for primitives.
                         let wrote = match self.json_value_into(
-                            v, "", val, indent, depth + 1, visited, replacer, allowlist, out,
+                            v,
+                            "",
+                            val,
+                            indent,
+                            depth + 1,
+                            visited,
+                            replacer,
+                            allowlist,
+                            out,
                         ) {
                             Ok(w) => w,
                             Err(e) => {
@@ -741,7 +975,15 @@ impl<'p> Vm<'p> {
                         json_quote_into(out, k);
                         out.push_str(sep);
                         let wrote = match self.json_value_into(
-                            v, k, val, indent, depth + 1, visited, replacer, allowlist, out,
+                            v,
+                            k,
+                            val,
+                            indent,
+                            depth + 1,
+                            visited,
+                            replacer,
+                            allowlist,
+                            out,
                         ) {
                             Ok(w) => w,
                             Err(e) => {
@@ -771,7 +1013,11 @@ impl<'p> Vm<'p> {
             // read directly from the map — eliding `object_enum_own`'s array alloc
             // + per-key display + the per-key `json_get` dispatch. `use_fast` gates
             // both the keys and the value reads together.
-            let fast_keys = if allowlist.is_none() { self.json_object_keys_fast(idx) } else { None };
+            let fast_keys = if allowlist.is_none() {
+                self.json_object_keys_fast(idx)
+            } else {
+                None
+            };
             let use_fast = fast_keys.is_some();
             let keys: Vec<String> = match (allowlist, fast_keys) {
                 (Some(a), _) => a.to_vec(),
@@ -833,9 +1079,17 @@ impl<'p> Vm<'p> {
                 }
                 json_quote_into(out, &k);
                 out.push_str(sep);
-                let wrote = match self
-                    .json_value_into(v, &k, val, indent, depth + 1, visited, replacer, allowlist, out)
-                {
+                let wrote = match self.json_value_into(
+                    v,
+                    &k,
+                    val,
+                    indent,
+                    depth + 1,
+                    visited,
+                    replacer,
+                    allowlist,
+                    out,
+                ) {
                     Ok(w) => w,
                     Err(e) => {
                         visited.pop();
@@ -882,7 +1136,9 @@ impl<'p> Vm<'p> {
         let v = self.json_parse_value(src, &mut i)?;
         json_skip_ws(src, &mut i);
         if i != src.len() {
-            return Err(Thrown("SyntaxError: Unexpected non-whitespace character after JSON".into()));
+            return Err(Thrown(
+                "SyntaxError: Unexpected non-whitespace character after JSON".into(),
+            ));
         }
         Ok(v)
     }
@@ -933,7 +1189,11 @@ impl<'p> Vm<'p> {
                     *i += 1;
                     break;
                 }
-                _ => return Err(Thrown("SyntaxError: Expected ',' or ']' in JSON array".into())),
+                _ => {
+                    return Err(Thrown(
+                        "SyntaxError: Expected ',' or ']' in JSON array".into(),
+                    ))
+                }
             }
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(items))))
@@ -948,7 +1208,9 @@ impl<'p> Vm<'p> {
             loop {
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b'"') {
-                    return Err(Thrown("SyntaxError: Expected property name string in JSON".into()));
+                    return Err(Thrown(
+                        "SyntaxError: Expected property name string in JSON".into(),
+                    ));
                 }
                 let key = json_parse_string(src, i)?.to_lossy_string();
                 json_skip_ws(b, i);
@@ -963,16 +1225,20 @@ impl<'p> Vm<'p> {
                 match b.get(*i) {
                     Some(b',') => *i += 1,
                     Some(b'}') => break,
-                    _ => return Err(Thrown("SyntaxError: Expected ',' or '}' in JSON object".into())),
+                    _ => {
+                        return Err(Thrown(
+                            "SyntaxError: Expected ',' or '}' in JSON object".into(),
+                        ))
+                    }
                 }
             }
         }
         *i += 1; // '}'
-        // `set_owned`, not `set(&k, …)`: the parser already allocated each key
-        // (`to_lossy_string` above), and `set` cloned a SECOND copy on first
-        // insertion only to drop the first. `with_capacity` then sizes the three
-        // parallel vectors once instead of growing them log n times — `pairs.len()`
-        // is exact for a duplicate-free object and a harmless over-reserve otherwise.
+                 // `set_owned`, not `set(&k, …)`: the parser already allocated each key
+                 // (`to_lossy_string` above), and `set` cloned a SECOND copy on first
+                 // insertion only to drop the first. `with_capacity` then sizes the three
+                 // parallel vectors once instead of growing them log n times — `pairs.len()`
+                 // is exact for a duplicate-free object and a harmless over-reserve otherwise.
         let mut map = crate::heap::ObjMap::with_capacity(pairs.len());
         for (k, v) in pairs {
             map.set_owned(k, v);
@@ -1007,8 +1273,8 @@ impl<'p> Vm<'p> {
     /// defineProperty trap may throw (propagated); an ordinary object that REJECTS the
     /// define (e.g. a non-configurable existing prop) just returns false — no throw.
     fn json_create_data(&mut self, target: Value, key: &str, value: Value) -> Result<(), Thrown> {
-        let is_proxy = target.is_heap()
-            && matches!(self.heap.get(target.heap_index()), HeapObj::Proxy { .. });
+        let is_proxy =
+            target.is_heap() && matches!(self.heap.get(target.heap_index()), HeapObj::Proxy { .. });
         let mut m = crate::heap::ObjMap::new();
         m.set("value", value);
         m.set("writable", Value::TRUE);
@@ -1112,7 +1378,10 @@ impl<'p> Vm<'p> {
     /// carries a `"source"` data property holding the value's raw JSON text.
     /// An array/object node yields an empty context.
     fn make_json_context(&mut self, src: Option<&JsonSrc>) -> Value {
-        let ctx = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new()))));
+        let ctx = Value::heap(
+            self.heap
+                .alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new()))),
+        );
         if let Some(JsonSrc::Prim(s, _)) = src {
             let sv = self.alloc_str(s.clone());
             if let HeapObj::Object(m) = self.heap.get_mut(ctx.heap_index()) {
@@ -1140,7 +1409,9 @@ impl<'p> Vm<'p> {
         let r = self.json_parse_value_src(src, &mut i)?;
         json_skip_ws(src, &mut i);
         if i != src.len() {
-            return Err(Thrown("SyntaxError: Unexpected non-whitespace character after JSON".into()));
+            return Err(Thrown(
+                "SyntaxError: Unexpected non-whitespace character after JSON".into(),
+            ));
         }
         Ok(r)
     }
@@ -1160,7 +1431,10 @@ impl<'p> Vm<'p> {
                 let v = self.json_parse_value(src, i)?;
                 // `context.source` is a Rust String — LOSSY if the span holds
                 // a raw lone surrogate (documented limit; escapes round-trip).
-                Ok((v, JsonSrc::Prim(crate::heap::wtf8_to_lossy_string(&src[start..*i]), v)))
+                Ok((
+                    v,
+                    JsonSrc::Prim(crate::heap::wtf8_to_lossy_string(&src[start..*i]), v),
+                ))
             }
         }
     }
@@ -1185,7 +1459,11 @@ impl<'p> Vm<'p> {
                 match b.get(*i) {
                     Some(b',') => *i += 1,
                     Some(b']') => break,
-                    _ => return Err(Thrown("SyntaxError: Expected ',' or ']' in JSON array".into())),
+                    _ => {
+                        return Err(Thrown(
+                            "SyntaxError: Expected ',' or ']' in JSON array".into(),
+                        ))
+                    }
                 }
             }
         }
@@ -1208,7 +1486,9 @@ impl<'p> Vm<'p> {
             loop {
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b'"') {
-                    return Err(Thrown("SyntaxError: Expected property name string in JSON".into()));
+                    return Err(Thrown(
+                        "SyntaxError: Expected property name string in JSON".into(),
+                    ));
                 }
                 let key = json_parse_string(src, i)?.to_lossy_string();
                 json_skip_ws(b, i);
@@ -1235,15 +1515,19 @@ impl<'p> Vm<'p> {
                 match b.get(*i) {
                     Some(b',') => *i += 1,
                     Some(b'}') => break,
-                    _ => return Err(Thrown("SyntaxError: Expected ',' or '}' in JSON object".into())),
+                    _ => {
+                        return Err(Thrown(
+                            "SyntaxError: Expected ',' or '}' in JSON object".into(),
+                        ))
+                    }
                 }
             }
         }
         *i += 1; // '}'
-        // As in `json_parse_object`. The `key.clone()` above stays: this variant
-        // maintains a PARALLEL source tree that needs the key too, so one of the two
-        // must own a copy. `set_owned` still removes the third allocation — the one
-        // `set` made inside the map.
+                 // As in `json_parse_object`. The `key.clone()` above stays: this variant
+                 // maintains a PARALLEL source tree that needs the key too, so one of the two
+                 // must own a copy. `set_owned` still removes the third allocation — the one
+                 // `set` made inside the map.
         let mut map = crate::heap::ObjMap::with_capacity(pairs.len());
         for (k, v) in pairs {
             map.set_owned(k, v);

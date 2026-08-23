@@ -68,7 +68,13 @@ fn main() -> ExitCode {
         // of trace+sweep a young-only minor GC would NOT have to do.
         let (my, mo, sy, so, wy, wt, alloced, ty, to) = zipp_vm::gc_gen_stats();
         if wt > 0 {
-            let pct = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 * 100.0 / b as f64 };
+            let pct = |a: u64, b: u64| {
+                if b == 0 {
+                    0.0
+                } else {
+                    a as f64 * 100.0 / b as f64
+                }
+            };
             let survival = pct(my, alloced);
             let trace_old_share = pct(to, ty + to);
             let sweep_old_share = pct(wt - wy, wt);
@@ -92,10 +98,12 @@ fn main() -> ExitCode {
     }
     if std::env::var_os("ZIPP_RXSTATS").is_some() {
         let (compact, materialized, fused, fallback) = zipp_vm::regexp_result_stats();
-        let pct = if compact == 0 { 0.0 } else { materialized as f64 * 100.0 / compact as f64 };
-        eprintln!(
-            "[rx] {compact} compact match results  {materialized} materialized ({pct:.2}%)"
-        );
+        let pct = if compact == 0 {
+            0.0
+        } else {
+            materialized as f64 * 100.0 / compact as f64
+        };
+        eprintln!("[rx] {compact} compact match results  {materialized} materialized ({pct:.2}%)");
         eprintln!("[rx] matchAll steps: {fused} fused  {fallback} eligible-fallback");
         let (it, ie, jt, je, declines) = zipp_vm::regexp_call_direct_stats();
         eprintln!(
@@ -116,26 +124,45 @@ fn main() -> ExitCode {
     }
     if std::env::var_os("ZIPP_ASYNCSTATS").is_some() {
         let (reparks, reused, grew, values, subs_in, subs_sp) = zipp_vm::async_stats();
-        let pct = if reparks == 0 { 0.0 } else { reused as f64 * 100.0 / reparks as f64 };
+        let pct = if reparks == 0 {
+            0.0
+        } else {
+            reused as f64 * 100.0 / reparks as f64
+        };
         eprintln!(
             "[async] {reparks} window re-parks  {reused} reused ({pct:.1}%)  {grew} grew  {values} values copied"
         );
         let subs = subs_in + subs_sp;
-        let spct = if subs == 0 { 0.0 } else { subs_in as f64 * 100.0 / subs as f64 };
+        let spct = if subs == 0 {
+            0.0
+        } else {
+            subs_in as f64 * 100.0 / subs as f64
+        };
         eprintln!(
             "[async] {subs} promise subscriptions  {subs_in} inline ({spct:.1}%)  {subs_sp} spilled to a Vec"
+        );
+        eprintln!(
+            "[async] {} settled awaits continued in-job",
+            zipp_vm::async_inline_await_stats()
         );
     }
     if std::env::var_os("ZIPP_ICSTATS").is_some() {
         let (gm, gk, gn, gd, sm, sg, sd, gah, sah) = zipp_vm::ic_stats();
-        let pct = |x: u64, t: u64| if t == 0 { 0.0 } else { x as f64 * 100.0 / t as f64 };
+        let pct = |x: u64, t: u64| {
+            if t == 0 {
+                0.0
+            } else {
+                x as f64 * 100.0 / t as f64
+            }
+        };
         eprintln!(
             "[ic] GetProp misses {gm}  shape-known {gk} ({:.1}%)  shape-new {gn} ({:.1}%)  dict {gd} ({:.1}%)",
             pct(gk, gm), pct(gn, gm), pct(gd, gm)
         );
         eprintln!(
             "[ic] SetProp misses {sm}  guardable {sg} ({:.1}%)  dict {sd} ({:.1}%)",
-            pct(sg, sm), pct(sd, sm)
+            pct(sg, sm),
+            pct(sd, sm)
         );
         eprintln!("[ic] accessor-way hits  get {gah}  set {sah}");
         let (csh, csa, css) = zipp_vm::concat_set_stats();
@@ -174,9 +201,16 @@ fn main() -> ExitCode {
     if bstats {
         let rows = zipp_vm::builtin_stats();
         let total: u64 = rows.iter().map(|(_, _, c)| *c).sum();
-        eprintln!("[builtin] {} distinct (kind, name) pairs, {total} calls", rows.len());
+        eprintln!(
+            "[builtin] {} distinct (kind, name) pairs, {total} calls",
+            rows.len()
+        );
         for (kind, name, calls) in rows.iter().take(40) {
-            let pct = if total == 0 { 0.0 } else { *calls as f64 * 100.0 / total as f64 };
+            let pct = if total == 0 {
+                0.0
+            } else {
+                *calls as f64 * 100.0 / total as f64
+            };
             eprintln!("[builtin] {calls:>10}  {pct:>5.1}%  {kind}.{name}");
         }
     }
@@ -312,16 +346,23 @@ fn run(args: &[String]) -> Result<(), String> {
             let (mut ok, mut failed) = (0usize, 0usize);
             let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
             for f in &files {
-                let Ok(src) = std::fs::read_to_string(f) else { continue };
+                let Ok(src) = std::fs::read_to_string(f) else {
+                    continue;
+                };
                 let m = f.extension().is_some_and(|e| e == "mjs");
-                let r = zipp_vm::parse_to_text(&src, m)
-                    .or_else(|_| zipp_vm::parse_to_text(&src, true));
+                let r =
+                    zipp_vm::parse_to_text(&src, m).or_else(|_| zipp_vm::parse_to_text(&src, true));
                 match r {
                     Ok(_) => ok += 1,
                     Err(e) => {
                         failed += 1;
-                        let key: String =
-                            e.split(" (at ").next().unwrap_or(&e).chars().take(90).collect();
+                        let key: String = e
+                            .split(" (at ")
+                            .next()
+                            .unwrap_or(&e)
+                            .chars()
+                            .take(90)
+                            .collect();
                         *reasons.entry(key).or_default() += 1;
                     }
                 }
@@ -357,7 +398,9 @@ fn run(args: &[String]) -> Result<(), String> {
             files.sort();
             let (mut same, mut differ, mut rejected) = (0usize, 0usize, 0usize);
             for f in &files {
-                let Ok(src) = std::fs::read_to_string(f) else { continue };
+                let Ok(src) = std::fs::read_to_string(f) else {
+                    continue;
+                };
                 let module = f.extension().is_some_and(|e| e == "mjs");
                 let a = zipp_vm::compile_to_text(&src, module);
                 let b = zipp_vm::compile_to_text(&src, module);
@@ -405,7 +448,9 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("  zipp mjs <file.mjs>             run a file as an ES module");
             println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
             println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");
-            println!("  zipp ast <file-or-dir>          parse and print the AST (--sweep for a corpus)");
+            println!(
+                "  zipp ast <file-or-dir>          parse and print the AST (--sweep for a corpus)"
+            );
             println!("  zipp --version [--json]         build identity (commit, dirty digest, rustc, target)");
             println!("\nenvironment:");
             println!("  ZIPP_NOJIT=1                    interpreter only (no native codegen)");
@@ -421,7 +466,9 @@ fn run(args: &[String]) -> Result<(), String> {
             print!("{}", build_identity(json));
             Ok(())
         }
-        Some(other) => Err(format!("unknown command '{other}' (try `zipp js <file.js>`)")),
+        Some(other) => Err(format!(
+            "unknown command '{other}' (try `zipp js <file.js>`)"
+        )),
     }
 }
 
@@ -445,7 +492,11 @@ fn build_identity(json: bool) -> String {
     let commit = env!("ZIPP_BUILD_COMMIT");
     let dirty = env!("ZIPP_BUILD_DIRTY") == "true";
     let digest = env!("ZIPP_BUILD_DIFF_DIGEST");
-    let source = if dirty { format!("{commit}+dirty.{digest}") } else { commit.to_string() };
+    let source = if dirty {
+        format!("{commit}+dirty.{digest}")
+    } else {
+        commit.to_string()
+    };
     // Asked of the VM crate, not `cfg!` here: the `jit` feature belongs to
     // zipp-vm, so a local `cfg!` would report every build as interpreter-only.
     let jit = zipp_vm::jit_enabled();
@@ -478,7 +529,10 @@ fn build_identity(json: bool) -> String {
     }
     let mut s = format!("zipp {}\n", env!("CARGO_PKG_VERSION"));
     s += &format!("source:    {source}\n");
-    s += &format!("commit:    {commit}{}\n", if dirty { " (DIRTY)" } else { "" });
+    s += &format!(
+        "commit:    {commit}{}\n",
+        if dirty { " (DIRTY)" } else { "" }
+    );
     s += &format!("rustc:     {}\n", env!("ZIPP_BUILD_RUSTC"));
     s += &format!("target:    {}\n", env!("ZIPP_BUILD_TARGET"));
     s += &format!(
@@ -486,8 +540,22 @@ fn build_identity(json: bool) -> String {
         env!("ZIPP_BUILD_PROFILE"),
         env!("ZIPP_BUILD_OPT_LEVEL")
     );
-    s += &format!("features:  {}\n", if features.is_empty() { "(none)" } else { features });
-    s += &format!("jit:       {}\n", if jit { "x86-64 native" } else { "disabled (interpreter only)" });
+    s += &format!(
+        "features:  {}\n",
+        if features.is_empty() {
+            "(none)"
+        } else {
+            features
+        }
+    );
+    s += &format!(
+        "jit:       {}\n",
+        if jit {
+            "x86-64 native"
+        } else {
+            "disabled (interpreter only)"
+        }
+    );
     if !rustflags.is_empty() {
         s += &format!("rustflags: {rustflags}\n");
     }
@@ -500,7 +568,9 @@ fn collect_js(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         out.push(p.to_path_buf());
         return;
     }
-    let Ok(entries) = std::fs::read_dir(p) else { return };
+    let Ok(entries) = std::fs::read_dir(p) else {
+        return;
+    };
     for e in entries.flatten() {
         let path = e.path();
         if path.is_dir() {

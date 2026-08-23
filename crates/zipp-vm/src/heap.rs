@@ -434,6 +434,42 @@ pub(crate) fn key_names_element(key: &str) -> bool {
     }
 }
 
+/// Parse the canonical decimal spelling of an ECMAScript Array index without
+/// allocating.  `2^32 - 1` is deliberately excluded: it is a named property,
+/// not an Array index, even though it is all decimal digits.
+#[inline]
+fn canonical_array_index_key(key: &str) -> Option<u32> {
+    let b = key.as_bytes();
+    if b.is_empty() || (b.len() > 1 && b[0] == b'0') || b.len() > 10 {
+        return None;
+    }
+    let mut n = 0u32;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+    }
+    (n != u32::MAX).then_some(n)
+}
+
+/// W25 sparse numeric side-index latch. `ZIPP_NO_SPARSE_NUM_INDEX=1` restores
+/// the old stack-format + string-hash lookup path in the same binary.
+#[inline]
+fn sparse_num_index_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPARSE_NUM_INDEX").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
     let mut n = i;
     let mut p = buf.len();
@@ -490,6 +526,13 @@ pub struct ObjMap {
     /// `Clone` clones the table verbatim, which is valid because the clone
     /// has identical keys at identical slots.
     index: Option<Box<PropIndex>>,
+    /// Allocation-free lookup for canonical numeric keys. Sparse Arrays store
+    /// present elements in this string-keyed map; hashing a freshly formatted
+    /// decimal string on every read dominated their hot path. The table is
+    /// created lazily only for maps that actually acquire an Array index, so an
+    /// ordinary named-property object pays one nullable pointer and no heap
+    /// allocation. Slots point into the authoritative parallel vectors.
+    numeric_index: Option<Box<rustc_hash::FxHashMap<u32, u32>>>,
     /// Does any key in this map name an ELEMENT of the exotic object it hangs
     /// off — a canonical decimal index, or `"length"`? Maintained by the same
     /// three appends and one removal that maintain `shape`, and read only
@@ -806,6 +849,7 @@ impl ObjMap {
             sealed: false,
             frozen: false,
             index: None,
+            numeric_index: None,
             has_element_key: false,
             shape: crate::shape::EMPTY,
         }
@@ -879,13 +923,41 @@ impl ObjMap {
         }
     }
 
+    /// Position of a canonical Array-index key. With the W25 side index on,
+    /// absence of the table is also proof that this map has no numeric keys.
+    /// The off-switch is the exact pre-wave spelling/hash lookup.
+    #[inline]
+    pub fn element_pos(&self, index: usize) -> Option<usize> {
+        if sparse_num_index_enabled() {
+            let index = u32::try_from(index).ok()?;
+            if index == u32::MAX {
+                return None;
+            }
+            return self
+                .numeric_index
+                .as_ref()?
+                .get(&index)
+                .copied()
+                .map(|slot| slot as usize);
+        }
+        let mut buf = [0u8; 20];
+        self.pos(index_key(&mut buf, index))
+    }
+
     /// Maintain the index across the append of `keys`' LAST entry: insert it
     /// when the index exists, build the index when the map just reached the
     /// threshold. Every structural append (set/define) funnels through here.
     #[inline]
     fn index_appended(&mut self) {
+        let slot = self.keys.len() - 1;
+        if sparse_num_index_enabled() {
+            if let Some(n) = canonical_array_index_key(&self.keys[slot]) {
+                self.numeric_index
+                    .get_or_insert_with(|| Box::new(rustc_hash::FxHashMap::default()))
+                    .insert(n, slot as u32);
+            }
+        }
         if let Some(ix) = &mut self.index {
-            let slot = self.keys.len() - 1;
             ix.insert(&self.keys[slot], slot as u32);
         } else if self.keys.len() >= PROP_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
@@ -1018,6 +1090,19 @@ impl ObjMap {
         // and a stale count is a silent wrong answer.
         if self.has_element_key && key_names_element(&key) {
             self.has_element_key = self.keys.iter().any(|k| key_names_element(k));
+        }
+        if let Some(numeric) = &mut self.numeric_index {
+            if let Some(n) = canonical_array_index_key(&key) {
+                numeric.remove(&n);
+            }
+            // `Vec::remove` shifted every later property down by one. Deletes
+            // are cold; updating the compact u32 slots in place avoids hashing
+            // every surviving decimal key again.
+            for slot in numeric.values_mut() {
+                if (*slot as usize) > i {
+                    *slot -= 1;
+                }
+            }
         }
         if let Some(ix) = &mut self.index {
             if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
@@ -3929,6 +4014,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn numeric_side_index_tracks_canonical_keys_and_shifted_slots() {
+        assert_eq!(canonical_array_index_key("0"), Some(0));
+        assert_eq!(canonical_array_index_key("4294967294"), Some(u32::MAX - 1));
+        for named in ["", "00", "01", "-1", "1.0", "4294967295", "99999999999"] {
+            assert_eq!(canonical_array_index_key(named), None, "{named:?}");
+        }
+
+        let mut m = ObjMap::new_side_table();
+        m.set("named", Value::int(1));
+        m.set("07", Value::int(2)); // named property, not index 7
+        m.set("7", Value::int(3));
+        m.set("123456", Value::int(4));
+        assert_eq!(m.element_pos(7), m.pos("7"));
+        assert_eq!(m.element_pos(123456), m.pos("123456"));
+        assert_eq!(m.element_pos(8), None);
+
+        // Removing a slot before both numeric entries shifts their authoritative
+        // vector positions. Overwriting/descriptor changes leave positions fixed.
+        assert!(m.remove("named"));
+        assert_eq!(m.element_pos(7), m.pos("7"));
+        assert_eq!(m.element_pos(123456), m.pos("123456"));
+        m.set("7", Value::int(30));
+        m.define("123456", Value::int(40), PropAttr::data());
+        assert_eq!(m.vals[m.element_pos(7).unwrap()], Value::int(30));
+        assert_eq!(m.vals[m.element_pos(123456).unwrap()], Value::int(40));
+        assert!(m.remove("7"));
+        assert_eq!(m.element_pos(7), None);
+        assert_eq!(m.element_pos(123456), m.pos("123456"));
     }
 
     /// The renumber sweep after a delete must leave EVERY surviving key

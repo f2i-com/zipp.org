@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -195,7 +195,10 @@ impl<'p> Vm<'p> {
                 // place — key_of allocated a fresh String per probe, per chain
                 // level (ZIPP_NO_ARRKEY_FAST=1 restores that).
                 let kbuf;
-                let k: &str = match arrkey_fast_enabled().then(|| self.flat_key_str(key)).flatten() {
+                let k: &str = match arrkey_fast_enabled()
+                    .then(|| self.flat_key_str(key))
+                    .flatten()
+                {
                     Some(s) => s,
                     None => {
                         kbuf = self.key_of(key);
@@ -205,7 +208,11 @@ impl<'p> Vm<'p> {
                 if k == "length" {
                     return true;
                 }
-                if self.arr_props.get(&idx).map_or(false, |m| m.pos(k).is_some()) {
+                if self
+                    .arr_props
+                    .get(&idx)
+                    .map_or(false, |m| m.pos(k).is_some())
+                {
                     return true;
                 }
                 if self.regexp_result_prop(idx, &k).is_some() {
@@ -240,7 +247,11 @@ impl<'p> Vm<'p> {
                 if self.is_canonical_numeric_index(&k) {
                     return self.ta_valid_index(idx, &k).is_some();
                 }
-                if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                if self
+                    .arr_props
+                    .get(&idx)
+                    .map_or(false, |m| m.pos(&k).is_some())
+                {
                     return true;
                 }
                 match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
@@ -277,7 +288,11 @@ impl<'p> Vm<'p> {
                 let k = self.key_of(key);
                 // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*,
                 // …) keep their named own props in the arr_props side table.
-                if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                if self
+                    .arr_props
+                    .get(&idx)
+                    .map_or(false, |m| m.pos(&k).is_some())
+                {
                     return true;
                 }
                 // A RegExp instance's `lastIndex` is an own data property held
@@ -292,8 +307,16 @@ impl<'p> Vm<'p> {
                 // Function-object descriptor).
                 if matches!(
                     self.heap.get(idx),
-                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
-                ) && self.fn_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
+                    HeapObj::Func(_)
+                        | HeapObj::Closure { .. }
+                        | HeapObj::Bound { .. }
+                        | HeapObj::Wrapped { .. }
+                        | HeapObj::Native(_)
+                        | HeapObj::NativeClosure { .. }
+                ) && self
+                    .fn_props
+                    .get(&idx)
+                    .map_or(false, |m| m.pos(&k).is_some())
                 {
                     return true;
                 }
@@ -343,7 +366,8 @@ impl<'p> Vm<'p> {
                         HeapObj::Func(_)
                         | HeapObj::Closure { .. }
                         | HeapObj::Bound { .. }
-                        | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self.fn_proto,
+                        | HeapObj::Native(_)
+                        | HeapObj::NativeClosure { .. } => self.fn_proto,
                         HeapObj::Boxed { kind: 0, .. } => self.str_proto,
                         HeapObj::Boxed { kind: 1, .. } => self.num_proto,
                         HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
@@ -422,7 +446,9 @@ impl<'p> Vm<'p> {
         // super() completion). Before that point the class's privates are NOT
         // yet on the instance (prod-private-*-before-super-return), even
         // though map.class already links to the class.
-        self.instance_brand.get(&receiver.heap_index()).is_some_and(|bs| bs.contains(&brand))
+        self.instance_brand
+            .get(&receiver.heap_index())
+            .is_some_and(|bs| bs.contains(&brand))
     }
 
     /// PrivateBrandAdd: install a class's own private brand on an instance at
@@ -432,7 +458,11 @@ impl<'p> Vm<'p> {
         if !inst.is_heap() || !classval.is_heap() {
             return;
         }
-        let own = self.method_brand.get(&classval.heap_index()).and_then(|c| c.first()).copied();
+        let own = self
+            .method_brand
+            .get(&classval.heap_index())
+            .and_then(|c| c.first())
+            .copied();
         if let Some(own) = own {
             if !self.brand_private_names.contains_key(&own) {
                 return;
@@ -459,7 +489,10 @@ impl<'p> Vm<'p> {
             | HeapObj::Symbol { .. }
             | HeapObj::BigInt(_)
             | HeapObj::BigIntBig(_) => false,
-            _ => self.arr_props.get(&v.heap_index()).map_or(true, |m| m.extensible),
+            _ => self
+                .arr_props
+                .get(&v.heap_index())
+                .map_or(true, |m| m.extensible),
         }
     }
 
@@ -481,7 +514,11 @@ impl<'p> Vm<'p> {
         if !inst.is_heap() || !classval.is_heap() {
             return Ok(());
         }
-        let own = match self.method_brand.get(&classval.heap_index()).and_then(|c| c.first()) {
+        let own = match self
+            .method_brand
+            .get(&classval.heap_index())
+            .and_then(|c| c.first())
+        {
             Some(&b) => b,
             None => return Ok(()),
         };
@@ -579,7 +616,11 @@ impl<'p> Vm<'p> {
         std::iter::from_fn(move || {
             let sc = cur?;
             budget -= 1;
-            cur = if budget > 0 { self.eval_scope_parent.get(&sc).copied() } else { None };
+            cur = if budget > 0 {
+                self.eval_scope_parent.get(&sc).copied()
+            } else {
+                None
+            };
             Some(sc)
         })
     }
@@ -609,9 +650,9 @@ impl<'p> Vm<'p> {
             return false;
         };
         // Innermost binding of the name wins, exactly as the read does.
-        let Some(target) = self.eval_scope_chain(fi).find(|&sc| {
-            matches!(self.heap.get(sc), HeapObj::EvalScope(m) if m.contains_key(&name))
-        }) else {
+        let Some(target) = self.eval_scope_chain(fi).find(
+            |&sc| matches!(self.heap.get(sc), HeapObj::EvalScope(m) if m.contains_key(&name)),
+        ) else {
             return false;
         };
         // Nursery barrier: an EvalScope is a mutable heap object like a Cell.
@@ -631,7 +672,10 @@ impl<'p> Vm<'p> {
         if !inst.is_heap() {
             return None;
         }
-        self.private_fields.get(&inst.heap_index())?.get(&(brand, key.to_string())).copied()
+        self.private_fields
+            .get(&inst.heap_index())?
+            .get(&(brand, key.to_string()))
+            .copied()
     }
 
     /// PrivateFieldAdd (`add=true`: upsert — field-init stores) or
@@ -708,13 +752,16 @@ impl<'p> Vm<'p> {
     /// A private member's VALUE from its DECLARING class. `want`: 1 = method,
     /// 2 = getter, 4 = setter (each searches the instance + static lists; a
     /// class cannot declare the same private name twice, so order is moot).
-    pub(crate) fn private_member_from_owner(&self, owner: u32, key: &str, want: u8) -> Option<Value> {
+    pub(crate) fn private_member_from_owner(
+        &self,
+        owner: u32,
+        key: &str,
+        want: u8,
+    ) -> Option<Value> {
         let HeapObj::Class(c) = self.heap.get(owner) else {
             return None;
         };
-        let from = |list: &[(String, Value)]| {
-            list.iter().find(|(n, _)| n == key).map(|&(_, v)| v)
-        };
+        let from = |list: &[(String, Value)]| list.iter().find(|(n, _)| n == key).map(|&(_, v)| v);
         let is_static = want & 8 != 0;
         match want & 7 {
             1 => {
@@ -724,8 +771,16 @@ impl<'p> Vm<'p> {
                     from(&c.methods)
                 }
             }
-            2 => from(if is_static { &c.static_getters } else { &c.getters }),
-            4 => from(if is_static { &c.static_setters } else { &c.setters }),
+            2 => from(if is_static {
+                &c.static_getters
+            } else {
+                &c.getters
+            }),
+            4 => from(if is_static {
+                &c.static_setters
+            } else {
+                &c.setters
+            }),
             _ => None,
         }
     }
@@ -771,7 +826,7 @@ impl<'p> Vm<'p> {
                 .brand_private_names
                 .get(&b)
                 .is_some_and(|names| names.iter().any(|(n, _)| n == key))
-        {
+            {
                 return Some(self.instance_has_brand(receiver, b));
             }
         }
@@ -782,9 +837,13 @@ impl<'p> Vm<'p> {
         // fallback rather than rejecting — names DECLARED by a chain brand keep
         // the precise per-evaluation check above.
         if !chain.iter().any(|&b| {
-            self.brand_private_names.get(&b).is_some_and(|names| !names.is_empty())
+            self.brand_private_names
+                .get(&b)
+                .is_some_and(|names| !names.is_empty())
         }) || chain.iter().all(|&b| {
-            self.brand_private_names.get(&b).map_or(true, |names| !names.iter().any(|(n, _)| n == key))
+            self.brand_private_names
+                .get(&b)
+                .map_or(true, |names| !names.iter().any(|(n, _)| n == key))
         }) {
             return None;
         }
@@ -810,7 +869,9 @@ impl<'p> Vm<'p> {
         // forward to the target's [[HasProperty]] when there is no trap.
         if let Some((target, handler, revoked)) = self.proxy_parts(idx) {
             if revoked {
-                return Err(Thrown("TypeError: Cannot perform 'has' on a revoked proxy".into()));
+                return Err(Thrown(
+                    "TypeError: Cannot perform 'has' on a revoked proxy".into(),
+                ));
             }
             return match self.proxy_trap(handler, "has")? {
                 Some(trap) => {
@@ -852,9 +913,7 @@ impl<'p> Vm<'p> {
             }
             // The global object's slot-backed own properties — mirrors
             // `has_property`'s Object arm (see the comment there).
-            if idx == self.global_this
-                && self.global_this != 0
-                && self.global_by_name(&k).is_some()
+            if idx == self.global_this && self.global_this != 0 && self.global_by_name(&k).is_some()
             {
                 return Ok(true);
             }
@@ -959,7 +1018,10 @@ impl<'p> Vm<'p> {
                     })
             } else {
                 let kbuf;
-                let k: &str = match arrkey_fast_enabled().then(|| self.flat_key_str(key)).flatten() {
+                let k: &str = match arrkey_fast_enabled()
+                    .then(|| self.flat_key_str(key))
+                    .flatten()
+                {
                     Some(s) => s,
                     None => {
                         kbuf = self.key_of(key);
@@ -967,7 +1029,10 @@ impl<'p> Vm<'p> {
                     }
                 };
                 k == "length"
-                    || self.arr_props.get(&idx).map_or(false, |m| m.pos(k).is_some())
+                    || self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(k).is_some())
                     || self.regexp_result_prop(idx, k).is_some()
             };
             if own {
@@ -992,7 +1057,11 @@ impl<'p> Vm<'p> {
             if self.is_canonical_numeric_index(&k) {
                 return Ok(self.ta_valid_index(idx, &k).is_some());
             }
-            if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+            if self
+                .arr_props
+                .get(&idx)
+                .map_or(false, |m| m.pos(&k).is_some())
+            {
                 return Ok(true);
             }
             return match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
@@ -1095,10 +1164,7 @@ impl<'p> Vm<'p> {
                                 return Some(true);
                             }
                             return Some(match self.arr_props.get(&idx) {
-                                Some(m) => {
-                                    let mut buf = [0u8; 20];
-                                    m.pos(crate::heap::index_key(&mut buf, ku)).is_some()
-                                }
+                                Some(m) => m.element_pos(ku).is_some(),
                                 None => false,
                             });
                         }
@@ -1110,7 +1176,10 @@ impl<'p> Vm<'p> {
         // (user code) or Symbol handling — interpreter only. A Number or a
         // String/Cons key is taken verbatim (matches coerce_index_key's no-op).
         if key.is_heap()
-            && !matches!(self.heap.get(key.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
+            && !matches!(
+                self.heap.get(key.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
         {
             return None;
         }
@@ -1139,13 +1208,16 @@ impl<'p> Vm<'p> {
         let mut cur = obj.heap_index();
         for _ in 0..64 {
             if matches!(self.heap.get(cur), HeapObj::Proxy { .. })
-                || (!self.deferred_ns_state.is_empty()
-                    && self.deferred_ns_state.contains_key(&cur))
+                || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&cur))
             {
                 return None;
             }
             let proto = if let Some(&p) = self.proto_of.get(&cur) {
-                if p.is_heap() { p.heap_index() } else { 0 }
+                if p.is_heap() {
+                    p.heap_index()
+                } else {
+                    0
+                }
             } else {
                 match self.heap.get(cur) {
                     HeapObj::Object(_) => {
@@ -1160,7 +1232,8 @@ impl<'p> Vm<'p> {
                     HeapObj::Func(_)
                     | HeapObj::Closure { .. }
                     | HeapObj::Bound { .. }
-                    | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self.fn_proto,
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. } => self.fn_proto,
                     HeapObj::Boxed { kind: 0, .. } => self.str_proto,
                     HeapObj::Boxed { kind: 1, .. } => self.num_proto,
                     HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
@@ -1350,7 +1423,11 @@ impl<'p> Vm<'p> {
     /// non-enumerable, writable, configurable own array built from
     /// IterableToList(errorsArg) (spec 20.5.7.1 steps 4-5). `iterate_to_vec` runs the
     /// argument's iterator (user code) under a GC lock, so `err` stays live across it.
-    pub(crate) fn install_agg_errors(&mut self, err: Value, errors_arg: Value) -> Result<(), Thrown> {
+    pub(crate) fn install_agg_errors(
+        &mut self,
+        err: Value,
+        errors_arg: Value,
+    ) -> Result<(), Thrown> {
         let list = self.iterate_to_vec(errors_arg)?;
         // CreateArrayFromList allocates in the CONSTRUCTOR's realm — the errors
         // array of `new otherRealm.AggregateError([e])` carries the other realm's
@@ -1407,14 +1484,20 @@ impl<'p> Vm<'p> {
         // non-simple parameter list (CreateUnmappedArgumentsObject step 8).
         let unmapped = mapinfo.is_none();
         let thrower = if unmapped {
-            let r =
-                if self.realm_global_objs.is_empty() { 0 } else { self.get_function_realm(callee) };
+            let r = if self.realm_global_objs.is_empty() {
+                0
+            } else {
+                self.get_function_realm(callee)
+            };
             if r != 0 {
                 self.realm_throw_type_error(r)
             } else if self.throw_type_error != Value::UNDEFINED {
                 self.throw_type_error
             } else {
-                Value::heap(self.heap.alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR)))
+                Value::heap(
+                    self.heap
+                        .alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR)),
+                )
             }
         } else {
             Value::UNDEFINED
@@ -1431,7 +1514,10 @@ impl<'p> Vm<'p> {
         if obj_proto != 0 {
             self.proto_of.insert(idx, Value::heap(obj_proto));
         }
-        let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
+        let m = self
+            .arr_props
+            .entry(idx)
+            .or_insert_with(ObjMap::new_side_table);
         // `length` is an ORDINARY data property of an arguments object
         // (writable, non-enumerable, configurable — it can hold any value and
         // be deleted), not the Array exotic length. Every Array-length special
@@ -1493,7 +1579,9 @@ impl<'p> Vm<'p> {
     /// liveness check in `args_mapped_get`/`_set` fails and the dense store
     /// (the escape snapshot) answers instead.
     pub(crate) fn relink_mapped_args(&mut self, state_idx: u32, frame_idx: usize, base: usize) {
-        let Some(&aidx) = self.gen_args_obj.get(&state_idx) else { return };
+        let Some(&aidx) = self.gen_args_obj.get(&state_idx) else {
+            return;
+        };
         if let Some(Some(m)) = self.arguments_objs.get_mut(&aidx) {
             m.frame_idx = frame_idx;
             m.base = base;
@@ -1530,7 +1618,9 @@ impl<'p> Vm<'p> {
     /// performs the ordinary store into the dense slot / side table, keeping
     /// the escape store in sync. Returns whether the alias write happened.
     pub(crate) fn args_mapped_set(&mut self, idx: u32, i: usize, val: Value) -> bool {
-        let Some(Some(m)) = self.arguments_objs.get(&idx) else { return false };
+        let Some(Some(m)) = self.arguments_objs.get(&idx) else {
+            return false;
+        };
         if i >= m.mapped_count || i >= 64 || (m.unmapped >> i) & 1 == 1 {
             return false;
         }
@@ -1563,7 +1653,11 @@ impl<'p> Vm<'p> {
     /// live formal value is copied into the dense slot first so the ordinary
     /// property keeps the latest aliased value.
     pub(crate) fn args_unmap(&mut self, idx: u32, i: usize, flush: bool) {
-        let cur = if flush { self.args_mapped_get(idx, i) } else { None };
+        let cur = if flush {
+            self.args_mapped_get(idx, i)
+        } else {
+            None
+        };
         if let Some(Some(m)) = self.arguments_objs.get_mut(&idx) {
             if i < 64 {
                 m.unmapped |= 1 << i;
@@ -1609,7 +1703,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn make_symbol(&mut self, desc: Value) -> Value {
         self.symbol_counter += 1;
         let prop_key = format!("@@sym:{}", self.symbol_counter);
-        let v = Value::heap(self.heap.alloc(HeapObj::Symbol { desc, prop_key: prop_key.clone() }));
+        let v = Value::heap(self.heap.alloc(HeapObj::Symbol {
+            desc,
+            prop_key: prop_key.clone(),
+        }));
         self.symbol_keys.insert(prop_key, v);
         v
     }
@@ -1617,9 +1714,10 @@ impl<'p> Vm<'p> {
     /// Allocate a symbol with a FIXED prop_key (well-known `@@iterator` etc., or a
     /// `Symbol.for` registry key) — so distinct call sites share the same key.
     pub(crate) fn make_named_symbol(&mut self, desc: Value, prop_key: &str) -> Value {
-        let v = Value::heap(
-            self.heap.alloc(HeapObj::Symbol { desc, prop_key: prop_key.to_string() }),
-        );
+        let v = Value::heap(self.heap.alloc(HeapObj::Symbol {
+            desc,
+            prop_key: prop_key.to_string(),
+        }));
         self.symbol_keys.insert(prop_key.to_string(), v);
         v
     }
@@ -1675,7 +1773,9 @@ impl<'p> Vm<'p> {
         // a boxed Number and an object whose ToPrimitive yields a Number (via the
         // object branch below), not just a bare numeric literal.
         if v.is_number() {
-            return Err(Thrown("TypeError: Cannot convert a Number to a BigInt".into()));
+            return Err(Thrown(
+                "TypeError: Cannot convert a Number to a BigInt".into(),
+            ));
         }
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
@@ -1694,7 +1794,9 @@ impl<'p> Vm<'p> {
             let prim = self.to_primitive_number(v)?;
             return self.to_bigint(prim);
         }
-        Err(Thrown("TypeError: Cannot convert this value to a BigInt".into()))
+        Err(Thrown(
+            "TypeError: Cannot convert this value to a BigInt".into(),
+        ))
     }
 
     /// The `BigInt(value)` constructor coercion (NOT the abstract ToBigInt): the
@@ -1775,7 +1877,11 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
-        Ok(RegExpPre { pattern_is_regexp, real_regexp, exact_bytes })
+        Ok(RegExpPre {
+            pattern_is_regexp,
+            real_regexp,
+            exact_bytes,
+        })
     }
 
     /// RegExpInitialize against an already-taken pattern snapshot.
@@ -1785,7 +1891,11 @@ impl<'p> Vm<'p> {
         f: Value,
         pre: RegExpPre,
     ) -> Result<Value, Thrown> {
-        let RegExpPre { pattern_is_regexp, real_regexp, exact_bytes } = pre;
+        let RegExpPre {
+            pattern_is_regexp,
+            real_regexp,
+            exact_bytes,
+        } = pre;
         let (source, inherited) = if let Some((src, fl)) = real_regexp {
             (src, Some(fl))
         } else if p.is_undefined() {
@@ -1795,10 +1905,18 @@ impl<'p> Vm<'p> {
             // read `source`/`flags` via Get (observable, may throw) per the RegExp
             // constructor, instead of ToString(pattern).
             let src_v = self.get_prop(p, "source")?;
-            let src = if src_v.is_undefined() { "(?:)".to_string() } else { self.to_js_string(src_v)? };
+            let src = if src_v.is_undefined() {
+                "(?:)".to_string()
+            } else {
+                self.to_js_string(src_v)?
+            };
             let inh = if f.is_undefined() {
                 let fl_v = self.get_prop(p, "flags")?;
-                Some(if fl_v.is_undefined() { String::new() } else { self.to_js_string(fl_v)? })
+                Some(if fl_v.is_undefined() {
+                    String::new()
+                } else {
+                    self.to_js_string(fl_v)?
+                })
             } else {
                 None
             };
@@ -1859,44 +1977,48 @@ impl<'p> Vm<'p> {
         // construct a species clone per call, so hot loops re-build the same
         // pattern — share the immutable compiled program instead.
         // Lone-surrogate patterns (exact bytes ≠ lossy source) bypass it.
-        let cache_key = exact_bytes.is_none().then(|| (source.clone(), rflags.clone(), false));
-        let regex: std::sync::Arc<regress::Regex> =
-            match cache_key.as_ref().and_then(|k| self.regex_compile_cache.get(k)) {
-                Some(rc) => rc.clone(),
-                None => {
-                    let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
-                        (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
-                        (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
-                            &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
-                        ),
-                        (None, true) => source.chars().map(u32::from).collect(),
-                        (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
-                            &source.encode_utf16().collect::<Vec<u16>>(),
-                        ),
-                    };
-                    let r = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
-                        .map_err(|e| {
-                            Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
-                        })?;
-                    let rc = std::sync::Arc::new(r);
-                    if let Some(k) = cache_key {
-                        if self.regex_compile_cache.len() >= 512 {
-                            self.regex_compile_cache.clear();
-                        }
-                        self.regex_compile_cache.insert(k, rc.clone());
+        let cache_key = exact_bytes
+            .is_none()
+            .then(|| (source.clone(), rflags.clone(), false));
+        let regex: std::sync::Arc<regress::Regex> = match cache_key
+            .as_ref()
+            .and_then(|k| self.regex_compile_cache.get(k))
+        {
+            Some(rc) => rc.clone(),
+            None => {
+                let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
+                    (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
+                    (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
+                        &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
+                    ),
+                    (None, true) => source.chars().map(u32::from).collect(),
+                    (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
+                        &source.encode_utf16().collect::<Vec<u16>>(),
+                    ),
+                };
+                let r = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
+                    .map_err(|e| {
+                        Thrown(format!(
+                            "SyntaxError: Invalid regular expression: /{source}/: {e}"
+                        ))
+                    })?;
+                let rc = std::sync::Arc::new(r);
+                if let Some(k) = cache_key {
+                    if self.regex_compile_cache.len() >= 512 {
+                        self.regex_compile_cache.clear();
                     }
-                    rc
+                    self.regex_compile_cache.insert(k, rc.clone());
                 }
-            };
-        let idx = self
-            .heap
-            .alloc(HeapObj::RegExp {
-                regex,
-                source: source.into(),
-                flags: flags.into(),
-                last_index: Value::int(0),
-                ascii_twin: None,
-            });
+                rc
+            }
+        };
+        let idx = self.heap.alloc(HeapObj::RegExp {
+            regex,
+            source: source.into(),
+            flags: flags.into(),
+            last_index: Value::int(0),
+            ascii_twin: None,
+        });
         // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
         // the side table (the struct's `source: String` is lossy) so the
         // `source` getter / `toString` round-trip the surrogates. The heap
@@ -1913,13 +2035,15 @@ impl<'p> Vm<'p> {
         // building a species clone is the current realm even with no child frame).
         if self.regexp_proto != 0 {
             let home = self.native_home(self.regexp_proto);
-            let proto =
-                if home != self.regexp_proto { home } else { self.active_realm_proto(self.regexp_proto) };
+            let proto = if home != self.regexp_proto {
+                home
+            } else {
+                self.active_realm_proto(self.regexp_proto)
+            };
             self.proto_of.insert(idx, Value::heap(proto));
         }
         Ok(Value::heap(idx))
     }
 
     // ── Temporal.Duration ──
-
 }

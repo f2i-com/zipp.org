@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -62,6 +62,182 @@ pub(crate) fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
     (buf, i)
 }
 
+/// Default-on fast path for appending one of the heap's 128 permanently
+/// interned ASCII-character strings directly into a proven-linear builder.
+/// The switch is process-latched so the hot append pays one relaxed byte load,
+/// while `ZIPP_NO_APPEND_ASCII_CHAR=1` restores the previous flat-string path
+/// for same-binary A/B measurements.
+#[inline]
+fn ascii_char_append_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_APPEND_ASCII_CHAR").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+#[inline]
+fn markdown_push_escaped_ascii(out: &mut Vec<u8>, bytes: &[u8]) {
+    for &b in bytes {
+        match b {
+            b'&' => out.extend_from_slice(b"&amp;"),
+            b'<' => out.extend_from_slice(b"&lt;"),
+            b'>' => out.extend_from_slice(b"&gt;"),
+            _ => out.push(b),
+        }
+    }
+}
+
+impl<'p> Vm<'p> {
+    /// Execute the exact [`crate::codegen::MarkdownInlinePlan`] over one flat
+    /// ASCII primitive string. The source recogniser licenses the state
+    /// machine; these live guards preserve every remaining observable lookup.
+    /// Any mismatch is a side-effect-free decline to the ordinary Tier-C body.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn markdown_inline_reduce(
+        &mut self,
+        plan: crate::codegen::MarkdownInlinePlan,
+        input: Value,
+    ) -> Option<u64> {
+        // `charCodeAt` and `substring` are invoked repeatedly by both exact
+        // source bodies. Read the actual own data slots on every outer call:
+        // accessorisation, deletion, replacement, and child-realm prototype
+        // images must all execute the generic JavaScript path.
+        if self.str_proto == 0 || self.active_realm_proto(self.str_proto) != self.str_proto {
+            return None;
+        }
+        let methods_pristine = match self.heap.get(self.str_proto) {
+            HeapObj::Object(map) => ["charCodeAt", "substring"].iter().all(|name| {
+                map.pos(name).is_some_and(|slot| {
+                    !map.attrs[slot].accessor
+                        && map.vals[slot].is_heap()
+                        && matches!(
+                            self.heap.get(map.vals[slot].heap_index()),
+                            HeapObj::Native(id)
+                                if native::proto_method(*id)
+                                    .is_some_and(|(n, kind, _)| n == *name && kind == 1)
+                        )
+                })
+            }),
+            _ => false,
+        };
+        if !methods_pristine {
+            return None;
+        }
+
+        // The render body performs a live global Get at each code/link span.
+        // Accept only the exact no-capture helper function; rebinding it to a
+        // proxy, closure, accessor-routed value or lookalike remains observable.
+        let helper = *self.globals.get(plan.escape_html_global as usize)?;
+        if !helper.is_heap() || self.get_function_realm(helper) != 0 {
+            return None;
+        }
+        let helper_fid = match self.heap.get(helper.heap_index()) {
+            HeapObj::Func(id) => *id,
+            _ => return None,
+        };
+        if !crate::codegen::markdown_escape_html_proto(self.func(helper_fid as usize)) {
+            return None;
+        }
+
+        let output = {
+            let bytes = match input.is_heap().then(|| self.heap.get(input.heap_index())) {
+                Some(HeapObj::Str(s)) if s.is_ascii() => s.as_bytes(),
+                _ => return None,
+            };
+            let capacity = bytes.len().checked_add(bytes.len() / 2)?;
+            let mut out = Vec::with_capacity(capacity);
+            let mut i = 0usize;
+            let mut bold = false;
+            let mut ital = false;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'*' => {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                            out.extend_from_slice(if bold { b"</strong>" } else { b"<strong>" });
+                            bold = !bold;
+                            i += 2;
+                        } else {
+                            out.extend_from_slice(if ital { b"</em>" } else { b"<em>" });
+                            ital = !ital;
+                            i += 1;
+                        }
+                    }
+                    b'`' => {
+                        let mut j = i + 1;
+                        while j < bytes.len() && bytes[j] != b'`' {
+                            j += 1;
+                        }
+                        out.extend_from_slice(b"<code>");
+                        markdown_push_escaped_ascii(&mut out, &bytes[i + 1..j]);
+                        out.extend_from_slice(b"</code>");
+                        i = j + 1;
+                    }
+                    b'[' => {
+                        let mut close_text = i + 1;
+                        while close_text < bytes.len() && bytes[close_text] != b']' {
+                            close_text += 1;
+                        }
+                        if close_text + 1 < bytes.len() && bytes[close_text + 1] == b'(' {
+                            let mut close_url = close_text + 2;
+                            while close_url < bytes.len() && bytes[close_url] != b')' {
+                                close_url += 1;
+                            }
+                            out.extend_from_slice(b"<a href=\"");
+                            out.extend_from_slice(&bytes[close_text + 2..close_url]);
+                            out.extend_from_slice(b"\">");
+                            markdown_push_escaped_ascii(&mut out, &bytes[i + 1..close_text]);
+                            out.extend_from_slice(b"</a>");
+                            i = close_url + 1;
+                        } else {
+                            out.push(b'[');
+                            i += 1;
+                        }
+                    }
+                    b'&' => {
+                        out.extend_from_slice(b"&amp;");
+                        i += 1;
+                    }
+                    b'<' => {
+                        out.extend_from_slice(b"&lt;");
+                        i += 1;
+                    }
+                    b'>' => {
+                        out.extend_from_slice(b"&gt;");
+                        i += 1;
+                    }
+                    b => {
+                        out.push(b);
+                        i += 1;
+                    }
+                }
+            }
+            out
+        };
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!("[jit] markdown-inline reducer accepted an ASCII input");
+            }
+        }
+        Some(
+            Value::heap(
+                self.heap
+                    .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(output))),
+            )
+            .bits(),
+        )
+    }
+}
+
 /// ECMAScript StringNumericLiteral over an already-decoded string. Keeping
 /// this grammar in one allocation-free entry lets the RegExp scalar-result
 /// path apply unary `+` directly to an immutable subject range without first
@@ -102,7 +278,11 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
     // Rust's parser also accepts word forms JS rejects. A valid decimal or
     // scientific literal begins (after an optional sign) with a digit or `.`.
     let body = t.strip_prefix(['+', '-']).unwrap_or(t);
-    if body.as_bytes().first().is_some_and(|b| b.is_ascii_alphabetic()) {
+    if body
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic())
+    {
         return f64::NAN;
     }
     t.parse::<f64>().unwrap_or(f64::NAN)
@@ -113,7 +293,7 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
 /// rightmost leaf; `fallback` ran the original inner Add followed by the outer
 /// Add.  Off, the hot path pays one relaxed byte load, matching chainstats.
 mod pairstats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);
     static FAST_STR: AtomicU64 = AtomicU64::new(0);
@@ -181,7 +361,7 @@ pub(crate) fn concat_pair_stats() -> (u64, u64, u64, u64) {
 /// `fallback` delegates to the exact ordinary `+` path. Off, each opcode pays
 /// one relaxed byte load; the compiler rollback emits no opcode at all.
 mod pad2stats {
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);
     static ZERO: AtomicU64 = AtomicU64::new(0);
@@ -310,9 +490,10 @@ impl<'p> Vm<'p> {
             // concat, spread, sort, JSON, …) — the internal HOLE sentinel must never
             // leak to user code. Hole-SENSITIVE methods (the callback/search/find
             // family) take the live HasProperty+Get path instead, not this snapshot.
-            HeapObj::Array(items) => {
-                items.iter().map(|&v| if v.is_hole() { Value::UNDEFINED } else { v }).collect()
-            }
+            HeapObj::Array(items) => items
+                .iter()
+                .map(|&v| if v.is_hole() { Value::UNDEFINED } else { v })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -345,7 +526,9 @@ impl<'p> Vm<'p> {
         for _ in 0..1000 {
             match self.heap.get(idx) {
                 HeapObj::Array(_) => return Ok(!self.arguments_objs.contains_key(&idx)),
-                HeapObj::Proxy { target, revoked, .. } => {
+                HeapObj::Proxy {
+                    target, revoked, ..
+                } => {
                     if *revoked {
                         return Err(Thrown(
                             "TypeError: Cannot perform 'IsArray' on a proxy that has been revoked"
@@ -377,7 +560,9 @@ impl<'p> Vm<'p> {
                 // An `arguments` exotic is Array-backed internally but is an ordinary
                 // object ([[ParameterMap]]), NOT an Array exotic — IsArray is false.
                 HeapObj::Array(_) => return !self.arguments_objs.contains_key(&idx),
-                HeapObj::Proxy { target, revoked, .. } if !*revoked && target.is_heap() => {
+                HeapObj::Proxy {
+                    target, revoked, ..
+                } if !*revoked && target.is_heap() => {
                     idx = target.heap_index();
                 }
                 _ => return false,
@@ -491,14 +676,20 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn to_object(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_number() {
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 1, value: v })));
+            return Ok(Value::heap(
+                self.heap.alloc(HeapObj::Boxed { kind: 1, value: v }),
+            ));
         }
         if v.is_bool() {
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 2, value: v })));
+            return Ok(Value::heap(
+                self.heap.alloc(HeapObj::Boxed { kind: 2, value: v }),
+            ));
         }
         if !v.is_heap() {
             // null / undefined → a fresh ordinary object.
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())))));
+            return Ok(Value::heap(
+                self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))),
+            ));
         }
         // A heap value: string/symbol/bigint primitives box; every real object
         // (Object/Array/Func/Map/Boxed/…) is already an object → unchanged.
@@ -508,7 +699,9 @@ impl<'p> Vm<'p> {
             HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => 4u8,
             _ => return Ok(v),
         };
-        Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind, value: v })))
+        Ok(Value::heap(
+            self.heap.alloc(HeapObj::Boxed { kind, value: v }),
+        ))
     }
 
     /// `ToString(v)` as a Rust String, honouring a user `toString`/`valueOf` on an
@@ -538,7 +731,9 @@ impl<'p> Vm<'p> {
         // explicitly instead — but even `String(sym)` routes through the dedicated
         // path, not this coercion).
         if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
-            return Err(Thrown("TypeError: Cannot convert a Symbol value to a string".into()));
+            return Err(Thrown(
+                "TypeError: Cannot convert a Symbol value to a string".into(),
+            ));
         }
         // ToString(bigint) is BigIntToString - direct and unobservable (the
         // user-patchable BigInt.prototype.toString must NOT run for a
@@ -572,7 +767,9 @@ impl<'p> Vm<'p> {
         // OrdinaryToPrimitive exhausted both methods without a primitive (each
         // returned an object, or neither was callable on a null-prototype object):
         // ToPrimitive throws rather than silently producing "[object Object]".
-        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+        Err(Thrown(
+            "TypeError: Cannot convert object to primitive value".into(),
+        ))
     }
 
     /// `ToPrimitive(v, hint String)` returning the primitive Value — which may be a
@@ -595,7 +792,9 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+        Err(Thrown(
+            "TypeError: Cannot convert object to primitive value".into(),
+        ))
     }
 
     /// Whether `v` has a `[[Construct]]` slot — i.e. `new v` / `Reflect.construct`
@@ -625,7 +824,9 @@ impl<'p> Vm<'p> {
             HeapObj::Bound { target, .. } => self.is_constructor(*target),
             // A non-revoked Proxy is a constructor iff its target is (the
             // `construct` trap is only callable when the target has [[Construct]]).
-            HeapObj::Proxy { target, revoked, .. } => !*revoked && self.is_constructor(*target),
+            HeapObj::Proxy {
+                target, revoked, ..
+            } => !*revoked && self.is_constructor(*target),
             _ => false,
         }
     }
@@ -668,7 +869,11 @@ impl<'p> Vm<'p> {
         v.is_heap()
             && !matches!(
                 self.heap.get(v.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+                    | HeapObj::Symbol { .. }
+                    | HeapObj::BigInt(_)
+                    | HeapObj::BigIntBig(_)
             )
     }
 
@@ -804,7 +1009,11 @@ impl<'p> Vm<'p> {
             // A SMALL result is built flat eagerly (one alloc, no flatten
             // later); only a large one pays for a rope node.
             if llen + rlen <= SMALL_CONCAT_FLAT_UNITS {
-                return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, llen + rlen)));
+                return Ok(Value::heap(self.heap.alloc_concat_flat(
+                    li,
+                    ri,
+                    llen + rlen,
+                )));
             }
             return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
         }
@@ -816,8 +1025,9 @@ impl<'p> Vm<'p> {
             if let Some(lu) = self.heap.str_units(va.heap_index()) {
                 let (buf, start) = fmt_i32_buf(vb.as_int());
                 if lu + (buf.len() - start) <= SMALL_CONCAT_FLAT_UNITS {
-                    if let Some(idx) =
-                        self.heap.alloc_concat_str_ascii(va.heap_index(), &buf[start..])
+                    if let Some(idx) = self
+                        .heap
+                        .alloc_concat_str_ascii(va.heap_index(), &buf[start..])
                     {
                         return Ok(Value::heap(idx));
                     }
@@ -828,8 +1038,9 @@ impl<'p> Vm<'p> {
             if let Some(ru) = self.heap.str_units(vb.heap_index()) {
                 let (buf, start) = fmt_i32_buf(va.as_int());
                 if (buf.len() - start) + ru <= SMALL_CONCAT_FLAT_UNITS {
-                    if let Some(idx) =
-                        self.heap.alloc_concat_ascii_str(&buf[start..], vb.heap_index())
+                    if let Some(idx) = self
+                        .heap
+                        .alloc_concat_ascii_str(&buf[start..], vb.heap_index())
                     {
                         return Ok(Value::heap(idx));
                     }
@@ -865,7 +1076,11 @@ impl<'p> Vm<'p> {
             let rlen = self.heap.str_units(ri).unwrap_or(0);
             // Small result → flat eagerly (see the string+string fast path).
             if llen + rlen <= SMALL_CONCAT_FLAT_UNITS {
-                return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, llen + rlen)));
+                return Ok(Value::heap(self.heap.alloc_concat_flat(
+                    li,
+                    ri,
+                    llen + rlen,
+                )));
             }
             return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
         }
@@ -891,7 +1106,11 @@ impl<'p> Vm<'p> {
     pub(crate) fn pad2_concat(&mut self, value: Value, zero: bool) -> Result<Value, Thrown> {
         if value.is_int() {
             let n = value.as_int();
-            let hit = if zero { (0..=9).contains(&n) } else { (10..=99).contains(&n) };
+            let hit = if zero {
+                (0..=9).contains(&n)
+            } else {
+                (10..=99).contains(&n)
+            };
             if hit {
                 if zero {
                     pad2stats::zero();
@@ -979,7 +1198,8 @@ impl<'p> Vm<'p> {
                                 out.extend_from_slice(cb);
                                 pairstats::fast_str();
                                 return Ok(Value::heap(
-                                    self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out))),
+                                    self.heap
+                                        .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out))),
                                 ));
                             }
                         }
@@ -995,7 +1215,8 @@ impl<'p> Vm<'p> {
                         out.extend_from_slice(cb);
                         pairstats::fast_int();
                         return Ok(Value::heap(
-                            self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out))),
+                            self.heap
+                                .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out))),
                         ));
                     }
                 }
@@ -1127,6 +1348,27 @@ impl<'p> Vm<'p> {
         let mutable = acc.is_heap()
             && acc.heap_index() > crate::heap::INTERN_PINNED_END
             && matches!(self.heap.get(acc.heap_index()), HeapObj::Str(_));
+        // `Heap::new` permanently pins the single-ASCII-character strings at
+        // slots 0..127, with slot == byte. String indexing returns those exact
+        // handles, so the ordinary `out += s[i]` loop can append the byte
+        // without taking the accumulator out of the heap, borrowing/copying
+        // the RHS `JsStr`, or running the general WTF-8 seam machinery.
+        //
+        // A mutable accumulator is necessarily above INTERN_PINNED_END, hence
+        // distinct from the RHS slot. Appending ASCII cannot create or repair a
+        // surrogate seam, and `push_ascii` updates the cached UTF-16 length.
+        if mutable && val.is_heap() {
+            let vi = val.heap_index();
+            if vi < crate::heap::INTERN_EMPTY && ascii_char_append_enabled() {
+                debug_assert!(
+                    matches!(self.heap.get(vi), HeapObj::Str(s) if s.as_bytes() == [vi as u8])
+                );
+                if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
+                    js.push_ascii(vi as u8);
+                    return Some(acc);
+                }
+            }
+        }
         // Fast path: appending a single decimal digit (the `s += i%10` shape) —
         // no temporary allocation for the value's string form.
         if mutable && val.is_int() {
@@ -1182,8 +1424,11 @@ impl<'p> Vm<'p> {
         // General: materialise `val`'s EXACT (WTF-8) string form (same coercion
         // as `+`) — `push_wtf8` canonicalizes a high+low surrogate seam.
         let ri = self.to_str_idx(val);
-        let add: Vec<u8> =
-            self.heap.str_wtf8_cow(ri).map(|c| c.into_owned()).unwrap_or_default();
+        let add: Vec<u8> = self
+            .heap
+            .str_wtf8_cow(ri)
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
         if mutable {
             if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
                 js.push_wtf8(&add); // updates the cached unit length + ascii flag
@@ -1193,10 +1438,56 @@ impl<'p> Vm<'p> {
         // Fresh buffer (first append / interned / rope acc): flatten acc + add into
         // a NON-interned `Str` (bypass `alloc_str`'s interning so it's mutable next).
         let li = self.to_str_idx(acc);
-        let mut s: Vec<u8> =
-            self.heap.str_wtf8_cow(li).map(|c| c.into_owned()).unwrap_or_default();
+        let mut s: Vec<u8> = self
+            .heap
+            .str_wtf8_cow(li)
+            .map(|c| c.into_owned())
+            .unwrap_or_default();
         crate::heap::wtf8_push(&mut s, &add);
-        Some(Value::heap(self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_wtf8(s)))))
+        Some(Value::heap(
+            self.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_wtf8(s))),
+        ))
+    }
+
+    /// Allocation-free prefix for the fused `acc += obj[key]` opcode. A hit is
+    /// fully primitive and cannot invoke JavaScript: `obj` is a flat ASCII
+    /// string, `key` is an in-range tagged integer, and `acc` is the mutable
+    /// flat builder licensed by the compiler's existing linearity proof. The
+    /// indexed byte is copied before borrowing `acc` mutably, so even the
+    /// defensive `obj == acc` case reads the pre-append string exactly.
+    ///
+    /// A miss performs no mutation. The interpreter then runs the historical
+    /// GetIndex + StrAppendInPlace/Add sequence; native code deopts to that arm.
+    #[inline]
+    pub(crate) fn str_append_index_ascii_fast(
+        &mut self,
+        acc: Value,
+        obj: Value,
+        key: Value,
+    ) -> Option<Value> {
+        if !acc.is_heap()
+            || acc.heap_index() <= crate::heap::INTERN_PINNED_END
+            || !obj.is_heap()
+            || !key.is_int()
+        {
+            return None;
+        }
+        let i = key.as_int();
+        if i < 0 {
+            return None;
+        }
+        let byte = match self.heap.get(obj.heap_index()) {
+            HeapObj::Str(s) if s.is_ascii() => *s.as_bytes().get(i as usize)?,
+            _ => return None,
+        };
+        match self.heap.get_mut(acc.heap_index()) {
+            HeapObj::Str(out) => {
+                out.push_ascii(byte);
+                Some(acc)
+            }
+            _ => None,
+        }
     }
 
     /// Heap index of a string-like object representing `v`: `v`'s own index when
@@ -1229,7 +1520,11 @@ impl<'p> Vm<'p> {
         if !v.is_heap()
             || matches!(
                 self.heap.get(v.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
+                HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+                    | HeapObj::BigInt(_)
+                    | HeapObj::BigIntBig(_)
+                    | HeapObj::Symbol { .. }
             )
         {
             return Ok(v);
@@ -1238,7 +1533,13 @@ impl<'p> Vm<'p> {
     }
 
     #[inline]
-    pub(crate) fn cmp_lt(&mut self, base: usize, a: u16, b: u16, left_first: bool) -> Result<bool, Thrown> {
+    pub(crate) fn cmp_lt(
+        &mut self,
+        base: usize,
+        a: u16,
+        b: u16,
+        left_first: bool,
+    ) -> Result<bool, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
         self.cmp_lt_values(va, vb, left_first)
@@ -1280,7 +1581,13 @@ impl<'p> Vm<'p> {
         Ok(self.to_number(va)? < self.to_number(vb)?)
     }
     #[inline]
-    pub(crate) fn cmp_le(&mut self, base: usize, a: u16, b: u16, left_first: bool) -> Result<bool, Thrown> {
+    pub(crate) fn cmp_le(
+        &mut self,
+        base: usize,
+        a: u16,
+        b: u16,
+        left_first: bool,
+    ) -> Result<bool, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
         if va.is_int() && vb.is_int() {
@@ -1339,11 +1646,18 @@ impl<'p> Vm<'p> {
     /// through f64; whitespace-only → 0n; a non-integer string → undefined, i.e.
     /// unordered so every relational result is false). A Number/Boolean compares
     /// by mathematical value.
-    fn cmp_bigint_other(&self, x: &BigVal, other: Value) -> Result<Option<std::cmp::Ordering>, Thrown> {
+    fn cmp_bigint_other(
+        &self,
+        x: &BigVal,
+        other: Value,
+    ) -> Result<Option<std::cmp::Ordering>, Thrown> {
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                let y =
-                    if s.trim().is_empty() { Some(BigVal::Small(0)) } else { parse_bigint_str(&s) };
+                let y = if s.trim().is_empty() {
+                    Some(BigVal::Small(0))
+                } else {
+                    parse_bigint_str(&s)
+                };
                 return Ok(y.map(|y| x.cmp(&y)));
             }
         }
@@ -1460,7 +1774,9 @@ impl<'p> Vm<'p> {
         }
         // ToNumber of a Symbol is a TypeError.
         if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
-            return Err(Thrown("TypeError: Cannot convert a Symbol value to a number".into()));
+            return Err(Thrown(
+                "TypeError: Cannot convert a Symbol value to a number".into(),
+            ));
         }
         // A BigInt's numeric value (for `Number(1n)` and relational comparison;
         // arithmetic mixing is rejected earlier by `numeric_binop`).
@@ -1574,7 +1890,11 @@ impl<'p> Vm<'p> {
         let prim = if v.is_heap()
             && !matches!(
                 self.heap.get(v.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
+                HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+                    | HeapObj::BigInt(_)
+                    | HeapObj::BigIntBig(_)
+                    | HeapObj::Symbol { .. }
             ) {
             self.to_primitive_number(v)?
         } else {
@@ -1583,10 +1903,14 @@ impl<'p> Vm<'p> {
         if prim.is_heap() {
             match self.heap.get(prim.heap_index()) {
                 HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
-                    return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
+                    return Err(Thrown(
+                        "TypeError: Cannot convert a BigInt value to a number".into(),
+                    ));
                 }
                 HeapObj::Symbol { .. } => {
-                    return Err(Thrown("TypeError: Cannot convert a Symbol value to a number".into()));
+                    return Err(Thrown(
+                        "TypeError: Cannot convert a Symbol value to a number".into(),
+                    ));
                 }
                 _ => {}
             }
@@ -1600,7 +1924,11 @@ impl<'p> Vm<'p> {
     /// result (else TypeError). Returns `None` when there is no such method, so the
     /// caller falls back to OrdinaryToPrimitive (valueOf/toString). Already-primitive
     /// heap values (str/bigint/symbol) and boxed wrappers are left to the caller.
-    pub(crate) fn symbol_to_primitive(&mut self, v: Value, hint: &str) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn symbol_to_primitive(
+        &mut self,
+        v: Value,
+        hint: &str,
+    ) -> Result<Option<Value>, Thrown> {
         if !v.is_heap()
             || matches!(
                 self.heap.get(v.heap_index()),
@@ -1630,17 +1958,25 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         if !self.is_callable(f) {
-            return Err(Thrown("TypeError: Symbol.toPrimitive is not a function".into()));
+            return Err(Thrown(
+                "TypeError: Symbol.toPrimitive is not a function".into(),
+            ));
         }
         let hv = self.alloc_str(hint.to_string());
         let r = self.call_value(f, v, &[hv])?;
         let is_obj = r.is_heap()
             && !matches!(
                 self.heap.get(r.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
+                HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+                    | HeapObj::BigInt(_)
+                    | HeapObj::BigIntBig(_)
+                    | HeapObj::Symbol { .. }
             );
         if is_obj {
-            return Err(Thrown("TypeError: Cannot convert object to primitive value".into()));
+            return Err(Thrown(
+                "TypeError: Cannot convert object to primitive value".into(),
+            ));
         }
         Ok(Some(r))
     }
@@ -1662,14 +1998,20 @@ impl<'p> Vm<'p> {
                 let is_primitive = !r.is_heap()
                     || matches!(
                         self.heap.get(r.heap_index()),
-                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
+                        HeapObj::Str(_)
+                            | HeapObj::Cons { .. }
+                            | HeapObj::BigInt(_)
+                            | HeapObj::BigIntBig(_)
+                            | HeapObj::Symbol { .. }
                     );
                 if is_primitive {
                     return Ok(r);
                 }
             }
         }
-        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+        Err(Thrown(
+            "TypeError: Cannot convert object to primitive value".into(),
+        ))
     }
 
     /// ToPrimitive(v) with the DEFAULT hint (used by binary `+` and `==`): an
@@ -1682,7 +2024,11 @@ impl<'p> Vm<'p> {
         }
         if matches!(
             self.heap.get(v.heap_index()),
-            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
+            HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::BigInt(_)
+                | HeapObj::BigIntBig(_)
+                | HeapObj::Symbol { .. }
         ) {
             return Ok(v);
         }
@@ -1707,14 +2053,20 @@ impl<'p> Vm<'p> {
                 let is_primitive = !r.is_heap()
                     || matches!(
                         self.heap.get(r.heap_index()),
-                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
+                        HeapObj::Str(_)
+                            | HeapObj::Cons { .. }
+                            | HeapObj::BigInt(_)
+                            | HeapObj::BigIntBig(_)
+                            | HeapObj::Symbol { .. }
                     );
                 if is_primitive {
                     return Ok(r);
                 }
             }
         }
-        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+        Err(Thrown(
+            "TypeError: Cannot convert object to primitive value".into(),
+        ))
     }
 
     /// OrdinaryToPrimitive(O, methodNames) (ES 7.1.1.1): try each method name in
@@ -1744,7 +2096,9 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+        Err(Thrown(
+            "TypeError: Cannot convert object to primitive value".into(),
+        ))
     }
 
     /// String COERCION (`String(v)`, `'' + v`, property keys). Arrays join with
@@ -1794,23 +2148,36 @@ impl<'p> Vm<'p> {
                     instant_to_string(ns)
                 }
                 HeapObj::Temporal { kind: 5, fields } => year_month_string(fields[0], fields[1]),
-                HeapObj::Temporal { kind: 6, fields } => format!("{:02}-{:02}", fields[1], fields[2]),
+                HeapObj::Temporal { kind: 6, fields } => {
+                    format!("{:02}-{:02}", fields[1], fields[2])
+                }
                 HeapObj::Temporal { kind: 7, .. } => self.zdt_to_string(v.heap_index()),
                 HeapObj::Temporal { .. } => "[object Temporal]".into(),
                 HeapObj::Intl { .. } => "[object Object]".into(),
                 // Display is a LOSSY observation: a lone surrogate reads U+FFFD.
                 HeapObj::Str(s) => s.to_lossy_string(),
-                HeapObj::Cons { .. } => {
-                    self.heap.str_cow(v.heap_index()).map(|c| c.into_owned()).unwrap_or_default()
-                }
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
-                    "function".into()
-                }
+                HeapObj::Cons { .. } => self
+                    .heap
+                    .str_cow(v.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default(),
+                HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. } => "function".into(),
                 HeapObj::Cell(inner) => self.display(*inner),
                 HeapObj::EvalScope(_) => "[object EvalScope]".into(),
                 HeapObj::Array(items) => items
                     .iter()
-                    .map(|e| if e.is_nullish() { String::new() } else { self.display(*e) })
+                    .map(|e| {
+                        if e.is_nullish() {
+                            String::new()
+                        } else {
+                            self.display(*e)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(","),
                 HeapObj::Object(_) => {
@@ -1835,7 +2202,11 @@ impl<'p> Vm<'p> {
                 // ToString of a Symbol actually throws (see `to_js_string`); this
                 // infallible debug form is "Symbol(desc)".
                 HeapObj::Symbol { desc, .. } => {
-                    let d = if *desc == Value::UNDEFINED { String::new() } else { self.display(*desc) };
+                    let d = if *desc == Value::UNDEFINED {
+                        String::new()
+                    } else {
+                        self.display(*desc)
+                    };
                     format!("Symbol({d})")
                 }
                 // ToString(BigInt) is the decimal digits with NO "n" (String(1n) === "1").
@@ -1849,7 +2220,10 @@ impl<'p> Vm<'p> {
                 HeapObj::TypedArray { length, .. } => {
                     let n = *length;
                     let idx = v.heap_index();
-                    (0..n).map(|i| self.ta_elem_string(idx, i)).collect::<Vec<_>>().join(",")
+                    (0..n)
+                        .map(|i| self.ta_elem_string(idx, i))
+                        .collect::<Vec<_>>()
+                        .join(",")
                 }
                 HeapObj::ArrayBuffer { .. } => "[object ArrayBuffer]".into(),
                 HeapObj::DataView { .. } => "[object DataView]".into(),
@@ -1924,7 +2298,10 @@ impl<'p> Vm<'p> {
                 format!("Temporal.Duration <{}>", duration_to_string(&f))
             }
             HeapObj::Temporal { kind: 1, fields } => {
-                format!("Temporal.PlainDate <{}>", iso_date_string(fields[0], fields[1], fields[2]))
+                format!(
+                    "Temporal.PlainDate <{}>",
+                    iso_date_string(fields[0], fields[1], fields[2])
+                )
             }
             HeapObj::Temporal { kind: 2, fields } => {
                 let mut f = [0i64; 6];
@@ -1946,26 +2323,46 @@ impl<'p> Vm<'p> {
                 format!("Temporal.Instant <{}>", instant_to_string(ns))
             }
             HeapObj::Temporal { kind: 5, fields } => {
-                format!("Temporal.PlainYearMonth <{}>", year_month_string(fields[0], fields[1]))
+                format!(
+                    "Temporal.PlainYearMonth <{}>",
+                    year_month_string(fields[0], fields[1])
+                )
             }
             HeapObj::Temporal { kind: 6, fields } => {
                 format!("Temporal.PlainMonthDay <{:02}-{:02}>", fields[1], fields[2])
             }
             HeapObj::Temporal { kind: 7, .. } => {
-                format!("Temporal.ZonedDateTime <{}>", self.zdt_to_string(v.heap_index()))
+                format!(
+                    "Temporal.ZonedDateTime <{}>",
+                    self.zdt_to_string(v.heap_index())
+                )
             }
             HeapObj::Temporal { .. } => "[object Temporal]".into(),
             HeapObj::Intl { kind, .. } => {
                 const NAMES: [&str; 10] = [
-                    "NumberFormat", "DateTimeFormat", "Collator", "PluralRules", "ListFormat",
-                    "RelativeTimeFormat", "Segmenter", "Locale", "DisplayNames", "DurationFormat",
+                    "NumberFormat",
+                    "DateTimeFormat",
+                    "Collator",
+                    "PluralRules",
+                    "ListFormat",
+                    "RelativeTimeFormat",
+                    "Segmenter",
+                    "Locale",
+                    "DisplayNames",
+                    "DurationFormat",
                 ];
-                format!("Intl.{} {{}}", NAMES.get(*kind as usize).copied().unwrap_or("?"))
+                format!(
+                    "Intl.{} {{}}",
+                    NAMES.get(*kind as usize).copied().unwrap_or("?")
+                )
             }
             HeapObj::Str(s) => format!("'{}'", s.as_str_lossy()),
             HeapObj::Cons { .. } => {
-                let out =
-                    self.heap.str_cow(v.heap_index()).map(|c| c.into_owned()).unwrap_or_default();
+                let out = self
+                    .heap
+                    .str_cow(v.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
                 format!("'{out}'")
             }
             HeapObj::Func(id) => self.func_label(*id),
@@ -2016,7 +2413,9 @@ impl<'p> Vm<'p> {
                 let parts: Vec<String> = keys
                     .iter()
                     .zip(vals.iter())
-                    .map(|(k, v)| format!("{} => {}", self.inspect_nested(*k), self.inspect_nested(*v)))
+                    .map(|(k, v)| {
+                        format!("{} => {}", self.inspect_nested(*k), self.inspect_nested(*v))
+                    })
                     .collect();
                 format!("Map({}) {{ {} }}", keys.len(), parts.join(", "))
             }
@@ -2042,7 +2441,11 @@ impl<'p> Vm<'p> {
                 }
             }
             HeapObj::Symbol { desc, .. } => {
-                let d = if *desc == Value::UNDEFINED { String::new() } else { self.display(*desc) };
+                let d = if *desc == Value::UNDEFINED {
+                    String::new()
+                } else {
+                    self.display(*desc)
+                };
                 format!("Symbol({d})")
             }
             // console.log shows BigInt with the `n` suffix (1n), unlike ToString.
@@ -2061,7 +2464,9 @@ impl<'p> Vm<'p> {
                     format!("{name}({n}) [ {} ]", parts.join(", "))
                 }
             }
-            HeapObj::ArrayBuffer { data, .. } => format!("ArrayBuffer {{ byteLength: {} }}", data.len()),
+            HeapObj::ArrayBuffer { data, .. } => {
+                format!("ArrayBuffer {{ byteLength: {} }}", data.len())
+            }
             HeapObj::DataView { byte_length, .. } => {
                 format!("DataView {{ byteLength: {byte_length} }}")
             }
@@ -2079,7 +2484,9 @@ impl<'p> Vm<'p> {
             HeapObj::BoundResolver { .. } => "[Function (anonymous)]".into(),
             // Internal: never user-visible (an async call yields its Promise).
             HeapObj::AsyncState(_) => "Promise { <pending> }".into(),
-            HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => "[object Object]".into(),
+            HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
+                "[object Object]".into()
+            }
             // node renders a Date in console.log as its ISO string (unquoted).
             HeapObj::Date(ms) => {
                 if ms.is_nan() {
@@ -2122,6 +2529,28 @@ impl<'p> Vm<'p> {
             return self.alloc_str(s);
         }
         v
+    }
+}
+
+/// Native prefix for [`Vm::str_append_index_ascii_fast`]. A miss is the normal
+/// deopt sentinel: no state changed, so the interpreter can execute the fused
+/// opcode's exact GetIndex + append fallback once.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_append_index_ascii(
+    vm: *mut core::ffi::c_void,
+    acc_bits: u64,
+    obj_bits: u64,
+    key_bits: u64,
+) -> u64 {
+    // SAFETY: native regions hold the VM exclusively while calling helpers.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.str_append_index_ascii_fast(
+        Value::from_bits(acc_bits),
+        Value::from_bits(obj_bits),
+        Value::from_bits(key_bits),
+    ) {
+        Some(v) => v.bits(),
+        None => crate::codegen::SELF_CALL_DEOPT,
     }
 }
 
@@ -2188,8 +2617,7 @@ mod resolve_const_tests {
             eval("fromEval = 'bigint'");
         "#;
         let ast = crate::front::parse_script(src).expect("source parses");
-        let program =
-            crate::compile::compile_program(&ast, src).expect("source compiles");
+        let program = crate::compile::compile_program(&ast, src).expect("source compiles");
         assert!(
             !program.functions[0].wtf8_consts.is_empty(),
             "the lone-surrogate case must exercise the WTF-8 branch"
@@ -2244,13 +2672,18 @@ mod add_values_fresh_index_tests {
         let mut vm = Vm::new(&program);
         vm.run().expect("program runs");
 
-        let lhs =
-            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("acc".into()))));
-        let small_str =
-            Value::heap(vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("tail".into()))));
+        let lhs = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("acc".into()))),
+        );
+        let small_str = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("tail".into()))),
+        );
         // Large RHS → the cons (rope) arm; small ones → the flat arms.
         let big_str = Value::heap(
-            vm.heap.alloc(HeapObj::Str(crate::heap::JsStr::new("y".repeat(4096)))),
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new("y".repeat(4096)))),
         );
         let empty = Value::heap(crate::heap::INTERN_EMPTY);
         let rhss = [
@@ -2279,6 +2712,282 @@ mod add_values_fresh_index_tests {
             if r2.is_heap() {
                 assert_ne!(r2.heap_index(), lhs.heap_index());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod str_append_ascii_char_tests {
+    use super::*;
+
+    fn vm() -> Vm<'static> {
+        let src = "var x = 0;";
+        let ast = crate::front::parse_script(src).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_program(&ast, src).expect("source compiles"),
+        ));
+        let mut vm = Vm::new(program);
+        vm.run().expect("program runs");
+        vm
+    }
+
+    fn mutable_str(vm: &mut Vm<'_>, s: &str) -> Value {
+        Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::new(s.into()))),
+        )
+    }
+
+    #[test]
+    fn every_interned_ascii_byte_appends_exactly_without_heap_allocation() {
+        let mut vm = vm();
+        let acc = mutable_str(&mut vm, "seed");
+        let heap_len = vm.heap.len();
+        let mut expected = b"seed".to_vec();
+
+        for byte in 0u8..128 {
+            let rhs = Value::heap(byte as u32);
+            assert_eq!(vm.str_append_inplace(acc, rhs), Some(acc));
+            assert_eq!(
+                vm.heap.len(),
+                heap_len,
+                "byte {byte:#04x} allocated on the VM heap"
+            );
+            expected.push(byte);
+        }
+
+        match vm.heap.get(acc.heap_index()) {
+            HeapObj::Str(s) => {
+                assert_eq!(s.as_bytes(), expected);
+                assert_eq!(s.units(), expected.len());
+                assert!(s.is_ascii());
+                assert!(s.is_wellformed());
+            }
+            other => panic!("ASCII append changed the builder kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonascii_and_wtf8_metadata_and_seams_stay_exact() {
+        let mut vm = vm();
+
+        // An ASCII leaf on a non-ASCII flat builder uses the new arm. It must
+        // leave the builder non-ASCII while preserving exact UTF-16 units.
+        let unicode = mutable_str(&mut vm, "é☃");
+        assert_eq!(
+            vm.str_append_inplace(unicode, Value::heap(b'!' as u32)),
+            Some(unicode)
+        );
+        match vm.heap.get(unicode.heap_index()) {
+            HeapObj::Str(s) => {
+                assert_eq!(s.as_bytes(), "é☃!".as_bytes());
+                assert_eq!(s.units(), 3);
+                assert!(!s.is_ascii());
+                assert!(s.is_wellformed());
+            }
+            other => panic!("Unicode builder changed kind: {other:?}"),
+        }
+
+        // A lone surrogate remains lone when followed by ASCII; push_ascii
+        // neither hides it nor perturbs its cached unit count.
+        let lone = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xD83D))),
+        );
+        assert_eq!(
+            vm.str_append_inplace(lone, Value::heap(b'A' as u32)),
+            Some(lone)
+        );
+        match vm.heap.get(lone.heap_index()) {
+            HeapObj::Str(s) => {
+                assert_eq!(s.units(), 2);
+                assert!(!s.is_ascii());
+                assert!(!s.is_wellformed());
+            }
+            other => panic!("lone-surrogate builder changed kind: {other:?}"),
+        }
+
+        // A non-ASCII/lone-surrogate RHS is outside the new guard and keeps
+        // using push_wtf8, including canonicalization of a surrogate seam.
+        let hi = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xD83D))),
+        );
+        let lo = Value::heap(
+            vm.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(0xDE00))),
+        );
+        assert_eq!(vm.str_append_inplace(hi, lo), Some(hi));
+        match vm.heap.get(hi.heap_index()) {
+            HeapObj::Str(s) => {
+                assert_eq!(s.as_bytes(), "😀".as_bytes());
+                assert_eq!(s.units(), 2);
+                assert!(!s.is_ascii());
+                assert!(s.is_wellformed());
+            }
+            other => panic!("surrogate pair changed builder kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interned_shared_and_self_alias_accumulators_preserve_string_values() {
+        let mut vm = vm();
+
+        // Interned accumulators are immutable. The first append allocates a
+        // fresh builder and leaves both pinned character slots untouched.
+        let interned = Value::heap(b'x' as u32);
+        let appended = vm
+            .str_append_inplace(interned, Value::heap(b'y' as u32))
+            .expect("primitive append");
+        assert_ne!(appended, interned);
+        assert_eq!(vm.display(interned), "x");
+        assert_eq!(vm.display(Value::heap(b'y' as u32)), "y");
+        assert_eq!(vm.display(appended), "xy");
+
+        // Same-slot `a += a` deliberately misses the distinct-flat-string arm
+        // and goes through the general owned-byte path; no split borrow occurs.
+        let self_alias = mutable_str(&mut vm, "ab");
+        assert_eq!(
+            vm.str_append_inplace(self_alias, self_alias),
+            Some(self_alias)
+        );
+        assert_eq!(vm.display(self_alias), "abab");
+
+        // Compiler-level snapshots are the observable alias hazard. If its
+        // linearity proof ever licenses mutation while `held`/`snap` are live,
+        // either prefix below grows with the final builder.
+        let out = crate::run(
+            r#"
+                "use strict";
+                function render(input) {
+                    var out = "seed", held = out, snap = "";
+                    for (var i = 0; i < input.length; i++) {
+                        out += input[i];
+                        if (i === 10) snap = out;
+                    }
+                    return held + "|" + snap + "|" + out.length + "|" + out.slice(-4);
+                }
+                console.log(render("ab".repeat(25000)));
+            "#,
+        )
+        .expect("alias fixture compiles");
+        assert!(out.error.is_none(), "alias fixture error: {:?}", out.error);
+        assert_eq!(out.output, vec!["seed|seedabababababa|50004|abab"]);
+    }
+
+    #[test]
+    fn primitive_coercions_and_heap_fallbacks_do_not_mutate_before_decline() {
+        let mut vm = vm();
+        let acc = mutable_str(&mut vm, "v=");
+
+        for (value, suffix) in [
+            (Value::TRUE, "true"),
+            (Value::NULL, "null"),
+            (Value::UNDEFINED, "undefined"),
+            (Value::num(3.5), "3.5"),
+        ] {
+            assert_eq!(vm.str_append_inplace(acc, value), Some(acc));
+            assert!(vm.display(acc).ends_with(suffix));
+        }
+        let before = vm.display(acc);
+
+        // Objects can run user coercion and Symbols must throw under ordinary
+        // `+`; the append helper must decline before touching the builder.
+        let object = Value::heap(vm.obj_proto);
+        assert_eq!(vm.str_append_inplace(acc, object), None);
+        assert_eq!(vm.display(acc), before);
+        let generic = vm
+            .add_values(acc, object)
+            .expect("ordinary object coercion");
+        assert_ne!(generic, acc);
+        assert_eq!(vm.display(acc), before);
+
+        let desc = Value::heap(crate::heap::INTERN_EMPTY);
+        let symbol = vm.make_symbol(desc);
+        assert_eq!(vm.str_append_inplace(acc, symbol), None);
+        assert_eq!(vm.display(acc), before);
+        assert!(
+            vm.add_values(acc, symbol).is_err(),
+            "ordinary string + Symbol must throw"
+        );
+        assert_eq!(vm.display(acc), before);
+    }
+}
+
+#[cfg(test)]
+mod str_append_index_ascii_tests {
+    use super::*;
+
+    fn vm() -> Vm<'static> {
+        let src = "var x = 0;";
+        let ast = crate::front::parse_script(src).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_program(&ast, src).expect("source compiles"),
+        ));
+        let mut vm = Vm::new(program);
+        vm.run().expect("program runs");
+        vm
+    }
+
+    fn flat(vm: &mut Vm<'_>, s: crate::heap::JsStr) -> Value {
+        Value::heap(vm.heap.alloc(HeapObj::Str(s)))
+    }
+
+    #[test]
+    fn copies_every_ascii_byte_without_heap_allocation() {
+        let mut vm = vm();
+        let source: String = (0u8..128).map(char::from).collect();
+        let source = flat(&mut vm, crate::heap::JsStr::new(source));
+        let out = flat(&mut vm, crate::heap::JsStr::new(String::new()));
+        let heap_len = vm.heap.len();
+
+        for i in 0..128 {
+            assert_eq!(
+                vm.str_append_index_ascii_fast(out, source, Value::int(i)),
+                Some(out)
+            );
+        }
+        assert_eq!(vm.heap.len(), heap_len);
+        match vm.heap.get(out.heap_index()) {
+            HeapObj::Str(s) => {
+                assert_eq!(s.as_bytes(), &(0u8..128).collect::<Vec<_>>());
+                assert_eq!(s.units(), 128);
+                assert!(s.is_ascii());
+            }
+            other => panic!("builder changed kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_slot_alias_reads_before_appending() {
+        let mut vm = vm();
+        let out = flat(&mut vm, crate::heap::JsStr::new("abc".into()));
+        assert_eq!(
+            vm.str_append_index_ascii_fast(out, out, Value::int(1)),
+            Some(out)
+        );
+        assert_eq!(vm.display(out), "abcb");
+    }
+
+    #[test]
+    fn every_miss_is_pristine_including_unicode_and_wtf8() {
+        let mut vm = vm();
+        let out = flat(&mut vm, crate::heap::JsStr::new("seed".into()));
+        let unicode = flat(&mut vm, crate::heap::JsStr::new("A😀".into()));
+        let lone = flat(&mut vm, crate::heap::JsStr::from_code_point(0xD800));
+        let interned_out = Value::heap(crate::heap::INTERN_EMPTY);
+
+        for (acc, obj, key) in [
+            (out, unicode, Value::int(0)),
+            (out, lone, Value::int(0)),
+            (out, out, Value::int(-1)),
+            (out, out, Value::int(99)),
+            (out, out, Value::num(1.5)),
+            (interned_out, out, Value::int(0)),
+        ] {
+            assert_eq!(vm.str_append_index_ascii_fast(acc, obj, key), None);
+            assert_eq!(vm.display(out), "seed");
+            assert_eq!(vm.display(interned_out), "");
         }
     }
 }
@@ -2364,7 +3073,10 @@ mod cmp_i128_f64_tests {
         assert_eq!(cmp_i128_f64(-2, -1.5), Some(Less));
         assert_eq!(cmp_i128_f64(-1, -1.5), Some(Greater));
         // Beyond 2^53 the f64 can't hold the integer exactly, but the compare must.
-        assert_eq!(cmp_i128_f64(9_007_199_254_740_993, 9_007_199_254_740_992.0), Some(Greater));
+        assert_eq!(
+            cmp_i128_f64(9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            Some(Greater)
+        );
         assert_eq!(cmp_i128_f64(10_000_000_000_000_001, 1e16), Some(Greater));
         // NaN / infinities.
         assert_eq!(cmp_i128_f64(1, f64::NAN), None);

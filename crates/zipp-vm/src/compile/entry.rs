@@ -21,13 +21,18 @@ pub fn compile_module(prog: &ast::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, true)
 }
 
-pub(crate) fn compile_program_inner(prog: &ast::Program, source: &str, module_mode: bool) -> R<Program> {
+pub(crate) fn compile_program_inner(
+    prog: &ast::Program,
+    source: &str,
+    module_mode: bool,
+) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.module_mode = module_mode;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
         rewrite_local_accumulators(f);
+        rewrite_append_indexes(f);
     }
     let module_decl_globals = c.collect_module_decl_globals();
     Ok(Program {
@@ -66,7 +71,9 @@ impl Compiler {
     /// Whether `#name` (full key, '#'-prefixed) is declared by an enclosing
     /// class body or visible to this direct eval.
     pub(crate) fn private_name_declared(&self, key: &str) -> bool {
-        self.private_names_stack.iter().any(|v| v.iter().any(|n| n == key))
+        self.private_names_stack
+            .iter()
+            .any(|v| v.iter().any(|n| n == key))
             || self.eval_visible_privates.contains(key)
     }
 }
@@ -126,14 +133,13 @@ pub fn compile_eval(
             collect_hoisted_vars(s, &mut vars);
         }
         let mut lexical: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut add_lexical = |n: String,
-                               lexical: &mut std::collections::HashSet<String>|
-         -> Result<(), String> {
-            if !lexical.insert(n.clone()) || vars.contains(&n) {
-                return Err(format!("duplicate declaration of '{n}' in module code"));
-            }
-            Ok(())
-        };
+        let mut add_lexical =
+            |n: String, lexical: &mut std::collections::HashSet<String>| -> Result<(), String> {
+                if !lexical.insert(n.clone()) || vars.contains(&n) {
+                    return Err(format!("duplicate declaration of '{n}' in module code"));
+                }
+                Ok(())
+            };
         // `export <decl>` keeps the declaration it wraps, so the exported form
         // goes through the same three cases as a bare one.
         let mut check_decl = |d: &ast::Stmt,
@@ -309,8 +315,7 @@ pub fn compile_eval(
     // A STRICT eval (strict caller or "use strict" source) gets its own
     // discarded variable environment: top-level var/function decls are frame
     // locals, never realm globals.
-    c.script_binds_globals =
-        !(c.eval_locals && (force_strict || has_use_strict(&prog.directives)));
+    c.script_binds_globals = !(c.eval_locals && (force_strict || has_use_strict(&prog.directives)));
     c.eval_inherit_super_obj = inherit_super_obj;
     c.force_strict = force_strict;
     c.force_new_target_ok = force_new_target_ok;
@@ -334,6 +339,7 @@ pub fn compile_eval(
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
         rewrite_local_accumulators(f);
+        rewrite_append_indexes(f);
     }
     let module_decl_globals = c.collect_module_decl_globals();
     Ok(Program {

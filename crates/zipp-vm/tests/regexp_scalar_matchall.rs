@@ -64,6 +64,53 @@ fn pristine_final_result_last_index_and_annex_b_statics_match_node() {
 }
 
 #[test]
+fn copied_nonzero_last_index_nullable_matches_and_short_prefix_match_node() {
+    let src = r#"var N=64,lines=new Array(N+3);
+for(var j=0;j<lines.length;j++)lines[j]=j<N?"a1":"a999";
+var reKv=/(a?)(\d*)/g,kvCount=0,kvSum=0,km;
+reKv.lastIndex=1;
+for(var i=0;i<N;i++){for(var km of lines[i].matchAll(reKv)){
+  kvCount++;kvSum=(kvSum+(+km[2]))|0;
+}}
+console.log(kvCount+"|"+kvSum+"|"+reKv.lastIndex+"|"+i+"|"+
+  km[0]+"|"+km[1]+"|"+km[2]+"|"+km.index+"|"+km.input);
+"#;
+    assert_matches_node(src);
+}
+
+#[test]
+fn outer_reducer_survives_empty_final_iterations_and_keeps_the_last_result() {
+    let src = r#"var N=96,lines=new Array(N);
+for(var j=0;j<N;j++)lines[j]=(j%4===3)?"":"a=1 b=22 c=333";
+var reKv=/([a-z]+)=(\d+)/g,kvCount=0,kvSum=0,km;
+for(var i=0;i<N;i++){for(var km of lines[i].matchAll(reKv)){
+  kvCount++;kvSum=(kvSum+(+km[2]))|0;
+}}
+console.log(kvCount+"|"+kvSum+"|"+km[0]+"|"+km[1]+"|"+km[2]+"|"+km.index);
+"#;
+    assert_matches_node(src);
+}
+
+#[test]
+fn pending_result_flushes_before_an_array_getter_can_observe_km() {
+    let src = r#"var N=48,lines=new Array(N);
+for(var j=0;j<N;j++)lines[j]="a=1 b=22";
+var reKv=/([a-z]+)=(\d+)/g,kvCount=0,kvSum=0,km,i=0,seen="";
+function scan(){for(i=0;i<N;i++){for(km of lines[i].matchAll(reKv)){
+  kvCount++;kvSum=(kvSum+(+km[2]))|0;
+}}}
+scan();
+Object.defineProperty(lines,"2",{configurable:true,get:function(){
+  seen=km[0]+"|"+km[1]+"|"+km[2];return "c=333";
+}});
+i=0;kvCount=0;kvSum=0;scan();
+delete lines[2];
+console.log(seen+"|"+kvCount+"|"+kvSum+"|"+km[0]);
+"#;
+    assert_matches_node(src);
+}
+
+#[test]
 fn iterator_protocol_accessors_replacements_and_noncallable_values_match_node() {
     // Warm the exact region, then mutate the same intrinsic prototype before a
     // second invocation. The compiled guards must decline before observing the
@@ -131,6 +178,49 @@ i=0;kvCount=0;kvSum=0;scan();
 String.prototype.matchAll=old;
 console.log(kvCount+"|"+kvSum+"|"+calls+"|"+km[0]);"#;
     assert_matches_node(src);
+}
+
+#[test]
+fn late_species_getter_is_observed_once_per_outer_iteration() {
+    let src = r#"var N=40,lines=new Array(N);
+for(var j=0;j<N;j++)lines[j]="a=1 b=2";
+var reKv=/([a-z]+)=(\d+)/g,kvCount=0,kvSum=0,km,i=0;
+function scan(){for(i=0;i<N;i++){for(km of lines[i].matchAll(reKv)){
+  kvCount++;kvSum=(kvSum+(+km[2]))|0;
+}}}
+scan();
+var sd=Object.getOwnPropertyDescriptor(RegExp,Symbol.species),gets=0;
+Object.defineProperty(RegExp,Symbol.species,{configurable:true,get:function(){gets++;return RegExp;}});
+i=0;kvCount=0;kvSum=0;scan();
+Object.defineProperty(RegExp,Symbol.species,sd);
+console.log(kvCount+"|"+kvSum+"|"+gets+"|"+km[0]);"#;
+    assert_matches_node(src);
+}
+
+#[test]
+fn late_hole_prototype_getter_and_proxy_array_are_not_batched() {
+    let hole = r#"var N=40,lines=new Array(N);
+for(var j=0;j<N;j++)lines[j]="a=1 b=2";
+var reKv=/([a-z]+)=(\d+)/g,kvCount=0,kvSum=0,km,i=0;
+function scan(){for(i=0;i<N;i++){for(km of lines[i].matchAll(reKv)){
+  kvCount++;kvSum=(kvSum+(+km[2]))|0;
+}}}
+scan();delete lines[2];var gets=0;
+Object.defineProperty(Array.prototype,"2",{configurable:true,get:function(){gets++;return "c=7";}});
+i=0;kvCount=0;kvSum=0;scan();delete Array.prototype[2];
+console.log(kvCount+"|"+kvSum+"|"+gets+"|"+km[0]);"#;
+    assert_matches_node(hole);
+
+    let proxy = r#"var N=40,base=new Array(N);
+for(var j=0;j<N;j++)base[j]="a=1 b=2";
+var lines=base,reKv=/([a-z]+)=(\d+)/g,kvCount=0,kvSum=0,km,i=0;
+function scan(){for(i=0;i<N;i++){for(km of lines[i].matchAll(reKv)){
+  kvCount++;kvSum=(kvSum+(+km[2]))|0;
+}}}
+scan();var gets=0;lines=new Proxy(base,{get:function(t,k,r){if(k!=="length")gets++;return Reflect.get(t,k,r);}});
+i=0;kvCount=0;kvSum=0;scan();
+console.log(kvCount+"|"+kvSum+"|"+gets+"|"+km[0]);"#;
+    assert_matches_node(proxy);
 }
 
 fn out_of_range_capture_src(n: usize) -> String {
@@ -231,7 +321,7 @@ fn scalar_counts_child() {
     };
     let mode = mode.to_string_lossy();
     let src = match mode.as_ref() {
-        "on" | "off" => core_src(HOT),
+        "on" | "off" | "array_off" => core_src(HOT),
         "out_of_range" => out_of_range_capture_src(HOT),
         "slow_throw" => slow_throw_src().to_owned(),
         "alias" => alias_src(HOT),
@@ -239,6 +329,7 @@ fn scalar_counts_child() {
     };
     assert_matches_node(&src);
     let scalar = zipp_vm::regexp_scalar_matchall_stats();
+    let (_, _, jit_matchall, _, _) = zipp_vm::regexp_string_call_direct_stats();
     let (success, capture, materialized, elided, declines, slow) = scalar;
     match mode.as_ref() {
         "on" => {
@@ -257,6 +348,23 @@ fn scalar_counts_child() {
                 compact,
                 (3 * HOT) as u64 - elided,
                 "allocation algebra drift"
+            );
+            assert!(
+                materialized <= 2,
+                "outer reducer did not collapse result materialization: {scalar:?}"
+            );
+            assert!(
+                jit_matchall > 0 && jit_matchall < (HOT / 2) as u64,
+                "outer reducer did not collapse matchAll calls: {jit_matchall}"
+            );
+        }
+        "array_off" => {
+            assert!(success > 0 && materialized > 0 && elided > 0, "vacuous: {scalar:?}");
+            assert_eq!(capture, success);
+            assert_eq!(success, materialized + elided);
+            assert!(
+                jit_matchall > (HOT / 2) as u64,
+                "array-reducer comparator did not restore per-subject calls: {jit_matchall}"
             );
         }
         "out_of_range" => {
@@ -285,21 +393,22 @@ fn zz_scalar_mechanism_guards_and_dependency_switches() {
         return;
     }
     let exe = std::env::current_exe().expect("test exe path");
-    let cases: &[(&str, Option<(&str, &str)>)] = &[
-        ("on", None),
-        ("out_of_range", None),
-        ("slow_throw", None),
-        ("alias", None),
-        ("off", Some(("ZIPP_NO_RX_SCALAR_MATCHALL", "1"))),
-        ("off", Some(("ZIPP_NO_MATCHALL_PRISTINE", "1"))),
-        ("off", Some(("ZIPP_NO_FASTOK_MEMO", "1"))),
-        ("off", Some(("ZIPP_NO_RX_STRING_CALL_DIRECT", "1"))),
-        ("off", Some(("ZIPP_NO_MATCHALL_STEP", "1"))),
-        ("off", Some(("ZIPP_NO_MATCHALL_BATCH", "1"))),
-        ("off", Some(("ZIPP_NO_SLIM_EXEC", "1"))),
-        ("off", Some(("ZIPP_NO_MATCH_VARIANT", "1"))),
-        ("off", Some(("ZIPP_NO_ITER_REGION", "1"))),
-        ("off", Some(("ZIPP_NO_TONUM_STR", "1"))),
+    let cases: &[(&str, &[(&str, &str)])] = &[
+        ("on", &[]),
+        ("out_of_range", &[]),
+        ("slow_throw", &[]),
+        ("alias", &[]),
+        ("array_off", &[("ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE", "1")]),
+        ("off", &[("ZIPP_NO_RX_SCALAR_MATCHALL", "1")]),
+        ("off", &[("ZIPP_NO_MATCHALL_PRISTINE", "1")]),
+        ("off", &[("ZIPP_NO_FASTOK_MEMO", "1")]),
+        ("off", &[("ZIPP_NO_RX_STRING_CALL_DIRECT", "1")]),
+        ("off", &[("ZIPP_NO_MATCHALL_STEP", "1")]),
+        ("off", &[("ZIPP_NO_MATCHALL_BATCH", "1")]),
+        ("off", &[("ZIPP_NO_SLIM_EXEC", "1")]),
+        ("off", &[("ZIPP_NO_MATCH_VARIANT", "1")]),
+        ("off", &[("ZIPP_NO_ITER_REGION", "1")]),
+        ("off", &[("ZIPP_NO_TONUM_STR", "1")]),
     ];
     for (mode, extra) in cases {
         let mut cmd = Command::new(&exe);
@@ -309,6 +418,7 @@ fn zz_scalar_mechanism_guards_and_dependency_switches() {
             .env("ZIPP_JIT_THRESHOLD", "1")
             .env_remove("ZIPP_NOJIT")
             .env_remove("ZIPP_NO_RX_SCALAR_MATCHALL")
+            .env_remove("ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE")
             .env_remove("ZIPP_NO_MATCHALL_PRISTINE")
             .env_remove("ZIPP_NO_FASTOK_MEMO")
             .env_remove("ZIPP_NO_RX_STRING_CALL_DIRECT")
@@ -318,7 +428,7 @@ fn zz_scalar_mechanism_guards_and_dependency_switches() {
             .env_remove("ZIPP_NO_MATCH_VARIANT")
             .env_remove("ZIPP_NO_ITER_REGION")
             .env_remove("ZIPP_NO_TONUM_STR");
-        if let Some((key, value)) = extra {
+        for &(key, value) in *extra {
             cmd.env(key, value);
         }
         let out = cmd.output().expect("spawn scalar mechanism child");
@@ -373,7 +483,8 @@ fn zz_scalar_default_threshold1_nojit_and_gcstress_modes() {
             .env_remove("ZIPP_NOJIT")
             .env_remove("ZIPP_JIT_THRESHOLD")
             .env_remove("ZIPP_GC_STRESS")
-            .env_remove("ZIPP_NO_RX_SCALAR_MATCHALL");
+            .env_remove("ZIPP_NO_RX_SCALAR_MATCHALL")
+            .env_remove("ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE");
         for &(key, value) in *envs {
             cmd.env(key, value);
         }

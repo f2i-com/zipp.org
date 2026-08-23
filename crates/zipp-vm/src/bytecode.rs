@@ -15,6 +15,15 @@ use crate::value::Value;
 /// A register index within a function's frame.
 pub type Reg = u16;
 
+/// Engine-private prefix carried by the Array returned from `ForInKeys`.
+///
+/// The snapshot is never exposed to JavaScript. Slots 0..6 hold the receiver,
+/// the two default-prototype anchors, and each object's matching shape version;
+/// actual enumerable key strings begin at this offset. Keeping the guard beside
+/// the snapshot makes nested and re-entrant for-in loops independent without a
+/// VM side table (and the Array keeps every Value here alive through GC).
+pub const FORIN_SNAPSHOT_PREFIX: usize = 6;
+
 /// `ClassAddMember.kind` flag: leave the ToPropertyKey'd key back in the `key`
 /// register. An auto-accessor installs a get/set PAIR from one
 /// ClassElementName, so the second instruction must reuse the first's coerced
@@ -28,40 +37,68 @@ pub const KEY_WRITEBACK: u8 = 0x80;
 #[derive(Clone, Debug)]
 pub enum Instr {
     /// `dst = <constant pool[idx]>`
-    LoadConst { dst: Reg, idx: u32 },
+    LoadConst {
+        dst: Reg,
+        idx: u32,
+    },
     /// `dst = <small integer immediate>`
-    LoadInt { dst: Reg, val: i32 },
+    LoadInt {
+        dst: Reg,
+        val: i32,
+    },
     /// `dst = undefined`
-    LoadUndefined { dst: Reg },
+    LoadUndefined {
+        dst: Reg,
+    },
     /// `dst = new.target` — the current activation's `new.target` (the constructor
     /// when entered via `new`/`Reflect.construct`/`super(...)`, else `undefined`).
-    LoadNewTarget { dst: Reg },
+    LoadNewTarget {
+        dst: Reg,
+    },
 
     /// `dst = <the function currently executing>` — materialises the running
     /// frame's own function value. Used to bind a named function expression's name
     /// to itself inside its body (`(function f(){ … f … })`), so self-reference and
     /// nested closures over the name resolve.
-    LoadCallee { dst: Reg },
+    LoadCallee {
+        dst: Reg,
+    },
     /// `dst = class_values[class_id]` — the inner immutable class-name binding
     /// visible to method/ctor/static-block bodies (and arrows inside them). A
     /// ReferenceError (TDZ) if the class value is not yet initialized.
-    LoadClassValue { dst: Reg, class_id: u32 },
+    LoadClassValue {
+        dst: Reg,
+        class_id: u32,
+    },
     /// `dst = <array hole>` — the internal HOLE sentinel, used only to fill an
     /// elided array-literal element (`[1,,3]`) before NewArray/ArrayAppend copies
     /// it into the array. Must never be observed outside that copy.
-    LoadHole { dst: Reg },
+    LoadHole {
+        dst: Reg,
+    },
     /// `dst = null`
-    LoadNull { dst: Reg },
+    LoadNull {
+        dst: Reg,
+    },
     /// `dst = true|false`
-    LoadBool { dst: Reg, val: bool },
+    LoadBool {
+        dst: Reg,
+        val: bool,
+    },
     /// `dst = src`
-    Move { dst: Reg, src: Reg },
+    Move {
+        dst: Reg,
+        src: Reg,
+    },
 
     /// `dst = globals[idx]`. Throws ReferenceError if the slot holds the
     /// never-declared sentinel (`Value::UNINITIALIZED`) — i.e. the name was
     /// referenced but never bound (`x` where no `var`/`let`/`function`/builtin/
     /// assignment ever defined it).
-    LoadGlobal { dst: Reg, idx: u32 },
+    LoadGlobal {
+        dst: Reg,
+        idx: u32,
+    },
     /// `dst = globals[idx]`, but the never-declared sentinel reads as `undefined`
     /// instead of throwing. Emitted for `typeof <ident>`, where an unbound name
     /// must yield "undefined" rather than a ReferenceError.
@@ -73,59 +110,132 @@ pub enum Instr {
     /// [`TYPEOF_NAMES`]; a literal that is not a possible `typeof` result
     /// compiles with code 255, which matches nothing (the comparison is a
     /// constant, but the operand is still evaluated for its effects).
-    TypeOfIs { dst: Reg, a: Reg, code: u8, neg: bool },
-    LoadGlobalOrUndefined { dst: Reg, idx: u32 },
+    TypeOfIs {
+        dst: Reg,
+        a: Reg,
+        code: u8,
+        neg: bool,
+    },
+    LoadGlobalOrUndefined {
+        dst: Reg,
+        idx: u32,
+    },
     /// Dynamic-first variants for code in a contains-direct-eval function (or
     /// an eval program): consult the activation's EvalScope (frame field or
     /// closure stamp) for the slot's NAME before the ordinary global slot.
-    LoadGlobalDyn { dst: Reg, idx: u32 },
-    LoadGlobalOrUndefinedDyn { dst: Reg, idx: u32 },
-    StoreGlobalDyn { idx: u32, src: Reg },
+    LoadGlobalDyn {
+        dst: Reg,
+        idx: u32,
+    },
+    LoadGlobalOrUndefinedDyn {
+        dst: Reg,
+        idx: u32,
+    },
+    StoreGlobalDyn {
+        idx: u32,
+        src: Reg,
+    },
     /// Does the activation's EvalScope bind this slot's NAME right now?
     /// An assignment in a sloppy direct-eval zone snapshots its target
     /// reference with this BEFORE the RHS runs: a `var` the RHS's eval
     /// introduces is what later READS see, but not what this assignment
     /// writes (PutValue uses the already-resolved reference).
-    EvalScopeHas { dst: Reg, idx: u32 },
+    EvalScopeHas {
+        dst: Reg,
+        idx: u32,
+    },
     /// Write the activation's EXISTING EvalScope binding for the slot's name
     /// (the EvalScopeHas-true arm; falls back to the global slot if gone).
-    EvalScopeSet { idx: u32, src: Reg },
+    EvalScopeSet {
+        idx: u32,
+        src: Reg,
+    },
     /// `globals[idx] = src`
-    StoreGlobal { idx: u32, src: Reg },
+    StoreGlobal {
+        idx: u32,
+        src: Reg,
+    },
     /// `globals[idx] = src`, but in STRICT mode: assignment to an unresolvable
     /// reference (a never-declared global slot, still UNINITIALIZED) throws a
     /// ReferenceError instead of creating the global (sloppy `StoreGlobal` creates).
-    StoreGlobalStrict { idx: u32, src: Reg },
+    StoreGlobalStrict {
+        idx: u32,
+        src: Reg,
+    },
     /// `globals[idx] = src` for a reference the SAME expression already read
     /// (`x++`, `x += 1`, `x ||= v`). GetValue having succeeded proves the
     /// reference is resolvable, so PutValue may not throw "is not defined";
     /// an uninitialized slot whose name is an own property of the global object
     /// writes through that property instead. Emitted only where a
     /// `load_binding` of the same binding precedes the store.
-    StoreGlobalResolved { idx: u32, src: Reg },
+    StoreGlobalResolved {
+        idx: u32,
+        src: Reg,
+    },
 
     /// A clock read: `performance.now()` (`epoch = false`, fractional ms since
     /// VM start) or `Date.now()` (`epoch = true`, integer ms since the Unix
     /// epoch). Both yield an f64 `Value`. Recognised at compile time so the
     /// common timing idiom works without a real global object model.
-    Now { dst: Reg, epoch: bool },
+    Now {
+        dst: Reg,
+        epoch: bool,
+    },
 
     // ── arithmetic (generic: operands may be any number) ──
-    Add { dst: Reg, a: Reg, b: Reg },
-    Sub { dst: Reg, a: Reg, b: Reg },
-    Mul { dst: Reg, a: Reg, b: Reg },
-    Div { dst: Reg, a: Reg, b: Reg },
-    Mod { dst: Reg, a: Reg, b: Reg },
-    Neg { dst: Reg, a: Reg },
+    Add {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    Sub {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    Mul {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    Div {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    Mod {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    Neg {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = +a` — unary plus: coerce `a` to a number (ToNumber).
-    ToNum { dst: Reg, a: Reg },
+    ToNum {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = a <bitop> b` — bitwise/shift with JS int32 coercion of the operands
     /// (`>>>` coerces to uint32 and may yield a value above i32::MAX).
-    Bitwise { dst: Reg, a: Reg, b: Reg, op: BitwiseOp },
+    Bitwise {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        op: BitwiseOp,
+    },
     /// `dst = a ** b` — exponentiation (f64 semantics).
-    Pow { dst: Reg, a: Reg, b: Reg },
+    Pow {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = ~a` — bitwise NOT (int32 coercion).
-    BitNot { dst: Reg, a: Reg },
+    BitNot {
+        dst: Reg,
+        a: Reg,
+    },
 
     /// `dst = a + <int immediate>` — the canonical `i + 1`, `n - 1` shape.
     /// `upd` distinguishes the two sources with DIFFERENT BigInt semantics:
@@ -134,7 +244,12 @@ pub enum Instr {
     /// fast path (upd=false) must throw the spec's mixing TypeError for a
     /// BigInt operand (`1n - 1` throws). Identical for Number operands (the
     /// JIT, which only handles numbers, ignores the flag).
-    AddInt { dst: Reg, a: Reg, imm: i32, upd: bool },
+    AddInt {
+        dst: Reg,
+        a: Reg,
+        imm: i32,
+        upd: bool,
+    },
 
     /// `dst = a + b` — SEMANTICALLY IDENTICAL to `Add` (same operator, same
     /// coercion). A pure JIT routing hint emitted by a compile pass for the
@@ -143,14 +258,24 @@ pub enum Instr {
     /// JITs its control flow natively and calls a concat helper per step rather
     /// than running fully interpreted. Because the semantics equal `Add`, a
     /// mis-applied hint can only change performance, never results.
-    StrConcat { dst: Reg, a: Reg, b: Reg },
+    StrConcat {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// `dst = a + (b + c)` with exact pairwise `+` semantics. The compiler
     /// emits this only for an identifier `+=` whose RHS is a single `b + c`
     /// pair with a definitely-string `b`. Flat ASCII
     /// `string + (string + {string,int})` is materialised directly into one
     /// result buffer; every other shape delegates to the two ordinary Adds in
     /// their original order (inner first, then outer).
-    AddRightPair { dst: Reg, a: Reg, b: Reg, c: Reg, in_place: bool },
+    AddRightPair {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        c: Reg,
+        in_place: bool,
+    },
 
     /// Exact literal-prefix `+` used by the benchmark's `pad2` leaves:
     /// `zero=true` is `"0" + src`, `zero=false` is `"" + src`. A tagged Int
@@ -158,7 +283,11 @@ pub enum Instr {
     /// string; every other value executes the ordinary `+` with the literal.
     /// The omitted left expression is a side-effect-free String literal, so
     /// operand evaluation and ToPrimitive order are unchanged.
-    Pad2Concat { dst: Reg, src: Reg, zero: bool },
+    Pad2Concat {
+        dst: Reg,
+        src: Reg,
+        zero: bool,
+    },
 
     /// Exact whole-conditional pad2 shape:
     /// `src < 10 ? "0" + src : "" + src`. The compiler emits this only when
@@ -167,7 +296,10 @@ pub enum Instr {
     /// second binding read. Tagged Ints 0..99 return the pinned two-digit slot;
     /// every other value executes the original relational comparison followed
     /// by the selected ordinary literal-prefix `+`, including both coercions.
-    Pad2Conditional { dst: Reg, src: Reg },
+    Pad2Conditional {
+        dst: Reg,
+        src: Reg,
+    },
 
     /// `dst = a + b`, computed by appending `b`'s string form into `a`'s buffer
     /// IN PLACE when `a` is a uniquely-owned mutable string (else a fresh string).
@@ -179,7 +311,26 @@ pub enum Instr {
     /// allocations into amortized buffer growth. Unlike `StrConcat`/`Add`, this is
     /// NOT semantics-preserving in general (it mutates) — correct ONLY under the
     /// linearity proof the emitter guarantees.
-    StrAppendInPlace { dst: Reg, a: Reg, b: Reg },
+    StrAppendInPlace {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// Exact fusion of an adjacent `scratch = obj[key]` followed by the
+    /// compiler-proven-linear `dst = a + scratch`. The compiler additionally
+    /// proves `scratch` cannot be observed anywhere else and that control
+    /// cannot enter at the removed append. Runtime may therefore read an
+    /// in-range byte directly from a flat ASCII string and append it without
+    /// materialising the indexed character; every other shape executes the
+    /// original GetIndex then StrAppendInPlace/Add fallback in that order.
+    /// `scratch` remains available to root the indexed Value on the slow path.
+    StrAppendIndex {
+        dst: Reg,
+        a: Reg,
+        obj: Reg,
+        key: Reg,
+        scratch: Reg,
+    },
 
     /// `dst = a + b` — SEMANTICALLY IDENTICAL to `Add` for EVERY operand pair
     /// (numeric folding, BigInt rules and the mixing TypeError, Symbol
@@ -197,75 +348,166 @@ pub enum Instr {
     /// pre-interned) string is never the in-place accumulator. Runtime =
     /// `Vm::add_values_chain`, shared verbatim by the interpreter arm, the
     /// MEM-region helper and the Tier-C helper (`jit_concat_chain`).
-    StrConcatChain { dst: Reg, a: Reg, b: Reg },
+    StrConcatChain {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
 
     // ── comparisons → boolean ──
-    Lt { dst: Reg, a: Reg, b: Reg },
-    Le { dst: Reg, a: Reg, b: Reg },
-    Gt { dst: Reg, a: Reg, b: Reg },
-    Ge { dst: Reg, a: Reg, b: Reg },
+    Lt {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    Le {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    Gt {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    Ge {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// strict `===`
-    Eq { dst: Reg, a: Reg, b: Reg },
+    Eq {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// strict `!==`
-    Ne { dst: Reg, a: Reg, b: Reg },
+    Ne {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// loose `==` (with type coercion)
-    LooseEq { dst: Reg, a: Reg, b: Reg },
+    LooseEq {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
     /// loose `!=` (with type coercion)
-    LooseNe { dst: Reg, a: Reg, b: Reg },
+    LooseNe {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+    },
 
-    Not { dst: Reg, a: Reg },
+    Not {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = ToString(a)` — the string-hint coercion (ToPrimitive with the string
     /// hint: `@@toPrimitive("string")` / `toString` / `valueOf`). Used for template-
     /// literal substitutions, which `ToString` each `${…}` rather than going through
     /// `+` (whose default hint tries `valueOf` first — wrong for e.g. a Temporal
     /// value, whose `valueOf` throws but whose `toString` works).
-    ToStr { dst: Reg, a: Reg },
+    ToStr {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = typeof a` (a JS type-name string).
-    TypeOf { dst: Reg, a: Reg },
+    TypeOf {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = Array.isArray(a)` — true iff `a` is a heap array.
-    IsArray { dst: Reg, a: Reg },
+    IsArray {
+        dst: Reg,
+        a: Reg,
+    },
     /// `dst = JSON.stringify(val, _, space)` — `space` is the indentation arg
     /// (a number → that many spaces, a string → that string, else compact).
-    JsonStringify { dst: Reg, val: Reg, space: Reg },
+    JsonStringify {
+        dst: Reg,
+        val: Reg,
+        space: Reg,
+    },
     /// `dst = JSON.parse(a)` — parse a JSON string; throws SyntaxError on invalid.
-    JsonParse { dst: Reg, a: Reg },
+    JsonParse {
+        dst: Reg,
+        a: Reg,
+    },
     /// Append to array `arr`: when `spread`, append every element of `val` (an
     /// array, or a string's chars); otherwise push `val` as one element. Used to
     /// build array literals / call-arg lists containing `...spread`.
-    ArrayAppend { arr: Reg, val: Reg, spread: bool },
+    ArrayAppend {
+        arr: Reg,
+        val: Reg,
+        spread: bool,
+    },
     /// `dst = [...src.slice(start)]` — the rest of an array (or a string's chars)
     /// from index `start`. Used by array destructuring's `[a, ...rest]`.
-    ArrayRest { dst: Reg, src: Reg, start: u32 },
+    ArrayRest {
+        dst: Reg,
+        src: Reg,
+        start: u32,
+    },
     /// Copy `src`'s own enumerable keys onto `target` (object literal `{...src}`).
     /// `src` may be an object, array, or string; null/undefined contribute none.
-    ObjectSpread { target: Reg, src: Reg },
+    ObjectSpread {
+        target: Reg,
+        src: Reg,
+    },
     /// `dst = { ...src } minus the keys` — object rest in destructuring
     /// (`let {a, ...rest} = src`). The excluded keys are `string_constants
     /// [exclude_start .. exclude_start+exclude_count]` (the sibling properties).
-    ObjectRest { dst: Reg, src: Reg, exclude_start: u32, exclude_count: u16 },
+    ObjectRest {
+        dst: Reg,
+        src: Reg,
+        exclude_start: u32,
+        exclude_count: u16,
+    },
     /// Like ObjectRest, but the excluded sibling keys are the `n` runtime values
     /// in registers `keys_base..keys_base+n` (each ToPropertyKey-coerced) — used
     /// when an object-rest pattern has a computed sibling key (`{[k]: a, ...r}`).
-    ObjectRestDyn { dst: Reg, src: Reg, keys_base: Reg, n: u16 },
+    ObjectRestDyn {
+        dst: Reg,
+        src: Reg,
+        keys_base: Reg,
+        n: u16,
+    },
     /// Record the evaluated ClassElementName of decorated element `elem` into the
     /// class's `DecState::keys`, so `context.name` is the very String/Symbol the
     /// key expression produced. Emitted only for a COMPUTED decorated key (a
     /// static one is already in `DecElemDef::name`); the key is ToPropertyKey'd
     /// by the member/field op that consumes the same register, so this op only
     /// stores what it is given.
-    DecKey { class: Reg, elem: u16, key: Reg, class_id: u32 },
+    DecKey {
+        class: Reg,
+        elem: u16,
+        key: Reg,
+        class_id: u32,
+    },
     /// Apply decorated element `elem`'s decorators — the `argc` values in
     /// `[arg_base, arg_base+argc)`, in REVERSE list order (`@a @b m(){}` calls
     /// `b` first and passes its result to `a`) — and write the results back:
     /// a method/getter/setter's replacement onto the class, a field's or
     /// auto-accessor's returned initializer into `DecState::field_inits[elem]`.
-    DecElem { class: Reg, elem: u16, arg_base: Reg, argc: u16, class_id: u32 },
+    DecElem {
+        class: Reg,
+        elem: u16,
+        arg_base: Reg,
+        argc: u16,
+        class_id: u32,
+    },
     /// Apply the class's own decorators (the `argc` values in `[arg_base,
     /// arg_base+argc)`, reverse order) to the class in `class`, leaving the
     /// possibly-replaced value in `class`. Runs after every element is decorated
     /// and BEFORE the static field initializers, so `@dec class C { static x = 1 }`
     /// initializes `x` on the class the decorator returned.
-    DecClass { class: Reg, arg_base: Reg, argc: u16 },
+    DecClass {
+        class: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// Run one of the class's `addInitializer` lists with `this` set to the
     /// receiver. `which`: 0 = instance METHOD/getter/setter list (receiver =
     /// reg 0, the new object; emitted at the head of the constructor's / field
@@ -279,59 +521,103 @@ pub enum Instr {
     /// `class_id` names the class whose `DecState` holds the list; for the
     /// instance form it is resolved through `class_values` exactly as `FieldInit`
     /// resolves a computed field key.
-    DecInits { class_id: u32, which: u8, elem: u16, recv: Reg },
+    DecInits {
+        class_id: u32,
+        which: u8,
+        elem: u16,
+        recv: Reg,
+    },
     /// Pipe a decorated field's initial value through the initializer chain the
     /// element's decorators returned: `val = init(val)` with `this` = `recv`, in
     /// chain order (innermost decorator first). A no-op when no decorator
     /// returned an initializer, which is why the undecorated field path never
     /// grows a branch.
-    DecField { class_id: u32, elem: u16, val: Reg, recv: Reg },
+    DecField {
+        class_id: u32,
+        elem: u16,
+        val: Reg,
+        recv: Reg,
+    },
     /// `dst = <the class value for classes[class_id]>` — materialize a class.
     /// `parent` is the register holding the superclass value (`extends P`), or
     /// `None`; the new class links to it for inherited lookup + instanceof.
-    MakeClass { dst: Reg, class_id: u32, parent: Option<Reg> },
+    MakeClass {
+        dst: Reg,
+        class_id: u32,
+        parent: Option<Reg>,
+    },
     /// Throw a ReferenceError if the value in `src` is a derived-class instance
     /// whose `this` is still in the constructor TDZ (its `super()` has not yet
     /// completed). Emitted before `this` reads and super-property references in
     /// a derived class constructor (and in arrows lexically inside one).
-    ThisCheck { src: Reg },
+    ThisCheck {
+        src: Reg,
+    },
     /// `dst = yield val` — suspend the current generator, handing `val` out as
     /// the yielded value. On resume the value passed to `.next(v)` lands in `dst`.
-    Yield { dst: Reg, val: Reg },
+    Yield {
+        dst: Reg,
+        val: Reg,
+    },
     /// Suspension point for an ASYNC `yield*` delegation step: hands `val` out like
     /// `Yield`. On resume the driver delivers the resume MODE into `mode_dst`
     /// (0 = next, 2 = return) and the value into `val_dst`, so the yield* loop forwards
     /// next/return to the inner iterator. A `.throw()` instead unwinds to the loop's
     /// surrounding handler (it does not resume here). Distinct op so the async-gen
     /// driver recognises a delegating suspension.
-    AsyncYieldDelegate { mode_dst: Reg, val_dst: Reg, val: Reg },
+    AsyncYieldDelegate {
+        mode_dst: Reg,
+        val_dst: Reg,
+        val: Reg,
+    },
     /// `RequireObject(val)` — throw a TypeError if `val` is not an Object. Used after
     /// awaiting an async iterator's `next()` result (the iterator-result must be an
     /// Object per the spec; a non-object result is a TypeError, NOT a thenable).
-    RequireObject { val: Reg },
+    RequireObject {
+        val: Reg,
+    },
     /// One async `yield*` THROW-delegation step: `dst = iter.throw(exc)`. Looks up the
     /// inner iterator's `throw`; if it is absent (undefined/null) or not callable,
     /// throws a TypeError (the spec's "iterator has no throw" case). Otherwise calls
     /// it with `exc` and writes the (to-be-awaited) result into `dst`.
-    AsyncIterThrowStep { dst: Reg, iter: Reg, exc: Reg },
+    AsyncIterThrowStep {
+        dst: Reg,
+        iter: Reg,
+        exc: Reg,
+    },
     /// One async `yield*` NEXT-delegation step: `dst = next_fn.call(iter, sent)`. Like
     /// `ForAwaitNext` but uses the `next` method CACHED once at GetIterator time
     /// (`next_fn`) — the spec's IteratorRecord.[[NextMethod]] is not re-read each step —
     /// and forwards `sent` (the value passed to the OUTER generator's `.next(v)`) so a
     /// delegated iterator observes it (and `arguments.length === 1`). A built-in
     /// generator/positional source ignores `next_fn` (cursor via `idx`).
-    AsyncIterNextStep { dst: Reg, iter: Reg, idx: Reg, sent: Reg, next_fn: Reg },
+    AsyncIterNextStep {
+        dst: Reg,
+        iter: Reg,
+        idx: Reg,
+        sent: Reg,
+        next_fn: Reg,
+    },
     /// One async `yield*` RETURN-delegation step. Looks up the inner iterator's
     /// `return`: if absent (undefined/null), sets `has_dst` to false (the yield* loop
     /// then makes the OUTER generator return `ret`); otherwise calls it with `ret`,
     /// sets `has_dst` true and writes the (to-be-awaited) result into `dst`.
-    AsyncIterReturnStep { dst: Reg, has_dst: Reg, iter: Reg, ret: Reg },
+    AsyncIterReturnStep {
+        dst: Reg,
+        has_dst: Reg,
+        iter: Reg,
+        ret: Reg,
+    },
     /// `yield*` suspension point: yield `val` like `Yield`, but on resume DELIVER
     /// the resume MODE (0 = next, 1 = throw, 2 = return) into `mode_dst` and the
     /// resume value into `val_dst` — instead of `Yield`'s in-body throw/return
     /// injection — so the `yield*` loop can forward it to the inner iterator's
     /// next/throw/return. Only emitted for a SYNC `yield*` (see `IterDelegate`).
-    YieldDelegate { mode_dst: Reg, val_dst: Reg, val: Reg },
+    YieldDelegate {
+        mode_dst: Reg,
+        val_dst: Reg,
+        val: Reg,
+    },
     /// One step of `yield*` delegation: drive `iter` per the resume `mode` (0 next /
     /// 1 throw / 2 return) with argument `sent`, applying the spec's missing-method
     /// rules (throw with no `throw` → IteratorClose + TypeError; return with no
@@ -339,7 +625,14 @@ pub enum Instr {
     /// `value_dst` and two booleans: `done_dst` true ⇒ the `yield*` expression
     /// completes with `value_dst`; `ret_dst` true ⇒ the generator must RETURN
     /// `value_dst`. Both false ⇒ yield `value_dst` (via `YieldDelegate`).
-    IterDelegate { value_dst: Reg, done_dst: Reg, ret_dst: Reg, iter: Reg, mode: Reg, sent: Reg },
+    IterDelegate {
+        value_dst: Reg,
+        done_dst: Reg,
+        ret_dst: Reg,
+        iter: Reg,
+        mode: Reg,
+        sent: Reg,
+    },
     /// Generator body entry marker — emitted for a (sync) generator right after the
     /// parameter prologue (defaults + destructuring). FunctionDeclarationInstantiation
     /// runs eagerly at call time (so a destructuring throw or default side-effect
@@ -350,7 +643,10 @@ pub enum Instr {
     /// `dst = await val` — suspend the async activation on the awaited value's
     /// promise; on resume the settled value lands in `dst` (a rejection is thrown
     /// in at this point so an enclosing `try`/`catch` sees it).
-    Await { dst: Reg, val: Reg },
+    Await {
+        dst: Reg,
+        val: Reg,
+    },
     /// for-of step: advance over `iter` (array/string/Map/Set positionally with
     /// the cursor in `idx`, or a generator via `.next()` ignoring `idx`). Writes
     /// the next element to `value_dst` and a bool to `done_dst`. Throws if `iter`
@@ -360,25 +656,40 @@ pub enum Instr {
     /// observed (spec: the iterator record snapshots it). `Reg::MAX` = no
     /// cache (destructuring sites): a user-object iterator's `next` is
     /// re-fetched per step there.
-    IterNext { value_dst: Reg, done_dst: Reg, iter: Reg, idx: Reg, next: Reg },
+    IterNext {
+        value_dst: Reg,
+        done_dst: Reg,
+        iter: Reg,
+        idx: Reg,
+        next: Reg,
+    },
     /// Cache a USER-OBJECT iterator's `next` method into `dst` for the loop's
     /// `IterNext` steps (one observable Get, per GetIterator). Built-in fast
     /// iterables (array/string/Map/Set/generator) skip the get — `dst` is
     /// undefined and the cursor fast path is unaffected.
-    IterPrime { dst: Reg, iter: Reg },
+    IterPrime {
+        dst: Reg,
+        iter: Reg,
+    },
     /// IteratorClose: invoke `iter`'s `return()` (if present) — emitted on the
     /// abrupt `break` exit of a `for-of` so a not-yet-exhausted iterator is closed.
-    IterClose { iter: Reg },
+    IterClose {
+        iter: Reg,
+    },
     /// GetIterator's type check, split out for destructuring: TypeError when
     /// `src` has no usable iterator (primitives without @@iterator, plain
     /// objects whose @@iterator is not callable). Built-ins with positional
     /// iteration (Array/String/Map/Set/TypedArray/arguments) pass.
-    CheckIterable { src: Reg },
+    CheckIterable {
+        src: Reg,
+    },
     /// IteratorClose in an ERROR context: invoke `iter`'s `return()` (if present)
     /// but SWALLOW any error it throws and skip the result-is-object check, so a
     /// throw/return out of a `for-of` body closes the iterator while preserving the
     /// original abrupt completion (the spec's `Completion(...)` discard of the close result).
-    IterCloseQuiet { iter: Reg },
+    IterCloseQuiet {
+        iter: Reg,
+    },
     /// The body of a `for-of`'s close handler, keyed on the completion record the
     /// finally machinery deposited in `kind_reg`: a THROW completion (2) closes
     /// quietly (the original error wins), a RETURN completion (1) closes for real
@@ -389,29 +700,52 @@ pub enum Instr {
     /// it AFTER the body's own handlers (7.4.11 runs it as the for-of statement's
     /// completion, outside any `try` in the body) and what makes `gen.return()` at
     /// a `yield` inside the loop close the loop's iterator at all.
-    IterCloseFinally { iter: Reg, kind_reg: Reg },
+    IterCloseFinally {
+        iter: Reg,
+        kind_reg: Reg,
+    },
     /// Resolve `src`'s ASYNC iterator into `dst`: `src[@@asyncIterator]()` if
     /// present, else `src[@@iterator]()` (a sync iterable used by `for await`),
     /// else pass `src` through (async generators / built-ins iterate directly).
-    GetAsyncIterator { dst: Reg, src: Reg, sync_dst: Reg },
+    GetAsyncIterator {
+        dst: Reg,
+        src: Reg,
+        sync_dst: Reg,
+    },
     /// `for await` step: writes the next RESULT to `dst` — a Promise (async
     /// iterator / async generator), or a `{value, done}` object (sync iterable,
     /// positional via the `idx` cursor). The loop then `await`s `dst`, so a sync
     /// `{value,done}` passes straight through and an async one suspends.
-    ForAwaitNext { dst: Reg, iter: Reg, idx: Reg },
+    ForAwaitNext {
+        dst: Reg,
+        iter: Reg,
+        idx: Reg,
+    },
     /// `dst = GetSuperConstructor()` for a `super(...)` call — fetched BEFORE the
     /// argument list is evaluated (spec SuperCall order: GetNewTarget,
     /// GetSuperConstructor, ArgumentListEvaluation, THEN IsConstructor check).
     /// No constructor-ness check here; SuperCtor/SuperCtorSpread do that after
     /// their args ran (call-proto-not-ctor, staging/sm/class/superCallOrder).
-    SuperCtorFetch { dst: Reg, home_class_id: u32 },
+    SuperCtorFetch {
+        dst: Reg,
+        home_class_id: u32,
+    },
     /// `super(args…)`: run the fetched superclass constructor (`ctor` — the
     /// register a SuperCtorFetch filled before the args were evaluated) on the
     /// current `this` (reg 0). IsConstructor is checked HERE, after the args.
-    SuperCtor { ctor: Reg, home_class_id: u32, arg_base: Reg, argc: u16 },
+    SuperCtor {
+        ctor: Reg,
+        home_class_id: u32,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `super(...args_array)`: like SuperCtor but spreads the elements of the
     /// array in `args` (`super(...xs)` in a derived constructor).
-    SuperCtorSpread { ctor: Reg, home_class_id: u32, args: Reg },
+    SuperCtorSpread {
+        ctor: Reg,
+        home_class_id: u32,
+        args: Reg,
+    },
     /// `dst = GetSuperBase()` — the home object's LIVE [[Prototype]] for a
     /// `super` property reference in a method of class `home_class_id`. Captured
     /// into a register at MakeSuperPropertyReference time (BEFORE the call's
@@ -419,59 +753,131 @@ pub enum Instr {
     /// object's prototype, staging/sm/class/superPropOrdering); the
     /// SuperMethod/SuperSet consumers read it from `base` instead of
     /// re-resolving. May be UNDEFINED/null — consumers RequireObjectCoercible.
-    SuperBase { dst: Reg, home_class_id: u32 },
+    SuperBase {
+        dst: Reg,
+        home_class_id: u32,
+    },
     /// `dst = super.<name>(args…)`: call the named method found from the
     /// captured super base (`base`, a SuperBase register) up its chain, with
     /// `this` = the current frame's `this` (reg 0).
-    SuperMethod { dst: Reg, base: Reg, home_class_id: u32, name: u32, arg_base: Reg, argc: u16 },
+    SuperMethod {
+        dst: Reg,
+        base: Reg,
+        home_class_id: u32,
+        name: u32,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = super.<name>`: read an inherited property (method value, or a getter
     /// invoked with `this` = the current frame's `this`) via the superclass's
     /// prototype.
-    SuperGet { dst: Reg, home_class_id: u32, name: u32 },
+    SuperGet {
+        dst: Reg,
+        home_class_id: u32,
+        name: u32,
+    },
     /// `dst = super[key]`: computed form of SuperGet (`key` is a register).
-    SuperGetComputed { dst: Reg, home_class_id: u32, key: Reg },
+    SuperGetComputed {
+        dst: Reg,
+        home_class_id: u32,
+        key: Reg,
+    },
     /// `dst = super[key](args…)`: computed form of SuperMethod.
-    SuperMethodComputed { dst: Reg, base: Reg, home_class_id: u32, key: Reg, arg_base: Reg, argc: u16 },
+    SuperMethodComputed {
+        dst: Reg,
+        base: Reg,
+        home_class_id: u32,
+        key: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `super.<name> = val`: if the captured super base's (`base`) prototype
     /// chain has an inherited setter, invoke it with `this` = the current
     /// receiver; otherwise create an own property on the receiver.
-    SuperSet { base: Reg, home_class_id: u32, name: u32, val: Reg },
+    SuperSet {
+        base: Reg,
+        home_class_id: u32,
+        name: u32,
+        val: Reg,
+    },
     /// `super[key] = val`: computed form of SuperSet (`key` is a register).
-    SuperSetComputed { base: Reg, home_class_id: u32, key: Reg, val: Reg },
+    SuperSetComputed {
+        base: Reg,
+        home_class_id: u32,
+        key: Reg,
+        val: Reg,
+    },
     /// Set the `[[HomeObject]]` of an OBJECT-LITERAL method/accessor closure `method`
     /// to `home` (the object being built), so `super.x` inside it resolves via
     /// GetPrototypeOf(home). Emitted by the object-literal codegen for concise
     /// methods and get/set accessors.
-    SetHomeObject { method: Reg, home: Reg },
+    SetHomeObject {
+        method: Reg,
+        home: Reg,
+    },
     /// `dst = super.name` inside an OBJECT method: resolve on GetPrototypeOf the
     /// executing closure's `[[HomeObject]]`, with `this` = the current receiver.
-    SuperGetObj { dst: Reg, name: u32 },
+    SuperGetObj {
+        dst: Reg,
+        name: u32,
+    },
     /// `dst = super[key]` inside an object method (computed form).
-    SuperGetObjComputed { dst: Reg, key: Reg },
+    SuperGetObjComputed {
+        dst: Reg,
+        key: Reg,
+    },
     /// `super.name = val` inside an object method.
-    SuperSetObj { name: u32, val: Reg },
+    SuperSetObj {
+        name: u32,
+        val: Reg,
+    },
     /// `super[key] = val` inside an object method (computed form).
-    SuperSetObjComputed { key: Reg, val: Reg },
+    SuperSetObjComputed {
+        key: Reg,
+        val: Reg,
+    },
     /// `dst = super.name(args…)` inside an OBJECT method: resolve `name` on
     /// GetPrototypeOf the executing closure's [[HomeObject]], call it with
     /// `this` = the current receiver.
-    SuperMethodObj { dst: Reg, name: u32, arg_base: Reg, argc: u16 },
+    SuperMethodObj {
+        dst: Reg,
+        name: u32,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = super[key](args…)` inside an object method (computed form).
-    SuperMethodObjComputed { dst: Reg, key: Reg, arg_base: Reg, argc: u16 },
+    SuperMethodObjComputed {
+        dst: Reg,
+        key: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = new callee(args…)` — construct an instance. `callee` must be a
     /// class value; builds an object, installs the methods, runs the ctor.
-    New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
+    New {
+        dst: Reg,
+        callee: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// Append a computed instance-field KEY (already evaluated into `key`) to the
     /// class value `class`'s `computed_field_keys`, at class-definition time and
     /// in source order. Read later by `FieldInit`.
-    PushFieldKey { class: Reg, key: Reg },
+    PushFieldKey {
+        class: Reg,
+        key: Reg,
+    },
     /// `this[key] = val` for the `key_index`-th computed instance field, run in a
     /// constructor: looks up the key from `class_id`'s runtime class value's
     /// `computed_field_keys` (eval-once at class definition) and assigns —
     /// resolved by the EXECUTING class, not `this`'s class, because a parent
     /// constructor's return-override makes `this` a foreign object.
     /// `class_id == u32::MAX` falls back to `this`'s class. `this` is reg 0.
-    FieldInit { key_index: u16, val: Reg, class_id: u32 },
+    FieldInit {
+        key_index: u16,
+        val: Reg,
+        class_id: u32,
+    },
     /// AsyncFromSyncIteratorContinuation(step): from a SYNC iterator's raw
     /// `{value, done}` result, build the spec's capability promise that
     /// resolves to `{ value: await value, done }`. Runs in ordinary dispatch
@@ -481,99 +887,218 @@ pub enum Instr {
     /// the SYNC iterator (the record's [[Iterator]]): with done == false it is
     /// closed when PromiseResolve aborts or the awaited value rejects
     /// (closeOnRejection — spec steps 7 and 13), before the capability rejects.
-    AsyncFromSyncStep { dst: Reg, step: Reg, iter: Reg },
+    AsyncFromSyncStep {
+        dst: Reg,
+        step: Reg,
+        iter: Reg,
+    },
     /// `dst = Array(args…)` / `new Array(args…)`: a single numeric arg makes an
     /// array of that length (holes → undefined); otherwise an array of the args.
-    ArrayCtor { dst: Reg, arg_base: Reg, argc: u16 },
+    ArrayCtor {
+        dst: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = new Map(src?)` — build a Map from an optional iterable of [k,v]
     /// entries (`src` register, or `None` for an empty map).
-    NewMap { dst: Reg, src: Option<Reg> },
+    NewMap {
+        dst: Reg,
+        src: Option<Reg>,
+    },
     /// `dst = new Set(src?)` — build a Set from an optional iterable of values.
-    NewSet { dst: Reg, src: Option<Reg> },
+    NewSet {
+        dst: Reg,
+        src: Option<Reg>,
+    },
     /// `dst = new WeakMap(src?)` / `new WeakSet(src?)` — like NewMap/NewSet but a
     /// distinct WeakMap/WeakSet type, and keys/values must be objects.
-    NewWeakMap { dst: Reg, src: Option<Reg> },
-    NewWeakSet { dst: Reg, src: Option<Reg> },
+    NewWeakMap {
+        dst: Reg,
+        src: Option<Reg>,
+    },
+    NewWeakSet {
+        dst: Reg,
+        src: Option<Reg>,
+    },
     /// `dst = new WeakRef(target)` — target must be an object.
-    NewWeakRef { dst: Reg, target: Reg },
+    NewWeakRef {
+        dst: Reg,
+        target: Reg,
+    },
     /// `dst = new String/Number/Boolean(arg?)` — a boxed primitive wrapper.
     /// `kind` 0=String/1=Number/2=Boolean; `arg` is the (optional) argument register.
-    NewBox { dst: Reg, kind: u8, arg: Option<Reg> },
+    NewBox {
+        dst: Reg,
+        kind: u8,
+        arg: Option<Reg>,
+    },
     /// `dst = new FinalizationRegistry(cleanupCallback)` — callback must be callable.
-    NewFinalizationRegistry { dst: Reg, cleanup: Reg },
+    NewFinalizationRegistry {
+        dst: Reg,
+        cleanup: Reg,
+    },
     /// `dst = new Promise(executor)` — alloc a pending promise, call `executor`
     /// with its (resolve, reject) functions; a throwing executor rejects it.
-    NewPromise { dst: Reg, executor: Reg },
+    NewPromise {
+        dst: Reg,
+        executor: Reg,
+    },
     /// `dst = callee(...args_array)` — call `callee` (a function value) spreading
     /// the elements of the array in `args` as the arguments (`this` = undefined).
-    CallSpread { dst: Reg, callee: Reg, args: Reg },
+    CallSpread {
+        dst: Reg,
+        callee: Reg,
+        args: Reg,
+    },
     /// `dst = obj[name](...args_array)` — method call spreading the elements of
     /// the array in `args` (`this` = obj). Handles builtin methods (e.g.
     /// `arr.push(...xs)`) and user methods alike.
-    CallMethodSpread { dst: Reg, obj: Reg, name: u32, args: Reg },
+    CallMethodSpread {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+        args: Reg,
+    },
     /// `dst = obj[key](...args_array)` — computed-member method call spreading the
     /// elements of `args` (`this` = obj). The computed-key analogue of
     /// `CallMethodSpread` (binds `this`, unlike `CallSpread` on the GET result).
-    CallMethodComputedSpread { dst: Reg, obj: Reg, key: Reg, args: Reg },
+    CallMethodComputedSpread {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+        args: Reg,
+    },
     /// `dst = super.name(...args_array)` — super method call spreading the elements
     /// of `args` (`this` = the current receiver). The spread analogue of SuperMethod.
-    SuperMethodSpread { dst: Reg, home_class_id: u32, name: u32, args: Reg },
+    SuperMethodSpread {
+        dst: Reg,
+        home_class_id: u32,
+        name: u32,
+        args: Reg,
+    },
     /// `super[key](...args_array)`: computed form of SuperMethodSpread.
-    SuperMethodComputedSpread { dst: Reg, home_class_id: u32, key: Reg, args: Reg },
+    SuperMethodComputedSpread {
+        dst: Reg,
+        home_class_id: u32,
+        key: Reg,
+        args: Reg,
+    },
     /// `dst = new callee(...args_array)` — construct `callee` spreading the
     /// elements of the array in `args` as the arguments.
-    NewSpread { dst: Reg, callee: Reg, args: Reg },
+    NewSpread {
+        dst: Reg,
+        callee: Reg,
+        args: Reg,
+    },
     /// `dst = Math.<op>(args…)` — a builtin Math function over `argc` contiguous
     /// argument registers starting at `arg_base`.
-    MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },
+    MathOp {
+        dst: Reg,
+        op: MathFn,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = <Number|parseInt|parseFloat>(args…)` — a builtin global function.
-    GlobalFn { dst: Reg, op: GlobalFn, arg_base: Reg, argc: u16 },
+    GlobalFn {
+        dst: Reg,
+        op: GlobalFn,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = <static builtin>(args…)` — a constructor-namespace static method
     /// over `argc` contiguous arg registers (Object.assign, Array.of,
     /// String.fromCharCode, Number.isInteger/isNaN/isFinite/isSafeInteger).
-    StaticFn { dst: Reg, op: StaticFn, arg_base: Reg, argc: u16 },
+    StaticFn {
+        dst: Reg,
+        op: StaticFn,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = Array.from(src[, mapfn])`. `mapfn` is a function value, or
     /// undefined-in-register when absent (the compiler loads undefined there).
-    ArrayFrom { dst: Reg, src: Reg, mapfn: Reg },
+    ArrayFrom {
+        dst: Reg,
+        src: Reg,
+        mapfn: Reg,
+    },
     /// `dst = Math.<op>(...arr)` — a variadic Math reduction (max/min/hypot)
     /// applied to the elements of the array in `args`.
-    MathSpread { dst: Reg, op: MathFn, args: Reg },
+    MathSpread {
+        dst: Reg,
+        op: MathFn,
+        args: Reg,
+    },
     /// `dst = (val instanceof <ctor>)` for a built-in constructor (Array, Object,
     /// Function, Error and its subclasses). User constructors are out of scope.
-    InstanceOf { dst: Reg, val: Reg, ctor: InstanceCtor },
+    InstanceOf {
+        dst: Reg,
+        val: Reg,
+        ctor: InstanceCtor,
+    },
     /// `dst = (val instanceof ctor)` where `ctor` is a runtime class value: true
     /// when `val` is an instance whose class is `ctor`.
-    InstanceOfDyn { dst: Reg, val: Reg, ctor: Reg },
+    InstanceOfDyn {
+        dst: Reg,
+        val: Reg,
+        ctor: Reg,
+    },
     /// `dst = (key in obj)` — true when `obj` has the property `key` (own or, for
     /// a class instance, inherited; array indices / `length`; Map/Set `size`).
     /// `brand` is set ONLY for the ergonomic private brand check `#x in obj` (whose
     /// key is the reserved `#x` string): it bypasses the private-key reflection
     /// filter that a regular `in` applies, so `#x in obj` sees the private element
     /// while `'#x' in obj` does not.
-    HasProp { dst: Reg, key: Reg, obj: Reg, brand: bool },
+    HasProp {
+        dst: Reg,
+        key: Reg,
+        obj: Reg,
+        brand: bool,
+    },
     /// `dst = bool` — a `with`-statement binding probe: true iff `obj` has the
     /// property `name` (own or inherited, [[HasProperty]]) AND it is not blocked
     /// by `obj[@@unscopables]` (an own/inherited unscopables object whose `name`
     /// entry is truthy hides the binding). Drives `with`-body identifier
     /// resolution: a true result routes the read/write to `obj`, false falls
     /// back to the next with-object or the lexical/global binding.
-    WithHas { dst: Reg, obj: Reg, name: u32 },
+    WithHas {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+    },
     /// GetBindingValue for a `with` binding AFTER `WithHas` reported it: the
     /// read RE-checks [[HasProperty]] (the WithHas @@unscopables getter may
     /// have DELETED the property) — a miss yields undefined for a sloppy
     /// reference site and a ReferenceError for a strict one (8.1.1.2.6).
-    WithGet { dst: Reg, obj: Reg, name: u32, strict: bool },
+    WithGet {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+        strict: bool,
+    },
     /// SetMutableBinding counterpart of `WithGet`: re-HasProperty, a strict
     /// reference site throws on a vanished binding, a sloppy one re-creates
     /// the property via the ordinary [[Set]].
-    WithSet { obj: Reg, name: u32, val: Reg, strict: bool },
+    WithSet {
+        obj: Reg,
+        name: u32,
+        val: Reg,
+        strict: bool,
+    },
 
     // ── control flow (targets are instruction indices) ──
-    Jump { target: u32 },
+    Jump {
+        target: u32,
+    },
     /// Jump if `cond` is falsy.
-    JumpIfFalse { cond: Reg, target: u32 },
+    JumpIfFalse {
+        cond: Reg,
+        target: u32,
+    },
     /// Jump if `cond` is truthy.
-    JumpIfTrue { cond: Reg, target: u32 },
+    JumpIfTrue {
+        cond: Reg,
+        target: u32,
+    },
 
     /// Fused compare-and-branch: `if !(a < b) goto target`. Keeps the common
     /// loop/recursion guard in one instruction so the boolean never has to be
@@ -582,41 +1107,65 @@ pub enum Instr {
     /// the op carries no operand-swap flag, so a fused `>`/`>=` would reorder
     /// the two ToPrimitive coercions. `ZIPP_NO_FUSED_CMPJUMP=1` restores the
     /// unfused `Lt`/`Le` + `JumpIfFalse` pair.
-    JumpIfNotLt { a: Reg, b: Reg, target: u32 },
-    JumpIfNotLe { a: Reg, b: Reg, target: u32 },
+    JumpIfNotLt {
+        a: Reg,
+        b: Reg,
+        target: u32,
+    },
+    JumpIfNotLe {
+        a: Reg,
+        b: Reg,
+        target: u32,
+    },
 
     // ── reference types ──
     /// `dst = <function object for functions[func_id]>`. Capture-free: used for
     /// functions that reference no enclosing variables.
-    MakeFunc { dst: Reg, func_id: u32 },
+    MakeFunc {
+        dst: Reg,
+        func_id: u32,
+    },
     /// `dst = <closure over functions[func_id]>` capturing upvalue cells named
     /// by `functions[func_id].upvalues`. Each upvalue source is resolved in the
     /// CURRENT (defining) frame: either a local register that holds a cell, or
     /// one of the current frame's own upvalues (for nested-of-nested capture).
-    MakeClosure { dst: Reg, func_id: u32 },
+    MakeClosure {
+        dst: Reg,
+        func_id: u32,
+    },
 
     /// Like `MakeClosure`, but for an ARROW function: the closure also captures
     /// the defining frame's effective `this` from register `this_reg` (the
     /// `this_override.unwrap_or(0)` at the definition site) into the closure, so
     /// a later call binds it lexically (see `FuncProto::lexical_this`). Always
     /// used for arrows (even with no upvalues) since `MakeFunc` has no `this` slot.
-    MakeArrow { dst: Reg, func_id: u32, this_reg: Reg },
+    MakeArrow {
+        dst: Reg,
+        func_id: u32,
+        this_reg: Reg,
+    },
 
     /// Box the value currently in `reg` into a fresh heap Cell and write the
     /// cell reference back into `reg`. Emitted for a captured local/param so
     /// later reads/writes go through the shared cell.
-    MakeCell { reg: Reg },
+    MakeCell {
+        reg: Reg,
+    },
     /// Like `MakeCell` but the fresh Cell holds the UNINITIALIZED (TDZ) sentinel
     /// regardless of `reg`'s value. Emitted at function entry for a captured
     /// lexical (`let`/`const`/`class`) that a forward-referenced function may
     /// capture: a `CellGet`/`UpvalGet` before the binding's textual declaration
     /// runs (its TDZ) then throws a ReferenceError instead of reading undefined.
-    MakeCellTdz { reg: Reg },
+    MakeCellTdz {
+        reg: Reg,
+    },
     /// Like `MakeCell` but the cell is tagged IMMUTABLE — a named function
     /// expression's own-name binding. A nested closure's / eval's write
     /// through it (UpvalSet / StoreUpvalDyn) is a silent no-op in sloppy code
     /// and a TypeError in strict code.
-    MakeCellFnName { reg: Reg },
+    MakeCellFnName {
+        reg: Reg,
+    },
     /// Tag the cell already in `reg` IMMUTABLE — a `const`/`using` binding that a
     /// nested closure captures. Emitted after the declaration's initializing
     /// store (a per-iteration loop binding re-tags its fresh cell each turn),
@@ -624,42 +1173,79 @@ pub enum Instr {
     /// and only writes THROUGH the closure (UpvalSet / StoreUpvalDyn) need the
     /// runtime check. Unlike `MakeCellFnName`, the write always throws a
     /// TypeError — sloppy code does not get a silent no-op for `const`.
-    MarkCellConst { reg: Reg },
+    MarkCellConst {
+        reg: Reg,
+    },
     /// `dst = *<cell in reg>` — read a captured local's cell.
-    CellGet { dst: Reg, cell: Reg },
+    CellGet {
+        dst: Reg,
+        cell: Reg,
+    },
     /// `*<cell in reg> = src` — write a captured local's cell.
-    CellSet { cell: Reg, src: Reg },
+    CellSet {
+        cell: Reg,
+        src: Reg,
+    },
     /// Like `CellSet` but the target is a lexical (`let`/`const`) cell that may
     /// still be in its TDZ: writing while the cell holds UNINITIALIZED throws a
     /// ReferenceError (an ASSIGNMENT before the declaration runs). The
     /// declaration's own initializing store uses plain `CellSet`.
-    CellSetChecked { cell: Reg, src: Reg },
+    CellSetChecked {
+        cell: Reg,
+        src: Reg,
+    },
     /// `dst = *<upvalue[idx]>` — read one of this closure's captured cells.
-    UpvalGet { dst: Reg, idx: u16 },
+    UpvalGet {
+        dst: Reg,
+        idx: u16,
+    },
     /// `*<upvalue[idx]> = src` — write one of this closure's captured cells.
-    UpvalSet { idx: u16, src: Reg },
+    UpvalSet {
+        idx: u16,
+        src: Reg,
+    },
     /// EvalScope-first upvalue access for a sloppy contains-direct-eval
     /// function: the eval may have introduced a function-scoped `var`
     /// SHADOWING the captured name — that binding (looked up via the `name`
     /// global-slot handle) wins over the captured cell.
-    LoadUpvalDyn { dst: Reg, idx: u16, name: u32 },
-    StoreUpvalDyn { idx: u16, src: Reg, name: u32 },
+    LoadUpvalDyn {
+        dst: Reg,
+        idx: u16,
+        name: u32,
+    },
+    StoreUpvalDyn {
+        idx: u16,
+        src: Reg,
+        name: u32,
+    },
     /// `dst = [reg[arg_base], …, reg[arg_base+argc-1]]` — array literal.
-    NewArray { dst: Reg, arg_base: Reg, argc: u16 },
+    NewArray {
+        dst: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = {}` — empty object (populated by following SetProp/SetIndex).
     /// `{}` — a fresh ordinary object. `hint` is the number of static data
     /// properties the literal will append, so the property vectors can be sized
     /// once instead of regrowing (0 when unknown). Purely an allocation hint; it
     /// changes nothing observable.
-    NewObject { dst: Reg, hint: u16 },
+    NewObject {
+        dst: Reg,
+        hint: u16,
+    },
     /// `dst = ToObject(src)` — `Object(x)` / `new Object(x)`: primitives box
     /// (string/number/boolean/symbol/bigint wrappers), null/undefined → a fresh
     /// object, and an existing object is returned unchanged.
-    ToObject { dst: Reg, src: Reg },
+    ToObject {
+        dst: Reg,
+        src: Reg,
+    },
     /// RequireObjectCoercible(src): throw a TypeError if `src` is null/undefined,
     /// otherwise a no-op. Emitted for an EMPTY object destructuring pattern
     /// (`var {} = x`) — a non-empty pattern already throws via member access.
-    CheckCoercible { src: Reg },
+    CheckCoercible {
+        src: Reg,
+    },
     /// `dst = new <Error subtype>(arg?, opts?)` — a proto-linked error instance.
     /// `kind` indexes the canonical error list (0=Error, 1=TypeError, …,
     /// 7=AggregateError); `arg` (when present) is coerced to the `message` string.
@@ -667,51 +1253,101 @@ pub enum Instr {
     /// non-enumerable own `cause` is installed (ES2022 InstallErrorCause).
     /// `errors` (AggregateError only) is the first argument — IterableToList'd into
     /// a non-enumerable own `errors` array AFTER the message is coerced.
-    NewError { dst: Reg, kind: u8, arg: Option<Reg>, opts: Option<Reg>, errors: Option<Reg> },
+    NewError {
+        dst: Reg,
+        kind: u8,
+        arg: Option<Reg>,
+        opts: Option<Reg>,
+        errors: Option<Reg>,
+    },
     /// `dst = Symbol(desc?)` — a fresh unique Symbol primitive. `desc` (when present)
     /// is coerced to a string description (undefined → no description).
-    MakeSymbol { dst: Reg, desc: Option<Reg> },
+    MakeSymbol {
+        dst: Reg,
+        desc: Option<Reg>,
+    },
     /// `dst = <BigInt literal>` (`123n`) — allocate a BigInt with the given value.
-    LoadBigInt { dst: Reg, value: i128 },
+    LoadBigInt {
+        dst: Reg,
+        value: i128,
+    },
     /// `dst = <BigInt literal beyond i128>` — allocate an arbitrary-precision
     /// BigInt from the function's `bigint_consts[idx]` (parsed at compile time).
-    LoadBigIntBig { dst: Reg, idx: u32 },
+    LoadBigIntBig {
+        dst: Reg,
+        idx: u32,
+    },
     /// `dst = BigInt(arg)` — convert a number/string/boolean/BigInt to a BigInt
     /// (non-integer number → RangeError; symbol/null/undefined → TypeError).
-    BigIntFrom { dst: Reg, arg: Reg },
+    BigIntFrom {
+        dst: Reg,
+        arg: Reg,
+    },
     /// `dst = new RegExp(pattern, flags)` — compile a regex (`/pat/flags` literal
     /// and the constructor both lower here). `pattern`/`flags` are string regs;
     /// a bad pattern throws SyntaxError. `is_construct` is false ONLY for a
     /// `RegExp(...)` call WITHOUT `new`: then a RegExp pattern with no flags whose
     /// `constructor` is RegExp is returned unchanged (RegExp ctor step 2.b).
-    NewRegExp { dst: Reg, pattern: Reg, flags: Reg, is_construct: bool },
+    NewRegExp {
+        dst: Reg,
+        pattern: Reg,
+        flags: Reg,
+        is_construct: bool,
+    },
     /// `dst = <array of obj's own enumerable string keys>` — Object.keys backing.
     /// For an array, the keys are the index strings "0".."len-1".
-    ObjectKeys { dst: Reg, obj: Reg },
+    ObjectKeys {
+        dst: Reg,
+        obj: Reg,
+    },
     /// `dst = <for-in key list>` — own + INHERITED enumerable string keys, walking
     /// the [[Prototype]] chain with shadowing dedup (vs `ObjectKeys`, own-only).
     /// null/undefined receiver → empty (for-in over nullish does not throw).
-    ForInKeys { dst: Reg, obj: Reg },
-    /// `dst = <is the snapshotted for-in key still present on obj?>` — the
-    /// per-iteration liveness re-check of EnumerateObjectProperties: a key
-    /// deleted (or otherwise removed) after the `ForInKeys` snapshot but before
-    /// its visit is skipped. Uses the NON-observable own+prototype presence
-    /// check; a Proxy receiver stays snapshot-only (its `has` trap must NOT
-    /// fire — the spec'd protocol is ownKeys + per-key gopd, already applied by
-    /// the snapshot), as does a primitive.
-    ForInLive { dst: Reg, obj: Reg, key: Reg },
+    ForInKeys {
+        dst: Reg,
+        obj: Reg,
+    },
+    /// `dst = <is the snapshotted for-in key still present?>` — `obj` is the
+    /// engine-private `ForInKeys` Array whose prefix carries the receiver and
+    /// optional version guard. A key deleted (or otherwise removed) after the
+    /// snapshot but before its visit is skipped. Uses the NON-observable
+    /// own+prototype presence check; a Proxy receiver stays snapshot-only (its
+    /// `has` trap must NOT fire — the spec'd protocol is ownKeys + per-key gopd,
+    /// already applied by the snapshot), as does a primitive.
+    ForInLive {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+    },
     /// `dst = Object.values(obj)` — array of the object's own values (or array
     /// elements).
-    ObjectValues { dst: Reg, obj: Reg },
+    ObjectValues {
+        dst: Reg,
+        obj: Reg,
+    },
     /// `dst = Object.entries(obj)` — array of `[key, value]` pair arrays.
-    ObjectEntries { dst: Reg, obj: Reg },
+    ObjectEntries {
+        dst: Reg,
+        obj: Reg,
+    },
     /// `dst = <length of array/string in obj>` (0 for anything else). Used by
     /// the `for-of` desugaring's bound check.
-    LenOf { dst: Reg, obj: Reg },
+    LenOf {
+        dst: Reg,
+        obj: Reg,
+    },
     /// `dst = obj[key]` — computed member read (array element or object prop).
-    GetIndex { dst: Reg, obj: Reg, key: Reg },
+    GetIndex {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+    },
     /// `obj[key] = val` — computed member write.
-    SetIndex { obj: Reg, key: Reg, val: Reg },
+    SetIndex {
+        obj: Reg,
+        key: Reg,
+        val: Reg,
+    },
     /// `dst = obj[<string-const `name`> + key]` — fused computed read for the
     /// `obj["prefix" + i]` map-key idiom. `name` indexes `string_constants` (the
     /// literal prefix). When `key` is an int and `obj` is a plain object, the key
@@ -719,10 +1355,20 @@ pub enum Instr {
     /// throwaway heap string is allocated for the concat (the dominant cost of
     /// dictionary-churn loops). Any other operand shape falls back to a real
     /// `prefix + key` concat + `GetIndex` (semantically identical).
-    GetIndexConcat { dst: Reg, obj: Reg, name: u32, key: Reg },
+    GetIndexConcat {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+        key: Reg,
+    },
     /// `obj[<string-const `name`> + key] = val` — the `SetIndex` twin of
     /// `GetIndexConcat` (same no-alloc fast path; falls back to concat + `SetIndex`).
-    SetIndexConcat { obj: Reg, name: u32, key: Reg, val: Reg },
+    SetIndexConcat {
+        obj: Reg,
+        name: u32,
+        key: Reg,
+        val: Reg,
+    },
     /// `dst = the key half of `"name" + src`, coerced to a PRIMITIVE` — the
     /// evaluation-order shim that makes the fused WRITE (`SetIndexConcat` from
     /// a plain `obj["name" + e] = v`) sound. The `+`'s observable coercion
@@ -733,12 +1379,21 @@ pub enum Instr {
     /// code, so deferring it is unobservable, and an Int key keeps
     /// `set_index_concat`'s allocation-free scratch path); a non-string heap
     /// value runs the real protocol here.
-    ToConcatKey { dst: Reg, src: Reg },
+    ToConcatKey {
+        dst: Reg,
+        src: Reg,
+    },
     /// `dst = delete obj[<string-const `name`> + key]` — the `DeleteIndex` twin of
     /// `GetIndexConcat`: an int key on a plain object deletes by `&str` (no concat
     /// alloc — these allocs dominate dictionary-churn delete loops via GC
     /// pressure); other shapes fall back to concat + `DeleteIndex`.
-    DeleteIndexConcat { dst: Reg, obj: Reg, name: u32, key: Reg, strict: bool },
+    DeleteIndexConcat {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+        key: Reg,
+        strict: bool,
+    },
     /// `dst = import(spec)` — dynamic import. ToString the specifier and return a
     /// Promise. With no host module loader, a successfully-coerced specifier rejects
     /// with a TypeError; if the specifier's coercion throws, the Promise rejects
@@ -747,50 +1402,89 @@ pub enum Instr {
     /// non-undefined options rejects with a TypeError). `phase`: 0 = normal
     /// `import(x)`, 1 = `import.defer(x)`, 2 = `import.source(x)` (source phase is
     /// not available for a SourceTextModule → rejects with a SyntaxError).
-    ImportCall { dst: Reg, spec: Reg, phase: u8, opts: Option<Reg> },
+    ImportCall {
+        dst: Reg,
+        spec: Reg,
+        phase: u8,
+        opts: Option<Reg>,
+    },
     /// Define a STATIC class field with a computed key: ToPropertyKey(key) once,
     /// throw a TypeError if it is "prototype" (a static field may not be named
     /// `prototype` — it is a non-configurable own property of the constructor),
     /// then write the field on the class. Unlike `SetIndex`, the prototype check
     /// is unconditional (class bodies are strict regardless of the enclosing code).
-    ClassStaticField { class: Reg, key: Reg, val: Reg },
+    ClassStaticField {
+        class: Reg,
+        key: Reg,
+        val: Reg,
+    },
     /// `dst = ToPropertyKey(src)` for a read-modify-write of `obj[src]` (`o[k] += v`,
     /// `o[k]++`): coerce the computed key to a property key ONCE (invoking its
     /// `toString`/`valueOf`/@@toPrimitive) so the load and the store reuse it. `obj`
     /// is RequireObjectCoercible-checked FIRST — a null/undefined base throws a
     /// TypeError BEFORE the key's coercion runs (matching `obj[k]`'s evaluation order).
-    ToPropKey { dst: Reg, obj: Reg, src: Reg },
+    ToPropKey {
+        dst: Reg,
+        obj: Reg,
+        src: Reg,
+    },
     /// Define an accessor property in an object literal: `{ get key(){…} }` or
     /// `{ set key(v){…} }`. `func` is the getter/setter function; `is_setter`
     /// picks the half. Merges with an existing accessor for the same key (so a
     /// get + set pair on one key becomes a single get/set accessor).
-    DefineAccessor { obj: Reg, key: Reg, func: Reg, is_setter: bool },
+    DefineAccessor {
+        obj: Reg,
+        key: Reg,
+        func: Reg,
+        is_setter: bool,
+    },
     /// SetFunctionName(func, key, prefix) for an object-literal accessor / computed
     /// member whose name is only known at runtime: name = prefix + key-as-name
     /// (a Symbol key → "[description]" or "", else ToString(key)); `prefix` is
     /// 0=none, 1="get ", 2="set ". Written as a non-writable/non-enumerable/
     /// configurable own `name` (overriding the synthesized intrinsic).
-    SetFnNameFromKey { func: Reg, key: Reg, prefix: u8 },
+    SetFnNameFromKey {
+        func: Reg,
+        key: Reg,
+        prefix: u8,
+    },
     /// `dst = obj.<string_constants[name]>` — static property read
     /// (also resolves `.length` for arrays/strings).
-    GetProp { dst: Reg, obj: Reg, name: u32 },
+    GetProp {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+    },
     /// `obj.<string_constants[name]> = val` — static property write.
     /// `strict` forces PutValue strictness even when the enclosing FUNCTION is
     /// sloppy: the ClassTail regions (heritage, computed keys, static field
     /// initializers) are strict code compiled INLINE into the enclosing
     /// function, whose proto-level `is_strict` flag cannot see it. Strict
     /// protos keep `strict: false` here (the runtime ORs the func flag in).
-    SetProp { obj: Reg, name: u32, val: Reg, strict: bool },
+    SetProp {
+        obj: Reg,
+        name: u32,
+        val: Reg,
+        strict: bool,
+    },
     /// `obj.#name = val` — a PRIVATE field/element write (PrivateSet). Unlike
     /// SetProp it brand-checks first: if the private element is NOT present on
     /// `obj` (PrivateFieldFind/PrivateElementFind empty), throw a TypeError. Used
     /// for user `this.#x = v` (incl. as a destructuring target), NOT for the
     /// field-initializer add (that is AddPrivateField).
-    SetPrivate { obj: Reg, name: u32, val: Reg },
+    SetPrivate {
+        obj: Reg,
+        name: u32,
+        val: Reg,
+    },
     /// Define an own writable/enumerable/configurable data property directly on a
     /// fresh object — CreateDataProperty, NOT [[Set]]: used for object-literal data
     /// properties, which must ignore any inherited accessor / non-writable property.
-    InitDataProp { obj: Reg, name: u32, val: Reg },
+    InitDataProp {
+        obj: Reg,
+        name: u32,
+        val: Reg,
+    },
     /// `{ __proto__: v }` — the object-literal proto SPECIAL FORM (B.3.1): a direct
     /// `object.[[SetPrototypeOf]](v)` for an Object/null `v`, a no-op otherwise.
     /// Deliberately NOT a [[Set]] of the key: the literal form is "not influenced
@@ -798,7 +1492,10 @@ pub enum Instr {
     /// Object.prototype.__proto__` and ignores a replacement `set __proto__`
     /// accessor (staging/sm/extensions/mutable-proto-special-form.js). The target
     /// is the freshly built literal, so the change can never be rejected.
-    SetLiteralProto { obj: Reg, val: Reg },
+    SetLiteralProto {
+        obj: Reg,
+        val: Reg,
+    },
     /// `InitDataProp` for a key the COMPILER has proven is new: the Nth distinct
     /// static key of a literal with no spread, computed key, accessor or
     /// `__proto__:` before it. Appends without the existence probe that
@@ -806,45 +1503,86 @@ pub enum Instr {
     /// in its key count. No version bump is needed (nor done by `InitDataProp`):
     /// the object was created by the immediately preceding `NewObject`, so no
     /// inline cache can hold a slot for it yet.
-    AppendDataProp { obj: Reg, name: u32, val: Reg },
+    AppendDataProp {
+        obj: Reg,
+        name: u32,
+        val: Reg,
+    },
     /// CreateDataProperty with a COMPUTED key (already ToPropertyKey'd via
     /// `ToPropKey`) on an object literal: an ordinary own data property even
     /// for "__proto__" — only the textual `__proto__:` colon form sets the
     /// prototype.
-    InitDataPropDyn { obj: Reg, key: Reg, val: Reg },
+    InitDataPropDyn {
+        obj: Reg,
+        key: Reg,
+        val: Reg,
+    },
     /// `dst = delete obj.<string_constants[name]>` — remove an own property;
     /// `dst` is the boolean result (true unless the property is non-deletable).
     /// In strict mode a false result throws a TypeError instead.
-    DeleteProp { dst: Reg, obj: Reg, name: u32, strict: bool },
+    DeleteProp {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+        strict: bool,
+    },
     /// `dst = delete obj[key]` — computed property delete (strict: throw on false).
-    DeleteIndex { dst: Reg, obj: Reg, key: Reg, strict: bool },
+    DeleteIndex {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+        strict: bool,
+    },
     /// `dst = delete <global identifier>` (sloppy only). A DECLARED global —
     /// the program's `hoisted_globals`/`decl_globals`/`lexical_globals` slot
     /// lists — is non-configurable: yields `false`, binding untouched.
     /// Anything else (an implicitly-created `x = 1` global, a builtin, an
     /// eval-introduced var) is removed — the slot returns to the
     /// `UNINITIALIZED` never-declared sentinel — and yields `true`.
-    DeleteGlobal { dst: Reg, slot: u32 },
+    DeleteGlobal {
+        dst: Reg,
+        slot: u32,
+    },
 
     /// Proper-tail-call prefix (strict `return f(args)` in an unprotected
     /// context): when the callee is a PLAIN function/closure, REUSE the
     /// current frame (constant stack for tail recursion) and never fall
     /// through; any other callee falls through to the ordinary Call+Return
     /// the compiler emits right after.
-    TailCall { callee: Reg, arg_base: Reg, argc: u16 },
+    TailCall {
+        callee: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `TailCall` with an explicit `this` (register `this_v`): the tail-position
     /// form of a `with`-resolved identifier call (this = the with-object).
     /// Falls through to the `CallWithThis` emitted right after for non-plain
     /// callees.
-    TailCallWithThis { callee: Reg, this_v: Reg, arg_base: Reg, argc: u16 },
+    TailCallWithThis {
+        callee: Reg,
+        this_v: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// Call `callee` with `argc` arguments staged in registers
     /// `[arg_base, arg_base+argc)`. Result lands in `dst`.
-    Call { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
+    Call {
+        dst: Reg,
+        callee: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// Like `Call` but with an explicit `this` value (register `this_v`):
     /// a `with`-resolved identifier call binds `this` to the with-object
     /// (spec WithBaseObject) — the callee value was already fetched by the
     /// `WithGet` protocol, so no further property read happens here.
-    CallWithThis { dst: Reg, callee: Reg, this_v: Reg, arg_base: Reg, argc: u16 },
+    CallWithThis {
+        dst: Reg,
+        callee: Reg,
+        this_v: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
 
     /// `dst = eval(arg)` — a DIRECT eval call (the callee is the unshadowed global
     /// `eval` identifier) emitted only from STRICT-mode code, so the evaluated
@@ -857,7 +1595,9 @@ pub enum Instr {
     /// u32::MAX when the eval site has no class context.
     /// `import.meta` (module code): the per-program host meta object,
     /// lazily allocated by the VM (ordinary, extensible, null prototype).
-    ImportMeta { dst: Reg },
+    ImportMeta {
+        dst: Reg,
+    },
 
     /// `tail`: the call sits in a proper-tail-call RETURN position — when the
     /// runtime identity check finds `eval` REBOUND (an ordinary call of that
@@ -870,7 +1610,22 @@ pub enum Instr {
     /// binding, so the eval'd code sees it too. Decided by the compiler because
     /// only it knows the caller's scope chain — a method-body `let C` shadows
     /// the class name, an enclosing function's `C` does not.
-    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, derived_ctor: bool, class_name_ok: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool, site: u16, tail: bool },
+    DirectEval {
+        dst: Reg,
+        arg: Reg,
+        new_target_ok: bool,
+        this_reg: Reg,
+        home_class: u32,
+        super_static: bool,
+        derived_ctor: bool,
+        class_name_ok: bool,
+        ban_arguments: bool,
+        strict_caller: bool,
+        super_home_obj: bool,
+        var_env_is_global: bool,
+        site: u16,
+        tail: bool,
+    },
 
     /// `dst = (src IS the realm's %eval% intrinsic)`. Lets a call site whose
     /// callee reference is NAMED `eval` but does not resolve to the unshadowed
@@ -878,7 +1633,10 @@ pub enum Instr {
     /// still take the direct-eval path when the live value is %eval%
     /// (13.3.6.1 tests the reference's name and the callee VALUE, not where
     /// the binding lives).
-    IsEvalFn { dst: Reg, src: Reg },
+    IsEvalFn {
+        dst: Reg,
+        src: Reg,
+    },
 
     /// ResolveBinding for a strict `name = …` on a global the program does not
     /// declare, probed BEFORE the RHS evaluates (the compiler emits this ahead
@@ -892,27 +1650,50 @@ pub enum Instr {
     /// var), it is a builtin, or the global object's PROTO CHAIN has it. A
     /// property the RHS itself creates must NOT resolve the reference
     /// (`undeclared = (this.undeclared = 5)` still throws).
-    CheckGlobalResolvable { idx: u32 },
+    CheckGlobalResolvable {
+        idx: u32,
+    },
 
     /// CreateDataPropertyOrThrow for a class FIELD initializer: an own
     /// {writable, enumerable, configurable} data property on the receiver —
     /// never consults prototype setters; a Proxy receiver's defineProperty
     /// trap fires.
-    DefineField { obj: Reg, name: u32, val: Reg },
+    DefineField {
+        obj: Reg,
+        name: u32,
+        val: Reg,
+    },
 
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
-    CallMethod { dst: Reg, obj: Reg, name: u32, arg_base: Reg, argc: u16 },
+    CallMethod {
+        dst: Reg,
+        obj: Reg,
+        name: u32,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `dst = obj[key](args…)` — computed method call: resolve the method by the
     /// runtime `key`, then call it with `this` bound to `obj`.
-    CallMethodComputed { dst: Reg, obj: Reg, key: Reg, arg_base: Reg, argc: u16 },
+    CallMethodComputed {
+        dst: Reg,
+        obj: Reg,
+        key: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
 
     /// Throw the value in `src`. Unwinds to the nearest enclosing catch handler
     /// (in this or a caller frame), or aborts the program if none.
-    Throw { src: Reg },
+    Throw {
+        src: Reg,
+    },
     /// Push a try-handler: on a throw before the matching `PopHandler`, control
     /// jumps to `catch_target` with the thrown value placed in `catch_reg`.
-    PushHandler { catch_target: u32, catch_reg: Reg },
+    PushHandler {
+        catch_target: u32,
+        catch_reg: Reg,
+    },
     /// Pop the most recent try-handler (reached when the try block completes
     /// without throwing).
     PopHandler,
@@ -921,7 +1702,11 @@ pub enum Instr {
     /// completion — running the finally block at `target` with a completion record
     /// deposited into `kind_reg` (0 normal, 1 return, 2 throw) and `val_reg` (the
     /// return value / thrown reason).
-    PushFinally { target: u32, kind_reg: Reg, val_reg: Reg },
+    PushFinally {
+        target: u32,
+        kind_reg: Reg,
+        val_reg: Reg,
+    },
     /// Pop the most recent `finally` handler (the normal-completion path, just
     /// before falling into the finally block).
     PopFinally,
@@ -929,24 +1714,36 @@ pub enum Instr {
     /// re-leave a pending `return` (chaining through any outer finally), re-raise a
     /// pending throw, resume a pending `break`/`continue` jump (chaining through any
     /// intervening finally), or fall through on normal completion.
-    EndFinally { kind_reg: Reg, val_reg: Reg },
+    EndFinally {
+        kind_reg: Reg,
+        val_reg: Reg,
+    },
 
     // ── Explicit Resource Management (`using` declarations) ──
     /// Open a fresh per-block sync-disposal scope: allocate an empty disposer list
     /// in `using_resources` and store its id (as an int Value) in `dst`. The id
     /// lives in a register so it is saved/restored with the frame (generator-safe).
-    OpenUsingScope { dst: Reg },
+    OpenUsingScope {
+        dst: Reg,
+    },
     /// Register a `using` resource (CreateDisposableResource, sync hint): `val` is
     /// the already-bound initializer value; `scope` holds the enclosing scope id.
     /// null/undefined → add nothing; a non-object → TypeError; an object whose
     /// @@dispose is absent/null/non-callable → TypeError; otherwise push a
     /// disposer (the @@dispose method bound to the value) onto the scope's list.
-    RegisterDisposable { scope: Reg, val: Reg },
+    RegisterDisposable {
+        scope: Reg,
+        val: Reg,
+    },
     /// Finally-body op: take the `scope` id's disposer list, run it LIFO building a
     /// SuppressedError chain merged with the incoming completion in `kind_reg`/
     /// `val_reg` (kind&3==2 ⇒ already a throw); rewrite kind_reg/val_reg so the
     /// following `EndFinally` re-raises the merged completion.
-    DisposeScope { scope: Reg, kind_reg: Reg, val_reg: Reg },
+    DisposeScope {
+        scope: Reg,
+        kind_reg: Reg,
+        val_reg: Reg,
+    },
     /// Register an `await using` resource (CreateDisposableResource, ASYNC hint):
     /// like `RegisterDisposable` but the dispose method is `@@asyncDispose` (read
     /// FIRST, read once), falling back to `@@dispose` only when `@@asyncDispose` is
@@ -954,7 +1751,10 @@ pub enum Instr {
     /// null/undefined value still pushes an INERT record (a plain `undefined`) — so
     /// the disposal still performs one `Await` (the spec's async asymmetry), unlike
     /// sync where nullish adds nothing.
-    RegisterAsyncDisposable { scope: Reg, val: Reg },
+    RegisterAsyncDisposable {
+        scope: Reg,
+        val: Reg,
+    },
     /// Async-disposal step: pop the LAST (LIFO) entry of `scope`'s disposer list. If
     /// the list is empty, set `done` true. An inert `undefined` entry → `res` =
     /// undefined (nothing called). A real disposer (a bound `@@asyncDispose`/
@@ -962,62 +1762,112 @@ pub enum Instr {
     /// `res` for the caller to `Await`. The compiler emits this under a handler that
     /// spans the following `Await`, so a sync throw or an awaited rejection both
     /// route to the merge step.
-    AsyncDisposeNext { scope: Reg, res: Reg, done: Reg },
+    AsyncDisposeNext {
+        scope: Reg,
+        res: Reg,
+        done: Reg,
+    },
     /// Merge a disposer error `err` into the completion in `kind_reg`/`val_reg`
     /// (DisposeResources error chaining): if already a throw (kind&3==2), wrap as
     /// `SuppressedError{error: err, suppressed: val}`; else set the completion to a
     /// throw of `err`. Used by the async-disposal loop's catch arm (the sync path
     /// does this inside `DisposeScope`'s native helper).
-    MergeDispose { kind_reg: Reg, val_reg: Reg, err: Reg },
+    MergeDispose {
+        kind_reg: Reg,
+        val_reg: Reg,
+        err: Reg,
+    },
     /// A `break`/`continue` that exits one or more `try` blocks: route through every
     /// intervening `finally` (running each, popping any intervening `catch`) before
     /// landing at `target`. `floor` is the handler-stack depth at the target
     /// loop/switch — routing pops handlers until the stack is back to `floor`. Only
     /// emitted when there ARE handlers to unwind; a plain `break`/`continue` uses
     /// `Jump` (so JIT-eligible loops stay eligible).
-    JumpFinally { target: u32, floor: u16 },
+    JumpFinally {
+        target: u32,
+        floor: u16,
+    },
 
     /// Finalize a tagged-template object: define `raw` as a frozen `.raw` own
     /// property of the cooked array `arr` and freeze both arrays.
-    SetRaw { arr: Reg, raw: Reg },
+    SetRaw {
+        arr: Reg,
+        raw: Reg,
+    },
     /// Load the cached tagged-template object for this call SITE (keyed by the
     /// current function id + `site`), or `undefined` on the first evaluation —
     /// GetTemplateObject memoizes one canonical frozen object per source location.
-    TemplateGetCached { dst: Reg, site: u32 },
+    TemplateGetCached {
+        dst: Reg,
+        site: u32,
+    },
     /// Memoize the freshly-built tagged-template object `src` for this call site.
-    TemplateSetCached { site: u32, src: Reg },
+    TemplateSetCached {
+        site: u32,
+        src: Reg,
+    },
     /// `Math.random()` → a float in [0, 1) from the VM's PRNG.
-    Random { dst: Reg },
+    Random {
+        dst: Reg,
+    },
     /// Install a method on a class value at runtime under a COMPUTED key
     /// (`class C { [expr]() {} }`). `class` holds the class value, `key` the
     /// evaluated key, `func` the method's function id, `kind` selects 0=method /
     /// 1=getter / 2=setter / 3=static method / 4=static getter / 5=static
     /// setter, optionally OR'd with [`KEY_WRITEBACK`].
-    ClassAddMember { class: Reg, key: Reg, func: u32, kind: u8 },
+    ClassAddMember {
+        class: Reg,
+        key: Reg,
+        func: u32,
+        kind: u8,
+    },
     /// `new Date(...)` → a Date. 0 args = now; 1 number = epoch ms; 1 string =
     /// parsed; ≥2 = (year, month0, day, h, m, s, ms) interpreted as UTC.
-    DateNew { dst: Reg, arg_base: Reg, argc: u16 },
+    DateNew {
+        dst: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `Date.UTC(year, month0, …)` → epoch ms (a number, not a Date).
-    DateUTC { dst: Reg, arg_base: Reg, argc: u16 },
+    DateUTC {
+        dst: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
     /// `Date.parse(str)` → epoch ms (NaN if unparseable).
-    DateParse { dst: Reg, src: Reg },
+    DateParse {
+        dst: Reg,
+        src: Reg,
+    },
     /// Resolve the iterator of `src` for a `for-of`: if `src` has a `@@iterator`
     /// method (a custom iterable) call it (this = src) → the iterator object; else
     /// pass `src` through (arrays/strings/Map/Set/generators iterate directly).
-    GetIterator { dst: Reg, src: Reg },
+    GetIterator {
+        dst: Reg,
+        src: Reg,
+    },
     /// Like `GetIterator` but ALWAYS returns a real iterator OBJECT (invokes
     /// `src[@@iterator]()`, never the raw positional fast-path) — for `yield*`
     /// delegation, which calls `.next`/`.throw`/`.return` on the iterator.
-    GetIteratorObj { dst: Reg, src: Reg },
+    GetIteratorObj {
+        dst: Reg,
+        src: Reg,
+    },
     /// Normalize `src` for array destructuring (`let [a,b] = src`): a generator or
     /// custom iterable is drained (LAZILY, ≤ `count` elements — `u32::MAX` when the
     /// pattern has a `...rest`) into a fresh array; arrays/strings/Map/Set (and
     /// anything else) pass through, since positional `GetIndex` already handles
     /// them. Bounding keeps `let [a,b] = infiniteIterator` from looping forever.
-    IterToArray { dst: Reg, src: Reg, count: u32 },
+    IterToArray {
+        dst: Reg,
+        src: Reg,
+        count: u32,
+    },
 
     /// Return `src` from the current function.
-    Return { src: Reg },
+    Return {
+        src: Reg,
+    },
     /// Return undefined.
     ReturnUndefined,
 
@@ -1025,7 +1875,11 @@ pub enum Instr {
     /// A dedicated opcode keeps the v1 stdlib trivial; later this becomes an
     /// ordinary builtin call. `to_stderr` is set for `console.error`/`warn`
     /// (which write to stderr in node), clear for `log`/`info`/`debug`.
-    Print { arg_base: Reg, argc: u16, to_stderr: bool },
+    Print {
+        arg_base: Reg,
+        argc: u16,
+        to_stderr: bool,
+    },
 }
 
 /// A compiled function: its code, register-file size, parameter count, and the
@@ -1172,13 +2026,40 @@ pub struct FuncProto {
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 pub enum MathFn {
-    Abs, Floor, Ceil, Round, Trunc, Sign, Sqrt, Cbrt,
-    Exp, Log, Log2, Log10, Expm1, Log1p,
-    Sin, Cos, Tan, Asin, Acos, Atan,
-    Sinh, Cosh, Tanh, Asinh, Acosh, Atanh,
-    Clz32, Fround,
-    Pow, Atan2, Imul,
-    Min, Max, Hypot,
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+    Sign,
+    Sqrt,
+    Cbrt,
+    Exp,
+    Log,
+    Log2,
+    Log10,
+    Expm1,
+    Log1p,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Clz32,
+    Fround,
+    Pow,
+    Atan2,
+    Imul,
+    Min,
+    Max,
+    Hypot,
 }
 
 impl MathFn {
@@ -1186,17 +2067,40 @@ impl MathFn {
     pub fn from_name(name: &str) -> Option<MathFn> {
         use MathFn::*;
         Some(match name {
-            "abs" => Abs, "floor" => Floor, "ceil" => Ceil, "round" => Round,
-            "trunc" => Trunc, "sign" => Sign, "sqrt" => Sqrt, "cbrt" => Cbrt,
-            "exp" => Exp, "log" => Log, "log2" => Log2, "log10" => Log10,
-            "expm1" => Expm1, "log1p" => Log1p,
-            "sin" => Sin, "cos" => Cos, "tan" => Tan,
-            "asin" => Asin, "acos" => Acos, "atan" => Atan,
-            "sinh" => Sinh, "cosh" => Cosh, "tanh" => Tanh,
-            "asinh" => Asinh, "acosh" => Acosh, "atanh" => Atanh,
-            "clz32" => Clz32, "fround" => Fround,
-            "pow" => Pow, "atan2" => Atan2, "imul" => Imul,
-            "min" => Min, "max" => Max, "hypot" => Hypot,
+            "abs" => Abs,
+            "floor" => Floor,
+            "ceil" => Ceil,
+            "round" => Round,
+            "trunc" => Trunc,
+            "sign" => Sign,
+            "sqrt" => Sqrt,
+            "cbrt" => Cbrt,
+            "exp" => Exp,
+            "log" => Log,
+            "log2" => Log2,
+            "log10" => Log10,
+            "expm1" => Expm1,
+            "log1p" => Log1p,
+            "sin" => Sin,
+            "cos" => Cos,
+            "tan" => Tan,
+            "asin" => Asin,
+            "acos" => Acos,
+            "atan" => Atan,
+            "sinh" => Sinh,
+            "cosh" => Cosh,
+            "tanh" => Tanh,
+            "asinh" => Asinh,
+            "acosh" => Acosh,
+            "atanh" => Atanh,
+            "clz32" => Clz32,
+            "fround" => Fround,
+            "pow" => Pow,
+            "atan2" => Atan2,
+            "imul" => Imul,
+            "min" => Min,
+            "max" => Max,
+            "hypot" => Hypot,
             _ => return None,
         })
     }
@@ -1524,7 +2428,14 @@ pub struct DecElemDef {
 /// exotic (`document.all`), whose `type_of` answers "undefined" and therefore
 /// matches code 3 here exactly as the unfused pair would.
 pub const TYPEOF_NAMES: [&str; 8] = [
-    "number", "string", "boolean", "undefined", "object", "function", "symbol", "bigint",
+    "number",
+    "string",
+    "boolean",
+    "undefined",
+    "object",
+    "function",
+    "symbol",
+    "bigint",
 ];
 
 /// Compile-time mapping of a string literal to its `TypeOfIs::code`. `None`

@@ -22,6 +22,93 @@ fn has_own_call_intrinsic_enabled() -> bool {
     }
 }
 
+/// Same-binary escape hatch for the guarded cyclic existing-field store
+/// reducer. The switch is sampled while compiling a region, so the ordinary
+/// loop pays no branch when the prefix is enabled.
+#[inline]
+fn field_write_stream_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_FIELD_WRITE_STREAM").is_none()
+}
+
+#[inline]
+fn field_mixed_stream_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_FIELD_MIXED_STREAM").is_none()
+}
+
+/// Codegen-side copy of `vm::field_stream`'s exact bytecode recognition.  This
+/// is only an admission filter: the FFI helper repeats every structural and
+/// runtime guard before committing a write, and a miss falls through to the
+/// unchanged MEM region.
+fn field_write_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
+    if end.checked_sub(start) != Some(13) || end + 1 >= proto.code.len() {
+        return false;
+    }
+    let c = &proto.code;
+    let (limit, i) = match (&c[start], &c[start + 1]) {
+        (Instr::LoadGlobal { dst: limit, .. }, Instr::JumpIfNotLt { a: i, b, target })
+            if b == limit && *target as usize == end + 1 =>
+        {
+            (*limit, *i)
+        }
+        _ => return false,
+    };
+    let (receiver, k) = match &c[start + 2] {
+        Instr::GetIndex { dst, key, .. } => (*dst, *key),
+        _ => return false,
+    };
+    let value = match &c[start + 3] {
+        Instr::Move { dst, src } if *src == i => *dst,
+        _ => return false,
+    };
+    if !matches!(&c[start + 4],
+        Instr::SetProp { obj, val, strict: false, .. }
+            if *obj == receiver && *val == value)
+        || !matches!(&c[start + 5],
+            Instr::AddInt { dst, a, imm: 1, upd: true } if *dst == k && *a == k)
+        || !matches!(&c[start + 6], Instr::Move { src, .. } if *src == k)
+    {
+        return false;
+    }
+    let (flag, n) = match &c[start + 7] {
+        Instr::Eq { dst, a, b } if *a == k => (*dst, *b),
+        _ => return false,
+    };
+    matches!(&c[start + 8], Instr::JumpIfFalse { cond, target }
+            if *cond == flag && *target as usize == start + 11)
+        && matches!(&c[start + 9], Instr::LoadInt { dst, val: 0 } if *dst == k)
+        && matches!(&c[start + 10], Instr::Move { src, .. } if *src == k)
+        && matches!(&c[start + 11],
+            Instr::AddInt { dst, a, imm: 1, upd: true } if *dst == i && *a == i)
+        && matches!(&c[start + 12], Instr::Move { src, .. } if *src == i)
+        && matches!(&c[start + 13], Instr::Jump { target } if *target as usize == start)
+        && limit != i
+        && n != i
+}
+
+/// Cheap admission copy for the exact global cyclic read/write reducer.  The
+/// FFI helper repeats the complete register/global/name relationship proof, so
+/// this screen only prevents unrelated regions from paying a prefix call.
+fn field_mixed_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
+    use crate::bytecode::BitwiseOp;
+    if end.checked_sub(start) != Some(26) || end + 1 >= proto.code.len() {
+        return false;
+    }
+    let c = &proto.code;
+    matches!(&c[start], Instr::LoadGlobal { .. })
+        && matches!(&c[start + 1], Instr::LoadGlobal { .. })
+        && matches!(&c[start + 2], Instr::JumpIfNotLt { target, .. }
+            if *target as usize == end + 1)
+        && matches!(&c[start + 3], Instr::LoadGlobal { .. })
+        && matches!(&c[start + 6], Instr::Bitwise { op: BitwiseOp::And, .. })
+        && matches!(&c[start + 7], Instr::GetIndex { .. })
+        && matches!(&c[start + 8], Instr::StoreGlobal { .. })
+        && matches!(&c[start + 12], Instr::Bitwise { op: BitwiseOp::And, .. })
+        && matches!(&c[start + 15], Instr::SetProp { strict: false, .. })
+        && matches!(&c[start + 18], Instr::GetProp { .. })
+        && matches!(&c[start + 21], Instr::Bitwise { op: BitwiseOp::Or, .. })
+        && matches!(&c[start + 26], Instr::Jump { target } if *target as usize == start)
+}
+
 /// Memory-based region codegen: every op loads operands from the register file
 /// (with a type guard) and stores results back, globals via the pinned base
 /// pointer. Correct and simple; ~4x faster than the interpreter but leaves
@@ -68,12 +155,24 @@ pub(crate) fn compile_region_mem(
         }
     }
 
-    // Does the region use the r13/r14 inline-cache pointers at all? Only
-    // GetProp/SetProp read them; when absent, allocating/user-code helpers
-    // skip the post-call re-fetch entirely.
+    // Does the region use the r13/r14 inline-cache pointers at all? GetProp/
+    // SetProp use both. The call-free ForInLive version guard below also reads
+    // r13, but only when its engine-private snapshot Array already has a dense-
+    // Array pin (normally supplied by the adjacent GetIndex of the key).
     let has_prop = proto.code[s..=e]
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
+    let forin_snapshot_pin = |obj: u16| {
+        ta_plan
+            .pins
+            .iter()
+            .position(|p| p.src == TaPinSrc::Reg(obj) && is_arr_pin(p.kind))
+    };
+    let has_forin_version_inline = forin_version_fast_enabled()
+        && proto.code[s..=e].iter().any(|instr| match *instr {
+            Instr::ForInLive { obj, .. } => forin_snapshot_pin(obj).is_some(),
+            _ => false,
+        });
     // ── Q4 leaf-call inlining ── the highest scratch slot any inlined callee
     // uses above the caller window (`reg_window + callee_reg_count`). Checked
     // ONCE at entry by `jit_regs_fits`; the result gates each inlined Call (a
@@ -87,7 +186,7 @@ pub(crate) fn compile_region_mem(
     // Vec and leave r13 STALE. So whenever the region inlines a call, the version
     // base must be re-derived after such helpers too — exactly where a GetProp/
     // SetProp region re-derives it. Fold `do_leaf` into the refetch gate.
-    let refetch_pinned = has_prop || do_leaf || do_method;
+    let refetch_pinned = has_prop || do_leaf || do_method || has_forin_version_inline;
     let max_scratch_top: u64 = leaf_plan
         .values()
         .map(|p| p.reg_window as u64 + p.callee_reg_count as u64)
@@ -110,7 +209,11 @@ pub(crate) fn compile_region_mem(
     let mut const_dbl_regs: FxHashSet<u16> = FxHashSet::default();
     for instr in &proto.code[s..=e] {
         if let Instr::LoadConst { dst, idx } = *instr {
-            if proto.constants.get(idx as usize).is_some_and(|c| c.is_double()) {
+            if proto
+                .constants
+                .get(idx as usize)
+                .is_some_and(|c| c.is_double())
+            {
                 const_dbl_regs.insert(dst);
             }
         }
@@ -155,6 +258,37 @@ pub(crate) fn compile_region_mem(
         ; call rax
         ; mov r14, rax                    // pinned inline-cache table base
     );
+    // The property-shape write phase is an exact cyclic loop whose only
+    // observable effects are existing own-data-slot stores.  A guarded helper
+    // preflights every receiver, then commits only the final value of each
+    // touched slot and publishes the loop-carried locals.  It runs before any
+    // TA pin or region-local state is materialized, so a guard miss has changed
+    // nothing and simply enters the byte-identical ordinary region below.
+    let field_write_prefix = (field_write_stream_enabled()
+        && field_write_stream_shape(proto, s, e))
+        || (field_mixed_stream_enabled() && field_mixed_stream_shape(proto, s, e));
+    if meter.is_none() && field_write_prefix {
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!(
+                "[jit] MEM region fn{} [{start},{end}] field-write-stream prefix",
+                heap.func_id
+            );
+        }
+        let packed = ((heap.func_id as u64) << 32) | ((s as u64) << 16) | e as u64;
+        let fallback = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, rbx
+            ; mov r8, QWORD packed as i64
+            ; mov rax, QWORD crate::vm::jit_field_write_loop as usize as i64
+            ; call rax
+            ; test rax, rax
+            ; je => fallback
+            ; mov DWORD [rsi], (e + 1) as i32
+            ; jmp => epilogue
+            ; => fallback
+        );
+    }
     // Pin each TypedArray's `{obj_bits, base, len}` snapshot (entry derivation).
     if let Some((snap, plan)) = ta_refetch {
         emit_refetch_ta(&mut ops, snap, plan);
@@ -398,11 +532,7 @@ pub(crate) fn compile_region_mem(
                         ; mov [rbx + dreg(dst)], rax
                     );
                     if refetch_pinned {
-                        emit_refetch_pinned(
-                            &mut ops,
-                            heap.versions_base,
-                            Some(heap.ic_base),
-                        );
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
                     // `add_values` can run user coercion code (valueOf) —
                     // re-derive the pinned TypedArray snapshots.
@@ -413,12 +543,28 @@ pub(crate) fn compile_region_mem(
                 dynasm!(ops ; => done_a);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::Sub { dst, a, b } => {
-                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Sub, int_hint(a, b))
-            }
-            Instr::Mul { dst, a, b } => {
-                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Mul, int_hint(a, b))
-            }
+            Instr::Sub { dst, a, b } => dbinop(
+                &mut ops,
+                ip,
+                bail,
+                epilogue,
+                dst,
+                a,
+                b,
+                DOp::Sub,
+                int_hint(a, b),
+            ),
+            Instr::Mul { dst, a, b } => dbinop(
+                &mut ops,
+                ip,
+                bail,
+                epilogue,
+                dst,
+                a,
+                b,
+                DOp::Mul,
+                int_hint(a, b),
+            ),
             Instr::Div { dst, a, b } => {
                 dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div, false)
             }
@@ -539,7 +685,7 @@ pub(crate) fn compile_region_mem(
                 // i32::MAX and is then boxed as an (exact) double.
                 use crate::bytecode::BitwiseOp as B;
                 load_toint32(&mut ops, a, bail);
-                dynasm!(ops ; mov r8d, eax);             // stash a
+                dynasm!(ops ; mov r8d, eax); // stash a
                 load_toint32(&mut ops, b, bail);
                 dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
                 match op {
@@ -661,9 +807,22 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::MathOp { dst, op, arg_base, argc } => emit_math_op(
-                &mut ops, ip, bail, epilogue, dst, op, arg_base, argc,
-                heap.math_unary, heap.math_two,
+            Instr::MathOp {
+                dst,
+                op,
+                arg_base,
+                argc,
+            } => emit_math_op(
+                &mut ops,
+                ip,
+                bail,
+                epilogue,
+                dst,
+                op,
+                arg_base,
+                argc,
+                heap.math_unary,
+                heap.math_two,
             ),
             Instr::CellGet { dst, cell } => {
                 // Per-op captured-cell read (jit_cell_get). NEVER hoisted: a
@@ -683,7 +842,12 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::GetIndexConcat { dst, obj, name, key } => {
+            Instr::GetIndexConcat {
+                dst,
+                obj,
+                name,
+                key,
+            } => {
                 // `obj["name" + i]`. The helper answers only the own-DATA hit on
                 // a plain object with an Int key — no allocation (the key goes
                 // into a reused scratch buffer) and no user code — and deopts on
@@ -749,7 +913,13 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::DeleteIndexConcat { dst, obj, name, key, strict } => {
+            Instr::DeleteIndexConcat {
+                dst,
+                obj,
+                name,
+                key,
+                strict,
+            } => {
                 // `delete obj["name" + i]` (W19 M3). This is the op that kept
                 // the whole delete loop off the JIT: there was no Delete arm at
                 // all here, so `[145,155]` DECLINED and was blacklisted.
@@ -795,7 +965,12 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::SetIndexConcat { obj, name, key, val } => {
+            Instr::SetIndexConcat {
+                obj,
+                name,
+                key,
+                val,
+            } => {
                 // `obj["name" + i] = v`. The selected pure helper returns a
                 // distinct sentinel for an own writable-data HIT or a
                 // proven-clean new append. Those two arms share the
@@ -940,18 +1115,58 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::ForInLive { dst, obj, key } => {
-                // Per-op for-in liveness check (jit_forin_live → Vm::forin_live).
-                // Re-reads the live shape each execution. Stores the Bool Value
-                // bits the helper returns (matches the interpreter's
-                // `Value::bool(live)`). Never deopts. The helper does no VM-heap
-                // alloc on the common path, but `key_of`/proto-walk could grow the
-                // heap in principle — so when the region also has GetProp/SetProp
-                // (the only r13/r14 consumers), re-derive those pinned pointers
-                // afterward (the StrConcat discipline). It runs NO user code, so
-                // the TypedArray snapshots are unaffected.
+                // Default-chain Array snapshots carry three (heap index,
+                // expected version) pairs in their private prefix. GetIndex has
+                // already pinned this immutable snapshot's Vec for the region,
+                // so compare those u32 versions directly through r13 and answer
+                // TRUE call-free. Identity/eligibility/version misses retain the
+                // exact jit_forin_live path, which observes a key deleted between
+                // snapshot and visit. ZIPP_NO_FORIN_VERSION_FAST omits this
+                // entire prefix probe at compile time for a same-binary A/B.
+                let inline_pin = if forin_version_fast_enabled() {
+                    forin_snapshot_pin(obj)
+                } else {
+                    None
+                };
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if let Some(slot) = inline_pin {
+                    let off = ta_slot_off(slot);
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(obj)]      // snapshot Value bits
+                        ; cmp rax, [rsp + off]            // pin still names it?
+                        ; jne => slow
+                        ; mov r9, [rsp + off + 8]         // snapshot items base
+                        ; test r9, r9                     // declined pin
+                        ; jz => slow
+                        ; mov r10, [r9 + 8]               // receiver expected-version Value
+                        ; mov r11, QWORD 0x7FFC_0000_0000_0000u64 as i64
+                        ; cmp r10, r11                    // Undefined = ineligible
+                        ; je => slow
+                        ; mov ecx, [r9]                   // receiver heap index
+                        ; mov edx, [r13 + rcx * 4]        // current receiver version
+                        ; cmp edx, [r9 + 8]               // expected payload u32
+                        ; jne => slow
+                        ; mov ecx, [r9 + 16]              // %Array.prototype% index
+                        ; mov edx, [r13 + rcx * 4]
+                        ; cmp edx, [r9 + 24]
+                        ; jne => slow
+                        ; mov ecx, [r9 + 32]              // %Object.prototype% index
+                        ; mov edx, [r13 + rcx * 4]
+                        ; cmp edx, [r9 + 40]
+                        ; jne => slow
+                        ; mov r10, QWORD BOOL_TRUE_BITS as i64
+                        ; mov [rbx + dreg(dst)], r10
+                        ; jmp => done
+                        ; => slow
+                    );
+                }
+                // Slow/mismatch path: stores the Bool Value bits returned by
+                // the shared interpreter implementation. It does no user code;
+                // refetching is conservative against a future heap allocation.
                 dynasm!(ops
                     ; mov rcx, rdi                       // vm
-                    ; mov rdx, [rbx + dreg(obj)]         // obj bits
+                    ; mov rdx, [rbx + dreg(obj)]         // snapshot bits
                     ; mov r8, [rbx + dreg(key)]          // key bits
                     ; mov rax, QWORD heap.forin_live as i64
                     ; call rax
@@ -960,8 +1175,16 @@ pub(crate) fn compile_region_mem(
                 if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
+                if inline_pin.is_some() {
+                    dynasm!(ops ; => done);
+                }
             }
-            Instr::HasProp { dst, key, obj, brand: _ } => {
+            Instr::HasProp {
+                dst,
+                key,
+                obj,
+                brand: _,
+            } => {
                 // `key in obj` (region_can_compile admitted only brand=false).
                 // ── pinned dense-Array fast path ── when the OSR plan pinned
                 // this receiver (ARR_PIN_KIND): identity-guard, then an INTEGER
@@ -1041,7 +1264,12 @@ pub(crate) fn compile_region_mem(
                         Some((false, tgt)) => {
                             // JumpIfTrue on a `true` condition: taken.
                             let t = region_target(
-                                tgt, start, end, &in_region, &mut exit_stubs, &mut ops,
+                                tgt,
+                                start,
+                                end,
+                                &in_region,
+                                &mut exit_stubs,
+                                &mut ops,
                             );
                             dynasm!(ops ; jmp => t);
                         }
@@ -1088,8 +1316,7 @@ pub(crate) fn compile_region_mem(
                 // flags (bool still stored); non-Int falls through to the
                 // unchanged generic sequence below.
                 if let Some((iff, tgt)) = cmp_branch_pair(ip, dst) {
-                    let t =
-                        region_target(tgt, start, end, &in_region, &mut exit_stubs, &mut ops);
+                    let t = region_target(tgt, start, end, &in_region, &mut exit_stubs, &mut ops);
                     let ft = lbl((ip + 2) as u32, &in_region);
                     emit_fused_cmp_branch_head(&mut ops, dst, a, b, cmp, iff, t, ft);
                 }
@@ -1099,10 +1326,26 @@ pub(crate) fn compile_region_mem(
                     // Undefined compare by bits, non-interned heap operands bail
                     // to the interpreter.
                     Cmp::Eq => region_poly_eq(
-                        &mut ops, ip, bail, epilogue, dst, a, b, false, heap.strict_eq,
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        dst,
+                        a,
+                        b,
+                        false,
+                        heap.strict_eq,
                     ),
                     Cmp::Ne => region_poly_eq(
-                        &mut ops, ip, bail, epilogue, dst, a, b, true, heap.strict_eq,
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        dst,
+                        a,
+                        b,
+                        true,
+                        heap.strict_eq,
                     ),
                     _ => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, cmp),
                 }
@@ -1184,7 +1427,15 @@ pub(crate) fn compile_region_mem(
                 // (which routes a real accessor via PROP_VIA_IC → helper).
                 if let Some(gp) = method_plan.get(&ip) {
                     emit_inline_accessor(
-                        &mut ops, ip, epilogue, leaf_flag_off, gp, obj, dst, false, cont,
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        gp,
+                        obj,
+                        dst,
+                        false,
+                        cont,
                     );
                 }
                 emit_ic_probe(&mut ops, IcProbe::Get { dst }, obj, off, cont, acc);
@@ -1259,7 +1510,12 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
-            Instr::SetProp { obj, name, val, strict: _ } => {
+            Instr::SetProp {
+                obj,
+                name,
+                val,
+                strict: _,
+            } => {
                 // ── 8-way inline cache (CALL-FREE write on hit) ── like
                 // GetProp, but the helper only ever fills OWN ways here
                 // (identity + receiver version fully guard an own writable
@@ -1282,7 +1538,15 @@ pub(crate) fn compile_region_mem(
                 // (a real setter → PROP_VIA_IC → helper).
                 if let Some(sp) = method_plan.get(&ip) {
                     emit_inline_accessor(
-                        &mut ops, ip, epilogue, leaf_flag_off, sp, obj, val, true, cont,
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        sp,
+                        obj,
+                        val,
+                        true,
+                        cont,
                     );
                 }
                 emit_ic_probe(&mut ops, IcProbe::Set { val }, obj, off, cont, acc);
@@ -1481,7 +1745,7 @@ pub(crate) fn compile_region_mem(
                             ; cmp rax, [rsp + off]            // identity vs snapshot
                             ; jne => ta_slow                  // miss/declined → helper
                         );
-                        emit_ta_key(&mut ops, key, bail);     // rcx = i64 index
+                        emit_ta_key(&mut ops, key, bail); // rcx = i64 index
                         dynasm!(ops
                             ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
                             ; jae => ta_slow                  // OOB/negative → helper
@@ -1497,58 +1761,58 @@ pub(crate) fn compile_region_mem(
                         );
                         // Fall through to the generic helper (hole/miss/OOB).
                     } else {
-                    dynasm!(ops
-                        ; mov rax, [rbx + dreg(obj)]      // receiver bits
-                        ; cmp rax, [rsp + off]            // identity vs snapshot
-                        ; jne => ta_slow
-                    );
-                    emit_ta_key(&mut ops, key, bail);     // rcx = i64 index
-                    dynasm!(ops
-                        ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
-                        ; jae => bail                     // OOB/negative → deopt
-                        ; mov rdx, [rsp + off + 8]        // pinned data base
-                    );
-                    match kind {
-                        0 => {
-                            dynasm!(ops ; movsx eax, BYTE [rdx + rcx]);
-                            box_eax(&mut ops, dst);
-                        }
-                        1 | 2 => {
-                            dynasm!(ops ; movzx eax, BYTE [rdx + rcx]);
-                            box_eax(&mut ops, dst);
-                        }
-                        3 => {
-                            dynasm!(ops ; movsx eax, WORD [rdx + rcx * 2]);
-                            box_eax(&mut ops, dst);
-                        }
-                        4 => {
-                            dynasm!(ops ; movzx eax, WORD [rdx + rcx * 2]);
-                            box_eax(&mut ops, dst);
-                        }
-                        5 => {
-                            dynasm!(ops ; mov eax, [rdx + rcx * 4]);
-                            box_eax(&mut ops, dst);
-                        }
-                        6 => {
-                            // u32: Int when it fits i32 (mirrors Value::num),
-                            // else the exact double (same as the `>>>` boxing).
-                            dynasm!(ops ; mov eax, [rdx + rcx * 4]);
-                            emit_box_u32(&mut ops, dst);
-                        }
-                        _ => {
-                            // 7/8 (f32/f64): box the double, NaN-canonicalised.
-                            if kind == 7 {
-                                dynasm!(ops
-                                    ; movss xmm0, [rdx + rcx * 4]
-                                    ; cvtss2sd xmm0, xmm0
-                                );
-                            } else {
-                                dynasm!(ops ; movsd xmm0, [rdx + rcx * 8]);
+                        dynasm!(ops
+                            ; mov rax, [rbx + dreg(obj)]      // receiver bits
+                            ; cmp rax, [rsp + off]            // identity vs snapshot
+                            ; jne => ta_slow
+                        );
+                        emit_ta_key(&mut ops, key, bail); // rcx = i64 index
+                        dynasm!(ops
+                            ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
+                            ; jae => bail                     // OOB/negative → deopt
+                            ; mov rdx, [rsp + off + 8]        // pinned data base
+                        );
+                        match kind {
+                            0 => {
+                                dynasm!(ops ; movsx eax, BYTE [rdx + rcx]);
+                                box_eax(&mut ops, dst);
                             }
-                            emit_box_f64_canon(&mut ops, dst);
+                            1 | 2 => {
+                                dynasm!(ops ; movzx eax, BYTE [rdx + rcx]);
+                                box_eax(&mut ops, dst);
+                            }
+                            3 => {
+                                dynasm!(ops ; movsx eax, WORD [rdx + rcx * 2]);
+                                box_eax(&mut ops, dst);
+                            }
+                            4 => {
+                                dynasm!(ops ; movzx eax, WORD [rdx + rcx * 2]);
+                                box_eax(&mut ops, dst);
+                            }
+                            5 => {
+                                dynasm!(ops ; mov eax, [rdx + rcx * 4]);
+                                box_eax(&mut ops, dst);
+                            }
+                            6 => {
+                                // u32: Int when it fits i32 (mirrors Value::num),
+                                // else the exact double (same as the `>>>` boxing).
+                                dynasm!(ops ; mov eax, [rdx + rcx * 4]);
+                                emit_box_u32(&mut ops, dst);
+                            }
+                            _ => {
+                                // 7/8 (f32/f64): box the double, NaN-canonicalised.
+                                if kind == 7 {
+                                    dynasm!(ops
+                                        ; movss xmm0, [rdx + rcx * 4]
+                                        ; cvtss2sd xmm0, xmm0
+                                    );
+                                } else {
+                                    dynasm!(ops ; movsd xmm0, [rdx + rcx * 8]);
+                                }
+                                emit_box_f64_canon(&mut ops, dst);
+                            }
                         }
-                    }
-                    dynasm!(ops ; jmp => ta_done ; => ta_slow);
+                        dynasm!(ops ; jmp => ta_done ; => ta_slow);
                     } // end TA-kind branch
                 }
                 // Generic element read `a[i]` via a win64 helper (dense arrays,
@@ -1602,7 +1866,7 @@ pub(crate) fn compile_region_mem(
                         ; cmp rax, [rsp + off]            // identity vs snapshot
                         ; jne => ta_slow
                     );
-                    emit_ta_key(&mut ops, key, bail);     // rcx = i64 index
+                    emit_ta_key(&mut ops, key, bail); // rcx = i64 index
                     dynasm!(ops
                         ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
                         ; jae => bail                     // OOB store → deopt
@@ -1708,7 +1972,13 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::CallMethod { dst, obj, name, arg_base, argc } => {
+            Instr::CallMethod {
+                dst,
+                obj,
+                name,
+                arg_base,
+                argc,
+            } => {
                 let key = proto.string_constants[name as usize].as_str();
                 if let Some(plan) = scalar_exec.filter(|p| p.call_ip == ip) {
                     debug_assert_eq!(key, "exec");
@@ -1739,11 +2009,7 @@ pub(crate) fn compile_region_mem(
                     // heap/pin side vector. Re-derive all snapshots before the
                     // next iteration's direct Array load.
                     if refetch_pinned {
-                        emit_refetch_pinned(
-                            &mut ops,
-                            heap.versions_base,
-                            Some(heap.ic_base),
-                        );
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
                     if let Some((snap, pin_plan)) = ta_refetch {
                         emit_refetch_ta(&mut ops, snap, pin_plan);
@@ -1855,11 +2121,7 @@ pub(crate) fn compile_region_mem(
                     // patched pinned/TypedArray snapshot, matching the generic
                     // method helper's post-call contract.
                     if refetch_pinned {
-                        emit_refetch_pinned(
-                            &mut ops,
-                            heap.versions_base,
-                            Some(heap.ic_base),
-                        );
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
                     if let Some((snap, plan)) = ta_refetch {
                         emit_refetch_ta(&mut ops, snap, plan);
@@ -1914,9 +2176,7 @@ pub(crate) fn compile_region_mem(
                 // interpreter's exact per-call intrinsic proofs. A miss has
                 // done no observable work and falls through to the unchanged
                 // generic call emission below; a throw is committed and exits.
-                if matches!(key, "test" | "exec")
-                    && crate::vm::regexp_call_direct_enabled()
-                {
+                if matches!(key, "test" | "exec") && crate::vm::regexp_call_direct_enabled() {
                     let rx_slow = ops.new_dynamic_label();
                     let rx_done = ops.new_dynamic_label();
                     let rx_bail = ops.new_dynamic_label();
@@ -1946,11 +2206,7 @@ pub(crate) fn compile_region_mem(
                     // every potentially moved/patched region snapshot exactly
                     // as the generic method helper does.
                     if refetch_pinned {
-                        emit_refetch_pinned(
-                            &mut ops,
-                            heap.versions_base,
-                            Some(heap.ic_base),
-                        );
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
                     if let Some((snap, plan)) = ta_refetch {
                         emit_refetch_ta(&mut ops, snap, plan);
@@ -2011,8 +2267,7 @@ pub(crate) fn compile_region_mem(
                 // `s.substring(a[,b])` / `s.slice(a[,b])` intrinsic — same
                 // shape as indexOf below. Args are read from the contiguous
                 // window; mode bit 1 tells the helper not to read an absent end.
-                let substring_arity_ok = argc == 2
-                    || (argc == 1 && substring1_intrinsic_enabled());
+                let substring_arity_ok = argc == 2 || (argc == 1 && substring1_intrinsic_enabled());
                 if substring_arity_ok && (key == "substring" || key == "slice") {
                     let bail = ops.new_dynamic_label();
                     let mode = (key == "slice") as i32 | (((argc == 1) as i32) << 1);
@@ -2112,8 +2367,7 @@ pub(crate) fn compile_region_mem(
                         .get(&ip)
                         .filter(|&&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND)
                         .map(|&j| j as usize);
-                    let (dv_slow, dv_done) =
-                        (ops.new_dynamic_label(), ops.new_dynamic_label());
+                    let (dv_slow, dv_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
                     if let Some(slot) = pinned {
                         let off = ta_slot_off(slot);
                         let size = [1i32, 1, 1, 2, 2, 4, 4, 4, 8][kindid as usize];
@@ -2357,7 +2611,12 @@ pub(crate) fn compile_region_mem(
                     }
                 }
             }
-            Instr::Call { dst, callee, arg_base, argc } => {
+            Instr::Call {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            } => {
                 // Generic `f(args…)` with `this = undefined`: the interpreter-IC
                 // call helper. Packing: r9 = (callee<<16) | arg_base.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
@@ -2371,8 +2630,7 @@ pub(crate) fn compile_region_mem(
                 let cross = cross_plan.contains(&ip) && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if cross {
-                    let packed_cross: u64 =
-                        (argc as u64) | ((proto.reg_count.max(1) as u64) << 16);
+                    let packed_cross: u64 = (argc as u64) | ((proto.reg_count.max(1) as u64) << 16);
                     let cross_fallback = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
@@ -2408,6 +2666,15 @@ pub(crate) fn compile_region_mem(
                 // site is inlined with an identity guard; a guard miss / tight
                 // headroom falls through to the SAME helper below (a pure prefix).
                 if let Some(lp) = leaf_plan.get(&ip) {
+                    // Pair fusion elides six caller ops.  Keep metered regions
+                    // on the ordinary path so every bytecode remains charged.
+                    let span_pair_resume = if blocks.is_none() {
+                        lp.span_code_unit_pred
+                            .and_then(|p| p.pair)
+                            .map(|p| lbl(p.resume_ip, &in_region))
+                    } else {
+                        None
+                    };
                     emit_inline_leaf_call(
                         &mut ops,
                         ip,
@@ -2430,6 +2697,7 @@ pub(crate) fn compile_region_mem(
                         packed_args,
                         refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                         ta_refetch,
+                        span_pair_resume,
                     );
                 } else {
                     emit_region_call_ic(
@@ -2480,7 +2748,13 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::AddRightPair { dst, a, b, c, in_place } => {
+            Instr::AddRightPair {
+                dst,
+                a,
+                b,
+                c,
+                in_place,
+            } => {
                 // Exact `a + (b + c)` through the shared interpreter helper.
                 // Its primitive ASCII arm allocates one flat result; the
                 // fallback can run user coercion code while performing the two
@@ -2715,7 +2989,12 @@ pub(crate) fn compile_region_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
             }
-            Instr::StaticFn { dst, op, arg_base, argc: _ } => {
+            Instr::StaticFn {
+                dst,
+                op,
+                arg_base,
+                argc: _,
+            } => {
                 // Bounded set (admission gated argc == 1). PromiseResolve
                 // ALLOCATES ⇒ the StrConcat discipline: re-derive r13 (and the
                 // TA snapshots) after the call; no user code ⇒ r14 safe. A
@@ -2777,6 +3056,26 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::StrAppendIndex {
+                dst, a, obj, key, ..
+            } => {
+                // Allocation-free fused ASCII prefix. A miss has not mutated
+                // the accumulator, so bailing at this ip lets the interpreter
+                // execute the exact GetIndex + append fallback once.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // accumulator bits
+                    ; mov r8, [rbx + dreg(obj)]            // indexed receiver bits
+                    ; mov r9, [rbx + dreg(key)]            // key bits
+                    ; mov rax, QWORD heap.str_append_index as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // pristine miss
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::GetIterator { dst, src } => {
                 let Some(_plan) = scalar_matchall.filter(|p| p.get_iterator_ip == ip) else {
                     return None;
@@ -2809,31 +3108,49 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::IterNext { value_dst, done_dst, iter, idx, next } => {
+            Instr::IterNext {
+                value_dst,
+                done_dst,
+                iter,
+                idx,
+                next,
+            } => {
                 if let Some(plan) = scalar_matchall.filter(|p| p.iter_next_ip == ip) {
+                    // Eight admission-proved u16 operands in the fourth/fifth
+                    // Win64 arguments. Besides avoiding another stack slot
+                    // (TA pins start immediately above the existing one), the
+                    // second pack gives the helper enough context to collapse
+                    // the remaining OUTER dense-string-array scan in one call.
+                    let result_capture_count_sum = ((plan.result_global as u64) << 48)
+                        | ((plan.capture as u64) << 32)
+                        | ((plan.count_global as u64) << 16)
+                        | plan.sum_global as u64;
+                    let i_n_lines_re = ((plan.i_global as u64) << 48)
+                        | ((plan.n_global as u64) << 32)
+                        | ((plan.lines_global as u64) << 16)
+                        | plan.re_global as u64;
                     dynasm!(ops
                         ; mov rcx, rdi
                         ; mov rdx, [rbx + dreg(iter)]
                         ; mov r8, [rbx + dreg(next)]
-                        ; mov r9d, plan.result_global as i32
+                        ; mov r9, QWORD result_capture_count_sum as i64
+                        ; mov rax, QWORD i_n_lines_re as i64
+                        ; mov [rsp + 32], rax
                         ; mov rax, QWORD heap.regexp_scalar_step as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
                         ; je => bail                      // no visible step committed
-                        // Success returns false; exhausted returns true only
-                        // AFTER flushing the final pending km before IP 405.
+                        // Success returns false. Exhaustion returns true while
+                        // retaining the range-only km across the unobservable
+                        // outer-loop tail; the region epilogue flushes it.
                         ; mov [rbx + dreg(done_dst)], rax
                     );
                     // The step's safe point and Annex-B string publication can
                     // move every pinned side vector. Exhaustion additionally
                     // materializes the final observable result.
                     if refetch_pinned {
-                        emit_refetch_pinned(
-                            &mut ops,
-                            heap.versions_base,
-                            Some(heap.ic_base),
-                        );
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
                     if let Some((snap, pin_plan)) = ta_refetch {
                         emit_refetch_ta(&mut ops, snap, pin_plan);
@@ -2882,12 +3199,15 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::PushFinally { target, kind_reg, val_reg } => {
+            Instr::PushFinally {
+                target,
+                kind_reg,
+                val_reg,
+            } => {
                 // Handler-stack push mirroring the interpreter arm, so the
                 // unwind state stays identical whichever engine runs the loop
                 // body. Total: no deopt, no alloc, no user code, no refetch.
-                let packed =
-                    ((target as u64) << 32) | ((kind_reg as u64) << 16) | val_reg as u64;
+                let packed = ((target as u64) << 32) | ((kind_reg as u64) << 16) | val_reg as u64;
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, QWORD packed as i64        // target/kind_reg/val_reg
@@ -2992,7 +3312,11 @@ pub(crate) fn compile_region_mem(
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding: None,
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════════════

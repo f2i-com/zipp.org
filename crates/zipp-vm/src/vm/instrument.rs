@@ -332,7 +332,9 @@ impl super::Vm<'_> {
     /// its call helpers, and that Rust can enter native again.
     #[must_use]
     pub(crate) fn meter_lend(&mut self) -> i64 {
-        let Some(rec) = self.instr_rec.as_mut() else { return 0 };
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return 0;
+        };
         // Once per native entry is the right cadence for the abort poll: the
         // interpreter's own every-4096-instructions check barely advances while
         // a hot loop is running natively.
@@ -360,7 +362,9 @@ impl super::Vm<'_> {
                 return 0;
             }
             // `heap_bytes` took `&self`, so the recorder has to be re-borrowed.
-            let Some(rec) = self.instr_rec.as_mut() else { return 0 };
+            let Some(rec) = self.instr_rec.as_mut() else {
+                return 0;
+            };
             let lend = rec.remaining.min(NATIVE_CHUNK).max(0);
             rec.remaining -= lend;
             rec.used = rec.used.wrapping_add(lend as u64);
@@ -750,16 +754,22 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
         // AddRightPair represents TWO ordered Adds and the AIR row has room
         // for only one binary relation. Keep it explicitly OTHER rather than
         // making a false single-Add claim.
-        AddRightPair { dst, a, b, .. } => {
-            (op::OTHER, Claim::None, Some(a), Some(b), 0, Some(dst))
-        }
+        AddRightPair { dst, a, b, .. } => (op::OTHER, Claim::None, Some(a), Some(b), 0, Some(dst)),
         // The left operand is an implicit fixed string literal, so there is no
         // second register with which to make a truthful arithmetic AIR claim.
-        Pad2Concat { dst, src, zero } => {
-            (op::OTHER, Claim::None, Some(src), None, zero as u64, Some(dst))
-        }
-        Pad2Conditional { dst, src } => {
-            (op::OTHER, Claim::None, Some(src), None, 0, Some(dst))
+        Pad2Concat { dst, src, zero } => (
+            op::OTHER,
+            Claim::None,
+            Some(src),
+            None,
+            zero as u64,
+            Some(dst),
+        ),
+        Pad2Conditional { dst, src } => (op::OTHER, Claim::None, Some(src), None, 0, Some(dst)),
+        // The fused op combines an indexed read and an append, so neither the
+        // property nor arithmetic claim schema can represent it faithfully.
+        StrAppendIndex { dst, a, obj, .. } => {
+            (op::OTHER, Claim::None, Some(a), Some(obj), 0, Some(dst))
         }
         // StrConcat/StrAppendInPlace are `Add` with a JIT routing hint; they are
         // the same operator and the post-check decides whether the row's values

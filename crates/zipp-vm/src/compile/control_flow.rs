@@ -104,7 +104,10 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn while_stmt(&mut self, test: &ast::Expr, body: &ast::Stmt) -> R<()> {
         let top = self.here();
         let jf = self.emit_test_jump(test)?;
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
+        self.loop_ctx.push(LoopCtx::loop_frame(
+            self.pending_label.take(),
+            self.handler_depth,
+        ));
         self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         for c in ctx.continue_jumps {
@@ -161,7 +164,10 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn emit_freshen_cells(&mut self, regs: &[Reg]) {
         for &reg in regs {
             let tmp = self.alloc_reg();
-            self.emit(Instr::CellGet { dst: tmp, cell: reg });
+            self.emit(Instr::CellGet {
+                dst: tmp,
+                cell: reg,
+            });
             self.emit(Instr::Move { dst: reg, src: tmp });
             self.emit(Instr::MakeCell { reg });
             self.next_reg -= 1; // free tmp
@@ -194,7 +200,11 @@ impl<'a> FnCompiler<'a> {
             let vreg = self.declare_local("<for.uval>");
             self.emit(Instr::OpenUsingScope { dst: sreg });
             let push_at = self.here();
-            self.emit(Instr::PushFinally { target: 0, kind_reg: kreg, val_reg: vreg });
+            self.emit(Instr::PushFinally {
+                target: 0,
+                kind_reg: kreg,
+                val_reg: vreg,
+            });
             self.handler_depth += 1;
             Some((is_async, sreg, kreg, vreg, push_at))
         } else {
@@ -242,7 +252,10 @@ impl<'a> FnCompiler<'a> {
             Some(t) => Some(self.emit_test_jump(t)?),
             None => None,
         };
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
+        self.loop_ctx.push(LoopCtx::loop_frame(
+            self.pending_label.take(),
+            self.handler_depth,
+        ));
         self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -284,9 +297,16 @@ impl<'a> FnCompiler<'a> {
             if is_async {
                 self.emit_async_dispose_loop(sreg, kreg, vreg);
             } else {
-                self.emit(Instr::DisposeScope { scope: sreg, kind_reg: kreg, val_reg: vreg });
+                self.emit(Instr::DisposeScope {
+                    scope: sreg,
+                    kind_reg: kreg,
+                    val_reg: vreg,
+                });
             }
-            self.emit(Instr::EndFinally { kind_reg: kreg, val_reg: vreg });
+            self.emit(Instr::EndFinally {
+                kind_reg: kreg,
+                val_reg: vreg,
+            });
         }
         self.pop_scope();
         Ok(())
@@ -328,7 +348,10 @@ impl<'a> FnCompiler<'a> {
         self.reset_loop_completion();
         let push_at = self.here();
         // catch_reg/target patched once known.
-        self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
+        self.emit(Instr::PushHandler {
+            catch_target: 0,
+            catch_reg: 0,
+        });
 
         // The catch handler is active throughout the try body (a `break`/`continue`
         // exiting it must pop the stale handler — see `emit_loop_jump`).
@@ -417,9 +440,8 @@ impl<'a> FnCompiler<'a> {
     /// ASYNCHRONOUSLY (each dispose result is awaited), so its finally epilogue is
     /// the awaited disposal loop rather than the single sync `DisposeScope` op.
     pub(crate) fn block_has_await_using(body: &[ast::Stmt]) -> bool {
-        body.iter().any(|st| {
-            matches!(st, ast::Stmt::VarDecl(d) if d.kind == ast::VarKind::AwaitUsing)
-        })
+        body.iter()
+            .any(|st| matches!(st, ast::Stmt::VarDecl(d) if d.kind == ast::VarKind::AwaitUsing))
     }
 
     /// Emit the async-disposal epilogue (the finally body for an `await using`
@@ -438,10 +460,20 @@ impl<'a> FnCompiler<'a> {
 
         let loop_top = self.here();
         let push_at = self.here();
-        self.emit(Instr::PushHandler { catch_target: 0, catch_reg: exc });
-        self.emit(Instr::AsyncDisposeNext { scope: scope_reg, res, done });
+        self.emit(Instr::PushHandler {
+            catch_target: 0,
+            catch_reg: exc,
+        });
+        self.emit(Instr::AsyncDisposeNext {
+            scope: scope_reg,
+            res,
+            done,
+        });
         let jdone = self.here();
-        self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+        self.emit(Instr::JumpIfTrue {
+            cond: done,
+            target: 0,
+        });
         self.emit(Instr::Await { dst: res, val: res });
         self.emit(Instr::PopHandler);
         self.emit(Instr::Jump { target: loop_top });
@@ -452,7 +484,11 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::Jump { target: 0 });
 
         let cat = self.here();
-        self.emit(Instr::MergeDispose { kind_reg, val_reg, err: exc });
+        self.emit(Instr::MergeDispose {
+            kind_reg,
+            val_reg,
+            err: exc,
+        });
         self.emit(Instr::Jump { target: loop_top });
 
         let after = self.here();
@@ -482,7 +518,11 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::OpenUsingScope { dst: scope_reg });
 
         let fin_push = self.here();
-        self.emit(Instr::PushFinally { target: 0, kind_reg, val_reg });
+        self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg,
+            val_reg,
+        });
         self.handler_depth += 1;
 
         let prev_scope = self.using_scope_reg.replace(scope_reg);
@@ -514,7 +554,11 @@ impl<'a> FnCompiler<'a> {
         if Self::block_has_await_using(body) && self.in_async {
             self.emit_async_dispose_loop(scope_reg, kind_reg, val_reg);
         } else {
-            self.emit(Instr::DisposeScope { scope: scope_reg, kind_reg, val_reg });
+            self.emit(Instr::DisposeScope {
+                scope: scope_reg,
+                kind_reg,
+                val_reg,
+            });
         }
         self.emit(Instr::EndFinally { kind_reg, val_reg });
         self.next_reg -= 3; // reclaim scope_reg / kind_reg / val_reg
@@ -562,7 +606,11 @@ impl<'a> FnCompiler<'a> {
         let val_reg = self.alloc_reg();
 
         let fin_push = self.here();
-        self.emit(Instr::PushFinally { target: 0, kind_reg, val_reg });
+        self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg,
+            val_reg,
+        });
         // The finally handler is active for the whole try/catch (a `break`/
         // `continue` exiting it must route through the finally — see
         // `emit_loop_jump`).
@@ -571,7 +619,10 @@ impl<'a> FnCompiler<'a> {
         let has_catch = handler.is_some();
         let catch_push = if has_catch {
             let at = self.here();
-            self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
+            self.emit(Instr::PushHandler {
+                catch_target: 0,
+                catch_reg: 0,
+            });
             self.handler_depth += 1; // catch handler active during the try body
             Some(at)
         } else {
@@ -652,7 +703,10 @@ impl<'a> FnCompiler<'a> {
     /// and pop the still-active `Finally` handler (abnormal paths pop it via the
     /// unwind / Return op instead).
     pub(crate) fn emit_leave_finally_normal(&mut self, kind_reg: Reg) {
-        self.emit(Instr::LoadInt { dst: kind_reg, val: 0 });
+        self.emit(Instr::LoadInt {
+            dst: kind_reg,
+            val: 0,
+        });
         self.emit(Instr::PopFinally);
     }
 
@@ -690,7 +744,11 @@ impl<'a> FnCompiler<'a> {
             },
             None => (self.declare_local_no_box("<catch.ignored>"), None, None),
         };
-        if let Instr::PushHandler { catch_target, catch_reg } = &mut self.code[push_at as usize] {
+        if let Instr::PushHandler {
+            catch_target,
+            catch_reg,
+        } = &mut self.code[push_at as usize]
+        {
             *catch_target = catch_start;
             *catch_reg = e_reg;
         }
@@ -699,8 +757,9 @@ impl<'a> FnCompiler<'a> {
             // globals): a destructured name must not leak past the catch nor
             // hoist a same-named block function to a global (B.3.5 skip).
             self.pattern_block_local = true;
-            let r =
-                self.declare_pattern(pat, false).and_then(|_| self.extract_pattern(pat, e_reg));
+            let r = self
+                .declare_pattern(pat, false)
+                .and_then(|_| self.extract_pattern(pat, e_reg));
             self.pattern_block_local = false;
             r?;
         }
@@ -725,7 +784,10 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn do_while_statement(&mut self, body: &ast::Stmt, test: &ast::Expr) -> R<()> {
         let top = self.here();
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
+        self.loop_ctx.push(LoopCtx::loop_frame(
+            self.pending_label.take(),
+            self.handler_depth,
+        ));
         self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -811,7 +873,11 @@ impl<'a> FnCompiler<'a> {
                     let save = self.next_reg;
                     let tv = self.expr(t)?;
                     let cond = self.temp();
-                    self.emit(Instr::Eq { dst: cond, a: disc, b: tv });
+                    self.emit(Instr::Eq {
+                        dst: cond,
+                        a: disc,
+                        b: tv,
+                    });
                     let j = self.here();
                     self.emit(Instr::JumpIfTrue { cond, target: 0 });
                     self.next_reg = save; // reclaim test/cond temps (disc survives)
@@ -825,7 +891,10 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::Jump { target: 0 });
 
         // Pass 2: case bodies, in source order (fall-through is natural).
-        self.loop_ctx.push(LoopCtx::switch_frame(self.pending_label.take(), self.handler_depth));
+        self.loop_ctx.push(LoopCtx::switch_frame(
+            self.pending_label.take(),
+            self.handler_depth,
+        ));
         let mut body_start: Vec<u32> = Vec::with_capacity(cases.len());
         for c in cases {
             body_start.push(self.here());
@@ -919,7 +988,10 @@ impl<'a> FnCompiler<'a> {
             self.param_tdz.remove(n);
         }
         if v != iter_reg {
-            self.emit(Instr::Move { dst: iter_reg, src: v });
+            self.emit(Instr::Move {
+                dst: iter_reg,
+                src: v,
+            });
         }
         // Resolve the iterator. `for await` uses the ASYNC iterator (@@asyncIterator
         // → @@iterator fallback); plain `for of` uses @@iterator. Built-ins/async
@@ -928,10 +1000,17 @@ impl<'a> FnCompiler<'a> {
             // The sync flag must survive the whole loop (read each iteration
             // for the AsyncFromSyncIteratorContinuation value-await below).
             let s = self.declare_local("<forof.sync>");
-            self.emit(Instr::GetAsyncIterator { dst: iter_reg, src: iter_reg, sync_dst: s });
+            self.emit(Instr::GetAsyncIterator {
+                dst: iter_reg,
+                src: iter_reg,
+                sync_dst: s,
+            });
             Some(s)
         } else {
-            self.emit(Instr::GetIterator { dst: iter_reg, src: iter_reg });
+            self.emit(Instr::GetIterator {
+                dst: iter_reg,
+                src: iter_reg,
+            });
             None
         };
         // GetIterator's iterator RECORD caches the `next` method ONCE in the
@@ -943,11 +1022,17 @@ impl<'a> FnCompiler<'a> {
             None
         } else {
             let n = self.declare_local("<forof.next>");
-            self.emit(Instr::IterPrime { dst: n, iter: iter_reg });
+            self.emit(Instr::IterPrime {
+                dst: n,
+                iter: iter_reg,
+            });
             Some(n)
         };
         let idx_reg = self.declare_local("<forof.idx>");
-        self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
+        self.emit(Instr::LoadInt {
+            dst: idx_reg,
+            val: 0,
+        });
         // Close-on-abrupt-exit (sync for-of only): the body runs under a `finally`
         // whose block is `IterCloseFinally` — the ONE place every abrupt exit meets
         // the iterator, so the close runs after the body's own catch/finally
@@ -1045,21 +1130,22 @@ impl<'a> FnCompiler<'a> {
         // Write the element straight into a plain-local loop var; use a temp for a
         // destructuring pattern, an assignment target, a cell-boxed var, or a
         // store-through `var` binding (catch-param / global / upvalue).
-        let elem = if pattern.is_some()
-            || assign_tgt.is_some()
-            || var_is_cell
-            || var_binding.is_some()
-        {
-            self.alloc_reg()
-        } else {
-            var_reg
-        };
+        let elem =
+            if pattern.is_some() || assign_tgt.is_some() || var_is_cell || var_binding.is_some() {
+                self.alloc_reg()
+            } else {
+                var_reg
+            };
         let jdone = if is_await {
             // `r = await <next step>; done = r.done; value = r.value`. ForAwaitNext
             // yields a Promise (async iterator) or a {value,done} (sync) — awaiting
             // suspends on the former and passes the latter straight through.
             let step = self.alloc_reg();
-            self.emit(Instr::ForAwaitNext { dst: step, iter: iter_reg, idx: idx_reg });
+            self.emit(Instr::ForAwaitNext {
+                dst: step,
+                iter: iter_reg,
+                idx: idx_reg,
+            });
             // AsyncFromSyncIteratorContinuation: a SYNC source's raw
             // {value,done} becomes the spec's capability promise resolving
             // to { value: await value, done } — built synchronously inside
@@ -1068,18 +1154,33 @@ impl<'a> FnCompiler<'a> {
             if let Some(s) = sync_reg {
                 let jskip = self.here();
                 self.emit(Instr::JumpIfFalse { cond: s, target: 0 });
-                self.emit(Instr::AsyncFromSyncStep { dst: step, step, iter: iter_reg });
+                self.emit(Instr::AsyncFromSyncStep {
+                    dst: step,
+                    step,
+                    iter: iter_reg,
+                });
                 let after = self.here();
                 self.patch_jump(jskip, after);
             }
             let r = self.alloc_reg();
             self.emit(Instr::Await { dst: r, val: step });
             let done_name = self.string_name("done");
-            self.emit(Instr::GetProp { dst: done, obj: r, name: done_name });
+            self.emit(Instr::GetProp {
+                dst: done,
+                obj: r,
+                name: done_name,
+            });
             let j = self.here();
-            self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            }); // done → exit
             let value_name = self.string_name("value");
-            self.emit(Instr::GetProp { dst: elem, obj: r, name: value_name });
+            self.emit(Instr::GetProp {
+                dst: elem,
+                obj: r,
+                name: value_name,
+            });
             j
         } else {
             self.emit(Instr::IterNext {
@@ -1090,7 +1191,10 @@ impl<'a> FnCompiler<'a> {
                 next: next_reg.unwrap_or(Reg::MAX),
             });
             let j = self.here();
-            self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            }); // done → exit
             j
         };
         // Enter the loop body's break/continue scope, then install the per-iteration
@@ -1099,7 +1203,10 @@ impl<'a> FnCompiler<'a> {
         // (popping the handler) on its way to the break/continue target.
         // The handler is OUTSIDE the IterNext/done-check above, so a throwing
         // `next()` (or normal exhaustion) does NOT close the iterator (per spec).
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
+        self.loop_ctx.push(LoopCtx::loop_frame(
+            self.pending_label.take(),
+            self.handler_depth,
+        ));
         // Record the iterator so a `break`/`continue` LEAVING this loop from inside a
         // nested one closes it, and (for-await only, which has no close handler) so
         // does a `return`.
@@ -1109,7 +1216,11 @@ impl<'a> FnCompiler<'a> {
             // also emit an inline IterClose for this frame — that would close twice.
             self.loop_ctx.last_mut().unwrap().close_via_finally = true;
             let at = self.here();
-            self.emit(Instr::PushFinally { target: 0, kind_reg: kr, val_reg: er });
+            self.emit(Instr::PushFinally {
+                target: 0,
+                kind_reg: kr,
+                val_reg: er,
+            });
             self.handler_depth += 1;
             Some(at)
         } else {
@@ -1153,7 +1264,10 @@ impl<'a> FnCompiler<'a> {
         } else if var_is_cell {
             // Per-iteration binding: a FRESH cell each iteration so a closure in
             // the body captures THIS element, not the last one (for-of let).
-            self.emit(Instr::Move { dst: var_reg, src: elem });
+            self.emit(Instr::Move {
+                dst: var_reg,
+                src: elem,
+            });
             self.emit(Instr::MakeCell { reg: var_reg });
             if head_const {
                 self.emit(Instr::MarkCellConst { reg: var_reg });
@@ -1166,32 +1280,44 @@ impl<'a> FnCompiler<'a> {
         // iteration exit (normal/throw/break/continue). Nested INSIDE the for-of's
         // close-on-throw handler, so a body throw disposes the resource first, then
         // closes the iterator.
-        let using_fin = if let (Some(is_async), Some((sreg, kreg, vreg))) =
-            (using_async, using_regs)
-        {
-            self.emit(Instr::OpenUsingScope { dst: sreg });
-            let src = if var_is_cell {
-                let t = self.alloc_reg();
-                self.emit(Instr::CellGet { dst: t, cell: var_reg });
-                t
+        let using_fin =
+            if let (Some(is_async), Some((sreg, kreg, vreg))) = (using_async, using_regs) {
+                self.emit(Instr::OpenUsingScope { dst: sreg });
+                let src = if var_is_cell {
+                    let t = self.alloc_reg();
+                    self.emit(Instr::CellGet {
+                        dst: t,
+                        cell: var_reg,
+                    });
+                    t
+                } else {
+                    var_reg
+                };
+                if is_async {
+                    self.emit(Instr::RegisterAsyncDisposable {
+                        scope: sreg,
+                        val: src,
+                    });
+                } else {
+                    self.emit(Instr::RegisterDisposable {
+                        scope: sreg,
+                        val: src,
+                    });
+                }
+                if var_is_cell {
+                    self.next_reg -= 1;
+                }
+                let push_at = self.here();
+                self.emit(Instr::PushFinally {
+                    target: 0,
+                    kind_reg: kreg,
+                    val_reg: vreg,
+                });
+                self.handler_depth += 1;
+                Some((is_async, sreg, kreg, vreg, push_at))
             } else {
-                var_reg
+                None
             };
-            if is_async {
-                self.emit(Instr::RegisterAsyncDisposable { scope: sreg, val: src });
-            } else {
-                self.emit(Instr::RegisterDisposable { scope: sreg, val: src });
-            }
-            if var_is_cell {
-                self.next_reg -= 1;
-            }
-            let push_at = self.here();
-            self.emit(Instr::PushFinally { target: 0, kind_reg: kreg, val_reg: vreg });
-            self.handler_depth += 1;
-            Some((is_async, sreg, kreg, vreg, push_at))
-        } else {
-            None
-        };
 
         self.stmt(body)?;
 
@@ -1210,9 +1336,16 @@ impl<'a> FnCompiler<'a> {
             if is_async {
                 self.emit_async_dispose_loop(sreg, kreg, vreg);
             } else {
-                self.emit(Instr::DisposeScope { scope: sreg, kind_reg: kreg, val_reg: vreg });
+                self.emit(Instr::DisposeScope {
+                    scope: sreg,
+                    kind_reg: kreg,
+                    val_reg: vreg,
+                });
             }
-            self.emit(Instr::EndFinally { kind_reg: kreg, val_reg: vreg });
+            self.emit(Instr::EndFinally {
+                kind_reg: kreg,
+                val_reg: vreg,
+            });
         }
 
         // Normal iteration completion: pop the close handler before looping (the
@@ -1234,8 +1367,14 @@ impl<'a> FnCompiler<'a> {
         // of those actually closes; `EndFinally` then resumes the completion.
         if let (Some(at), Some(kr), Some(er)) = (close_push, kind_reg, exc_reg) {
             let fin_start = self.here();
-            self.emit(Instr::IterCloseFinally { iter: iter_reg, kind_reg: kr });
-            self.emit(Instr::EndFinally { kind_reg: kr, val_reg: er });
+            self.emit(Instr::IterCloseFinally {
+                iter: iter_reg,
+                kind_reg: kr,
+            });
+            self.emit(Instr::EndFinally {
+                kind_reg: kr,
+                val_reg: er,
+            });
             if let Instr::PushFinally { target, .. } = &mut self.code[at as usize] {
                 *target = fin_start;
             }
@@ -1344,14 +1483,28 @@ impl<'a> FnCompiler<'a> {
             self.param_tdz.remove(n);
         }
         if v != obj_reg {
-            self.emit(Instr::Move { dst: obj_reg, src: v });
+            self.emit(Instr::Move {
+                dst: obj_reg,
+                src: v,
+            });
         }
         let keys_reg = self.declare_local("<forin.keys>");
-        self.emit(Instr::ForInKeys { dst: keys_reg, obj: obj_reg });
+        self.emit(Instr::ForInKeys {
+            dst: keys_reg,
+            obj: obj_reg,
+        });
         let len_reg = self.declare_local("<forin.len>");
-        self.emit(Instr::LenOf { dst: len_reg, obj: keys_reg });
+        self.emit(Instr::LenOf {
+            dst: len_reg,
+            obj: keys_reg,
+        });
         let idx_reg = self.declare_local("<forin.idx>");
-        self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
+        self.emit(Instr::LoadInt {
+            dst: idx_reg,
+            // `ForInKeys` carries its receiver/version guard in an engine-private
+            // prefix. JavaScript-visible keys start after it.
+            val: crate::bytecode::FORIN_SNAPSHOT_PREFIX as i32,
+        });
 
         let head_lexical = matches!(left, ast::ForTarget::Var(d) if d.kind.is_lexical());
         let head_const = matches!(left, ast::ForTarget::Var(d) if matches!(
@@ -1412,10 +1565,18 @@ impl<'a> FnCompiler<'a> {
         let jf;
         if exprs::fused_cmp_jump_enabled() {
             jf = self.here();
-            self.emit(Instr::JumpIfNotLt { a: idx_reg, b: len_reg, target: 0 });
+            self.emit(Instr::JumpIfNotLt {
+                a: idx_reg,
+                b: len_reg,
+                target: 0,
+            });
         } else {
             let cond = self.temp();
-            self.emit(Instr::Lt { dst: cond, a: idx_reg, b: len_reg });
+            self.emit(Instr::Lt {
+                dst: cond,
+                a: idx_reg,
+                b: len_reg,
+            });
             jf = self.here();
             self.emit(Instr::JumpIfFalse { cond, target: 0 });
             self.next_reg -= 1;
@@ -1430,15 +1591,29 @@ impl<'a> FnCompiler<'a> {
         } else {
             var_reg
         };
-        self.emit(Instr::GetIndex { dst: key_dst, obj: keys_reg, key: idx_reg });
+        self.emit(Instr::GetIndex {
+            dst: key_dst,
+            obj: keys_reg,
+            key: idx_reg,
+        });
         // EnumerateObjectProperties: a not-yet-visited key DELETED during the
         // loop is skipped — re-check liveness against the receiver each
         // iteration (the snapshot in keys_reg is taken once) and jump to the
         // increment when the key is gone.
         let live = self.temp();
-        self.emit(Instr::ForInLive { dst: live, obj: obj_reg, key: key_dst });
+        // Pass the snapshot, not just the receiver: its private prefix owns the
+        // exact receiver + versions captured by THIS enumeration. That is what
+        // keeps nested/re-entrant walks from sharing mutable guard state.
+        self.emit(Instr::ForInLive {
+            dst: live,
+            obj: keys_reg,
+            key: key_dst,
+        });
         let live_jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond: live, target: 0 });
+        self.emit(Instr::JumpIfFalse {
+            cond: live,
+            target: 0,
+        });
         self.next_reg -= 1;
         if let Some(p) = pattern {
             if head_lexical {
@@ -1476,7 +1651,10 @@ impl<'a> FnCompiler<'a> {
         }
         self.next_reg = save;
 
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
+        self.loop_ctx.push(LoopCtx::loop_frame(
+            self.pending_label.take(),
+            self.handler_depth,
+        ));
         self.stmt(body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -1484,7 +1662,12 @@ impl<'a> FnCompiler<'a> {
         for c in ctx.continue_jumps {
             self.patch_jump(c, cont); // continue → increment + re-test
         }
-        self.emit(Instr::AddInt { dst: idx_reg, a: idx_reg, imm: 1, upd: false });
+        self.emit(Instr::AddInt {
+            dst: idx_reg,
+            a: idx_reg,
+            imm: 1,
+            upd: false,
+        });
         self.emit(Instr::Jump { target: top });
         let end = self.here();
         self.patch_jump(jf, end);
@@ -1517,7 +1700,10 @@ impl<'a> FnCompiler<'a> {
         let floor = self.loop_ctx[idx].handler_depth;
         let j = self.here();
         if self.handler_depth > floor {
-            self.emit(Instr::JumpFinally { target: 0, floor: floor as u16 });
+            self.emit(Instr::JumpFinally {
+                target: 0,
+                floor: floor as u16,
+            });
         } else {
             self.emit(Instr::Jump { target: 0 });
         }
@@ -1527,5 +1713,4 @@ impl<'a> FnCompiler<'a> {
             self.loop_ctx[idx].continue_jumps.push(j);
         }
     }
-
 }

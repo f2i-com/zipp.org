@@ -22,6 +22,37 @@ mod bytecode;
 mod capture;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod codegen;
+// These five switches gate semantics-preserving interpreter fast paths as well
+// as their native-JIT twins. Their same-binary A/B latches live in `codegen`
+// on native x86-64 builds; interpreter-only hosts (including wasm) have no JIT
+// comparator, so keep the production paths enabled without pulling in dynasm.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+mod codegen {
+    #[inline]
+    pub(crate) const fn hole_absent_fast_enabled() -> bool {
+        true
+    }
+
+    #[inline]
+    pub(crate) const fn hole_undef_enabled() -> bool {
+        true
+    }
+
+    #[inline]
+    pub(crate) const fn index_in_overlay_enabled() -> bool {
+        true
+    }
+
+    #[inline]
+    pub(crate) const fn forin_arr_own_enabled() -> bool {
+        true
+    }
+
+    #[inline]
+    pub(crate) const fn forin_version_fast_enabled() -> bool {
+        true
+    }
+}
 mod compile;
 /// Persistent-VM embedding API, for hosts that keep a script alive across many
 /// re-entries rather than running it once (see the module docs).
@@ -29,11 +60,11 @@ pub mod embed;
 mod front;
 pub use front::set_pure_script_goal;
 mod heap;
-mod slot_table;
 /// Hand-written front end (lexer/AST/parser) being built to replace
 /// `oxc_parser` — see the module docs for why. Not yet wired in.
 mod parse;
 mod shape;
+mod slot_table;
 
 /// Transition-tree diagnostics: `(nodes, max fan-out, total edges)`. Behind
 /// `ZIPP_SHAPESTATS=1` in the CLI — fan-out is what decides whether a linear
@@ -140,6 +171,12 @@ pub fn regexp_scalar_exec_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
 /// was set.
 pub fn async_stats() -> (u64, u64, u64, u64, u64, u64) {
     vm::async_stats()
+}
+
+/// Number of already-settled awaits continued by the bounded FIFO trampoline
+/// while `ZIPP_ASYNCSTATS=1` is active.
+pub fn async_inline_await_stats() -> u64 {
+    vm::async_inline_await_stats()
 }
 
 /// `ZIPP_ICSTATS=1` native property-cache miss breakdown:
@@ -257,7 +294,6 @@ pub fn jit_enabled() -> bool {
 pub mod value;
 mod vm;
 
-
 pub use value::Value;
 
 /// Install the host's clocks — honored on every target, required on wasm32.
@@ -345,8 +381,11 @@ pub fn parse_to_text(src: &str, module: bool) -> Result<String, String> {
 /// Parse + compile, no VM. Shares `run_with_base`'s Annex B parse-retry so the
 /// dump reflects what would actually run.
 fn compile_only(src: &str, module: bool) -> Result<bytecode::Program, String> {
-    let ast =
-        if module { front::parse_module(src)? } else { front::parse_script(src)? };
+    let ast = if module {
+        front::parse_module(src)?
+    } else {
+        front::parse_script(src)?
+    };
     compile::compile_program(&ast, src)
 }
 
@@ -363,7 +402,10 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
     // running (so the JIT-able regions can be inspected).
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
-            eprintln!("── fn {fid} (regs={}, params={}) ──", f.reg_count, f.param_count);
+            eprintln!(
+                "── fn {fid} (regs={}, params={}) ──",
+                f.reg_count, f.param_count
+            );
             for (ip, instr) in f.code.iter().enumerate() {
                 eprintln!("  {ip:4}  {instr:?}");
             }
@@ -372,7 +414,11 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
     let mut vm = vm::Vm::new(&program);
     vm.set_module_base_dir(base_dir);
     match vm.run() {
-        Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+        Ok(_) => Ok(Outcome {
+            output: vm.output,
+            errput: vm.errput,
+            error: None,
+        }),
         Err(thrown) => Ok(Outcome {
             output: std::mem::take(&mut vm.output),
             errput: std::mem::take(&mut vm.errput),
@@ -412,7 +458,11 @@ pub fn run_with_harness(
     let mut vm = vm::Vm::new(&program);
     vm.set_module_base_dir(base_dir);
     match vm.run_with_prelude(Some(harness)) {
-        Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+        Ok(_) => Ok(Outcome {
+            output: vm.output,
+            errput: vm.errput,
+            error: None,
+        }),
         Err(thrown) => Ok(Outcome {
             output: std::mem::take(&mut vm.output),
             errput: std::mem::take(&mut vm.errput),
@@ -463,7 +513,11 @@ pub fn run_module_file(
         });
     }
     match vm.run_module_entry(path) {
-        Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+        Ok(_) => Ok(Outcome {
+            output: vm.output,
+            errput: vm.errput,
+            error: None,
+        }),
         Err(thrown) if thrown.0.contains("top-level await is not supported") => {
             // ENTRY top-level await: rerun on a fresh Vm via the direct
             // async-capable module path, with the harness prepended (the
@@ -488,7 +542,11 @@ pub fn run_module_file(
             let mut vm = vm::Vm::new(&program2);
             vm.set_module_base_dir(base_dir);
             match vm.run_module() {
-                Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+                Ok(_) => Ok(Outcome {
+                    output: vm.output,
+                    errput: vm.errput,
+                    error: None,
+                }),
                 Err(thrown) => Ok(Outcome {
                     output: std::mem::take(&mut vm.output),
                     errput: std::mem::take(&mut vm.errput),
@@ -504,12 +562,18 @@ pub fn run_module_file(
     }
 }
 
-pub fn run_module_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
+pub fn run_module_with_base(
+    src: &str,
+    base_dir: Option<std::path::PathBuf>,
+) -> Result<Outcome, String> {
     let ast = front::parse_module(src)?;
     let program = compile::compile_module(&ast, src)?;
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
-            eprintln!("── fn {fid} (regs={}, params={}) ──", f.reg_count, f.param_count);
+            eprintln!(
+                "── fn {fid} (regs={}, params={}) ──",
+                f.reg_count, f.param_count
+            );
             for (ip, instr) in f.code.iter().enumerate() {
                 eprintln!("  {ip:4}  {instr:?}");
             }
@@ -518,7 +582,11 @@ pub fn run_module_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> 
     let mut vm = vm::Vm::new(&program);
     vm.set_module_base_dir(base_dir);
     match vm.run_module() {
-        Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+        Ok(_) => Ok(Outcome {
+            output: vm.output,
+            errput: vm.errput,
+            error: None,
+        }),
         Err(thrown) => Ok(Outcome {
             output: std::mem::take(&mut vm.output),
             errput: std::mem::take(&mut vm.errput),
@@ -540,7 +608,10 @@ mod tests {
     #[test]
     fn console_log_basics() {
         assert_eq!(run_ok("console.log(1, 2, 3)"), vec!["1 2 3"]);
-        assert_eq!(run_ok("console.log('hi', true, null)"), vec!["hi true null"]);
+        assert_eq!(
+            run_ok("console.log('hi', true, null)"),
+            vec!["hi true null"]
+        );
     }
 
     #[test]
@@ -583,11 +654,26 @@ mod tests {
     #[test]
     fn var_is_legal_as_an_unbraced_statement_body() {
         assert_eq!(run_ok("if(true)var x=1; console.log(x)"), vec!["1"]);
-        assert_eq!(run_ok("if(false)var x=1; else var y=2; console.log(y)"), vec!["2"]);
-        assert_eq!(run_ok("for(var i=0;i<1;i++)var q=5; console.log(q)"), vec!["5"]);
-        assert_eq!(run_ok("for(var k in {a:1})var m=1; console.log(m)"), vec!["1"]);
-        assert_eq!(run_ok("for(var v of [1])var n=2; console.log(n)"), vec!["2"]);
-        assert_eq!(run_ok("do var d=1; while(false); console.log(d)"), vec!["1"]);
+        assert_eq!(
+            run_ok("if(false)var x=1; else var y=2; console.log(y)"),
+            vec!["2"]
+        );
+        assert_eq!(
+            run_ok("for(var i=0;i<1;i++)var q=5; console.log(q)"),
+            vec!["5"]
+        );
+        assert_eq!(
+            run_ok("for(var k in {a:1})var m=1; console.log(m)"),
+            vec!["1"]
+        );
+        assert_eq!(
+            run_ok("for(var v of [1])var n=2; console.log(n)"),
+            vec!["2"]
+        );
+        assert_eq!(
+            run_ok("do var d=1; while(false); console.log(d)"),
+            vec!["1"]
+        );
         assert_eq!(run_ok("var i=0; while(i<1){i++} console.log(i)"), vec!["1"]);
         // `var` hoists out of the body, so it is visible afterwards even when
         // the branch never ran.
@@ -684,17 +770,41 @@ mod tests {
     #[test]
     fn assign_reads_target() {
         // The two forms that build incrementally.
-        assert_eq!(run_ok("let e = 'old'; e = {v: e}; console.log(e.v)"), vec!["old"]);
-        assert_eq!(run_ok("let e = 'old'; e = `<${e}>`; console.log(e)"), vec!["<old>"]);
+        assert_eq!(
+            run_ok("let e = 'old'; e = {v: e}; console.log(e.v)"),
+            vec!["old"]
+        );
+        assert_eq!(
+            run_ok("let e = 'old'; e = `<${e}>`; console.log(e)"),
+            vec!["<old>"]
+        );
         // Reached through the transparent forms.
-        assert_eq!(run_ok("let e = 'old'; e = e ? {v: e} : 0; console.log(e.v)"), vec!["old"]);
-        assert_eq!(run_ok("let e = 'old'; e = e && {v: e}; console.log(e.v)"), vec!["old"]);
-        assert_eq!(run_ok("let e = 'old'; e = (0, {v: e}); console.log(e.v)"), vec!["old"]);
-        assert_eq!(run_ok("let e = 'old'; e = {a: {b: e}}; console.log(e.a.b)"), vec!["old"]);
-        assert_eq!(run_ok("let e = 'old'; e = {...{}, v: e}; console.log(e.v)"), vec!["old"]);
+        assert_eq!(
+            run_ok("let e = 'old'; e = e ? {v: e} : 0; console.log(e.v)"),
+            vec!["old"]
+        );
+        assert_eq!(
+            run_ok("let e = 'old'; e = e && {v: e}; console.log(e.v)"),
+            vec!["old"]
+        );
+        assert_eq!(
+            run_ok("let e = 'old'; e = (0, {v: e}); console.log(e.v)"),
+            vec!["old"]
+        );
+        assert_eq!(
+            run_ok("let e = 'old'; e = {a: {b: e}}; console.log(e.a.b)"),
+            vec!["old"]
+        );
+        assert_eq!(
+            run_ok("let e = 'old'; e = {...{}, v: e}; console.log(e.v)"),
+            vec!["old"]
+        );
         // Forms that were already correct must stay correct (and keep compiling
         // in place — this asserts behaviour, not codegen, but pins the semantics).
-        assert_eq!(run_ok("let e = 'old'; e = [e]; console.log(e[0])"), vec!["old"]);
+        assert_eq!(
+            run_ok("let e = 'old'; e = [e]; console.log(e[0])"),
+            vec!["old"]
+        );
         assert_eq!(run_ok("let e = 1; e = e + 1; console.log(e)"), vec!["2"]);
         assert_eq!(
             run_ok("function f(x){return x} let e = 'old'; e = f(e); console.log(e)"),
@@ -857,13 +967,19 @@ mod tests {
     #[test]
     fn int_region_positive_sum() {
         // sum 0..999 = 499500 (stays well within i32).
-        assert_jit_matches("let s=0; for(let i=0;i<1000;i++){ s+=i; } console.log(s)", &["499500"]);
+        assert_jit_matches(
+            "let s=0; for(let i=0;i<1000;i++){ s+=i; } console.log(s)",
+            &["499500"],
+        );
     }
 
     #[test]
     fn int_region_subtraction_negative() {
         // 0 - (0+1+...+999) = -499500 (negative i64, signed flush to Int).
-        assert_jit_matches("let s=0; for(let i=0;i<1000;i++){ s-=i; } console.log(s)", &["-499500"]);
+        assert_jit_matches(
+            "let s=0; for(let i=0;i<1000;i++){ s-=i; } console.log(s)",
+            &["-499500"],
+        );
     }
 
     // ── B67: the tier facts whose guards live in more than one place ──
@@ -1545,13 +1661,19 @@ mod tests {
     #[test]
     fn early_exit_flush_def_first_move() {
         // Returned 8 (the loop counter's value, via a unified home) instead of 7.
-        assert_jit_matches("var s=999; for(var i=0;i<8;i++){ s=i; } console.log(s)", &["7"]);
+        assert_jit_matches(
+            "var s=999; for(var i=0;i<8;i++){ s=i; } console.log(s)",
+            &["7"],
+        );
     }
 
     #[test]
     fn early_exit_flush_def_first_arith() {
         // Returned 0 — an xmm home that was never loaded and never written.
-        assert_jit_matches("var s=999; for(var i=0;i<8;i++){ s=(i*3)|0|0; } console.log(s)", &["21"]);
+        assert_jit_matches(
+            "var s=999; for(var i=0;i<8;i++){ s=(i*3)|0|0; } console.log(s)",
+            &["21"],
+        );
     }
 
     #[test]
@@ -1755,7 +1877,10 @@ mod tests {
     fn int_region_crosses_i32() {
         // sum 0..99999 = 4999950000 > 2^31 — value stays i64 in the loop, flushes
         // as a DOUBLE (since >i32) and must render identically to the interpreter.
-        assert_jit_matches("let s=0; for(let i=0;i<100000;i++){ s+=i; } console.log(s)", &["4999950000"]);
+        assert_jit_matches(
+            "let s=0; for(let i=0;i<100000;i++){ s+=i; } console.log(s)",
+            &["4999950000"],
+        );
     }
 
     #[test]
@@ -2017,7 +2142,10 @@ mod tests {
     fn large_whole_double_uses_shortest_roundtrip() {
         // JS Number→String prints the shortest decimal that round-trips, and a
         // whole double above i64::MAX must not overflow `as i64`.
-        assert_eq!(run_ok("console.log(4660046610375530496)"), vec!["4660046610375530000"]);
+        assert_eq!(
+            run_ok("console.log(4660046610375530496)"),
+            vec!["4660046610375530000"]
+        );
         assert_eq!(run_ok("console.log(1e20)"), vec!["100000000000000000000"]);
         assert_eq!(run_ok("console.log(1e19)"), vec!["10000000000000000000"]);
     }
@@ -2041,7 +2169,9 @@ mod tests {
     #[test]
     fn recursion_fib() {
         assert_eq!(
-            run_ok("function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2) } console.log(fib(10))"),
+            run_ok(
+                "function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2) } console.log(fib(10))"
+            ),
             vec!["55"]
         );
     }
@@ -2076,9 +2206,15 @@ mod tests {
 
     #[test]
     fn array_literal_and_index() {
-        assert_eq!(run_ok("let a = [10, 20, 30]; console.log(a[0], a[1], a[2])"), vec!["10 20 30"]);
+        assert_eq!(
+            run_ok("let a = [10, 20, 30]; console.log(a[0], a[1], a[2])"),
+            vec!["10 20 30"]
+        );
         assert_eq!(run_ok("let a = [1,2,3]; console.log(a.length)"), vec!["3"]);
-        assert_eq!(run_ok("let a = [1,2,3]; a[1] = 99; console.log(a[1])"), vec!["99"]);
+        assert_eq!(
+            run_ok("let a = [1,2,3]; a[1] = 99; console.log(a[1])"),
+            vec!["99"]
+        );
     }
 
     #[test]
@@ -2109,8 +2245,14 @@ mod tests {
 
     #[test]
     fn front_parse_script_raises_early_errors() {
-        assert!(crate::front::parse_script("let x; let x;").is_err(), "dup lexical");
-        assert!(crate::front::parse_auto("let x; let x;").is_err(), "dup via auto");
+        assert!(
+            crate::front::parse_script("let x; let x;").is_err(),
+            "dup lexical"
+        );
+        assert!(
+            crate::front::parse_auto("let x; let x;").is_err(),
+            "dup via auto"
+        );
         assert!(run("let x; let x;").is_err(), "dup via run()");
     }
 
@@ -2120,18 +2262,30 @@ mod tests {
         // as a hole: the result is DENSE. Copying the backing store verbatim
         // instead made `[...Array(3)]` sparse, and every hole-skipping method
         // then silently did nothing — `.map` returned three holes, not [0,1,2].
-        assert_eq!(run_ok("let a = [...Array(3)]; console.log(0 in a, a.length)"), vec!["true 3"]);
+        assert_eq!(
+            run_ok("let a = [...Array(3)]; console.log(0 in a, a.length)"),
+            vec!["true 3"]
+        );
         assert_eq!(
             run_ok("console.log(JSON.stringify([...Array(3)].map((_, i) => i)))"),
             vec!["[0,1,2]"]
         );
-        assert_eq!(run_ok("let b = [...[1, , 3]]; console.log(1 in b)"), vec!["true"]);
+        assert_eq!(
+            run_ok("let b = [...[1, , 3]]; console.log(1 in b)"),
+            vec!["true"]
+        );
 
         // Every construct that materializes an array by iterating it.
-        assert_eq!(run_ok("let [, ...r] = [1, , 3]; console.log(0 in r)"), vec!["true"]);
+        assert_eq!(
+            run_ok("let [, ...r] = [1, , 3]; console.log(0 in r)"),
+            vec!["true"]
+        );
         assert_eq!(run_ok("console.log(1 in [...[...[1, , 3]]])"), vec!["true"]);
         assert_eq!(run_ok("console.log(2 in [9, ...[1, , 3]])"), vec!["true"]);
-        assert_eq!(run_ok("console.log(0 in Array.from(Array(2)))"), vec!["true"]);
+        assert_eq!(
+            run_ok("console.log(0 in Array.from(Array(2)))"),
+            vec!["true"]
+        );
 
         // The hole resolves THROUGH the prototype chain, and the consumer stores
         // the result as an own property — so it outlives the prototype entry.
@@ -2184,14 +2338,23 @@ mod tests {
             run_ok("let a = [1]; a.push(2); a.push(3); console.log(a.length, a[2])"),
             vec!["3 3"]
         );
-        assert_eq!(run_ok("let a = [1,2,3]; let x = a.pop(); console.log(x, a.length)"), vec!["3 2"]);
+        assert_eq!(
+            run_ok("let a = [1,2,3]; let x = a.pop(); console.log(x, a.length)"),
+            vec!["3 2"]
+        );
     }
 
     #[test]
     fn object_literal_and_props() {
-        assert_eq!(run_ok("let o = {a: 1, b: 2}; console.log(o.a, o.b)"), vec!["1 2"]);
+        assert_eq!(
+            run_ok("let o = {a: 1, b: 2}; console.log(o.a, o.b)"),
+            vec!["1 2"]
+        );
         assert_eq!(run_ok("let o = {}; o.x = 5; console.log(o.x)"), vec!["5"]);
-        assert_eq!(run_ok("let o = {a: 1}; o['b'] = 2; console.log(o['a'], o['b'])"), vec!["1 2"]);
+        assert_eq!(
+            run_ok("let o = {a: 1}; o['b'] = 2; console.log(o['a'], o['b'])"),
+            vec!["1 2"]
+        );
     }
 
     #[test]
@@ -2203,7 +2366,10 @@ mod tests {
     #[test]
     fn object_reference_semantics() {
         // Aliasing: mutating through one binding is visible through the other.
-        assert_eq!(run_ok("let a = {n: 1}; let b = a; b.n = 9; console.log(a.n)"), vec!["9"]);
+        assert_eq!(
+            run_ok("let a = {n: 1}; let b = a; b.n = 9; console.log(a.n)"),
+            vec!["9"]
+        );
     }
 
     #[test]
@@ -2224,15 +2390,27 @@ mod tests {
 
     #[test]
     fn function_expression_and_arrow() {
-        assert_eq!(run_ok("let f = function(a){ return a*2 }; console.log(f(21))"), vec!["42"]);
+        assert_eq!(
+            run_ok("let f = function(a){ return a*2 }; console.log(f(21))"),
+            vec!["42"]
+        );
         assert_eq!(run_ok("let g = a => a + 1; console.log(g(41))"), vec!["42"]);
-        assert_eq!(run_ok("let h = (a, b) => a * b; console.log(h(6, 7))"), vec!["42"]);
+        assert_eq!(
+            run_ok("let h = (a, b) => a * b; console.log(h(6, 7))"),
+            vec!["42"]
+        );
     }
 
     #[test]
     fn nested_arrays_and_objects_inspect() {
-        assert_eq!(run_ok("console.log([1, [2, 3], 4])"), vec!["[ 1, [ 2, 3 ], 4 ]"]);
-        assert_eq!(run_ok("console.log({a: [1, 2], b: {c: 3}})"), vec!["{ a: [ 1, 2 ], b: { c: 3 } }"]);
+        assert_eq!(
+            run_ok("console.log([1, [2, 3], 4])"),
+            vec!["[ 1, [ 2, 3 ], 4 ]"]
+        );
+        assert_eq!(
+            run_ok("console.log({a: [1, 2], b: {c: 3}})"),
+            vec!["{ a: [ 1, 2 ], b: { c: 3 } }"]
+        );
     }
 
     #[test]
@@ -2284,20 +2462,35 @@ mod tests {
         // Literal int array (int-tagged elements): full native run.
         assert_jit_matches("console.log([1,2,3,4].map(x=>x*2).join(','))", &["2,4,6,8"]);
         // Two-param callback (element, index).
-        assert_jit_matches("console.log([10,20,30].map((x,i)=>x+i).join(','))", &["10,21,32"]);
+        assert_jit_matches(
+            "console.log([10,20,30].map((x,i)=>x+i).join(','))",
+            &["10,21,32"],
+        );
         // Division (f64).
         assert_jit_matches("console.log([4,6,9].map(x=>x/2).join(','))", &["2,3,4.5"]);
         // Mixed int/double: kernel runs the int prefix, bails at 3.5, the tail
         // (interpreter) finishes — same answer as a full interpreter run.
-        assert_jit_matches("console.log([1,2,3.5,4].map(x=>x*2).join(','))", &["2,4,7,8"]);
+        assert_jit_matches(
+            "console.log([1,2,3.5,4].map(x=>x*2).join(','))",
+            &["2,4,7,8"],
+        );
         // Non-numeric element → bail to the tail, which yields NaN (== node).
-        assert_jit_matches("console.log([1,2,'x',4].map(x=>x*2).join(','))", &["2,4,NaN,8"]);
+        assert_jit_matches(
+            "console.log([1,2,'x',4].map(x=>x*2).join(','))",
+            &["2,4,NaN,8"],
+        );
         // Overflow past i32: f64 stays exact (no wrap).
-        assert_jit_matches("console.log([2,1000000000,3].map(x=>x*3).join(','))", &["6,3000000000,9"]);
+        assert_jit_matches(
+            "console.log([2,1000000000,3].map(x=>x*3).join(','))",
+            &["6,3000000000,9"],
+        );
         // Empty array.
         assert_jit_matches("console.log([].map(x=>x*2).length)", &["0"]);
         // Compound arithmetic body.
-        assert_jit_matches("console.log([1,2,3,4].map(x=>x*2+1).join(','))", &["3,5,7,9"]);
+        assert_jit_matches(
+            "console.log([1,2,3,4].map(x=>x*2+1).join(','))",
+            &["3,5,7,9"],
+        );
     }
 
     #[test]
@@ -2333,23 +2526,47 @@ mod tests {
         // or `%`-comparison) selects elements; non-Bool predicates and non-number
         // elements fall to the per-element tail (JS truthiness). Must agree with
         // the interpreter and node across int/double, mixed, index, and empty.
-        assert_jit_matches("console.log([1,2,3,4,5,6].filter(x=>x%2===0).join(','))", &["2,4,6"]);
-        assert_jit_matches("console.log([1,2,3,4,5,6,7,8,9].filter(x=>x%3===0).join(','))", &["3,6,9"]);
-        assert_jit_matches("console.log([5,3,8,1,9,2].filter(x=>x>=5).join(','))", &["5,8,9"]);
-        assert_jit_matches("console.log([1,2,3,4,5].filter(x=>x<=2).join(','))", &["1,2"]);
+        assert_jit_matches(
+            "console.log([1,2,3,4,5,6].filter(x=>x%2===0).join(','))",
+            &["2,4,6"],
+        );
+        assert_jit_matches(
+            "console.log([1,2,3,4,5,6,7,8,9].filter(x=>x%3===0).join(','))",
+            &["3,6,9"],
+        );
+        assert_jit_matches(
+            "console.log([5,3,8,1,9,2].filter(x=>x>=5).join(','))",
+            &["5,8,9"],
+        );
+        assert_jit_matches(
+            "console.log([1,2,3,4,5].filter(x=>x<=2).join(','))",
+            &["1,2"],
+        );
         // Loop-built (double) array.
         assert_jit_matches(
             "let a=[]; for(let i=0;i<100;i++) a[i]=i; console.log(a.filter(x=>x%10===0).length)",
             &["10"],
         );
         // Mixed: 3.5 % 2 !== 0 (kept-out), and the run continues past it.
-        assert_jit_matches("console.log([1,2,3.5,4,6].filter(x=>x%2===0).join(','))", &["2,4,6"]);
+        assert_jit_matches(
+            "console.log([1,2,3.5,4,6].filter(x=>x%2===0).join(','))",
+            &["2,4,6"],
+        );
         // Non-number element → predicate bails to the tail ('x' % 2 !== 0).
-        assert_jit_matches("console.log([1,2,'x',4].filter(x=>x%2===0).join(','))", &["2,4"]);
+        assert_jit_matches(
+            "console.log([1,2,'x',4].filter(x=>x%2===0).join(','))",
+            &["2,4"],
+        );
         // Non-Bool predicate result (bare value) → tail evaluates JS truthiness.
-        assert_jit_matches("console.log([0,1,2,0,3].filter(x=>x).join(','))", &["1,2,3"]);
+        assert_jit_matches(
+            "console.log([0,1,2,0,3].filter(x=>x).join(','))",
+            &["1,2,3"],
+        );
         // Index predicate (2-param).
-        assert_jit_matches("console.log([1,2,3,4,5,6].filter((x,i)=>i%2===0).join(','))", &["1,3,5"]);
+        assert_jit_matches(
+            "console.log([1,2,3,4,5,6].filter((x,i)=>i%2===0).join(','))",
+            &["1,3,5"],
+        );
         // Empty.
         assert_jit_matches("console.log([].filter(x=>x>0).length)", &["0"]);
     }
@@ -2362,7 +2579,9 @@ mod tests {
         );
         // sort returns the same array reference and mutates in place.
         assert_eq!(
-            run_ok("let a = [3,1,2]; let b = a.sort((x,y)=>x-y); console.log(a.join(','), a === b)"),
+            run_ok(
+                "let a = [3,1,2]; let b = a.sort((x,y)=>x-y); console.log(a.join(','), a === b)"
+            ),
             vec!["1,2,3 true"]
         );
     }
@@ -2379,16 +2598,31 @@ mod tests {
     fn array_misc_methods() {
         assert_eq!(run_ok("console.log([1,2,3].indexOf(2))"), vec!["1"]);
         assert_eq!(run_ok("console.log([1,2,3].includes(5))"), vec!["false"]);
-        assert_eq!(run_ok("console.log([1,2,3,4].slice(1,3).join(','))"), vec!["2,3"]);
-        assert_eq!(run_ok("let a=[1,2,3]; console.log(a.shift(), a.join(','))"), vec!["1 2,3"]);
+        assert_eq!(
+            run_ok("console.log([1,2,3,4].slice(1,3).join(','))"),
+            vec!["2,3"]
+        );
+        assert_eq!(
+            run_ok("let a=[1,2,3]; console.log(a.shift(), a.join(','))"),
+            vec!["1 2,3"]
+        );
     }
 
     #[test]
     fn string_indexing_and_methods() {
-        assert_eq!(run_ok("let s = 'hello'; console.log(s[0], s[4], s.length)"), vec!["h o 5"]);
+        assert_eq!(
+            run_ok("let s = 'hello'; console.log(s[0], s[4], s.length)"),
+            vec!["h o 5"]
+        );
         assert_eq!(run_ok("console.log('hello'.toUpperCase())"), vec!["HELLO"]);
-        assert_eq!(run_ok("console.log('Hello World'.indexOf('World'))"), vec!["6"]);
-        assert_eq!(run_ok("console.log('a,b,c'.split(',').join('-'))"), vec!["a-b-c"]);
+        assert_eq!(
+            run_ok("console.log('Hello World'.indexOf('World'))"),
+            vec!["6"]
+        );
+        assert_eq!(
+            run_ok("console.log('a,b,c'.split(',').join('-'))"),
+            vec!["a-b-c"]
+        );
         assert_eq!(run_ok("console.log('ab'.repeat(3))"), vec!["ababab"]);
         assert_eq!(run_ok("console.log('hello'.slice(1, 4))"), vec!["ell"]);
     }
@@ -2423,7 +2657,10 @@ mod tests {
 
     #[test]
     fn arrow_captures_outer_let() {
-        assert_eq!(run_ok("let mul = 3; let f = x => x * mul; console.log(f(10))"), vec!["30"]);
+        assert_eq!(
+            run_ok("let mul = 3; let f = x => x * mul; console.log(f(10))"),
+            vec!["30"]
+        );
     }
 
     #[test]
@@ -2473,42 +2710,74 @@ mod tests {
 
     #[test]
     fn strict_vs_loose_distinct() {
-        assert_eq!(run_ok("console.log(1 === '1', 1 == '1')"), vec!["false true"]);
-        assert_eq!(run_ok("console.log(null === undefined, null == undefined)"), vec!["false true"]);
+        assert_eq!(
+            run_ok("console.log(1 === '1', 1 == '1')"),
+            vec!["false true"]
+        );
+        assert_eq!(
+            run_ok("console.log(null === undefined, null == undefined)"),
+            vec!["false true"]
+        );
     }
 
     #[test]
     fn nan_and_infinity_globals() {
         assert_eq!(run_ok("console.log(NaN == NaN)"), vec!["false"]);
         assert_eq!(run_ok("let x = 0/0; console.log(x === x)"), vec!["false"]);
-        assert_eq!(run_ok("console.log(Infinity > 1e308, -Infinity < 0)"), vec!["true true"]);
+        assert_eq!(
+            run_ok("console.log(Infinity > 1e308, -Infinity < 0)"),
+            vec!["true true"]
+        );
     }
 
     // ── Stage 4: for-of / for-in / do-while / try-catch-throw ──
 
     #[test]
     fn for_of_array_and_string() {
-        assert_eq!(run_ok("let s=0; for (const x of [1,2,3,4]) { s += x } console.log(s)"), vec!["10"]);
-        assert_eq!(run_ok("let s=''; for (const c of 'abc') { s = c + s } console.log(s)"), vec!["cba"]);
+        assert_eq!(
+            run_ok("let s=0; for (const x of [1,2,3,4]) { s += x } console.log(s)"),
+            vec!["10"]
+        );
+        assert_eq!(
+            run_ok("let s=''; for (const c of 'abc') { s = c + s } console.log(s)"),
+            vec!["cba"]
+        );
     }
 
     #[test]
     fn for_in_object_keys_and_values() {
-        assert_eq!(run_ok("let o={a:1,b:2,c:3}; let k=''; for (const key in o) { k += key } console.log(k)"), vec!["abc"]);
+        assert_eq!(
+            run_ok(
+                "let o={a:1,b:2,c:3}; let k=''; for (const key in o) { k += key } console.log(k)"
+            ),
+            vec!["abc"]
+        );
         assert_eq!(run_ok("let o={x:10,y:20,z:5}; let s=0; for (const key in o) { s += o[key] } console.log(s)"), vec!["35"]);
     }
 
     #[test]
     fn do_while_runs_body_first() {
-        assert_eq!(run_ok("let i=0,s=0; do { s+=i; i++ } while (i<5); console.log(s)"), vec!["10"]);
+        assert_eq!(
+            run_ok("let i=0,s=0; do { s+=i; i++ } while (i<5); console.log(s)"),
+            vec!["10"]
+        );
         // body runs at least once even when the condition is false initially
-        assert_eq!(run_ok("let n=0; do { n++ } while (false); console.log(n)"), vec!["1"]);
+        assert_eq!(
+            run_ok("let n=0; do { n++ } while (false); console.log(n)"),
+            vec!["1"]
+        );
     }
 
     #[test]
     fn try_catch_basic() {
-        assert_eq!(run_ok("try { throw 'boom' } catch (e) { console.log('caught', e) }"), vec!["caught boom"]);
-        assert_eq!(run_ok("try { throw 42 } catch (e) { console.log(e + 1) }"), vec!["43"]);
+        assert_eq!(
+            run_ok("try { throw 'boom' } catch (e) { console.log('caught', e) }"),
+            vec!["caught boom"]
+        );
+        assert_eq!(
+            run_ok("try { throw 42 } catch (e) { console.log(e + 1) }"),
+            vec!["43"]
+        );
     }
 
     #[test]
@@ -2535,15 +2804,27 @@ mod tests {
     #[test]
     fn try_finally_runs_on_all_exits() {
         // `return` inside try runs the finally first (sync function).
-        assert_eq!(run_ok("function f(){try{return 'A'}finally{console.log('fin')}} console.log(f())"), vec!["fin", "A"]);
+        assert_eq!(
+            run_ok("function f(){try{return 'A'}finally{console.log('fin')}} console.log(f())"),
+            vec!["fin", "A"]
+        );
         // Plain `return` in try/finally, no catch.
-        assert_eq!(run_ok("function f(){try{return 1}finally{console.log('f')}} console.log(f())"), vec!["f", "1"]);
+        assert_eq!(
+            run_ok("function f(){try{return 1}finally{console.log('f')}} console.log(f())"),
+            vec!["f", "1"]
+        );
         // Nested try/finally: both finallys run, innermost first.
         assert_eq!(run_ok("function f(){try{try{return 'v'}finally{console.log('in')}}finally{console.log('out')}} console.log(f())"), vec!["in", "out", "v"]);
         // finally overrides the try's return.
-        assert_eq!(run_ok("function f(){try{return 'try'}finally{return 'fin'}} console.log(f())"), vec!["fin"]);
+        assert_eq!(
+            run_ok("function f(){try{return 'try'}finally{return 'fin'}} console.log(f())"),
+            vec!["fin"]
+        );
         // finally overrides a throw with a return.
-        assert_eq!(run_ok("function f(){try{throw 'x'}finally{return 'saved'}} console.log(f())"), vec!["saved"]);
+        assert_eq!(
+            run_ok("function f(){try{throw 'x'}finally{return 'saved'}} console.log(f())"),
+            vec!["saved"]
+        );
         // A throw in finally overrides the try's return; caught one level out.
         assert_eq!(run_ok("function f(){try{try{return 'x'}finally{throw 'ft'}}catch(e){return 'caught '+e}} console.log(f())"), vec!["caught ft"]);
         // Throw propagates THROUGH a finally (uncaught locally) across a call.
@@ -2556,8 +2837,14 @@ mod tests {
 
     #[test]
     fn error_object_name_and_message() {
-        assert_eq!(run_ok("try { throw new Error('boom') } catch (e) { console.log(e.message, e.name) }"), vec!["boom Error"]);
-        assert_eq!(run_ok("try { throw new RangeError('neg') } catch (e) { console.log(e.name) }"), vec!["RangeError"]);
+        assert_eq!(
+            run_ok("try { throw new Error('boom') } catch (e) { console.log(e.message, e.name) }"),
+            vec!["boom Error"]
+        );
+        assert_eq!(
+            run_ok("try { throw new RangeError('neg') } catch (e) { console.log(e.name) }"),
+            vec!["RangeError"]
+        );
     }
 
     #[test]
@@ -2570,9 +2857,14 @@ mod tests {
 
     #[test]
     fn uncaught_throw_reports_error_with_output_preserved() {
-        let out = run("console.log('before'); throw new Error('fail'); console.log('after')").expect("compile");
+        let out = run("console.log('before'); throw new Error('fail'); console.log('after')")
+            .expect("compile");
         assert_eq!(out.output, vec!["before"]);
-        assert!(out.error.as_ref().unwrap().contains("fail"), "got {:?}", out.error);
+        assert!(
+            out.error.as_ref().unwrap().contains("fail"),
+            "got {:?}",
+            out.error
+        );
     }
 
     // ── Stage 5b: native JIT (correctness — same answers as the interpreter) ──
@@ -2649,7 +2941,10 @@ mod tests {
             vec!["0,1,10,11"]
         );
         // Non-captured loop is unaffected (fast path / hot-loop JIT preserved).
-        assert_eq!(run_ok("let s=0; for(let i=0;i<1000;i++) s+=i; console.log(s)"), vec!["499500"]);
+        assert_eq!(
+            run_ok("let s=0; for(let i=0;i<1000;i++) s+=i; console.log(s)"),
+            vec!["499500"]
+        );
     }
 
     // ── rope strings (cons-strings) + JsStr cached length/index + interning ──
@@ -2784,7 +3079,10 @@ mod tests {
     #[test]
     fn switch_statement() {
         assert_eq!(run_ok("let x=2,r=''; switch(x){case 1:r='a';break;case 2:r='b';break;default:r='d';} console.log(r)"), vec!["b"]);
-        assert_eq!(run_ok("let x=9,r=''; switch(x){case 1:r='a';break;default:r='d';} console.log(r)"), vec!["d"]);
+        assert_eq!(
+            run_ok("let x=9,r=''; switch(x){case 1:r='a';break;default:r='d';} console.log(r)"),
+            vec!["d"]
+        );
         // Fall-through (no break) runs subsequent case bodies.
         assert_eq!(run_ok("let r='',x=2; switch(x){case 1:r+='1';case 2:r+='2';case 3:r+='3';break;case 4:r+='4';} console.log(r)"), vec!["23"]);
         assert_eq!(run_ok("function f(x){switch(x){case 1:return 'one';default:return 'other'}} console.log(f(1),f(5))"), vec!["one other"]);
@@ -2794,10 +3092,22 @@ mod tests {
 
     #[test]
     fn break_and_continue() {
-        assert_eq!(run_ok("let s=0; for(let i=0;i<10;i++){ if(i===5) break; s+=i; } console.log(s)"), vec!["10"]);
-        assert_eq!(run_ok("let s=0; for(let i=0;i<5;i++){ if(i===2) continue; s+=i; } console.log(s)"), vec!["8"]);
-        assert_eq!(run_ok("let s=0,i=0; while(i<100){ i++; if(i>5) break; s+=i; } console.log(s)"), vec!["15"]);
-        assert_eq!(run_ok("let s=0; for(const x of [1,2,3,4]){ if(x===3) break; s+=x; } console.log(s)"), vec!["3"]);
+        assert_eq!(
+            run_ok("let s=0; for(let i=0;i<10;i++){ if(i===5) break; s+=i; } console.log(s)"),
+            vec!["10"]
+        );
+        assert_eq!(
+            run_ok("let s=0; for(let i=0;i<5;i++){ if(i===2) continue; s+=i; } console.log(s)"),
+            vec!["8"]
+        );
+        assert_eq!(
+            run_ok("let s=0,i=0; while(i<100){ i++; if(i>5) break; s+=i; } console.log(s)"),
+            vec!["15"]
+        );
+        assert_eq!(
+            run_ok("let s=0; for(const x of [1,2,3,4]){ if(x===3) break; s+=x; } console.log(s)"),
+            vec!["3"]
+        );
         // do-while with both; and a nested loop where the inner break stays inner.
         assert_eq!(run_ok("let s=0,i=0; do{ i++; if(i===3) continue; if(i>5) break; s+=i; }while(i<100); console.log(s)"), vec!["12"]);
         assert_eq!(run_ok("let s=0; for(let i=0;i<5;i++){ for(let j=0;j<5;j++){ if(j===2) break; s+=1; } } console.log(s)"), vec!["10"]);
@@ -2815,25 +3125,55 @@ mod tests {
     #[test]
     fn optional_chaining() {
         // Member chains short-circuit to undefined at the first nullish base.
-        assert_eq!(run_ok("let o={a:{b:7}}; console.log(o?.a?.b, o?.x?.y, o?.a?.b?.c)"), vec!["7 undefined undefined"]);
-        assert_eq!(run_ok("let o=null; console.log(o?.a?.b)"), vec!["undefined"]);
+        assert_eq!(
+            run_ok("let o={a:{b:7}}; console.log(o?.a?.b, o?.x?.y, o?.a?.b?.c)"),
+            vec!["7 undefined undefined"]
+        );
+        assert_eq!(
+            run_ok("let o=null; console.log(o?.a?.b)"),
+            vec!["undefined"]
+        );
         // Optional computed access and optional calls.
-        assert_eq!(run_ok("let o={arr:[10,20]}; console.log(o?.arr?.[1], o?.no?.[0])"), vec!["20 undefined"]);
-        assert_eq!(run_ok("let o={f:()=>42}; console.log(o?.f(), o?.g?.())"), vec!["42 undefined"]);
+        assert_eq!(
+            run_ok("let o={arr:[10,20]}; console.log(o?.arr?.[1], o?.no?.[0])"),
+            vec!["20 undefined"]
+        );
+        assert_eq!(
+            run_ok("let o={f:()=>42}; console.log(o?.f(), o?.g?.())"),
+            vec!["42 undefined"]
+        );
         // The short-circuited value is genuine undefined (NaN in arithmetic).
-        assert_eq!(run_ok("let u=undefined; console.log(u?.x, (u?.x)+1)"), vec!["undefined NaN"]);
+        assert_eq!(
+            run_ok("let u=undefined; console.log(u?.x, (u?.x)+1)"),
+            vec!["undefined NaN"]
+        );
     }
 
     #[test]
     fn default_parameters() {
         // Applied only when the arg is missing/undefined (null does NOT trigger it).
-        assert_eq!(run_ok("function f(x=5){return x} console.log(f(), f(9), f(undefined))"), vec!["5 9 5"]);
-        assert_eq!(run_ok("function z(x=1){return x} console.log(z(null), z(0))"), vec!["null 0"]);
+        assert_eq!(
+            run_ok("function f(x=5){return x} console.log(f(), f(9), f(undefined))"),
+            vec!["5 9 5"]
+        );
+        assert_eq!(
+            run_ok("function z(x=1){return x} console.log(z(null), z(0))"),
+            vec!["null 0"]
+        );
         // A later default may reference an earlier parameter.
-        assert_eq!(run_ok("function g(a,b=10,c=a+b){return a+','+b+','+c} console.log(g(1), g(1,2))"), vec!["1,10,11 1,2,3"]);
+        assert_eq!(
+            run_ok("function g(a,b=10,c=a+b){return a+','+b+','+c} console.log(g(1), g(1,2))"),
+            vec!["1,10,11 1,2,3"]
+        );
         // Arrow defaults; and a defaulted parameter captured by a closure.
-        assert_eq!(run_ok("let h=(x=7)=>x*2; console.log(h(), h(4))"), vec!["14 8"]);
-        assert_eq!(run_ok("function cap(n=3){return ()=>n} console.log(cap()(), cap(8)())"), vec!["3 8"]);
+        assert_eq!(
+            run_ok("let h=(x=7)=>x*2; console.log(h(), h(4))"),
+            vec!["14 8"]
+        );
+        assert_eq!(
+            run_ok("function cap(n=3){return ()=>n} console.log(cap()(), cap(8)())"),
+            vec!["3 8"]
+        );
     }
 
     #[test]
@@ -2847,7 +3187,9 @@ mod tests {
     #[test]
     fn number_parse_globals() {
         assert_eq!(
-            run_ok("console.log(Number('42')+1, Number(''), Number(true), Number('abc'), Number())"),
+            run_ok(
+                "console.log(Number('42')+1, Number(''), Number(true), Number('abc'), Number())"
+            ),
             vec!["43 0 1 NaN 0"],
         );
         assert_eq!(
@@ -2866,15 +3208,33 @@ mod tests {
         // not the constant pool — a preceding non-string constant (e.g. 3.5) used
         // to push the name's pool index past string_constants and panic (OOB).
         assert_eq!(run_ok("console.log((3.5).toFixed(2))"), vec!["3.50"]);
-        assert_eq!(run_ok("let x=3.14159; console.log(x.toFixed(2))"), vec!["3.14"]);
-        assert_eq!(run_ok("let n=9.5; let o={prop:7}; console.log(o.prop, n)"), vec!["7 9.5"]);
-        assert_eq!(run_ok("let a=[1.5]; console.log(a[0].toFixed(1))"), vec!["1.5"]);
+        assert_eq!(
+            run_ok("let x=3.14159; console.log(x.toFixed(2))"),
+            vec!["3.14"]
+        );
+        assert_eq!(
+            run_ok("let n=9.5; let o={prop:7}; console.log(o.prop, n)"),
+            vec!["7 9.5"]
+        );
+        assert_eq!(
+            run_ok("let a=[1.5]; console.log(a[0].toFixed(1))"),
+            vec!["1.5"]
+        );
         // toFixed rounds half AWAY from zero (not Rust's half-to-even), on the
         // EXACT decimal — so float-repr near-ties round the way node does.
-        assert_eq!(run_ok("console.log((0.5).toFixed(0), (2.5).toFixed(0), (1.5).toFixed(0))"), vec!["1 3 2"]);
+        assert_eq!(
+            run_ok("console.log((0.5).toFixed(0), (2.5).toFixed(0), (1.5).toFixed(0))"),
+            vec!["1 3 2"]
+        );
         assert_eq!(run_ok("console.log((0.15).toFixed(1), (1.45).toFixed(1), (2.675).toFixed(2), (8.575).toFixed(2))"), vec!["0.1 1.4 2.67 8.57"]);
-        assert_eq!(run_ok("console.log((-0.5).toFixed(0), (-2.5).toFixed(0), (123.456).toFixed(2))"), vec!["-1 -3 123.46"]);
-        assert_eq!(run_ok("console.log((999.999).toFixed(2), (0).toFixed(2))"), vec!["1000.00 0.00"]);
+        assert_eq!(
+            run_ok("console.log((-0.5).toFixed(0), (-2.5).toFixed(0), (123.456).toFixed(2))"),
+            vec!["-1 -3 123.46"]
+        );
+        assert_eq!(
+            run_ok("console.log((999.999).toFixed(2), (0).toFixed(2))"),
+            vec!["1000.00 0.00"]
+        );
     }
 
     #[test]
@@ -2884,11 +3244,19 @@ mod tests {
             vec!["a,b,c 1,2,3"],
         );
         assert_eq!(
-            run_ok("let o={x:10,y:20}; console.log(Object.entries(o).map(e=>e[0]+'='+e[1]).join(','))"),
+            run_ok(
+                "let o={x:10,y:20}; console.log(Object.entries(o).map(e=>e[0]+'='+e[1]).join(','))"
+            ),
             vec!["x=10,y=20"],
         );
-        assert_eq!(run_ok("console.log(Object.keys([7,8]).join(','), Object.values([7,8]).join(','))"), vec!["0,1 7,8"]);
-        assert_eq!(run_ok("console.log(Math.PI.toFixed(4), Math.E.toFixed(4), Math.SQRT2.toFixed(4))"), vec!["3.1416 2.7183 1.4142"]);
+        assert_eq!(
+            run_ok("console.log(Object.keys([7,8]).join(','), Object.values([7,8]).join(','))"),
+            vec!["0,1 7,8"]
+        );
+        assert_eq!(
+            run_ok("console.log(Math.PI.toFixed(4), Math.E.toFixed(4), Math.SQRT2.toFixed(4))"),
+            vec!["3.1416 2.7183 1.4142"]
+        );
     }
 
     #[test]
@@ -2902,180 +3270,436 @@ mod tests {
             vec!["1,2.5,-3,100,true,false,"],
         );
         // Round-trips with stringify.
-        assert_eq!(run_ok("let r=JSON.parse(JSON.stringify({x:[1,{y:2}],z:'a'})); console.log(r.x[1].y, r.z)"), vec!["2 a"]);
+        assert_eq!(
+            run_ok(
+                "let r=JSON.parse(JSON.stringify({x:[1,{y:2}],z:'a'})); console.log(r.x[1].y, r.z)"
+            ),
+            vec!["2 a"]
+        );
         // Invalid JSON throws a (catchable) SyntaxError.
-        assert_eq!(run_ok("let e='ok'; try{ JSON.parse('{bad}'); }catch(x){ e='threw'; } console.log(e)"), vec!["threw"]);
-        assert_eq!(run_ok("let e='ok'; try{ JSON.parse('[1,2'); }catch(x){ e='threw'; } console.log(e)"), vec!["threw"]);
+        assert_eq!(
+            run_ok("let e='ok'; try{ JSON.parse('{bad}'); }catch(x){ e='threw'; } console.log(e)"),
+            vec!["threw"]
+        );
+        assert_eq!(
+            run_ok("let e='ok'; try{ JSON.parse('[1,2'); }catch(x){ e='threw'; } console.log(e)"),
+            vec!["threw"]
+        );
     }
 
     #[test]
     fn json_stringify() {
-        assert_eq!(run_ok("console.log(JSON.stringify({a:1,b:[2,3]}))"), vec![r#"{"a":1,"b":[2,3]}"#]);
+        assert_eq!(
+            run_ok("console.log(JSON.stringify({a:1,b:[2,3]}))"),
+            vec![r#"{"a":1,"b":[2,3]}"#]
+        );
         // undefined/function are omitted in objects but become null in arrays.
-        assert_eq!(run_ok("console.log(JSON.stringify([1,undefined,null]))"), vec!["[1,null,null]"]);
-        assert_eq!(run_ok("console.log(JSON.stringify({x:undefined,y:1}))"), vec![r#"{"y":1}"#]);
+        assert_eq!(
+            run_ok("console.log(JSON.stringify([1,undefined,null]))"),
+            vec!["[1,null,null]"]
+        );
+        assert_eq!(
+            run_ok("console.log(JSON.stringify({x:undefined,y:1}))"),
+            vec![r#"{"y":1}"#]
+        );
         // Primitives; NaN/Infinity → null; top-level undefined → undefined.
-        assert_eq!(run_ok("console.log(JSON.stringify(42), JSON.stringify(NaN), JSON.stringify(undefined))"), vec!["42 null undefined"]);
+        assert_eq!(
+            run_ok(
+                "console.log(JSON.stringify(42), JSON.stringify(NaN), JSON.stringify(undefined))"
+            ),
+            vec!["42 null undefined"]
+        );
         // Pretty-print with a numeric `space`.
-        assert_eq!(run_ok("console.log(JSON.stringify({a:1}, null, 2))"), vec!["{\n  \"a\": 1\n}"]);
+        assert_eq!(
+            run_ok("console.log(JSON.stringify({a:1}, null, 2))"),
+            vec!["{\n  \"a\": 1\n}"]
+        );
     }
 
     #[test]
     fn spread_operator() {
         // Array-literal spread: arrays, repeated sources, with plain elements.
-        assert_eq!(run_ok("let a=[1,2]; console.log([...a,3,...a].join(','))"), vec!["1,2,3,1,2"]);
-        assert_eq!(run_ok("let a=[1,2],b=[3,4]; console.log([0,...a,...b,5].join(','))"), vec!["0,1,2,3,4,5"]);
-        assert_eq!(run_ok("console.log([...[]].length, [...[1]].length)"), vec!["0 1"]);
+        assert_eq!(
+            run_ok("let a=[1,2]; console.log([...a,3,...a].join(','))"),
+            vec!["1,2,3,1,2"]
+        );
+        assert_eq!(
+            run_ok("let a=[1,2],b=[3,4]; console.log([0,...a,...b,5].join(','))"),
+            vec!["0,1,2,3,4,5"]
+        );
+        assert_eq!(
+            run_ok("console.log([...[]].length, [...[1]].length)"),
+            vec!["0 1"]
+        );
         // Spreading a string yields its characters.
         assert_eq!(run_ok("console.log([...'abc'].join('-'))"), vec!["a-b-c"]);
         // Call spread on a plain function value (declared fn and arrow).
-        assert_eq!(run_ok("function sum(a,b,c){return a+b+c} console.log(sum(...[1,2,3]))"), vec!["6"]);
-        assert_eq!(run_ok("let g=(a,b)=>a-b; console.log(g(...[10,3]))"), vec!["7"]);
-        assert_eq!(run_ok("function f(a,b,c,d){return a+b+c+d} console.log(f(1,...[2,3],4))"), vec!["10"]);
+        assert_eq!(
+            run_ok("function sum(a,b,c){return a+b+c} console.log(sum(...[1,2,3]))"),
+            vec!["6"]
+        );
+        assert_eq!(
+            run_ok("let g=(a,b)=>a-b; console.log(g(...[10,3]))"),
+            vec!["7"]
+        );
+        assert_eq!(
+            run_ok("function f(a,b,c,d){return a+b+c+d} console.log(f(1,...[2,3],4))"),
+            vec!["10"]
+        );
         // Method-call spread: builtin (push/concat) and mixed spread+plain args.
-        assert_eq!(run_ok("let a=[3,1,2]; a.push(...[4,5]); console.log(a.join(','))"), vec!["3,1,2,4,5"]);
-        assert_eq!(run_ok("let a=[1,2],b=[5,6]; a.push(...b,7); console.log(a.join(','))"), vec!["1,2,5,6,7"]);
-        assert_eq!(run_ok("console.log([0].concat(...[[1,2],[3]]).join(','))"), vec!["0,1,2,3"]);
+        assert_eq!(
+            run_ok("let a=[3,1,2]; a.push(...[4,5]); console.log(a.join(','))"),
+            vec!["3,1,2,4,5"]
+        );
+        assert_eq!(
+            run_ok("let a=[1,2],b=[5,6]; a.push(...b,7); console.log(a.join(','))"),
+            vec!["1,2,5,6,7"]
+        );
+        assert_eq!(
+            run_ok("console.log([0].concat(...[[1,2],[3]]).join(','))"),
+            vec!["0,1,2,3"]
+        );
         // Spreading a non-iterable throws a (catchable) TypeError.
-        assert_eq!(run_ok("let e='ok'; try{ [...5]; }catch(x){ e='threw'; } console.log(e)"), vec!["threw"]);
+        assert_eq!(
+            run_ok("let e='ok'; try{ [...5]; }catch(x){ e='threw'; } console.log(e)"),
+            vec!["threw"]
+        );
     }
 
     #[test]
     fn destructuring() {
         // Object: shorthand, subset, rename, defaults.
         assert_eq!(run_ok("let {x,y}={x:1,y:2}; console.log(x+y)"), vec!["3"]);
-        assert_eq!(run_ok("let {a:p,b:q}={a:10,b:20}; console.log(p,q)"), vec!["10 20"]);
+        assert_eq!(
+            run_ok("let {a:p,b:q}={a:10,b:20}; console.log(p,q)"),
+            vec!["10 20"]
+        );
         assert_eq!(run_ok("let {x=5,y=9}={x:1}; console.log(x,y)"), vec!["1 9"]);
         // Array: positional, holes, defaults, rest (incl. shorter-than-pattern).
-        assert_eq!(run_ok("let [a,b,c]=[10,20,30]; console.log(a+b+c)"), vec!["60"]);
-        assert_eq!(run_ok("let [,b,,d]=[1,2,3,4]; console.log(b,d)"), vec!["2 4"]);
-        assert_eq!(run_ok("let [a=1,b=2,c=3]=[10]; console.log(a,b,c)"), vec!["10 2 3"]);
-        assert_eq!(run_ok("let [first,...rest]=[1,2,3,4]; console.log(first, rest.join(','))"), vec!["1 2,3,4"]);
-        assert_eq!(run_ok("let [a,b,...rest]=[1]; console.log(a,b,rest.length)"), vec!["1 undefined 0"]);
+        assert_eq!(
+            run_ok("let [a,b,c]=[10,20,30]; console.log(a+b+c)"),
+            vec!["60"]
+        );
+        assert_eq!(
+            run_ok("let [,b,,d]=[1,2,3,4]; console.log(b,d)"),
+            vec!["2 4"]
+        );
+        assert_eq!(
+            run_ok("let [a=1,b=2,c=3]=[10]; console.log(a,b,c)"),
+            vec!["10 2 3"]
+        );
+        assert_eq!(
+            run_ok("let [first,...rest]=[1,2,3,4]; console.log(first, rest.join(','))"),
+            vec!["1 2,3,4"]
+        );
+        assert_eq!(
+            run_ok("let [a,b,...rest]=[1]; console.log(a,b,rest.length)"),
+            vec!["1 undefined 0"]
+        );
         // A string is iterable for array destructuring.
-        assert_eq!(run_ok("let [h,...t]='hello'; console.log(h, t.join(''))"), vec!["h ello"]);
+        assert_eq!(
+            run_ok("let [h,...t]='hello'; console.log(h, t.join(''))"),
+            vec!["h ello"]
+        );
         // Nested patterns, arbitrary depth.
         assert_eq!(run_ok("let {a:{b}}={a:{b:42}}; console.log(b)"), vec!["42"]);
-        assert_eq!(run_ok("let [[a,b],[c]]=[[1,2],[3]]; console.log(a,b,c)"), vec!["1 2 3"]);
-        assert_eq!(run_ok("let {p:[m,n]}={p:[7,8]}; console.log(m,n)"), vec!["7 8"]);
+        assert_eq!(
+            run_ok("let [[a,b],[c]]=[[1,2],[3]]; console.log(a,b,c)"),
+            vec!["1 2 3"]
+        );
+        assert_eq!(
+            run_ok("let {p:[m,n]}={p:[7,8]}; console.log(m,n)"),
+            vec!["7 8"]
+        );
         // Computed key.
-        assert_eq!(run_ok("let k='x'; let {[k]:v}={x:99}; console.log(v)"), vec!["99"]);
+        assert_eq!(
+            run_ok("let k='x'; let {[k]:v}={x:99}; console.log(v)"),
+            vec!["99"]
+        );
         // Object rest: collects the remaining own keys into a new object.
-        assert_eq!(run_ok("let {a,...rest}={a:1,b:2,c:3}; console.log(a, JSON.stringify(rest))"), vec![r#"1 {"b":2,"c":3}"#]);
-        assert_eq!(run_ok("let {a:x,...rest}={a:1,b:2}; console.log(x, JSON.stringify(rest))"), vec![r#"1 {"b":2}"#]);
-        assert_eq!(run_ok("let f=({id,...opts})=>id+':'+JSON.stringify(opts); console.log(f({id:1,a:2,b:3}))"), vec![r#"1:{"a":2,"b":3}"#]);
+        assert_eq!(
+            run_ok("let {a,...rest}={a:1,b:2,c:3}; console.log(a, JSON.stringify(rest))"),
+            vec![r#"1 {"b":2,"c":3}"#]
+        );
+        assert_eq!(
+            run_ok("let {a:x,...rest}={a:1,b:2}; console.log(x, JSON.stringify(rest))"),
+            vec![r#"1 {"b":2}"#]
+        );
+        assert_eq!(
+            run_ok(
+                "let f=({id,...opts})=>id+':'+JSON.stringify(opts); console.log(f({id:1,a:2,b:3}))"
+            ),
+            vec![r#"1:{"a":2,"b":3}"#]
+        );
         // Inside a function; a destructured local captured by a closure.
-        assert_eq!(run_ok("function f(o){let {a,b}=o; return a+b} console.log(f({a:3,b:4}))"), vec!["7"]);
-        assert_eq!(run_ok("function mk(){let [a,b]=[1,2]; return ()=>a+b} console.log(mk()())"), vec!["3"]);
+        assert_eq!(
+            run_ok("function f(o){let {a,b}=o; return a+b} console.log(f({a:3,b:4}))"),
+            vec!["7"]
+        );
+        assert_eq!(
+            run_ok("function mk(){let [a,b]=[1,2]; return ()=>a+b} console.log(mk()())"),
+            vec!["3"]
+        );
     }
 
     #[test]
     fn number_to_radix_and_array_ctor() {
         // Number.toString(radix).
-        assert_eq!(run_ok("console.log((255).toString(16), (255).toString(2), (10).toString())"), vec!["ff 11111111 10"]);
-        assert_eq!(run_ok("console.log((-42).toString(16), (35).toString(36), (3735928559).toString(16))"), vec!["-2a z deadbeef"]);
+        assert_eq!(
+            run_ok("console.log((255).toString(16), (255).toString(2), (10).toString())"),
+            vec!["ff 11111111 10"]
+        );
+        assert_eq!(
+            run_ok("console.log((-42).toString(16), (35).toString(36), (3735928559).toString(16))"),
+            vec!["-2a z deadbeef"]
+        );
         // new Array(n) → n holes; new Array(a,b,…) / Array(...) → the args.
-        assert_eq!(run_ok("console.log(new Array(3).length, new Array(3).fill(0).join(','))"), vec!["3 0,0,0"]);
-        assert_eq!(run_ok("console.log(new Array(1,2,3).join(','), Array(4,5).join(','))"), vec!["1,2,3 4,5"]);
-        assert_eq!(run_ok("console.log(Array(3).fill(7).map((x,i)=>x+i).join(','))"), vec!["7,8,9"]);
+        assert_eq!(
+            run_ok("console.log(new Array(3).length, new Array(3).fill(0).join(','))"),
+            vec!["3 0,0,0"]
+        );
+        assert_eq!(
+            run_ok("console.log(new Array(1,2,3).join(','), Array(4,5).join(','))"),
+            vec!["1,2,3 4,5"]
+        );
+        assert_eq!(
+            run_ok("console.log(Array(3).fill(7).map((x,i)=>x+i).join(','))"),
+            vec!["7,8,9"]
+        );
         // Invalid length throws a RangeError; new Object()/Object() → {}.
-        assert_eq!(run_ok("let e='ok'; try{ new Array(-1); }catch(x){ e='threw'; } console.log(e)"), vec!["threw"]);
-        assert_eq!(run_ok("let o=new Object(); o.x=1; console.log(o.x, JSON.stringify(Object()))"), vec!["1 {}"]);
+        assert_eq!(
+            run_ok("let e='ok'; try{ new Array(-1); }catch(x){ e='threw'; } console.log(e)"),
+            vec!["threw"]
+        );
+        assert_eq!(
+            run_ok("let o=new Object(); o.x=1; console.log(o.x, JSON.stringify(Object()))"),
+            vec!["1 {}"]
+        );
     }
 
     #[test]
     fn static_builtins() {
         // Array.from over array / string / array-like, with and without a map fn.
-        assert_eq!(run_ok("console.log(Array.from([1,2,3],x=>x*2).join(','))"), vec!["2,4,6"]);
-        assert_eq!(run_ok("console.log(Array.from({length:3},(_, i)=>i).join(','))"), vec!["0,1,2"]);
-        assert_eq!(run_ok("console.log(Array.from('abc').join('-'))"), vec!["a-b-c"]);
-        assert_eq!(run_ok("console.log(Array.of(1,2,3).join(','), Array.of(7).length)"), vec!["1,2,3 1"]);
+        assert_eq!(
+            run_ok("console.log(Array.from([1,2,3],x=>x*2).join(','))"),
+            vec!["2,4,6"]
+        );
+        assert_eq!(
+            run_ok("console.log(Array.from({length:3},(_, i)=>i).join(','))"),
+            vec!["0,1,2"]
+        );
+        assert_eq!(
+            run_ok("console.log(Array.from('abc').join('-'))"),
+            vec!["a-b-c"]
+        );
+        assert_eq!(
+            run_ok("console.log(Array.of(1,2,3).join(','), Array.of(7).length)"),
+            vec!["1,2,3 1"]
+        );
         // Object.assign mutates + returns the target.
-        assert_eq!(run_ok("let t={a:1}; let r=Object.assign(t,{a:9,b:2}); console.log(r===t, t.a, t.b)"), vec!["true 9 2"]);
+        assert_eq!(
+            run_ok("let t={a:1}; let r=Object.assign(t,{a:9,b:2}); console.log(r===t, t.a, t.b)"),
+            vec!["true 9 2"]
+        );
         // String.fromCharCode.
-        assert_eq!(run_ok("console.log(String.fromCharCode(72,73,33))"), vec!["HI!"]);
+        assert_eq!(
+            run_ok("console.log(String.fromCharCode(72,73,33))"),
+            vec!["HI!"]
+        );
         // Number.isX (no coercion).
-        assert_eq!(run_ok("console.log(Number.isInteger(5), Number.isInteger(5.5), Number.isInteger('5'))"), vec!["true false false"]);
-        assert_eq!(run_ok("console.log(Number.isSafeInteger(2**53-1), Number.isSafeInteger(2**53))"), vec!["true false"]);
+        assert_eq!(
+            run_ok(
+                "console.log(Number.isInteger(5), Number.isInteger(5.5), Number.isInteger('5'))"
+            ),
+            vec!["true false false"]
+        );
+        assert_eq!(
+            run_ok("console.log(Number.isSafeInteger(2**53-1), Number.isSafeInteger(2**53))"),
+            vec!["true false"]
+        );
         // Math.max/min spread (incl. mixed plain + spread args).
         assert_eq!(run_ok("let a=[4,2,8,1]; console.log(Math.max(...a), Math.min(...a), Math.max(1,...[5,3],10))"), vec!["8 1 10"]);
         // .at() with negative indexing on arrays and strings.
-        assert_eq!(run_ok("console.log([10,20,30].at(-1), [1,2].at(5))"), vec!["30 undefined"]);
-        assert_eq!(run_ok("console.log('hello'.at(-1), 'hi'.at(10))"), vec!["o undefined"]);
+        assert_eq!(
+            run_ok("console.log([10,20,30].at(-1), [1,2].at(5))"),
+            vec!["30 undefined"]
+        );
+        assert_eq!(
+            run_ok("console.log('hello'.at(-1), 'hi'.at(10))"),
+            vec!["o undefined"]
+        );
     }
 
     #[test]
     fn nullish_and_logical_assign() {
         // ?? keeps the left unless null/undefined (0 and "" are kept).
-        assert_eq!(run_ok("console.log(null ?? 5, 0 ?? 9, undefined ?? 'x', '' ?? 'y')"), vec!["5 0 x "]);
+        assert_eq!(
+            run_ok("console.log(null ?? 5, 0 ?? 9, undefined ?? 'x', '' ?? 'y')"),
+            vec!["5 0 x "]
+        );
         // Logical assignment, short-circuit (RHS not evaluated when skipped).
-        assert_eq!(run_ok("let a=0; a||=7; let b=1; b&&=9; console.log(a,b)"), vec!["7 9"]);
-        assert_eq!(run_ok("let x=5; x??=10; let y=null; y??=20; console.log(x,y)"), vec!["5 20"]);
-        assert_eq!(run_ok("let cnt=0; function f(){cnt++;return 5} let v=1; v||=f(); console.log(v,cnt)"), vec!["1 0"]);
+        assert_eq!(
+            run_ok("let a=0; a||=7; let b=1; b&&=9; console.log(a,b)"),
+            vec!["7 9"]
+        );
+        assert_eq!(
+            run_ok("let x=5; x??=10; let y=null; y??=20; console.log(x,y)"),
+            vec!["5 20"]
+        );
+        assert_eq!(
+            run_ok("let cnt=0; function f(){cnt++;return 5} let v=1; v||=f(); console.log(v,cnt)"),
+            vec!["1 0"]
+        );
         // Member logical assignment + the counter idiom.
-        assert_eq!(run_ok("let o={}; o.a ??= 1; o.a ??= 2; console.log(o.a)"), vec!["1"]);
+        assert_eq!(
+            run_ok("let o={}; o.a ??= 1; o.a ??= 2; console.log(o.a)"),
+            vec!["1"]
+        );
         assert_eq!(run_ok("let c={}; for(let k of ['a','b','a']){ c[k] ??= 0; c[k]++; } console.log(c.a, c.b)"), vec!["2 1"]);
     }
 
     #[test]
     fn compound_and_update_assignment() {
         // All arithmetic/bitwise compound operators on a local.
-        assert_eq!(run_ok("let a=10; a/=2; a%=3; a**=3; console.log(a)"), vec!["8"]);
-        assert_eq!(run_ok("let f=1; f<<=4; f|=1; f&=0xF; f^=2; console.log(f)"), vec!["3"]);
+        assert_eq!(
+            run_ok("let a=10; a/=2; a%=3; a**=3; console.log(a)"),
+            vec!["8"]
+        );
+        assert_eq!(
+            run_ok("let f=1; f<<=4; f|=1; f&=0xF; f^=2; console.log(f)"),
+            vec!["3"]
+        );
         // Compound + update on members (property and index).
-        assert_eq!(run_ok("let o={n:10}; o.n+=5; o.n*=2; console.log(o.n)"), vec!["30"]);
-        assert_eq!(run_ok("let a=[1,2,3]; a[0]+=10; a[1]*=3; console.log(a.join(','))"), vec!["11,6,3"]);
-        assert_eq!(run_ok("let o={n:5}; let r=[o.n++, o.n, ++o.n]; console.log(r.join(','))"), vec!["5,6,7"]);
-        assert_eq!(run_ok("let a=[10,20]; let r=[a[0]++, a[0], --a[1]]; console.log(r.join(','))"), vec!["10,11,19"]);
+        assert_eq!(
+            run_ok("let o={n:10}; o.n+=5; o.n*=2; console.log(o.n)"),
+            vec!["30"]
+        );
+        assert_eq!(
+            run_ok("let a=[1,2,3]; a[0]+=10; a[1]*=3; console.log(a.join(','))"),
+            vec!["11,6,3"]
+        );
+        assert_eq!(
+            run_ok("let o={n:5}; let r=[o.n++, o.n, ++o.n]; console.log(r.join(','))"),
+            vec!["5,6,7"]
+        );
+        assert_eq!(
+            run_ok("let a=[10,20]; let r=[a[0]++, a[0], --a[1]]; console.log(r.join(','))"),
+            vec!["10,11,19"]
+        );
     }
 
     #[test]
     fn object_spread_and_computed_keys() {
-        assert_eq!(run_ok("let o={a:1,...{b:2,c:3}}; console.log(o.a,o.b,o.c)"), vec!["1 2 3"]);
+        assert_eq!(
+            run_ok("let o={a:1,...{b:2,c:3}}; console.log(o.a,o.b,o.c)"),
+            vec!["1 2 3"]
+        );
         // Later properties win over a spread; array source spreads as index keys.
-        assert_eq!(run_ok("let base={x:1,y:2}; let o={...base, y:9, z:3}; console.log(o.x,o.y,o.z)"), vec!["1 9 3"]);
-        assert_eq!(run_ok("let o={...[10,20]}; console.log(o[0],o[1])"), vec!["10 20"]);
+        assert_eq!(
+            run_ok("let base={x:1,y:2}; let o={...base, y:9, z:3}; console.log(o.x,o.y,o.z)"),
+            vec!["1 9 3"]
+        );
+        assert_eq!(
+            run_ok("let o={...[10,20]}; console.log(o[0],o[1])"),
+            vec!["10 20"]
+        );
         // null/undefined spread is a no-op.
-        assert_eq!(run_ok("let o={...null,...undefined,a:1}; console.log(o.a, Object.keys(o).length)"), vec!["1 1"]);
+        assert_eq!(
+            run_ok("let o={...null,...undefined,a:1}; console.log(o.a, Object.keys(o).length)"),
+            vec!["1 1"]
+        );
         // Computed keys, including a template-literal key.
-        assert_eq!(run_ok("let k='dyn'; let o={[k]:42,[`a${1}`]:7}; console.log(o.dyn,o.a1)"), vec!["42 7"]);
+        assert_eq!(
+            run_ok("let k='dyn'; let o={[k]:42,[`a${1}`]:7}; console.log(o.dyn,o.a1)"),
+            vec!["42 7"]
+        );
     }
 
     #[test]
     fn bitwise_and_exponent() {
-        assert_eq!(run_ok("console.log(5 & 3, 5 | 2, 5 ^ 1, ~5)"), vec!["1 7 4 -6"]);
+        assert_eq!(
+            run_ok("console.log(5 & 3, 5 | 2, 5 ^ 1, ~5)"),
+            vec!["1 7 4 -6"]
+        );
         assert_eq!(run_ok("console.log(1<<4, 256>>2, -8>>1)"), vec!["16 64 -4"]);
         // Unsigned right shift yields a uint32 (can exceed i32::MAX).
-        assert_eq!(run_ok("console.log(-1>>>0, (1<<31)>>>0, -1>>>28)"), vec!["4294967295 2147483648 15"]);
+        assert_eq!(
+            run_ok("console.log(-1>>>0, (1<<31)>>>0, -1>>>28)"),
+            vec!["4294967295 2147483648 15"]
+        );
         // The canonical (x*31+c)|0 hash idiom.
-        assert_eq!(run_ok("let h=0; for(let i=0;i<5;i++) h=(h*31 + i)|0; console.log(h)"), vec!["31810"]);
+        assert_eq!(
+            run_ok("let h=0; for(let i=0;i<5;i++) h=(h*31 + i)|0; console.log(h)"),
+            vec!["31810"]
+        );
         // Exponentiation, right-associative.
-        assert_eq!(run_ok("console.log(2**10, (-2)**3, 2**3**2, 10**-2)"), vec!["1024 -8 512 0.01"]);
+        assert_eq!(
+            run_ok("console.log(2**10, (-2)**3, 2**3**2, 10**-2)"),
+            vec!["1024 -8 512 0.01"]
+        );
         // Operands coerce via ToInt32 (bool/string/null/undefined/NaN/float).
-        assert_eq!(run_ok("console.log(true & 1, '5'|0, null|0, undefined|0, 3.9|0, NaN|0)"), vec!["1 5 0 0 3 0"]);
+        assert_eq!(
+            run_ok("console.log(true & 1, '5'|0, null|0, undefined|0, 3.9|0, NaN|0)"),
+            vec!["1 5 0 0 3 0"]
+        );
     }
 
     #[test]
     fn assignment_destructuring() {
         // The swap idiom + plain array targets.
-        assert_eq!(run_ok("let a=1,b=2; [a,b]=[b,a]; console.log(a,b)"), vec!["2 1"]);
-        assert_eq!(run_ok("let a,b,c; [a,b,c]=[10,20,30]; console.log(a+b+c)"), vec!["60"]);
+        assert_eq!(
+            run_ok("let a=1,b=2; [a,b]=[b,a]; console.log(a,b)"),
+            vec!["2 1"]
+        );
+        assert_eq!(
+            run_ok("let a,b,c; [a,b,c]=[10,20,30]; console.log(a+b+c)"),
+            vec!["60"]
+        );
         // Rest and defaults in an assignment target.
-        assert_eq!(run_ok("let a,r; [a,...r]=[1,2,3,4]; console.log(a, r.join(','))"), vec!["1 2,3,4"]);
-        assert_eq!(run_ok("let a,b; [a=5,b=9]=[1]; console.log(a,b)"), vec!["1 9"]);
+        assert_eq!(
+            run_ok("let a,r; [a,...r]=[1,2,3,4]; console.log(a, r.join(','))"),
+            vec!["1 2,3,4"]
+        );
+        assert_eq!(
+            run_ok("let a,b; [a=5,b=9]=[1]; console.log(a,b)"),
+            vec!["1 9"]
+        );
         // Object assignment destructuring (shorthand, rename, default).
-        assert_eq!(run_ok("let x,y; ({x,y}=({x:1,y:2})); console.log(x+y)"), vec!["3"]);
-        assert_eq!(run_ok("let p,q; ({a:p,b:q}=({a:7,b:8})); console.log(p,q)"), vec!["7 8"]);
+        assert_eq!(
+            run_ok("let x,y; ({x,y}=({x:1,y:2})); console.log(x+y)"),
+            vec!["3"]
+        );
+        assert_eq!(
+            run_ok("let p,q; ({a:p,b:q}=({a:7,b:8})); console.log(p,q)"),
+            vec!["7 8"]
+        );
         assert_eq!(run_ok("let x; ({x=42}=({})); console.log(x)"), vec!["42"]);
         // Member targets and nesting.
-        assert_eq!(run_ok("let o={}; [o.a,o.b]=[1,2]; console.log(o.a,o.b)"), vec!["1 2"]);
-        assert_eq!(run_ok("let a,b,c; [a,[b,c]]=[1,[2,3]]; console.log(a,b,c)"), vec!["1 2 3"]);
+        assert_eq!(
+            run_ok("let o={}; [o.a,o.b]=[1,2]; console.log(o.a,o.b)"),
+            vec!["1 2"]
+        );
+        assert_eq!(
+            run_ok("let a,b,c; [a,[b,c]]=[1,[2,3]]; console.log(a,b,c)"),
+            vec!["1 2 3"]
+        );
         // The assignment expression evaluates to the right-hand side.
-        assert_eq!(run_ok("let a,b; let r=([a,b]=[1,2]); console.log(r.join(','))"), vec!["1,2"]);
+        assert_eq!(
+            run_ok("let a,b; let r=([a,b]=[1,2]); console.log(r.join(','))"),
+            vec!["1,2"]
+        );
         // Object rest in an assignment target (own keys minus the siblings).
-        assert_eq!(run_ok("let a,rest; ({a,...rest}=({a:1,b:2,c:3})); console.log(a, JSON.stringify(rest))"), vec![r#"1 {"b":2,"c":3}"#]);
+        assert_eq!(
+            run_ok(
+                "let a,rest; ({a,...rest}=({a:1,b:2,c:3})); console.log(a, JSON.stringify(rest))"
+            ),
+            vec![r#"1 {"b":2,"c":3}"#]
+        );
         assert_eq!(run_ok("let x,others; ({a:x,...others}=({a:10,p:1,q:2})); console.log(x, JSON.stringify(others))"), vec![r#"10 {"p":1,"q":2}"#]);
-        assert_eq!(run_ok("let a,o={}; ({a,...o.bag}=({a:5,m:6})); console.log(a, JSON.stringify(o.bag))"), vec![r#"5 {"m":6}"#]);
+        assert_eq!(
+            run_ok("let a,o={}; ({a,...o.bag}=({a:5,m:6})); console.log(a, JSON.stringify(o.bag))"),
+            vec![r#"5 {"m":6}"#]
+        );
     }
 
     #[test]
@@ -3088,7 +3712,10 @@ mod tests {
         assert_eq!(run_ok("let r=[]; loop: for(let x of [1,2,3]){ for(let y of [10,20]){ if(y===20) continue loop; r.push(x*y); } } console.log(r.join(','))"), vec!["10,20,30"]);
         assert_eq!(run_ok("let r=[]; a: for(let i=0;i<2;i++) b: for(let j=0;j<3;j++){ if(j===2) break a; r.push(j); } console.log(r.join(','))"), vec!["0,1"]);
         // A label on a block makes `break label` exit the block.
-        assert_eq!(run_ok("let r=[]; blk:{ r.push(1); break blk; r.push(2); } console.log(r.join(','))"), vec!["1"]);
+        assert_eq!(
+            run_ok("let r=[]; blk:{ r.push(1); break blk; r.push(2); } console.log(r.join(','))"),
+            vec!["1"]
+        );
     }
 
     #[test]
@@ -3105,71 +3732,156 @@ mod tests {
 
     #[test]
     fn for_of_destructuring() {
-        assert_eq!(run_ok("let r=[]; for(let [a,b] of [[1,2],[3,4]]) r.push(a+b); console.log(r.join(','))"), vec!["3,7"]);
+        assert_eq!(
+            run_ok(
+                "let r=[]; for(let [a,b] of [[1,2],[3,4]]) r.push(a+b); console.log(r.join(','))"
+            ),
+            vec!["3,7"]
+        );
         // The canonical Object.entries idiom.
         assert_eq!(run_ok("let o={x:1,y:2}; let r=[]; for(let [k,v] of Object.entries(o)) r.push(k+'='+v); console.log(r.join(' '))"), vec!["x=1 y=2"]);
-        assert_eq!(run_ok("let r=[]; for(let {n} of [{n:'a'},{n:'b'}]) r.push(n); console.log(r.join(''))"), vec!["ab"]);
+        assert_eq!(
+            run_ok(
+                "let r=[]; for(let {n} of [{n:'a'},{n:'b'}]) r.push(n); console.log(r.join(''))"
+            ),
+            vec!["ab"]
+        );
         // Rest and defaults in the head.
         assert_eq!(run_ok("let r=[]; for(let [a,...t] of [[1,2,3]]) r.push(a+':'+t.join(',')); console.log(r[0])"), vec!["1:2,3"]);
         assert_eq!(run_ok("let r=[]; for(let {a,b=9} of [{a:1,b:2},{a:3}]) r.push(a+''+b); console.log(r.join(' '))"), vec!["12 39"]);
         // Captured destructured loop var.
-        assert_eq!(run_ok("let f; for(let [a,b] of [[1,2]]) f=()=>a+b; console.log(f())"), vec!["3"]);
+        assert_eq!(
+            run_ok("let f; for(let [a,b] of [[1,2]]) f=()=>a+b; console.log(f())"),
+            vec!["3"]
+        );
     }
 
     #[test]
     fn function_inspect_label() {
         // Named functions / methods show their name; truly anonymous ones don't.
-        assert_eq!(run_ok("function foo(){} console.log(foo)"), vec!["[Function: foo]"]);
-        assert_eq!(run_ok("console.log([function named(){}, x=>x])"), vec!["[ [Function: named], [Function (anonymous)] ]"]);
-        assert_eq!(run_ok("class A{m(){}} console.log(new A().m)"), vec!["[Function: m]"]);
+        assert_eq!(
+            run_ok("function foo(){} console.log(foo)"),
+            vec!["[Function: foo]"]
+        );
+        assert_eq!(
+            run_ok("console.log([function named(){}, x=>x])"),
+            vec!["[ [Function: named], [Function (anonymous)] ]"]
+        );
+        assert_eq!(
+            run_ok("class A{m(){}} console.log(new A().m)"),
+            vec!["[Function: m]"]
+        );
     }
 
     #[test]
     fn function_name_and_length() {
         // .name: declaration, named expression, class, and inference for an
         // anonymous arrow / function expression bound to a variable.
-        assert_eq!(run_ok("function foo(){} console.log(foo.name)"), vec!["foo"]);
-        assert_eq!(run_ok("let q=function named(){}; console.log(q.name)"), vec!["named"]);
-        assert_eq!(run_ok("const baz=()=>{}; console.log(baz.name)"), vec!["baz"]);
-        assert_eq!(run_ok("const bar=function(){}; console.log(bar.name)"), vec!["bar"]);
+        assert_eq!(
+            run_ok("function foo(){} console.log(foo.name)"),
+            vec!["foo"]
+        );
+        assert_eq!(
+            run_ok("let q=function named(){}; console.log(q.name)"),
+            vec!["named"]
+        );
+        assert_eq!(
+            run_ok("const baz=()=>{}; console.log(baz.name)"),
+            vec!["baz"]
+        );
+        assert_eq!(
+            run_ok("const bar=function(){}; console.log(bar.name)"),
+            vec!["bar"]
+        );
         assert_eq!(run_ok("class C{} console.log(C.name)"), vec!["C"]);
         // A truly anonymous function (in an array) has an empty name.
         assert_eq!(run_ok("console.log([x=>x][0].name === '')"), vec!["true"]);
         // .length: declared parameter count (rest excluded).
-        assert_eq!(run_ok("function f(a,b,c){} console.log(f.length, ((x,y)=>{}).length, (()=>{}).length)"), vec!["3 2 0"]);
-        assert_eq!(run_ok("function r(a,...rest){} console.log(r.length)"), vec!["1"]);
-        assert_eq!(run_ok("class C{constructor(a,b){}} console.log(C.length)"), vec!["2"]);
+        assert_eq!(
+            run_ok(
+                "function f(a,b,c){} console.log(f.length, ((x,y)=>{}).length, (()=>{}).length)"
+            ),
+            vec!["3 2 0"]
+        );
+        assert_eq!(
+            run_ok("function r(a,...rest){} console.log(r.length)"),
+            vec!["1"]
+        );
+        assert_eq!(
+            run_ok("class C{constructor(a,b){}} console.log(C.length)"),
+            vec!["2"]
+        );
     }
 
     #[test]
     fn promises() {
         // resolve/reject + then/catch; chaining; a throw in then routes to catch.
-        assert_eq!(run_ok("Promise.resolve(5).then(v=>console.log('got',v))"), vec!["got 5"]);
-        assert_eq!(run_ok("Promise.reject('e').catch(e=>console.log('caught',e))"), vec!["caught e"]);
-        assert_eq!(run_ok("Promise.resolve(1).then(v=>v+1).then(v=>console.log(v))"), vec!["2"]);
-        assert_eq!(run_ok("Promise.resolve(1).then(v=>{throw 'x'}).catch(e=>console.log('c:'+e))"), vec!["c:x"]);
+        assert_eq!(
+            run_ok("Promise.resolve(5).then(v=>console.log('got',v))"),
+            vec!["got 5"]
+        );
+        assert_eq!(
+            run_ok("Promise.reject('e').catch(e=>console.log('caught',e))"),
+            vec!["caught e"]
+        );
+        assert_eq!(
+            run_ok("Promise.resolve(1).then(v=>v+1).then(v=>console.log(v))"),
+            vec!["2"]
+        );
+        assert_eq!(
+            run_ok("Promise.resolve(1).then(v=>{throw 'x'}).catch(e=>console.log('c:'+e))"),
+            vec!["c:x"]
+        );
         // The defining ordering property: reactions run as microtasks AFTER sync.
-        assert_eq!(run_ok("console.log('A'); Promise.resolve().then(()=>console.log('C')); console.log('B')"), vec!["A", "B", "C"]);
+        assert_eq!(
+            run_ok(
+                "console.log('A'); Promise.resolve().then(()=>console.log('C')); console.log('B')"
+            ),
+            vec!["A", "B", "C"]
+        );
         // new Promise: resolve, reject, chaining, and adopting a returned promise.
-        assert_eq!(run_ok("new Promise(res=>res(42)).then(v=>console.log(v))"), vec!["42"]);
-        assert_eq!(run_ok("new Promise((res,rej)=>rej('bad')).catch(e=>console.log('err',e))"), vec!["err bad"]);
-        assert_eq!(run_ok("new Promise(r=>r(Promise.resolve(99))).then(v=>console.log(v))"), vec!["99"]);
+        assert_eq!(
+            run_ok("new Promise(res=>res(42)).then(v=>console.log(v))"),
+            vec!["42"]
+        );
+        assert_eq!(
+            run_ok("new Promise((res,rej)=>rej('bad')).catch(e=>console.log('err',e))"),
+            vec!["err bad"]
+        );
+        assert_eq!(
+            run_ok("new Promise(r=>r(Promise.resolve(99))).then(v=>console.log(v))"),
+            vec!["99"]
+        );
         // A promise resolved later by a stored resolver.
-        assert_eq!(run_ok("let r; let p=new Promise(res=>{r=res}); p.then(v=>console.log('late',v)); r(7)"), vec!["late 7"]);
+        assert_eq!(
+            run_ok(
+                "let r; let p=new Promise(res=>{r=res}); p.then(v=>console.log('late',v)); r(7)"
+            ),
+            vec!["late 7"]
+        );
         // The executor captures an outer variable (regression: capture analysis
         // must descend into `new` arguments to box `v`).
         assert_eq!(run_ok("function delay(v){return new Promise(res=>res(v))} delay(9).then(x=>console.log('d',x))"), vec!["d 9"]);
         // finally runs on both paths and passes the value/reason through.
         assert_eq!(run_ok("Promise.resolve(1).finally(()=>console.log('cleanup')).then(v=>console.log('v',v))"), vec!["cleanup", "v 1"]);
-        assert_eq!(run_ok("console.log(typeof Promise.resolve(1))"), vec!["object"]);
+        assert_eq!(
+            run_ok("console.log(typeof Promise.resolve(1))"),
+            vec!["object"]
+        );
     }
 
     #[test]
     fn promise_combinators() {
         // all: array of values (mixed plain + promise); first rejection wins; empty.
-        assert_eq!(run_ok("Promise.all([1,Promise.resolve(2),3]).then(a=>console.log(a.join(',')))"), vec!["1,2,3"]);
+        assert_eq!(
+            run_ok("Promise.all([1,Promise.resolve(2),3]).then(a=>console.log(a.join(',')))"),
+            vec!["1,2,3"]
+        );
         assert_eq!(run_ok("Promise.all([Promise.resolve(1),Promise.reject('x'),Promise.resolve(3)]).catch(e=>console.log('r',e))"), vec!["r x"]);
-        assert_eq!(run_ok("Promise.all([]).then(a=>console.log(a.length))"), vec!["0"]);
+        assert_eq!(
+            run_ok("Promise.all([]).then(a=>console.log(a.length))"),
+            vec!["0"]
+        );
         // race: first to settle (fulfil or reject).
         assert_eq!(run_ok("Promise.race([Promise.resolve('fast'),Promise.reject('slow')]).then(v=>console.log(v))"), vec!["fast"]);
         assert_eq!(run_ok("Promise.race([Promise.reject('boom'),Promise.resolve('ok')]).catch(e=>console.log('r',e))"), vec!["r boom"]);
@@ -3179,9 +3891,17 @@ mod tests {
             vec!["fulfilled1,rejectede"]
         );
         // any: first fulfilment; all-reject → AggregateError; empty → AggregateError.
-        assert_eq!(run_ok("Promise.any([Promise.reject('a'),Promise.resolve('win')]).then(v=>console.log(v))"), vec!["win"]);
+        assert_eq!(
+            run_ok(
+                "Promise.any([Promise.reject('a'),Promise.resolve('win')]).then(v=>console.log(v))"
+            ),
+            vec!["win"]
+        );
         assert_eq!(run_ok("Promise.any([Promise.reject('e1'),Promise.reject('e2')]).catch(e=>console.log(e.name,e.errors.join(',')))"), vec!["AggregateError e1,e2"]);
-        assert_eq!(run_ok("Promise.any([]).catch(e=>console.log(e.name))"), vec!["AggregateError"]);
+        assert_eq!(
+            run_ok("Promise.any([]).catch(e=>console.log(e.name))"),
+            vec!["AggregateError"]
+        );
         // Integrates with await + destructuring.
         assert_eq!(run_ok("async function f(){let [a,b]=await Promise.all([Promise.resolve(10),Promise.resolve(20)]); return a+b} f().then(v=>console.log(v))"), vec!["30"]);
     }
@@ -3192,7 +3912,10 @@ mod tests {
         assert_eq!(run_ok("function* g(){yield 1;yield 2} let it=g(); console.log(it.next().value,it.next().value,it.next().done)"), vec!["1 2 true"]);
         assert_eq!(run_ok("function* g(){yield 1; return 9} let it=g(); console.log(JSON.stringify(it.next()),JSON.stringify(it.next()),JSON.stringify(it.next()))"), vec![r#"{"value":1,"done":false} {"value":9,"done":true} {"done":true}"#]);
         // Empty generator; value sent into a yield expression.
-        assert_eq!(run_ok("function* g(){} console.log(g().next().done)"), vec!["true"]);
+        assert_eq!(
+            run_ok("function* g(){} console.log(g().next().done)"),
+            vec!["true"]
+        );
         assert_eq!(run_ok("function* g(){let x=yield 1; yield x+10} let it=g(); console.log(it.next().value, it.next(5).value)"), vec!["1 15"]);
         // for-of over a generator: direct call AND via a variable.
         assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} let s=0; for(let x of g()) s+=x; console.log(s)"), vec!["6"]);
@@ -3206,35 +3929,67 @@ mod tests {
         // A generator using a captured outer variable + a range helper.
         assert_eq!(run_ok("function* range(n){for(let i=0;i<n;i++) yield i*i} console.log([...range(4)].join(','))"), vec!["0,1,4,9"]);
         // typeof and inspect.
-        assert_eq!(run_ok("function* g(){} console.log(typeof g, typeof g())"), vec!["function object"]);
+        assert_eq!(
+            run_ok("function* g(){} console.log(typeof g, typeof g())"),
+            vec!["function object"]
+        );
     }
 
     #[test]
     fn generator_methods_and_yield_star() {
         // Object and class generator methods (incl. using `this` and static).
-        assert_eq!(run_ok("let o={*gen(){yield 1;yield 2}}; console.log([...o.gen()].join(','))"), vec!["1,2"]);
-        assert_eq!(run_ok("class C{*vals(){yield 1;yield 2}} console.log([...new C().vals()].join(','))"), vec!["1,2"]);
+        assert_eq!(
+            run_ok("let o={*gen(){yield 1;yield 2}}; console.log([...o.gen()].join(','))"),
+            vec!["1,2"]
+        );
+        assert_eq!(
+            run_ok("class C{*vals(){yield 1;yield 2}} console.log([...new C().vals()].join(','))"),
+            vec!["1,2"]
+        );
         assert_eq!(run_ok("class C{constructor(){this.xs=[10,20,30]} *each(){for(let x of this.xs) yield x}} console.log([...new C().each()].join(','))"), vec!["10,20,30"]);
-        assert_eq!(run_ok("class C{static *make(){yield 1;yield 2}} console.log([...C.make()].join(','))"), vec!["1,2"]);
+        assert_eq!(
+            run_ok("class C{static *make(){yield 1;yield 2}} console.log([...C.make()].join(','))"),
+            vec!["1,2"]
+        );
         // yield* delegation over a generator, array, string, and nested.
         assert_eq!(run_ok("function* inner(){yield 1;yield 2} function* outer(){yield* inner(); yield 3} console.log([...outer()].join(','))"), vec!["1,2,3"]);
-        assert_eq!(run_ok("function* g(){yield* [1,2,3]; yield* 'ab'} console.log([...g()].join(','))"), vec!["1,2,3,a,b"]);
-        assert_eq!(run_ok("function* g(){yield 0; yield* [1,2]; yield 3} console.log([...g()].join(','))"), vec!["0,1,2,3"]);
+        assert_eq!(
+            run_ok("function* g(){yield* [1,2,3]; yield* 'ab'} console.log([...g()].join(','))"),
+            vec!["1,2,3,a,b"]
+        );
+        assert_eq!(
+            run_ok("function* g(){yield 0; yield* [1,2]; yield 3} console.log([...g()].join(','))"),
+            vec!["0,1,2,3"]
+        );
         assert_eq!(run_ok("function* nest(){yield* (function*(){yield* [1,2]})()} console.log([...nest()].join(','))"), vec!["1,2"]);
     }
 
     #[test]
     fn async_await() {
         // An async function returns a Promise; its body's `return` fulfills it.
-        assert_eq!(run_ok("async function f(){return 1} f().then(v=>console.log('v',v))"), vec!["v 1"]);
+        assert_eq!(
+            run_ok("async function f(){return 1} f().then(v=>console.log('v',v))"),
+            vec!["v 1"]
+        );
         // await a non-promise (still yields a microtask tick) and a real promise.
-        assert_eq!(run_ok("async function f(){let x=await 5; return x+10} f().then(v=>console.log(v))"), vec!["15"]);
+        assert_eq!(
+            run_ok("async function f(){let x=await 5; return x+10} f().then(v=>console.log(v))"),
+            vec!["15"]
+        );
         assert_eq!(run_ok("async function f(){let x=await Promise.resolve(3); let y=await Promise.resolve(4); return x*y} f().then(v=>console.log(v))"), vec!["12"]);
         // Rejection caught by try/catch around the await.
         assert_eq!(run_ok("async function f(){try{await Promise.reject('boom'); return 'no'}catch(e){return 'caught '+e}} f().then(v=>console.log(v))"), vec!["caught boom"]);
         // Uncaught rejection / a thrown body error reject the returned promise.
-        assert_eq!(run_ok("async function f(){await Promise.reject('k')} f().catch(e=>console.log('c',e))"), vec!["c k"]);
-        assert_eq!(run_ok("async function f(){throw new Error('x')} f().catch(e=>console.log(e.message))"), vec!["x"]);
+        assert_eq!(
+            run_ok(
+                "async function f(){await Promise.reject('k')} f().catch(e=>console.log('c',e))"
+            ),
+            vec!["c k"]
+        );
+        assert_eq!(
+            run_ok("async function f(){throw new Error('x')} f().catch(e=>console.log(e.message))"),
+            vec!["x"]
+        );
         // Ordering: sync runs first; the await suspends and resumes as a microtask.
         assert_eq!(
             run_ok("console.log('start'); async function f(){console.log('before'); await 0; console.log('after')} f(); console.log('end')"),
@@ -3251,9 +4006,15 @@ mod tests {
             vec!["30"]
         );
         // Async arrow.
-        assert_eq!(run_ok("const f=async()=>(await Promise.resolve(7))+1; f().then(v=>console.log(v))"), vec!["8"]);
+        assert_eq!(
+            run_ok("const f=async()=>(await Promise.resolve(7))+1; f().then(v=>console.log(v))"),
+            vec!["8"]
+        );
         // typeof of an async call is the Promise object.
-        assert_eq!(run_ok("async function f(){} console.log(typeof f())"), vec!["object"]);
+        assert_eq!(
+            run_ok("async function f(){} console.log(typeof f())"),
+            vec!["object"]
+        );
         // try/finally around `return await` runs the finally before fulfilling.
         assert_eq!(
             run_ok("async function f(){try{return await Promise.resolve('ok')}finally{console.log('fin')}} f().then(v=>console.log(v))"),
@@ -3269,34 +4030,76 @@ mod tests {
     #[test]
     fn date_basics() {
         // Construct from ms; getTime / toISOString / UTC getters.
-        assert_eq!(run_ok("let d=new Date(1577836800000); console.log(d.getTime(), d.toISOString())"), vec!["1577836800000 2020-01-01T00:00:00.000Z"]);
+        assert_eq!(
+            run_ok("let d=new Date(1577836800000); console.log(d.getTime(), d.toISOString())"),
+            vec!["1577836800000 2020-01-01T00:00:00.000Z"]
+        );
         assert_eq!(run_ok("let d=new Date(Date.UTC(2021,5,15,10,30,45,123)); console.log(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate(),d.getUTCHours(),d.getUTCMinutes(),d.getUTCSeconds(),d.getUTCMilliseconds())"), vec!["2021 5 15 10 30 45 123"]);
         // Date.UTC / Date.parse / new Date(string).
-        assert_eq!(run_ok("console.log(Date.UTC(2000,0,1))"), vec!["946684800000"]);
-        assert_eq!(run_ok("console.log(Date.parse('2020-01-01T00:00:00.000Z'), Date.parse('1970-01-02'))"), vec!["1577836800000 86400000"]);
-        assert_eq!(run_ok("console.log(new Date('2020-06-15').toISOString())"), vec!["2020-06-15T00:00:00.000Z"]);
+        assert_eq!(
+            run_ok("console.log(Date.UTC(2000,0,1))"),
+            vec!["946684800000"]
+        );
+        assert_eq!(
+            run_ok("console.log(Date.parse('2020-01-01T00:00:00.000Z'), Date.parse('1970-01-02'))"),
+            vec!["1577836800000 86400000"]
+        );
+        assert_eq!(
+            run_ok("console.log(new Date('2020-06-15').toISOString())"),
+            vec!["2020-06-15T00:00:00.000Z"]
+        );
         // Arithmetic (ms diff), comparison, unary + coercion.
-        assert_eq!(run_ok("let a=new Date(1000),b=new Date(5000); console.log(b-a, a<b, +a)"), vec!["4000 true 1000"]);
+        assert_eq!(
+            run_ok("let a=new Date(1000),b=new Date(5000); console.log(b-a, a<b, +a)"),
+            vec!["4000 true 1000"]
+        );
         // Leap day, month overflow, pre-epoch, getUTCDay (2020-01-01 = Wednesday).
-        assert_eq!(run_ok("console.log(new Date(Date.UTC(2020,1,29)).toISOString())"), vec!["2020-02-29T00:00:00.000Z"]);
-        assert_eq!(run_ok("console.log(new Date(Date.UTC(2020,12,1)).toISOString())"), vec!["2021-01-01T00:00:00.000Z"]);
-        assert_eq!(run_ok("console.log(new Date(-86400000).toISOString())"), vec!["1969-12-31T00:00:00.000Z"]);
-        assert_eq!(run_ok("console.log(new Date(Date.UTC(2020,0,1)).getUTCDay())"), vec!["3"]);
+        assert_eq!(
+            run_ok("console.log(new Date(Date.UTC(2020,1,29)).toISOString())"),
+            vec!["2020-02-29T00:00:00.000Z"]
+        );
+        assert_eq!(
+            run_ok("console.log(new Date(Date.UTC(2020,12,1)).toISOString())"),
+            vec!["2021-01-01T00:00:00.000Z"]
+        );
+        assert_eq!(
+            run_ok("console.log(new Date(-86400000).toISOString())"),
+            vec!["1969-12-31T00:00:00.000Z"]
+        );
+        assert_eq!(
+            run_ok("console.log(new Date(Date.UTC(2020,0,1)).getUTCDay())"),
+            vec!["3"]
+        );
         // Invalid date; the legacy 2-digit year (constructor only); setFullYear (literal year).
-        assert_eq!(run_ok("console.log(new Date('nope').getTime(), String(new Date(NaN)))"), vec!["NaN Invalid Date"]);
+        assert_eq!(
+            run_ok("console.log(new Date('nope').getTime(), String(new Date(NaN)))"),
+            vec!["NaN Invalid Date"]
+        );
         assert_eq!(run_ok("console.log(new Date(Date.UTC(99,0,1)).getUTCFullYear(), Date.parse('0001-01-01T00:00:00.000Z'))"), vec!["1999 -62135596800000"]);
-        assert_eq!(run_ok("let d=new Date(0); d.setUTCFullYear(99); console.log(d.getUTCFullYear())"), vec!["99"]);
+        assert_eq!(
+            run_ok("let d=new Date(0); d.setUTCFullYear(99); console.log(d.getUTCFullYear())"),
+            vec!["99"]
+        );
         // console.log renders a Date as its ISO string (unquoted).
-        assert_eq!(run_ok("console.log(new Date(0))"), vec!["1970-01-01T00:00:00.000Z"]);
+        assert_eq!(
+            run_ok("console.log(new Date(0))"),
+            vec!["1970-01-01T00:00:00.000Z"]
+        );
     }
 
     #[test]
     fn computed_class_member_keys() {
         // Runtime-computed method / getter / setter / static keys.
-        assert_eq!(run_ok("let m='m'+1; class C{[m](){return 7}} console.log(new C().m1())"), vec!["7"]);
+        assert_eq!(
+            run_ok("let m='m'+1; class C{[m](){return 7}} console.log(new C().m1())"),
+            vec!["7"]
+        );
         assert_eq!(run_ok("class C{constructor(){this.x=3} ['a'+'b'](){return this.x}} console.log(new C().ab())"), vec!["3"]);
         assert_eq!(run_ok("class C{get [('v'+'al')](){return 42} set [('v'+'al')](z){this.x=z*2} ['get'+'X'](){return this.x}} let c=new C(); c.val=10; console.log(c.val, c.getX())"), vec!["42 20"]);
-        assert_eq!(run_ok("class C{static ['s'+'q'](n){return n*n}} console.log(C.sq(5))"), vec!["25"]);
+        assert_eq!(
+            run_ok("class C{static ['s'+'q'](n){return n*n}} console.log(C.sq(5))"),
+            vec!["25"]
+        );
     }
 
     #[test]
@@ -3306,7 +4109,12 @@ mod tests {
         // `this.#n++` update.
         assert_eq!(run_ok("class C{#n=0; bump(){this.#n++; return this.#n}} let c=new C(); console.log(c.bump(), c.bump())"), vec!["1 2"]);
         // A closure capturing `this`/a local that reads a private field.
-        assert_eq!(run_ok("class E{#v=7; make(){let s=this; return ()=>s.#v}} console.log(new E().make()())"), vec!["7"]);
+        assert_eq!(
+            run_ok(
+                "class E{#v=7; make(){let s=this; return ()=>s.#v}} console.log(new E().make()())"
+            ),
+            vec!["7"]
+        );
         // A private field used inside a method-local closure (map).
         assert_eq!(run_ok("class D{#xs=[1,2,3]; doubled(){return this.#xs.map(x=>x*2)}} console.log(new D().doubled().join(','))"), vec!["2,4,6"]);
     }
@@ -3318,7 +4126,10 @@ mod tests {
         // A dispatch table iterated by name.
         assert_eq!(run_ok("let ops={inc(n){return n+1},dbl(n){return n*2}}; let r=[]; for(let k of ['inc','dbl']) r.push(ops[k](10)); console.log(r.join(','))"), vec!["11,20"]);
         // Computed builtin method on an array.
-        assert_eq!(run_ok("let a=[3,1,2]; console.log(a['join']('-'))"), vec!["3-1-2"]);
+        assert_eq!(
+            run_ok("let a=[3,1,2]; console.log(a['join']('-'))"),
+            vec!["3-1-2"]
+        );
         // Class instance dynamic method.
         assert_eq!(run_ok("class C{constructor(){this.v=5} double(){return this.v*2}} let c=new C(),n='double'; console.log(c[n]())"), vec!["10"]);
     }
@@ -3328,9 +4139,20 @@ mod tests {
         // A custom-iterable object: for-of, spread, and Array.from all drive its
         // `[Symbol.iterator]()`.
         let range = "let range={from:1,to:4,[Symbol.iterator](){let c=this.from,e=this.to;return{next:()=>c<=e?{value:c++,done:false}:{done:true}}}};";
-        assert_eq!(run_ok(&format!("{range} let r=[]; for(let x of range) r.push(x); console.log(r.join(','))")), vec!["1,2,3,4"]);
-        assert_eq!(run_ok(&format!("{range} console.log([...range].join(','))")), vec!["1,2,3,4"]);
-        assert_eq!(run_ok(&format!("{range} console.log(Array.from(range).join(','))")), vec!["1,2,3,4"]);
+        assert_eq!(
+            run_ok(&format!(
+                "{range} let r=[]; for(let x of range) r.push(x); console.log(r.join(','))"
+            )),
+            vec!["1,2,3,4"]
+        );
+        assert_eq!(
+            run_ok(&format!("{range} console.log([...range].join(','))")),
+            vec!["1,2,3,4"]
+        );
+        assert_eq!(
+            run_ok(&format!("{range} console.log(Array.from(range).join(','))")),
+            vec!["1,2,3,4"]
+        );
         // Lazy: a `break` stops pulling from an infinite iterator.
         assert_eq!(
             run_ok("let nat={[Symbol.iterator](){let i=0;return{next:()=>({value:i++,done:false})}}}; let o=[]; for(let n of nat){if(n>=4)break; o.push(n)} console.log(o.join(','))"),
@@ -3342,68 +4164,141 @@ mod tests {
             vec!["3,2,1"]
         );
         // `obj[Symbol.iterator]` reads the (inherited) method via computed access.
-        assert_eq!(run_ok(&format!("{range} console.log(typeof range[Symbol.iterator])")), vec!["function"]);
+        assert_eq!(
+            run_ok(&format!(
+                "{range} console.log(typeof range[Symbol.iterator])"
+            )),
+            vec!["function"]
+        );
     }
 
     #[test]
     fn string_relational_comparison() {
         // `<`/`>`/`<=`/`>=` on two strings compare lexicographically (not numeric).
-        assert_eq!(run_ok("console.log('apple'<'banana', 'cherry'<'apple', 'a'<='a', 'b'>'a', 'Z'<'a')"), vec!["true false true true true"]);
+        assert_eq!(
+            run_ok("console.log('apple'<'banana', 'cherry'<'apple', 'a'<='a', 'b'>'a', 'Z'<'a')"),
+            vec!["true false true true true"]
+        );
         // String vs number falls back to numeric coercion.
-        assert_eq!(run_ok("console.log('10'<'9', 10<9, '10'<9)"), vec!["true false false"]);
+        assert_eq!(
+            run_ok("console.log('10'<'9', 10<9, '10'<9)"),
+            vec!["true false false"]
+        );
         // sort with a string comparator, and the default (stringify) sort.
         assert_eq!(run_ok("let s=['banana','apple','cherry','date']; s.sort((x,y)=>x<y?-1:x>y?1:0); console.log(s.join(','))"), vec!["apple,banana,cherry,date"]);
-        assert_eq!(run_ok("console.log(['banana','apple','cherry'].sort().join(','))"), vec!["apple,banana,cherry"]);
+        assert_eq!(
+            run_ok("console.log(['banana','apple','cherry'].sort().join(','))"),
+            vec!["apple,banana,cherry"]
+        );
         // Numeric comparator still goes through the (now native) fast path.
-        assert_eq!(run_ok("console.log([5,3,8,1,9,2].sort((a,b)=>a-b).join(','))"), vec!["1,2,3,5,8,9"]);
+        assert_eq!(
+            run_ok("console.log([5,3,8,1,9,2].sort((a,b)=>a-b).join(','))"),
+            vec!["1,2,3,5,8,9"]
+        );
     }
 
     #[test]
     fn array_destructure_iterables() {
         // Array destructuring drives the iterator protocol for generators and
         // custom iterables (positional fast path still used for arrays/strings).
-        assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} let [a,b]=g(); console.log(a,b)"), vec!["1 2"]);
+        assert_eq!(
+            run_ok("function* g(){yield 1;yield 2;yield 3} let [a,b]=g(); console.log(a,b)"),
+            vec!["1 2"]
+        );
         assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} let [a,...r]=g(); console.log(a,r.join(','))"), vec!["1 2,3"]);
         assert_eq!(run_ok("let it={[Symbol.iterator](){let i=0;return{next:()=>({value:i++,done:false})}}}; let [a,b,c]=it; console.log(a,b,c)"), vec!["0 1 2"]); // infinite iterator, bounded pull (no hang)
-        assert_eq!(run_ok("let [a,b]=[10,20]; console.log(a,b)"), vec!["10 20"]);          // array fast path
-        assert_eq!(run_ok("let [x,y]='hi'; console.log(x,y)"), vec!["h i"]);              // string
-        assert_eq!(run_ok("let m=new Map([['k',1]]); let [[k,v]]=m; console.log(k,v)"), vec!["k 1"]); // map entries
+        assert_eq!(run_ok("let [a,b]=[10,20]; console.log(a,b)"), vec!["10 20"]); // array fast path
+        assert_eq!(run_ok("let [x,y]='hi'; console.log(x,y)"), vec!["h i"]); // string
+        assert_eq!(
+            run_ok("let m=new Map([['k',1]]); let [[k,v]]=m; console.log(k,v)"),
+            vec!["k 1"]
+        ); // map entries
     }
 
     #[test]
     fn map_basics() {
         assert_eq!(run_ok("let m=new Map(); m.set('a',1).set('b',2); console.log(m.get('a'),m.get('b'),m.size,m.has('a'),m.has('z'))"), vec!["1 2 2 true false"]);
-        assert_eq!(run_ok("let m=new Map([['x',10],['y',20]]); console.log(m.get('x'),m.get('y'),m.size)"), vec!["10 20 2"]);
+        assert_eq!(
+            run_ok("let m=new Map([['x',10],['y',20]]); console.log(m.get('x'),m.get('y'),m.size)"),
+            vec!["10 20 2"]
+        );
         // set on an existing key updates in place (one entry); delete returns bool.
-        assert_eq!(run_ok("let m=new Map(); m.set(1,'a'); m.set(1,'b'); console.log(m.get(1),m.size)"), vec!["b 1"]);
-        assert_eq!(run_ok("let m=new Map([[1,1]]); console.log(m.delete(1),m.delete(1),m.size)"), vec!["true false 0"]);
+        assert_eq!(
+            run_ok("let m=new Map(); m.set(1,'a'); m.set(1,'b'); console.log(m.get(1),m.size)"),
+            vec!["b 1"]
+        );
+        assert_eq!(
+            run_ok("let m=new Map([[1,1]]); console.log(m.delete(1),m.delete(1),m.size)"),
+            vec!["true false 0"]
+        );
         // Iteration: for-of entries, keys/values, forEach(value,key), spread.
         assert_eq!(run_ok("let m=new Map([['a',1],['b',2]]); let r=[]; for(let [k,v] of m) r.push(k+v); console.log(r.join(','))"), vec!["a1,b2"]);
         assert_eq!(run_ok("let m=new Map([['a',1],['b',2]]); console.log([...m.keys()].join(','), [...m.values()].join(','))"), vec!["a,b 1,2"]);
         assert_eq!(run_ok("let m=new Map([['a',1]]); let r=[]; m.forEach((v,k)=>r.push(k+'='+v)); console.log(r.join(','))"), vec!["a=1"]);
         // SameValueZero keys: NaN dedupes, -0/+0 collapse, objects by identity, no coercion.
-        assert_eq!(run_ok("let m=new Map(); m.set(NaN,1).set(NaN,2); console.log(m.size,m.get(NaN))"), vec!["1 2"]);
-        assert_eq!(run_ok("let m=new Map(); m.set(-0,'z'); console.log(m.get(0), m.has(0))"), vec!["z true"]);
-        assert_eq!(run_ok("let m=new Map(); m.set(1,'n'); console.log(m.get('1'))"), vec!["undefined"]);
+        assert_eq!(
+            run_ok("let m=new Map(); m.set(NaN,1).set(NaN,2); console.log(m.size,m.get(NaN))"),
+            vec!["1 2"]
+        );
+        assert_eq!(
+            run_ok("let m=new Map(); m.set(-0,'z'); console.log(m.get(0), m.has(0))"),
+            vec!["z true"]
+        );
+        assert_eq!(
+            run_ok("let m=new Map(); m.set(1,'n'); console.log(m.get('1'))"),
+            vec!["undefined"]
+        );
         // console.log + JSON shape.
-        assert_eq!(run_ok("console.log(new Map([['a',1],['b',2]]))"), vec!["Map(2) { 'a' => 1, 'b' => 2 }"]);
-        assert_eq!(run_ok("console.log(JSON.stringify({m:new Map([[1,2]])}))"), vec![r#"{"m":{}}"#]);
+        assert_eq!(
+            run_ok("console.log(new Map([['a',1],['b',2]]))"),
+            vec!["Map(2) { 'a' => 1, 'b' => 2 }"]
+        );
+        assert_eq!(
+            run_ok("console.log(JSON.stringify({m:new Map([[1,2]])}))"),
+            vec![r#"{"m":{}}"#]
+        );
     }
 
     #[test]
     fn set_basics() {
-        assert_eq!(run_ok("let s=new Set([1,2,2,3]); console.log(s.size, s.has(2), s.has(9))"), vec!["3 true false"]);
-        assert_eq!(run_ok("let s=new Set(); s.add(1).add(2).add(1); console.log(s.size, [...s].join(','))"), vec!["2 1,2"]);
-        assert_eq!(run_ok("let s=new Set([1,2,3]); console.log(s.delete(2), s.size, [...s].join(','))"), vec!["true 2 1,3"]);
+        assert_eq!(
+            run_ok("let s=new Set([1,2,2,3]); console.log(s.size, s.has(2), s.has(9))"),
+            vec!["3 true false"]
+        );
+        assert_eq!(
+            run_ok(
+                "let s=new Set(); s.add(1).add(2).add(1); console.log(s.size, [...s].join(','))"
+            ),
+            vec!["2 1,2"]
+        );
+        assert_eq!(
+            run_ok("let s=new Set([1,2,3]); console.log(s.delete(2), s.size, [...s].join(','))"),
+            vec!["true 2 1,3"]
+        );
         // Set from a string iterates chars (deduped).
-        assert_eq!(run_ok("let s=new Set('aabbc'); console.log(s.size, [...s].join(''))"), vec!["3 abc"]);
+        assert_eq!(
+            run_ok("let s=new Set('aabbc'); console.log(s.size, [...s].join(''))"),
+            vec!["3 abc"]
+        );
         // for-of yields values; forEach; NaN dedupe.
-        assert_eq!(run_ok("let r=[]; for(let v of new Set([10,20])) r.push(v); console.log(r.join(','))"), vec!["10,20"]);
-        assert_eq!(run_ok("let s=new Set([1,2,3]); let t=0; s.forEach(v=>t+=v); console.log(t)"), vec!["6"]);
+        assert_eq!(
+            run_ok("let r=[]; for(let v of new Set([10,20])) r.push(v); console.log(r.join(','))"),
+            vec!["10,20"]
+        );
+        assert_eq!(
+            run_ok("let s=new Set([1,2,3]); let t=0; s.forEach(v=>t+=v); console.log(t)"),
+            vec!["6"]
+        );
         assert_eq!(run_ok("console.log(new Set([NaN,NaN]).size)"), vec!["1"]);
         // The canonical dedupe idiom + console.log.
-        assert_eq!(run_ok("console.log([...new Set([3,1,3,2,1])].join(','))"), vec!["3,1,2"]);
-        assert_eq!(run_ok("console.log(new Set([1,2]))"), vec!["Set(2) { 1, 2 }"]);
+        assert_eq!(
+            run_ok("console.log([...new Set([3,1,3,2,1])].join(','))"),
+            vec!["3,1,2"]
+        );
+        assert_eq!(
+            run_ok("console.log(new Set([1,2]))"),
+            vec!["Set(2) { 1, 2 }"]
+        );
     }
 
     #[test]
@@ -3416,14 +4311,20 @@ mod tests {
         assert_eq!(run_ok("class K{constructor(){this.v=0} add(n){this.v+=n;return this} val(){return this.v}} console.log(new K().add(3).add(4).val())"), vec!["7"]);
         assert_eq!(run_ok("class A{constructor(n){this.n=n} d(){return this.n*2} q(){return this.d()*2}} console.log(new A(5).q())"), vec!["20"]);
         // A constructor returning an object replaces the instance.
-        assert_eq!(run_ok("class W{constructor(){return {custom:true}}} console.log(new W().custom)"), vec!["true"]);
+        assert_eq!(
+            run_ok("class W{constructor(){return {custom:true}}} console.log(new W().custom)"),
+            vec!["true"]
+        );
         // Methods are non-enumerable: keys/JSON show only fields.
         assert_eq!(run_ok("class A{constructor(){this.k=1;this.j=2} m(){}} let a=new A(); console.log(Object.keys(a).join(','), JSON.stringify(a))"), vec![r#"k,j {"k":1,"j":2}"#]);
         // instanceof for user classes; typeof a class is "function".
         assert_eq!(run_ok("class A{} class B{} let a=new A(); console.log(a instanceof A, a instanceof B, typeof A)"), vec!["true false function"]);
         // Arrays of instances; console.log prints the constructor name.
         assert_eq!(run_ok("class Pt{constructor(x){this.x=x}} console.log([new Pt(1),new Pt(2)].map(p=>p.x).join(','))"), vec!["1,2"]);
-        assert_eq!(run_ok("class Pt{constructor(x,y){this.x=x;this.y=y}} console.log(new Pt(3,4))"), vec!["Pt { x: 3, y: 4 }"]);
+        assert_eq!(
+            run_ok("class Pt{constructor(x,y){this.x=x;this.y=y}} console.log(new Pt(3,4))"),
+            vec!["Pt { x: 3, y: 4 }"]
+        );
         // Getters: invoked on read (this = instance), not enumerable.
         assert_eq!(run_ok("class C{constructor(){this.items=[1,2,3]} get size(){return this.items.length}} console.log(new C().size)"), vec!["3"]);
         assert_eq!(run_ok("class C{constructor(){this.n=1} get d(){return this.n*2}} let c=new C(); console.log(c.d, Object.keys(c).join(','))"), vec!["2 n"]);
@@ -3434,10 +4335,21 @@ mod tests {
         assert_eq!(run_ok("class B{set v(x){this._v=x*2} get v(){return this._v}} class D extends B{} let d=new D(); d.v=21; console.log(d.v)"), vec!["42"]);
         assert_eq!(run_ok("class P{constructor(){this.x=1}} let p=new P(); p.x=5; p.y=9; console.log(p.x,p.y)"), vec!["5 9"]);
         // Static methods + fields; instances don't see statics.
-        assert_eq!(run_ok("class M{static sq(n){return n*n}} console.log(M.sq(5))"), vec!["25"]);
-        assert_eq!(run_ok("class Cfg{static V='1.0'; static MAX=100} console.log(Cfg.V, Cfg.MAX)"), vec!["1.0 100"]);
+        assert_eq!(
+            run_ok("class M{static sq(n){return n*n}} console.log(M.sq(5))"),
+            vec!["25"]
+        );
+        assert_eq!(
+            run_ok("class Cfg{static V='1.0'; static MAX=100} console.log(Cfg.V, Cfg.MAX)"),
+            vec!["1.0 100"]
+        );
         assert_eq!(run_ok("class C{static n=0; constructor(){C.n++; this.id=C.n}} let a=new C(),b=new C(); console.log(a.id,b.id,C.n)"), vec!["1 2 2"]);
-        assert_eq!(run_ok("class A{static s(){return 1}} let a=new A(); console.log(typeof a.s, typeof A.s)"), vec!["undefined function"]);
+        assert_eq!(
+            run_ok(
+                "class A{static s(){return 1}} let a=new A(); console.log(typeof a.s, typeof A.s)"
+            ),
+            vec!["undefined function"]
+        );
     }
 
     #[test]
@@ -3447,67 +4359,146 @@ mod tests {
         // super(args) in a derived constructor; fields after super.
         assert_eq!(run_ok("class A{constructor(x){this.x=x}} class B extends A{constructor(x,y){super(x);this.y=y}} let b=new B(3,4); console.log(b.x,b.y)"), vec!["3 4"]);
         // Implicit super forwards constructor args.
-        assert_eq!(run_ok("class A{constructor(n){this.n=n}} class B extends A{} console.log(new B(7).n)"), vec!["7"]);
+        assert_eq!(
+            run_ok("class A{constructor(n){this.n=n}} class B extends A{} console.log(new B(7).n)"),
+            vec!["7"]
+        );
         // super.method() and override.
         assert_eq!(run_ok("class A{g(){return 'A'}} class B extends A{g(){return 'B->'+super.g()}} console.log(new B().g())"), vec!["B->A"]);
         assert_eq!(run_ok("class Animal{constructor(n){this.name=n} speak(){return this.name+' sound'}} class Dog extends Animal{speak(){return this.name+' barks'}} console.log(new Dog('Rex').speak())"), vec!["Rex barks"]);
         // Inherited fields; 3-level chain.
-        assert_eq!(run_ok("class A{x=1} class B extends A{y=2} let b=new B(); console.log(b.x,b.y)"), vec!["1 2"]);
+        assert_eq!(
+            run_ok("class A{x=1} class B extends A{y=2} let b=new B(); console.log(b.x,b.y)"),
+            vec!["1 2"]
+        );
         assert_eq!(run_ok("class A{constructor(){this.t='a'}} class B extends A{} class C extends B{} console.log(new C().t, new C() instanceof A)"), vec!["a true"]);
         // Inherited static method.
-        assert_eq!(run_ok("class A{static make(){return 'A'}} class B extends A{} console.log(B.make())"), vec!["A"]);
+        assert_eq!(
+            run_ok("class A{static make(){return 'A'}} class B extends A{} console.log(B.make())"),
+            vec!["A"]
+        );
     }
 
     #[test]
     fn instanceof_operator() {
         // Built-in collections / functions.
-        assert_eq!(run_ok("console.log([] instanceof Array, [] instanceof Object)"), vec!["true true"]);
-        assert_eq!(run_ok("console.log(({}) instanceof Object, ({}) instanceof Array)"), vec!["true false"]);
-        assert_eq!(run_ok("let f=x=>x; console.log(f instanceof Function, f instanceof Object)"), vec!["true true"]);
+        assert_eq!(
+            run_ok("console.log([] instanceof Array, [] instanceof Object)"),
+            vec!["true true"]
+        );
+        assert_eq!(
+            run_ok("console.log(({}) instanceof Object, ({}) instanceof Array)"),
+            vec!["true false"]
+        );
+        assert_eq!(
+            run_ok("let f=x=>x; console.log(f instanceof Function, f instanceof Object)"),
+            vec!["true true"]
+        );
         // Primitives are never instances.
-        assert_eq!(run_ok("console.log(5 instanceof Object, 's' instanceof Object, null instanceof Object)"), vec!["false false false"]);
+        assert_eq!(
+            run_ok(
+                "console.log(5 instanceof Object, 's' instanceof Object, null instanceof Object)"
+            ),
+            vec!["false false false"]
+        );
         // Error hierarchy: a subtype is also an Error; siblings don't match.
         assert_eq!(run_ok("let e=new TypeError('x'); console.log(e instanceof TypeError, e instanceof Error, e instanceof RangeError)"), vec!["true true false"]);
         // Engine-thrown errors are real Error objects (name/message/instanceof).
-        assert_eq!(run_ok("try{null.x}catch(e){console.log(e instanceof TypeError, e.name)}"), vec!["true TypeError"]);
-        assert_eq!(run_ok("try{let a=[];a.length=-1}catch(e){console.log(e instanceof RangeError)}"), vec!["true"]);
+        assert_eq!(
+            run_ok("try{null.x}catch(e){console.log(e instanceof TypeError, e.name)}"),
+            vec!["true TypeError"]
+        );
+        assert_eq!(
+            run_ok("try{let a=[];a.length=-1}catch(e){console.log(e instanceof RangeError)}"),
+            vec!["true"]
+        );
     }
 
     #[test]
     fn is_nan_is_finite() {
-        assert_eq!(run_ok("console.log(isNaN(NaN), isNaN(5), isNaN('x'), isNaN('12'))"), vec!["true false true false"]);
-        assert_eq!(run_ok("console.log(isFinite(5), isFinite(Infinity), isFinite(NaN), isFinite('3'))"), vec!["true false false true"]);
+        assert_eq!(
+            run_ok("console.log(isNaN(NaN), isNaN(5), isNaN('x'), isNaN('12'))"),
+            vec!["true false true false"]
+        );
+        assert_eq!(
+            run_ok("console.log(isFinite(5), isFinite(Infinity), isFinite(NaN), isFinite('3'))"),
+            vec!["true false false true"]
+        );
     }
 
     #[test]
     fn destructuring_parameters() {
         // The common .map(([k,v])=>…) over entries; arrow object-pattern param.
-        assert_eq!(run_ok("console.log(Object.entries({a:1,b:2}).map(([k,v])=>k+v).join(','))"), vec!["a1,b2"]);
-        assert_eq!(run_ok("let f=({x,y})=>x+y; console.log(f({x:3,y:4}))"), vec!["7"]);
+        assert_eq!(
+            run_ok("console.log(Object.entries({a:1,b:2}).map(([k,v])=>k+v).join(','))"),
+            vec!["a1,b2"]
+        );
+        assert_eq!(
+            run_ok("let f=({x,y})=>x+y; console.log(f({x:3,y:4}))"),
+            vec!["7"]
+        );
         // Function with mixed array + object pattern params.
-        assert_eq!(run_ok("function f([a,b],{c}){return a+b+c} console.log(f([1,2],{c:3}))"), vec!["6"]);
+        assert_eq!(
+            run_ok("function f([a,b],{c}){return a+b+c} console.log(f([1,2],{c:3}))"),
+            vec!["6"]
+        );
         // Defaults and rest inside a pattern parameter.
-        assert_eq!(run_ok("let f=({a,b=10})=>a+b; console.log(f({a:1}), f({a:1,b:2}))"), vec!["11 3"]);
-        assert_eq!(run_ok("let f=([a,...rest])=>a+':'+rest.join(','); console.log(f([1,2,3,4]))"), vec!["1:2,3,4"]);
+        assert_eq!(
+            run_ok("let f=({a,b=10})=>a+b; console.log(f({a:1}), f({a:1,b:2}))"),
+            vec!["11 3"]
+        );
+        assert_eq!(
+            run_ok("let f=([a,...rest])=>a+':'+rest.join(','); console.log(f([1,2,3,4]))"),
+            vec!["1:2,3,4"]
+        );
         // forEach with a pattern param; pattern param captured by a closure.
-        assert_eq!(run_ok("let r=[]; [[1,2],[3,4]].forEach(([a,b])=>r.push(a+b)); console.log(r.join(','))"), vec!["3,7"]);
-        assert_eq!(run_ok("let fns=[[1,2],[3,4]].map(([a,b])=>()=>a+b); console.log(fns[0](),fns[1]())"), vec!["3 7"]);
+        assert_eq!(
+            run_ok(
+                "let r=[]; [[1,2],[3,4]].forEach(([a,b])=>r.push(a+b)); console.log(r.join(','))"
+            ),
+            vec!["3,7"]
+        );
+        assert_eq!(
+            run_ok("let fns=[[1,2],[3,4]].map(([a,b])=>()=>a+b); console.log(fns[0](),fns[1]())"),
+            vec!["3 7"]
+        );
     }
 
     #[test]
     fn rest_parameters() {
         // Pure rest, rest after fixed params, empty rest.
-        assert_eq!(run_ok("function f(...a){return a.length} console.log(f(1,2,3))"), vec!["3"]);
-        assert_eq!(run_ok("function f(a,...b){return a+':'+b.join(',')} console.log(f(1,2,3,4))"), vec!["1:2,3,4"]);
-        assert_eq!(run_ok("function f(a,...b){return b.length} console.log(f(1))"), vec!["0"]);
+        assert_eq!(
+            run_ok("function f(...a){return a.length} console.log(f(1,2,3))"),
+            vec!["3"]
+        );
+        assert_eq!(
+            run_ok("function f(a,...b){return a+':'+b.join(',')} console.log(f(1,2,3,4))"),
+            vec!["1:2,3,4"]
+        );
+        assert_eq!(
+            run_ok("function f(a,...b){return b.length} console.log(f(1))"),
+            vec!["0"]
+        );
         // Arrow rest.
-        assert_eq!(run_ok("let g=(...xs)=>xs.reduce((a,b)=>a+b,0); console.log(g(1,2,3,4))"), vec!["10"]);
+        assert_eq!(
+            run_ok("let g=(...xs)=>xs.reduce((a,b)=>a+b,0); console.log(g(1,2,3,4))"),
+            vec!["10"]
+        );
         // Rest fed by spread (the two halves compose).
-        assert_eq!(run_ok("function f(...a){return a.join(',')} console.log(f(...[1,2,3],4))"), vec!["1,2,3,4"]);
+        assert_eq!(
+            run_ok("function f(...a){return a.join(',')} console.log(f(...[1,2,3],4))"),
+            vec!["1,2,3,4"]
+        );
         // Rest array captured by an inner closure (boxed into a cell).
-        assert_eq!(run_ok("function f(...a){return ()=>a.length} console.log(f(1,2,3)())"), vec!["3"]);
+        assert_eq!(
+            run_ok("function f(...a){return ()=>a.length} console.log(f(1,2,3)())"),
+            vec!["3"]
+        );
         // Rest method keeps `this`.
-        assert_eq!(run_ok("let o={n:5,f(...xs){return this.n+xs.length}}; console.log(o.f(1,2))"), vec!["7"]);
+        assert_eq!(
+            run_ok("let o={n:5,f(...xs){return this.n+xs.length}}; console.log(o.f(1,2))"),
+            vec!["7"]
+        );
     }
 
     #[test]
@@ -3515,44 +4506,106 @@ mod tests {
         // `in`: own object keys, array indices/length, class-instance inherited
         // methods, Map/Set size. (Plain-object Object.prototype methods aren't
         // inherited here — no prototype chain.)
-        assert_eq!(run_ok("let o={a:1,b:2}; console.log('a' in o, 'c' in o)"), vec!["true false"]);
-        assert_eq!(run_ok("console.log(0 in [1,2], 5 in [1,2], 'length' in [])"), vec!["true false true"]);
-        assert_eq!(run_ok("class A{m(){}} let a=new A(); a.x=1; console.log('m' in a, 'x' in a, 'y' in a)"), vec!["true true false"]);
-        assert_eq!(run_ok("class A{am(){}} class B extends A{} console.log('am' in new B())"), vec!["true"]);
+        assert_eq!(
+            run_ok("let o={a:1,b:2}; console.log('a' in o, 'c' in o)"),
+            vec!["true false"]
+        );
+        assert_eq!(
+            run_ok("console.log(0 in [1,2], 5 in [1,2], 'length' in [])"),
+            vec!["true false true"]
+        );
+        assert_eq!(
+            run_ok(
+                "class A{m(){}} let a=new A(); a.x=1; console.log('m' in a, 'x' in a, 'y' in a)"
+            ),
+            vec!["true true false"]
+        );
+        assert_eq!(
+            run_ok("class A{am(){}} class B extends A{} console.log('am' in new B())"),
+            vec!["true"]
+        );
         assert_eq!(run_ok("console.log('size' in new Map())"), vec!["true"]);
         // reduceRight (with and without an initial value).
-        assert_eq!(run_ok("console.log([1,2,3].reduceRight((a,b)=>a+'-'+b))"), vec!["3-2-1"]);
-        assert_eq!(run_ok("console.log([[0,1],[2,3]].reduceRight((a,b)=>a.concat(b),[]).join(','))"), vec!["2,3,0,1"]);
+        assert_eq!(
+            run_ok("console.log([1,2,3].reduceRight((a,b)=>a+'-'+b))"),
+            vec!["3-2-1"]
+        );
+        assert_eq!(
+            run_ok("console.log([[0,1],[2,3]].reduceRight((a,b)=>a.concat(b),[]).join(','))"),
+            vec!["2,3,0,1"]
+        );
         // Object.fromEntries from an array of pairs and from a Map.
-        assert_eq!(run_ok("console.log(JSON.stringify(Object.fromEntries([['a',1],['b',2]])))"), vec![r#"{"a":1,"b":2}"#]);
-        assert_eq!(run_ok("let m=new Map([['x',1]]); console.log(Object.fromEntries(m).x)"), vec!["1"]);
+        assert_eq!(
+            run_ok("console.log(JSON.stringify(Object.fromEntries([['a',1],['b',2]])))"),
+            vec![r#"{"a":1,"b":2}"#]
+        );
+        assert_eq!(
+            run_ok("let m=new Map([['x',1]]); console.log(Object.fromEntries(m).x)"),
+            vec!["1"]
+        );
     }
 
     #[test]
     fn array_string_methods_batch2() {
         // flatMap (map + flatten one level; empty array => filter out).
-        assert_eq!(run_ok("console.log([1,2,3].flatMap(x=>[x,x*2]).join(','))"), vec!["1,2,2,4,3,6"]);
-        assert_eq!(run_ok("console.log([1,2,3].flatMap(x=>x%2?[x]:[]).join(','))"), vec!["1,3"]);
+        assert_eq!(
+            run_ok("console.log([1,2,3].flatMap(x=>[x,x*2]).join(','))"),
+            vec!["1,2,2,4,3,6"]
+        );
+        assert_eq!(
+            run_ok("console.log([1,2,3].flatMap(x=>x%2?[x]:[]).join(','))"),
+            vec!["1,3"]
+        );
         // Immutable toSorted / toReversed leave the receiver unchanged.
         assert_eq!(run_ok("let a=[3,1,2]; let b=a.toSorted((x,y)=>x-y); console.log(b.join(','), a.join(','))"), vec!["1,2,3 3,1,2"]);
-        assert_eq!(run_ok("let a=[1,2,3]; console.log(a.toReversed().join(','), a.join(','))"), vec!["3,2,1 1,2,3"]);
+        assert_eq!(
+            run_ok("let a=[1,2,3]; console.log(a.toReversed().join(','), a.join(','))"),
+            vec!["3,2,1 1,2,3"]
+        );
         // findLast / findLastIndex.
-        assert_eq!(run_ok("console.log([1,2,3,4].findLast(x=>x<3), [1,2,3,4].findLastIndex(x=>x<3))"), vec!["2 1"]);
+        assert_eq!(
+            run_ok("console.log([1,2,3,4].findLast(x=>x<3), [1,2,3,4].findLastIndex(x=>x<3))"),
+            vec!["2 1"]
+        );
         // splice: remove+insert (returns removed), insert-only, negative start.
         assert_eq!(run_ok("let a=[1,2,3,4,5]; let r=a.splice(1,2,9,9,9); console.log(r.join(','), a.join(','))"), vec!["2,3 1,9,9,9,4,5"]);
-        assert_eq!(run_ok("let a=[1,2,3]; a.splice(1,0,'x'); console.log(a.join(','))"), vec!["1,x,2,3"]);
-        assert_eq!(run_ok("let a=[1,2,3]; console.log(a.splice(-1).join(','), a.join(','))"), vec!["3 1,2"]);
+        assert_eq!(
+            run_ok("let a=[1,2,3]; a.splice(1,0,'x'); console.log(a.join(','))"),
+            vec!["1,x,2,3"]
+        );
+        assert_eq!(
+            run_ok("let a=[1,2,3]; console.log(a.splice(-1).join(','), a.join(','))"),
+            vec!["3 1,2"]
+        );
         // String indexOf honors a start position; codePointAt.
-        assert_eq!(run_ok("console.log('abcabc'.indexOf('c',3), 'abcabc'.indexOf('a',1))"), vec!["5 3"]);
-        assert_eq!(run_ok("console.log('Hello'.codePointAt(0), 'Hi'.codePointAt(5))"), vec!["72 undefined"]);
+        assert_eq!(
+            run_ok("console.log('abcabc'.indexOf('c',3), 'abcabc'.indexOf('a',1))"),
+            vec!["5 3"]
+        );
+        assert_eq!(
+            run_ok("console.log('Hello'.codePointAt(0), 'Hi'.codePointAt(5))"),
+            vec!["72 undefined"]
+        );
     }
 
     #[test]
     fn array_methods_more() {
-        assert_eq!(run_ok("let a=[1,2,3]; a.reverse(); console.log(a.join(','))"), vec!["3,2,1"]);
-        assert_eq!(run_ok("console.log([1,2].concat([3,4],5,[6]).join(','))"), vec!["1,2,3,4,5,6"]);
-        assert_eq!(run_ok("console.log([1,[2,[3]]].flat().length, [1,[2,[3]]].flat(2).join(','))"), vec!["3 1,2,3"]);
-        assert_eq!(run_ok("console.log([1,2,3,4].fill(9,1,3).join(','), [1,2,1].lastIndexOf(1))"), vec!["1,9,9,4 2"]);
+        assert_eq!(
+            run_ok("let a=[1,2,3]; a.reverse(); console.log(a.join(','))"),
+            vec!["3,2,1"]
+        );
+        assert_eq!(
+            run_ok("console.log([1,2].concat([3,4],5,[6]).join(','))"),
+            vec!["1,2,3,4,5,6"]
+        );
+        assert_eq!(
+            run_ok("console.log([1,[2,[3]]].flat().length, [1,[2,[3]]].flat(2).join(','))"),
+            vec!["3 1,2,3"]
+        );
+        assert_eq!(
+            run_ok("console.log([1,2,3,4].fill(9,1,3).join(','), [1,2,1].lastIndexOf(1))"),
+            vec!["1,9,9,4 2"]
+        );
     }
 
     #[test]
@@ -3566,15 +4619,27 @@ mod tests {
             vec!["undefined -1 false false"],
         );
         // Empty array: some→false, every→true (vacuous truth).
-        assert_eq!(run_ok("console.log([].some(x=>x), [].every(x=>x))"), vec!["false true"]);
+        assert_eq!(
+            run_ok("console.log([].some(x=>x), [].every(x=>x))"),
+            vec!["false true"]
+        );
     }
 
     #[test]
     fn string_methods_extra() {
-        assert_eq!(run_ok("console.log('  hi  '.trim(), 'abc'.startsWith('ab'), 'abc'.endsWith('bc'))"), vec!["hi true true"]);
-        assert_eq!(run_ok("console.log('5'.padStart(3,'0'), '5'.padEnd(3,'-'), 'abc'.padStart(2))"), vec!["005 5-- abc"]);
+        assert_eq!(
+            run_ok("console.log('  hi  '.trim(), 'abc'.startsWith('ab'), 'abc'.endsWith('bc'))"),
+            vec!["hi true true"]
+        );
+        assert_eq!(
+            run_ok("console.log('5'.padStart(3,'0'), '5'.padEnd(3,'-'), 'abc'.padStart(2))"),
+            vec!["005 5-- abc"]
+        );
         // replace = first occurrence; replaceAll = all.
-        assert_eq!(run_ok("console.log('aXbXc'.replace('X','-'), 'aXbXc'.replaceAll('X','-'))"), vec!["a-bXc a-b-c"]);
+        assert_eq!(
+            run_ok("console.log('aXbXc'.replace('X','-'), 'aXbXc'.replaceAll('X','-'))"),
+            vec!["a-bXc a-b-c"]
+        );
         // charCodeAt/charAt/at/codePointAt — O(1) byte access (no per-call clone),
         // correct for ASCII and multi-byte; out-of-range → NaN/''/undefined.
         assert_eq!(run_ok("let s='hello'; console.log(s.charCodeAt(0), s.charCodeAt(4), s.charCodeAt(9), s.charAt(1), s.charAt(9), s.at(-1), s.codePointAt(2))"), vec!["104 111 NaN e  o 108"]);
@@ -3590,9 +4655,14 @@ mod tests {
             vec!["4 3 4 5 -4"],
         );
         // JS Math.round is half-up (≠ Rust's half-away-from-zero for negatives).
-        assert_eq!(run_ok("console.log(Math.round(2.5), Math.round(-2.5), Math.round(-2.6))"), vec!["3 -2 -3"]);
         assert_eq!(
-            run_ok("console.log(Math.min(3,1,2), Math.max(1,9,2), Math.pow(2,10), Math.hypot(3,4))"),
+            run_ok("console.log(Math.round(2.5), Math.round(-2.5), Math.round(-2.6))"),
+            vec!["3 -2 -3"]
+        );
+        assert_eq!(
+            run_ok(
+                "console.log(Math.min(3,1,2), Math.max(1,9,2), Math.pow(2,10), Math.hypot(3,4))"
+            ),
             vec!["1 9 1024 5"],
         );
         // sign preserves 0 / maps NaN→NaN; min/max are NaN-sticky; empty → ±Infinity.
@@ -3604,16 +4674,28 @@ mod tests {
         assert_eq!(run_ok("console.log(Math.sqrt('9'))"), vec!["3"]);
         // Math.random(): always in [0,1); a dice roll lands in range.
         assert_eq!(run_ok("let ok=true; for(let i=0;i<500;i++){let r=Math.random(); if(!(r>=0&&r<1))ok=false} console.log(ok)"), vec!["true"]);
-        assert_eq!(run_ok("let d=Math.floor(Math.random()*6)+1; console.log(d>=1&&d<=6)"), vec!["true"]);
+        assert_eq!(
+            run_ok("let d=Math.floor(Math.random()*6)+1; console.log(d>=1&&d<=6)"),
+            vec!["true"]
+        );
     }
 
     #[test]
     fn template_literals() {
         assert_eq!(run_ok("let x=5; console.log(`val=${x+1}`)"), vec!["val=6"]);
-        assert_eq!(run_ok("let a='A',b=2; console.log(`${a}-${b}-${a+b}`)"), vec!["A-2-A2"]);
-        assert_eq!(run_ok("let o={n:7}; console.log(`obj ${o.n} arr ${[1,2].length}`)"), vec!["obj 7 arr 2"]);
+        assert_eq!(
+            run_ok("let a='A',b=2; console.log(`${a}-${b}-${a+b}`)"),
+            vec!["A-2-A2"]
+        );
+        assert_eq!(
+            run_ok("let o={n:7}; console.log(`obj ${o.n} arr ${[1,2].length}`)"),
+            vec!["obj 7 arr 2"]
+        );
         assert_eq!(run_ok("console.log(`no interp`)"), vec!["no interp"]);
-        assert_eq!(run_ok("let n=10; let f=()=>`n=${n}`; console.log(f())"), vec!["n=10"]);
+        assert_eq!(
+            run_ok("let n=10; let f=()=>`n=${n}`; console.log(f())"),
+            vec!["n=10"]
+        );
     }
 
     #[test]
@@ -3621,11 +4703,20 @@ mod tests {
         // The tag gets the cooked strings array + the interpolated values.
         assert_eq!(run_ok("function t(s,...v){return s.join('|')+'#'+v.join(',')} console.log(t`a${1}b${2}c`)"), vec!["a|b|c#1,2"]);
         // No interpolations: one string, no values.
-        assert_eq!(run_ok("function t(s,...v){return s.join('|')+'#'+v.length} console.log(t`hi`)"), vec!["hi#0"]);
+        assert_eq!(
+            run_ok("function t(s,...v){return s.join('|')+'#'+v.length} console.log(t`hi`)"),
+            vec!["hi#0"]
+        );
         // `.raw` is the un-escaped parts (here `\\n` stays literal).
-        assert_eq!(run_ok(r"function t(s){return s.raw[0]} console.log(t`a\nb`)"), vec![r"a\nb"]);
+        assert_eq!(
+            run_ok(r"function t(s){return s.raw[0]} console.log(t`a\nb`)"),
+            vec![r"a\nb"]
+        );
         // String.raw built-in.
-        assert_eq!(run_ok(r"console.log(String.raw`a\n${1+1}b`)"), vec![r"a\n2b"]);
+        assert_eq!(
+            run_ok(r"console.log(String.raw`a\n${1+1}b`)"),
+            vec![r"a\n2b"]
+        );
         // A member tag binds `this`.
         assert_eq!(run_ok("let o={p:'P',f(s,...v){return this.p+':'+s.join('/')+v.join('')}}; console.log(o.f`x${10}y`)"), vec!["P:x/y10"]);
         // A closure capturing an outer var inside an interpolation.
@@ -3687,7 +4778,10 @@ mod tests {
             "let a=[]; for(let i=0;i<1000;i++){ a[i]=i*i; } let s=0; for(let i=0;i<1000;i++) s+=a[i]; console.log(a.length, s)",
             &["1000 332833500"],
         );
-        assert_eq!(run_ok("let a=[]; a[5]=99; console.log(a.length, a[0], a[5])"), vec!["6 undefined 99"]);
+        assert_eq!(
+            run_ok("let a=[]; a[5]=99; console.log(a.length, a[0], a[5])"),
+            vec!["6 undefined 99"]
+        );
     }
 
     #[test]
@@ -3706,10 +4800,20 @@ mod tests {
     fn array_length_clear_grow_invalid() {
         // arr.length = 0 clears (a very common idiom); larger extends with holes;
         // a non-integer / negative length throws RangeError.
-        assert_eq!(run_ok("let a=[1,2,3]; a.length=0; console.log(a.length, a[0])"), vec!["0 undefined"]);
-        assert_eq!(run_ok("let a=[1,2]; a.length=4; console.log(a.length, a[3], a[1])"), vec!["4 undefined 2"]);
+        assert_eq!(
+            run_ok("let a=[1,2,3]; a.length=0; console.log(a.length, a[0])"),
+            vec!["0 undefined"]
+        );
+        assert_eq!(
+            run_ok("let a=[1,2]; a.length=4; console.log(a.length, a[3], a[1])"),
+            vec!["4 undefined 2"]
+        );
         let out = run("let a=[1,2,3]; a.length=-1;").expect("compile");
-        assert!(out.error.as_deref().unwrap_or("").contains("Invalid array length"));
+        assert!(out
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Invalid array length"));
     }
 
     #[test]
@@ -3823,9 +4927,7 @@ mod tests {
         );
         // Several out-of-order deadlines must still fire earliest-first.
         assert_eq!(
-            run_ok(
-                "for (const ms of [30, 10, 20]) setTimeout(()=>console.log('t'+ms), ms)"
-            ),
+            run_ok("for (const ms of [30, 10, 20]) setTimeout(()=>console.log('t'+ms), ms)"),
             vec!["t10", "t20", "t30"],
         );
         // Equal deadlines keep insertion order (FIFO).

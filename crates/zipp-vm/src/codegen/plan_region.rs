@@ -41,7 +41,11 @@ fn set_decline_region(proto: &FuncProto, start: u32, end: u32) {
     DECLINE_REGION.with(|c| {
         let mut c = c.borrow_mut();
         c.0.clear();
-        c.0.push_str(if proto.name.is_empty() { "<anon>" } else { proto.name.as_str() });
+        c.0.push_str(if proto.name.is_empty() {
+            "<anon>"
+        } else {
+            proto.name.as_str()
+        });
         c.1 = start;
         c.2 = end;
     });
@@ -413,8 +417,12 @@ fn hoistable_pins(
         return out;
     }
     let code = &proto.code;
-    let pin_kind_at =
-        |ip: usize| -> Option<u8> { ta_plan.access.get(&ip).map(|&j| ta_plan.pins[j as usize].kind) };
+    let pin_kind_at = |ip: usize| -> Option<u8> {
+        ta_plan
+            .access
+            .get(&ip)
+            .map(|&j| ta_plan.pins[j as usize].kind)
+    };
     for (off, instr) in code[s..=e].iter().enumerate() {
         let ip = s + off;
         let ok = match *instr {
@@ -450,7 +458,11 @@ fn hoistable_pins(
             | Instr::ReturnUndefined
             | Instr::ToPropKey { .. } => true,
             // `Math.imul` is a native `imul` on every tier that admits it.
-            Instr::MathOp { op: MathFn::Imul, argc: 2, .. } => true,
+            Instr::MathOp {
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } => true,
             // W20 M4: `!b` on a bool home is one `xor` -- no user code, no
             // allocation, nothing that can move a pin.
             Instr::Not { .. } if int_push_enabled() => true,
@@ -573,7 +585,10 @@ pub(crate) struct BoxRefAdmit {
 }
 
 impl BoxRefAdmit {
-    pub(crate) const NONE: BoxRefAdmit = BoxRefAdmit { elems: false, ro_recv: false };
+    pub(crate) const NONE: BoxRefAdmit = BoxRefAdmit {
+        elems: false,
+        ro_recv: false,
+    };
     pub(crate) fn any(&self) -> bool {
         self.elems || self.ro_recv
     }
@@ -613,8 +628,17 @@ pub(crate) fn plan_region_cold(
     // after this plan is handed to it — belongs to THIS region. See
     // `set_decline_region`.
     plan_region_cold_ex(
-        proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, share_homes,
-        cold, admit_dv, BoxRefAdmit::NONE,
+        proto,
+        start,
+        end,
+        ta_plan,
+        admit_bitwise,
+        admit_split,
+        admit_wt_share,
+        share_homes,
+        cold,
+        admit_dv,
+        BoxRefAdmit::NONE,
     )
 }
 
@@ -637,14 +661,34 @@ pub(crate) fn plan_region_cold_ex(
 ) -> Option<RegionPlan> {
     set_decline_region(proto, start, end);
     match plan_region_cold_inner(
-        proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, share_homes,
-        cold, true, admit_dv, boxref,
+        proto,
+        start,
+        end,
+        ta_plan,
+        admit_bitwise,
+        admit_split,
+        admit_wt_share,
+        share_homes,
+        cold,
+        true,
+        admit_dv,
+        boxref,
     ) {
         PlanOutcome::Plan(p) => Some(*p),
         PlanOutcome::RetryNoHoist => {
             match plan_region_cold_inner(
-                proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share,
-                share_homes, cold, false, admit_dv, boxref,
+                proto,
+                start,
+                end,
+                ta_plan,
+                admit_bitwise,
+                admit_split,
+                admit_wt_share,
+                share_homes,
+                cold,
+                false,
+                admit_dv,
+                boxref,
             ) {
                 PlanOutcome::Plan(p) => Some(*p),
                 _ => None,
@@ -907,7 +951,9 @@ fn plan_region_cold_inner(
                 return true;
             }
             !admit_bitwise
-                && (k == ARR_INT_PIN_KIND || k == ARR_NUM_PIN_KIND || (arr_pin_loose() && is_arr_pin(k)))
+                && (k == ARR_INT_PIN_KIND
+                    || k == ARR_NUM_PIN_KIND
+                    || (arr_pin_loose() && is_arr_pin(k)))
                 && matches!(code[ip], Instr::GetIndex { .. })
         })
     };
@@ -927,10 +973,9 @@ fn plan_region_cold_inner(
     // from typing/homing too.
     let pinned_arr_len = |ip: usize| -> bool {
         admit_bitwise
-            && ta_plan
-                .access
-                .get(&ip)
-                .map_or(false, |&j| ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND)
+            && ta_plan.access.get(&ip).map_or(false, |&j| {
+                ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND
+            })
     };
     // A pinned DataView `get*` CallMethod (kind DV_PIN_KIND), DOUBLE path only.
     // The INT tier keeps declining these (B22/B32): a getUint32 result ranges
@@ -978,7 +1023,11 @@ fn plan_region_cold_inner(
     // recycled receivers of the parse-large-js mix loop (`kinds`, `ends`,
     // `starts`, `src`). `ZIPP_NO_MULTI_SPLIT=1` puts it back to one.
     let mut split_recvs: FxHashSet<u16> = FxHashSet::default();
-    let non_dv_split_budget = if crate::codegen::multi_split_enabled() { MULTI_SPLIT_BUDGET } else { 1 };
+    let non_dv_split_budget = if crate::codegen::multi_split_enabled() {
+        MULTI_SPLIT_BUDGET
+    } else {
+        1
+    };
     let mut non_dv_splits = 0usize;
     let mut write_through: FxHashSet<u16> = FxHashSet::default();
     let mut split_recv_lg: FxHashSet<usize> = FxHashSet::default();
@@ -989,7 +1038,9 @@ fn plan_region_cold_inner(
         // `obj` of every pinned-STRING charCodeAt/length access.
         let mut recv: FxHashSet<u16> = FxHashSet::default();
         for (off, instr) in code[s..=e].iter().enumerate() {
-            if cold.contains(&(s + off)) { continue; }
+            if cold.contains(&(s + off)) {
+                continue;
+            }
             if pinned_elem(s + off) {
                 if let Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } = *instr {
                     recv.insert(obj);
@@ -1012,7 +1063,9 @@ fn plan_region_cold_inner(
             let mut def_n: FxHashMap<u16, u32> = FxHashMap::default();
             let mut def_lg: FxHashSet<u16> = FxHashSet::default();
             for (off, instr) in code[s..=e].iter().enumerate() {
-                if cold.contains(&(s + off)) { continue; }
+                if cold.contains(&(s + off)) {
+                    continue;
+                }
                 if let Some(d) = writes_reg(instr) {
                     *def_n.entry(d).or_insert(0) += 1;
                     if matches!(instr, Instr::LoadGlobal { .. }) {
@@ -1022,7 +1075,9 @@ fn plan_region_cold_inner(
             }
             let mut used_elsewhere: FxHashSet<u16> = FxHashSet::default();
             for (off, instr) in code[s..=e].iter().enumerate() {
-                if cold.contains(&(s + off)) { continue; }
+                if cold.contains(&(s + off)) {
+                    continue;
+                }
                 // The receiver use AT a pinned access is exempt (read via the pin,
                 // not the register). Both halves are load-bearing: `instr_uses`
                 // declares the receiver of a `CallMethod` and of a `GetProp`, so
@@ -1078,8 +1133,9 @@ fn plan_region_cold_inner(
                 // read only via the STR pin). `def_n.get(&r).is_none()` (NOT
                 // `!= Some(&1)`) is load-bearing: a multiply-defined reg must NOT
                 // be admitted (it would need a real home).
-                let clean_global =
-                    def_n.get(&r) == Some(&1) && def_lg.contains(&r) && !used_elsewhere.contains(&r);
+                let clean_global = def_n.get(&r) == Some(&1)
+                    && def_lg.contains(&r)
+                    && !used_elsewhere.contains(&r);
                 let clean_param = def_n.get(&r).is_none() && !used_elsewhere.contains(&r);
                 if clean_global || clean_param {
                     ta_recv_regs.insert(r);
@@ -1132,8 +1188,14 @@ fn plan_region_cold_inner(
                                 continue;
                             }
                             all_dv &= is_dv;
-                            match ta_plan.access.get(&(s + off)).map(|&j| ta_plan.pins[j as usize].src) {
-                                Some(TaPinSrc::Global(g)) if g0.is_none() || g0 == Some(g) => g0 = Some(g),
+                            match ta_plan
+                                .access
+                                .get(&(s + off))
+                                .map(|&j| ta_plan.pins[j as usize].src)
+                            {
+                                Some(TaPinSrc::Global(g)) if g0.is_none() || g0 == Some(g) => {
+                                    g0 = Some(g)
+                                }
                                 _ => ok = false,
                             }
                         }
@@ -1183,7 +1245,13 @@ fn plan_region_cold_inner(
                     };
                     if !recv_lg_ips.is_empty()
                         && crate::codegen::plan::split_home_provably_safe(
-                            code, s, e, r, cold, &recv_lg_ips, &recv_use_at,
+                            code,
+                            s,
+                            e,
+                            r,
+                            cold,
+                            &recv_lg_ips,
+                            &recv_use_at,
                         )
                     {
                         split_recvs.insert(r);
@@ -1217,7 +1285,9 @@ fn plan_region_cold_inner(
     // neither can name a register this base set lacks.
     let mut used: FxHashSet<u16> = FxHashSet::default();
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         for u in instr_uses(instr) {
             used.insert(u);
         }
@@ -1324,7 +1394,13 @@ fn plan_region_cold_inner(
             if cold.contains(&ip) || ip == s || !pinned_dv(ip) {
                 continue;
             }
-            if let Instr::CallMethod { arg_base, argc: 2, name, .. } = *instr {
+            if let Instr::CallMethod {
+                arg_base,
+                argc: 2,
+                name,
+                ..
+            } = *instr
+            {
                 let size = proto
                     .string_constants
                     .get(name as usize)
@@ -1383,9 +1459,8 @@ fn plan_region_cold_inner(
                 };
                 // No use of f between the call and its kill (the kill's own
                 // operands included — they read the pre-def value).
-                let tainted_use = (cip + 1..=m).any(|ip2| {
-                    !cold.contains(&ip2) && instr_uses(&code[ip2]).contains(&f)
-                });
+                let tainted_use = (cip + 1..=m)
+                    .any(|ip2| !cold.contains(&ip2) && instr_uses(&code[ip2]).contains(&f));
                 // No way out of `(eq, m)` while the Bool is live, and no way
                 // in: no branch, no jump target, and only PURE-NUMERIC ops
                 // that cannot throw on the numeric state a deopt flush
@@ -1444,7 +1519,12 @@ fn plan_region_cold_inner(
 
     // Record a use (operand) of reg `r` with required type `req`.
     // Returns false on a type conflict (caller declines).
-    let note_def = |r: u16, t: VTy, ty: &mut FxHashMap<u16, VTy>, first_seen: &mut FxHashMap<u16, bool>, reg_order: &mut Vec<u16>| -> bool {
+    let note_def = |r: u16,
+                    t: VTy,
+                    ty: &mut FxHashMap<u16, VTy>,
+                    first_seen: &mut FxHashMap<u16, bool>,
+                    reg_order: &mut Vec<u16>|
+     -> bool {
         if let Some(prev) = ty.get(&r) {
             if *prev != t {
                 return false;
@@ -1461,7 +1541,9 @@ fn plan_region_cold_inner(
     // type (from defs) and first-occurrence (def vs use). Operand type
     // requirements are validated in a second loop once types are known.
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         // A call or a bitwise op can't be register-allocated (boxed Values / int32
         // lanes / arbitrary user code) — decline to the memory path. A dense-array
         // GetIndex/SetIndex likewise declines UNLESS it is a kind-8 (Float64) pinned
@@ -1543,13 +1625,16 @@ fn plan_region_cold_inner(
             // under a tag guard (`emit_box_to_home`) that DEOPTs on anything
             // else -- the same contract the dense-Array element read has used
             // on this tier since B95.
-            Instr::GetProp { dst, .. } if getprop_ips.contains(&(s + off)) => {
-                (Some(dst), VTy::Num)
-            }
+            Instr::GetProp { dst, .. } if getprop_ips.contains(&(s + off)) => (Some(dst), VTy::Num),
             // `Math.imul` → a signed i32 (Num). BLOCKER FIX: without this the carried
             // fnv1a accumulator (written ONLY by Imul) is never typed → the
             // used-but-undefined scan declines the whole region.
-            Instr::MathOp { dst, op: MathFn::Imul, argc: 2, .. } => (Some(dst), VTy::Num),
+            Instr::MathOp {
+                dst,
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } => (Some(dst), VTy::Num),
             // ToPropertyKey of a NUMBER is the identity (no observable
             // coercion), so on this tier the op is a register copy and its dst
             // is a Num. The identity claim needs the src to actually BE a
@@ -1566,9 +1651,7 @@ fn plan_region_cold_inner(
             // W20 M4: `!b` yields a Bool from a Bool. INT path only (the other
             // tiers have no `Not` arm and still decline at their emitter's
             // catch-all, exactly as today).
-            Instr::Not { dst, .. } if admit_bitwise && int_push_enabled() => {
-                (Some(dst), VTy::Bool)
-            }
+            Instr::Not { dst, .. } if admit_bitwise && int_push_enabled() => (Some(dst), VTy::Bool),
             Instr::Move { dst, .. } => (Some(dst), VTy::Num), // refined below
             _ => (None, VTy::Num),
         };
@@ -1589,8 +1672,8 @@ fn plan_region_cold_inner(
             split_recv_lg.contains(&(s + off)) || dv_flag_elide.contains(&(s + off));
         // W20: a `box_regs` member is deliberately UNTYPED and UNHOMED -- its
         // value lives in the frame slot the def writes.
-        if let Some(d) =
-            def.filter(|d| !ta_recv_regs.contains(d) && !is_split_recv_load && !box_regs.contains(d))
+        if let Some(d) = def
+            .filter(|d| !ta_recv_regs.contains(d) && !is_split_recv_load && !box_regs.contains(d))
         {
             // Move's dst type follows its src; default Num is corrected here.
             let t = if let Instr::Move { src, .. } = *instr {
@@ -1657,7 +1740,9 @@ fn plan_region_cold_inner(
     // TA-receiver regs are intentionally untyped (sourced via the pin) — skip them.
     let mut ro_live_in: Vec<u16> = Vec::new();
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         for u in instr_uses(instr) {
             if !ta_recv_regs.contains(&u)
                 && !box_regs.contains(&u)
@@ -1670,7 +1755,9 @@ fn plan_region_cold_inner(
     }
     if !ro_live_in.is_empty() {
         for (off, instr) in code[s..=e].iter().enumerate() {
-            if cold.contains(&(s + off)) { continue; }
+            if cold.contains(&(s + off)) {
+                continue;
+            }
             // B98: on the DOUBLE path, an `Add` operand counts as a numeric-required
             // use. `Add` is excluded globally because it is also string concat, so a
             // string live-in is unremarkable and the entry guard would miss on every
@@ -1706,7 +1793,8 @@ fn plan_region_cold_inner(
             }
             for u in instr_uses(instr) {
                 if ro_live_in.contains(&u) && !numeric.contains(&u) {
-                    decline!("read-only live-in used where a number isn't required"); // 
+                    decline!("read-only live-in used where a number isn't required");
+                    //
                 }
             }
         }
@@ -1722,7 +1810,9 @@ fn plan_region_cold_inner(
     // Num home: the emitter reads the index from `key`'s home and a SetIndex stores
     // `val`'s home. Decline if either isn't a number home.
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         if pinned_elem(s + off) {
             let bad = match *instr {
                 Instr::GetIndex { key, .. } => ty.get(&key) != Some(&VTy::Num),
@@ -1744,7 +1834,13 @@ fn plan_region_cold_inner(
         // the single-byte kinds ignore the argument entirely (as the
         // interpreter does).
         if pinned_dv(s + off) {
-            if let Instr::CallMethod { arg_base, argc, name, .. } = *instr {
+            if let Instr::CallMethod {
+                arg_base,
+                argc,
+                name,
+                ..
+            } = *instr
+            {
                 if ty.get(&arg_base) != Some(&VTy::Num) {
                     decline!("pinned DV pos operand is not numeric");
                 }
@@ -1766,7 +1862,9 @@ fn plan_region_cold_inner(
 
     // Validate operand type requirements now that types are known.
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         match *instr {
             Instr::Add { a, b, .. }
             | Instr::Sub { a, b, .. }
@@ -1825,7 +1923,9 @@ fn plan_region_cold_inner(
     let mut def_count: FxHashMap<u16, u32> = FxHashMap::default();
     let mut const_def_ip: FxHashMap<u16, usize> = FxHashMap::default();
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         match *instr {
             Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } => {
                 *def_count.entry(dst).or_insert(0) += 1;
@@ -1849,7 +1949,9 @@ fn plan_region_cold_inner(
     // the whole op, silently dropping the append. Keeping the dst `used` is
     // what makes the side effect survive.
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         if let Instr::CallMethod { dst, .. } = *instr {
             if pinned_dv(s + off) || pinned_arr_push(s + off) {
                 used.insert(dst);
@@ -1869,14 +1971,27 @@ fn plan_region_cold_inner(
     // `used` (here) and the live-range touch loop (below). `(ip,reg,def)`.
     let mut str_imul_touch: Vec<(usize, u16, bool)> = Vec::new();
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         let ip = s + off;
         match *instr {
-            Instr::CallMethod { dst, arg_base, argc: 1, .. } if pinned_str(ip) => {
+            Instr::CallMethod {
+                dst,
+                arg_base,
+                argc: 1,
+                ..
+            } if pinned_str(ip) => {
                 str_imul_touch.push((ip, arg_base, false)); // index (use)
                 str_imul_touch.push((ip, dst, true)); // charCodeAt result (def)
             }
-            Instr::MathOp { dst, arg_base, op: MathFn::Imul, argc: 2, .. } => {
+            Instr::MathOp {
+                dst,
+                arg_base,
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } => {
                 str_imul_touch.push((ip, arg_base, false));
                 str_imul_touch.push((ip, arg_base + 1, false));
                 str_imul_touch.push((ip, dst, true)); // imul result (def)
@@ -2080,6 +2195,7 @@ fn plan_region_cold_inner(
                     | Instr::Mod { .. }
                     | Instr::StrConcat { .. }
                     | Instr::StrAppendInPlace { .. }
+                    | Instr::StrAppendIndex { .. }
                     | Instr::AddRightPair { .. }
                     | Instr::Pad2Concat { .. }
                     | Instr::Pad2Conditional { .. }
@@ -2139,11 +2255,23 @@ fn plan_region_cold_inner(
                     // Call-family windows, modeled explicitly (their reads are
                     // exactly callee/receiver + the contiguous arg window).
                     let win_use = match *i2 {
-                        Instr::Call { callee, arg_base, argc, .. }
-                        | Instr::New { callee, arg_base, argc, .. }
-                        | Instr::TailCall { callee, arg_base, argc } => {
-                            r == callee || (r >= arg_base && (r - arg_base) < argc)
+                        Instr::Call {
+                            callee,
+                            arg_base,
+                            argc,
+                            ..
                         }
+                        | Instr::New {
+                            callee,
+                            arg_base,
+                            argc,
+                            ..
+                        }
+                        | Instr::TailCall {
+                            callee,
+                            arg_base,
+                            argc,
+                        } => r == callee || (r >= arg_base && (r - arg_base) < argc),
                         Instr::NewArray { arg_base, argc, .. }
                         | Instr::ArrayCtor { arg_base, argc, .. }
                         | Instr::GlobalFn { arg_base, argc, .. }
@@ -2195,7 +2323,9 @@ fn plan_region_cold_inner(
                     };
                     if gap_has_target(d, uip) {
                         if grdbg {
-                            eprintln!("[globrange] [{s},{e}] r{r} not dead-out: target in ({d},{uip}]");
+                            eprintln!(
+                                "[globrange] [{s},{e}] r{r} not dead-out: target in ({d},{uip}]"
+                            );
                         }
                         continue 'ro_reg;
                     }
@@ -2269,12 +2399,10 @@ fn plan_region_cold_inner(
             // flushed.
             let v = match code[ip] {
                 Instr::LoadInt { val, .. } => val,
-                Instr::LoadConst { idx, .. } => {
-                    match proto.constants.get(idx as usize) {
-                        Some(c) if c.is_int() => c.bits() as u32 as i32,
-                        _ => continue,
-                    }
-                }
+                Instr::LoadConst { idx, .. } => match proto.constants.get(idx as usize) {
+                    Some(c) if c.is_int() => c.bits() as u32 as i32,
+                    _ => continue,
+                },
                 _ => continue,
             };
             slot_consts.insert(r, v);
@@ -2294,8 +2422,12 @@ fn plan_region_cold_inner(
     if allow_hoist && !hoist_pins.is_empty() {
         for (off, instr) in code[s..=e].iter().enumerate() {
             let ip = s + off;
-            let Instr::GetProp { dst, .. } = *instr else { continue };
-            let Some(&j) = ta_plan.access.get(&ip) else { continue };
+            let Instr::GetProp { dst, .. } = *instr else {
+                continue;
+            };
+            let Some(&j) = ta_plan.access.get(&ip) else {
+                continue;
+            };
             // STRINGS only: immutable, so length is a constant once identity
             // holds (entry-guarded — `hoist_pins` membership is the
             // precondition). A dense-Array length is also region-stable under
@@ -2378,7 +2510,15 @@ fn plan_region_cold_inner(
         let g =
             unify_homes_with_globals(code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets);
         let m = unify_move_homes(
-            code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets, &g,
+            code,
+            s,
+            e,
+            &ty,
+            &first_seen,
+            &dead,
+            &hoisted,
+            &jump_targets,
+            &g,
         );
         (g, m)
     } else {
@@ -2490,7 +2630,9 @@ fn plan_region_cold_inner(
     let mut first_ip: FxHashMap<u16, usize> = FxHashMap::default();
     let mut last_ip: FxHashMap<u16, usize> = FxHashMap::default();
     for (off, instr) in code[s..=e].iter().enumerate() {
-        if cold.contains(&(s + off)) { continue; }
+        if cold.contains(&(s + off)) {
+            continue;
+        }
         let ip = s + off;
         let mut touch = |r: u16| {
             first_ip.entry(r).or_insert(ip);
@@ -2561,9 +2703,8 @@ fn plan_region_cold_inner(
     // can only ever move a register from "shareable" to "permanent + entry
     // loaded", never the other way — the direction that is never wrong.
     let entry_live = liveness.entry_live;
-    let live_in = |r: u16| -> bool {
-        first_seen.get(&r) == Some(&false) || entry_live.contains(&r)
-    };
+    let live_in =
+        |r: u16| -> bool { first_seen.get(&r) == Some(&false) || entry_live.contains(&r) };
     let range = |r: u16| -> (usize, usize) {
         // Whole-region (permanent home) if loop-carried (live-in, used before
         // defined) OR a HOISTED constant — hoisted values are materialised once
@@ -2637,7 +2778,9 @@ fn plan_region_cold_inner(
             // two sets with OR, so emptying the overlap changes nothing else.
             if split_recvs.contains(&r) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
-                    eprintln!("[jit] region [{s},{e}] B97 write-through excludes B94 split receiver r{r}");
+                    eprintln!(
+                        "[jit] region [{s},{e}] B97 write-through excludes B94 split receiver r{r}"
+                    );
                 }
                 continue;
             }
@@ -2710,8 +2853,7 @@ fn plan_region_cold_inner(
     // `share_homes` call site feeds `compile_region_int_gpr` only — the xmm
     // emitters never see a narrowed plan. `ZIPP_NO_GLOB_RANGE=1` restores the
     // forced intervals byte-for-byte.
-    let glob_range =
-        (admit_dv || share_homes) && reuse && cold.is_empty() && glob_range_enabled();
+    let glob_range = (admit_dv || share_homes) && reuse && cold.is_empty() && glob_range_enabled();
     let mut narrow_globs: FxHashSet<u32> = FxHashSet::default();
     let mut glob_touch: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
     let mut seg_map: FxHashMap<u16, Vec<(usize, usize)>> = FxHashMap::default();
@@ -2776,10 +2918,9 @@ fn plan_region_cold_inner(
                 .then(|| writes_reg(instr))
                 .flatten()
                 .or_else(|| {
-                    (dv_flag_fuse.contains_key(&ip) && ip > s
-                        && dv_flag_elide.contains(&(ip - 1)))
-                    .then(|| writes_reg(&code[ip - 1]))
-                    .flatten()
+                    (dv_flag_fuse.contains_key(&ip) && ip > s && dv_flag_elide.contains(&(ip - 1)))
+                        .then(|| writes_reg(&code[ip - 1]))
+                        .flatten()
                 });
             for u in instr_uses(instr) {
                 if dv_flag_fuse.contains_key(&ip) && elided_dst == Some(u) {
@@ -2809,7 +2950,9 @@ fn plan_region_cold_inner(
             {
                 continue;
             }
-            let Some(tv) = touch.get_mut(&r) else { continue };
+            let Some(tv) = touch.get_mut(&r) else {
+                continue;
+            };
             tv.sort_unstable();
             let mut segs: Vec<(usize, usize)> = Vec::new();
             let mut cur: Option<(usize, usize)> = None;
@@ -2862,8 +3005,12 @@ fn plan_region_cold_inner(
             }
             // Bounds only — the phantom-drop above may trim an endpoint
             // relative to the raw first_ip/last_ip walk.
-            debug_assert!(segs.first().is_some_and(|x| x.0 >= *first_ip.get(&r).unwrap_or(&s)));
-            debug_assert!(segs.last().is_some_and(|x| x.1 <= *last_ip.get(&r).unwrap_or(&e)));
+            debug_assert!(segs
+                .first()
+                .is_some_and(|x| x.0 >= *first_ip.get(&r).unwrap_or(&s)));
+            debug_assert!(segs
+                .last()
+                .is_some_and(|x| x.1 <= *last_ip.get(&r).unwrap_or(&e)));
             seg_map.insert(r, segs);
         }
     }
@@ -2982,10 +3129,22 @@ fn plan_region_cold_inner(
                 }
                 if std::env::var_os("ZIPP_JITDECLINE").is_some() {
                     let nregs = reg_order.iter().filter(|r| ty[r] == VTy::Num).count();
-                    let perm = reg_order.iter().filter(|r| ty[r] == VTy::Num && !shareable(**r)).count();
-                    let ro = reg_order.iter().filter(|r| ty[r] == VTy::Num && read_outside.contains(r)).count();
-                    let li = reg_order.iter().filter(|r| ty[r] == VTy::Num && first_seen.get(r) == Some(&false)).count();
-                    let ho = reg_order.iter().filter(|r| ty[r] == VTy::Num && hoisted.contains(r)).count();
+                    let perm = reg_order
+                        .iter()
+                        .filter(|r| ty[r] == VTy::Num && !shareable(**r))
+                        .count();
+                    let ro = reg_order
+                        .iter()
+                        .filter(|r| ty[r] == VTy::Num && read_outside.contains(r))
+                        .count();
+                    let li = reg_order
+                        .iter()
+                        .filter(|r| ty[r] == VTy::Num && first_seen.get(r) == Some(&false))
+                        .count();
+                    let ho = reg_order
+                        .iter()
+                        .filter(|r| ty[r] == VTy::Num && hoisted.contains(r))
+                        .count();
                     eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                         glob_order.len(), nregs - perm);
                 }
@@ -3022,10 +3181,22 @@ fn plan_region_cold_inner(
                     }
                     if std::env::var_os("ZIPP_JITDECLINE").is_some() {
                         let nregs = reg_order.iter().filter(|r| ty[r] == VTy::Num).count();
-                        let perm = reg_order.iter().filter(|r| ty[r] == VTy::Num && !shareable(**r)).count();
-                        let ro = reg_order.iter().filter(|r| ty[r] == VTy::Num && read_outside.contains(r)).count();
-                        let li = reg_order.iter().filter(|r| ty[r] == VTy::Num && first_seen.get(r) == Some(&false)).count();
-                        let ho = reg_order.iter().filter(|r| ty[r] == VTy::Num && hoisted.contains(r)).count();
+                        let perm = reg_order
+                            .iter()
+                            .filter(|r| ty[r] == VTy::Num && !shareable(**r))
+                            .count();
+                        let ro = reg_order
+                            .iter()
+                            .filter(|r| ty[r] == VTy::Num && read_outside.contains(r))
+                            .count();
+                        let li = reg_order
+                            .iter()
+                            .filter(|r| ty[r] == VTy::Num && first_seen.get(r) == Some(&false))
+                            .count();
+                        let ho = reg_order
+                            .iter()
+                            .filter(|r| ty[r] == VTy::Num && hoisted.contains(r))
+                            .count();
                         eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                             glob_order.len(), nregs - perm);
                     }
@@ -3107,7 +3278,11 @@ fn plan_region_cold_inner(
         let mut iv: Vec<(usize, usize, u16)> = Vec::new();
         for &r in &reg_order {
             if ty[&r] == VTy::Bool {
-                let (a, b) = if bool_shareable(r) { (first_ip[&r], last_ip[&r]) } else { (s, e) };
+                let (a, b) = if bool_shareable(r) {
+                    (first_ip[&r], last_ip[&r])
+                } else {
+                    (s, e)
+                };
                 iv.push((a, b, r));
             }
         }
@@ -3168,7 +3343,9 @@ fn plan_region_cold_inner(
     {
         let mut imms: Vec<i32> = Vec::new();
         for (off, instr) in code[s..=e].iter().enumerate() {
-            if cold.contains(&(s + off)) { continue; }
+            if cold.contains(&(s + off)) {
+                continue;
+            }
             if let Instr::AddInt { imm, .. } = *instr {
                 if !imms.contains(&imm) {
                     imms.push(imm);
@@ -3190,7 +3367,9 @@ fn plan_region_cold_inner(
     {
         let mut cand: Vec<u16> = Vec::new();
         for (off, instr) in code[s..=e].iter().enumerate() {
-            if cold.contains(&(s + off)) { continue; }
+            if cold.contains(&(s + off)) {
+                continue;
+            }
             let (a, b) = match *instr {
                 Instr::Lt { a, b, .. }
                 | Instr::Le { a, b, .. }
@@ -3318,6 +3497,7 @@ fn plan_region_cold_inner(
         hoist_ips,
         hoisted,
         dead,
+        outside_dead,
         elide_guard,
         mul_shift,
         addint_imm_home,
@@ -3458,7 +3638,12 @@ pub(crate) fn region_liveness(
         if !(s..=e).contains(&ip) || cold.contains(&ip) {
             continue;
         }
-        if is_def { &mut defs[ip - s] } else { &mut uses[ip - s] }.push(r);
+        if is_def {
+            &mut defs[ip - s]
+        } else {
+            &mut uses[ip - s]
+        }
+        .push(r);
     }
     let mut live_in: Vec<FxHashSet<u16>> = vec![FxHashSet::default(); n];
     let mut live_out: Vec<FxHashSet<u16>> = vec![FxHashSet::default(); n];
@@ -3508,7 +3693,10 @@ pub(crate) fn region_liveness(
                 entry_live.insert(r);
             }
         }
-        return RegionLiveness { spans: span, entry_live };
+        return RegionLiveness {
+            spans: span,
+            entry_live,
+        };
     }
     for k in 0..n {
         let ip = s + k;
@@ -3525,7 +3713,10 @@ pub(crate) fn region_liveness(
             en.1 = en.1.max(ip);
         }
     }
-    RegionLiveness { spans: span, entry_live: live_in[0].clone() }
+    RegionLiveness {
+        spans: span,
+        entry_live: live_in[0].clone(),
+    }
 }
 
 /// Does the instruction at `d` run on EVERY pass through region `[s, e]`?
@@ -3695,6 +3886,9 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::LooseNe { a, b, .. }
         | Instr::JumpIfNotLt { a, b, .. }
         | Instr::JumpIfNotLe { a, b, .. } => vec![a, b],
+        Instr::StrAppendIndex {
+            a, obj, key, ..
+        } => vec![a, obj, key],
         Instr::AddRightPair { a, b, c, .. } => vec![a, b, c],
         Instr::Pad2Concat { src, .. } => vec![src],
         Instr::Pad2Conditional { src, .. } => vec![src],
@@ -4073,7 +4267,8 @@ pub(crate) fn plan_field_promotion(
     for instr in &code[s..=e] {
         if let Instr::StoreGlobal { idx, .. }
         | Instr::StoreGlobalStrict { idx, .. }
-        | Instr::StoreGlobalResolved { idx, .. } = *instr {
+        | Instr::StoreGlobalResolved { idx, .. } = *instr
+        {
             if idx == g {
                 return None;
             }
@@ -4123,9 +4318,15 @@ pub(crate) fn plan_field_promotion(
             _ => false,
         });
         match m.pos(fname) {
-            Some(slot) if !m.attrs[slot].accessor && (!need_writable || m.attrs[slot].writable) => {}
+            Some(slot) if !m.attrs[slot].accessor && (!need_writable || m.attrs[slot].writable) => {
+            }
             _ => return None,
         }
     }
-    Some(FieldPromotePlan { obj_global: g, fields, obj_idx, obj_version: heap.version_of(obj_idx) })
+    Some(FieldPromotePlan {
+        obj_global: g,
+        fields,
+        obj_idx,
+        obj_version: heap.version_of(obj_idx),
+    })
 }
