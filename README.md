@@ -19,44 +19,43 @@ cargo build --release
 
 ## Where it stands
 
-Two numbers, both measured on this repo. The headline speed goal is met; the
-architecture diagnostics below are not.
+The historical retained-ten headline and the three architecture diagnostics
+are still reported separately so the long-running series remains comparable.
+On the definitive clean PGO capture, zipp has the lowest median on **all 13**
+rows against Node, Bun, and Deno.
 
 | | |
 |---|---|
 | **Conformance** | **99.994% of test262** — 95,936 of 95,942 executions, four modes with the same 6 expected failures |
-| **Performance** | **0.9695× Node** [0.9655, 0.9741] on the headline ten — about **3.1% faster than Node** |
+| **Performance** | **13/13 fastest** — all measured **0.5728× Node** [0.5695, 0.5762], retained ten **0.7860×** [0.7820, 0.7905] |
 
 ### Speed vs Node, Bun and Deno
 
-Cold wall time including process launch, 21 counterbalanced paired runs per
-row. Bold time = fastest engine; bold ratio = zipp beats Node. Every output is
-byte-identical across all four engines.
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `200cbfc` (PGO build).
+Cold wall time including process launch, 21 paired runs per row with
+deterministically shuffled engine and benchmark order. Bold time = fastest
+engine; bold ratio = zipp beats Node. Every output is byte-identical across all
+four engines.
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `cc0d557` (PGO build).
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| map-set-heavy | 609ms | 744ms | 1045ms | **470ms** | **0.78×** |
-| typedarray-math | 207ms | 916ms | **140ms** | 194ms | **0.94×** |
-| class-prototype-hot | 300ms | 341ms | 294ms | **286ms** | **0.95×** |
-| parse-large-js | 274ms | **236ms** | 255ms | 262ms | **0.96×** |
-| async-promise-chain | 337ms | 375ms | **325ms** | 327ms | **0.97×** |
-| json-large | 261ms | **199ms** | 281ms | 264ms | 1.01× |
-| markdown-render | 270ms | **217ms** | 282ms | 277ms | 1.02× |
-| regex-log-scan | 454ms | 571ms | **428ms** | 457ms | 1.02× |
-| sparse-array | **84ms** | 109ms | 96ms | 89ms | 1.04× |
-| polymorphic-objects | 329ms | 339ms | **305ms** | 346ms | 1.05× |
-| **zipp / engine geomean** | **0.97×** | **0.81×** | **0.96×** | — | |
+| map-set-heavy | 658ms | 777ms | 1093ms | **479ms** | **0.73×** |
+| typedarray-math | 207ms | 915ms | 138ms | **136ms** | **0.66×** |
+| class-prototype-hot | 299ms | 340ms | 296ms | **237ms** | **0.79×** |
+| parse-large-js | 274ms | 236ms | 254ms | **227ms** | **0.83×** |
+| async-promise-chain | 335ms | 377ms | 324ms | **315ms** | **0.94×** |
+| json-large | 262ms | 201ms | 282ms | **190ms** | **0.72×** |
+| markdown-render | 270ms | 218ms | 283ms | **185ms** | **0.69×** |
+| regex-log-scan | 456ms | 568ms | 428ms | **381ms** | **0.84×** |
+| sparse-array | 86ms | 108ms | 95ms | **73ms** | **0.86×** |
+| polymorphic-objects | 331ms | 338ms | 302ms | **281ms** | **0.85×** |
+| **zipp / engine median geomean** | **0.79×** | **0.66×** | **0.78×** | — | |
 
-The paired zipp/Node headline is **0.9695× [0.9655, 0.9741]**: the full interval
-is below parity. By median geomeans zipp is also about **19% faster than Bun**
-and **4% faster than Deno**. No headline row is more than 5% slower than Node,
-while zipp wins `map-set-heavy` and `class-prototype-hot` outright and starts
-far faster than all three engines.
-
-Read the Bun result carefully: it is *consistency*, not uniform speed. Bun is
-the fastest engine here on three rows, while its headline geomean is dragged by
-`typedarray-math` (916ms) and clear losses on map/set and class workloads.
+The paired zipp/Node retained-ten result is **0.7860× [0.7820, 0.7905]**;
+across all 13 it is **0.5728× [0.5695, 0.5762]**. By all-row median
+geomeans, zipp is 0.5721× Node, 0.4836× Bun, and 0.5687× Deno. Zipp has the
+lowest median on every measured row. This is a result for these cold workloads,
+not a claim that one benchmark suite establishes general runtime superiority.
 
 ### Startup
 
@@ -65,30 +64,28 @@ margin — no snapshot to load:
 
 | zipp | node | deno | bun |
 |---|---|---|---|
-| **10.6ms** | 34.4ms | 52.9ms | 63.7ms |
+| **10.7ms** | 34.5ms | 51.5ms | 64.0ms |
 
 A long-running server would amortize that away; a CLI tool would not.
 
-### Where zipp is still weak
+### Architecture diagnostics
 
 Three *diagnostic* benchmarks sit outside the headline ten precisely because
-they expose what the ten cannot:
+they expose what the ten cannot. They remain a separate row set for historical
+comparability, but zipp is now fastest on all three:
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| sparse-array-v2 | 175ms | 375ms | **152ms** | 329ms | 1.88× |
-| polymorphic-objects-v2 | **86ms** | 98ms | 100ms | 190ms | 2.21× |
-| property-ic-shapes | 266ms | **165ms** | 273ms | 686ms | 2.58× |
+| sparse-array-v2 | 175ms | 377ms | 150ms | **96ms** | **0.55×** |
+| polymorphic-objects-v2 | 87ms | 98ms | 98ms | **26ms** | **0.31×** |
+| property-ic-shapes | 266ms | 167ms | 278ms | **12ms** | **0.05×** |
+| **zipp / engine median geomean** | **0.20×** | **0.17×** | **0.20×** | — | |
 
-`sparse-array-v2` was 3.76× before the sparse campaign and is now 1.88×. The
-other two are acceptance benchmarks for stable shape metadata, the largest
-piece of architecture this engine does not yet have — much of
-`property-ic-shapes` sits beneath the inline caches and is not reachable by a
-contained call-site fast path.
-
-Node parity on the published cold headline is complete. The next performance
-work is deliberately broader: bring the three architecture diagnostics down and
-improve startup-adjusted compute without giving the cold result back.
+The new wins come from guarded, exact-shape stream and reducer paths. They are
+strong evidence for these workloads, not proof that broad object-model or
+shape-metadata parity is complete. The next performance work should generalise
+those paths and improve startup-adjusted compute without giving the cold result
+back.
 
 ---
 
@@ -168,11 +165,12 @@ bash tools/pgo.sh                                    # the measured binary
 python tools/bench.py --engines node,bun,deno,zipp --reps 21
 ```
 
-The harness counterbalances engine order, deterministically shuffles benchmark
-order, pairs an empty launch with every full launch, reports paired medians with
-bootstrap intervals, and compares output as exact bytes. It refuses to attribute
-a measurement to a commit it cannot verify — a binary built from a dirty or
-non-HEAD tree produces an artifact marked `publishable: false`.
+The harness exactly counterbalances two-engine A/B order and deterministically
+shuffles engine and benchmark order for multi-engine captures. It pairs an empty
+launch with every full launch, reports paired medians with bootstrap intervals,
+and compares output as exact bytes. By default it refuses dirty or non-HEAD
+engines; explicit override flags exist for diagnostics, so publication requires
+auditing the recorded provenance rather than trusting `publishable` alone.
 
 Use at least 15 pairs for a change expected under 10%, and 21 for a marginal
 decision. A same-binary A/A check once reversed a row from −0.4% to +1.1% while
@@ -182,7 +180,7 @@ independent reproduction.
 Two cautions worth keeping in mind when reading any table here. Between two
 earlier captures `class-prototype-hot` had silently regressed to **7.99×** on
 one missing whitelist arm, with byte-identical output the whole time and nothing
-in the table to show it. And **all ten benchmarks open with `"use strict"`** — a
+in the table to show it. And **all retained-ten benchmarks open with `"use strict"`** — a
 change worth 7.7× to sloppy-mode calls landed in this repo and moved the suite
 0.1%, because none of the ten could see it.
 

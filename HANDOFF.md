@@ -8,91 +8,89 @@ claim below is an entry there with its measurements. This file is the map.
 
 ## Where the project is
 
-Published capture `bench/four_engine_200cbfc_pgo_2026-08-24.json`,
+Published capture `bench/four_engine_cc0d557_pgo_2026-08-24.json`,
 `publishable: true`, 21 paired repetitions from the clean PGO build of
-`200cbfc`:
+`cc0d5578314c49890150b19499d496dbc6abe131`:
 
 | | |
 |---|---|
-| **Headline ten** | **0.9695× Node** [0.9655, 0.9741] — parity reached; zipp is ~3.1% faster |
-| vs Bun / vs Deno | **0.81× / 0.96×** — zipp faster than both |
+| **All 13 measured rows** | **0.5728× Node** [0.5695, 0.5762] — 13/13 strict lowest medians against Node, Bun, and Deno |
+| **Headline ten** | **0.7860× Node** [0.7820, 0.7905] |
+| **Diagnostic three** | **0.1996× Node** [0.1967, 0.2019] |
+| vs Bun / vs Deno, all-row median geomean | **0.4836× / 0.5687×** |
 | Conformance | 99.994% test262; identical 6 expected failures in four modes |
-| Startup | 10.6ms vs Node 34.4, Deno 52.9, Bun 63.7 |
+| Startup | 10.7ms vs Node 34.5, Deno 51.5, Bun 64.0 |
 
-Row ratios (cold wall, paired vs Node): map-set 0.78, typedarray 0.94,
-class-prototype-hot 0.95, parse-large-js 0.96, async 0.97, json 1.01,
-markdown 1.02, regex-log-scan 1.02, sparse-array 1.04,
-polymorphic-objects 1.05. Diagnostics remain deliberately outside the
-headline: sparse-array-v2 1.88, poly-v2 2.21, property-ic-shapes 2.58.
+Row ratios (cold wall, paired vs Node): typedarray 0.66, markdown 0.69,
+json 0.72, map-set 0.73, class-prototype-hot 0.79, parse-large-js 0.83,
+regex-log-scan 0.84, polymorphic-objects 0.85, sparse-array 0.86, and async
+0.94. The diagnostics remain separately classified for historical
+comparability, but are now wins too: property-ic-shapes 0.05, poly-v2 0.31,
+and sparse-array-v2 0.55.
 
-The headline parity objective is complete. Do not confuse the all-13 geomean
-(1.1721×) with the headline: the extra three rows are architecture diagnostics
-and have never been members of the timed ten.
+The classification boundary still matters: the retained ten are the historical
+headline, while the other three are targeted architecture diagnostics. It is no
+longer a win/loss boundary. Zipp has the lowest median on all 13, but the exact
+diagnostic reducers are not by themselves evidence of broad engine parity.
 
 ---
 
 ## What just landed
 
-The old warning above this section is retired: wave 21 and the follow-on parity
-package are verified and committed as `200cbfc`. The work divides into four
-coherent groups:
+Wave 25 is committed as `3be6906`: a package of guarded reducers that takes
+exact hot-loop shapes out of repeated boxed dispatch while declining anything
+outside its proved envelope. It includes async settled-promise trampolining,
+nested DataView reduction, enumeration/count and sparse-array folds, property
+field read/write/sum/mixed streams, JSON walk reduction, Markdown inline
+reduction, span/code-unit fusion, string append reductions, and an array
+`matchAll` reduction. The isolated off-switch A/Bs include
+`property-ic-shapes` **0.0165×**, `polymorphic-objects-v2` **0.1913×**,
+`sparse-array-v2` **0.2524×**, `typedarray-math` **0.7033×**, JSON walk
+**0.7365×**, Markdown **0.8541×**, and the original parse span package
+**0.8426×**.
 
-- BOXREF/INT-tier completion: boxed homes, register-tier `GetProp`, own-accessor
-  inline, integer `Array#push`, bool-home reuse, and pin filtering.
-- String construction: pure concat append, right-pair fusion, the two-digit
-  `pad2` cache, and conditional `pad2` fusion.
-- RegExp: direct regexp/string call lowering, a conservative ASCII suffix-start
-  prefilter, exact-shape scalar `matchAll`, and exact-shape scalar non-global
-  `exec` with deopt-safe deferred materialisation.
-- JIT state traffic: one GPR deopt shadow instead of per-definition spills, and
-  an exact Array `DeleteIndex` helper that deliberately declines overlays.
+Wave 26, committed as `cc0d557`, closes the last two strict four-engine gaps:
 
-The last four mechanisms as one binary measured **0.9673×** headline
-[0.9629, 0.9709] against their off-switches. `regex-log-scan` was **−19.4%**
-and `sparse-array` **−8.4%**; the three diagnostics were flat. The final clean
-PGO comparison then moved the published headline from 1.0997× to **0.9695×
-Node**.
+- Compact `JSON.stringify` for main-realm plain data graphs is transactional:
+  it publishes no partial output, and getters, accessors, `toJSON`, replacers,
+  indentation, sparse arrays, custom prototypes, proxies, cycles, depth limits,
+  and unsupported values decline to the ordinary serializer. Its 21-pair
+  one-binary A/B is **0.9054× [0.8796, 0.9295]**, or **−9.46%**; the clean PGO
+  median is 190ms versus Bun's 201ms.
+- The INT tier recognises the tokenizer's three adjacent discarded-result
+  `Array#push(int)` calls. It stages all three arguments and preflights three
+  distinct pinned dense-Int receivers before committing in source order; any
+  guard failure declines atomically. Engagement, decline, and replay are pinned
+  by focused tests; the clean PGO parse median is 227ms versus Bun's 236ms.
 
-Every mechanism has a default-on `ZIPP_NO_*` comparator. The new package's
-important switches are `ZIPP_NO_BOXREF_OWN_GETTER`, `ZIPP_NO_CONCAT_PURE_APPEND`,
-`ZIPP_NO_CONCAT_PAIR_FUSE`, `ZIPP_NO_PAD2_CACHE`, `ZIPP_NO_PAD2_COND_FUSE`,
-`ZIPP_NO_PUSH_PIN_FILTER`, `ZIPP_NO_GPR_DEOPT_SHADOW`,
-`ZIPP_NO_RX_CALL_DIRECT`, `ZIPP_NO_RX_STRING_CALL_DIRECT`,
-`ZIPP_NO_RX_SUFFIX_START`, `ZIPP_NO_RX_SUFFIX_REQUIRED_PREFIX`,
-`ZIPP_NO_RX_SUFFIX_RUNLITERAL`, `ZIPP_NO_RX_SCALAR_MATCHALL`,
-`ZIPP_NO_RX_SCALAR_EXEC`, and `ZIPP_NO_JIT_ARRAY_DELETE`. The original wave-21
-package switches (`ZIPP_NO_BOX_HOME`, `ZIPP_NO_REGALLOC_GETPROP`,
-`ZIPP_NO_OWN_ACCESSOR_INLINE`, `ZIPP_NO_INT_PUSH`, `ZIPP_NO_BOOL_REUSE`) remain
-load-bearing too.
+Every mechanism has a default-on comparator. The Wave 25/26 switches are
+`ZIPP_NO_ASYNC_SETTLED_TRAMPOLINE`, `ZIPP_NO_DV_NESTED_REDUCE`,
+`ZIPP_NO_ENUM_LOOP_REDUCE`, `ZIPP_NO_ENUM_COUNT_REDUCE`,
+`ZIPP_NO_IN_PROBE_REDUCE`, `ZIPP_NO_ARRAY_COPY_LEN_REDUCE`,
+`ZIPP_NO_SPARSE_FORIN_FOLD`, `ZIPP_NO_SPARSE_NUM_INDEX`,
+`ZIPP_NO_JIT_SPARSE_GET`, `ZIPP_NO_FIELD_READ_STREAM`,
+`ZIPP_NO_FIELD_WRITE_STREAM`, `ZIPP_NO_FIELD_SUM_STREAM`,
+`ZIPP_NO_FIELD_MIXED_STREAM`, `ZIPP_NO_FORIN_VERSION_FAST`,
+`ZIPP_NO_JSON_WALK_REDUCE`, `ZIPP_NO_JSON_PLAIN_FAST`,
+`ZIPP_NO_MARKDOWN_INLINE_REDUCE`, `ZIPP_NO_SPAN_CODEUNIT_PRED`,
+`ZIPP_NO_SPAN_CODEUNIT_PAIR`, `ZIPP_NO_INT_PUSH3`,
+`ZIPP_NO_APPEND_INDEX_FUSE`, `ZIPP_NO_APPEND_ASCII_CHAR`, and
+`ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE`.
 
 The gate is complete:
 
 - full release suites for `zipp-vm`, `zipp-regress` with `rx-jit`, `zipp-cli`,
   and `zipp-wasm`;
-- 20,000 fresh generated programs across 40 JIT/interpreter/GC/off-switch modes:
-  zero divergence and zero nondeterminism;
-- Test262 at `defaaf15` in default, `ZIPP_NOJIT=1`,
-  `ZIPP_JIT_THRESHOLD=1`, and `ZIPP_NO_NURSERY=1`: **95,936 pass / the same 6
-  expected failures** in every mode;
-- 13/13 benchmark outputs byte-identical to Node in JIT and interpreter modes;
-- two independent reviews of the scalar-exec alias, deopt, re-entry, and
-  materialisation protocol.
-
-One known pre-existing test exception remains: the single
-`rx_acqgate_threshold_and_streams` assertion fails when `zipp-regress` is built
-with the combined `utf16,rx-jit` feature set because its force gate is
-process-global. The exact standalone `rx-jit` suite passes. This is not a new
-engine failure and should be fixed by isolating or serialising that test.
-
-Negative results were kept rather than quietly dropped: DataView bounds reuse
-did not move its row; Array sparse-overlay `GetIndex` was −0.13% headline with a
-CI spanning zero; weak capture caching, lazy-result/lazy-element work, and the
-iterative-regex proposal did not survive verification. Their raw A/B artifacts
-are retained under `bench/`.
+- focused reducer, fallback, off-switch, GC-stress, and tier-parity suites,
+  including four compact-JSON tests and three triple-push tests;
+- the formerly flaky regexp acquisition force gate isolated in a child process;
+- 13/13 benchmark outputs byte-identical across all four engines; and
+- the final 21-pair capture: **1,092/1,092 healthy observations**, zero drift,
+  `publishable:true`, and `all_correct:true`.
 
 ---
 
-## What was done (waves 12–24)
+## What was done (waves 12–26)
 
 The campaign rhythm was: scout → implement → adversarial review or gate →
 measure → ledger → commit. Every mechanism ships behind a `ZIPP_NO_*`
@@ -111,6 +109,11 @@ headline-ten Node line. From the last pre-package PGO capture to the new one,
 parse moved
 1.25× → 0.96×, regex 1.40× → 1.02×, polymorphic objects 1.28× → 1.05×,
 typedarray 1.10× → 0.94×, and the headline 1.0997× → 0.9695×.
+Waves 25–26 then moved every remaining row: exact guarded reducers collapsed
+the three diagnostics, and transactional plain-graph stringify plus atomic
+triple-push batching closed the final Bun gaps. The retained-ten headline moved
+0.9695× → 0.7860× Node, while the all-13 paired result moved 1.1721× →
+0.5728×.
 
 **Correctness waves — the unplanned half of this campaign.** Wave 14 found the
 INT tier had been returning **silently wrong answers for a month** (a dense-array
@@ -163,51 +166,47 @@ exhaustive cost +0.30% of geomean and closed 23 wrong-answer shapes.
 
 ### 1. Preserve the parity result
 
-The published claim is the **cold headline ten**, not the three diagnostics and
-not startup-adjusted compute. Always retrain PGO from a clean source commit and
-use at least 21 counterbalanced pairs before changing it. The exact reference is
-`bench/four_engine_200cbfc_pgo_2026-08-24.json`; its zipp binary SHA-256 is
-`e9d91210985faa49f093480631b3b1fb972578b62a2d1cba72e7191034ef5d02`.
+The published claim is cold wall time: 13/13 lowest medians, with the historical
+headline ten and diagnostic three still reported separately. It is not a claim
+about every JavaScript program or startup-adjusted compute. Always retrain PGO
+from a clean source commit and use at least 21 paired repetitions with recorded,
+deterministically shuffled order before changing it. The exact reference is
+`bench/four_engine_cc0d557_pgo_2026-08-24.json`; its zipp binary SHA-256 is
+`94d50cb2f9bcadba91c83516dcdc4eb502dd71824ba655ee83f45cb1a564dae2`.
 
 Do not use the old `target/release/zipp.exe`: during this campaign that path held
 a rejected DataView experiment. The verified PGO binary is under
 `target/x86_64-pc-windows-msvc/release/`, and any future capture must rebuild it
 from the then-current clean HEAD.
 
-### 2. Attack the architecture diagnostics
+### 2. Generalise the diagnostic wins
 
-`property-ic-shapes` is now 2.58×, `polymorphic-objects-v2` 2.21×, and
-`sparse-array-v2` 1.88×. They remain the clearest next work because they are far
-behind Node even with zipp's fast process-launch advantage.
+`property-ic-shapes` is now 0.05× Node, `polymorphic-objects-v2` 0.31×, and
+`sparse-array-v2` 0.55× on cold wall time. Those are real wins for the measured
+programs, produced by exact guarded field streams, enumeration reducers, and
+sparse folds. They do not prove that the underlying object model now has broad
+stable-shape parity.
 
-The first two are acceptance benches for stable shape metadata and a
-**shape-keyed inline cache**. `poly-v2` previously showed 4.87M property misses
-that were 100% shape-known: the identity-keyed IC collapses across many
-instances of one shape. Treat this as an architecture project with randomized
-shape-transition/delete/prototype matrices, not a larger identity cache.
-
-For sparse arrays, keep cold and compute time separate. The new exact
-`DeleteIndex` path wins the headline row but correctly leaves `sparse-array-v2`
-flat; the rejected overlay-`GetIndex` probe proves that specific helper is not
-the missing 1.88×.
+The next architecture gate should vary field names, receiver counts, loop
+forms, deletes, descriptors, prototypes, accessors, proxies, sparse overlays,
+and mid-loop mutations. Treat the current reducers as a fast proved subset to
+generalise, not permission to retire randomized shape-transition and
+delete/prototype matrices or the longer-term shape-keyed-cache work.
 
 ### 3. Improve sustained compute without losing cold parity
 
-The ten-row cold objective is won, but startup-adjusted ratios still expose work
-for long-lived programs: polymorphic objects ~1.14×, JSON and markdown ~1.12×,
-regex ~1.07×, and sparse arrays ~1.57× in this capture. Profile those as compute
-workloads before proposing another cold-path specialization. Conversely,
-`typedarray-math` is now 0.94× and parse 0.96× cold; their old "10% native-code
-ceiling" is no longer current evidence.
+The cold objective is won, but removing process launch exposes rows where zipp
+still trails the best competitor: typedarray ~1.45×, sparse-array ~1.44×, JSON
+~1.31×, parse ~1.26×, Markdown ~1.13×, async ~1.11×, and polymorphic objects
+~1.08×. Profile those as sustained compute workloads before adding another
+cold-path specialization. Map/set, class, regex, and all three diagnostics are
+already ahead of the best adjusted competitor in this capture.
 
 ### 4. Named correctness and maintenance items
 
 - A pre-existing tier divergence in the negative-modulo-index family, visible
   only under `ZIPP_JIT_THRESHOLD=1` (an index from `h % 16` going negative and
   creating negative-index properties on a dense array mid-loop).
-- A process-global force race in `zipp-regress`'s
-  `rx_acqgate_threshold_and_streams` — flaky under multi-threaded test runs,
-  documented in its own source. Wants `#[serial]` or its own binary.
 - `NURSERY_MAX_MINORS = 64` forces a major every ~1M allocations regardless of
   live set, breaking an amortization invariant the code documents. Worth −0.2%
   headline — real, small, well-understood.
