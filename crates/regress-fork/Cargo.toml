@@ -77,6 +77,11 @@ path = "tests/rxjit_differential.rs"
 required-features = ["rx-jit"]
 
 [[test]]
+name = "rxjit_groupinit"
+path = "tests/rxjit_groupinit.rs"
+required-features = ["rx-jit"]
+
+[[test]]
 name = "replacement_tests"
 path = "tests/replacement_tests.rs"
 

@@ -235,6 +235,20 @@ pub(crate) fn region_can_compile(
             // key — exactly the cases the old Add+SetIndex pair also failed
             // to compile.
             Instr::ToConcatKey { .. } | Instr::SetIndexConcat { .. } => {}
+            // The fused computed-key DELETE (W19 M3). `region_mem.rs` had no
+            // `Delete` arm of any kind, so ONE opcode blacklisted the whole
+            // `delete obj["prop_" + p]` loop of `polymorphic-objects`
+            // (`[145,155]`) and it ran 100% interpreted. The MEM emitter calls
+            // `jit_delete_index_concat`, a thin wrapper over the SAME
+            // `Vm::delete_index_concat` the interpreter arm calls — so there is
+            // no re-derived semantics to get wrong, and no deopt sentinel:
+            // every receiver shape (Proxy, global, array, frozen) is served by
+            // the shared waterfall. It CAN allocate and CAN run user code, and a
+            // successful delete shifts slots and bumps the receiver version, so
+            // the emitter owes the full `CALL_THREW` + `emit_refetch_pinned`
+            // protocol — the `SetIndexConcat` treatment, for stronger reasons.
+            // Only the MEM tier gets it; `region_int.rs` keeps its own list.
+            Instr::DeleteIndexConcat { .. } if crate::codegen::jit_delete_enabled() => {}
             // `ForInLive` — the per-iteration for-in liveness check — MEM path via
             // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
             // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
@@ -822,6 +836,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) static_fn: usize,
     pub(crate) to_concat_key: usize,
     pub(crate) set_index_concat: usize,
+    /// W19 M3 -- `DeleteIndexConcat` helper (result bits / `CALL_THREW`).
+    pub(crate) delete_index_concat: usize,
     /// Tier C `IsArray` helper (v bits → Bool bits / deopt sentinel).
     pub(crate) is_array: usize,
     /// Tier C `LenOf` helper (obj bits → length Value bits).

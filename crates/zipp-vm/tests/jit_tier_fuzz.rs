@@ -427,6 +427,21 @@ const MODES: &[Mode] = &[
     Mode { name: "noarrkeyfast", env: &[("ZIPP_NO_ARRKEY_FAST", "1")] },
     Mode { name: "nopolyeqfast", env: &[("ZIPP_NO_POLYEQ_FAST", "1")] },
     Mode { name: "nonursery", env: &[("ZIPP_NO_NURSERY", "1")] },
+    // ── W19 ── the ordinary-object fast path at the head of `Vm::delete_prop`.
+    // `DeoptKind::ElemDelete` emits `delete arr[7]`, so every program carrying
+    // that deopt runs the new guard chain — and an Array is one of the receiver
+    // kinds the guard must REJECT, which is the arm a mis-guard would break.
+    //
+    // Its two wave-mates are deliberately NOT rows here, on this file's own
+    // `ZIPP_NO_ITER_REGION` reasoning: the generator emits no `delete o["k"+i]`
+    // (so `ZIPP_NO_JIT_DELETE`, which gates the `DeleteIndexConcat` region arm,
+    // would never see the op) and no object with enough keys to build a
+    // `PropIndex` at all (so `ZIPP_NO_SPLIT_PROPINDEX` would never see the
+    // table). Both rows would cost process time to prove nothing. They are
+    // covered instead by `tests/w19_jit_delete.rs`, whose whole battery re-runs
+    // in a child process under each latch, and by
+    // `tests/w19_delete_differential.js`.
+    Mode { name: "nodeletefast", env: &[("ZIPP_NO_DELETE_FASTPATH", "1")] },
     // Two OPT-IN rows beside `intsplit`, which is where a path gets less
     // exercise than it needs by construction.
     Mode { name: "arrpinloose", env: &[("ZIPP_ARR_PIN_LOOSE", "1")] },

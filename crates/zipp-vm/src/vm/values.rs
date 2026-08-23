@@ -1046,17 +1046,62 @@ impl<'p> Vm<'p> {
         // `has_property`, whose `arr_props` probe formats the index into a fresh
         // String on every call. Measured: that probe was 26 ns/element against
         // node's 0.9, and 55% of sparse-array's entire gap to node.
+        //
+        // W19 (M3): THE OVERLAY ARM. The guard above used to include
+        // `!array_elements_overlaid(idx)`, which refused the shortcut at the
+        // RECEIVER level: one sparse element anywhere sent EVERY probe on that
+        // array — including the ones landing inside its dense prefix — down the
+        // generic walk. Measured on sparse-array's `sp` (a 1,047,501-slot dense
+        // prefix plus 39,161 overlay entries): `i in sp` cost 88.4 ns against
+        // node's 29.5, and an in-prefix probe cost 81.9 ns against 84.0 ns past
+        // it — indistinguishable, i.e. the dense half was paying the sparse
+        // price. `hasOwn.call(sp, i)` on the SAME receiver cost 36.8 ns, because
+        // it routes through `has_own_index_fast`, which answers the overlay
+        // directly. This arm gives `in` that same answer:
+        //   * a dense in-range non-hole slot is an own element → `true`
+        //     (`in` needs no chain walk once an own property is found);
+        //   * otherwise, when a side table can shadow an element, ONE `pos`
+        //     probe on the canonical index key — `index_key` formats into a
+        //     `[0u8; 20]` stack buffer, so this allocates nothing — and its
+        //     presence IS the answer for every descriptor shape, accessor and
+        //     non-enumerable included, exactly as the shipped `hasOwn` path
+        //     already answers it (construct/iterate.rs:404-414);
+        //   * otherwise absent, which is the pre-wave answer unchanged.
+        // A `!extensible` (sealed/frozen) array reaches the probe too and gets
+        // the same correct answer, since `overlays_elements` folds integrity in.
+        // Excluded, as before: a `setPrototypeOf`'d receiver and every arguments
+        // object (both recorded in `proto_of`), a Proxy or a non-Array receiver
+        // (not a `HeapObj::Array`, so the 64-level walk below still runs), and a
+        // negative key (`k < 0` keeps its pre-wave `false`, untouched).
         if !self.array_proto_has_index && key.is_int() && obj.is_heap() {
             let idx = obj.heap_index();
-            if !self.proto_of.contains_key(&idx) && !self.array_elements_overlaid(idx) {
+            if !self.proto_of.contains_key(&idx) {
                 if let HeapObj::Array(items) = self.heap.get(idx) {
                     let k = key.as_int();
-                    let absent = k < 0
-                        || items
-                            .get(k as usize)
-                            .map_or(true, |v| v.is_hole());
-                    if absent {
-                        return Some(false);
+                    let overlaid = self.array_elements_overlaid(idx);
+                    if k < 0 {
+                        if !overlaid {
+                            return Some(false);
+                        }
+                    } else {
+                        let ku = k as usize;
+                        let dense_hit = items.get(ku).is_some_and(|v| !v.is_hole());
+                        if !overlaid {
+                            if !dense_hit {
+                                return Some(false);
+                            }
+                        } else if crate::codegen::index_in_overlay_enabled() {
+                            if dense_hit {
+                                return Some(true);
+                            }
+                            return Some(match self.arr_props.get(&idx) {
+                                Some(m) => {
+                                    let mut buf = [0u8; 20];
+                                    m.pos(crate::heap::index_key(&mut buf, ku)).is_some()
+                                }
+                                None => false,
+                            });
+                        }
                     }
                 }
             }

@@ -500,6 +500,52 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // W19 (M1): ABSENT-INDEX FAST ANSWER — the other half of the fast path
+        // above. A hole (or an index past the dense end) is PROVABLY absent when
+        // nothing in the receiver's chain can supply an integer index, and then
+        // `has_property_dyn` below can only return `false` — after formatting the
+        // index into a fresh `String`, probing `arr_props`, and walking the
+        // prototype chain. That walk is the per-hole cost every element-visiting
+        // builtin pays: measured 64.5 ns/hole through `concat` on a 4096-element
+        // array (0 holes 12.3 µs/call → 2048 holes 144.3 µs/call, dead linear),
+        // against node's flat 1.0 µs. One hole anywhere also flips the whole
+        // receiver off `concat`'s bulk-copy arm (:2001) and `slice`'s (:2105), so
+        // this predicate is what those two fall back ONTO.
+        //
+        // The predicate is `has_property_jit`'s, verbatim (values.rs:1049-1062),
+        // and the invalidation story is that one's:
+        //   * `array_proto_has_index` is the sticky indexed-prototype protector
+        //     (vm/mod.rs:743-762) — set, never cleared, by `note_array_proto_index`
+        //     (props/array_len.rs:376) when an integer-like key is defined on
+        //     Array.prototype/Object.prototype, and by
+        //     `invalidate_indexed_proto_protector` when either is re-prototyped.
+        //     It is read PER CALL here, not cached in compiled code, so a program
+        //     that invalidates it mid-run sees the very next element visit take
+        //     the full protocol.
+        //   * `proto_of` excludes a `setPrototypeOf`'d receiver — and every
+        //     arguments object, which always records one (values.rs:1385-1387),
+        //     so its mapped/`length` shapes never reach here.
+        //   * `array_elements_overlaid` (props/array_len.rs:58-60) excludes any
+        //     receiver whose side table can shadow an ELEMENT — a `defineProperty`'d
+        //     accessor or non-default index, a sparse overlay, and (via
+        //     `overlays_elements`, heap.rs:592-594) a sealed/frozen/non-extensible
+        //     array. A RegExp match result answers `false` there, correctly: its
+        //     `index`/`input`/`groups` cannot shadow an index.
+        // A Proxy receiver, or a Proxy on the chain, is not a `HeapObj::Array` and
+        // is not reached — the `has` trap below still runs and may still throw.
+        if crate::codegen::hole_absent_fast_enabled()
+            && !self.array_proto_has_index
+            && this.is_heap()
+        {
+            let idx = this.heap_index();
+            if !self.proto_of.contains_key(&idx) && !self.array_elements_overlaid(idx) {
+                if let HeapObj::Array(items) = self.heap.get(idx) {
+                    if items.get(k).map_or(true, |v| v.is_hole()) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
         let kv = Value::num(k as f64);
         // Proxy-aware HasProperty (a has trap must dispatch and may throw).
         if self.has_property_dyn(this, kv)? {

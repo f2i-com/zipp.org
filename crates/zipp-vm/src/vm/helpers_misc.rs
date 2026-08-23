@@ -654,11 +654,48 @@ pub(crate) extern "win64" fn jit_get_index(
     match vm.heap.get(arr.heap_index()) {
         HeapObj::Array(items) => match array_index(key) {
             // In range and present → the element. A HOLE must NOT be returned (it is
-            // an internal sentinel): deopt so the interpreter's get_index applies the
-            // absent-index / prototype semantics.
+            // an internal sentinel): under W19 (M2) it reads `undefined` when the
+            // chain provably cannot supply the index, else it deopts so the
+            // interpreter's get_index applies the absent-index / prototype semantics.
+            //
+            // W19 (M2): THE HOLE ARM GETS THE OOB ARM'S GUARD. A hole below length
+            // and an index above length are the SAME question — an absent own
+            // element — and [[Get]] resolves both by the same prototype walk, so
+            // the guard eight lines below is the whole soundness argument, reused
+            // verbatim. Until now only the OOB half had it, and the asymmetry was
+            // measurable: on one 4096-element array, 2,000,000 reads each, present
+            // 1.0 ns / OOB 6.0 ns / HOLE 65.5 ns, against ZIPP_NOJIT's 22.5 / 76.0 /
+            // 65.0 — i.e. the JIT accelerated OOB 12.7x and the hole not at all,
+            // because every hole read left the compiled code. Node is ~1.5 ns for
+            // all three.
+            //
+            // Everything that could supply the index is excluded by the same two
+            // tests: `array_proto_has_index` is the sticky protector (set by
+            // `note_array_proto_index` for an integer-like key defined on
+            // Array/Object.prototype, and by `invalidate_indexed_proto_protector`
+            // when either is re-prototyped), and `proto_of` covers a
+            // `setPrototypeOf`'d receiver. An `arr_props` element overlay — a
+            // sparse element, a `defineProperty`'d index, a sealed/frozen array —
+            // already deopted upstream (`array_elements_overlaid`, :651), and a
+            // TypedArray never reaches here. Both flags are read PER CALL, from the
+            // live VM, never cached in compiled code, so an invalidation mid-run is
+            // observed by the very next read.
+            //
+            // The interpreter twin in `vm/indexing_date.rs` carries the identical
+            // predicate and MUST change with this one, in the same commit: it is
+            // the reference this helper is validated against, and a JIT that
+            // answers `undefined` where the interpreter walks the chain is exactly
+            // the wrong-answer class the tier-differential fuzzer exists to catch.
             Some(i) if i < items.len() => {
                 if items[i].is_hole() {
-                    crate::codegen::SELF_CALL_DEOPT
+                    if crate::codegen::hole_undef_enabled()
+                        && !vm.array_proto_has_index
+                        && !vm.proto_of.contains_key(&arr.heap_index())
+                    {
+                        Value::UNDEFINED.bits()
+                    } else {
+                        crate::codegen::SELF_CALL_DEOPT
+                    }
                 } else {
                     items[i].bits()
                 }
@@ -2800,6 +2837,55 @@ pub(crate) extern "win64" fn jit_set_index_concat(
         vm.idx_key_scratch = scratch;
     }
     out
+}
+
+/// Win64 helper for a region `DeleteIndexConcat` (`delete obj["name" + i]`) --
+/// W19 M3. The delete loop of `polymorphic-objects` was the ONLY op keeping its
+/// region off the JIT: `region_mem.rs` had no `Delete` arm at all, so
+/// `[145,155]` was permanently blacklisted and the 900k-delete loop ran wholly
+/// interpreted.
+///
+/// The helper does NOT re-derive the semantics: it calls
+/// `Vm::delete_index_concat`, the exact function the interpreter's
+/// `Instr::DeleteIndexConcat` arm calls, so the strict-mode TypeError, the
+/// no-alloc scratch-key fast path, the global/module-namespace exclusions and
+/// the full `delete_property` waterfall (Proxy `deleteProperty` trap, array
+/// `length`, non-configurable -> `false`) all keep whatever behaviour that path
+/// already has. There is therefore NO deopt sentinel -- every receiver shape is
+/// served -- and the only non-Value return is `CALL_THREW`.
+///
+/// `packed = (func_id << 32) | name_idx`; `strict` rides the stack as arg 5.
+///
+/// Two consequences the emitter must honour, both stronger here than for
+/// `SetIndexConcat`:
+///  * it CAN allocate (the slow path materialises the key `String`) and it CAN
+///    run USER CODE (a Proxy trap), so `emit_refetch_pinned` after the call is
+///    mandatory -- and a successful delete SHIFTS every later slot and calls
+///    `bump_version`, so every IC entry recorded against the receiver is stale;
+///  * a throw becomes `CALL_THREW`, never the redo sentinel: a strict-mode
+///    `delete` that returns `false` throws AFTER the (failed) delete, and a
+///    Proxy trap may already have run arbitrary side effects, so re-executing
+///    the op in the interpreter would run them twice.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; all bits are valid rooted Values.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_delete_index_concat(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    packed: u64,
+    key_bits: u64,
+    strict: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let func_id = (packed >> 32) as u32;
+    let name = packed as u32;
+    let obj = Value::from_bits(obj_bits);
+    let key = Value::from_bits(key_bits);
+    match vm.delete_index_concat(obj, name, key, strict != 0, func_id) {
+        Ok(v) => v.bits(),
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
 }
 
 /// Win64 helper: write a captured cell (`CellSet`). A cell is one heap slot and

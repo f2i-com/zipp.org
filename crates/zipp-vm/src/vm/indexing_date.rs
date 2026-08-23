@@ -213,6 +213,25 @@ impl<'p> Vm<'p> {
                     // Out of range OR a hole → not an own element; [[Get]] continues up
                     // the ACTUAL prototype chain (a setPrototypeOf custom proto can
                     // carry inherited indices/accessors), else %Array.prototype%.
+                    //
+                    // W19 (M2): unless nothing on that chain can supply an integer
+                    // index, in which case the walk can only end in `undefined` —
+                    // after spelling the index and running `get_member` over
+                    // %Array.prototype% and %Object.prototype% for every hole. This
+                    // is the INTERPRETER TWIN of the `jit_get_index` hole arm
+                    // (vm/helpers_misc.rs) and carries the identical predicate: the
+                    // sticky `array_proto_has_index` protector plus "no
+                    // setPrototypeOf'd receiver". They must always agree — the JIT
+                    // is validated against this function — so the two changes are
+                    // one change, gated by one switch. A `defineProperty`'d index,
+                    // a sparse overlay and a live-mapped arguments index have all
+                    // already been answered above, so `i` is genuinely absent here.
+                    if crate::codegen::hole_undef_enabled()
+                        && !self.array_proto_has_index
+                        && !self.proto_of.contains_key(&aidx)
+                    {
+                        return Ok(Value::UNDEFINED);
+                    }
                     // The walk's key text is the canonical decimal of `i` for BOTH
                     // key shapes, so spell it from `i` (no key_of allocation).
                     let mut buf = [0u8; 20];

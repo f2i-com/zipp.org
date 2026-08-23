@@ -7100,6 +7100,7 @@ impl<'p> Vm<'p> {
             static_fn: crate::vm::helpers_misc::jit_static_fn as usize,
             to_concat_key: crate::vm::helpers_misc::jit_to_concat_key as usize,
             set_index_concat: crate::vm::helpers_misc::jit_set_index_concat as usize,
+            delete_index_concat: crate::vm::helpers_misc::jit_delete_index_concat as usize,
             is_array: jit_is_array as usize,
             len_of: jit_len_of as usize,
             forin_keys: jit_forin_keys as usize,
@@ -7471,12 +7472,54 @@ impl<'p> Vm<'p> {
         // place (a flat ASCII/UTF-8 string — surrogate-bearing keys take the
         // generic path) and ask the receiver's own map directly. has_property
         // below re-derives the key as a fresh String per chain level.
+        //
+        // W19 (M4): THE ARRAY ARM. This probe used to match `HeapObj::Object`
+        // ONLY, so an ARRAY receiver — the whole point of a `for (k in sparse)`
+        // walk — fell through to `has_property` and then, on a miss, to
+        // `key_of`, which allocates a fresh `String` for every key on every
+        // iteration. Measured over sparse-array's 40,000-key `sp`: a count-only
+        // for-in cost 250 ns/key against node's 170, while `Object.keys(sp)` on
+        // the same receiver cost 67 ns/key against node's 97 — i.e. zipp BUILDS
+        // the snapshot faster than node and loses it all in the liveness check.
+        //
+        // An array's own properties are its dense elements plus its `arr_props`
+        // side table (sparse elements AND ordinary named keys both live there),
+        // so both are probed, and both are byte views — no allocation:
+        //   * a CANONICAL index key resolves against the dense slots, where a
+        //     deleted element is a `HOLE` and correctly reads as absent;
+        //   * every other key — and every canonical index the dense storage does
+        //     not answer — takes one `pos` probe on the side table.
+        // The canonicality test is load-bearing and is `canonical_index_str`'s,
+        // byte-for-byte: `"01"`, `"1.0"`, `"-0"`, `" 1"` parse to a number but
+        // are ORDINARY named properties that no element may answer. It is
+        // spelled out here rather than called because `canonical_index_str`
+        // round-trips through `i.to_string()`, and an allocation per key is the
+        // cost this arm exists to remove.
+        //
+        // Answering `true` is the SAFE direction (it only keeps a key visited,
+        // and this probe's whole job is to DROP keys deleted mid-loop), so the
+        // arm is fail-closed: anything it cannot resolve falls through to the
+        // unchanged generic path below. Arguments objects are excluded — their
+        // `length`/mapped-index machinery is not this simple ownership question.
         let own_hit = o.is_heap()
             && kv.is_heap()
             && match self.heap.str_wtf8_cow(kv.heap_index()) {
                 Some(std::borrow::Cow::Borrowed(b)) => {
-                    match (std::str::from_utf8(b), self.heap.get(o.heap_index())) {
+                    let oidx = o.heap_index();
+                    match (std::str::from_utf8(b), self.heap.get(oidx)) {
                         (Ok(k), HeapObj::Object(m)) => m.pos(k).is_some(),
+                        (Ok(k), HeapObj::Array(items))
+                            if crate::codegen::forin_arr_own_enabled()
+                                && !self.arguments_objs.contains_key(&oidx) =>
+                        {
+                            let dense = canonical_index_bytes(k)
+                                .is_some_and(|i| items.get(i).is_some_and(|v| !v.is_hole()));
+                            dense
+                                || self
+                                    .arr_props
+                                    .get(&oidx)
+                                    .is_some_and(|m| m.pos(k).is_some())
+                        }
                         _ => false,
                     }
                 }
@@ -7707,4 +7750,61 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+}
+
+/// A CANONICAL non-negative integer property key, read straight off the key's
+/// bytes: `"0"`, `"1"`, `"10"` — but NOT `"00"`, `"01"`, `"-1"`, `"1.5"`, `""`,
+/// `" 1"` or anything that overflows a `usize`. Exactly
+/// [`crate::vm::helpers_numeric::canonical_index_str`]'s predicate, with the
+/// same rejections for the same reasons, but WITHOUT its `i.to_string()`
+/// round-trip: `forin_live`'s array arm runs once per key per iteration, and an
+/// allocation there is the cost that arm exists to remove.
+///
+/// Canonicality is load-bearing, not a nicety. `a["01"] = v` is an ordinary
+/// named property that element storage must never answer, and a bare
+/// `parse::<usize>()` would map it onto element 1.
+#[inline]
+fn canonical_index_bytes(k: &str) -> Option<usize> {
+    let b = k.as_bytes();
+    match b.first() {
+        None => None,
+        // A leading zero is canonical only for "0" itself.
+        Some(&b'0') => (b.len() == 1).then_some(0),
+        Some(_) => {
+            let mut n: usize = 0;
+            for &c in b {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                n = n.checked_mul(10)?.checked_add((c - b'0') as usize)?;
+            }
+            Some(n)
+        }
+    }
+}
+
+#[cfg(test)]
+mod forin_canon_tests {
+    use super::canonical_index_bytes;
+    use crate::vm::helpers_numeric::canonical_index_str;
+
+    /// The alloc-free spelling must agree with `canonical_index_str` on every
+    /// key shape a for-in snapshot can produce — that agreement is the whole
+    /// safety argument for W19's `forin_live` array arm.
+    #[test]
+    fn agrees_with_canonical_index_str() {
+        let cases = [
+            "", "0", "00", "01", "1", "10", "007", "-0", "-1", "1.0", "1.5", " 1", "1 ", "+1",
+            "0x10", "1e3", "length", "x", "4294967294", "4294967295", "4294967296",
+            "18446744073709551615", "18446744073709551616", "99999999999999999999999",
+            "\u{0}1", "1\u{0}",
+        ];
+        for c in cases {
+            assert_eq!(canonical_index_bytes(c), canonical_index_str(c), "key {c:?}");
+        }
+        for i in 0..2000usize {
+            let s = i.to_string();
+            assert_eq!(canonical_index_bytes(&s), canonical_index_str(&s), "key {s:?}");
+        }
+    }
 }

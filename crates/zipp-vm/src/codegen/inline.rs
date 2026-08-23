@@ -173,7 +173,7 @@ pub(crate) fn emit_inline_leaf_call(
     // committed before the lane's exit steps). `None` keeps the generic
     // emission below byte-identical.
     if let Some(lane) = &plan.typed_lane {
-        emit_typed_lane(ops, lane, plan, dst, fallback);
+        emit_typed_lane(ops, lane, plan.cell_get, plan.cell_set, dst, fallback);
         dynasm!(ops
             ; jmp => done
             ; => fallback
@@ -1223,6 +1223,19 @@ pub(crate) fn emit_inline_method_call(
                 ; jne => miss
             );
         }
+        // ── W19 (MI-LANE) ── a scheduled register-resident emission replaces
+        // the boxed body below. It needs NO scratch window at all: no `this`
+        // bind (the receiver is baked into every field load), no arg copy
+        // (params read the caller's arg slots directly), and no zero-fill
+        // (there are no callee locals in memory to stale-read). Every guard
+        // inside it jumps to `fallback` — the unchanged per-call helper — and
+        // the v1 gate admits only effect-free bodies, so the lane is a pure
+        // prefix: nothing is committed before it writes `dst` last.
+        if let Some(lane) = &shape.typed_lane {
+            emit_typed_lane(ops, lane, 0, 0, dst, fallback);
+            dynasm!(ops ; jmp => done);
+            continue;
+        }
         dynasm!(ops
             // ── bind reg 0 = `this` (rax still = receiver) ──
             ; mov [rbx + dreg(w)], rax
@@ -1327,8 +1340,20 @@ pub(crate) fn emit_inline_accessor(
             ; mov edx, [r13 + rcx*4]
             ; cmp edx, DWORD shape.recv_ver as i32
             ; jne => miss
-            ; mov [rbx + dreg(w)], rax          // reg 0 = this (receiver)
         );
+        // W19 (MI-LANE): a GETTER arm whose body scheduled a lane writes the
+        // result straight into `payload` and joins the site's IC continuation
+        // — no window binding at all. `after` (fall through to the unchanged
+        // IC probe) is the fallback, so a guard miss degrades exactly like an
+        // all-arm miss does today. `build_accessor_shape` never schedules a
+        // lane for a SETTER (its body ends in the store the v1 gate excludes).
+        if let Some(lane) = &shape.typed_lane {
+            debug_assert!(!is_setter, "a setter arm must not carry a v1 lane");
+            emit_typed_lane(ops, lane, 0, 0, payload, after);
+            dynasm!(ops ; jmp => cont);
+            continue;
+        }
+        dynasm!(ops ; mov [rbx + dreg(w)], rax); // reg 0 = this (receiver)
         if is_setter {
             dynasm!(ops
                 ; mov rax, [rbx + dreg(payload)]
@@ -1393,6 +1418,23 @@ pub(crate) fn emit_inline_accessor(
 
 /// GPR value homes (dynasm register codes): r8, r9, r10, r11, rdx.
 const LANE_GPR_HOMES: [u8; 5] = [8, 9, 10, 11, 2];
+/// Every lane step's operand template scratches rax and rcx and nothing else,
+/// which is only sound while neither is a VALUE HOME. W19 made that load-bearing
+/// in a new way: `LaneStep::SuperGuard` re-emits a block that `emit_mi_body`
+/// writes with rdx and r10 — both homes — so copying that emission verbatim
+/// silently destroys any intermediate live across the guard (measured: a wrong
+/// accumulator, not a crash). Assert the disjointness where the table is
+/// defined, so re-ordering the homes fails the build rather than the answer.
+const _: () = {
+    let mut i = 0;
+    while i < LANE_GPR_HOMES.len() {
+        assert!(
+            LANE_GPR_HOMES[i] != 0 && LANE_GPR_HOMES[i] != 1,
+            "rax/rcx are lane operand scratch and must never be value homes"
+        );
+        i += 1;
+    }
+};
 /// XMM value homes: xmm2..xmm5 (xmm0/xmm1 are operand-conversion scratch).
 const LANE_XMM_HOMES: [u8; 4] = [2, 3, 4, 5];
 /// Defensive cap on scheduled body length (splice bodies are ≤ ~64 ops).
@@ -1458,11 +1500,42 @@ pub(crate) enum LaneStep {
     ImmToSlot { bits: u64, slot: u16 },
     /// Exit upval commit: `jit_cell_set(cell, [slot])`.
     CellCommit { cell_bits: u64, slot: u16 },
+    /// W19 (MI-LANE): `this.<field>` — a baked `[vals_ptr + slot*8]` load,
+    /// tag-guarded Int and sign-extended into a GPR home. Shape-identical to
+    /// `ParamLoad`, with a baked absolute address in place of a window slot
+    /// (the receiver's identity+version guard, already emitted by the arm,
+    /// is what makes `vals_ptr`/`slot` valid).
+    FieldLoadInt { vals_ptr: u64, slot: u32, d: u8 },
+    /// The same load guarded as a boxed DOUBLE — high-16 OUTSIDE the tag band
+    /// `[INT_TAG_HI, TAG_HI]`, i.e. exactly `load_num_xmm`'s non-Int arm —
+    /// into an xmm home. Which of the two is emitted is decided at plan time
+    /// from the slot's live representation; the other tagging misses the
+    /// guard and re-runs the call through the helper.
+    FieldLoadF64 { vals_ptr: u64, slot: u32, d: u8 },
+    /// W19 (MI-LANE): the `super.m()` / `super.v` guard block — class epoch,
+    /// one version compare per super-chain hop (`hop_pool[at..at+len]`), and
+    /// the holder-slot re-read. Produces NO value: the flattened super body
+    /// follows it and its `Return` was rewritten to a `Move` into the call's
+    /// dst. Emitted with rax/rcx only — the boxed emitter's copy of this
+    /// block clobbers rdx and r10, which ARE lane value homes.
+    SuperGuard {
+        epoch_ptr: u64,
+        epoch_val: u32,
+        hops_at: u16,
+        hops_len: u16,
+        holder_vals_ptr: u64,
+        holder_slot: u32,
+        fn_bits: u64,
+    },
 }
 
-/// The scheduled lane carried by a `LeafInlinePlan`.
+/// The scheduled lane carried by a `LeafInlinePlan` or a `MethodInlineShape`.
 pub struct TypedLanePlan {
     pub(crate) steps: Vec<LaneStep>,
+    /// Side table for `LaneStep::SuperGuard`'s hop version list (keeps every
+    /// `LaneStep` a plain scalar record, so the emitter can keep matching by
+    /// value).
+    pub(crate) hop_pool: Vec<(u32, u32)>,
     /// Census counts for the plan-time JITLOG line.
     pub n_ops: u16,
     pub n_guards: u16,
@@ -1511,6 +1584,14 @@ fn lane_use_def(ins: &Instr) -> Option<(([u16; 3], u8), Option<u16>)> {
             }
         }
         Instr::UpvalSet { src, .. } => u1(src, None),
+        // W19 (MI-LANE): `this.<field>` reads NO vreg — the receiver is baked
+        // into the step as an absolute `vals` address behind the arm's
+        // identity+version guard. `obj != 0` stays unmodelled (`None`).
+        Instr::GetProp { dst, obj: 0, .. } => u0(Some(dst)),
+        // W19 (MI-LANE): the flattened super marker. Like the nested-splice
+        // `Call` below it is a guard site, not a def: the super body's ops
+        // follow and a rewritten `Move` writes the call's dst.
+        Instr::SuperMethod { .. } | Instr::SuperGet { .. } => u0(None),
         // The nested-splice guard marker: consumes the callee register,
         // defines nothing (the rewritten inner Return writes the dst later).
         Instr::Call { callee, .. } => u1(callee, None),
@@ -1609,6 +1690,13 @@ struct LaneBuilder<'a> {
     uentry: FxHashMap<u16, usize>,
     steps: Vec<LaneStep>,
     n_guards: u16,
+    /// W19 (MI-LANE): `Some` for a METHOD-inline body — the baked receiver
+    /// `vals` base, its admitted `this.<field>` slots, and one guard block per
+    /// flattened `super` site. `None` is the leaf lane, whose closed op set
+    /// contains neither, so both mi arms of the walk are unreachable there.
+    mi: Option<&'a MiLaneCtx>,
+    /// Side storage for `LaneStep::SuperGuard` hop lists.
+    hop_pool: Vec<(u32, u32)>,
 }
 
 impl LaneBuilder<'_> {
@@ -1894,6 +1982,293 @@ impl LaneBuilder<'_> {
     }
 }
 
+// ───────────────────── W19: the METHOD-inline lane ─────────────────────
+//
+// `MethodInlinePlan` was consumable by exactly one emitter — the boxed one
+// (`region_mem.rs` → `emit_mi_body`) — so every intermediate of every inlined
+// class-method body went through a memory home with a NaN-box tag test, and a
+// four-op `area()` body cost ~100 instructions. This gives the mi path the
+// same register-resident lane wave 13 gave leaf splices, over the SAME
+// scheduler: the only additions to the closed set are `this.<field>` (a baked
+// absolute load, structurally `ParamLoad`) and `super.m()` / `super.v` (the
+// existing guard block, then the super body scheduled inline).
+//
+// SOUNDNESS is the wave-13 contract unchanged. v1 admits only EFFECT-FREE
+// bodies (no `SetProp{obj:0}`, no `SuperSet`), so the lane is a pure prefix
+// end to end: every guard — the field tag test, the super epoch/hop/holder
+// block, a ToInt32 range bail — jumps to `fallback`, the unchanged per-call
+// helper, which re-runs the whole call with nothing committed. Magnitude
+// bounds stay fail-closed under 2^53 and IEEE ops keep bytecode order.
+
+/// The `super.m()` / `super.v` guard block, lifted out of `SuperInline` (whose
+/// other fields — body, field slots, window offset — are consumed by the
+/// flattener instead of by the emitter).
+#[derive(Clone)]
+pub(crate) struct MiSuperGuard {
+    pub(crate) epoch_ptr: u64,
+    pub(crate) epoch_val: u32,
+    pub(crate) hops: Vec<(u32, u32)>,
+    pub(crate) holder_vals_ptr: u64,
+    pub(crate) holder_slot: u32,
+    pub(crate) fn_bits: u64,
+}
+
+/// The extra plan context a METHOD-inline lane needs beyond the leaf lane's.
+pub(crate) struct MiLaneCtx {
+    /// The arm's baked receiver `vals` base — shared by the outer body and
+    /// every inlined super body, which all run over the SAME receiver.
+    vals_ptr: u64,
+    /// (namespaced) `GetProp` name index → (own data slot, `true` = the slot
+    /// held an Int at plan time, `false` = a boxed double).
+    fields: FxHashMap<u32, (u32, bool)>,
+    /// Flattened-body index of a `SuperMethod`/`SuperGet` marker → its guards.
+    guards: FxHashMap<usize, MiSuperGuard>,
+}
+
+/// Namespace shift for a flattened super body's name/const indices. The outer
+/// body keeps namespace 0; super body `k` gets `k+1`. Both index spaces are
+/// per-function constant pools, so a real index at or above this bound is
+/// impossible in practice — it declines rather than aliasing.
+const MI_NS_SHIFT: u32 = 20;
+const MI_NS_MAX: u32 = 1 << MI_NS_SHIFT;
+
+/// Shift every REGISTER operand of an admitted super-body op by `off`. The
+/// admitted set is `method_inline_body_ok(.., allow_super=false, ..)`; anything
+/// outside it declines (the lane would decline on it anyway, but a silently
+/// unshifted operand would alias the OUTER body's registers, which is a
+/// wrong-answer shape rather than a missed optimisation).
+fn mi_shift_regs(ins: &Instr, off: u16) -> Result<Instr, &'static str> {
+    let s = |r: u16| off + r;
+    Ok(match *ins {
+        Instr::LoadInt { dst, val } => Instr::LoadInt { dst: s(dst), val },
+        Instr::LoadBool { dst, val } => Instr::LoadBool { dst: s(dst), val },
+        Instr::Move { dst, src } => Instr::Move { dst: s(dst), src: s(src) },
+        Instr::Add { dst, a, b } => Instr::Add { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Sub { dst, a, b } => Instr::Sub { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Mul { dst, a, b } => Instr::Mul { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Div { dst, a, b } => Instr::Div { dst: s(dst), a: s(a), b: s(b) },
+        Instr::Mod { dst, a, b } => Instr::Mod { dst: s(dst), a: s(a), b: s(b) },
+        Instr::AddInt { dst, a, imm, upd } => {
+            Instr::AddInt { dst: s(dst), a: s(a), imm, upd }
+        }
+        Instr::Neg { dst, a } => Instr::Neg { dst: s(dst), a: s(a) },
+        Instr::Bitwise { dst, a, b, op } => {
+            Instr::Bitwise { dst: s(dst), a: s(a), b: s(b), op }
+        }
+        _ => return Err("mi-super-op-unshiftable"),
+    })
+}
+
+/// Flatten a method-inline shape's body and its baked super bodies into ONE
+/// straight-line, register-disjoint sequence the lane scheduler can walk.
+///
+/// * `SuperBase` is dropped — `mi_super_base_dst_dead` already proved its dst
+///   has no reader in an inlined body, which is why `emit_mi_body` drops it too.
+/// * `SuperMethod`/`SuperGet` stay in place as a GUARD MARKER (exactly the role
+///   `Call` plays in a nested leaf splice), followed by the super body with
+///   every register shifted above the outer body's and its `Return` rewritten
+///   to `Move { dst: <the call's dst>, src: <shifted return reg> }`.
+/// * Name and constant indices of super body `k` are shifted into namespace
+///   `k+1` so two functions' constant pools cannot alias in the merged maps.
+#[allow(clippy::type_complexity)]
+fn mi_flatten(
+    body: &[Instr],
+    supers: &FxHashMap<usize, SuperInline>,
+    outer_fields: &FxHashMap<u32, (u32, bool)>,
+    outer_consts: &FxHashMap<u32, u64>,
+    super_fields: &FxHashMap<usize, FxHashMap<u32, (u32, bool)>>,
+    outer_reg_count: u16,
+    param_count: u16,
+    vals_ptr: u64,
+) -> Result<(Vec<Instr>, FxHashMap<u32, u64>, MiLaneCtx), &'static str> {
+    let mut flat: Vec<Instr> = Vec::with_capacity(body.len() + 8);
+    let mut consts: FxHashMap<u32, u64> = outer_consts.clone();
+    let mut fields: FxHashMap<u32, (u32, bool)> = outer_fields.clone();
+    let mut guards: FxHashMap<usize, MiSuperGuard> = FxHashMap::default();
+    // The super sub-window base in VREG space. It starts at the outer body's
+    // register count, which is > param_count, so no shifted super register can
+    // ever be mistaken for a formal parameter by `LaneBuilder::resolve`.
+    let mut next_off = outer_reg_count;
+    if next_off <= param_count {
+        return Err("mi-window-overlaps-params");
+    }
+    for (&name, _) in outer_fields.iter() {
+        if name >= MI_NS_MAX {
+            return Err("mi-name-space");
+        }
+    }
+    for (&idx, _) in outer_consts.iter() {
+        if idx >= MI_NS_MAX {
+            return Err("mi-const-space");
+        }
+    }
+    let mut n_super = 0u32;
+    for (bi, ins) in body.iter().enumerate() {
+        match *ins {
+            // Dropped: no inlined consumer (the Super* arms resolve through
+            // their baked plan and never dereference `base`).
+            Instr::SuperBase { .. } => {}
+            Instr::SuperMethod { dst, .. } | Instr::SuperGet { dst, .. } => {
+                let s = supers.get(&bi).ok_or("mi-super-unbaked")?;
+                let sf = super_fields.get(&bi).ok_or("mi-super-fields-missing")?;
+                let ns = n_super + 1;
+                n_super += 1;
+                if ns >= 16 {
+                    return Err("mi-too-many-supers");
+                }
+                let off = next_off;
+                next_off = off.checked_add(s.callee_reg_count).ok_or("mi-reg-overflow")?;
+                if next_off > 512 {
+                    return Err("mi-reg-overflow");
+                }
+                for (&name, &(slot, is_int)) in sf.iter() {
+                    if name >= MI_NS_MAX {
+                        return Err("mi-name-space");
+                    }
+                    fields.insert((ns << MI_NS_SHIFT) | name, (slot, is_int));
+                }
+                for (&idx, &bits) in s.consts.iter() {
+                    if idx >= MI_NS_MAX {
+                        return Err("mi-const-space");
+                    }
+                    consts.insert((ns << MI_NS_SHIFT) | idx, bits);
+                }
+                guards.insert(
+                    flat.len(),
+                    MiSuperGuard {
+                        epoch_ptr: s.epoch_ptr,
+                        epoch_val: s.epoch_val,
+                        hops: s.hops.clone(),
+                        holder_vals_ptr: s.holder_vals_ptr,
+                        holder_slot: s.holder_slot,
+                        fn_bits: s.fn_bits,
+                    },
+                );
+                flat.push(ins.clone()); // the marker, at the guard's index
+                let mut sret: Option<u16> = None;
+                for sins in s.body.iter() {
+                    match *sins {
+                        Instr::Return { src } => {
+                            sret = Some(off + src);
+                            break;
+                        }
+                        // A super body that falls off the end yields undefined,
+                        // which the lane has no representation for.
+                        Instr::ReturnUndefined => return Err("mi-super-undefined"),
+                        // `this.<field>` keeps `obj: 0` (the SAME receiver) and
+                        // takes the super's namespaced name.
+                        Instr::GetProp { dst, obj: 0, name } => flat.push(Instr::GetProp {
+                            dst: off + dst,
+                            obj: 0,
+                            name: (ns << MI_NS_SHIFT) | name,
+                        }),
+                        Instr::LoadConst { dst, idx } => flat.push(Instr::LoadConst {
+                            dst: off + dst,
+                            idx: (ns << MI_NS_SHIFT) | idx,
+                        }),
+                        ref other => flat.push(mi_shift_regs(other, off)?),
+                    }
+                }
+                let src = sret.ok_or("mi-super-no-return")?;
+                flat.push(Instr::Move { dst, src });
+            }
+            ref other => flat.push(other.clone()),
+        }
+    }
+    Ok((flat, consts, MiLaneCtx { vals_ptr, fields, guards }))
+}
+
+/// Schedule a typed lane for one METHOD-inline arm. `Err` declines with the
+/// JITLOG reason and `emit_inline_method_call` keeps today's boxed emission
+/// byte-identically.
+///
+/// v1 gate, fail-closed (all checked here or by the flattener): the body must
+/// be EFFECT-FREE (`SetProp{obj:0}` and `SuperSet` are the only effects
+/// `method_inline_body_ok` admits, and both are excluded), every admitted
+/// `this.<field>` must hold a number at plan time, and every super body must
+/// return a value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_mi_lane(
+    body: &[Instr],
+    supers: &FxHashMap<usize, SuperInline>,
+    outer_fields: &FxHashMap<u32, (u32, bool)>,
+    super_fields: &FxHashMap<usize, FxHashMap<u32, (u32, bool)>>,
+    outer_consts: &FxHashMap<u32, u64>,
+    vals_ptr: u64,
+    callee_reg_count: u16,
+    param_count: u16,
+    argc: u16,
+    arg_base: u16,
+) -> Result<TypedLanePlan, &'static str> {
+    // ── v1: EFFECT-FREE bodies only ── an effectful body's mid-lane guard bail
+    // would re-run the whole call through the helper and DOUBLE-APPLY a store
+    // that already committed. `method_inline_body_ok` places the store last
+    // precisely so the boxed path can re-run cleanly; a lane has guards after
+    // it too (the exit box has none, but a later op's would), so exclude the
+    // shape outright rather than reason about sinking.
+    if body.iter().any(|i| {
+        matches!(i, Instr::SetProp { obj: 0, .. } | Instr::SuperSet { .. })
+    }) {
+        return Err("mi-effectful-body");
+    }
+    // ── v1: the lane must have something to WIN ── its value is removing the
+    // per-op boxing of intermediates and the sub-window bind + zero-fill of an
+    // inlined super body. A body with neither — `get v() { return this._v; }`,
+    // the bare pass-through — trades one boxed move for a tag guard, a
+    // sign-extend and a re-box, and buys a failure mode the boxed path does not
+    // have: a field that OSCILLATES between Int and double now misses the baked
+    // representation guard on every call, where a move copied the bits either
+    // way. Measured on a 24M-iteration pass-through getter: +1.2% [-2.2, +3.1]
+    // — no proven regression, but no win either, and the oscillation case has
+    // no upside at all. Decline it; `super.v` (one guard block, whose window
+    // work the lane still deletes) measured -4.3% and stays.
+    if !body.iter().any(|i| {
+        matches!(
+            i,
+            Instr::Add { .. }
+                | Instr::Sub { .. }
+                | Instr::Mul { .. }
+                | Instr::Div { .. }
+                | Instr::Mod { .. }
+                | Instr::AddInt { .. }
+                | Instr::Neg { .. }
+                | Instr::Bitwise { .. }
+                | Instr::MathOp { .. }
+                | Instr::SuperMethod { .. }
+                | Instr::SuperGet { .. }
+        )
+    }) {
+        return Err("mi-nothing-to-unbox");
+    }
+    let (flat, consts, ctx) = mi_flatten(
+        body,
+        supers,
+        outer_fields,
+        outer_consts,
+        super_fields,
+        callee_reg_count,
+        param_count,
+        vals_ptr,
+    )?;
+    let no_upvals: FxHashMap<u16, u64> = FxHashMap::default();
+    let no_nested: FxHashMap<usize, NestedGuard> = FxHashMap::default();
+    build_lane_inner(
+        &flat,
+        param_count,
+        argc,
+        arg_base,
+        // A method lane needs NO scratch window: no `this` bind, no arg copy,
+        // no zero-fill, and (having no upvals) no park/commit slots. Pass the
+        // callee's own count so the two overflow checks stay well-defined.
+        0,
+        callee_reg_count,
+        &no_upvals,
+        &consts,
+        &no_nested,
+        Some(&ctx),
+    )
+}
+
 /// Schedule a typed lane for a (possibly nested-flattened) leaf-splice body.
 /// `Err` declines with the JITLOG reason; the generic boxed loop is then
 /// emitted byte-identically to today. See the module comment above for the
@@ -1909,6 +2284,25 @@ pub(crate) fn build_typed_lane(
     upvals: &FxHashMap<u16, u64>,
     consts: &FxHashMap<u32, u64>,
     nested: &FxHashMap<usize, NestedGuard>,
+) -> Result<TypedLanePlan, &'static str> {
+    build_lane_inner(
+        body, param_count, argc, arg_base, reg_window, callee_reg_count, upvals, consts, nested,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_lane_inner(
+    body: &[Instr],
+    param_count: u16,
+    argc: u16,
+    arg_base: u16,
+    reg_window: u16,
+    callee_reg_count: u16,
+    upvals: &FxHashMap<u16, u64>,
+    consts: &FxHashMap<u32, u64>,
+    nested: &FxHashMap<usize, NestedGuard>,
+    mi: Option<&MiLaneCtx>,
 ) -> Result<TypedLanePlan, &'static str> {
     use crate::bytecode::BitwiseOp as B;
     if body.len() > LANE_MAX_BODY {
@@ -1937,6 +2331,8 @@ pub(crate) fn build_typed_lane(
         uentry: FxHashMap::default(),
         steps: Vec::new(),
         n_guards: 0,
+        mi,
+        hop_pool: Vec::new(),
     };
     // ── entry: hoisted upval loads ── every upval index whose FIRST body op
     // is a read gets one cell_get + Int guard at entry. Hoisting is sound:
@@ -2010,6 +2406,53 @@ pub(crate) fn build_typed_lane(
             Instr::LoadGlobal { dst, idx } => {
                 let sid = b.push_slot(Av::Callee { g: idx });
                 b.binds.insert(dst, sid);
+            }
+            // ── W19 (MI-LANE): `this.<field>` ── a baked absolute load behind
+            // the arm's identity+version guard, tag-checked into a home. The
+            // representation was chosen at plan time from the slot's live
+            // value; the other tagging misses and re-runs the call. Reads no
+            // vreg, so nothing here can alias the outer body's registers.
+            Instr::GetProp { dst, obj: 0, name } => {
+                let ctx = mi.ok_or("op-outside-lane-set")?;
+                let &(slot, is_int) = ctx.fields.get(&name).ok_or("mi-field-unbaked")?;
+                if is_int {
+                    let h = b.alloc_gpr(i, &[], None)?;
+                    b.steps.push(LaneStep::FieldLoadInt { vals_ptr: ctx.vals_ptr, slot, d: h });
+                    b.n_guards += 1;
+                    // The Int tag's payload IS an i32, so the interval is exact.
+                    b.binds.remove(&dst);
+                    b.bind_int(dst, h, IV32);
+                } else {
+                    let h = b.alloc_xmm(i, &[], None)?;
+                    b.steps.push(LaneStep::FieldLoadF64 { vals_ptr: ctx.vals_ptr, slot, d: h });
+                    b.n_guards += 1;
+                    b.binds.remove(&dst);
+                    let sid = b.push_slot(Av::F64 { h });
+                    b.binds.insert(dst, sid);
+                }
+            }
+            // ── W19 (MI-LANE): the flattened `super.m()` / `super.v` marker ──
+            // emit the guard block; the super body's scheduled steps follow and
+            // a rewritten `Move` binds the call's dst. No value is produced
+            // here and no home is touched, so live outer values survive it.
+            Instr::SuperMethod { .. } | Instr::SuperGet { .. } => {
+                let ctx = mi.ok_or("op-outside-lane-set")?;
+                let g = ctx.guards.get(&i).ok_or("mi-super-guard-missing")?;
+                let at = b.hop_pool.len();
+                if at + g.hops.len() > u16::MAX as usize {
+                    return Err("mi-hop-pool-overflow");
+                }
+                b.hop_pool.extend_from_slice(&g.hops);
+                b.steps.push(LaneStep::SuperGuard {
+                    epoch_ptr: g.epoch_ptr,
+                    epoch_val: g.epoch_val,
+                    hops_at: at as u16,
+                    hops_len: g.hops.len() as u16,
+                    holder_vals_ptr: g.holder_vals_ptr,
+                    holder_slot: g.holder_slot,
+                    fn_bits: g.fn_bits,
+                });
+                b.n_guards += 1;
             }
             Instr::Call { callee, .. } => {
                 let g = nested.get(&i).ok_or("call-without-nested-guard")?;
@@ -2228,7 +2671,7 @@ pub(crate) fn build_typed_lane(
     }
     let n_ops = b.steps.len() as u16;
     let n_guards = b.n_guards;
-    Ok(TypedLanePlan { steps: b.steps, n_ops, n_guards })
+    Ok(TypedLanePlan { steps: b.steps, hop_pool: b.hop_pool, n_ops, n_guards })
 }
 
 /// Emit a scheduled typed lane. Every guard/bail jumps to `fallback` (the
@@ -2237,7 +2680,8 @@ pub(crate) fn build_typed_lane(
 fn emit_typed_lane(
     ops: &mut dynasmrt::x64::Assembler,
     lane: &TypedLanePlan,
-    plan: &LeafInlinePlan,
+    cell_get: usize,
+    cell_set: usize,
     dst: u16,
     fallback: dynasmrt::DynamicLabel,
 ) {
@@ -2248,7 +2692,7 @@ fn emit_typed_lane(
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, QWORD cell_bits as i64
-                    ; mov rax, QWORD plan.cell_get as i64
+                    ; mov rax, QWORD cell_get as i64
                     ; call rax
                     ; mov rcx, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, rcx
@@ -2533,8 +2977,78 @@ fn emit_typed_lane(
                     ; mov rcx, rdi
                     ; mov rdx, QWORD cell_bits as i64
                     ; mov r8, [rbx + dreg(slot)]
-                    ; mov rax, QWORD plan.cell_set as i64
+                    ; mov rax, QWORD cell_set as i64
                     ; call rax
+                );
+            }
+            // ── W19 (MI-LANE) ── `this.<field>`, Int representation. The
+            // absolute address is valid behind the arm's identity+version
+            // guard (a `vals` realloc or an own-key add bumps the version);
+            // the tag test is `ParamLoad`'s, on a baked address.
+            LaneStep::FieldLoadInt { vals_ptr, slot, d } => {
+                dynasm!(ops
+                    ; mov rcx, QWORD vals_ptr as i64
+                    ; mov rax, [rcx + (slot as i32) * 8]
+                    ; mov rcx, rax
+                    ; shr rcx, 48
+                    ; cmp ecx, INT_TAG_HI as i32
+                    ; jne => fallback
+                    ; movsxd Rq(d), eax
+                );
+            }
+            // Double representation: the high 16 bits must fall OUTSIDE the
+            // tag band [INT_TAG_HI, TAG_HI] — the same discriminator
+            // `load_num_xmm` uses to separate a real f64 from Int/bool/null/
+            // undefined/heap. An in-band value (including an Int, if the slot
+            // was re-typed since plan time) misses and re-runs the call.
+            LaneStep::FieldLoadF64 { vals_ptr, slot, d } => {
+                dynasm!(ops
+                    ; mov rcx, QWORD vals_ptr as i64
+                    ; mov rax, [rcx + (slot as i32) * 8]
+                    ; mov rcx, rax
+                    ; shr rcx, 48
+                    ; sub ecx, INT_TAG_HI as i32
+                    ; cmp ecx, (TAG_HI - INT_TAG_HI) as i32
+                    ; jbe => fallback
+                    ; movq Rx(d), rax
+                );
+            }
+            // ── W19 (MI-LANE) ── the super guard block. Same three checks as
+            // `emit_mi_body`'s copy, in the same order, but written with
+            // rax/rcx ONLY: that copy uses rdx and r10 as scratch and both are
+            // lane value homes (`LANE_GPR_HOMES`), so reusing it verbatim
+            // would silently corrupt live intermediates. r13 (the version
+            // array base) is valid — a v1 lane runs no allocating helper.
+            LaneStep::SuperGuard {
+                epoch_ptr,
+                epoch_val,
+                hops_at,
+                hops_len,
+                holder_vals_ptr,
+                holder_slot,
+                fn_bits,
+            } => {
+                dynasm!(ops
+                    ; mov rcx, QWORD epoch_ptr as i64
+                    ; mov ecx, [rcx]
+                    ; cmp ecx, DWORD epoch_val as i32
+                    ; jne => fallback
+                );
+                for &(idx, ver) in
+                    &lane.hop_pool[hops_at as usize..hops_at as usize + hops_len as usize]
+                {
+                    dynasm!(ops
+                        ; mov ecx, [r13 + (idx as i32) * 4]
+                        ; cmp ecx, DWORD ver as i32
+                        ; jne => fallback
+                    );
+                }
+                dynasm!(ops
+                    ; mov rcx, QWORD holder_vals_ptr as i64
+                    ; mov rax, [rcx + (holder_slot as i32) * 8]
+                    ; mov rcx, QWORD fn_bits as i64
+                    ; cmp rax, rcx
+                    ; jne => fallback
                 );
             }
         }

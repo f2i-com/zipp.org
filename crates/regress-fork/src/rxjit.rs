@@ -13,11 +13,15 @@
 //! non-x86-64 target and every non-byte input.
 //!
 //! Per-attempt contract (mirrors `try_at_pos` with `Forward`):
-//!   - entry: capture groups all unset; a fresh backtrack stack.
+//!   - entry: capture groups all unset; a fresh backtrack stack. The emitted
+//!     prologue establishes "all unset" itself (`ZIPP_NO_RX_GROUPINIT=1`
+//!     moves that back to a Rust-side `fill` before every entry).
 //!   - success: returns the end offset; groups hold the match's captures.
-//!   - failure: returns "no match"; groups are back to unset (the interpreter
-//!     restores them while unwinding; native simply never publishes them —
-//!     the wrapper reinitializes the scratch array per attempt).
+//!   - failure: returns "no match"; the scratch slots may hold the failed
+//!     attempt's partial writes, and NOTHING reads them — the wrappers
+//!     publish groups only on success, and the interpreter (which owns a
+//!     separate `GroupData` array) restores its own while unwinding. The next
+//!     native entry re-clears the scratch before it can observe them.
 //!
 //! Every single-character matcher (Char, CharICase, CharSet, Bracket,
 //! AsciiBracket, ByteSet2/3/4, MatchAny, dot) is lowered to one shared
@@ -35,7 +39,7 @@
 use crate::bytesearch::{charset_contains, ByteSet};
 use crate::insn::{CompiledRegex, Insn};
 use crate::matchers::{ASCIICharProperties, CharProperties};
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use dynasmrt::{dynasm, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer};
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -50,10 +54,26 @@ static DECLINED_LIMITS: AtomicU64 = AtomicU64::new(0);
 static NATIVE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static BAILS: AtomicU64 = AtomicU64::new(0);
-/// Scan sessions opened (`with_session`). Counts unconditionally — per call,
-/// not per attempt — so the differential harness can assert the session path
-/// engaged without env plumbing.
+/// Scan sessions opened (`with_session`) — per call, not per attempt.
+///
+/// PATCH: this used to tick UNCONDITIONALLY, which put a `lock xadd` on every
+/// JS-level regex operation (~750k of them on the regex-log-scan row). It is
+/// an instrument, so it now ticks only when something can read it: `RXSTATS`,
+/// or a test that has touched one of the `__rx*_force` hooks (every reader of
+/// `session_stats` in the harness does, and they read DELTAS). The
+/// unconditional tick comes back with `ZIPP_NO_RX_GROUPINIT=1`, which reverts
+/// this whole patch together.
 static SESSIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Set by any `__rx*_force` test hook. See `session_count_enabled`.
+static TESTHOOK_USED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn session_count_enabled() -> bool {
+    TESTHOOK_USED.load(Ordering::Relaxed)
+        || crate::classicalbacktrack::rxstats::enabled()
+        || !groupinit_enabled()
+}
 
 /// Scan sessions opened.
 pub(crate) fn session_stats() -> u64 {
@@ -83,6 +103,7 @@ pub(crate) fn stats() -> (u64, u64, u64, u64, u64, u64) {
 static FORCE: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn force(mode: Option<bool>) {
+    TESTHOOK_USED.store(true, Ordering::Relaxed);
     FORCE.store(
         match mode {
             None => 0,
@@ -113,6 +134,7 @@ fn threshold() -> u32 {
 static SESSION_FORCE: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn session_force(mode: Option<bool>) {
+    TESTHOOK_USED.store(true, Ordering::Relaxed);
     SESSION_FORCE.store(
         match mode {
             None => 0,
@@ -145,6 +167,7 @@ pub(crate) fn session_enabled() -> bool {
 static ACQGATE_FORCE: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn acqgate_force(mode: Option<bool>) {
+    TESTHOOK_USED.store(true, Ordering::Relaxed);
     ACQGATE_FORCE.store(
         match mode {
             None => 0,
@@ -171,6 +194,47 @@ pub(crate) fn acqgate_enabled() -> bool {
         _ => !acqgate_env_disabled(),
     }
 }
+
+/// Test override for the emitted group reset: 0 = env policy, 1 = force off,
+/// 2 = force on. Set via `__rx_groupinit_force` for the differential harness.
+/// Read at COMPILE time only — a regex that has already compiled keeps the
+/// arm it was emitted with, and `JitCode::resets_groups` records which.
+static GROUPINIT_FORCE: AtomicU8 = AtomicU8::new(0);
+
+pub(crate) fn groupinit_force(mode: Option<bool>) {
+    TESTHOOK_USED.store(true, Ordering::Relaxed);
+    GROUPINIT_FORCE.store(
+        match mode {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn groupinit_env_disabled() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("ZIPP_NO_RX_GROUPINIT").is_some_and(|v| v != "0"))
+}
+
+/// Whether the compiled prologue owns the per-attempt capture-slot reset
+/// (`ZIPP_NO_RX_GROUPINIT=1` keeps the Rust-side `fill` in the attempt loop).
+/// Consulted once per `compile`, never per attempt.
+#[inline]
+fn groupinit_enabled() -> bool {
+    match GROUPINIT_FORCE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => !groupinit_env_disabled(),
+    }
+}
+
+/// Capture groups whose reset is unrolled into the prologue. Past this the
+/// emitted stores stop paying for the code they add to EVERY entry of a
+/// compiled regex, so the Rust `fill` is kept instead. The row's regexes have
+/// 0, 1, 2 and 4 groups; the cap is far above that.
+const MAX_PROLOGUE_RESET_GROUPS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // The per-regex slot: use counter + lazily compiled code.
@@ -273,6 +337,12 @@ pub(crate) struct JitCode {
     _buf: ExecutableBuffer,
     entry: unsafe extern "win64" fn(*mut JitCtx) -> i64,
     groups: usize,
+    /// Whether the emitted prologue sets all `2 * groups` capture slots to
+    /// `u64::MAX` on every entry. When true the callers skip the Rust-side
+    /// refill; when false (switch off, or too many groups to unroll) they
+    /// must still do it. Recorded per compilation, so flipping the switch
+    /// after a regex compiled cannot desynchronize the two.
+    resets_groups: bool,
 }
 
 // ExecutableBuffer is an immutable mapped region after finalize; the entry
@@ -315,8 +385,16 @@ pub(crate) fn run_attempt(
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
         loop {
-            s.groups.clear();
-            s.groups.resize(code.groups * 2, u64::MAX);
+            // The scratch is shared across regexes on this thread, so the
+            // LENGTH is always re-established; the VALUE fill is the emitted
+            // prologue's job whenever it owns the reset.
+            let need = code.groups * 2;
+            if s.groups.len() != need {
+                s.groups.clear();
+                s.groups.resize(need, u64::MAX);
+            } else if !code.resets_groups {
+                s.groups.fill(u64::MAX);
+            }
             let mut ctx = JitCtx {
                 input: bytes.as_ptr(),
                 len: bytes.len() as u64,
@@ -383,7 +461,9 @@ pub(crate) fn with_session<R>(
     bytes: &[u8],
     f: impl FnOnce(&mut Session) -> R,
 ) -> R {
-    SESSIONS.fetch_add(1, Ordering::Relaxed);
+    if session_count_enabled() {
+        SESSIONS.fetch_add(1, Ordering::Relaxed);
+    }
     SCRATCH.with(|s| match s.try_borrow_mut() {
         Ok(mut s) => {
             let s = &mut *s;
@@ -404,8 +484,16 @@ impl<'s> Session<'s> {
         groups: &'s mut Vec<u64>,
         bt: &'s mut Vec<u64>,
     ) -> Self {
-        groups.clear();
-        groups.resize(code.groups * 2, u64::MAX);
+        // Establish the LENGTH (the scratch is shared across regexes on this
+        // thread); the value fill is the emitted prologue's job when it owns
+        // the reset — see `Session::attempt`.
+        let need = code.groups * 2;
+        if groups.len() != need {
+            groups.clear();
+            groups.resize(need, u64::MAX);
+        } else if !code.resets_groups {
+            groups.fill(u64::MAX);
+        }
         let ctx = JitCtx {
             input: bytes.as_ptr(),
             len: bytes.len() as u64,
@@ -429,10 +517,17 @@ impl<'s> Session<'s> {
     ) -> Outcome {
         debug_assert!(start as u64 <= self.ctx.len);
         loop {
-            // A failed attempt leaves partial group writes behind — refill
-            // before every entry (only the alloc/borrow was hoisted).
-            self.groups.fill(u64::MAX);
-            self.ctx.groups = self.groups.as_mut_ptr();
+            // A failed attempt leaves partial group writes behind, so every
+            // entry starts from all-unset. The compiled prologue does that
+            // itself when it owns the reset (`resets_groups`); otherwise the
+            // refill happens here, as it always did.
+            //
+            // `self.groups` is never resized inside a session (only `bt` is,
+            // on the -2 retry below), so `ctx.groups` stays the pointer
+            // `Session::new` stored and needs no per-attempt re-store.
+            if !self.code.resets_groups {
+                self.groups.fill(u64::MAX);
+            }
             self.ctx.start = start as u64;
             self.ctx.skip_hint = u64::MAX;
             // SAFETY: as in `run_attempt` — the code only reads the input
@@ -734,6 +829,28 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         ; mov r14, rsi
         ; mov r15, [rdi + 0x28]
     );
+
+    // PATCH (`ZIPP_NO_RX_GROUPINIT=1` reverts): the per-attempt capture-slot
+    // reset, emitted here instead of run in Rust before every entry. The
+    // group count is a compile-time constant, so this is an unrolled run of
+    // 16-byte stores at the ONE true entry point — which is also the target
+    // the -2 backtrack-overflow retry re-enters through, so a retry re-clears
+    // exactly as the Rust fill did. xmm0 is volatile under win64 and the
+    // emitted program never uses SSE elsewhere.
+    //
+    // The placement is load-bearing in BOTH directions: it must be at or
+    // after the `rbp` load, and it must be BEFORE `labels[0]`, because a
+    // `Node::Jump` back to node 0 is an in-attempt branch that must NOT
+    // re-clear captures the attempt has already written.
+    let ngroups = re.groups as usize;
+    let resets_groups = groupinit_enabled() && ngroups <= MAX_PROLOGUE_RESET_GROUPS;
+    if resets_groups && ngroups > 0 {
+        dynasm!(ops ; pcmpeqd xmm0, xmm0);
+        for g in 0..ngroups {
+            let off = (g as i32) * 16;
+            dynasm!(ops ; movdqu [rbp + off], xmm0);
+        }
+    }
 
     // Push a 32-byte backtrack entry whose handler is `h`; fields b/c are
     // stored by the caller-provided closure to keep register choices local.
@@ -1101,5 +1218,5 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         )
     };
     COMPILED.fetch_add(1, Ordering::Relaxed);
-    Some(JitCode { _buf: buf, entry, groups: re.groups as usize })
+    Some(JitCode { _buf: buf, entry, groups: ngroups, resets_groups })
 }

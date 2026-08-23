@@ -640,6 +640,52 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::DeleteIndexConcat { dst, obj, name, key, strict } => {
+                // `delete obj["name" + i]` (W19 M3). This is the op that kept
+                // the whole delete loop off the JIT: there was no Delete arm at
+                // all here, so `[145,155]` DECLINED and was blacklisted.
+                //
+                // The helper is a thin wrapper over `Vm::delete_index_concat`,
+                // the exact function the interpreter arm calls, so there is no
+                // guard chain to get wrong and NO deopt sentinel — a Proxy, a
+                // global, a frozen object, a non-Int key all go through the
+                // same shared waterfall they already did. The one non-Value
+                // return is CALL_THREW (strict-mode `delete` of a
+                // non-configurable property, a throwing Proxy trap, a throwing
+                // key coercion): the delete attempt and any trap side effects
+                // ALREADY happened, so the region unwinds and must never
+                // re-execute the op.
+                //
+                // `strict` rides the stack as arg 5 (the SetIndexConcat shape).
+                // `dst` is written BEFORE the refetch calls, which clobber the
+                // caller-saved registers (the StrConcat ordering).
+                //
+                // The refetch is MANDATORY and for a stronger reason than the
+                // key-add case: a successful delete `Vec::remove`s the slot,
+                // shifting every later key down, and calls `bump_version`, so
+                // the heap version array, the IC table and any pinned
+                // TypedArray snapshot may all have moved or gone stale.
+                let packed: u64 = ((heap.func_id as u64) << 32) | (name as u64);
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(obj)]         // receiver bits
+                    ; mov r8, QWORD packed as i64        // (func_id << 32) | name
+                    ; mov r9, [rbx + dreg(key)]          // key bits
+                    ; mov rax, QWORD strict as i64
+                    ; mov [rsp + 32], rax                // 5th arg: strict flag
+                    ; mov rax, QWORD heap.delete_index_concat as i64
+                    ; call rax
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // threw: unwind, do NOT re-execute
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::SetIndexConcat { obj, name, key, val } => {
                 // `obj["name" + i] = v`. An own writable data-slot HIT is
                 // written in place (scratch key, no alloc, no version bump —
@@ -833,9 +879,49 @@ pub(crate) fn compile_region_mem(
                         ; je => hp_slow                   // HOLE (absent own) → helper (proto walk)
                         ; mov r10, QWORD BOOL_TRUE_BITS as i64
                         ; mov [rbx + dreg(dst)], r10      // in-range present → true
-                        ; jmp => hp_done
-                        ; => hp_slow
                     );
+                    // W19 (M5): FUSED HasProp → JumpIf, B118's idiom extended.
+                    // The inline above has already PROVEN the answer is `true`,
+                    // and the very next ip is a `JumpIfTrue/False` on this exact
+                    // `dst` — which would reload the bool it just stored, tag-
+                    // dispatch it (Int? Bool? else call `jit_truthy`) and test it,
+                    // ~8 instructions to re-derive a constant. Branch straight to
+                    // the resolved destination instead: taken for `JumpIfTrue`,
+                    // the ip after the pair for `JumpIfFalse`.
+                    //
+                    // B118's two constraints carry over VERBATIM and neither is
+                    // relaxed: (1) the store to `dst` STAYS — `cmp_branch_pair`
+                    // does not prove `dst` dead after the JumpIf, a chained
+                    // `||`/`&&` arm can jump straight to the JumpIf ip, and the
+                    // deopt contract wants the register file exact at every ip
+                    // boundary; (2) the JumpIf is STILL EMITTED at ip+1 and stays
+                    // reachable — this only skips it on the one path that already
+                    // knows the answer. The helper path (`hp_slow`) is untouched
+                    // and still falls into it, including its SELF_CALL_DEOPT bail.
+                    // `cmp_branch_pair` itself declines under step metering, so
+                    // the elided block cannot go uncharged.
+                    let fused = if hasprop_jumpfuse_enabled() {
+                        cmp_branch_pair(ip, dst)
+                    } else {
+                        None
+                    };
+                    match fused {
+                        Some((true, tgt)) => {
+                            // JumpIfFalse on a `true` condition: not taken.
+                            let _ = tgt;
+                            let ft = lbl((ip + 2) as u32, &in_region);
+                            dynasm!(ops ; jmp => ft);
+                        }
+                        Some((false, tgt)) => {
+                            // JumpIfTrue on a `true` condition: taken.
+                            let t = region_target(
+                                tgt, start, end, &in_region, &mut exit_stubs, &mut ops,
+                            );
+                            dynasm!(ops ; jmp => t);
+                        }
+                        None => dynasm!(ops ; jmp => hp_done),
+                    }
+                    dynasm!(ops ; => hp_slow);
                 }
                 // The read-only `jit_has_property` helper returns the BOOL Value
                 // bits, or SELF_CALL_DEOPT → bail (the interpreter re-executes the

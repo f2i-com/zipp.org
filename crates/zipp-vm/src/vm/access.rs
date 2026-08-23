@@ -156,11 +156,196 @@ impl<'p> Vm<'p> {
         Ok(self.delete_prop(obj, key))
     }
 
+    /// W19 M2 — the ordinary-object delete fast path latch.
+    /// `ZIPP_NO_DELETE_FASTPATH=1` skips the guard and takes the untouched
+    /// waterfall, which is what shipped before this wave.
+    #[inline]
+    fn delete_fastpath_enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("ZIPP_NO_DELETE_FASTPATH").is_none();
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    /// W19 M2 — is `key` a name that NO branch of `delete_prop`'s waterfall
+    /// special-cases, so that deleting it from an ordinary object is exactly
+    /// "remove the slot and bump the version"?
+    ///
+    /// This is a NEGATIVE filter, not a re-implementation: it names every key
+    /// the waterfall treats specially and rejects it, and the caller's receiver
+    /// guard rejects every receiver kind the waterfall treats specially. A
+    /// rejection costs nothing but the untouched slow path.
+    ///
+    /// FIRST BYTE. Only an ASCII letter, `_` or `$` is accepted. That excludes,
+    /// in one test: the empty key; private names (`#x`) and well-known symbols
+    /// (`@@x`), which the property machinery keys differently; and every
+    /// index-like spelling (`"5"`, `"05"`, `"+5"`, `"-1"`, `" 5"`), which
+    /// `canonical_u32_key` / `key_names_element` reason about.
+    ///
+    /// NAMED CASES. Each rejected name below is one waterfall branch:
+    ///  * `__proto__` — the proto slot, never an ordinary own data property;
+    ///  * `length` — Array/String/callable exotic `length`, and the
+    ///    `%Array.prototype%.length` case in `delete_property`;
+    ///  * `name`, `prototype`, `caller`, `arguments` — callable intrinsics
+    ///    (`callable_has_prototype`, `fn_has_legacy_caller_prop`, the
+    ///    `deleted_callable_intrinsics` tombstone);
+    ///  * `lastIndex` — RegExp's non-configurable own property;
+    ///  * `index`, `input`, `groups`, `indices` — the four keys that make
+    ///    `materialize_regexp_result_prop_for_key` (the FIRST statement of
+    ///    `delete_prop`) do work.
+    ///
+    /// The four callable names and `lastIndex` cannot apply to a
+    /// `HeapObj::Object` receiver at all; they are rejected anyway so the
+    /// guard's soundness does not rest on a second argument about callability.
+    #[inline]
+    fn delete_fastpath_key_ok(key: &str) -> bool {
+        match key.as_bytes().first() {
+            Some(&b) if b.is_ascii_alphabetic() || b == b'_' || b == b'$' => {}
+            _ => return false,
+        }
+        !matches!(
+            key,
+            "__proto__"
+                | "length"
+                | "name"
+                | "prototype"
+                | "caller"
+                | "arguments"
+                | "lastIndex"
+                | "index"
+                | "input"
+                | "groups"
+                | "indices"
+        )
+    }
+
+    /// W19 M2 — `delete obj[key]` for the one case that carries the whole
+    /// dictionary-churn row: an ORDINARY object with a CONFIGURABLE own
+    /// property and an ordinary key. Returns `Some(true)` when it performed the
+    /// deletion, `None` when anything at all is unusual — in which case the
+    /// caller runs the untouched waterfall.
+    ///
+    /// WHY. `delete_prop` is a ~280-line unguarded spec waterfall — proxies,
+    /// global bindings, `arr_props`, `fn_props`, `arguments`, TypedArray
+    /// indices, String exotics, RegExp `lastIndex`, class statics, sealed and
+    /// frozen receivers — with no fast path for the common case. Deleting a key
+    /// that does not even exist on a 60-property object measured 40 ns of pure
+    /// waterfall (`dsplit.js` P, 900k ops), against node's ~36 ns for a delete
+    /// that actually removes something.
+    ///
+    /// SOUNDNESS. Every guard is a NEGATIVE test that excludes a receiver kind
+    /// or key spelling some later branch reasons about; nothing here reproduces
+    /// a spec case. Taken in order:
+    ///
+    ///  1. `HeapObj::Object` — the receiver is an ordinary object. This alone
+    ///     excludes Array (dense elements, `length`, `args_unmap`), TypedArray
+    ///     (in-bounds indices are non-configurable), RegExp (`lastIndex`),
+    ///     Class (statics / static accessors), every callable kind
+    ///     (`fn_props`, intrinsic `name`/`length`/`prototype`, legacy
+    ///     `caller`/`arguments`), Boxed (String exotic chars and `length`), and
+    ///     Proxy — which in any case never reaches `delete_prop`, because
+    ///     `delete_property` handles the `deleteProperty` trap before calling
+    ///     it, and `defer_check` has already run there.
+    ///  2. `!m.is_ctor && m.class.is_none()` — the two ordinary-object shapes
+    ///     that carry extra structure, mirroring `ordinary_set_recv_ok`.
+    ///  3. not `global_this` — the global-binding branch
+    ///     (`global_by_name`, `uninitialize_global`, `deleted_globals`,
+    ///     the non-configurable script-declared names).
+    ///  4. not `obj_proto` / `arr_proto` — the two intrinsics with exotic
+    ///     `delete` behaviour reachable as plain objects.
+    ///  5. absent from `realm_global_objs`, `module_namespaces`,
+    ///     `deferred_ns_state`, `arr_props`, `fn_props`, `arguments_objs` —
+    ///     every side table a later branch consults. Each is tested only after
+    ///     an `is_empty()` screen, so in a program that never creates one the
+    ///     whole group is a handful of loads.
+    ///  6. `delete_fastpath_key_ok(key)` — see above.
+    ///
+    /// Once guards 1-6 hold, ONE `pos()` answers all three remaining cases, and
+    /// each is the waterfall's own answer for an ordinary object:
+    ///  * present and `configurable` -> remove the slot and `bump_version`
+    ///    (the removal shifted every later slot and an inline cache may hold
+    ///    one). This is the waterfall's tail, with `remove_at` rather than
+    ///    `remove` only to avoid re-running the `pos()` just performed;
+    ///  * present and NOT `configurable` -> `false`, which is the first thing
+    ///    the waterfall answers and the only thing it can answer here.
+    ///    `Object.freeze` / `Object.seal` clear `configurable` on a plain
+    ///    object's own properties, so a frozen or sealed receiver lands here
+    ///    rather than needing a test of its own;
+    ///  * ABSENT -> `true`, changing nothing: the tail's `map.remove(key)`
+    ///    returns false, so no version bump, and the result is `true`.
+    ///
+    /// The waterfall runs `pos()` TWICE in each of those cases (its
+    /// non-configurable check, then again inside `ObjMap::remove`); the fast
+    /// path runs it once.
+    #[inline]
+    fn delete_prop_ordinary_fast(&mut self, idx: u32, key: &str) -> Option<bool> {
+        if !Self::delete_fastpath_key_ok(key) {
+            return None;
+        }
+        if !matches!(self.heap.get(idx), HeapObj::Object(m) if !m.is_ctor && m.class.is_none()) {
+            return None;
+        }
+        if (idx == self.global_this && self.global_this != 0)
+            || idx == self.obj_proto
+            || idx == self.arr_proto
+        {
+            return None;
+        }
+        if (!self.realm_global_objs.is_empty() && self.realm_global_objs.contains_key(&idx))
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&idx))
+            || (!self.fn_props.is_empty() && self.fn_props.contains_key(&idx))
+            || (!self.arguments_objs.is_empty() && self.arguments_objs.contains_key(&idx))
+        {
+            return None;
+        }
+        // The ONE hash lookup. The waterfall runs `pos()` twice for a hit (its
+        // non-configurable check, then again inside `ObjMap::remove`) and twice
+        // for a miss; the fast path runs it once and answers all three cases.
+        let slot = match self.heap.get(idx) {
+            HeapObj::Object(m) => match m.pos(key) {
+                // Present and configurable -> the waterfall tail for this case.
+                Some(i) if m.attrs[i].configurable => i,
+                // Present and NON-configurable -> `false`, which is the very
+                // first thing the waterfall answers (access.rs, the
+                // `!m.attrs[i].configurable` branch) and the only thing it can
+                // answer for an ordinary object.
+                Some(_) => return Some(false),
+                // ABSENT -> `true`, changing nothing. Every waterfall branch
+                // between here and the tail is excluded by the guards above, and
+                // the tail is `map.remove(key)` returning false (so no
+                // `bump_version`) followed by `Value::bool(true)`.
+                None => return Some(true),
+            },
+            _ => return None,
+        };
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.remove_at(slot);
+        }
+        self.heap.bump_version(idx); // a key was removed -> slots shifted (IC)
+        Some(true)
+    }
+
     pub(crate) fn delete_prop(&mut self, obj: Value, key: &str) -> Value {
         if !obj.is_heap() {
             return Value::bool(true);
         }
         let idx = obj.heap_index();
+        // W19 M2: the ordinary-object case, ahead of the whole waterfall.
+        // `delete_property` has already run `defer_check` and the Proxy trap.
+        if Self::delete_fastpath_enabled() {
+            if let Some(r) = self.delete_prop_ordinary_fast(idx, key) {
+                return Value::bool(r);
+            }
+        }
         self.materialize_regexp_result_prop_for_key(idx, key);
         // A non-configurable own property cannot be deleted (`delete` yields false).
         if let HeapObj::Object(m) = self.heap.get(idx) {

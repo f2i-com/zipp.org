@@ -525,6 +525,20 @@ pub struct MethodInlineShape {
     /// For a receiver that resolves `name` on its PROTOTYPE CHAIN (B78) — no
     /// class, no own slot. Mutually exclusive with `method_slot`.
     pub proto_method: Option<ProtoMethodGuard>,
+    /// W19 (MI-LANE): a register-resident schedule for this arm's body, the
+    /// same mechanism `LeafInlinePlan::typed_lane` carries — the reason it is
+    /// per-SHAPE and not per-plan is that the field slots, the receiver `vals`
+    /// base and the super chain it bakes are all per-receiver.
+    ///
+    /// `Some` ⇒ `emit_inline_method_call` / `emit_inline_accessor` emit the
+    /// lane INSTEAD of `emit_mi_body`, and with it drop the `this` bind, the
+    /// argument copy and the scratch-window zero-fill (a lane keeps no value
+    /// in the window). Any guard miss or range bail jumps to the arm's
+    /// existing fallback as a pure prefix — v1 schedules EFFECT-FREE bodies
+    /// only, so nothing can have committed. `None` (an untypeable op, a
+    /// non-numeric field, an unprovable magnitude bound, a blown register
+    /// budget, or `ZIPP_NO_MI_LANE=1`) keeps the boxed emission byte-identical.
+    pub typed_lane: Option<TypedLanePlan>,
 }
 
 pub struct MethodInlinePlan {
@@ -672,6 +686,10 @@ pub struct HeapHelperAddrs {
     pub static_fn: usize,
     pub to_concat_key: usize,
     pub set_index_concat: usize,
+    /// W19 M3 -- `DeleteIndexConcat` (`delete obj["k" + i]`) via the shared
+    /// `Vm::delete_index_concat`. Allocates and can run user code (Proxy
+    /// `deleteProperty`); returns the result Value bits or `CALL_THREW`.
+    pub delete_index_concat: usize,
     /// Tier C `IsArray` — `Array.isArray(v)`; returns Bool bits, or the deopt
     /// sentinel for the rare throwing case (revoked Proxy).
     pub is_array: usize,
@@ -735,6 +753,7 @@ impl HeapHelperAddrs {
             static_fn: self.static_fn,
             to_concat_key: self.to_concat_key,
             set_index_concat: self.set_index_concat,
+            delete_index_concat: self.delete_index_concat,
             is_array: self.is_array,
             len_of: self.len_of,
             forin_keys: self.forin_keys,
@@ -846,6 +865,139 @@ pub(crate) fn typed_splice_enabled() -> bool {
         2 => false,
         _ => {
             let on = std::env::var_os("ZIPP_NO_TYPED_SPLICE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 M3 — `DeleteIndexConcat` in a MEM region. `ZIPP_NO_JIT_DELETE=1`
+/// restores the pre-wave state, where the op had no admission arm and every
+/// region containing a `delete obj["k" + i]` DECLINED and was blacklisted
+/// (`polymorphic-objects` region `[145,155]`, its 900k-delete loop). Read at
+/// ADMISSION time only, so OFF reproduces the old plan byte-identically.
+pub(crate) fn jit_delete_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JIT_DELETE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (MI-LANE): method-inline typed lanes — `ZIPP_NO_MI_LANE=1` pins every
+/// `MethodInlineShape::typed_lane` to `None`, so `emit_inline_method_call` and
+/// `emit_inline_accessor` emit the boxed `emit_mi_body` path (with its `this`
+/// bind, argument copy and window zero-fill) byte-identically to pre-wave
+/// builds. Read at PLAN time only — never on a hot path.
+pub(crate) fn mi_lane_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_MI_LANE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M1): absent-index fast answer in `array_iter_get` —
+/// `ZIPP_NO_HOLE_ABSENT_FAST=1` restores the pre-wave fall-through, where a
+/// hole or an out-of-range index inside a builtin's element walk (slice /
+/// concat / the change-by-copy snapshot / the hole-skipping callback arms)
+/// paid a full `has_property_dyn` prototype walk. OFF reproduces the prior
+/// behaviour exactly: the fast answer is `Ok(None)`, which is precisely what
+/// the walk it replaces returns for the same receiver shapes.
+pub(crate) fn hole_absent_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HOLE_ABSENT_FAST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M5): fused `HasProp` → `JumpIf` on the MEM tier —
+/// `ZIPP_NO_HASPROP_JUMPFUSE=1` restores the pre-wave emission, where the
+/// pinned-array `in` inline stored `true` and then let the next ip reload it,
+/// tag-dispatch it and test it. Independent of `ZIPP_NO_MEM_CMPJUMP`, which
+/// still gates the underlying `cmp_branch_pair` detector (both must be on).
+/// Read at region-compile time only.
+pub(crate) fn hasprop_jumpfuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HASPROP_JUMPFUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M2): a HOLE reads `undefined` under the indexed-prototype protector —
+/// `ZIPP_NO_HOLE_UNDEF=1` restores the pre-wave pair, where the JIT helper
+/// `SELF_CALL_DEOPT`ed on every hole read (so a holey array was JIT-dead) and
+/// the interpreter spelled the index and walked the prototype chain for it.
+/// Read by the JIT helper and its interpreter twin, which must always agree.
+pub(crate) fn hole_undef_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HOLE_UNDEF").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M3): `has_property_jit`'s overlay arm — `ZIPP_NO_INDEX_IN_OVERLAY=1`
+/// restores the receiver-level refusal, where ANY array carrying an element
+/// overlay declined the whole `in` shortcut (so even a probe landing inside
+/// the dense prefix paid the generic walk).
+pub(crate) fn index_in_overlay_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INDEX_IN_OVERLAY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// W19 (M4): `forin_live`'s Array arm — `ZIPP_NO_FORIN_ARR_OWN=1` restores the
+/// Object-only alloc-free own-hit probe, so an ARRAY receiver again fell to
+/// `has_property` plus a freshly allocated key `String` per iteration.
+pub(crate) fn forin_arr_own_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_FORIN_ARR_OWN").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

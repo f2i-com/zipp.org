@@ -207,6 +207,16 @@ pub fn __rx_acqgate_force(mode: Option<bool>) {
     rxjit::acqgate_force(mode)
 }
 
+/// PATCH (test hook, see rxjit.rs): force the emitted capture-slot reset on
+/// or off, overriding the `ZIPP_NO_RX_GROUPINIT` env switch. Read when a
+/// regex COMPILES, so a regex must be constructed after the call for the
+/// setting to reach it. For the differential harness only.
+#[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+#[doc(hidden)]
+pub fn __rx_groupinit_force(mode: Option<bool>) {
+    rxjit::groupinit_force(mode)
+}
+
 /// PATCH (see rxjit.rs): scan sessions opened — the hoisted advance loop
 /// engaged in place of the per-attempt wrapper. Zero when the `rx-jit`
 /// feature or the x86-64 target is absent.

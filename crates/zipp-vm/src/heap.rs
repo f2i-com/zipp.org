@@ -62,19 +62,80 @@ fn prop_tag(key: &str) -> u32 {
 /// every stored slot above the removed one in a flat integer sweep — the
 /// owning map's `Vec::remove` shifted those positions down. Both passes
 /// touch only this table; no key is re-hashed (see [`PropIndex::remove_slot`]).
+/// W19 M1 — the SPLIT representation latch. `ZIPP_NO_SPLIT_PROPINDEX=1` builds
+/// every new index in the pre-wave INTERLEAVED layout, which is retained
+/// verbatim as `PropIndex::Inter` — so OFF is not an alternate code path but
+/// literally the old data structure and the old loops.
+///
+/// Read ONCE per index construction (`with_capacity`), never per operation: the
+/// variant is fixed for the life of an index, and `grow` preserves it.
+fn split_propindex_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPLIT_PROPINDEX").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// The two physical layouts of the table. `Inter` is the pre-W19 one, kept so
+/// `ZIPP_NO_SPLIT_PROPINDEX=1` restores the old memory layout exactly (a
+/// data-layout change has no "code path" to switch off). `Split` is W19 M1.
+///
+/// WHY SPLIT. `remove_slot` ends in a sweep over EVERY entry, decrementing the
+/// stored slots above the removed one. Over an interleaved `Vec<(u32, u32)>`
+/// that writes 4 bytes out of every 8 — a strided store LLVM cannot vectorize —
+/// and its cost tracks table CAPACITY, not the live key count and not the shift
+/// distance: 28.3 ns at cap 128, 104 ns at cap 512 (measured). Over a
+/// contiguous `Vec<u32>` the identical predicate vectorizes to 7.4 ns at cap 128
+/// and 11.2 ns at cap 512. That sweep is `polymorphic-objects`' single largest
+/// interpreter cost: 900k deletes against a 60-key (capacity 128) object.
+///
+/// A BRANCHLESS-BUT-INTERLEAVED rewrite was measured and is WORSE (28.3 → 30.6
+/// ns): the branch predictor was already handling the test, and the strided
+/// 4-of-8-byte store is the whole bottleneck. Do not ship that instead.
+///
+/// The read path is unchanged in cost (interleaved 8.97 ns/find vs split 8.80,
+/// 20M lookups over the row's real 60-key / capacity-128 shape): a probe reads
+/// `slots[i]` for the empty test and `tags[i]` only to screen a candidate, and
+/// the two arrays together are the same bytes as the one they replace but split
+/// so the hot sweep touches only half of them.
 #[derive(Clone, Debug)]
-pub struct PropIndex {
-    table: Vec<(u32, u32)>,
-    mask: usize,
-    /// Occupied entries (== the owning map's key count).
-    len: usize,
+pub enum PropIndex {
+    /// Pre-W19: one flat `Vec<(tag, slot)>`.
+    Inter { table: Vec<(u32, u32)>, mask: usize, len: usize },
+    /// W19 M1: parallel `tags` / `slots`, same length, same bucket index.
+    /// INVARIANT: `tags.len() == slots.len() == mask + 1`, a bucket is occupied
+    /// iff `slots[i] != PROP_EMPTY`, and `tags[i]` is meaningful only then.
+    Split { tags: Vec<u32>, slots: Vec<u32>, mask: usize, len: usize },
 }
 
 impl PropIndex {
     fn with_capacity(n: usize) -> PropIndex {
         // Capacity for `n` entries at < 3/4 load, minimum 32, power of two.
         let cap = (n * 4 / 3 + 1).next_power_of_two().max(32);
-        PropIndex { table: vec![(0, PROP_EMPTY); cap], mask: cap - 1, len: 0 }
+        Self::with_capacity_kind(cap, split_propindex_enabled())
+    }
+
+    /// `with_capacity` with the layout NAMED rather than latched — the seam the
+    /// differential test drives both representations through in one process.
+    fn with_capacity_kind(cap: usize, split: bool) -> PropIndex {
+        debug_assert!(cap.is_power_of_two() && cap >= 32);
+        if split {
+            PropIndex::Split {
+                tags: vec![0; cap],
+                slots: vec![PROP_EMPTY; cap],
+                mask: cap - 1,
+                len: 0,
+            }
+        } else {
+            PropIndex::Inter { table: vec![(0, PROP_EMPTY); cap], mask: cap - 1, len: 0 }
+        }
     }
 
     fn build(keys: &[String]) -> Box<PropIndex> {
@@ -89,86 +150,224 @@ impl PropIndex {
     #[inline]
     fn find(&self, keys: &[String], key: &str) -> Option<usize> {
         let tag = prop_tag(key);
-        let mut i = tag as usize & self.mask;
-        loop {
-            let (st, ss) = self.table[i];
-            if ss == PROP_EMPTY {
-                return None;
+        match self {
+            PropIndex::Inter { table, mask, .. } => {
+                let mut i = tag as usize & mask;
+                loop {
+                    let (st, ss) = table[i];
+                    if ss == PROP_EMPTY {
+                        return None;
+                    }
+                    if st == tag && keys[ss as usize] == key {
+                        return Some(ss as usize);
+                    }
+                    i = (i + 1) & mask;
+                }
             }
-            if st == tag && keys[ss as usize] == key {
-                return Some(ss as usize);
+            PropIndex::Split { tags, slots, mask, .. } => {
+                let mut i = tag as usize & mask;
+                loop {
+                    let ss = slots[i];
+                    if ss == PROP_EMPTY {
+                        return None;
+                    }
+                    if tags[i] == tag && keys[ss as usize] == key {
+                        return Some(ss as usize);
+                    }
+                    i = (i + 1) & mask;
+                }
             }
-            i = (i + 1) & self.mask;
+        }
+    }
+
+    #[inline]
+    fn cap(&self) -> usize {
+        match self {
+            PropIndex::Inter { mask, .. } | PropIndex::Split { mask, .. } => mask + 1,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len,
         }
     }
 
     /// Record `slot` under `key`. The caller guarantees the key is absent
     /// (every insertion path misses in `pos()` first).
     fn insert(&mut self, key: &str, slot: u32) {
-        if (self.len + 1) * 4 >= self.table.len() * 3 {
+        if (self.len() + 1) * 4 >= self.cap() * 3 {
             self.grow();
         }
         self.insert_raw(prop_tag(key), slot);
-        self.len += 1;
+        match self {
+            PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len += 1,
+        }
     }
 
     fn insert_raw(&mut self, tag: u32, slot: u32) {
-        let mut i = tag as usize & self.mask;
-        while self.table[i].1 != PROP_EMPTY {
-            i = (i + 1) & self.mask;
+        match self {
+            PropIndex::Inter { table, mask, .. } => {
+                let mut i = tag as usize & *mask;
+                while table[i].1 != PROP_EMPTY {
+                    i = (i + 1) & *mask;
+                }
+                table[i] = (tag, slot);
+            }
+            PropIndex::Split { tags, slots, mask, .. } => {
+                let mut i = tag as usize & *mask;
+                while slots[i] != PROP_EMPTY {
+                    i = (i + 1) & *mask;
+                }
+                tags[i] = tag;
+                slots[i] = slot;
+            }
         }
-        self.table[i] = (tag, slot);
     }
 
     /// Unrecord `slot` (whose key hashes to `tag`) after the owning map's
     /// `Vec::remove(slot)`: backward-shift-delete its table entry, then
-    /// decrement every stored slot above `slot` (those keys all shifted
-    /// down one position). The caller guarantees the entry exists — `pos()`
-    /// just found the key through this very index.
+    /// decrement every stored slot above `slot` (those keys all shifted down one
+    /// position). The caller guarantees the entry exists — `pos()` just found the
+    /// key through this very index.
+    ///
+    /// Both arms run the SAME two passes over the SAME buckets in the same
+    /// order; only the physical layout differs.
     fn remove_slot(&mut self, tag: u32, slot: u32) {
-        // Walk the probe chain to the entry recording `slot` (tags can
-        // collide; slot values are unique across the table).
-        let mut j = tag as usize & self.mask;
-        while self.table[j].1 != slot {
-            debug_assert!(self.table[j].1 != PROP_EMPTY, "remove_slot: entry missing");
-            j = (j + 1) & self.mask;
-        }
-        // Backward-shift deletion: free j, then pull forward any later
-        // chain entry whose probe path runs through j (an entry at k with
-        // ideal bucket b may move iff j ∈ [b, k) cyclically — otherwise a
-        // find() probing from b would stop at the new hole before reaching it).
-        self.table[j] = (0, PROP_EMPTY);
-        let mut k = (j + 1) & self.mask;
-        loop {
-            let (kt, ks) = self.table[k];
-            if ks == PROP_EMPTY {
-                break;
+        match self {
+            PropIndex::Inter { table, mask, len } => {
+                let mask = *mask;
+                // Walk the probe chain to the entry recording `slot` (tags can
+                // collide; slot values are unique across the table).
+                let mut j = tag as usize & mask;
+                while table[j].1 != slot {
+                    debug_assert!(table[j].1 != PROP_EMPTY, "remove_slot: entry missing");
+                    j = (j + 1) & mask;
+                }
+                // Backward-shift deletion: free j, then pull forward any later
+                // chain entry whose probe path runs through j (an entry at k with
+                // ideal bucket b may move iff j ∈ [b, k) cyclically — otherwise a
+                // find() probing from b would stop at the new hole before reaching it).
+                table[j] = (0, PROP_EMPTY);
+                let mut k = (j + 1) & mask;
+                loop {
+                    let (kt, ks) = table[k];
+                    if ks == PROP_EMPTY {
+                        break;
+                    }
+                    let ideal = kt as usize & mask;
+                    if (j.wrapping_sub(ideal) & mask) < (k.wrapping_sub(ideal) & mask) {
+                        table[j] = (kt, ks);
+                        table[k] = (0, PROP_EMPTY);
+                        j = k;
+                    }
+                    k = (k + 1) & mask;
+                }
+                *len -= 1;
+                for e in table.iter_mut() {
+                    if e.1 != PROP_EMPTY && e.1 > slot {
+                        e.1 -= 1;
+                    }
+                }
             }
-            let ideal = kt as usize & self.mask;
-            if (j.wrapping_sub(ideal) & self.mask) < (k.wrapping_sub(ideal) & self.mask) {
-                self.table[j] = (kt, ks);
-                self.table[k] = (0, PROP_EMPTY);
-                j = k;
-            }
-            k = (k + 1) & self.mask;
-        }
-        self.len -= 1;
-        for e in &mut self.table {
-            if e.1 != PROP_EMPTY && e.1 > slot {
-                e.1 -= 1;
+            PropIndex::Split { tags, slots, mask, len } => {
+                let mask = *mask;
+                let mut j = tag as usize & mask;
+                while slots[j] != slot {
+                    debug_assert!(slots[j] != PROP_EMPTY, "remove_slot: entry missing");
+                    j = (j + 1) & mask;
+                }
+                tags[j] = 0;
+                slots[j] = PROP_EMPTY;
+                let mut k = (j + 1) & mask;
+                loop {
+                    let ks = slots[k];
+                    if ks == PROP_EMPTY {
+                        break;
+                    }
+                    let kt = tags[k];
+                    let ideal = kt as usize & mask;
+                    if (j.wrapping_sub(ideal) & mask) < (k.wrapping_sub(ideal) & mask) {
+                        tags[j] = kt;
+                        slots[j] = ks;
+                        tags[k] = 0;
+                        slots[k] = PROP_EMPTY;
+                        j = k;
+                    }
+                    k = (k + 1) & mask;
+                }
+                *len -= 1;
+                // The renumber sweep, and the whole point of the split: one
+                // contiguous u32 store per entry, written UNCONDITIONALLY so the
+                // loop vectorizes. `PROP_EMPTY` is `u32::MAX`, so it satisfies
+                // `v > slot` and must be excluded explicitly — the second
+                // conjunct is not redundant.
+                for s in slots.iter_mut() {
+                    let v = *s;
+                    let dec = ((v > slot) as u32) & ((v != PROP_EMPTY) as u32);
+                    *s = v - dec;
+                }
             }
         }
     }
 
     /// Double and rehash from the stored tags (bucket = `tag & mask`).
+    /// Preserves the variant — an index never changes layout mid-life.
     fn grow(&mut self) {
-        let cap = self.table.len() * 2;
-        let old = std::mem::replace(&mut self.table, vec![(0, PROP_EMPTY); cap]);
-        self.mask = cap - 1;
-        for (tag, slot) in old {
-            if slot != PROP_EMPTY {
-                self.insert_raw(tag, slot);
+        match self {
+            PropIndex::Inter { table, mask, .. } => {
+                let cap = table.len() * 2;
+                let old = std::mem::replace(table, vec![(0, PROP_EMPTY); cap]);
+                *mask = cap - 1;
+                for (tag, slot) in old {
+                    if slot != PROP_EMPTY {
+                        self.insert_raw(tag, slot);
+                    }
+                }
             }
+            PropIndex::Split { tags, slots, mask, .. } => {
+                let cap = slots.len() * 2;
+                let old_tags = std::mem::replace(tags, vec![0; cap]);
+                let old_slots = std::mem::replace(slots, vec![PROP_EMPTY; cap]);
+                *mask = cap - 1;
+                for (tag, slot) in old_tags.into_iter().zip(old_slots) {
+                    if slot != PROP_EMPTY {
+                        self.insert_raw(tag, slot);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Debug-only structural check: the arrays are in lockstep, `len` counts the
+    /// occupied buckets, every occupied bucket's tag is its key's tag, and every
+    /// key round-trips through `find`. A tags/slots desync is a HIT ON THE WRONG
+    /// SLOT — a silent wrong answer, not a crash — so this is the assertion that
+    /// catches it.
+    #[cfg(test)]
+    fn verify(&self, keys: &[String]) {
+        let cap = self.cap();
+        if let PropIndex::Split { tags, slots, mask, .. } = self {
+            assert_eq!(tags.len(), slots.len(), "tags/slots length desync");
+            assert_eq!(tags.len(), mask + 1, "arrays do not match mask");
+        }
+        let mut live = 0usize;
+        for i in 0..cap {
+            let (t, sl) = match self {
+                PropIndex::Inter { table, .. } => table[i],
+                PropIndex::Split { tags, slots, .. } => (tags[i], slots[i]),
+            };
+            if sl == PROP_EMPTY {
+                continue;
+            }
+            live += 1;
+            assert!((sl as usize) < keys.len(), "slot {sl} out of range");
+            assert_eq!(t, prop_tag(&keys[sl as usize]), "tag/slot desync at bucket {i}");
+        }
+        assert_eq!(live, self.len(), "len disagrees with occupancy");
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(self.find(keys, k), Some(i), "key {k:?} lost");
         }
     }
 }
@@ -753,30 +952,42 @@ impl ObjMap {
     /// slots, so the caller MUST bump the object's version (a JIT inline cache
     /// may have recorded a now-stale slot index for another key).
     pub fn remove(&mut self, key: &str) -> bool {
-        if let Some(i) = self.pos(key) {
-            // A hole in the middle of the sequence: every later property's slot
-            // shifts down, so no shape in the tree describes the result.
-            self.shape_to_dict();
-            self.keys.remove(i);
-            self.vals.remove(i);
-            self.attrs.remove(i);
-            // Removing the last element-naming key must clear the bit, or a
-            // `delete arr[0]` would leave every dense fast path shut off for the
-            // life of the object. Recompute rather than count: deletion is rare
-            // and a stale count is a silent wrong answer.
-            if self.has_element_key && key_names_element(key) {
-                self.has_element_key = self.keys.iter().any(|k| key_names_element(k));
+        match self.pos(key) {
+            Some(i) => {
+                self.remove_at(i);
+                true
             }
-            if let Some(ix) = &mut self.index {
-                if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
-                    self.index = None;
-                } else {
-                    ix.remove_slot(prop_tag(key), i as u32);
-                }
+            None => false,
+        }
+    }
+
+    /// `remove` with the slot ALREADY resolved. Split out (W19 M2) so a caller
+    /// that has just run `pos()` for its own reasons -- the ordinary-object
+    /// delete fast path, which must read `attrs[i].configurable` first -- does
+    /// not pay a second hash lookup to remove the same key. Pure refactor: the
+    /// body below is `remove`'s former body verbatim, in the same order.
+    ///
+    /// `i` MUST be a live slot index (`i < self.keys.len()`).
+    pub fn remove_at(&mut self, i: usize) {
+        // A hole in the middle of the sequence: every later property's slot
+        // shifts down, so no shape in the tree describes the result.
+        self.shape_to_dict();
+        let key = self.keys.remove(i);
+        self.vals.remove(i);
+        self.attrs.remove(i);
+        // Removing the last element-naming key must clear the bit, or a
+        // `delete arr[0]` would leave every dense fast path shut off for the
+        // life of the object. Recompute rather than count: deletion is rare
+        // and a stale count is a silent wrong answer.
+        if self.has_element_key && key_names_element(&key) {
+            self.has_element_key = self.keys.iter().any(|k| key_names_element(k));
+        }
+        if let Some(ix) = &mut self.index {
+            if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
+                self.index = None;
+            } else {
+                ix.remove_slot(prop_tag(&key), i as u32);
             }
-            true
-        } else {
-            false
         }
     }
 }
@@ -3384,6 +3595,155 @@ pub(crate) mod gcoracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── W19 M1: PropIndex layout differential ──
+    //
+    // The split (`tags`/`slots`) and interleaved (`Vec<(tag, slot)>`) layouts
+    // must be observationally identical. A desync between the two parallel
+    // arrays is a HIT ON THE WRONG SLOT — a silent wrong answer, not a crash —
+    // so the assertion that matters is that both layouts agree on `find` for
+    // every key after every structural change, not merely that neither panics.
+    //
+    // `with_capacity_kind` is the seam: the shipped constructor reads a
+    // process-wide latch, so only this seam can drive both representations in
+    // one process.
+
+    /// xorshift64* — deterministic, no dev-dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Both layouts, driven through the same random add/remove sequence, must
+    /// answer every lookup identically and stay structurally sound throughout.
+    #[test]
+    fn propindex_split_matches_interleaved() {
+        for seed in 1u64..40 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut keys: Vec<String> = Vec::new();
+            let mut inter = PropIndex::with_capacity_kind(32, false);
+            let mut split = PropIndex::with_capacity_kind(32, true);
+            let mut next_id = 0u32;
+
+            for step in 0..600 {
+                // Bias toward growth early so the table crosses several grow()
+                // boundaries, then toward deletion so the backward-shift
+                // deletion and the renumber sweep both run hot.
+                let add = keys.is_empty() || (step < 200 && rng.below(4) != 0) || rng.below(2) == 0;
+                if add {
+                    // Key spellings that collide in the low tag bits, share
+                    // prefixes, and vary in length.
+                    let k = match rng.below(4) {
+                        0 => format!("prop_{next_id}"),
+                        1 => format!("k{}", next_id % 97),
+                        2 => format!("{}", next_id),
+                        _ => format!("aVeryLongPropertyName_{next_id}"),
+                    };
+                    next_id += 1;
+                    if keys.iter().any(|e| *e == k) {
+                        continue;
+                    }
+                    keys.push(k);
+                    let slot = (keys.len() - 1) as u32;
+                    inter.insert(&keys[slot as usize], slot);
+                    split.insert(&keys[slot as usize], slot);
+                } else {
+                    let i = rng.below(keys.len());
+                    let k = keys.remove(i);
+                    let tag = prop_tag(&k);
+                    inter.remove_slot(tag, i as u32);
+                    split.remove_slot(tag, i as u32);
+                }
+
+                assert_eq!(inter.len(), keys.len(), "seed {seed} step {step}: inter len");
+                assert_eq!(split.len(), keys.len(), "seed {seed} step {step}: split len");
+                assert_eq!(inter.cap(), split.cap(), "seed {seed} step {step}: capacity diverged");
+                inter.verify(&keys);
+                split.verify(&keys);
+                for (want, k) in keys.iter().enumerate() {
+                    assert_eq!(inter.find(&keys, k), Some(want));
+                    assert_eq!(split.find(&keys, k), Some(want));
+                }
+                for miss in ["", "nope", "prop_999999", "0", "__proto__"] {
+                    assert_eq!(
+                        inter.find(&keys, miss),
+                        split.find(&keys, miss),
+                        "seed {seed} step {step}: layouts disagree on absent key {miss:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `remove_at` is `remove` with the slot pre-resolved (W19 M2 uses it to
+    /// skip a second `pos()`). The two must leave byte-identical maps.
+    #[test]
+    fn objmap_remove_at_matches_remove() {
+        for n in [3usize, 11, 12, 30, 60, 200] {
+            for victim in [0usize, 1, n / 2, n - 1] {
+                let mut a = ObjMap::new();
+                let mut b = ObjMap::new();
+                for i in 0..n {
+                    a.set(&format!("prop_{i}"), Value::int(i as i32));
+                    b.set(&format!("prop_{i}"), Value::int(i as i32));
+                }
+                let key = format!("prop_{victim}");
+                let i = b.pos(&key).unwrap();
+                assert!(a.remove(&key));
+                b.remove_at(i);
+                assert_eq!(a.keys, b.keys, "n={n} victim={victim}: keys diverged");
+                assert_eq!(a.vals, b.vals, "n={n} victim={victim}: vals diverged");
+                assert_map_consistent(&a);
+                assert_map_consistent(&b);
+                for j in 0..n {
+                    let k = format!("prop_{j}");
+                    assert_eq!(a.pos(&k), b.pos(&k), "n={n} victim={victim} key {k}");
+                }
+            }
+        }
+    }
+
+    /// The renumber sweep after a delete must leave EVERY surviving key
+    /// addressable at its new slot, at each capacity the row's objects pass
+    /// through (the index is built at 12 keys and grows at 3/4 load: 32 -> 64 at
+    /// 24 -> 128 at 48). Deleting front-first maximises the shift distance.
+    #[test]
+    fn objmap_delete_rebuild_cycle_keeps_every_key_addressable() {
+        for n in [12usize, 24, 48, 60, 130, 400] {
+            let mut m = ObjMap::new();
+            for i in 0..n {
+                m.set(&format!("prop_{i}"), Value::int(i as i32));
+            }
+            // Delete every other key front-first, then re-add them.
+            for i in (0..n).step_by(2) {
+                assert!(m.remove(&format!("prop_{i}")), "n={n}: prop_{i} not removed");
+                assert_map_consistent(&m);
+            }
+            for i in (0..n).step_by(2) {
+                m.set(&format!("prop_{i}"), Value::int((i * 2) as i32));
+            }
+            assert_map_consistent(&m);
+            assert_eq!(m.keys.len(), n, "n={n}: key count after rebuild");
+            for i in 0..n {
+                let want = if i % 2 == 0 { (i * 2) as i32 } else { i as i32 };
+                assert_eq!(
+                    m.get(&format!("prop_{i}")),
+                    Some(Value::int(want)),
+                    "n={n}: prop_{i} wrong after delete/rebuild"
+                );
+            }
+        }
+    }
 
     /// Every key the map claims to hold must be found by `pos()` at the slot
     /// that actually stores it, and absent keys must miss — checked through

@@ -770,10 +770,16 @@ impl<'p> Vm<'p> {
             Setter,
         }
         for ip in start as usize..=end as usize {
-            let (obj, name, kind) = match caller.code[ip] {
-                Instr::CallMethod { obj, name, .. } => (obj, name, MiKind::Method),
-                Instr::GetProp { obj, name, .. } => (obj, name, MiKind::Getter),
-                Instr::SetProp { obj, name, .. } => (obj, name, MiKind::Setter),
+            // W19 (MI-LANE): a method site's `(arg_base, argc)` travels with the
+            // arm so a lane can read formals from the caller's argument slots —
+            // the SAME pair `emit_inline_method_call` binds from, taken from the
+            // same instruction, so the two cannot disagree.
+            let (obj, name, kind, arg_base, argc) = match caller.code[ip] {
+                Instr::CallMethod { obj, name, arg_base, argc, .. } => {
+                    (obj, name, MiKind::Method, arg_base, argc)
+                }
+                Instr::GetProp { obj, name, .. } => (obj, name, MiKind::Getter, 0, 0),
+                Instr::SetProp { obj, name, .. } => (obj, name, MiKind::Setter, 0, 0),
                 _ => continue,
             };
             let key = &caller.string_constants[name as usize];
@@ -824,7 +830,9 @@ impl<'p> Vm<'p> {
             let mut win_top = 0u16;
             for recv in cands {
                 let built = match kind {
-                    MiKind::Method => self.build_method_shape(func_id, ip, recv, key, reg_window),
+                    MiKind::Method => {
+                        self.build_method_shape(func_id, ip, recv, key, reg_window, arg_base, argc)
+                    }
                     MiKind::Getter => {
                         self.build_accessor_shape(func_id, ip, recv, key, reg_window, false)
                     }
@@ -1038,6 +1046,11 @@ impl<'p> Vm<'p> {
         recv: Value,
         key: &str,
         reg_window: u16,
+        // W19 (MI-LANE): the SITE's argument window. A lane reads a formal
+        // parameter straight out of the caller's arg slot (`ParamLoad`), so it
+        // needs the same `arg_base`/`argc` the emitter binds from.
+        arg_base: u16,
+        argc: u16,
     ) -> Option<(crate::codegen::MethodInlineShape, u16)> {
         use crate::heap::HeapObj;
         use crate::vm::ic::Walked;
@@ -1159,6 +1172,10 @@ impl<'p> Vm<'p> {
         // ── bake each `super.m()` in the body (Stage 3) ──
         let super_win = reg_window + callee.reg_count;
         let mut supers = rustc_hash::FxHashMap::default();
+        let mut super_kinds: rustc_hash::FxHashMap<
+            usize,
+            rustc_hash::FxHashMap<u32, (u32, bool)>,
+        > = rustc_hash::FxHashMap::default();
         let mut max_super_regs = 0u16;
         for (bi, instr) in body.iter().enumerate() {
             if let Instr::SuperMethod { home_class_id, name: sname, argc: sargc, .. } = *instr {
@@ -1173,6 +1190,9 @@ impl<'p> Vm<'p> {
                 let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
                 let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
                 let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
+                if let Some(k) = self.mi_field_kinds(ridx, &sfields) {
+                    super_kinds.insert(bi, k);
+                }
                 max_super_regs = max_super_regs.max(scallee.reg_count);
                 supers.insert(
                     bi,
@@ -1200,6 +1220,22 @@ impl<'p> Vm<'p> {
             super_win + max_super_regs
         };
         let recv_ver = self.heap.version_of(ridx);
+        let typed_lane = self.mi_plan_lane(
+            func_id,
+            ip,
+            "method",
+            ridx,
+            &body,
+            &supers,
+            &super_kinds,
+            &field_slots,
+            &consts,
+            vals_ptr,
+            callee.reg_count,
+            callee.param_count,
+            argc,
+            arg_base,
+        );
         Some((
             crate::codegen::MethodInlineShape {
                 method_slot,
@@ -1213,9 +1249,75 @@ impl<'p> Vm<'p> {
                 body,
                 consts,
                 supers,
+                typed_lane,
             },
             win_top,
         ))
+    }
+
+    /// W19 (MI-LANE): schedule this arm's body register-resident, or return
+    /// `None` (with a JITLOG reason under `ZIPP_JITLOG`) to keep the boxed
+    /// `emit_mi_body` emission byte-identical. Fail-closed at every step.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn mi_plan_lane(
+        &self,
+        func_id: u32,
+        ip: usize,
+        kind: &str,
+        ridx: u32,
+        body: &[Instr],
+        supers: &rustc_hash::FxHashMap<usize, crate::codegen::SuperInline>,
+        super_kinds: &rustc_hash::FxHashMap<usize, rustc_hash::FxHashMap<u32, (u32, bool)>>,
+        field_slots: &rustc_hash::FxHashMap<u32, u32>,
+        consts: &rustc_hash::FxHashMap<u32, u64>,
+        vals_ptr: u64,
+        callee_reg_count: u16,
+        param_count: u16,
+        argc: u16,
+        arg_base: u16,
+    ) -> Option<crate::codegen::TypedLanePlan> {
+        if !crate::codegen::mi_lane_enabled() {
+            return None;
+        }
+        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let fields = match self.mi_field_kinds(ridx, field_slots) {
+            Some(f) => f,
+            None => {
+                if log {
+                    eprintln!("[mi] fn{func_id}@{ip} {kind} lane=DECLINED(field-not-number)");
+                }
+                return None;
+            }
+        };
+        match crate::codegen::build_mi_lane(
+            body,
+            supers,
+            &fields,
+            super_kinds,
+            consts,
+            vals_ptr,
+            callee_reg_count,
+            param_count,
+            argc,
+            arg_base,
+        ) {
+            Ok(lane) => {
+                if log {
+                    eprintln!(
+                        "[mi] fn{func_id}@{ip} {kind} LANE (ops={} guards={})",
+                        lane.n_ops, lane.n_guards
+                    );
+                }
+                Some(lane)
+            }
+            Err(reason) => {
+                if log {
+                    eprintln!("[mi] fn{func_id}@{ip} {kind} lane=DECLINED({reason})");
+                }
+                None
+            }
+        }
     }
 
     /// Build one receiver arm for an ACCESSOR (getter/setter) inline (Stage 5):
@@ -1280,6 +1382,10 @@ impl<'p> Vm<'p> {
         // re-check must read (see `ic_super_setter_baked`).
         let super_win = reg_window + callee.reg_count;
         let mut supers = rustc_hash::FxHashMap::default();
+        let mut super_kinds: rustc_hash::FxHashMap<
+            usize,
+            rustc_hash::FxHashMap<u32, (u32, bool)>,
+        > = rustc_hash::FxHashMap::default();
         let mut max_super_regs = 0u16;
         for (bi, instr) in body.iter().enumerate() {
             let (sr, sname, is_store) = match *instr {
@@ -1312,6 +1418,9 @@ impl<'p> Vm<'p> {
             let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
             let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
             let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
+            if let Some(k) = self.mi_field_kinds(ridx, &sfields) {
+                super_kinds.insert(bi, k);
+            }
             max_super_regs = max_super_regs.max(scallee.reg_count);
             supers.insert(
                 bi,
@@ -1336,6 +1445,31 @@ impl<'p> Vm<'p> {
             super_win + max_super_regs
         };
         let recv_ver = self.heap.version_of(ridx);
+        // W19 (MI-LANE): GETTERS only. A setter's body ends in the store the
+        // v1 gate excludes (`build_mi_lane` would decline anyway), and a
+        // setter's value is bound to sub-window reg 1 rather than read from an
+        // argument slot — so `param_count > 0` must never reach `ParamLoad`
+        // here, which reads `arg_base + i` with `arg_base = 0` at this site.
+        let typed_lane = if is_setter || callee.param_count != 0 {
+            None
+        } else {
+            self.mi_plan_lane(
+                func_id,
+                ip,
+                "getter",
+                ridx,
+                &body,
+                &supers,
+                &super_kinds,
+                &field_slots,
+                &consts,
+                vals_ptr,
+                callee.reg_count,
+                0,
+                0,
+                0,
+            )
+        };
         Some((
             crate::codegen::MethodInlineShape {
                 method_slot: None,
@@ -1349,6 +1483,7 @@ impl<'p> Vm<'p> {
                 body,
                 consts,
                 supers,
+                typed_lane,
             },
             win_top,
         ))
@@ -1387,6 +1522,36 @@ impl<'p> Vm<'p> {
             }
         }
         Some(fs)
+    }
+
+    /// W19 (MI-LANE): pair each baked `this.<field>` slot with the live
+    /// REPRESENTATION of the value it holds — `true` = Int-tagged, `false` = a
+    /// boxed double. The lane emits the matching tag guard, so a slot that is
+    /// re-typed after compile misses and re-runs the call through the helper
+    /// (slower, never wrong).
+    ///
+    /// `None` if any admitted field holds a NON-number: the lane has no
+    /// representation for it, and emitting a numeric guard that can never pass
+    /// would turn every call at this arm into a guaranteed fallback.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_field_kinds(
+        &self,
+        ridx: u32,
+        slots: &rustc_hash::FxHashMap<u32, u32>,
+    ) -> Option<rustc_hash::FxHashMap<u32, (u32, bool)>> {
+        let m = match self.heap.get(ridx) {
+            crate::heap::HeapObj::Object(m) => m,
+            _ => return None,
+        };
+        let mut out = rustc_hash::FxHashMap::default();
+        for (&name, &slot) in slots.iter() {
+            let v = *m.vals.get(slot as usize)?;
+            if !v.is_number() {
+                return None;
+            }
+            out.insert(name, (slot, v.is_int()));
+        }
+        Some(out)
     }
 
     /// Pre-resolve the numeric-constant bits a body's `LoadConst` ops read.
