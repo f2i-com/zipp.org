@@ -525,6 +525,20 @@ pub struct MethodInlineShape {
     /// For a receiver that resolves `name` on its PROTOTYPE CHAIN (B78) — no
     /// class, no own slot. Mutually exclusive with `method_slot`.
     pub proto_method: Option<ProtoMethodGuard>,
+    /// W20 (M2): an OWN ACCESSOR arm — the getter/setter this arm inlined is
+    /// held in the RECEIVER's own property slot rather than resolved through a
+    /// class. Baked as the ABSOLUTE address of the `Value` that holds it
+    /// (`vals[slot]` for a getter, `attrs[slot].setter` for a setter) plus the
+    /// callee bits read from it, guarded as `*addr == bits` before the body
+    /// runs — the same shape as `method_slot`, which cannot simply be reused
+    /// because a SETTER does not live in `vals` at all.
+    ///
+    /// REQUIRED, not defensive: an accessor function can be replaced in place
+    /// (`Object.defineProperty` re-stating only the `get`, `set_setter_at`),
+    /// and a data/accessor FLIP that happened to leave the same bits behind
+    /// would otherwise run the old body. `None` for a class accessor, whose
+    /// resolution the receiver-version guard already covers.
+    pub own_acc: Option<(u64, u64)>,
     /// W19 (MI-LANE): a register-resident schedule for this arm's body, the
     /// same mechanism `LeafInlinePlan::typed_lane` carries — the reason it is
     /// per-SHAPE and not per-plan is that the field slots, the receiver `vals`
@@ -1267,6 +1281,12 @@ pub struct Region {
     /// were rewritten to scratch field-globals. The interpreter must sync the
     /// object's fields ↔ the pool slots around each native run.
     field_plan: Option<FieldSyncPlan>,
+    /// W20: the register-tier compile engaged the BOXREF arms (a boxed heap value
+    /// and an inline-cache probe inside a register-homed region). On eviction such
+    /// a region RETRIES without them instead of being blacklisted — a blacklisted
+    /// DOUBLE region leaves the loop INTERPRETED (B102 measured that shape at 11x),
+    /// and the memory tier that was working is exactly what the retry lands on.
+    is_boxref: bool,
 }
 
 /// How the interpreter syncs a scalar-replaced object around a native region run:
@@ -1413,6 +1433,76 @@ pub(crate) fn ic_refill_gate_enabled() -> bool {
         1 => true,
         _ => {
             let v = std::env::var_os("ZIPP_NO_ICGATE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// W20 BOXREF — `ZIPP_NO_BOX_HOME=1` turns OFF the register tier's boxed
+/// heap-reference values: a dense-Array `GetIndex` whose elements are OBJECTS
+/// (`ARR_PIN_KIND`) declines the region to the memory tier again, exactly as it
+/// did before this wave, and `RegionPlan::box_regs` is empty for every plan.
+/// Latched once per process, read only while PLANNING a region — never on a hot
+/// path — so OFF reproduces the pre-wave byte stream by construction.
+#[inline]
+pub(crate) fn box_home_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_BOX_HOME").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// W20 — `ZIPP_NO_REGALLOC_GETPROP=1` turns OFF the register tier's `GetProp`
+/// arm for a READ-ONLY LIVE-IN receiver (the `o.p` in a loop whose `o` is a
+/// parameter/outer local the region never writes). Independent of
+/// [`box_home_enabled`]: BOXREF needs the arm and turns it on for its own
+/// receivers regardless, so this switch isolates the standalone half — the one
+/// the wave-20 map priced at −0.23% of the headline and told nobody to ship
+/// alone. Latched, plan-time only.
+#[inline]
+pub(crate) fn regalloc_getprop_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_REGALLOC_GETPROP").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// W20 — `ZIPP_BOXREF_MISS=deopt` makes the register tier's `GetProp` probe
+/// DEOPT on an all-ways miss instead of calling `jit_get_prop_miss`.
+///
+/// This exists to MEASURE the wave-20 map's mechanism, which specified exactly
+/// that ("the miss must deopt and not call") and gated it on a plan-time
+/// zero-miss check. It cannot work: `reserve_ic_sites` hands every fresh compile
+/// eight ZEROED ways, and `Jit::set_ic` — the only thing that ever fills one — is
+/// reachable only from the miss helpers. A probe that never calls the helper
+/// therefore never fills a way, misses on every access forever, and evicts the
+/// region. The default is the call form; this switch reproduces the deopt form
+/// so the claim is a measurement rather than an argument.
+#[inline]
+pub(crate) fn boxref_miss_deopts() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_BOXREF_MISS")
+                .is_some_and(|v| v.eq_ignore_ascii_case("deopt")) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1594,6 +1684,10 @@ pub struct Jit {
     /// Loop headers where the INTEGER path was tried and deoptimised; the next
     /// compile for the key skips int and uses the double path instead.
     region_int_blacklist: FxHashSet<(u32, u32)>,
+    /// W20: `(func_id, region_start)` whose BOXREF compile evicted. The next
+    /// compile of that loop is offered without the boxed arms, so it settles on
+    /// the memory tier — see `Region::is_boxref`.
+    region_boxref_blacklist: FxHashSet<(u32, u32)>,
     /// Dense per-func mirror of `region_blacklist` membership, indexed
     /// `[func_id][loop_header_ip]` (1 = permanently blacklisted). The back-edge
     /// fast path: a permanently-rejected loop pays two array reads per
@@ -2228,7 +2322,7 @@ impl Jit {
                         };
                         self.regions.insert(
                             key,
-                            Region { code, start, end, deopts: 0, ok_runs: 0, is_int, is_mem: false, field_plan: Some(plan) },
+                            Region { code, start, end, deopts: 0, ok_runs: 0, is_int, is_mem: false, field_plan: Some(plan), is_boxref: false },
                         );
                         self.note_reg_region_installed(func_id, false);
                         self.yield_tier_c_to_region(func_id);
@@ -2275,7 +2369,7 @@ impl Jit {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
                 }
                 self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, is_mem: false, field_plan: None });
+                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: true, is_mem: false, field_plan: None, is_boxref: false });
                 self.note_reg_region_installed(func_id, false);
                 self.yield_tier_c_to_region(func_id);
                 return;
@@ -2296,8 +2390,11 @@ impl Jit {
             start,
         );
         let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
-        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, cross_plan, &acc_emit, meter) {
-            Some((code, is_mem)) => {
+        // W20: a region whose BOXREF compile already evicted is re-offered WITHOUT
+        // the boxed arms, so it lands on the memory tier instead of oscillating.
+        let boxref_ok = !self.region_boxref_blacklist.contains(&key);
+        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan, cross_plan, &acc_emit, boxref_ok, meter) {
+            Some((code, is_mem, is_boxref)) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     let tier = if is_mem { "MEM" } else { "DOUBLE" };
                     eprintln!(
@@ -2307,7 +2404,7 @@ impl Jit {
                     );
                 }
                 self.regions
-                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: false, is_mem, field_plan: None });
+                    .insert(key, Region { code, start, end, deopts: 0, ok_runs: 0, is_int: false, is_mem, field_plan: None, is_boxref });
                 self.note_reg_region_installed(func_id, is_mem);
                 if !is_mem {
                     self.yield_tier_c_to_region(func_id);
@@ -2329,6 +2426,7 @@ impl Jit {
     /// failing). Returns whether the region remains installed.
     pub fn note_region_resume(&mut self, func_id: u32, entry_ip: u32, resume_ip: u32) {
         let key = (func_id, entry_ip);
+        let mut boxref_evicted = false;
         let (evict, retry) = if let Some(r) = self.regions.get_mut(&key) {
             if resume_ip >= r.start && resume_ip <= r.end {
                 r.deopts += 1;
@@ -2338,7 +2436,7 @@ impl Jit {
                 // Retry on a SIMPLER path if this was an int region (value grew
                 // past 2^53 → double handles it) or a SROA region (a field turned
                 // non-numeric → the inline-cache mem path handles any type).
-                (r.deopts >= OSR_DEOPT_LIMIT, r.is_int || r.field_plan.is_some())
+                (r.deopts >= OSR_DEOPT_LIMIT, r.is_int || r.field_plan.is_some() || r.is_boxref)
             } else {
                 // A clean exit: the region reached its loop exit instead of
                 // bailing. DECAY the deopt budget.
@@ -2370,6 +2468,7 @@ impl Jit {
             // running (a call helper re-entered the interpreter, which looped
             // back into the region and deopted it) — see `retired`.
             if let Some(r) = self.regions.remove(&key) {
+                boxref_evicted = r.is_boxref;
                 self.note_reg_region_removed(key.0, &r);
                 self.retired.push(r);
             }
@@ -2378,6 +2477,12 @@ impl Jit {
                 // path (region_int_blacklist also gates the SROA + int attempts).
                 // Reset the back-edge counter so iterations re-trigger compile.
                 self.region_int_blacklist.insert(key);
+                // W20: and if the evicted code was a BOXREF region, take the
+                // boxed arms away too, so the recompile reaches the memory tier
+                // rather than rebuilding the same guard that just failed.
+                if boxref_evicted {
+                    self.region_boxref_blacklist.insert(key);
+                }
                 self.region_counts.remove(&key);
             } else {
                 self.region_blacklist.insert(key);

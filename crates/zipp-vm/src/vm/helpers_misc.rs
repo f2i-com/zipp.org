@@ -1229,6 +1229,132 @@ pub(crate) extern "win64" fn jit_array_push(
     }
 }
 
+/// Win64 helper: may `arr` take the register tier's inline `push` lane for the
+/// WHOLE life of a compiled region? Returns 1 (yes) or 0 (take `entry_bail`).
+///
+/// This is `jit_array_push`'s deopt list, hoisted out of the per-append path.
+/// The hoist is licensed by the INT tier's own admission set and by nothing
+/// else: a compiled INT region's body is loads, stores to global SLOTS,
+/// integer arithmetic, compares, jumps, pinned string/array READS and this
+/// append. None of that runs user code, so between the prologue and any exit
+/// nothing can freeze or seal the array, make its `length` non-writable, give
+/// it a virtual (sparse) length, install an index on `Array.prototype`, give it
+/// a custom prototype, or overlay a `defineProperty`'d index. The append itself
+/// changes only the `Vec`'s contents and length. So the answer computed here
+/// holds until the region is left, and every re-entry re-runs this prologue.
+///
+/// The two `arr_props` / `arguments_objs` conditions match `jit_ta_snapshot`'s
+/// own declines, so a gate PASS also certifies that the `{obj_bits, base, len}`
+/// the append writes back is exactly the snapshot the snapshot helper would
+/// have produced.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_push_gate(
+    vm: *mut core::ffi::c_void,
+    arr_bits: u64,
+) -> u64 {
+    let arr = Value::from_bits(arr_bits);
+    if !arr.is_heap() {
+        return 0;
+    }
+    // SAFETY: exclusive view; read-only apart from `array_elements_overlaid`.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = arr.heap_index();
+    if !matches!(vm.heap.get(idx), HeapObj::Array(_)) {
+        return 0;
+    }
+    let bad = vm.array_js_len.contains_key(&idx)
+        || vm.array_elements_overlaid(idx)
+        || vm.array_length_nonwritable.contains(&idx)
+        || vm.array_proto_has_index
+        || vm.proto_of.contains_key(&idx)
+        || vm.arr_props.contains_key(&idx)
+        || vm.arguments_objs.contains_key(&idx);
+    u64::from(!bad)
+}
+
+/// Win64 helper for a JIT'd `arr.push(int)` inside a REGISTER-tier region
+/// (W20 M2). Appends the i64 home value `val`, REWRITES the receiver's pin
+/// snapshot slot with the array's new `{base, len}`, and returns the new length
+/// (Int bits); `SELF_CALL_DEOPT` on anything it will not handle, in which case
+/// nothing has been mutated and the region resumes the interpreter AT the
+/// CallMethod ip.
+///
+/// This is `jit_array_push` plus the snapshot write-back, and the write-back is
+/// the whole reason it exists: a register-tier region reads `arr[i]` and
+/// `arr.length` straight out of that 32-byte slot, and a `Vec` append can
+/// reallocate the storage the slot's `base` points at. Doing it inside the same
+/// helper keeps it to ONE call per push — routing through `emit_refetch_ta`
+/// would cost one `jit_ta_snapshot` call per pin per push.
+///
+/// WHY THIS IS SAFE TO CALL FROM A REGION THAT HOLDS LIVE REGISTER HOMES. It
+/// runs no user code (every path that would need a setter, a prototype index,
+/// a sparse virtual length or a non-writable `length` deopts instead) and it
+/// performs NO VM-heap allocation — `items.push` grows the array's own `Vec`
+/// through the Rust allocator, and `write_barrier_val` only touches the
+/// remembered set. There is therefore no GC safepoint inside it, so no pinned
+/// string byte pointer, DataView base or TypedArray base can move, and no
+/// global can be reassigned. The one thing it invalidates is this array's own
+/// `base`/`len`, which it repairs before returning. What it CANNOT repair is a
+/// SECOND pin on the same array; the region's prologue proves that case away
+/// by comparing the arr pins' `obj_bits` pairwise once, at entry.
+///
+/// The deopt list is `jit_array_push`'s, plus the two conditions
+/// `jit_ta_snapshot` itself declines on (`arr_props` overlay, mapped
+/// `arguments`) so the slot this writes is exactly the slot the snapshot helper
+/// would have produced.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `out` points to this region's 32-byte pin slot.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_push_pinned(
+    vm: *mut core::ffi::c_void,
+    arr_bits: u64,
+    val: i64,
+    out: *mut TaSnap,
+) -> u64 {
+    let arr = Value::from_bits(arr_bits);
+    if !arr.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: exclusive view; pins only the register file, not the array's Vec.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = arr.heap_index();
+    // NOTE: the seven eligibility conditions are NOT re-tested here. They are
+    // hoisted to `jit_array_push_gate`, which the region prologue runs once per
+    // pushed pin -- see that function for why once is enough. Re-testing them
+    // per append cost six hash lookups on the hottest path this arm has.
+    // The i64 home boxes by exactly the rule `flush_exit` uses for the same
+    // home: Int when it fits i32, else the exact double (the tier's i53 guards
+    // bound |val| by 2^53, where every integer is representable).
+    let v = if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+        Value::int(val as i32)
+    } else {
+        Value::num(val as f64)
+    };
+    // An Int/double is never a heap value, so this is a no-op today — it is
+    // here so the lane cannot drift from `jit_array_push` if the arm is ever
+    // widened past numeric pushes.
+    vm.heap.write_barrier_val(idx, v);
+    match vm.heap.get_mut(idx) {
+        HeapObj::Array(items) => {
+            items.push(v);
+            let snap = TaSnap {
+                obj_bits: arr_bits,
+                base: items.as_ptr() as u64,
+                len: items.len() as u64,
+            };
+            let n = items.len();
+            // SAFETY: caller passes its own pin slot, 32 bytes, writable.
+            unsafe { core::ptr::write(out, snap) };
+            Value::int(n as i32).bits()
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper for a JIT'd `str.charCodeAt(i)` in a region. Returns the
 /// UTF-16 code unit at `i` (Int bits), NaN bits for an out-of-range index, or
 /// `SELF_CALL_DEOPT` for a non-int index / non-flat-string receiver (a rope or

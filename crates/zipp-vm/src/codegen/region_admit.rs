@@ -868,8 +868,12 @@ pub(crate) fn compile_region(
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
     cross_plan: &FxHashSet<usize>,
     acc_emit: &[bool],
+    // W20: may the register path admit the boxed heap arms here? Cleared for a
+    // region whose BOXREF compile already evicted once.
+    boxref_ok: bool,
     meter: Option<crate::codegen::meter::Meter>,
-) -> Option<(JitFn, bool)> {
+    // `(code, is_mem, engaged_boxref)`.
+) -> Option<(JitFn, bool, bool)> {
     // The register/SROA paths decline any region containing a Call/CallMethod, so
     // leaf inlining and method inlining (which apply only to those sites) are
     // reachable only via the memory path below.
@@ -879,11 +883,14 @@ pub(crate) fn compile_region(
     // profiler can charge time to `jit-mem` rather than `jit-fast`: B92 showed the
     // two tiers differ by ~4x on the same loop, so a single `jit-native` bucket
     // cannot say whether a row that is 99% native is fast or slow.
-    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot, meter) {
-        return Some((f, false));
+    if let Some((f, bx)) = compile_region_regalloc(
+        proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot, Some(&heap),
+        acc_emit, boxref_ok, meter,
+    ) {
+        return Some((f, false, bx));
     }
     compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan, cross_plan, acc_emit, meter)
-        .map(|f| (f, true))
+        .map(|f| (f, true, false))
 }
 
 /// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
@@ -905,7 +912,10 @@ pub(crate) fn compile_region_numeric(
         return Some((f, true));
     }
     // SROA-rewritten code has no index ops, so an empty TA plan is correct here.
-    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default(), 0, meter).map(|f| (f, false))
+    // No heap helpers: the SROA rewrite left no heap op, so the W20 boxed arms
+    // are unreachable here by construction.
+    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default(), 0, None, &[], false, meter)
+        .map(|(f, _)| (f, false))
 }
 
 /// Clone `proto` and rewrite the region's heap ops to scratch field-globals so

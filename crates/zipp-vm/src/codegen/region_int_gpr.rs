@@ -1219,8 +1219,19 @@ pub(crate) fn compile_region_int_gpr(
     allow_spill: bool,
 ) -> GprAttempt {
     let (s, e) = (start as usize, end as usize);
+    // W20 M2: a region with an admitted `arr.push(int)` is out of scope for the
+    // GPR sub-mode. The xmm INT emitter states its call-save set in three lines
+    // (the bool gprs in use, plus any numeric home in xmm2..xmm5; xmm6..15 and
+    // rbx/rsi/rdi/r12/r13/r14 are non-volatile), while this emitter's pool mixes
+    // r15/rbp/rsi/rdi/r13/r14 with whichever `BOOL_GPRS` the bools left free --
+    // the same set would have to be re-derived per plan. Refusing costs nothing:
+    // `gpr_home_map` already requires a Bitwise/imul to engage, which a
+    // push-bearing scan loop does not have.
+    if region_has_arr_push(proto, s, e, ta_plan) {
+        return GprAttempt::OutOfScope;
+    }
     let rip = |ip: usize| -> i32 {
-        // See `compile_region_int`'s twin: empty ⇒ `ip` is already the resume ip.
+        // See `compile_region_int`'s twin: empty => `ip` is already the resume ip.
         entry.resume.get(ip.wrapping_sub(s)).map_or(ip as i32, |&r| r as i32)
     };
     // W10.3 frame spill slots sit AFTER the resume-ip slot (see the frame
@@ -1370,6 +1381,7 @@ pub(crate) fn compile_region_int_gpr(
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_int_entry_load_gpr(&mut ops, gx(x), entry_bail, is_strict(gx(x)));
     }
+    emit_bool_home_zero(&mut ops, plan);
     for &(r, gb) in &plan.live_in_bools {
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_bool_entry_load(&mut ops, gb, entry_bail);

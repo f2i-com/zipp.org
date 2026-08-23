@@ -13,6 +13,83 @@ pub(crate) const TWO_POW_53: i64 = 9_007_199_254_740_992;
 /// `2^54` — the unsigned upper bound for the shifted range check `(x + 2^53) ≤ 2^54`.
 pub(crate) const TWO_POW_54: i64 = 18_014_398_509_481_984;
 
+/// W20 M1: zero every bool gpr home that gets NO entry load.
+///
+/// `plan_region` drops a bool from `live_in_bools` exactly when its gpr is
+/// SHARED with another bool (two entry loads into one register would overwrite
+/// each other, and `bool_shareable` already proved no path from entry reads the
+/// register before a def). But `flush_exit` boxes EVERY bool home at EVERY exit
+/// as `BOOL_TAG | gpr`, so an exit taken before the first def would `or` the
+/// tag with whatever the caller left in r8..r11 — not merely a wrong bool, but
+/// a Value whose TAG bits are arbitrary, which the GC would then walk as a heap
+/// pointer. One `xor` per such register in the prologue makes every bool home
+/// 0/1 from entry on (every bool def is a `movzx Rq(d), al`), which is the
+/// invariant `flush_exit` has always relied on.
+///
+/// Byte-identical to the pre-wave prologue whenever no bool shares a home:
+/// every bool is then in `live_in_bools` and nothing is emitted.
+pub(crate) fn emit_bool_home_zero(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan) {
+    let loaded: FxHashSet<u8> = plan.live_in_bools.iter().map(|&(_, g)| g).collect();
+    let mut gs: Vec<u8> = plan.bool_regs.iter().map(|&(_, g)| g).collect();
+    gs.sort_unstable();
+    gs.dedup();
+    for g in gs {
+        if !loaded.contains(&g) {
+            dynasm!(ops ; xor Rq(g), Rq(g));
+        }
+    }
+}
+
+/// W20 M2 -- the pin slot of an INT-tier-admissible `arr.push(int)` at `ip`.
+///
+/// Admissible means: the mechanism's latch is on, the op is a one-argument
+/// `push` `CallMethod`, and the OSR pin planner pinned its receiver as a dense
+/// Array observed all-Int (`ARR_INT_PIN_KIND`). The pin does three jobs at
+/// once -- it keeps the receiver register out of the numeric home set
+/// (`ta_recv_regs`), it supplies the identity guard the emitted arm checks
+/// before it touches anything, and its snapshot slot is where the helper writes
+/// the array's new `{base, len}` back, which is what keeps a sibling `arr[i]`
+/// or `arr.length` in the same region reading the truth after an append.
+///
+/// A NON-all-Int dense Array (`ARR_PIN_KIND` / `ARR_NUM_PIN_KIND`) is
+/// deliberately excluded: B102's 11x regression is the standing warning against
+/// loosening the pin kind, and the arm boxes from an i64 home, so the all-Int
+/// observation is also what makes the array's own contents match what it will
+/// keep pushing.
+pub(crate) fn arr_push_pin(proto: &FuncProto, ip: usize, ta_plan: &TaPinPlan) -> Option<usize> {
+    if !int_push_enabled() {
+        return None;
+    }
+    let j = *ta_plan.access.get(&ip)? as usize;
+    if ta_plan.pins.get(j)?.kind != ARR_INT_PIN_KIND {
+        return None;
+    }
+    match proto.code.get(ip)? {
+        Instr::CallMethod { name, argc: 1, .. }
+            if proto.string_constants.get(*name as usize).is_some_and(|k| k == "push") =>
+        {
+            Some(j)
+        }
+        _ => None,
+    }
+}
+
+/// Does `[start, end]` contain an admitted `arr.push(int)`? The INT-GPR
+/// sub-mode uses this to stay out of scope: its home pool mixes volatile and
+/// non-volatile gprs (r15/rbp/rsi/rdi/r13/r14 plus whichever `BOOL_GPRS` the
+/// bools left free), so the call-save set the xmm emitter states in three lines
+/// would have to be re-derived there per plan. The xmm emitter hosts these
+/// regions instead; `gpr_home_map` also requires a Bitwise/imul to engage at
+/// all, which a tokenizer scan does not have.
+pub(crate) fn region_has_arr_push(
+    proto: &FuncProto,
+    start: usize,
+    end: usize,
+    ta_plan: &TaPinPlan,
+) -> bool {
+    (start..=end).any(|ip| arr_push_pin(proto, ip, ta_plan).is_some())
+}
+
 /// Can the loop region `[start, end]` run on the INTEGER path? Stricter than
 /// `region_is_int`: every op must be integer-valued (no Div — fractional; `Mod`
 /// IS allowed, via integer `idiv`), and every `LoadConst` must be an Int-tagged
@@ -134,6 +211,19 @@ pub(crate) fn int_unadmitted_ips(
             Instr::CallMethod { .. } if pinned_str(s + off) => {}
             // W9: pinned-DV get* (int-lane kinds) under the GPR-routed retry.
             Instr::CallMethod { .. } if pinned_dv_int(s + off) => {}
+            // W20 M2: `arr.push(int)` on a dense all-Int Array pin. The ONE
+            // admitted op that issues a call; see `int_push_enabled` for what
+            // re-establishes the tier's register contract around it.
+            Instr::CallMethod { .. } if arr_push_pin(proto, s + off, ta_plan).is_some() => {}
+            // W20 M4: `!b` on a Bool home is `xor home, 1` -- a bool home holds
+            // 0 or 1 by construction (every def is a `movzx home, al` off a
+            // `set<cc>`, and the prologue zeroes any home it does not entry
+            // load). Worth ZERO on its own and measured so: with `push` still
+            // declining, removing `Not` from the tokenizer moved `region_is_int`
+            // to true and bought nothing, because the bool pool declined one
+            // rung later. It rides the package's latch for exactly that reason
+            // -- it is the third rung of one ladder, not a mechanism.
+            Instr::Not { .. } if int_push_enabled() => {}
             // `Math.imul(a, b)` — a 2-arg int32 multiply (ToInt32 of the low 32 of
             // the product); the int path emits a native `imul eax, ecx`.
             Instr::MathOp { op: MathFn::Imul, argc: 2, .. } => {}
@@ -598,11 +688,50 @@ pub(crate) fn compile_region_int_maybe_cold(
     // [shadow 32][TA snapshot slots 32·n_ta][xmm6..15 save 160][pad 8], shadow at the
     // bottom so the snapshot calls have shadow space and rsp stays 16-aligned.
     let n_ta = ta_plan.pins.len() as i32;
+    // W20 M2: a region with an admitted `arr.push(int)` reserves 64 more bytes
+    // above the xmm6..15 saves — the call-save area for the four `BOOL_GPRS`
+    // and the four VOLATILE numeric homes (xmm2..xmm5). It is part of THIS
+    // frame, above the shadow space, so no callee can write it. A push always
+    // brings a pin, so the area only ever exists in the `n_ta > 0` layout
+    // (whose `frame` keeps rsp 16-aligned for the call; +64 preserves that).
+    let has_push = region_has_arr_push(proto, s, e, ta_plan);
+    if has_push && n_ta == 0 {
+        decline_emit("int-emit: arr.push without a pin slot");
+        return None;
+    }
     let (frame, xmm_off, ta_base) = if n_ta > 0 {
-        (200 + 32 * n_ta, 32 + 32 * n_ta, 32i32)
+        (200 + 32 * n_ta + if has_push { 64 } else { 0 }, 32 + 32 * n_ta, 32i32)
     } else {
         (160i32, 0i32, 0i32)
     };
+    // [shadow 32][pin slots 32·n_ta][xmm6..15 saves 160][push call-save 64][pad]
+    let psave_off = xmm_off + 160;
+    // The registers the win64 callee may scratch that this planner OWNS:
+    // the bool gprs in use (bool homes AND `gpr_const` compare mirrors), and
+    // every numeric home in xmm2..xmm5. xmm6..xmm15 are callee-saved by the
+    // ABI, and rbx/rsi/rdi/r12/r13/r14 are non-volatile.
+    let (save_gprs, save_xmms): (Vec<u8>, Vec<u8>) = if has_push {
+        let mut g: Vec<u8> = plan.bool_regs.iter().map(|&(_, gb)| gb).collect();
+        g.extend(plan.gpr_const.values().map(|&(gb, _)| gb));
+        g.sort_unstable();
+        g.dedup();
+        let mut x: Vec<u8> = Vec::new();
+        for h in plan.reg_home.values() {
+            if let Home::Xmm(xi) = *h {
+                if xi < 6 {
+                    x.push(xi);
+                }
+            }
+        }
+        x.extend(plan.glob_home.values().copied().filter(|&xi| xi < 6));
+        x.extend(plan.addint_imm_home.values().copied().filter(|&xi| xi < 6));
+        x.sort_unstable();
+        x.dedup();
+        (g, x)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    debug_assert!(save_gprs.len() <= 4 && save_xmms.len() <= 4);
     dynasm!(ops
         ; push rbx
         ; push rsi
@@ -646,6 +775,58 @@ pub(crate) fn compile_region_int_maybe_cold(
             ; call rax
         );
     }
+    // ── W20 M2 push eligibility, hoisted ── the seven conditions
+    // `jit_array_push` re-tested on every single append are region-invariant
+    // (nothing an INT region body can execute runs user code), so they are
+    // settled here, once per pushed pin, and the per-append helper is left with
+    // the append itself. A `no` takes `entry_bail`: no flush, resume at the
+    // header, counts as a deopt -- the same contract as a failed live-in guard,
+    // and the same outcome the per-access identity guard would have produced
+    // one iteration later at 10.8M times the cost.
+    if has_push {
+        let mut pushed: Vec<usize> = (s..=e)
+            .filter_map(|ip| arr_push_pin(proto, ip, ta_plan))
+            .collect();
+        pushed.sort_unstable();
+        pushed.dedup();
+        for j in pushed {
+            dynasm!(ops
+                ; mov rcx, rdi                                  // vm
+                ; mov rdx, [rsp + ta_base + 32 * j as i32]      // pinned receiver bits
+                ; mov rax, QWORD crate::vm::jit_array_push_gate as usize as i64
+                ; call rax
+                ; test rax, rax
+                ; jz => entry_bail
+            );
+        }
+    }
+    // ── W20 M2 arr-pin disjointness ── the push arm repairs the snapshot of
+    // the array it appends to, and nothing else. That is complete exactly when
+    // no OTHER dense-Array pin in this region names the SAME array — otherwise
+    // a `Vec` realloc would leave the sibling pin's `base` dangling. Identity
+    // cannot change in-region (no user code runs), so ONE pairwise check here
+    // settles it for the whole run; a match takes `entry_bail` (no flush,
+    // resume at the header) exactly like a failed live-in guard. Declined
+    // snapshots ({0,0,0}) are skipped: their accesses miss identity and deopt
+    // on their own, and two of them are not evidence of aliasing.
+    if has_push {
+        let arr: Vec<usize> = (0..ta_plan.pins.len())
+            .filter(|&j| crate::codegen::is_arr_pin(ta_plan.pins[j].kind))
+            .collect();
+        for (a, &j1) in arr.iter().enumerate() {
+            for &j2 in &arr[a + 1..] {
+                let skip = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rsp + ta_base + 32 * j1 as i32]
+                    ; test rax, rax
+                    ; jz => skip
+                    ; cmp rax, [rsp + ta_base + 32 * j2 as i32]
+                    ; je => entry_bail
+                    ; => skip
+                );
+            }
+        }
+    }
     // ── W7 hoisted pin identity guards ── one check per hoisted pin, HERE,
     // instead of a source-load+compare at every access. The snapshot was just
     // taken FROM the source, so `source == obj_bits` holds by construction and
@@ -671,6 +852,7 @@ pub(crate) fn compile_region_int_maybe_cold(
     // Bool homes last. This ORDER is no longer load-bearing — no entry-load
     // helper scratches a BOOL_GPR any more (see the register contract on
     // `BOOL_GPRS`) — but it is kept: it is the order the other two tiers use.
+    emit_bool_home_zero(&mut ops, &plan);
     for &(r, g) in &plan.live_in_bools {
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_bool_entry_load(&mut ops, g, entry_bail);
@@ -1008,6 +1190,21 @@ pub(crate) fn compile_region_int_maybe_cold(
                 emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Ne);
                 flag_cmp = Some((ip, dst, Cmp::Ne));
             }
+            // W20 M4: `!b` on bool gpr homes. A bool home holds 0 or 1 by
+            // construction (every def is `movzx home, al` off a `set<cc>`, the
+            // entry load validates a Bool tag, and the prologue zeroes any home
+            // it does not entry-load), so the negation is one `xor`. Scratches
+            // nothing: the BOOL_GPRS register contract forbids touching
+            // r8..r11 that this region does not own, and both operands here ARE
+            // its own bool homes.
+            Instr::Not { dst, a } if int_push_enabled() => {
+                let d = gh(&plan, dst);
+                let sa = gh(&plan, a);
+                if d != sa {
+                    dynasm!(ops ; mov Rq(d), Rq(sa));
+                }
+                dynasm!(ops ; xor Rq(d), 1);
+            }
             Instr::Jump { target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
                 dynasm!(ops ; jmp => t);
@@ -1230,6 +1427,88 @@ pub(crate) fn compile_region_int_maybe_cold(
                     ; jae => deopt                       // OOB → deopt (interp yields NaN)
                     ; mov rdx, [rsp + off + 8]           // pinned bytes base
                     ; movzx eax, BYTE [rdx + rcx]        // ASCII code unit, zero-extend 0..255
+                    ; movq Rx(d), rax
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], rip_at         // resume AT this ip
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
+            // ── pinned dense-Array `arr.push(int)` (W20 M2) ── the ONE arm on
+            // this tier that issues a call. Shape: identity-guard the receiver,
+            // spill the planner-owned volatile registers into this frame's
+            // call-save area, call `jit_array_push_pinned` (which appends and
+            // rewrites THIS pin's `{obj_bits, base, len}`), restore, then take
+            // the new length into the dst i64 home. A deopt sentinel — a frozen
+            // / sparse / prototype-overridden array, or a receiver that is no
+            // longer the pinned one — resumes the interpreter AT this ip, which
+            // is sound because every early return in the helper happens before
+            // it mutates anything.
+            Instr::CallMethod { dst, arg_base, .. }
+                if arr_push_pin(proto, ip, ta_plan).is_some() =>
+            {
+                let j = arr_push_pin(proto, ip, ta_plan).unwrap();
+                let off = ta_base + 32 * j as i32;
+                // Both the pushed value and the new-length dst must live in
+                // xmm homes. `plan_region` types both Num and keeps the dst out
+                // of `dead` (the append is a side effect, so the dead-code pass
+                // must not skip the op), but a slot-materialized constant owns
+                // no home at all -- decline rather than assume.
+                if plan.slot_consts.contains_key(&arg_base)
+                    || plan.slot_consts.contains_key(&dst)
+                    || !matches!(plan.reg_home.get(&arg_base), Some(Home::Xmm(_)))
+                    || !matches!(plan.reg_home.get(&dst), Some(Home::Xmm(_)))
+                {
+                    decline_emit("int-emit: arr.push operand/dst has no numeric home");
+                    return None;
+                }
+                let vx = xh(&plan, arg_base);
+                let d = xh(&plan, dst);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rdx, [rsp + off]               // receiver identity vs snapshot
+                    ; jne => deopt                       // (homes still intact here)
+                );
+                for (k, &gb) in save_gprs.iter().enumerate() {
+                    dynasm!(ops ; mov [rsp + psave_off + 8 * k as i32], Rq(gb));
+                }
+                for (k, &xi) in save_xmms.iter().enumerate() {
+                    dynasm!(ops ; movq [rsp + psave_off + 32 + 8 * k as i32], Rx(xi));
+                }
+                dynasm!(ops
+                    ; movq r8, Rx(vx)                    // the raw i64 home value
+                    ; mov rcx, rdi                       // vm
+                    ; lea r9, [rsp + off]                // out: this pin's slot
+                    ; mov rax, QWORD crate::vm::jit_array_push_pinned as usize as i64
+                    ; call rax
+                    // The sentinel goes into rcx BEFORE the restore, and the
+                    // compare happens AFTER it. Two reasons, both load-bearing:
+                    // r10/r11 are BOOL_GPRS and must not serve as scratch once
+                    // they hold restored values again, and the deopt path jumps
+                    // to `flush_exit`, which boxes every home -- so the homes
+                    // have to be back before either branch is taken. rax (the
+                    // result) and rcx survive the restores, which touch only
+                    // r8..r11 and xmm2..xmm5.
+                    ; mov rcx, QWORD SELF_CALL_DEOPT as i64
+                );
+                for (k, &gb) in save_gprs.iter().enumerate() {
+                    dynasm!(ops ; mov Rq(gb), [rsp + psave_off + 8 * k as i32]);
+                }
+                for (k, &xi) in save_xmms.iter().enumerate() {
+                    dynasm!(ops ; movq Rx(xi), [rsp + psave_off + 32 + 8 * k as i32]);
+                }
+                dynasm!(ops
+                    ; cmp rax, rcx
+                    ; je => deopt
+                    ; movsxd rax, eax                    // Int payload → i64 home
                     ; movq Rx(d), rax
                     ; jmp => done
                     ; => deopt

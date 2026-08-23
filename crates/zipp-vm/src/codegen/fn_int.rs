@@ -183,6 +183,15 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         // suite where "read-only live-in used where a number isn't required"
         // fired (typedarray-math's normalize phase).
         | Instr::ToPropKey { dst, .. } => Some(dst),
+        // W20 M4: `Not` DEFINES its dst too, and the omission is the same one
+        // the note above records for `MathOp`/`CallMethod` -- a register the
+        // def model cannot see gets its live range from its USES alone, so the
+        // linear-scan allocator is free to hand its home out across the def.
+        // That was inert while `Instr::Not` declined every register tier; the
+        // INT tier admits it as of this wave, so the cover has to be real.
+        // Behind the package latch so `ZIPP_NO_INT_PUSH=1` restores the exact
+        // pre-wave def model for every tier, not just this one.
+        Instr::Not { dst, .. } if crate::codegen::int_push_enabled() => Some(dst),
         _ => None,
     }
 }

@@ -238,6 +238,27 @@ pub(crate) struct RegionPlan {
     /// def-first / runs-every-iteration conditions; the dst joins `hoisted`
     /// so it keeps a permanent home and no entry load).
     pub(crate) hoist_len_ips: Vec<usize>,
+    /// W20 BOXREF — registers holding a BOXED HEAP VALUE inside a register-tier
+    /// region. They get NO home at all: the value lives in the interpreter frame
+    /// slot `[rbx + dreg(r)]`, which every def writes and no exit flushes, so the
+    /// slot is AUTHORITATIVE on every path (the `emit_recv_slot_store` /
+    /// `split_recvs` discipline, and the reason this needs neither a new `Home`
+    /// variant nor a callee-saved gpr).
+    ///
+    /// A member is defined ONLY by an admitted dense-Array `GetIndex` whose
+    /// elements are objects (`ARR_PIN_KIND`) and used ONLY as the receiver of an
+    /// admitted `GetProp` (`getprop_ips`). That closed def/use shape is what makes
+    /// the no-home choice sound and cheap: one store at the def, one load at the
+    /// use, both L1, and nothing numeric ever touches the register.
+    ///
+    /// Empty under `ZIPP_NO_BOX_HOME=1`, and empty for every non-regalloc plan.
+    pub(crate) box_regs: FxHashSet<u16>,
+    /// W20 — region ips of `GetProp`s the REGALLOC emitter will serve with its own
+    /// inline-cache probe (`emit_regalloc_ic_probe`) instead of declining the
+    /// region to the memory tier. The dst is a `VTy::Num` home under a tag guard
+    /// on the probe result. Empty unless BOXREF or the read-only-receiver arm
+    /// admitted this region.
+    pub(crate) getprop_ips: FxHashSet<usize>,
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops

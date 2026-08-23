@@ -442,6 +442,15 @@ const MODES: &[Mode] = &[
     // in a child process under each latch, and by
     // `tests/w19_delete_differential.js`.
     Mode { name: "nodeletefast", env: &[("ZIPP_NO_DELETE_FASTPATH", "1")] },
+    // ── W20 ── the two rungs that put an `arr.push(int)` and a linear-scan
+    // bool allocator on the INT tier. Both are rows for the same reason the
+    // W17 batch is: each is specified as a PURE FALLBACK, so a switch that
+    // changes an answer is a bug whichever side is wrong. `nointpush` is the
+    // one that matters most -- with it OFF the whole `Stmt::Push` family runs
+    // on the boxed memory tier, which is the reference the register-tier arm
+    // has to match byte for byte.
+    Mode { name: "nointpush", env: &[("ZIPP_NO_INT_PUSH", "1")] },
+    Mode { name: "noboolreuse", env: &[("ZIPP_NO_BOOL_REUSE", "1")] },
     // Two OPT-IN rows beside `intsplit`, which is where a path gets less
     // exercise than it needs by construction.
     Mode { name: "arrpinloose", env: &[("ZIPP_ARR_PIN_LOOSE", "1")] },
@@ -665,6 +674,16 @@ enum Stmt {
     /// A kernel-local object whose fields are read and written in the loop: the
     /// admission shape for object scalar replacement (`[jit] SROA region`).
     Sroa { f: u8, op: u8, a: Src },
+    /// W20: `parr.push(v & 255)` -- the append the INT tier admits as of this
+    /// wave, and the ONLY op on that tier that issues a call. `style` decides
+    /// what the kernel reads back afterwards, which is what makes a STALE pin
+    /// snapshot observable rather than merely unlucky:
+    ///   0 the new length, 1 the element just appended (through the same pin
+    ///   the helper rewrote), 2 an element from the array's stable prefix.
+    /// The generator emits it into ordinary kernel bodies, so it lands beside
+    /// bool temps, pinned element reads and nested loops -- the combination
+    /// that has to survive the call-save/restore around the append.
+    Push { v: Src, style: u8 },
 }
 
 /// Where the kernel lives.
@@ -1723,6 +1742,8 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
                 }
             } else if g.rng.chance(15) {
                 Stmt::ALen { arr }
+            } else if g.rng.chance(22) {
+                Stmt::Push { v: gen_src(g), style: g.rng.below(3) as u8 }
             } else {
                 // Writes always use a masked index so an array cannot grow
                 // without bound; reads deliberately may go out of range.
@@ -1905,12 +1926,15 @@ struct Used {
     probe: bool,
     /// `w`, the second region's counter.
     loop2: bool,
+    /// W20: `parr`, the growable array `Stmt::Push` appends to.
+    push_arr: bool,
     labels: Vec<u32>,
 }
 
 impl Used {
     fn everything() -> Used {
         Used {
+            push_arr: true,
             temps: [true; TEMPS],
             bools: [true; BOOLS],
             dbls: [true; DBLS],
@@ -2066,6 +2090,10 @@ fn collect_stmts(ss: &[Stmt], u: &mut Used) {
                 u.src(*v);
             }
             Stmt::ALen { arr } => u.arrs[arr.ix()] = true,
+            Stmt::Push { v, .. } => {
+                u.push_arr = true;
+                u.src(*v);
+            }
             Stmt::If { a, b, then_, else_, .. } => {
                 u.src(*a);
                 u.src(*b);
@@ -2308,6 +2336,18 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
         }
         Stmt::ALen { arr } => {
             line(o, ind, &format!("{l}h = ({l}h + {p}{}.length) | 0;", arr.name()));
+        }
+        Stmt::Push { v, style } => {
+            let val = s_txt(p, *v);
+            line(o, ind, &format!("{p}parr.push({val} & 255);"));
+            let back = match style {
+                0 => format!("{l}h = ({l}h + {p}parr.length) | 0;"),
+                1 => format!("{l}h = ({l}h + {p}parr[{p}parr.length - 1]) | 0;"),
+                _ => format!(
+                    "{l}h = ({l}h + ({p}parr.length > 8 ? {p}parr[7] : 1)) | 0;"
+                ),
+            };
+            line(o, ind, &back);
         }
         Stmt::If { a, b, cmp, neg, then_, else_ } => {
             line(o, ind, &format!("if ({}) {{", cmp_txt(p, *a, *b, *cmp, *neg)));
@@ -2582,6 +2622,12 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
     let u = collect(prog);
     let mut o = String::new();
 
+    if u.push_arr {
+        // Starts EMPTY on purpose: an empty dense array samples as all-Int, so
+        // the pin planner offers it to the INT tier, and the kernel then walks
+        // it through every `Vec` capacity doubling from zero.
+        line(&mut o, 0, &format!("var {p}parr = [];"));
+    }
     if u.arrs[Arr::Dense.ix()] {
         // Small values on purpose: `A[i] === 1` has to MATCH sometimes.
         line(&mut o, 0, &format!("var {p}arr = [{}];", int_list(32, |i| (i as i64 * 3) % 7)));

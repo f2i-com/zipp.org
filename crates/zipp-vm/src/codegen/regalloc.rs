@@ -5,11 +5,195 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// ── W20 ── the REGISTER tier's inline-cache probe for `GetProp`.
+///
+/// This is not `emit_ic_probe`, and the reason is the whole difficulty of the
+/// mechanism. That probe clobbers `r8d/r9/r10/r11d` — which on this tier are
+/// [`BOOL_GPRS`], the planner's register file for `Bool` homes, live across the
+/// backedge and reloaded by nothing. Using it here would silently corrupt a JS
+/// boolean for the rest of the region: the exact W14/W16 defect class the
+/// register contract on `BOOL_GPRS` was written for, three times a silent wrong
+/// answer.
+///
+/// So this one is written to a tighter contract:
+///   * **reads** `rbx` (frame window), `r13` (heap version array), `r14` (IC
+///     table base) — all pinned for the run;
+///   * **clobbers** `rax`, `rcx`, `rdx` and 16 bytes of frame scratch at
+///     `probe_off`, and NOTHING else. No `BOOL_GPRS`, no xmm home;
+///   * on a hit, leaves the property's `Value` bits in `rax` and falls through;
+///   * on any miss it calls `jit_get_prop_miss` (spilling the volatile homes
+///     around the call, see below) and falls through with the answer in `rax`,
+///     or jumps to `deopt`.
+///
+/// The 16 bytes of scratch buy the fourth and fifth registers a hop-walking
+/// 8-way probe needs. `[probe_off]` holds the receiver bits (re-loaded per way
+/// so `rax` is free inside the hop walk) and `[probe_off + 8]` holds the way
+/// counter, re-used as the hop counter once the way loop can no longer be
+/// resumed (a hop mismatch commits to the miss path: identity + receiver version
+/// already matched, so no other way can answer for this receiver).
+///
+/// ── the miss must CALL, and this is a measured claim ──
+/// The wave-20 map specified a DEOPT here, gated on a plan-time zero-miss check.
+/// That cannot work. `Jit::reserve_ic_sites` hands every fresh compile eight
+/// ZEROED ways and `Jit::set_ic` — the only writer of a way anywhere in the
+/// engine — is reachable only from the miss helpers. A probe that never calls
+/// one never fills a way, misses on every access for the life of the region, and
+/// evicts it. `ZIPP_BOXREF_MISS=deopt` emits that form so the claim is a
+/// measurement rather than an argument; the default is the call.
+///
+/// `jit_get_prop_miss` is the ONLY helper this tier may call, and the reason it
+/// is safe is worth stating: it never runs user code (an accessor returns
+/// `PROP_VIA_IC`, an exotic receiver `SELF_CALL_DEOPT` — both deopt here), it
+/// never touches `vm.heap`, and it resizes neither the version array nor the IC
+/// table. So `r13`, `r14`, every pinned-Array snapshot and every `items` base
+/// survive it unchanged — which is why there is no re-fetch, exactly as on the
+/// memory tier, whose own probe skips the re-fetch on this same path.
+///
+/// What does NOT survive is the volatile register file: win64 lets a callee
+/// clobber `rax/rcx/rdx/r8..r11` and `xmm0..xmm5`, and homes 2..5 plus all four
+/// `BOOL_GPRS` live there. They are spilled to the frame around the call —
+/// unconditionally, all eight, because "which home did I forget" is not a
+/// question a reviewer should have to answer — and restored on BOTH exits,
+/// including the deopt exit, since `flush_exit` writes every home back.
+#[allow(clippy::too_many_arguments)]
+fn emit_regalloc_ic_probe(
+    ops: &mut dynasmrt::x64::Assembler,
+    heap: &HeapHelpers,
+    ic_site: u32,
+    obj: u16,
+    name: u32,
+    probe_off: i32,
+    spill_off: i32,
+    deopt: dynasmrt::DynamicLabel,
+) {
+    let off = (ic_site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
+    let packed = ((heap.func_id as u64) << 32) | name as u64;
+    let probe = ops.new_dynamic_label();
+    let next = ops.new_dynamic_label();
+    let hit = ops.new_dynamic_label();
+    let hop = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    let got = ops.new_dynamic_label();
+    let end = off + (JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
+    dynasm!(ops
+        ; lea rcx, [r14 + off]                 // way cursor
+        ; lea rdx, [r14 + end]                 // one past the last way
+        ; => probe
+        // The receiver is re-loaded per way rather than parked in scratch: it is
+        // an L1 hit, and it keeps `rax` free for the hop walk (which clobbers it
+        // and can no longer return here -- see the `jne => miss` below).
+        ; mov rax, [rbx + dreg(obj)]           // receiver bits (the box slot)
+        ; cmp rax, [rcx]                       // identity (an empty 0 never matches)
+        ; jne => next
+        ; mov eax, eax                         // receiver heap index = low 32
+        ; mov eax, [r13 + rax * 4]             // live receiver version
+        ; cmp eax, [rcx + 16]
+        ; jne => next
+        ; mov eax, [rcx + 20]
+        ; shr eax, 24                          // tag byte: hop count | acc tags
+        ; jz => hit                            // 0 hops, untagged ⇒ own data
+        ; test eax, 0xC0                       // IC_ACC_TAG | IC_ACC_BAKED (post-shr)
+        ; jnz => miss                          // an accessor way is not ours
+        // ── CHAIN way ── identity AND receiver version already matched, so this
+        // way is THE answer for this receiver or there is none: a stale hop goes
+        // straight to the miss path rather than trying the rest. That is what
+        // frees `rdx` (the way-loop bound) to become the hop cursor and `rax` to
+        // become the version scratch, and it leaves the 8 bytes of frame scratch
+        // carrying only the hop counter.
+        ; and eax, 0x3F                        // hop count, 1..=JIT_IC_MAX_HOPS
+        ; mov [rsp + probe_off], eax
+        ; lea rdx, [rcx + 24]                  // hop cursor
+        ; => hop
+        ; mov eax, [rdx]                       // hop heap index
+        ; mov eax, [r13 + rax * 4]             // live hop version
+        ; cmp eax, [rdx + 4]
+        ; jne => miss                          // chain moved: no other way answers
+        ; add rdx, 8
+        ; dec DWORD [rsp + probe_off]
+        ; jnz => hop
+        ; => hit
+        // `slot_nhops` packs the slot in the low 24 bits, so masking is part of
+        // reading a slot at all.
+        ; mov eax, [rcx + 20]
+        ; and eax, 0x00FF_FFFF
+        ; mov rdx, [rcx + 8]                   // holder vals_ptr
+        ; mov rax, [rdx + rax * 8]             // vals[slot] (CALL-FREE)
+        ; jmp => got
+        ; => next
+        ; add rcx, JIT_IC_STRIDE as i32
+        ; cmp rcx, rdx
+        ; jb => probe
+        ; => miss
+    );
+    if boxref_miss_deopts() {
+        // The map's form, kept for measurement only — see the doc above.
+        dynasm!(ops ; jmp => deopt);
+    } else {
+        let restore_deopt = ops.new_dynamic_label();
+        emit_probe_spill(ops, spill_off, true);
+        dynasm!(ops
+            ; mov rcx, rdi                     // vm
+            ; mov rdx, [rbx + dreg(obj)]       // receiver bits
+            ; mov r8d, ic_site as i32          // site_idx
+            ; mov r9, QWORD packed as i64      // (func_id<<32)|name_idx
+            ; mov rax, QWORD heap.get_prop_miss as i64
+            ; call rax
+            ; mov rcx, QWORD SELF_CALL_DEOPT as i64
+            ; cmp rax, rcx
+            ; je => restore_deopt
+            ; mov rcx, QWORD PROP_VIA_IC as i64
+            ; cmp rax, rcx                     // accessor/class ⇒ interpreter
+            ; je => restore_deopt
+            ; mov [rsp + probe_off], rax       // park the answer across the reloads
+        );
+        emit_probe_spill(ops, spill_off, false);
+        dynasm!(ops
+            ; mov rax, [rsp + probe_off]
+            ; jmp => got
+            ; => restore_deopt
+        );
+        // `flush_exit` writes every home back, so the homes must be whole before
+        // the deopt jump — not only before the fall-through.
+        emit_probe_spill(ops, spill_off, false);
+        dynasm!(ops ; jmp => deopt);
+    }
+    dynasm!(ops ; => got);
+}
+
+/// Spill (`save`) or reload the volatile register homes around the register
+/// tier's one permitted call. `xmm2..xmm5` are the volatile half of the numeric
+/// home pool ([`HOME_XMM_FIRST`] is 2; xmm6..15 are saved by the prologue AND
+/// callee-saved across a win64 call) and `r8..r11` are [`BOOL_GPRS`] in full.
+///
+/// All eight, always, whether or not the plan allocated them: the area is
+/// already reserved, the path is the cold one, and an unconditional sequence has
+/// no "is this home live here" question for a reviewer — or for the next arm
+/// that reaches for a register.
+fn emit_probe_spill(ops: &mut dynasmrt::x64::Assembler, spill_off: i32, save: bool) {
+    for k in 0..4i32 {
+        let x = 2 + k as u8;
+        if save {
+            dynasm!(ops ; movdqu [rsp + spill_off + k * 16], Rx(x));
+        } else {
+            dynasm!(ops ; movdqu Rx(x), [rsp + spill_off + k * 16]);
+        }
+    }
+    for (i, &g) in BOOL_GPRS.iter().enumerate() {
+        let o = spill_off + 64 + i as i32 * 8;
+        if save {
+            dynasm!(ops ; mov [rsp + o], Rq(g));
+        } else {
+            dynasm!(ops ; mov Rq(g), [rsp + o]);
+        }
+    }
+}
+
 /// Register-promoting region codegen: each region value lives in a fixed xmm
 /// (numbers) or gpr (booleans) home for the whole loop. Live-in values are
 /// loaded + type-guarded ONCE at entry; the loop body is then pure register SSE
 /// with NO per-op guards or memory traffic (this is what makes it competitive
 /// with V8). All homes are flushed back to the reg file / globals on every exit.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compile_region_regalloc(
     proto: &FuncProto,
     start: u32,
@@ -17,14 +201,53 @@ pub(crate) fn compile_region_regalloc(
     globals_base_helper: usize,
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
+    // W20 BOXREF: the heap helper block + this region's inline-cache site base.
+    // `None` for the SROA/numeric caller, whose rewritten bytecode has no heap
+    // op at all — so the boxed arms are unreachable there by construction.
+    heap: Option<&HeapHelpers>,
+    // Per-site accessor-arm flags, in the same order `register_ic_sites` built
+    // them (the k-th GetProp/SetProp of the region).
+    acc_emit: &[bool],
+    // Cleared by `Jit::compile_region` for a region whose BOXREF compile has
+    // already evicted once — see `region_boxref_blacklist`.
+    boxref_ok: bool,
     meter: Option<crate::codegen::meter::Meter>,
-) -> Option<JitFn> {
+    // `(code, engaged_boxref)`. The flag rides back so `Jit::compile_region` can
+    // tag the installed region: a BOXREF region that evicts must retry WITHOUT
+    // the boxed arms rather than be blacklisted, which for a DOUBLE region means
+    // the loop runs interpreted (B102's 11x).
+) -> Option<(JitFn, bool)> {
     if !region_can_compile(proto, start, end, None) {
         return None;
     }
+    // ── W20 BOXREF admission ──
+    // An ACCESSOR-armed site is excluded wholesale: its probe would have to
+    // dispatch a getter, which is user code, which this tier cannot run. A site
+    // that turns accessor LATER resolves the same way at runtime — the miss
+    // helper answers `PROP_VIA_IC`, the arm deopts, and the region falls back —
+    // so this gate is about not emitting a probe that is known to be useless,
+    // not about soundness.
+    let boxref = if heap.is_some() && boxref_ok && !acc_emit.iter().any(|&b| b) {
+        BoxRefAdmit {
+            elems: box_home_enabled(),
+            ro_recv: regalloc_getprop_enabled(),
+        }
+    } else {
+        BoxRefAdmit::NONE
+    };
     // The regalloc path uses boxed-double semantics and cannot host Bitwise
     // (int32-lane) ops — they decline to the memory path here.
-    let plan = plan_region(proto, start, end, ta_plan, false, true, true)?;
+    let plan = plan_region(proto, start, end, ta_plan, false, true, true, boxref)?;
+    // W20: does this region carry the inline-cache probe? That decides the frame
+    // layout (a shadow window + a volatile-home spill area + 16 bytes of probe
+    // scratch) and whether the prologue pins r13/r14. Empty ⇒ every byte below is
+    // what the pre-wave emitter produced.
+    let needs_ic = !plan.getprop_ips.is_empty();
+    let heap = heap.filter(|_| needs_ic);
+    if needs_ic && heap.is_none() {
+        decline_emit("regalloc-emit: GetProp arm planned without heap helpers");
+        return None;
+    }
     if !plan.split_recvs.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
         let mut srs: Vec<u16> = plan.split_recvs.iter().copied().collect();
         srs.sort_unstable();
@@ -71,11 +294,20 @@ pub(crate) fn compile_region_regalloc(
     // snapshot calls (the only calls after the globals fetch) have their 32-byte
     // shadow space, and `frame ≡ 8 (mod 16)` keeps rsp 16-aligned for them. With no
     // pins this is exactly the legacy 160-byte xmm frame (xmm_off/ta_base = 0).
+    // W20: with the inline-cache probe the frame grows by a 96-byte VOLATILE
+    // HOME SPILL area and 16 bytes of PROBE SCRATCH, and the 32-byte shadow is
+    // reserved even with no pins (the miss helper is a win64 call):
+    //   [shadow 32][TA slots 32n][xmm6..15 save 160][spill 96][probe 16][pad 8]
+    // 312 ≡ 8 (mod 16), the same residue the pinned layout already needs, so rsp
+    // is 16-aligned at every call in both shapes.
     let n_ta = ta_plan.pins.len() as i32;
-    let (frame, xmm_off, ta_base) = if n_ta > 0 {
-        (200 + 32 * n_ta, 32 + 32 * n_ta, 32i32)
+    let (frame, xmm_off, ta_base, spill_off, probe_off) = if needs_ic {
+        let xo = 32 + 32 * n_ta;
+        (312 + 32 * n_ta, xo, 32i32, xo + 160, xo + 256)
+    } else if n_ta > 0 {
+        (200 + 32 * n_ta, 32 + 32 * n_ta, 32i32, 0i32, 0i32)
     } else {
-        (160i32, 0i32, 0i32)
+        (160i32, 0i32, 0i32, 0i32, 0i32)
     };
     dynasm!(ops
         ; push rbx
@@ -92,6 +324,27 @@ pub(crate) fn compile_region_regalloc(
         ; mov rax, QWORD globals_base_helper as i64
         ; call rax
         ; mov r12, rax
+    );
+    // W20: the inline-cache probe's two pinned bases, fetched in the SAME shadow
+    // window as the globals base. r13/r14 are already pushed by the prologue
+    // above (they were pushed only to share the int path's restore sequence) and
+    // are callee-saved across the pin-snapshot calls below, so nothing else in
+    // this frame changes. Both stay valid for the whole run: `jit_get_prop_miss`
+    // — the only helper this tier may call — resizes neither the version array
+    // nor the IC table (see the miss arm), which is why there is no re-fetch.
+    if let Some(h) = heap {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rax, QWORD h.versions_base as i64
+            ; call rax
+            ; mov r13, rax
+            ; mov rcx, rdi
+            ; mov rax, QWORD h.ic_base as i64
+            ; call rax
+            ; mov r14, rax
+        );
+    }
+    dynasm!(ops
         ; add rsp, 40
         ; sub rsp, frame              // [shadow][TA slots][xmm6..15 save][pad]
     );
@@ -141,6 +394,7 @@ pub(crate) fn compile_region_regalloc(
     // Bool homes last. This ORDER is no longer load-bearing — no entry-load
     // helper scratches a BOOL_GPR any more (see the register contract on
     // `BOOL_GPRS`) — but it is kept: it is the order the other two tiers use.
+    region_int::emit_bool_home_zero(&mut ops, &plan);
     for &(r, g) in &plan.live_in_bools {
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_bool_entry_load(&mut ops, g, entry_bail);
@@ -166,6 +420,12 @@ pub(crate) fn compile_region_regalloc(
     let mut flag_cmp: Option<(usize, u16, Cmp)> = None;
     // Redundant-copy tracker (see `LastCopy`).
     let mut lc: LastCopy = None;
+    // W20: the inline-cache site cursor. `register_ic_sites` numbered the k-th
+    // GetProp/SetProp of the region `ic_base_idx + k`, so this must advance on
+    // exactly the same ops in the same order. It advances on GetProp only —
+    // which is sound because a SetProp DECLINES the whole region at the
+    // catch-all below, so no site after one is ever emitted.
+    let mut ic_site = heap.map_or(0, |h| h.ic_base_idx);
     for ip in s..=e {
         dynasm!(ops ; => lbl(ip as u32, &in_region));
         let charged =
@@ -237,7 +497,9 @@ pub(crate) fn compile_region_regalloc(
             // this register throughout the region. `emit_recv_slot_store` carries
             // why the ta_recv half is not a no-op.
             Instr::LoadGlobal { dst, idx }
-                if plan.ta_recv_regs.contains(&dst) || plan.split_recv_lg.contains(&ip) =>
+                if plan.ta_recv_regs.contains(&dst)
+                    || plan.split_recv_lg.contains(&ip)
+                    || plan.box_regs.contains(&dst) =>
             {
                 emit_recv_slot_store(&mut ops, dst, idx);
                 flag_cmp = prev_flag;
@@ -523,6 +785,57 @@ pub(crate) fn compile_region_regalloc(
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
+            }
+            // ── W20 BOXREF element read ── `o = arr[i]` where the elements are
+            // OBJECTS. Same three guards as the numeric arm below, and then the
+            // element's `Value` BITS are stored verbatim into the register's
+            // interpreter frame slot: that slot IS this register's home (see
+            // `RegionPlan::box_regs`), so there is nothing to unbox, nothing to
+            // re-encode, and no forgery risk.
+            //
+            // A HOLE deopts rather than storing, EXACTLY mirroring the memory
+            // tier's arm and `jit_get_index`: an absent index resolves through the
+            // PROTOTYPE CHAIN, which is a different answer from the bits sitting
+            // in the dense Vec. OOB / negative / fractional / NaN keys and an
+            // identity miss deopt for the same reason. Nothing is written before
+            // any of those, so re-executing the op is sound.
+            Instr::GetIndex { dst, key, .. } if plan.box_regs.contains(&dst) => {
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let kx = xh(&plan, key);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]        // receiver vs snapshot obj_bits
+                        ; jne => deopt
+                    );
+                }
+                dynasm!(ops
+                    ; cvttsd2si rcx, Rx(kx)           // index = trunc(key home)
+                    ; cvtsi2sd xmm0, rcx
+                    ; ucomisd xmm0, Rx(kx)
+                    ; jne => deopt                    // non-integral index
+                    ; jp => deopt                     // NaN index
+                    ; cmp rcx, [rsp + off + 16]       // unsigned: i < len (catches <0)
+                    ; jae => deopt
+                    ; mov rdx, [rsp + off + 8]        // pinned items base
+                    ; mov rax, [rdx + rcx * 8]        // items[i] (Value bits)
+                    ; mov rdx, QWORD ARR_HOLE_BITS as i64
+                    ; cmp rax, rdx
+                    ; je => deopt                     // HOLE → interpreter (proto walk)
+                    ; mov [rbx + dreg(dst)], rax      // the frame slot IS the home
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32      // resume AT this ip
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                lc = None;
             }
             // ── pinned-Float64Array element read ── x[i] → a direct movsd into the
             // dst xmm home (UNBOXED). Guards (any miss DEOPTs to the interpreter AT
@@ -811,6 +1124,36 @@ pub(crate) fn compile_region_regalloc(
                 copy_clobber(&mut lc, d);
                 lc = None;
             }
+            // ── W20 ── `o.p` on the REGISTER tier. The receiver comes from its
+            // frame slot (a `box_regs` member: either the element this loop just
+            // read, or a live-in the region never writes), the 8-way probe runs
+            // call-free on a hit, and the result is tag-guarded into the dst's
+            // f64 home. See `emit_regalloc_ic_probe` for the register contract —
+            // it is the reason this is a bespoke probe and not `emit_ic_probe`.
+            Instr::GetProp { dst, obj, name } if plan.getprop_ips.contains(&ip) => {
+                let h = heap.expect("getprop_ips non-empty implies heap helpers");
+                let d = xh(&plan, dst);
+                let deopt = ops.new_dynamic_label();
+                emit_regalloc_ic_probe(
+                    &mut ops, h, ic_site, obj, name, probe_off, spill_off, deopt,
+                );
+                // rax = the property's Value bits. Int → cvtsi2sd, double → movq,
+                // anything else (a string, an object, undefined, a bool) DEOPTs:
+                // the dst is an f64 home and cannot hold it. Nothing has been
+                // written yet, so re-execution at this ip is sound.
+                let done = ops.new_dynamic_label();
+                emit_box_to_home(&mut ops, d, deopt);
+                dynasm!(ops
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                ic_site += 1;
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
             // POST-PLAN hole: this region passed `region_can_compile` AND
             // `plan_region` (which types e.g. `Mod` and `MathOp{Imul,2}` as Num
             // defs), but this emitter has no arm for the op. The decline must be
@@ -912,7 +1255,16 @@ pub(crate) fn compile_region_regalloc(
         );
         log_pinned_recvs("DOUBLE", start, end, proto, &plan);
     }
+    if needs_ic && std::env::var_os("ZIPP_JITLOG").is_some() {
+        let mut gps: Vec<usize> = plan.getprop_ips.iter().copied().collect();
+        gps.sort_unstable();
+        eprintln!(
+            "[jit] DOUBLE region [{start},{end}] BOXREF box_regs={} getprops={gps:?} code={}b",
+            plan.box_regs.len(),
+            buf.len()
+        );
+    }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    Some((JitFn { _buf: buf, entry: entry_ptr, self_binding: None }, needs_ic))
 }
 

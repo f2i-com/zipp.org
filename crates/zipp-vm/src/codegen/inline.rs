@@ -1341,6 +1341,24 @@ pub(crate) fn emit_inline_accessor(
             ; cmp edx, DWORD shape.recv_ver as i32
             ; jne => miss
         );
+        // ── W20 (M2): OWN-ACCESSOR arm ── the accessor function lives in the
+        // receiver's own slot (`vals[slot]` for a getter, `attrs[slot].setter`
+        // for a setter), so the baked callee must still BE there. The version
+        // guard above covers a `defineProperty` redefinition (props/define.rs
+        // bumps it on every define) and a delete/realloc; this covers an
+        // in-place replacement that does not, and — because a data/accessor
+        // flip goes through `defineProperty` — it is a second, independent
+        // check on the flip. The version guard is emitted FIRST, so the baked
+        // address is only dereferenced after the vectors are proven un-realloc'd.
+        if let Some((addr, bits)) = shape.own_acc {
+            dynasm!(ops
+                ; mov rcx, QWORD addr as i64
+                ; mov rcx, [rcx]
+                ; mov r10, QWORD bits as i64
+                ; cmp rcx, r10
+                ; jne => miss
+            );
+        }
         // W19 (MI-LANE): a GETTER arm whose body scheduled a lane writes the
         // result straight into `payload` and joins the site's IC continuation
         // — no window binding at all. `after` (fall through to the unchanged

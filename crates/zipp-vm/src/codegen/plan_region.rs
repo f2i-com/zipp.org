@@ -174,6 +174,83 @@ pub(crate) fn wt_share_enabled() -> bool {
 /// Those two shapes want opposite answers, so the next step is a per-region
 /// admission for the spill (split-receiver regions, whose homes are already
 /// write-through-backed) rather than flipping `ZIPP_GPR_SPILL_SLOTS` globally.
+/// W20 M1 — `ZIPP_NO_BOOL_REUSE=1` restores the pre-wave BOOL home allocator:
+/// a 4-register first-fit that declines the whole region at the fifth distinct
+/// bool temp. With the switch OFF (default ON) a region whose bool count would
+/// OVERFLOW the pool linear-scan-reuses `BOOL_GPRS` over non-overlapping live
+/// ranges, exactly as the numeric path already does above the 14-xmm pool.
+///
+/// SCOPE IS DELIBERATELY "ON OVERFLOW ONLY". Every region that fits four bools
+/// today keeps the identical first-fit assignment, which matters twice over:
+/// the INT-GPR emitter hands out whichever `BOOL_GPRS` the bools left free as
+/// numeric i64 homes (`gpr_home_map`), so changing the bool assignment of a
+/// region that already compiles would silently re-allocate its numeric homes;
+/// and it keeps this mechanism a pure WIDENING — no region that compiles today
+/// plans differently, so the only rows it can move are ones that decline today.
+///
+/// Sharing is gated on the same three predicates the numeric reuse path uses
+/// (`live_in` / `read_outside` / `outside_dead`); see `bool_range` at the
+/// allocation site for the argument, and `RegionPlan::live_in_bools` for why a
+/// shared bool must NOT be entry-loaded.
+pub(crate) fn bool_reuse_enabled() -> bool {
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match ON.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_BOOL_REUSE").is_none();
+            ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+            v
+        }
+    }
+}
+
+/// W20 M2 — `ZIPP_NO_INT_PUSH=1` restores the pre-wave INT-tier admission: an
+/// `arr.push(x)` `CallMethod` declines the whole region to the boxed memory
+/// tier (`CallMethod (receiver not a pinned string/DataView)`), and the pin
+/// planner stops pinning `push` receivers, so every plan in the suite is
+/// bit-identical to the wave-19 binary.
+///
+/// WHAT THE WIDENING IS, AND WHAT RE-ESTABLISHES THE INVARIANT IT RELAXES.
+/// `plan_region`'s CallMethod decline exists to keep the INT tier's no-call
+/// contract, which is what lets `BOOL_GPRS` (r8..r11) and the pin snapshots
+/// live across the whole loop body with nothing reloading them. Admitting
+/// `push` puts ONE call in the body, so the contract is re-established
+/// explicitly rather than assumed:
+///
+///   * VOLATILE HOMES. The arm saves every planner-owned register the win64
+///     callee may scratch — the bool gprs actually allocated, and any numeric
+///     home in xmm2..xmm5 — into a dedicated 64-byte call-save area on the
+///     region's own frame, and restores them after. xmm6..xmm15 are callee
+///     saved by the ABI (and by this region's own prologue), rbx/rsi/rdi/r12/
+///     r13/r14 are non-volatile. `gpr_const` mirrors are re-materialised from
+///     their immediates instead of saved.
+///   * PIN SNAPSHOTS. `jit_array_push_pinned` runs NO user code, performs NO
+///     VM-heap allocation and therefore cannot GC (it appends to the receiver
+///     array's own `Vec` and touches the remembered set; there is no
+///     `heap.alloc` on any path). So it cannot detach a buffer, resize an
+///     ArrayBuffer, reassign a source global or free a pinned string — the
+///     ONE thing it can invalidate is the pushed array's own `Vec` base and
+///     length, and it rewrites that pin's snapshot slot itself before
+///     returning. Every OTHER pin is provably untouched, PROVIDED no two arr
+///     pins alias; the prologue proves that once, by comparing the arr pins'
+///     snapshot `obj_bits` pairwise and taking `entry_bail` on a match.
+///   * GUARD HOISTING. `hoistable_pins` refuses to hoist any pin that is a
+///     push target (its base/len change in-region); the string/DataView pins
+///     around it still hoist, since a `Vec` append cannot move a JS string.
+pub(crate) fn int_push_enabled() -> bool {
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match ON.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_INT_PUSH").is_none();
+            ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+            v
+        }
+    }
+}
+
 pub(crate) fn int_split_enabled() -> bool {
     static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
     match ON.load(std::sync::atomic::Ordering::Relaxed) {
@@ -374,6 +451,9 @@ fn hoistable_pins(
             | Instr::ToPropKey { .. } => true,
             // `Math.imul` is a native `imul` on every tier that admits it.
             Instr::MathOp { op: MathFn::Imul, argc: 2, .. } => true,
+            // W20 M4: `!b` on a bool home is one `xor` -- no user code, no
+            // allocation, nothing that can move a pin.
+            Instr::Not { .. } if int_push_enabled() => true,
             // A PINNED element read is an inline load (TA raw element or a
             // tag-guarded dense-Array Value) — reads grow nothing.
             Instr::GetIndex { .. } => pin_kind_at(ip).is_some(),
@@ -391,8 +471,16 @@ fn hoistable_pins(
             // guarded byte load) — no user code, no allocation, cannot
             // detach/resize. Any OTHER CallMethod can run arbitrary user code
             // (incl. `transfer()` / `resize()`) and refuses the whole region.
+            // W20 M2: an admitted `arr.push(int)` does not refuse the region
+            // either. It runs no user code and cannot GC, so it cannot detach,
+            // resize, reassign a source or move a string's bytes -- the whole
+            // list this predicate is defending. The ONE thing it does change is
+            // the pushed array's own base and length, so that pin is dropped
+            // from the hoist set below while the string/DataView pins around it
+            // keep their entry-hoisted guard.
             Instr::CallMethod { .. } => {
                 matches!(pin_kind_at(ip), Some(STR_PIN_KIND) | Some(DV_PIN_KIND))
+                    || arr_push_pin(proto, ip, ta_plan).is_some()
             }
             _ => false,
         };
@@ -400,11 +488,21 @@ fn hoistable_pins(
             return out;
         }
     }
+    // W20 M2: pins the region PUSHES to. Their identity is stable (a push
+    // cannot replace the object), but their snapshot base and length are
+    // rewritten in-region, so hoisting -- whose whole licence is "the snapshot
+    // cannot change" -- must not cover them.
+    let pushed: FxHashSet<u8> = (s..=e)
+        .filter_map(|ip| arr_push_pin(proto, ip, ta_plan).map(|j| j as u8))
+        .collect();
     // Per-pin: the source must have no in-region write. `writes_reg` (the
     // emitter-grade cover: CallMethod/MathOp/GetProp/GetIndex dsts included)
     // is total over the whitelist above, so "no def found" is a proof here,
     // not a hint.
     for (j, pin) in ta_plan.pins.iter().enumerate() {
+        if pushed.contains(&(j as u8)) {
+            continue;
+        }
         let has_access = ta_plan
             .access
             .iter()
@@ -436,8 +534,15 @@ pub(crate) fn plan_region(
     admit_bitwise: bool,
     admit_split: bool,
     admit_wt_share: bool,
+    // W20 BOXREF: may this plan admit boxed heap values (`box_regs`) and the
+    // regalloc `GetProp` arm (`getprop_ips`)? Only `compile_region_regalloc`
+    // passes `true`, and only when the caller can serve the arm — see
+    // `BoxRefAdmit`. Every other planner caller reaches
+    // `plan_region_cold`, which pins this to `BoxRefAdmit::NONE`, so their
+    // plans are byte-identical to the pre-wave ones.
+    boxref: BoxRefAdmit,
 ) -> Option<RegionPlan> {
-    plan_region_cold(
+    plan_region_cold_ex(
         proto,
         start,
         end,
@@ -448,7 +553,30 @@ pub(crate) fn plan_region(
         false,
         &FxHashSet::default(),
         false,
+        boxref,
     )
+}
+
+/// W20 — what a plan may admit onto the register tier beyond the numeric subset.
+/// A plain `Copy` pair rather than two bools so a caller cannot silently swap
+/// them, and so the "neither" case has one name (`NONE`) that reads as a
+/// decline at every use site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct BoxRefAdmit {
+    /// Admit a dense-Array `GetIndex` over an ARRAY OF OBJECTS, typing its dst
+    /// as a slot-resident `box_regs` member (BOXREF proper; `ZIPP_NO_BOX_HOME`).
+    pub(crate) elems: bool,
+    /// Admit a `GetProp` whose receiver is a READ-ONLY LIVE-IN register
+    /// (`ZIPP_NO_REGALLOC_GETPROP`). Orthogonal to `elems`: a BOXREF receiver is
+    /// admitted by `elems` alone.
+    pub(crate) ro_recv: bool,
+}
+
+impl BoxRefAdmit {
+    pub(crate) const NONE: BoxRefAdmit = BoxRefAdmit { elems: false, ro_recv: false };
+    pub(crate) fn any(&self) -> bool {
+        self.elems || self.ro_recv
+    }
 }
 
 /// `cold`: ips the caller will emit as SIDE EXITS (B9) rather than as native
@@ -484,16 +612,39 @@ pub(crate) fn plan_region_cold(
     // Every `[decline-reason]` line below — and every one an emitter prints
     // after this plan is handed to it — belongs to THIS region. See
     // `set_decline_region`.
+    plan_region_cold_ex(
+        proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, share_homes,
+        cold, admit_dv, BoxRefAdmit::NONE,
+    )
+}
+
+/// `plan_region_cold` plus the W20 `boxref` admission. Split out so the six
+/// `region_int` call sites keep their signature (and their `BoxRefAdmit::NONE`)
+/// while the regalloc tier can ask for the boxed arms.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_region_cold_ex(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+    admit_bitwise: bool,
+    admit_split: bool,
+    admit_wt_share: bool,
+    share_homes: bool,
+    cold: &FxHashSet<usize>,
+    admit_dv: bool,
+    boxref: BoxRefAdmit,
+) -> Option<RegionPlan> {
     set_decline_region(proto, start, end);
     match plan_region_cold_inner(
         proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share, share_homes,
-        cold, true, admit_dv,
+        cold, true, admit_dv, boxref,
     ) {
         PlanOutcome::Plan(p) => Some(*p),
         PlanOutcome::RetryNoHoist => {
             match plan_region_cold_inner(
                 proto, start, end, ta_plan, admit_bitwise, admit_split, admit_wt_share,
-                share_homes, cold, false, admit_dv,
+                share_homes, cold, false, admit_dv, boxref,
             ) {
                 PlanOutcome::Plan(p) => Some(*p),
                 _ => None,
@@ -544,6 +695,9 @@ fn plan_region_cold_inner(
     allow_hoist: bool,
     // W9 — see `plan_region_cold`.
     admit_dv: bool,
+    // W20 — see `BoxRefAdmit`. `BoxRefAdmit::NONE` for every caller but the
+    // regalloc tier, and the passes below are no-ops under it.
+    boxref: BoxRefAdmit,
 ) -> PlanOutcome {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
@@ -557,6 +711,144 @@ fn plan_region_cold_inner(
     // `key` are NOT homed — the emitter reads the receiver via the pin's source and the
     // index via `key`'s home. Identify the admissible ops + their receiver regs so the
     // typing/homing passes below bypass the receivers.
+    // -- W20 BOXREF -- the ONE loop shape the register tier could not host:
+    //   `o = arr[i]; ... o.p ...`
+    // Both halves are already emitted call-free somewhere in this JIT (the
+    // dense-Array element load on this very tier, the 8-way `GetProp` probe on
+    // the memory tier); what was missing is a way for a HEAP value to exist
+    // between them without a numeric home. `box_regs` is that way, and it is
+    // deliberately NOT a new `Home` variant: the value stays in the interpreter
+    // frame slot `[rbx + dreg(r)]`, written at its def and never flushed, so
+    // every exit is correct without knowing which path reached it (the
+    // `split_recvs` / `emit_recv_slot_store` invariant) and no callee-saved
+    // register is spent on it.
+    //
+    // A register qualifies only under a CLOSED def/use shape, checked here:
+    //   * defs -- exactly one, an `ARR_PIN_KIND` (sampled: NOT all-numeric, i.e.
+    //     an array of objects) dense-Array `GetIndex`. `ARR_INT_PIN_KIND` /
+    //     `ARR_NUM_PIN_KIND` keep their f64 homes: they are FASTER, and B102's
+    //     11x entry-bail is precisely what happens when a numeric home is handed
+    //     an object, which is why the three kinds exist at all;
+    //   * uses -- every one is the receiver of an admitted `GetProp`.
+    // A live-in receiver with ZERO defs qualifies the same way under
+    // `boxref.ro_recv` (the standalone `o.p` arm), because a register the region
+    // never writes has an authoritative slot by construction.
+    //
+    // Anything outside that shape leaves both sets empty and the region declines
+    // exactly as it did before the wave.
+    let mut box_regs: FxHashSet<u16> = FxHashSet::default();
+    let mut getprop_ips: FxHashSet<usize> = FxHashSet::default();
+    let mut boxref_gets: FxHashSet<usize> = FxHashSet::default();
+    if boxref.any() && !admit_bitwise {
+        // Candidate receivers: every `GetProp` in the region not already served
+        // by a pin (a `.length` read rides `pinned_arr_len`/`pinned_str` and must
+        // keep doing so -- its dst is the snapshot length, not a probe result).
+        let mut cand_recv: FxHashSet<u16> = FxHashSet::default();
+        let mut gp_of: Vec<(usize, u16)> = Vec::new();
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            let ip = s + off;
+            if cold.contains(&ip) {
+                continue;
+            }
+            if let Instr::GetProp { obj, .. } = *instr {
+                if ta_plan.access.contains_key(&ip) {
+                    continue; // pinned `.length` -- not ours
+                }
+                cand_recv.insert(obj);
+                gp_of.push((ip, obj));
+            }
+        }
+        if !cand_recv.is_empty() {
+            // One pass for def counts and for every use that is NOT a candidate
+            // receiver position. A receiver appearing anywhere else -- an
+            // arithmetic operand, a `Move` source, an element key, a `SetProp`
+            // receiver -- is disqualified: the emitter would need a home for it,
+            // and the whole point is that it has none.
+            let mut def_n: FxHashMap<u16, u32> = FxHashMap::default();
+            let mut def_boxable: FxHashSet<u16> = FxHashSet::default();
+            let mut def_glob: FxHashSet<u16> = FxHashSet::default();
+            let mut used_elsewhere: FxHashSet<u16> = FxHashSet::default();
+            for (off, instr) in code[s..=e].iter().enumerate() {
+                let ip = s + off;
+                if cold.contains(&ip) {
+                    continue;
+                }
+                if let Some(d) = writes_reg(instr) {
+                    *def_n.entry(d).or_insert(0) += 1;
+                    // The two def forms that can fill a box slot.
+                    if matches!(*instr, Instr::GetIndex { .. })
+                        && ta_plan
+                            .access
+                            .get(&ip)
+                            .is_some_and(|&j| ta_plan.pins[j as usize].kind == ARR_PIN_KIND)
+                    {
+                        def_boxable.insert(d);
+                    }
+                    if let Instr::LoadGlobal { idx, .. } = *instr {
+                        // The global must have NO in-region store: its slot gets
+                        // no xmm home (an object cannot live in one), so the
+                        // emitter's `StoreGlobal` arm would have no home to write
+                        // — and the receiver store reads `[r12 + 8*idx]`, which
+                        // must therefore BE the live value.
+                        let stored = code[s..=e].iter().any(|i| {
+                            matches!(*i,
+                                Instr::StoreGlobal { idx: g, .. }
+                                | Instr::StoreGlobalStrict { idx: g, .. }
+                                | Instr::StoreGlobalResolved { idx: g, .. } if g == idx)
+                        });
+                        if !stored {
+                            def_glob.insert(d);
+                        }
+                    }
+                }
+                let recv_here = match *instr {
+                    Instr::GetProp { obj, .. } if !ta_plan.access.contains_key(&ip) => Some(obj),
+                    _ => None,
+                };
+                for u in instr_uses(instr) {
+                    if Some(u) != recv_here && cand_recv.contains(&u) {
+                        used_elsewhere.insert(u);
+                    }
+                }
+            }
+            for &r in &cand_recv {
+                if used_elsewhere.contains(&r) {
+                    continue;
+                }
+                let n = def_n.get(&r).copied().unwrap_or(0);
+                // (a) BOXREF proper: one `ARR_PIN_KIND` element read fills it.
+                // (b) the standalone arm: a live-in the region never writes, or a
+                //     single `LoadGlobal` of a slot it never stores -- the two
+                //     forms `ta_recv_regs` already calls `clean_param` and
+                //     `clean_global`, for exactly the same reason.
+                let ok = (boxref.elems && n == 1 && def_boxable.contains(&r))
+                    || (boxref.ro_recv && (n == 0 || (n == 1 && def_glob.contains(&r))));
+                if ok {
+                    box_regs.insert(r);
+                }
+            }
+            for (ip, obj) in gp_of {
+                if box_regs.contains(&obj) {
+                    getprop_ips.insert(ip);
+                }
+            }
+            if !getprop_ips.is_empty() {
+                for (off, instr) in code[s..=e].iter().enumerate() {
+                    let ip = s + off;
+                    if cold.contains(&ip) {
+                        continue;
+                    }
+                    if let Instr::GetIndex { dst, .. } = *instr {
+                        if box_regs.contains(&dst) {
+                            boxref_gets.insert(ip);
+                        }
+                    }
+                }
+            } else {
+                box_regs.clear();
+            }
+        }
+    }
     let pin_kind: u8 = if admit_bitwise { 5 } else { 8 };
     let pinned_elem = |ip: usize| -> bool {
         ta_plan.access.get(&ip).map_or(false, |&j| {
@@ -605,6 +897,15 @@ fn plan_region_cold_inner(
             // including one of OBJECTS; see `ARR_NUM_PIN_KIND` for the 11x
             // entry-bail that caused. `ZIPP_ARR_PIN_LOOSE=1` restores the
             // unsampled B95 behaviour for A/B.
+            // W20 BOXREF: an ARR_PIN_KIND (array-of-objects) READ joins on the
+            // same terms once its dst is a `box_regs` member -- the element is
+            // stored to the register's frame slot as raw Value bits rather than
+            // unboxed into an f64 home, so B102's entry-bail (a numeric home
+            // entry-loaded from an object) cannot arise: the register has no
+            // home to entry-load.
+            if !admit_bitwise && boxref_gets.contains(&ip) {
+                return true;
+            }
             !admit_bitwise
                 && (k == ARR_INT_PIN_KIND || k == ARR_NUM_PIN_KIND || (arr_pin_loose() && is_arr_pin(k)))
                 && matches!(code[ip], Instr::GetIndex { .. })
@@ -658,6 +959,12 @@ fn plan_region_cold_inner(
                         .is_some_and(|k| dv_get_kind(k)
                             .is_some_and(|kid| !admit_bitwise || kid <= 6)))
     };
+    // W20 M2: an INT-tier-admissible `arr.push(int)` -- a `CallMethod` on a
+    // receiver pinned as a dense all-Int Array. Admitted on the INT path only
+    // (`admit_bitwise`), and only behind the mechanism's own latch, so every
+    // other tier's plan is unchanged.
+    let pinned_arr_push =
+        |ip: usize| -> bool { admit_bitwise && arr_push_pin(proto, ip, ta_plan).is_some() };
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
     // B94 recycled receivers (see `plan::RegionPlan::split_recvs`). A receiver
     // whose pinned accesses are all DV `get*` CallMethods is exempt from the
@@ -688,7 +995,11 @@ fn plan_region_cold_inner(
                     recv.insert(obj);
                 }
             }
-            if pinned_str(s + off) || pinned_arr_len(s + off) || pinned_dv(s + off) {
+            if pinned_str(s + off)
+                || pinned_arr_len(s + off)
+                || pinned_dv(s + off)
+                || pinned_arr_push(s + off)
+            {
                 if let Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. } = *instr {
                     recv.insert(obj);
                 }
@@ -734,7 +1045,10 @@ fn plan_region_cold_inner(
                         Some(obj)
                     }
                     Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
-                        if pinned_str(s + off) || pinned_arr_len(s + off) || pinned_dv(s + off) =>
+                        if pinned_str(s + off)
+                            || pinned_arr_len(s + off)
+                            || pinned_dv(s + off)
+                            || pinned_arr_push(s + off) =>
                     {
                         Some(obj)
                     }
@@ -805,7 +1119,9 @@ fn plan_region_cold_inner(
                             // reach the split and the whole region declined.
                             Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
                                 if crate::codegen::multi_split_enabled()
-                                    && (pinned_str(s + off) || pinned_arr_len(s + off)) =>
+                                    && (pinned_str(s + off)
+                                        || pinned_arr_len(s + off)
+                                        || pinned_arr_push(s + off)) =>
                             {
                                 Some((obj, false))
                             }
@@ -854,7 +1170,10 @@ fn plan_region_cold_inner(
                                 Some(obj)
                             }
                             Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
-                                if pinned_str(ip) || pinned_arr_len(ip) || pinned_dv(ip) =>
+                                if pinned_str(ip)
+                                    || pinned_arr_len(ip)
+                                    || pinned_dv(ip)
+                                    || pinned_arr_push(ip) =>
                             {
                                 Some(obj)
                             }
@@ -1156,7 +1475,17 @@ fn plan_region_cold_inner(
             // `get*` on the double path (same properties: a guarded byte load, no
             // user code, no allocation). Any other method call, or an access whose
             // receiver isn't pinned, declines.
-            Instr::CallMethod { .. } if !pinned_str(s + off) && !pinned_dv(s + off) => {
+            // W20 M2: `arr.push(int)` on a dense all-Int Array pin joins the
+            // admitted set on the INT path. It is the ONE admitted op that
+            // issues a call, so the no-call invariant this decline protects is
+            // re-established explicitly at the emission site rather than by the
+            // absence of calls -- see `int_push_enabled` for the argument, and
+            // note the two things it rests on: the helper runs no user code and
+            // performs no VM-heap allocation (so it cannot GC), and the emitter
+            // saves every planner-owned volatile register across it.
+            Instr::CallMethod { .. }
+                if !pinned_str(s + off) && !pinned_dv(s + off) && !pinned_arr_push(s + off) =>
+            {
                 decline!("CallMethod (receiver not a pinned string/DataView)")
             }
             // A Bitwise op declines UNLESS the caller (the INT path) admits it: its
@@ -1204,10 +1533,19 @@ fn plan_region_cold_inner(
             // length → the snapshot units; both land in a Num i64 home. A
             // pinned-DV `get*` result is a Num too: every whitelisted kind is
             // exact in an f64 home (u32 <= 2^32-1; the float kinds native).
-            Instr::CallMethod { dst, .. } if pinned_str(s + off) || pinned_dv(s + off) => {
+            Instr::CallMethod { dst, .. }
+                if pinned_str(s + off) || pinned_dv(s + off) || pinned_arr_push(s + off) =>
+            {
                 (Some(dst), VTy::Num)
             }
             Instr::GetProp { dst, .. } if pinned_str(s + off) => (Some(dst), VTy::Num),
+            // W20: an admitted `GetProp` lands its probe result in a Num home
+            // under a tag guard (`emit_box_to_home`) that DEOPTs on anything
+            // else -- the same contract the dense-Array element read has used
+            // on this tier since B95.
+            Instr::GetProp { dst, .. } if getprop_ips.contains(&(s + off)) => {
+                (Some(dst), VTy::Num)
+            }
             // `Math.imul` → a signed i32 (Num). BLOCKER FIX: without this the carried
             // fnv1a accumulator (written ONLY by Imul) is never typed → the
             // used-but-undefined scan declines the whole region.
@@ -1224,6 +1562,12 @@ fn plan_region_cold_inner(
                     decline!("ToPropKey of a Bool-typed key");
                 }
                 (Some(dst), VTy::Num)
+            }
+            // W20 M4: `!b` yields a Bool from a Bool. INT path only (the other
+            // tiers have no `Not` arm and still decline at their emitter's
+            // catch-all, exactly as today).
+            Instr::Not { dst, .. } if admit_bitwise && int_push_enabled() => {
+                (Some(dst), VTy::Bool)
             }
             Instr::Move { dst, .. } => (Some(dst), VTy::Num), // refined below
             _ => (None, VTy::Num),
@@ -1243,7 +1587,11 @@ fn plan_region_cold_inner(
         // so its Bool must not type the register — the remaining defs are Num.
         let is_split_recv_load =
             split_recv_lg.contains(&(s + off)) || dv_flag_elide.contains(&(s + off));
-        if let Some(d) = def.filter(|d| !ta_recv_regs.contains(d) && !is_split_recv_load) {
+        // W20: a `box_regs` member is deliberately UNTYPED and UNHOMED -- its
+        // value lives in the frame slot the def writes.
+        if let Some(d) =
+            def.filter(|d| !ta_recv_regs.contains(d) && !is_split_recv_load && !box_regs.contains(d))
+        {
             // Move's dst type follows its src; default Num is corrected here.
             let t = if let Instr::Move { src, .. } = *instr {
                 *ty.get(&src).unwrap_or(&VTy::Num)
@@ -1260,7 +1608,9 @@ fn plan_region_cold_inner(
             // Neither a pinned receiver's global nor a B94 split receiver's gets an
             // xmm home: the value is an object, and the entry guard would reject it.
             Instr::LoadGlobal { dst, .. }
-                if ta_recv_regs.contains(&dst) || split_recv_lg.contains(&(s + off)) => {}
+                if ta_recv_regs.contains(&dst)
+                    || split_recv_lg.contains(&(s + off))
+                    || box_regs.contains(&dst) => {}
             Instr::LoadGlobal { idx, .. } => {
                 glob_first_read.entry(idx).or_insert(true);
                 if !glob_order.contains(&idx) {
@@ -1309,7 +1659,11 @@ fn plan_region_cold_inner(
     for (off, instr) in code[s..=e].iter().enumerate() {
         if cold.contains(&(s + off)) { continue; }
         for u in instr_uses(instr) {
-            if !ta_recv_regs.contains(&u) && !ty.contains_key(&u) && !ro_live_in.contains(&u) {
+            if !ta_recv_regs.contains(&u)
+                && !box_regs.contains(&u)
+                && !ty.contains_key(&u)
+                && !ro_live_in.contains(&u)
+            {
                 ro_live_in.push(u);
             }
         }
@@ -1329,6 +1683,23 @@ fn plan_region_cold_inner(
             let mut numeric = numeric_operand_uses(instr);
             if !admit_bitwise && wt_share_enabled() {
                 if let Instr::Add { a, b, .. } = *instr {
+                    numeric.push(a);
+                    numeric.push(b);
+                }
+            }
+            // W20, and the reason the mechanism reaches `property-ic-shapes` at
+            // all: its four read loops wrap with `if (k === n) k = 0`, so the
+            // bound `n` is a read-only live-in whose ONLY use is an `Eq`. `Eq`
+            // is excluded from `numeric_operand_uses` globally because it is
+            // defined on every type -- B98's reasoning for admitting `Add` on
+            // the DOUBLE path applies here verbatim (a double live-in is native
+            // here; a string or object still bails at entry through
+            // `emit_box_to_home`) -- but the 3.31x -> 3.45x regression that
+            // exclusion is guarding against was BLANKET admission on the INT
+            // path. This is confined to regions that already carry a BOXREF
+            // probe, so `ZIPP_NO_BOX_HOME=1` restores the old plan exactly.
+            if !getprop_ips.is_empty() {
+                if let Instr::Eq { a, b, .. } | Instr::Ne { a, b, .. } = *instr {
                     numeric.push(a);
                     numeric.push(b);
                 }
@@ -1426,6 +1797,24 @@ fn plan_region_cold_inner(
                     decline!("branch condition is not a bool");
                 }
             }
+            // W20 M2: the pushed value is read from an i64 NUMERIC home and
+            // boxed by the same Int-if-it-fits-else-double rule `flush_exit`
+            // uses. A Bool-typed operand lives in a gpr instead and would be
+            // pushed as a number -- decline the region rather than widen the
+            // arm.
+            Instr::CallMethod { arg_base, .. } if pinned_arr_push(s + off) => {
+                if ty.get(&arg_base) != Some(&VTy::Num) {
+                    decline!("arr.push operand is not a numeric home");
+                }
+            }
+            // W20 M4: `xor home, 1` is `!b` only for a REAL boolean. Anything
+            // else (`!0`, `!""`, `!obj`) is JS truthiness, which this tier does
+            // not model -- decline rather than widen the arm.
+            Instr::Not { a, .. } if admit_bitwise && int_push_enabled() => {
+                if ty.get(&a) != Some(&VTy::Bool) {
+                    decline!("Not of a non-bool");
+                }
+            }
             _ => {}
         }
     }
@@ -1453,10 +1842,16 @@ fn plan_region_cold_inner(
     // RangeError. Keep its dst out of `dead` — the emitter skips a dead-dst op
     // entirely, which would skip the throw (and leave the dst with no home for
     // the arm that does emit).
+    //
+    // W20 M2: an admitted `arr.push(int)` is the same case and a sharper one.
+    // Its dst (the new length) is USUALLY dead — `kinds.push(1);` as a
+    // statement never reads the result — and the dead-code pass would then skip
+    // the whole op, silently dropping the append. Keeping the dst `used` is
+    // what makes the side effect survive.
     for (off, instr) in code[s..=e].iter().enumerate() {
         if cold.contains(&(s + off)) { continue; }
         if let Instr::CallMethod { dst, .. } = *instr {
-            if pinned_dv(s + off) {
+            if pinned_dv(s + off) || pinned_arr_push(s + off) {
                 used.insert(dst);
             }
         }
@@ -1537,11 +1932,37 @@ fn plan_region_cold_inner(
     // untouched by the REST OF THE FUNCTION as well. Conservative (a reg read
     // anywhere outside `[s, e]` is kept) and cheap — `read_outside`, computed
     // once above (the DV flag-fusion veto shares it).
+    // W20, and a SILENT WRONG ANSWER this mechanism created before this line
+    // existed. Dead-code elimination here is licensed by one sentence on
+    // `RegionPlan::dead` — "every regalloc-region op is side-effect-free (heap
+    // ops decline the region)" — and the BOXREF `GetProp` arm is the first thing
+    // ever to make that sentence false. `o.p` as a STATEMENT has a dead dst, the
+    // emitter skipped the op, and a GETTER therefore never ran:
+    //
+    //     class A { get v(){ n++; return this._v } }
+    //     class B extends A { get v(){ return super.v * 2 } }
+    //     var b = new B(1);
+    //     for (var i = 0; i < 200000; i++) b.v;   // n === 8, not 200000
+    //
+    // The value is discarded, so nothing but the side effect is observable —
+    // which is exactly why the receiver-count and semantics matrices missed it
+    // and `zipp-vm`'s own `super_getter_inline_preserves_values_and_effects`
+    // caught it. An admitted `GetProp` dst is therefore never dead.
+    let getprop_dsts: FxHashSet<u16> = getprop_ips
+        .iter()
+        .filter_map(|&ip| match code[ip] {
+            Instr::GetProp { dst, .. } => Some(dst),
+            _ => None,
+        })
+        .collect();
     let dead: FxHashSet<u16> = reg_order
         .iter()
         .copied()
         .filter(|r| {
-            !used.contains(r) && first_seen.get(r) != Some(&false) && !read_outside.contains(r)
+            !used.contains(r)
+                && first_seen.get(r) != Some(&false)
+                && !read_outside.contains(r)
+                && !getprop_dsts.contains(r)
         })
         .collect();
     reg_order.retain(|r| !dead.contains(r));
@@ -2643,15 +3064,97 @@ fn plan_region_cold_inner(
         // that un-hoisting would relieve; the two declines above are the
         // n_numeric miscount guard, unchanged.)
     }
+    // W20 M1: bool regs whose gpr home is SHARED with another bool. They must
+    // be excluded from `live_in_bools` — see the note there.
+    let mut bool_shared: FxHashSet<u16> = FxHashSet::default();
     // Bools (both modes): gpr homes; a live-in bool is unsupported.
+    //
+    // W20 M1: when the bool count OVERFLOWS the four-register pool, hand the
+    // registers out by linear scan over non-overlapping live ranges instead of
+    // declining the region — the same mechanism, and the same three soundness
+    // predicates, the numeric path above uses over the 14-xmm pool. Below the
+    // overflow point the assignment is the identical first-fit, byte for byte:
+    // this is a widening of what compiles, never a re-allocation of what
+    // already does (see `bool_reuse_enabled`).
     let mut next_bool = 0usize;
-    for &r in &reg_order {
-        if ty[&r] == VTy::Bool {
-            if first_seen.get(&r) == Some(&false) || next_bool >= BOOL_GPRS.len() {
+    // Registers whose bool home MAY BE SHARED, i.e. whose frame slot no reader
+    // can observe: `flush_exit` writes a shared gpr into EVERY sharer's slot,
+    // so a sharer whose range has ended comes back holding an unrelated temp.
+    // Sound exactly when (a) nothing reads the register after the region and
+    // (b) no path from region entry reads it before a def — (b) is the W18
+    // `live_in` predicate, and it is also what lets the prologue skip the
+    // per-register entry load that would otherwise overwrite a co-tenant's.
+    // This is deliberately STRICTER than the numeric `shareable`: a B97
+    // write-through bool is excluded, because `flush_exit`'s bool loop does not
+    // skip `write_through` the way its numeric loop does.
+    let bool_shareable = |r: u16| -> bool {
+        !live_in(r) && (!read_outside.contains(&r) || outside_dead.contains(&r))
+    };
+    let n_bools = reg_order.iter().filter(|r| ty[r] == VTy::Bool).count();
+    if n_bools > BOOL_GPRS.len() && bool_reuse_enabled() {
+        // A live-in bool still declines: it has no entry-load path at all.
+        for &r in &reg_order {
+            if ty[&r] == VTy::Bool && first_seen.get(&r) == Some(&false) {
                 decline!("bool live-in, or bool gpr pool exhausted");
             }
-            reg_home.insert(r, Home::Gpr(BOOL_GPRS[next_bool]));
-            next_bool += 1;
+        }
+        // Intervals in ascending start order; a non-shareable bool takes the
+        // whole region and so keeps a private register, exactly as `range`
+        // does for a numeric value that may not share.
+        let mut iv: Vec<(usize, usize, u16)> = Vec::new();
+        for &r in &reg_order {
+            if ty[&r] == VTy::Bool {
+                let (a, b) = if bool_shareable(r) { (first_ip[&r], last_ip[&r]) } else { (s, e) };
+                iv.push((a, b, r));
+            }
+        }
+        iv.sort_by_key(|&(a, _, _)| a);
+        // XmmAlloc's structure over BOOL_GPRS: expire strictly-before-start
+        // intervals (an arm may read an operand home after writing its dst's,
+        // so equal ips always conflict), reuse a freed register, else take the
+        // next never-used one.
+        let mut active: Vec<(usize, u8)> = Vec::new();
+        let mut freed: Vec<u8> = Vec::new();
+        for (a, b, r) in iv {
+            let mut i = 0;
+            while i < active.len() {
+                if active[i].0 < a {
+                    freed.push(active[i].1);
+                    active.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            let g = if let Some(g) = freed.pop() {
+                g
+            } else if next_bool < BOOL_GPRS.len() {
+                let g = BOOL_GPRS[next_bool];
+                next_bool += 1;
+                g
+            } else {
+                decline!("bool live-in, or bool gpr pool exhausted");
+            };
+            active.push((b, g));
+            reg_home.insert(r, Home::Gpr(g));
+            if bool_shareable(r) {
+                bool_shared.insert(r);
+            }
+        }
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!(
+                "[jit] region [{s},{e}] bool reuse: {n_bools} bools -> {next_bool} gpr(s), shared={}",
+                bool_shared.len()
+            );
+        }
+    } else {
+        for &r in &reg_order {
+            if ty[&r] == VTy::Bool {
+                if first_seen.get(&r) == Some(&false) || next_bool >= BOOL_GPRS.len() {
+                    decline!("bool live-in, or bool gpr pool exhausted");
+                }
+                reg_home.insert(r, Home::Gpr(BOOL_GPRS[next_bool]));
+                next_bool += 1;
+            }
         }
     }
 
@@ -2758,7 +3261,17 @@ fn plan_region_cold_inner(
             }
             Home::Gpr(g) => {
                 bool_regs.push((r, g));
-                live_in_bools.push((r, g));
+                // W20 M1: a bool that SHARES its gpr is not entry-loaded. Two
+                // sharers' entry loads would overwrite each other (only the
+                // last would survive), and the load is meaningless anyway:
+                // `bool_shareable` proved no path from entry reads the register
+                // before a def. The emitters zero every bool gpr that gets no
+                // entry load, so a home is 0/1 from the prologue on and
+                // `flush_exit`'s `BOOL_TAG | gpr` can never manufacture a
+                // non-Bool Value out of an inherited register.
+                if !bool_shared.contains(&r) {
+                    live_in_bools.push((r, g));
+                }
             }
         }
     }
@@ -2818,6 +3331,8 @@ fn plan_region_cold_inner(
         hoist_pins,
         hoist_len_ips,
         strict_entry_globs,
+        box_regs,
+        getprop_ips,
     }))
 }
 

@@ -36,6 +36,29 @@ fn proto_method_inline_enabled() -> bool {
     }
 }
 
+/// W20 (M2): `ZIPP_NO_OWN_ACCESSOR_INLINE=1` drops the OWN-accessor arm back out
+/// of `build_accessor_shape`, leaving the class arm exactly as it was -- i.e. OFF
+/// reproduces pre-wave behaviour byte-identically, since the own-slot receivers
+/// this admits are precisely the ones that used to `return None`. Exists so the
+/// mechanism can be A/B'd with `tools/bench.py --ab-env` against ONE binary,
+/// which removes the fat-LTO code-layout confound a two-binary A/B carries.
+/// Memoized and read at PLAN time only (once per candidate receiver per region
+/// compile), never on a hot path.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn own_accessor_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_OWN_ACCESSOR_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Build the TypedArray pin plan for the OSR region `[start, end]` from
     /// LIVE VM state (called right before `compile_region`, frame `base` on
@@ -154,6 +177,26 @@ impl<'p> Vm<'p> {
                             .is_some_and(|k| k == "charCodeAt") =>
                 {
                     (obj, Recv::Str)
+                }
+                // W20 M2: an `arr.push(x)` receiver pins as a dense Array on
+                // exactly the same terms as `arr[i]` — the live receiver picks
+                // the kind, and an all-Int one (`ARR_INT_PIN_KIND`) is what
+                // lets the INTEGER tier host the append inline instead of
+                // declining the whole region over one `CallMethod`. The pin is
+                // ALSO what keeps the receiver register out of the numeric home
+                // set (`ta_recv_regs`); without it a `LoadGlobal` of the array
+                // would be typed Num and homed as an i64. Gated so
+                // `ZIPP_NO_INT_PUSH=1` leaves every plan in the suite
+                // bit-identical, this arm included.
+                Instr::CallMethod { obj, name, argc, .. }
+                    if crate::codegen::int_push_enabled()
+                        && argc == 1
+                        && proto
+                            .string_constants
+                            .get(name as usize)
+                            .is_some_and(|k| k == "push") =>
+                {
+                    (obj, Recv::Ta)
                 }
                 // `.length` on the SAME receiver coalesces onto that receiver's pin
                 // — the snapshot's third word IS the length for both pin families
@@ -1240,6 +1283,7 @@ impl<'p> Vm<'p> {
             crate::codegen::MethodInlineShape {
                 method_slot,
                 proto_method,
+                own_acc: None,
                 recv_bits: recv.bits(),
                 recv_ver,
                 vals_ptr,
@@ -1343,24 +1387,81 @@ impl<'p> Vm<'p> {
         if !self.ic_obj_ok(ridx) {
             return None;
         }
-        let (recv_class, vals_ptr) = match self.heap.get(ridx) {
-            HeapObj::Object(m) if !m.is_ctor => match m.class {
-                Some(c) => (c, m.vals.as_ptr() as u64),
-                None => return None,
-            },
+        let (recv_class, vals_ptr, own_slot) = match self.heap.get(ridx) {
+            HeapObj::Object(m) if !m.is_ctor => (m.class, m.vals.as_ptr() as u64, m.pos(name)),
             _ => return None,
         };
-        // G3b: an own property named `name` shadows the accessor → decline (the
-        // recv-version guard catches a LATER own-add).
-        if let HeapObj::Object(m) = self.heap.get(ridx) {
-            if m.pos(name).is_some() {
-                return None;
+        // Resolution splits on whether the receiver carries an OWN property of
+        // this name.
+        //
+        //  * NONE -- the accessor is the receiver's CLASS's; the class resolvers
+        //    hand back its fid. Unchanged, and still the only arm when a
+        //    receiver has no own slot (G3b's "the recv-version guard catches a
+        //    LATER own-add" reasoning is untouched).
+        //  * SOME -- W20 (M2). An own DATA property SHADOWS a class accessor and
+        //    still declines, exactly as G3b did. An own ACCESSOR *is* the
+        //    accessor being read, and G3b declined that too, because an own
+        //    accessor is an own property of that name: the twin of the defect
+        //    B74/B78 fixed on `build_method_shape`. `Object.defineProperty(o,
+        //    "v", {get})` is how most accessors in the wild are installed, and
+        //    the identical getter body measured 3.8x (PGO) / 5.9x (stock)
+        //    slower installed that way than on an ES class.
+        let (fid, own_acc) = match own_slot {
+            None => {
+                let c = recv_class?;
+                let fid = if is_setter {
+                    self.ic_class_setter_fid(func_id, ip, c)?
+                } else {
+                    self.ic_class_getter_fid(func_id, ip, c)?
+                };
+                (fid, None)
             }
-        }
-        let fid = if is_setter {
-            self.ic_class_setter_fid(func_id, ip, recv_class)?
-        } else {
-            self.ic_class_getter_fid(func_id, ip, recv_class)?
+            Some(slot) => {
+                if !own_accessor_inline_enabled() {
+                    return None;
+                }
+                let m = match self.heap.get(ridx) {
+                    HeapObj::Object(m) => m,
+                    _ => return None,
+                };
+                let a = m.attr_at(slot);
+                if !a.accessor {
+                    // An own DATA property shadows the accessor -> G3b, unchanged.
+                    return None;
+                }
+                // A getter lives in `vals[slot]`; a setter in `attrs[slot].setter`.
+                // A getter-only accessor WRITTEN to (or a setter-only one read)
+                // finds UNDEFINED here, `ic_plain_fn` rejects it, and the site
+                // stays on the helper -- which throws in strict mode / answers
+                // undefined exactly as the interpreter does.
+                let (f, addr) = if is_setter {
+                    (a.setter, std::ptr::addr_of!(m.attrs[slot].setter) as u64)
+                } else {
+                    (m.val_at(slot), vals_ptr + (slot * std::mem::size_of::<Value>()) as u64)
+                };
+                // A `defineProperty` accessor is an ARBITRARY function, unlike a
+                // class accessor. `ic_plain_fn` is the same screen the
+                // interpreter's own accessor path applies (rejects a
+                // non-callable, a generator, an async fn); `method_inline_body_ok`
+                // below rejects a body that reads an upvalue, `arguments` or a
+                // rest parameter; and an ARROW is rejected here, because its
+                // `this` is lexical and binding it to the receiver would be a
+                // silent wrong answer (`build_method_shape` makes the same check
+                // for the same reason).
+                let (fid, _closure) = self.ic_plain_fn(f)?;
+                if self.func(fid as usize).lexical_this {
+                    return None;
+                }
+                // A class setter always has exactly one formal; a
+                // `defineProperty` one need not. The emitter binds the incoming
+                // value to window reg 1 unconditionally, so with 0 formals reg 1
+                // is a LOCAL that must start undefined -- the same gate the
+                // super-setter arm below applies, for the same reason.
+                if is_setter && self.func(fid as usize).param_count != 1 {
+                    return None;
+                }
+                (fid, Some((addr, f.bits())))
+            }
         };
         let callee = self.func(fid as usize);
         // A GETTER body may read `super.v` (Stage 6) and a SETTER body may end
@@ -1474,6 +1575,7 @@ impl<'p> Vm<'p> {
             crate::codegen::MethodInlineShape {
                 method_slot: None,
                 proto_method: None,
+                own_acc,
                 recv_bits: recv.bits(),
                 recv_ver,
                 vals_ptr,
