@@ -26,7 +26,188 @@ fn json_leaf_fast_enabled() -> bool {
     }
 }
 
+/// Default-on compact `JSON.stringify(value)` fast path for a graph made only
+/// of plain data objects, dense Arrays and JSON primitive leaves. The entire
+/// output is private until the walk succeeds, so an exotic node can decline
+/// after an arbitrary prefix without exposing work; the ordinary serializer
+/// then restarts and observes getters, proxies, `toJSON`, holes and errors.
+/// `ZIPP_NO_JSON_PLAIN_FAST=1` restores the general recursive serializer.
+#[inline]
+fn json_plain_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_JSON_PLAIN_FAST").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
+    /// Serialize the closed plain-data subset without paying the general
+    /// serializer's per-node `toJSON` lookup, key snapshot, version probe and
+    /// generic Array length/index dispatch. `None` is a side-effect-free
+    /// decline, never the JavaScript `undefined` result.
+    pub(crate) fn json_plain_stringify(&self, root: Value) -> Option<String> {
+        if !json_plain_fast_enabled() || self.current_realm_id().is_some() {
+            return None;
+        }
+
+        // Plain objects/arrays/strings still perform a live `toJSON` lookup in
+        // the general serializer. Only accept the default main-realm chains
+        // while none of their links can answer that lookup. An explicit proto
+        // entry means user code changed the chain, even if today's end happens
+        // not to contain `toJSON`, so leave it to the observable generic walk.
+        if self.obj_proto == 0
+            || self.arr_proto == 0
+            || self.str_proto == 0
+            || self.proto_of.contains_key(&self.obj_proto)
+            || self.proto_of.contains_key(&self.arr_proto)
+            || self.proto_of.contains_key(&self.str_proto)
+        {
+            return None;
+        }
+        let no_own_tojson = |vm: &Self, idx: u32| match vm.heap.get(idx) {
+            HeapObj::Object(map) => map.pos("toJSON").is_none(),
+            _ => vm
+                .arr_props
+                .get(&idx)
+                .is_none_or(|map| map.pos("toJSON").is_none()),
+        };
+        if !no_own_tojson(self, self.obj_proto)
+            || !no_own_tojson(self, self.arr_proto)
+            || !no_own_tojson(self, self.str_proto)
+        {
+            return None;
+        }
+
+        let mut out = String::with_capacity(1024);
+        let mut active = Vec::with_capacity(16);
+        self.json_plain_value_into(root, 0, &mut active, &mut out)
+            .then_some(out)
+    }
+
+    /// Recursive emitter for [`Self::json_plain_stringify`]. Depth is capped
+    /// below the ordinary engine stack limit so the iterative-looking fast
+    /// path cannot hide the generic serializer's stack overflow behaviour.
+    fn json_plain_value_into(
+        &self,
+        value: Value,
+        depth: usize,
+        active: &mut Vec<u32>,
+        out: &mut String,
+    ) -> bool {
+        const MAX_DEPTH: usize = 256;
+        if value.is_null() {
+            out.push_str("null");
+            return true;
+        }
+        if value.is_bool() {
+            out.push_str(if value.as_bool() { "true" } else { "false" });
+            return true;
+        }
+        if value.is_number() {
+            let n = value.as_f64();
+            if n.is_finite() {
+                fmt_f64_into(out, n);
+            } else {
+                out.push_str("null");
+            }
+            return true;
+        }
+        if !value.is_heap() {
+            return false;
+        }
+        let idx = value.heap_index();
+        match self.heap.get(idx) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                let Some(bytes) = self.heap.str_wtf8_cow(idx) else {
+                    return false;
+                };
+                json_quote_wtf8_into(out, &bytes);
+                true
+            }
+            HeapObj::Array(items) => {
+                if depth >= MAX_DEPTH
+                    || active.contains(&idx)
+                    || self.proto_of.contains_key(&idx)
+                    || self.arguments_objs.contains_key(&idx)
+                    || self.arr_props.contains_key(&idx)
+                    || self.array_js_len.contains_key(&idx)
+                    || items.iter().any(|item| item.is_hole())
+                {
+                    return false;
+                }
+                active.push(idx);
+                out.push('[');
+                for (i, &item) in items.iter().enumerate() {
+                    if i != 0 {
+                        out.push(',');
+                    }
+                    if !self.json_plain_value_into(item, depth + 1, active, out) {
+                        active.pop();
+                        return false;
+                    }
+                }
+                out.push(']');
+                active.pop();
+                true
+            }
+            HeapObj::Object(map) => {
+                if depth >= MAX_DEPTH
+                    || active.contains(&idx)
+                    || idx == self.global_this
+                    // `%Array.prototype%` is internally an Object map, but
+                    // IsArray is true and the ordinary serializer emits it as
+                    // a length-zero Array (`[]`), ignoring named properties.
+                    || idx == self.arr_proto
+                    || self.proto_of.contains_key(&idx)
+                    || map.class.is_some()
+                    || map.is_ctor
+                    || map.is_raw_json
+                    || map.pos("toJSON").is_some()
+                    || self.module_namespaces.contains_key(&idx)
+                    || self.deferred_ns_state.contains_key(&idx)
+                {
+                    return false;
+                }
+                active.push(idx);
+                out.push('{');
+                let mut any = false;
+                for i in 0..map.keys.len() {
+                    let key = &map.keys[i];
+                    if is_hidden_key(key) || !map.attrs[i].enumerable {
+                        continue;
+                    }
+                    // Integer keys need spec reordering; accessors can run user
+                    // code. Both are clean declines before any visible result.
+                    if map.attrs[i].accessor || canonical_index_str(key).is_some() {
+                        active.pop();
+                        return false;
+                    }
+                    if any {
+                        out.push(',');
+                    }
+                    json_quote_into(out, key);
+                    out.push(':');
+                    if !self.json_plain_value_into(map.vals[i], depth + 1, active, out) {
+                        active.pop();
+                        return false;
+                    }
+                    any = true;
+                }
+                out.push('}');
+                active.pop();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Guarded whole-tree execution for the exact Tier-C [`JsonWalkPlan`].
     ///
     /// The bytecode shape has no observable work except numeric global updates

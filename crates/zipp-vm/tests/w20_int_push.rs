@@ -374,6 +374,121 @@ console.log("tok " + s);
     )
 }
 
+/// The W25 batching shape in isolation: three distinct global arrays, three
+/// discarded push results, and argument values coming from both a constant and
+/// live numeric homes. Reading every append back through its refreshed pin
+/// crosses Vec capacity boundaries and makes ordering/value mistakes visible.
+fn push3_boundary_case(n: usize) -> String {
+    format!(
+        r#"var aa = [], bb = [], cc = [];
+function kernel(n) {{
+  var i = 0, st = 7, h = 0;
+  while (i < n) {{
+    aa.push(1); bb.push(st); cc.push(i);
+    h = (Math.imul(h ^ aa[aa.length - 1], 33) + bb[bb.length - 1] + cc[cc.length - 1]) | 0;
+    st = (Math.imul(st, 17) + i) | 0;
+    i = i + 1;
+  }}
+  return h + ":" + st + ":" + aa.length + ":" + bb.length + ":" + cc.length
+    + ":" + aa[0] + ":" + bb[0] + ":" + cc[cc.length - 1];
+}}
+var s = "";
+for (var r = 0; r < 4; r++) {{ aa = []; bb = []; cc = []; s += "|" + kernel({n}); }}
+console.log("push3 " + s);
+"#
+    )
+}
+
+/// Runtime shapes which invalidate the batching assumptions only after the
+/// kernel has warmed: two globals aliasing one array, and a frozen middle
+/// receiver. Entry guards must route both through the ordinary calls, retaining
+/// source order (notably, `aa` grows once before frozen `bb.push` throws).
+fn push3_guard_decline_case() -> String {
+    r#"var aa = [], bb = [], cc = [];
+function kernel(n) {
+  var i = 0, st = 7, h = 0;
+  while (i < n) {
+    aa.push(1); bb.push(st); cc.push(i);
+    h = (Math.imul(h, 33) + st + i) | 0;
+    st = (Math.imul(st, 17) + i) | 0;
+    i = i + 1;
+  }
+  return h;
+}
+for (var w = 0; w < 4; w++) { aa = []; bb = []; cc = []; kernel(400); }
+aa = []; bb = aa; cc = [];
+var ah = kernel(37);
+console.log("alias " + ah + ":" + aa.length + ":" + bb.length + ":" + cc.length);
+aa = []; bb = []; cc = []; Object.freeze(bb);
+try { kernel(37); console.log("freeze NO_THROW"); }
+catch (e) { console.log("freeze " + e.name + ":" + aa.length + ":" + bb.length + ":" + cc.length); }
+"#
+    .to_string()
+}
+
+/// A live receiver global changes inside the candidate region before the
+/// textual trio. The batch must not be recognised: ordinary calls append to
+/// the newly loaded receiver, while a stale snapshot would mutate `first`.
+fn push3_receiver_store_case() -> String {
+    r#"var aa = [], bb = [], cc = [], swap = [];
+function kernel(n, poison) {
+  var i = 0, st = 7, h = 0;
+  while (i < n) {
+    if (poison && i === 30) aa = swap;
+    aa.push(1); bb.push(st); cc.push(i);
+    h = (Math.imul(h, 33) + st + i) | 0;
+    st = (Math.imul(st, 17) + i) | 0;
+    i = i + 1;
+  }
+  return h;
+}
+for (var w = 0; w < 4; w++) { aa = []; bb = []; cc = []; swap = []; kernel(400, false); }
+aa = []; bb = []; cc = []; swap = [];
+var first = aa, h = kernel(80, true);
+console.log("store " + h + ":" + first.length + ":" + swap.length + ":" + bb.length + ":" + cc.length);
+"#
+    .to_string()
+}
+
+/// More than the 14-xmm distinct-value threshold forces the INT planner's
+/// linear-scan home reuse. The first push argument is a Move from `x`, whose
+/// value dies at that call; later argument temporaries are therefore free to
+/// reuse its physical home. Forced helper decline must restore those physical
+/// homes before replaying the trio.
+fn push3_home_pressure_case(n: usize) -> String {
+    let decls: String = (0..20).map(|j| format!("p{j} = 0, ")).collect();
+    let pressure: String = (0..20)
+        .map(|j| {
+            format!(
+                "    p{j} = (i + {j}) | 0; h = (h + p{j}) | 0;\n"
+            )
+        })
+        .collect();
+    format!(
+        r#"var aa = [], bb = [], cc = [];
+function kernel(n) {{
+  var {decls}i = 0, h = 1, x = 0, y = 0, z = 0;
+  while (i < n) {{
+{pressure}    x = (h + i) | 0;
+    y = (h ^ i) | 0;
+    z = (h + i + 7) | 0;
+    aa.push(x); bb.push(y); cc.push(z);
+    h = (Math.imul(h, 33) + y + z) | 0;
+    i = i + 1;
+  }}
+  return h;
+}}
+var s = "";
+for (var r = 0; r < 4; r++) {{
+  aa = []; bb = []; cc = [];
+  s += "|" + kernel({n}) + ":" + aa.length + ":" + bb.length + ":" + cc.length
+    + ":" + aa[0] + ":" + aa[aa.length - 1] + ":" + bb[bb.length - 1] + ":" + cc[cc.length - 1];
+}}
+console.log("pressure " + s);
+"#
+    )
+}
+
 // ── M2 parity ───────────────────────────────────────────────────────────────
 
 /// 1..8 distinct bool sites with disjoint ranges around the append. This is the
@@ -423,6 +538,47 @@ fn intpush_parity_tokenizer_shape() {
     for n in [40usize, 400, 2000] {
         assert_matches_node(&tokenizer_case(n));
     }
+}
+
+#[test]
+fn intpush3_parity_distinct_arrays_realloc_and_guard_declines() {
+    for n in [17usize, 257, 4097] {
+        assert_matches_node(&push3_boundary_case(n));
+    }
+    assert_matches_node(&push3_guard_decline_case());
+    assert_matches_node(&push3_receiver_store_case());
+    assert_matches_node(&push3_home_pressure_case(400));
+}
+
+#[test]
+fn intpush3_off_switch_and_atomic_helper_replay_match_node() {
+    // The full tokenizer is the non-vacuous INT-tier host; the smaller
+    // boundary kernel above deliberately falls to MEM once its post-push array
+    // reads make the pinned receiver ranges overlap.
+    let src = tokenizer_case(400);
+    let want = node_output(&src);
+    for mode in [
+        &[][..],
+        &[("ZIPP_NO_INT_PUSH3", "1")][..],
+        &[("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE", "1")][..],
+        &[
+            ("ZIPP_INT_SPLIT", "1"),
+            ("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE", "1"),
+        ][..],
+        &[("ZIPP_NOJIT", "1")][..],
+    ] {
+        assert_eq!(child_output(&src, mode), want, "mode {mode:?} diverged");
+    }
+
+    let pressure = push3_home_pressure_case(400);
+    assert_eq!(
+        child_output(
+            &pressure,
+            &[("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE", "1")]
+        ),
+        node_output(&pressure),
+        "forced decline corrupted a home-reuse pressure region"
+    );
 }
 
 /// The shapes `jit_array_push_pinned` must DEOPT on rather than handle. Each
@@ -775,6 +931,68 @@ fn intpush_mechanism_reaches_the_int_tier() {
             && live_homes.contains("compiled")
             && live_homes.contains("deopt at ip"),
         "live-home kernel did not compile on INT and then deopt after its push; log was:\n{live_homes}"
+    );
+}
+
+#[test]
+fn intpush3_mechanism_engages_declines_atomically_and_switches_off() {
+    let src = tokenizer_case(400);
+    let on = jitlog_of(&src, &[("ZIPP_JIT_THRESHOLD", "1")]);
+    assert!(
+        on.contains("array-push3 groups="),
+        "three-push batch did not engage; log was:\n{on}"
+    );
+
+    let off = jitlog_of(
+        &src,
+        &[("ZIPP_JIT_THRESHOLD", "1"), ("ZIPP_NO_INT_PUSH3", "1")],
+    );
+    assert!(
+        !off.contains("array-push3 groups="),
+        "ZIPP_NO_INT_PUSH3 did not disable batching; log was:\n{off}"
+    );
+
+    let forced = jitlog_of(
+        &src,
+        &[
+            ("ZIPP_JIT_THRESHOLD", "1"),
+            ("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE", "1"),
+        ],
+    );
+    assert!(
+        forced.contains("array-push3 groups=") && forced.contains("deopt at ip"),
+        "forced atomic helper decline did not execute/replay; log was:\n{forced}"
+    );
+
+    let split_forced = jitlog_of(
+        &src,
+        &[
+            ("ZIPP_JIT_THRESHOLD", "1"),
+            ("ZIPP_INT_SPLIT", "1"),
+            ("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE", "1"),
+        ],
+    );
+    assert!(
+        split_forced.contains("array-push3 groups=") && split_forced.contains("deopt at ip"),
+        "split-mode forced decline did not batch and replay; log was:\n{split_forced}"
+    );
+
+    let receiver_store = jitlog_of(
+        &push3_receiver_store_case(),
+        &[("ZIPP_JIT_THRESHOLD", "1")],
+    );
+    assert!(
+        !receiver_store.contains("array-push3 groups="),
+        "batch ignored an in-region receiver-global store; log was:\n{receiver_store}"
+    );
+
+    let pressure = jitlog_of(
+        &push3_home_pressure_case(400),
+        &[("ZIPP_JIT_THRESHOLD", "1")],
+    );
+    assert!(
+        pressure.contains("array-push3 groups="),
+        "home-pressure forced-decline oracle was vacuous; log was:\n{pressure}"
     );
 }
 

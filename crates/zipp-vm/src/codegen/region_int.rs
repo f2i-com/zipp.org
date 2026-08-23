@@ -90,6 +90,179 @@ pub(crate) fn region_has_arr_push(
     (start..=end).any(|ip| arr_push_pin(proto, ip, ta_plan).is_some())
 }
 
+/// One leg of an exact `a.push(x); b.push(y); c.push(z)` batch. The bytecode
+/// still executes each receiver/argument setup in order; the first two call
+/// sites only stage their numeric argument and the third performs all three
+/// guarded appends in one leaf helper call.
+#[derive(Clone, Copy)]
+struct ArrPush3Step {
+    first_ip: usize,
+    stage: u8,
+    pins: [usize; 3],
+    args: [u16; 3],
+}
+
+/// Independent latch for the three-push batching peephole. `ZIPP_NO_INT_PUSH`
+/// continues to disable the underlying admission as well.
+fn int_push3_enabled() -> bool {
+    static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    match ON.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = int_push_enabled() && std::env::var_os("ZIPP_NO_INT_PUSH3").is_none();
+            ON.store(v as u8, std::sync::atomic::Ordering::Relaxed);
+            v
+        }
+    }
+}
+
+/// Find fail-closed three-push batches in an ordinary, unmetered INT region.
+///
+/// The exact nine-op shape is three repetitions of
+/// `LoadGlobal receiver; LoadInt|Move argument; CallMethod push`. Every call
+/// result must be bytecode-dead across the whole function, because the batched
+/// helper intentionally does not materialise the three otherwise discarded
+/// length results. No interior op may be a jump target, all receiver pins must
+/// be distinct stable globals, and every argument must already have an xmm
+/// home. These restrictions make moving the three pure argument reads ahead
+/// of the appends unobservable: the push gate proved the appends cannot invoke
+/// user code, and a helper decline mutates nothing and replays the first setup.
+fn arr_push3_steps(
+    proto: &FuncProto,
+    s: usize,
+    e: usize,
+    ta_plan: &TaPinPlan,
+    plan: &RegionPlan,
+    cold: &FxHashSet<usize>,
+    enabled: bool,
+) -> FxHashMap<usize, ArrPush3Step> {
+    let mut out = FxHashMap::default();
+    if !enabled || e.saturating_sub(s) < 8 {
+        return out;
+    }
+
+    let result_is_unread = |r: u16| {
+        !proto
+            .code
+            .iter()
+            .any(|ins| instr_uses(ins).into_iter().any(|u| u == r))
+    };
+    // `TaPinSrc::Global` currently carries this same proof from jit_plans, but
+    // batching reorders later receiver loads ahead of earlier appends. Keep the
+    // source-stability licence local so a future pin-planner relaxation cannot
+    // silently turn the snapshots into stale push targets.
+    let global_is_stable = |g: u32| {
+        !proto.code[s..=e].iter().any(|ins| {
+            matches!(
+                *ins,
+                Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::StoreGlobalResolved { idx, .. }
+                    if idx == g
+            )
+        })
+    };
+    let receiver_is_private = |r: u16, def_ip: usize, use_ip: usize| {
+        proto.code.iter().enumerate().all(|(ip, ins)| {
+            (writes_reg(ins) != Some(r) || ip == def_ip)
+                && (!instr_uses(ins).into_iter().any(|u| u == r) || ip == use_ip)
+        })
+    };
+    let mut base = s;
+    while base + 8 <= e {
+        let mut pins = [0usize; 3];
+        let mut calls = [0usize; 3];
+        let mut args = [0u16; 3];
+        let mut ok = true;
+        for leg in 0..3usize {
+            let b = base + 3 * leg;
+            let (recv, global) = match proto.code[b] {
+                Instr::LoadGlobal { dst, idx } => (dst, idx),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            };
+            let arg = match proto.code[b + 1] {
+                Instr::LoadInt { dst, .. } | Instr::Move { dst, .. } => dst,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            };
+            let (dst, obj, arg_base) = match proto.code[b + 2] {
+                Instr::CallMethod {
+                    dst,
+                    obj,
+                    arg_base,
+                    argc: 1,
+                    ..
+                } => (dst, obj, arg_base),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            };
+            let Some(j) = arr_push_pin(proto, b + 2, ta_plan) else {
+                ok = false;
+                break;
+            };
+            if obj != recv
+                || arg_base != arg
+                || ta_plan.pins[j].src != TaPinSrc::Global(global)
+                || !global_is_stable(global)
+                // Later receiver LoadGlobals write frame slots speculatively.
+                // Prove those slots are compiler-private call temporaries, so
+                // rollback need only restore the two numeric physical homes.
+                || !receiver_is_private(recv, b, b + 2)
+                || !result_is_unread(dst)
+                || plan.split_recvs.contains(&dst)
+                || plan.write_through.contains(&dst)
+                // A future setup is speculative until the helper commits.
+                // Split/write-through argument registers make their boxed
+                // frame slot authoritative immediately, which the XMM-only
+                // rollback cannot undo before replaying the first setup.
+                || plan.split_recvs.contains(&arg)
+                || plan.write_through.contains(&arg)
+                || plan.slot_consts.contains_key(&arg)
+                || !matches!(plan.reg_home.get(&arg), Some(Home::Xmm(_)))
+            {
+                ok = false;
+                break;
+            }
+            pins[leg] = j;
+            calls[leg] = b + 2;
+            args[leg] = arg;
+        }
+        if ok
+            && pins[0] != pins[1]
+            && pins[0] != pins[2]
+            && pins[1] != pins[2]
+            && !(base..=base + 8).any(|ip| cold.contains(&ip))
+            // The first receiver load may itself be a branch target; it is the
+            // semantic start of the batch. No control flow may enter later.
+            && !(base + 1..=base + 8).any(|ip| plan.jump_targets.contains(&ip))
+        {
+            for stage in 0..3usize {
+                out.insert(
+                    calls[stage],
+                    ArrPush3Step {
+                        first_ip: base,
+                        stage: stage as u8,
+                        pins,
+                        args,
+                    },
+                );
+            }
+            base += 9;
+        } else {
+            base += 1;
+        }
+    }
+    out
+}
+
 /// Can the loop region `[start, end]` run on the INTEGER path? Stricter than
 /// `region_is_int`: every op must be integer-valued (no Div — fractional; `Mod`
 /// IS allowed, via integer `idiv`), and every `LoadConst` must be an Int-tagged
@@ -688,9 +861,30 @@ pub(crate) fn compile_region_int_maybe_cold(
     // [shadow 32][TA snapshot slots 32·n_ta][xmm6..15 save 160][pad 8], shadow at the
     // bottom so the snapshot calls have shadow space and rsp stays 16-aligned.
     let n_ta = ta_plan.pins.len() as i32;
+    // Batching deliberately stays out of spliced/self-call bodies and metered
+    // VMs: a splice needs its call-resume map, while metering must retain one
+    // charge for every original bytecode op.
+    let push3 = arr_push3_steps(
+        proto,
+        s,
+        e,
+        ta_plan,
+        &plan,
+        &cold,
+        int_push3_enabled() && entry.resume.is_empty() && meter.is_none(),
+    );
+    let has_push3 = !push3.is_empty();
+    if has_push3 && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] INT region [{start},{end}] array-push3 groups={}",
+            push3.len() / 3
+        );
+    }
     // W20 M2: a region with an admitted `arr.push(int)` reserves 64 more bytes
     // above the xmm6..15 saves — the call-save area for the four `BOOL_GPRS`
-    // and the four VOLATILE numeric homes (xmm2..xmm5). It is part of THIS
+    // and the four VOLATILE numeric homes (xmm2..xmm5). A batched group reserves
+    // another 48 bytes for its three staged i64 arguments plus the two future
+    // argument homes' rollback values. It is part of THIS
     // frame, above the shadow space, so no callee can write it. A push always
     // brings a pin, so the area only ever exists in the `n_ta > 0` layout
     // (whose `frame` keeps rsp 16-aligned for the call; +64 preserves that).
@@ -700,12 +894,19 @@ pub(crate) fn compile_region_int_maybe_cold(
         return None;
     }
     let (frame, xmm_off, ta_base) = if n_ta > 0 {
-        (200 + 32 * n_ta + if has_push { 64 } else { 0 }, 32 + 32 * n_ta, 32i32)
+        (
+            200 + 32 * n_ta + if has_push { 64 } else { 0 } + if has_push3 { 48 } else { 0 },
+            32 + 32 * n_ta,
+            32i32,
+        )
     } else {
         (160i32, 0i32, 0i32)
     };
-    // [shadow 32][pin slots 32·n_ta][xmm6..15 saves 160][push call-save 64][pad]
+    // [shadow 32][pin slots 32·n_ta][xmm6..15 saves 160][push call-save 64]
+    // [optional push3 values/rollback 48][pad]
     let psave_off = xmm_off + 160;
+    let push3_vals_off = psave_off + 64;
+    let push3_rollback_off = push3_vals_off + 24;
     // The registers the win64 callee may scratch that this planner OWNS:
     // the bool gprs in use (bool homes AND `gpr_const` compare mirrors), and
     // every numeric home in xmm2..xmm5. xmm6..xmm15 are callee-saved by the
@@ -1437,6 +1638,81 @@ pub(crate) fn compile_region_int_maybe_cold(
                 copy_clobber(&mut lc, d);
                 lc = None;
             }
+            // ── exact three-array push batch ── the receiver/argument setup
+            // instructions remain emitted in source order. The first two
+            // calls stage their already-unboxed argument; the third makes one
+            // leaf call which preflights all three pins before mutating any,
+            // then appends in the original order and refreshes every snapshot.
+            // All three result registers are proven unread by `arr_push3_steps`.
+            Instr::CallMethod { arg_base, .. } if push3.contains_key(&ip) => {
+                let step = push3[&ip];
+                let vx = xh(&plan, arg_base);
+                dynasm!(ops ; movq [rsp + push3_vals_off + 8 * step.stage as i32], Rx(vx));
+                if step.stage == 0 {
+                    // A later setup may reuse a currently-live numeric home.
+                    // Preserve the two destination homes as they stand at the
+                    // first call so an atomic helper decline can restore the
+                    // exact pre-batch state before `flush_exit` boxes aliases.
+                    for (k, &arg) in step.args[1..].iter().enumerate() {
+                        let ax = xh(&plan, arg);
+                        dynasm!(ops ; movq [rsp + push3_rollback_off + 8 * k as i32], Rx(ax));
+                    }
+                }
+                if step.stage == 2 {
+                    for (k, &gb) in save_gprs.iter().enumerate() {
+                        dynasm!(ops ; mov [rsp + psave_off + 8 * k as i32], Rq(gb));
+                    }
+                    for (k, &xi) in save_xmms.iter().enumerate() {
+                        dynasm!(ops ; movq [rsp + psave_off + 32 + 8 * k as i32], Rx(xi));
+                    }
+                    let packed = step.pins[0] as u32
+                        | ((step.pins[1] as u32) << 8)
+                        | ((step.pins[2] as u32) << 16)
+                        // Regression-only fault injection for the otherwise
+                        // defensive atomic-decline path. It changes emitted
+                        // code only in an explicitly marked child process.
+                        | if std::env::var_os("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE").is_some() {
+                            1 << 31
+                        } else {
+                            0
+                        };
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; lea rdx, [rsp + ta_base]
+                        ; mov r8d, packed as i32
+                        ; lea r9, [rsp + push3_vals_off]
+                        ; mov rax, QWORD crate::vm::jit_array_push3_pinned as usize as i64
+                        ; call rax
+                    );
+                    for (k, &gb) in save_gprs.iter().enumerate() {
+                        dynasm!(ops ; mov Rq(gb), [rsp + psave_off + 8 * k as i32]);
+                    }
+                    for (k, &xi) in save_xmms.iter().enumerate() {
+                        dynasm!(ops ; movq Rx(xi), [rsp + psave_off + 32 + 8 * k as i32]);
+                    }
+                    // Later receiver/argument setup may share a home with an
+                    // earlier temporary. Replay from the first LoadGlobal, not
+                    // from the first call, so the interpreter reconstructs all
+                    // six setup registers after an atomic helper decline.
+                    let replay = rip(step.first_ip);
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; test rax, rax
+                        ; jnz => done
+                    );
+                    for (k, &arg) in step.args[1..].iter().enumerate() {
+                        let ax = xh(&plan, arg);
+                        dynasm!(ops ; movq Rx(ax), [rsp + push3_rollback_off + 8 * k as i32]);
+                    }
+                    dynasm!(ops
+                        ; mov DWORD [rsi], replay
+                        ; jmp => flush_exit
+                        ; => done
+                    );
+                }
+                flag_cmp = None;
+                lc = None;
+            }
             // ── pinned dense-Array `arr.push(int)` (W20 M2) ── the ONE arm on
             // this tier that issues a call. Shape: identity-guard the receiver,
             // spill the planner-owned volatile registers into this frame's
@@ -1682,4 +1958,3 @@ pub(crate) fn compile_region_int_maybe_cold(
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
 }
-

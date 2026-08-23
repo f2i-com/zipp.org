@@ -1557,6 +1557,94 @@ pub(crate) extern "win64" fn jit_array_push_pinned(
     }
 }
 
+/// Leaf helper for an exact straight-line trio of discarded-result
+/// `arr.push(int)` calls. `packed_pins` holds three byte-sized indices into
+/// `snaps`; `vals` points to three staged raw i64 homes. All three receivers
+/// are preflighted before the first append, so returning 0 is atomic and lets
+/// codegen replay from the first receiver setup. A successful pass appends in source
+/// order and refreshes each pin after its Vec may have reallocated.
+///
+/// Eligibility properties (extensibility, writable length, prototype/index
+/// overlays, sparse length, mapped arguments) were hoisted to
+/// `jit_array_push_gate` in the region prologue. No admitted INT op can change
+/// them or invoke user code before this helper runs. The pointer/length checks
+/// below additionally reject a stale snapshot before any mutation.
+///
+/// # Safety
+/// `vm` is valid; `snaps` points to this region's pin array and `vals` to three
+/// readable i64s in its frame. The packed indices originate in `TaPinPlan`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_push3_pinned(
+    vm: *mut core::ffi::c_void,
+    snaps: *mut TaSnap,
+    packed_pins: u32,
+    vals: *const i64,
+) -> u64 {
+    // High bit is outside the three packed u8 pin fields. Tests use it to make
+    // the atomic no-mutation fallback observable; normal emitted code leaves
+    // it clear.
+    if packed_pins & (1 << 31) != 0 {
+        return 0;
+    }
+    let js = [
+        (packed_pins & 0xff) as usize,
+        ((packed_pins >> 8) & 0xff) as usize,
+        ((packed_pins >> 16) & 0xff) as usize,
+    ];
+    if js[0] == js[1] || js[0] == js[2] || js[1] == js[2] {
+        return 0;
+    }
+    // SAFETY: caller owns the VM for the duration of native region execution.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let mut ids = [0u32; 3];
+    let mut bits = [0u64; 3];
+    for k in 0..3 {
+        // SAFETY: each packed index came from the region's TaPinPlan.
+        let snap = unsafe { &*snaps.add(js[k]) };
+        let arr = Value::from_bits(snap.obj_bits);
+        if !arr.is_heap() || snap.flags != TA_SNAP_LOCAL {
+            return 0;
+        }
+        let idx = arr.heap_index();
+        let HeapObj::Array(items) = vm.heap.get(idx) else {
+            return 0;
+        };
+        if items.as_ptr() as u64 != snap.base || items.len() as u64 != snap.len {
+            return 0;
+        }
+        ids[k] = idx;
+        bits[k] = snap.obj_bits;
+    }
+    if ids[0] == ids[1] || ids[0] == ids[2] || ids[1] == ids[2] {
+        return 0;
+    }
+
+    for k in 0..3 {
+        // SAFETY: caller provided three staged i64 values.
+        let val = unsafe { *vals.add(k) };
+        let v = if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+            Value::int(val as i32)
+        } else {
+            Value::num(val as f64)
+        };
+        let HeapObj::Array(items) = vm.heap.get_mut(ids[k]) else {
+            // All three distinct receivers were checked above and no operation
+            // here can change an object's heap variant.
+            unreachable!("push3 preflighted array changed variant")
+        };
+        items.push(v);
+        let snap = TaSnap {
+            obj_bits: bits[k],
+            base: items.as_ptr() as u64,
+            len: items.len() as u64,
+            flags: TA_SNAP_LOCAL,
+        };
+        // SAFETY: caller passed its writable pin array.
+        unsafe { core::ptr::write(snaps.add(js[k]), snap) };
+    }
+    1
+}
+
 /// Win64 helper for a JIT'd `str.charCodeAt(i)` in a region. Returns the
 /// UTF-16 code unit at `i` (Int bits), NaN bits for an out-of-range index, or
 /// `SELF_CALL_DEOPT` for a non-int index / non-flat-string receiver (a rope or

@@ -1,0 +1,1270 @@
+{
+  "schema_version": 2,
+  "created_utc": "2026-08-23T22:05:09.119663+00:00",
+  "git_commit": "3be6906ac47cb279039eb174647e3fe553b0e8e9",
+  "workspace_source": "3be6906ac47cb279039eb174647e3fe553b0e8e9",
+  "engine_source_before": {
+    "old": "3be6906ac47cb279039eb174647e3fe553b0e8e9+dirty.a7f8bbf87c7ff32e",
+    "new": "3be6906ac47cb279039eb174647e3fe553b0e8e9+dirty.a7f8bbf87c7ff32e"
+  },
+  "engine_source_after": {
+    "old": "3be6906ac47cb279039eb174647e3fe553b0e8e9+dirty.a7f8bbf87c7ff32e",
+    "new": "3be6906ac47cb279039eb174647e3fe553b0e8e9+dirty.a7f8bbf87c7ff32e"
+  },
+  "engine_binary_sha_before": {
+    "old": "f8c81e7f188d8e2d5ced2d9b6f6bab4c7c42205cecfcd4474b79833a264f8fca",
+    "new": "f8c81e7f188d8e2d5ced2d9b6f6bab4c7c42205cecfcd4474b79833a264f8fca"
+  },
+  "engine_binary_sha_after": {
+    "old": "f8c81e7f188d8e2d5ced2d9b6f6bab4c7c42205cecfcd4474b79833a264f8fca",
+    "new": "f8c81e7f188d8e2d5ced2d9b6f6bab4c7c42205cecfcd4474b79833a264f8fca"
+  },
+  "publishable": true,
+  "provenance_reasons": [],
+  "engine_drift": [],
+  "harness": {
+    "bench_py_sha256": "85f4f17cc6ffad0732a68c32b64893f8598e43e3a8c5f194fc179b00dee66dfd",
+    "run_real_sh_sha256": "b14a7e33fbd9c007e0bd0bdcde861e1ed7b86dc52cec09734f82120905190c5c"
+  },
+  "bench_input_sha256": {
+    "json-large": "a9d8f81e33fb3ca39bbb514ccdeeab5e202dc0ef3bc41b9adcab762684a2f3ec"
+  },
+  "headline_benches": [
+    "json-large"
+  ],
+  "diagnostic_benches": [],
+  "unclassified_benches": [],
+  "row_set_summaries": {
+    "headline": {
+      "benches": [
+        "json-large"
+      ],
+      "geomean_paired_ratio": 0.9053946058036708,
+      "ci95": [
+        0.8795978311412808,
+        0.9294692024251087
+      ]
+    },
+    "all_measured": {
+      "benches": [
+        "json-large"
+      ],
+      "geomean_paired_ratio": 0.9053946058036708,
+      "ci95": [
+        0.8795978311412808,
+        0.9294692024251087
+      ]
+    }
+  },
+  "seed": 1511464998,
+  "reps": 21,
+  "metric": "cold",
+  "report_mode": "modern",
+  "headline_metric": "cold",
+  "timeout_s": 300.0,
+  "bootstrap_samples": 10000,
+  "benches": [
+    "json-large"
+  ],
+  "bench_dir": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\real",
+  "baseline": "old",
+  "engines": [
+    {
+      "name": "old",
+      "argv": [
+        "target/json-plain-release/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\json-plain-release\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 6964224,
+      "mtime_ns": 1787522684796984000,
+      "sha256": "f8c81e7f188d8e2d5ced2d9b6f6bab4c7c42205cecfcd4474b79833a264f8fca",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "3be6906ac47cb279039eb174647e3fe553b0e8e9+dirty.a7f8bbf87c7ff32e",
+        "commit": "3be6906ac47cb279039eb174647e3fe553b0e8e9",
+        "dirty": true,
+        "diff_digest": "a7f8bbf87c7ff32e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {
+        "ZIPP_NO_JSON_PLAIN_FAST": "1"
+      }
+    },
+    {
+      "name": "new",
+      "argv": [
+        "target/json-plain-release/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\json-plain-release\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 6964224,
+      "mtime_ns": 1787522684796984000,
+      "sha256": "f8c81e7f188d8e2d5ced2d9b6f6bab4c7c42205cecfcd4474b79833a264f8fca",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "3be6906ac47cb279039eb174647e3fe553b0e8e9+dirty.a7f8bbf87c7ff32e",
+        "commit": "3be6906ac47cb279039eb174647e3fe553b0e8e9",
+        "dirty": true,
+        "diff_digest": "a7f8bbf87c7ff32e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {}
+    }
+  ],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {
+    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "c5e8b73f10ecc47ad1be38f14ba6b79cd3af06fcd86637f7b6b857ae209a686e,f204d340535055781952b10ed396de20b842f00a19e430852f7e121ad1ce91f6",
+    "RUST_LOG": "warn"
+  },
+  "schedule": [
+    {
+      "rep": 0,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 1,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 2,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 3,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 4,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 5,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 6,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 7,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 8,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 9,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 10,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 11,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 12,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 13,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 14,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 15,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 16,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 17,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 18,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 19,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 20,
+      "bench_order": [
+        "json-large"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010326499992515892,
+      "cold_s": 0.23712479998357594,
+      "adjusted_s": 0.22679829999106005,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.01022610004292801,
+      "cold_s": 0.21319819998461753,
+      "adjusted_s": 0.20297209994168952,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010572900006081909,
+      "cold_s": 0.21600300003774464,
+      "adjusted_s": 0.20543010003166273,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010472900001332164,
+      "cold_s": 0.23458210000535473,
+      "adjusted_s": 0.22410920000402257,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010636499966494739,
+      "cold_s": 0.24105200002668425,
+      "adjusted_s": 0.23041550006018952,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011398400005418807,
+      "cold_s": 0.21111309999832883,
+      "adjusted_s": 0.19971469999291003,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010428299952764064,
+      "cold_s": 0.214690699998755,
+      "adjusted_s": 0.20426240004599094,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010474400012753904,
+      "cold_s": 0.23712390003493056,
+      "adjusted_s": 0.22664950002217665,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010414600023068488,
+      "cold_s": 0.24532250000629574,
+      "adjusted_s": 0.23490789998322725,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.01079939998453483,
+      "cold_s": 0.2153863999992609,
+      "adjusted_s": 0.20458700001472607,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010800099989864975,
+      "cold_s": 0.21560940000927076,
+      "adjusted_s": 0.20480930001940578,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.014345199975650758,
+      "cold_s": 0.23157679999712855,
+      "adjusted_s": 0.2172316000214778,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010326199990231544,
+      "cold_s": 0.2402709000161849,
+      "adjusted_s": 0.22994470002595335,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010443400009535253,
+      "cold_s": 0.2096517999889329,
+      "adjusted_s": 0.19920839997939765,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010437500022817403,
+      "cold_s": 0.2081278000259772,
+      "adjusted_s": 0.1976903000031598,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010428000008687377,
+      "cold_s": 0.2366170000168495,
+      "adjusted_s": 0.2261890000081621,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010343900008592755,
+      "cold_s": 0.24645400000736117,
+      "adjusted_s": 0.23611009999876842,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011160299996845424,
+      "cold_s": 0.2119799999636598,
+      "adjusted_s": 0.20081969996681437,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010348000039812177,
+      "cold_s": 0.2104708999977447,
+      "adjusted_s": 0.20012289995793253,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010602599999401718,
+      "cold_s": 0.23692229995504022,
+      "adjusted_s": 0.2263196999556385,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010445200023241341,
+      "cold_s": 0.24052960000699386,
+      "adjusted_s": 0.23008439998375252,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.012920600012876093,
+      "cold_s": 0.20881679997546598,
+      "adjusted_s": 0.1958961999625899,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.01038009999319911,
+      "cold_s": 0.21365089999744669,
+      "adjusted_s": 0.20327080000424758,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010522700031287968,
+      "cold_s": 0.24351440003374591,
+      "adjusted_s": 0.23299170000245795,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010400400031358004,
+      "cold_s": 0.23434159997850657,
+      "adjusted_s": 0.22394119994714856,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010197000054176897,
+      "cold_s": 0.21781330002704635,
+      "adjusted_s": 0.20761629997286946,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010253900021780282,
+      "cold_s": 0.21251539996592328,
+      "adjusted_s": 0.202261499944143,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010306400014087558,
+      "cold_s": 0.2349530999781564,
+      "adjusted_s": 0.22464669996406883,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010796300019137561,
+      "cold_s": 0.23559650004608557,
+      "adjusted_s": 0.224800200026948,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.0103059999528341,
+      "cold_s": 0.2217897999798879,
+      "adjusted_s": 0.2114838000270538,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 15,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010630700038746,
+      "cold_s": 0.2152893000165932,
+      "adjusted_s": 0.2046585999778472,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 15,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.014367400028277189,
+      "cold_s": 0.23714069998823106,
+      "adjusted_s": 0.22277329995995387,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 16,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.010458300006575882,
+      "cold_s": 0.23615260003134608,
+      "adjusted_s": 0.2256943000247702,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 16,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010407699970528483,
+      "cold_s": 0.22401620005257428,
+      "adjusted_s": 0.2136085000820458,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 17,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010292999970261008,
+      "cold_s": 0.2474699000013061,
+      "adjusted_s": 0.23717690003104508,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 17,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010158599994610995,
+      "cold_s": 0.24915970000438392,
+      "adjusted_s": 0.23900110000977293,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 18,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009815099998377264,
+      "cold_s": 0.23817839997354895,
+      "adjusted_s": 0.22836329997517169,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 18,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010681999963708222,
+      "cold_s": 0.22377250000135973,
+      "adjusted_s": 0.2130905000376515,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 19,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.010192200017627329,
+      "cold_s": 0.21057940000901,
+      "adjusted_s": 0.20038719999138266,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 19,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010661099979188293,
+      "cold_s": 0.23056440002983436,
+      "adjusted_s": 0.21990330005064607,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 20,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.0107669000281021,
+      "cold_s": 0.2418152999598533,
+      "adjusted_s": 0.2310483999317512,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 20,
+      "bench": "json-large",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010486499988473952,
+      "cold_s": 0.22508730000117794,
+      "adjusted_s": 0.21460080001270398,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 121,
+      "stdout_sha256": "d8144095f6f73f51adc22373012c3e40808cbf6b5f3124eb3f38b468c8b09bd9",
+      "valid_for_stats": true
+    }
+  ],
+  "summary": {
+    "headline_metric": "cold",
+    "rows": {
+      "json-large": {
+        "median_ms": {
+          "old": 237.12479998357594,
+          "new": 214.690699998755
+        },
+        "paired_ratio": 0.9053946058036708,
+        "paired_ratio_ci95": [
+          0.8795978311412808,
+          0.9294692024251087
+        ],
+        "metrics": {
+          "cold": {
+            "median_ms": {
+              "old": 237.12479998357594,
+              "new": 214.690699998755
+            },
+            "paired_ratio": 0.9053946058036708,
+            "paired_ratio_ci95": [
+              0.8795978311412808,
+              0.9294692024251087
+            ],
+            "nonpositive_pairs": 0
+          },
+          "startup": {
+            "median_ms": {
+              "old": 10.458300006575882,
+              "new": 10.437500022817403
+            },
+            "paired_ratio": 0.995161734123559,
+            "paired_ratio_ci95": [
+              0.9804430621353178,
+              1.0113497723668512
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "old": 226.64950002217665,
+              "new": 204.26240004599094
+            },
+            "paired_ratio": 0.9012259017822883,
+            "paired_ratio_ci95": [
+              0.8740049250672052,
+              0.9271018464751825
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "geomean_paired_ratio": 0.9053946058036708,
+    "geomean_paired_ratio_ci95": [
+      0.8795978311412808,
+      0.9294692024251087
+    ],
+    "metric_geomean_paired_ratio": {
+      "cold": 0.9053946058036708,
+      "startup": 0.995161734123559,
+      "adjusted": 0.9012259017822883
+    },
+    "startup_median_ms": {
+      "old": 10.458300006575882,
+      "new": 10.437500022817403
+    }
+  },
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "failures": []
+}

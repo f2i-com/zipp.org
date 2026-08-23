@@ -3906,6 +3906,14 @@ impl<'p> Vm<'p> {
                 let (replacer_fn, allowlist) = self.json_resolve_replacer(replacer)?;
                 // Hold un-rooted Values across toJSON/replacer re-entry; suspend GC.
                 let _gc = self.gc_lock_guard();
+                if indent.is_empty()
+                    && replacer_fn.is_undefined()
+                    && allowlist.is_none()
+                {
+                    if let Some(s) = self.json_plain_stringify(a0) {
+                        return Ok(self.alloc_str(s));
+                    }
+                }
                 let mut m = crate::heap::ObjMap::new();
                 m.set("", a0);
                 let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));

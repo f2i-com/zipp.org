@@ -1504,22 +1504,32 @@ impl<'p> Vm<'p> {
                         // `JSON.stringify(undefined)` (and of a function) is undefined.
                         // This op is the single-arg form: no replacer / allowlist.
                         let _gc = self.gc_lock_guard();
-                        let mut m = crate::heap::ObjMap::new();
-                        m.set("", v);
-                        let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
-                        let mut visited = Vec::new();
-                        let result = match self.json_value(
-                            wrapper,
-                            "",
-                            v,
-                            &indent,
-                            0,
-                            &mut visited,
-                            Value::UNDEFINED,
-                            None,
-                        )? {
+                        let plain = indent
+                            .is_empty()
+                            .then(|| self.json_plain_stringify(v))
+                            .flatten();
+                        let result = match plain {
                             Some(s) => self.alloc_str(s),
-                            None => Value::UNDEFINED,
+                            None => {
+                                let mut m = crate::heap::ObjMap::new();
+                                m.set("", v);
+                                let wrapper =
+                                    Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                                let mut visited = Vec::new();
+                                match self.json_value(
+                                    wrapper,
+                                    "",
+                                    v,
+                                    &indent,
+                                    0,
+                                    &mut visited,
+                                    Value::UNDEFINED,
+                                    None,
+                                )? {
+                                    Some(s) => self.alloc_str(s),
+                                    None => Value::UNDEFINED,
+                                }
+                            }
                         };
                         self.set(base, dst, result);
                         ip += 1;
