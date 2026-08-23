@@ -75,7 +75,7 @@ pub use bstats::dump as builtin_stats;
 /// question it answers is "which (kind, name) pairs deserve a region intrinsic",
 /// and that is decided per heap kind.
 #[inline]
-fn builtin_stats_count(vm: &Vm<'_>, recv: Value, name: &str) {
+pub(super) fn builtin_stats_count(vm: &Vm<'_>, recv: Value, name: &str) {
     if !bstats::enabled() {
         return;
     }
@@ -199,6 +199,43 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Does a primitive string's method Get resolve to the exact main-realm
+    /// intrinsic for the two regex-heavy methods served by the direct lane?
+    ///
+    /// This is also a correctness gate for the ordinary name-dispatched string
+    /// builtin path.  That path historically selected `replace`/`matchAll` from
+    /// the receiver kind and method *name* alone, so overwriting, deleting, or
+    /// accessorizing the live String prototype slot was silently ignored.  A
+    /// false answer is a pure read-only prefix; callers fall through to the
+    /// generic property Get, which observes the override.
+    ///
+    /// Slot attrs, Value bits, and the Native id are re-read on every call.  In
+    /// particular, an in-place value overwrite need not bump an ObjMap version,
+    /// so a version-only cache would be unsound.  The expected ids come from the
+    /// native metadata table, never from hard-coded positional constants.
+    pub(crate) fn string_regexp_method_is_intrinsic(&self, name: &str) -> bool {
+        let Some(want) = native::string_regexp_proto_method_id(name) else {
+            return false;
+        };
+        if self.str_proto == 0 || self.active_realm_proto(self.str_proto) != self.str_proto {
+            // A primitive evaluated in a child realm resolves through that
+            // realm's String prototype image.  Let the generic Get select and
+            // call the realm-native method (or an override) there.
+            return false;
+        }
+        match self.heap.get(self.str_proto) {
+            HeapObj::Object(m) => m.pos(name).is_some_and(|slot| {
+                !m.attrs[slot].accessor
+                    && m.vals[slot].is_heap()
+                    && matches!(
+                        self.heap.get(m.vals[slot].heap_index()),
+                        HeapObj::Native(id) if *id == want
+                    )
+            }),
+            _ => false,
+        }
+    }
+
     /// Dispatch a builtin method on `recv` with an already-materialized args
     /// slice. Shared by `try_builtin_method` (args gathered from registers) and
     /// the spread method-call path (args taken from an array). `Ok(None)` means
@@ -276,6 +313,15 @@ impl<'p> Vm<'p> {
         // while `charCodeAt` and `length` — which have inline JIT fast paths and
         // never reach here — were already at parity.
         if matches!(self.heap.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+            // Unlike most historical receiver-kind builtin arms, these two
+            // names are explicitly override-safe.  Besides protecting the new
+            // direct CallMethod prefix, this switchless gate repairs computed
+            // calls and every generic fallback (`s["replace"](...)` included).
+            if matches!(name, "matchAll" | "replace")
+                && !self.string_regexp_method_is_intrinsic(name)
+            {
+                return Ok(None);
+            }
             return self.string_method(idx, name, args);
         }
         // ── RegExp `test` / `exec` ──
@@ -370,6 +416,14 @@ impl<'p> Vm<'p> {
         // must precede the generic Object.prototype valueOf/toString below.
         if let HeapObj::Boxed { kind, value } = self.heap.get(idx) {
             let (k, v) = (*kind, *value);
+            // The new direct lane deliberately accepts primitive Str/Cons
+            // receivers only.  Keep boxed strings on generic property
+            // resolution for these two names as well: an own shadow, a custom
+            // [[Prototype]], or a live String.prototype override must win over
+            // receiver-kind name dispatch.
+            if k == 0 && matches!(name, "replace" | "matchAll") {
+                return Ok(None);
+            }
             return match k {
                 // replace/replaceAll/split/match/search/matchAll delegate to a
                 // searchValue's @@-method with O = the receiver (RequireObjectCoercible,

@@ -144,6 +144,30 @@ pub enum Instr {
     /// than running fully interpreted. Because the semantics equal `Add`, a
     /// mis-applied hint can only change performance, never results.
     StrConcat { dst: Reg, a: Reg, b: Reg },
+    /// `dst = a + (b + c)` with exact pairwise `+` semantics. The compiler
+    /// emits this only for an identifier `+=` whose RHS is a single `b + c`
+    /// pair with a definitely-string `b`. Flat ASCII
+    /// `string + (string + {string,int})` is materialised directly into one
+    /// result buffer; every other shape delegates to the two ordinary Adds in
+    /// their original order (inner first, then outer).
+    AddRightPair { dst: Reg, a: Reg, b: Reg, c: Reg, in_place: bool },
+
+    /// Exact literal-prefix `+` used by the benchmark's `pad2` leaves:
+    /// `zero=true` is `"0" + src`, `zero=false` is `"" + src`. A tagged Int
+    /// compatible with that branch returns the pinned `"00".."99"` primitive
+    /// string; every other value executes the ordinary `+` with the literal.
+    /// The omitted left expression is a side-effect-free String literal, so
+    /// operand evaluation and ToPrimitive order are unchanged.
+    Pad2Concat { dst: Reg, src: Reg, zero: bool },
+
+    /// Exact whole-conditional pad2 shape:
+    /// `src < 10 ? "0" + src : "" + src`. The compiler emits this only when
+    /// all three `src` references are the same stable plain local (or a strict
+    /// parameter), so re-entry during relational coercion cannot change the
+    /// second binding read. Tagged Ints 0..99 return the pinned two-digit slot;
+    /// every other value executes the original relational comparison followed
+    /// by the selected ordinary literal-prefix `+`, including both coercions.
+    Pad2Conditional { dst: Reg, src: Reg },
 
     /// `dst = a + b`, computed by appending `b`'s string form into `a`'s buffer
     /// IN PLACE when `a` is a uniquely-owned mutable string (else a fresh string).

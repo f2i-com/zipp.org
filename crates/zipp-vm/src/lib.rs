@@ -99,6 +99,38 @@ pub fn regexp_result_stats() -> (u64, u64, u64, u64) {
     vm::regexp_result_stats()
 }
 
+/// `ZIPP_RXSTATS=1` direct RegExp CallMethod counters:
+/// `(interpreter_test, interpreter_exec, jit_test, jit_exec, guard_declines)`.
+/// A guard decline has performed no observable operation and falls through to
+/// the unchanged generic method-call route. Zeroed unless the variable was set.
+pub fn regexp_call_direct_stats() -> (u64, u64, u64, u64, u64) {
+    vm::regexp_call_direct_stats()
+}
+
+/// `ZIPP_RXSTATS=1` primitive-string RegExp CallMethod counters:
+/// `(interpreter_matchall, interpreter_replace, jit_matchall, jit_replace,
+/// guard_declines)`.  A decline is a read-only prefix and the generic method
+/// route performs the call.  All fields remain zero when
+/// `ZIPP_NO_RX_STRING_CALL_DIRECT=1` is set.
+pub fn regexp_string_call_direct_stats() -> (u64, u64, u64, u64, u64) {
+    vm::regexp_string_call_direct_stats()
+}
+
+/// `ZIPP_RXSTATS=1` exact outer-region matchAll scalarization counters:
+/// `(successes, direct_capture_numbers, materialized, elided,
+/// guard_declines, slow_reentry_flushes)`. A pending result is materialized
+/// before every native exit/re-entry and at iterator exhaustion.
+pub fn regexp_scalar_matchall_stats() -> (u64, u64, u64, u64, u64, u64) {
+    vm::regexp_scalar_matchall_stats()
+}
+
+/// `ZIPP_RXSTATS=1` exact non-global exec scalarization counters:
+/// `(successes, semantic_misses, direct_capture_numbers, materialized,
+/// elided, guard_declines, input_pin_declines, slow_reentry_flushes)`.
+pub fn regexp_scalar_exec_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+    vm::regexp_scalar_exec_stats()
+}
+
 /// `ZIPP_ASYNCSTATS=1` async-path counters:
 /// `(reparks, reused, grew, values_copied, subs_inline, subs_spilled)`. A re-park
 /// is one suspension of an async function, async generator or generator, and
@@ -121,6 +153,37 @@ pub fn async_stats() -> (u64, u64, u64, u64, u64, u64) {
 /// Zeroed unless the variable was set.
 pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
     vm::ic_stats()
+}
+
+/// `ZIPP_ICSTATS=1` fused computed-write counters: `(pure_hits, pure_adds,
+/// slow)`. A hit/add completed in the shared allocation-free ordinary-object
+/// prefix; slow declined before an observable change and retained the delegated
+/// or interpreter path. `ZIPP_NO_CONCAT_PURE_APPEND=1` forces pure-adds to zero.
+pub fn concat_set_stats() -> (u64, u64, u64) {
+    vm::concat_set_stats()
+}
+
+/// `ZIPP_ICSTATS=1` identifier-`+=` right-pair counters:
+/// `(one_alloc_string_tail, one_alloc_int_tail, proven_linear_in_place,
+/// pairwise_fallback)`. `ZIPP_NO_CONCAT_PAIR_FUSE=1` restores the two original
+/// Adds at compile time and therefore forces every field to zero.
+pub fn concat_pair_stats() -> (u64, u64, u64, u64) {
+    vm::concat_pair_stats()
+}
+
+/// `ZIPP_ICSTATS=1` pad2 literal-concat counters:
+/// `(cached_zero_prefix, cached_empty_prefix, ordinary_add_fallback)`.
+/// `ZIPP_NO_PAD2_CACHE=1` restores the original `LoadConst` + `Add` lowering
+/// and therefore forces all three fields to zero.
+pub fn pad2_concat_stats() -> (u64, u64, u64) {
+    vm::pad2_concat_stats()
+}
+
+/// `ZIPP_ICSTATS=1` whole-pad2 conditional counters:
+/// `(tagged_int_cache_hits, exact_relational_add_fallbacks)`.
+/// `ZIPP_NO_PAD2_COND_FUSE=1` removes the fused opcode, so both are zero.
+pub fn pad2_conditional_stats() -> (u64, u64) {
+    vm::pad2_conditional_stats()
 }
 
 /// `ZIPP_ICSTATS=1` B82 call/apply splice counters:
@@ -167,6 +230,12 @@ pub fn builtin_stats() -> Vec<(&'static str, String, u64)> {
 /// regress-fork's possessify.rs).
 pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
     regress::rx_stats()
+}
+
+/// `ZIPP_RXSTATS=1` suffix-start filter counters from regress:
+/// `(literal_hits, candidate_starts, cap_fallbacks)`.
+pub fn rx_suffix_start_stats() -> (u64, u64, u64) {
+    regress::rx_suffix_start_stats()
 }
 
 /// `ZIPP_RXSTATS=1` regex-JIT counters: `(regexes compiled, declined:

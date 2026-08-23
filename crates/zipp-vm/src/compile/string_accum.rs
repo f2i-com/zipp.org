@@ -188,7 +188,12 @@ pub(crate) fn loop_inplace_safe(
     // Only simple ops in the body, and the buffer's registers (`a`, `dst`) are
     // touched ONLY by the load/append/store — never leaking the buffer elsewhere.
     for ip in start..=end {
-        if !is_simple_loop_op(&code[ip]) {
+        // The candidate itself is the new two-Add op. Its primitive fast arm
+        // runs no user code, while every coercing shape declines before
+        // mutation to the exact fresh-result fallback. Keep it exempt here;
+        // any *other* AddRightPair remains outside `is_simple_loop_op` and is
+        // therefore the conservative unknown-op barrier.
+        if ip != k && !is_simple_loop_op(&code[ip]) {
             return false;
         }
         if ip != load_ip && ip != k && ip != store_ip && (instr_touches(&code[ip], a) || instr_touches(&code[ip], dst)) {
@@ -255,6 +260,8 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
         | Instr::Ne { a, b, .. }
         | Instr::JumpIfNotLt { a, b, .. }
         | Instr::JumpIfNotLe { a, b, .. } => a == r || b == r,
+        Instr::AddRightPair { a, b, c, .. } => a == r || b == r || c == r,
+        Instr::Pad2Concat { src, .. } | Instr::Pad2Conditional { src, .. } => src == r,
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => cond == r,
         Instr::Return { src } | Instr::CheckCoercible { src } => src == r,
         Instr::CellGet { cell, .. } => cell == r,
@@ -327,6 +334,9 @@ pub(crate) fn accum_touches(i: &Instr, r: Reg) -> bool {
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }
         | Instr::ToConcatKey { dst, .. } => dst == r,
+        Instr::AddRightPair { dst, .. }
+        | Instr::Pad2Concat { dst, .. }
+        | Instr::Pad2Conditional { dst, .. } => dst == r,
         Instr::StoreGlobal { .. }
         | Instr::StoreGlobalStrict { .. }
         | Instr::StoreGlobalResolved { .. }
@@ -395,6 +405,9 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }
         | Instr::ToConcatKey { dst, .. } => dst == r,
+        Instr::AddRightPair { dst, .. }
+        | Instr::Pad2Concat { dst, .. }
+        | Instr::Pad2Conditional { dst, .. } => dst == r,
         _ => false,
     }
 }
@@ -601,7 +614,8 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
         };
         for k in start..=j {
             let (dst, a) = match f.code[k] {
-                Instr::Add { dst, a, .. } => (dst, a),
+                Instr::Add { dst, a, .. }
+                | Instr::AddRightPair { dst, a, in_place: false, .. } => (dst, a),
                 _ => continue,
             };
             // result `dst` stored back to some global `g` in the body
@@ -634,12 +648,22 @@ pub(crate) fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool)
         }
     }
     for (k, in_place) in rewrites {
-        if let Instr::Add { dst, a, b } = f.code[k] {
-            f.code[k] = if in_place {
-                Instr::StrAppendInPlace { dst, a, b }
-            } else {
-                Instr::StrConcat { dst, a, b }
-            };
+        match f.code[k] {
+            Instr::Add { dst, a, b } => {
+                f.code[k] = if in_place {
+                    Instr::StrAppendInPlace { dst, a, b }
+                } else {
+                    Instr::StrConcat { dst, a, b }
+                };
+            }
+            Instr::AddRightPair { dst, a, b, c, in_place: false } if in_place => {
+                f.code[k] = Instr::AddRightPair { dst, a, b, c, in_place: true };
+            }
+            Instr::AddRightPair { .. } => {
+                // The generic fused op is already admitted by MEM/Tier C; no
+                // StrConcat routing hint is needed when the alias proof declines.
+            }
+            _ => {}
         }
     }
 }

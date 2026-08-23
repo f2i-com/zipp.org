@@ -51,6 +51,14 @@ pub(crate) fn compile_region_mem(
     if !region_can_compile(proto, start, end, Some(const_strs)) {
         return None;
     }
+    let scalar_matchall = rx_scalar_matchall_plan(proto, start, end);
+    let scalar_exec = rx_scalar_exec_plan(proto, start, end, ta_plan);
+    // Scalarization elides source bytecodes and therefore their individual
+    // meter charges. Metered execution retains the byte-for-byte ordinary
+    // region/interpreter path rather than under-counting steps.
+    if (scalar_matchall.is_some() || scalar_exec.is_some()) && meter.is_some() {
+        return None;
+    }
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let (s, e) = (start as usize, end as usize);
 
@@ -227,6 +235,21 @@ pub(crate) fn compile_region_mem(
         let ipl = lbl(ip as u32, &in_region);
         dynasm!(ops ; => ipl);
         crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
+        if let Some(plan) = scalar_exec.filter(|p| p.result_reload_ip == ip) {
+            // The call helper left its true/null control value in
+            // call_result_reg. Mirror the skipped LoadGlobal into its original
+            // destination (the allocator need not reuse the call register).
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(plan.call_result_reg)]
+                ; mov [rbx + dreg(plan.result_test_reg)], rax
+            );
+            continue;
+        }
+        if scalar_exec.is_some_and(|p| p.elides_capture_ip(ip)) {
+            // The helper wrote the four future ToNum destinations; these exact
+            // publication/capture-only bytecodes have no remaining source effect.
+            continue;
+        }
         let bail = ops.new_dynamic_label();
         match proto.code[ip] {
             Instr::LoadInt { dst, val } => {
@@ -266,6 +289,27 @@ pub(crate) fn compile_region_mem(
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
             | Instr::StoreGlobalResolved { idx, src } => {
+                if let Some(plan) = scalar_exec.filter(|p| p.result_store_ip == ip) {
+                    let done = ops.new_dynamic_label();
+                    // Success is represented by TRUE while the real Array is
+                    // pending; a semantic miss is NULL and must publish now.
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(src)]
+                        ; mov r10, QWORD Value::TRUE.bits() as i64
+                        ; cmp rax, r10
+                        ; je => done
+                        ; mov [r12 + (plan.result_global as i32) * 8], rax
+                        ; => done
+                    );
+                    continue;
+                }
+                if scalar_matchall.is_some_and(|p| p.result_store_ip == ip) {
+                    // The match range is pending in RegexpIterRec. It becomes
+                    // observable in this global only at the final flush (or
+                    // before any exit/re-entry); the exact capture consumer
+                    // below reads the range directly.
+                    continue;
+                }
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(src)]
                     ; mov [r12 + (idx as i32) * 8], rax
@@ -308,26 +352,63 @@ pub(crate) fn compile_region_mem(
                 dynasm!(ops
                     ; jmp => done_a
                     ; => slow
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, [rbx + dreg(a)]
-                    ; mov r8, [rbx + dreg(b)]
-                    ; mov rax, QWORD heap.concat as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail                          // IC-style redo (nothing ran)
-                    ; mov r10, QWORD CALL_THREW as i64
-                    ; cmp rax, r10
-                    ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
-                    ; mov [rbx + dreg(dst)], rax
                 );
-                if refetch_pinned {
-                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
-                }
-                // `add_values` can run user coercion code (valueOf) — re-derive
-                // the pinned TypedArray snapshots.
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some(plan) = scalar_matchall.filter(|p| p.add_ip == ip) {
+                    // A non-number would enter the ordinary Add helper, which
+                    // can invoke valueOf/toString. Publish the pending km first,
+                    // then exit and let the interpreter execute this Add once.
+                    // No native re-entry means global-route and pin invariants
+                    // cannot be invalidated behind the scalar plan.
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(plan.iter_reg)]
+                        ; mov r8d, plan.result_global as i32
+                        ; mov r9d, 1                         // slow/re-entry census
+                        ; mov rax, QWORD heap.regexp_scalar_flush as i64
+                        ; call rax
+                        ; mov DWORD [rsi], ip as i32
+                        ; jmp => epilogue
+                    );
+                } else if let Some(plan) = scalar_exec.filter(|p| p.add_ips.contains(&ip)) {
+                    // Any non-number would enter observable ToPrimitive.  The
+                    // exact result must exist in its global before replaying
+                    // this Add in the interpreter.
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov edx, plan.result_global as i32
+                        ; mov r8d, 1                         // slow/re-entry
+                        ; mov rax, QWORD heap.regexp_scalar_exec_flush as i64
+                        ; call rax
+                        ; mov DWORD [rsi], ip as i32
+                        ; jmp => epilogue
+                    );
+                } else {
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(a)]
+                        ; mov r8, [rbx + dreg(b)]
+                        ; mov rax, QWORD heap.concat as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // IC-style redo (nothing ran)
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if refetch_pinned {
+                        emit_refetch_pinned(
+                            &mut ops,
+                            heap.versions_base,
+                            Some(heap.ic_base),
+                        );
+                    }
+                    // `add_values` can run user coercion code (valueOf) —
+                    // re-derive the pinned TypedArray snapshots.
+                    if let Some((snap, plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, plan);
+                    }
                 }
                 dynasm!(ops ; => done_a);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
@@ -640,6 +721,34 @@ pub(crate) fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::DeleteIndex { dst, obj, key, .. } => {
+                // Narrow ordinary computed delete. The helper accepts only an
+                // exact descriptor-free, non-arguments Array and a non-negative
+                // tagged Int. That served case always returns true, so `strict`
+                // is immaterial; every shape that could return false, throw, run
+                // coercion/user code, or need arguments unmapping deopts before
+                // mutation and re-executes this ip in the interpreter.
+                //
+                // Success overwrites at most one existing element with HOLE and
+                // bumps the live version word. It cannot allocate/re-enter or
+                // reallocate the Vec, so r13/r14 and every pin's identity/base/len
+                // remain valid and no post-call refetch is owed.
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[jit] MEM array DeleteIndex helper emitted at ip {ip}");
+                }
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(obj)]         // receiver bits
+                    ; mov r8, [rbx + dreg(key)]          // key bits
+                    ; mov rax, QWORD heap.delete_index as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // untouched → interpreter
+                    ; mov [rbx + dreg(dst)], rax         // Value::TRUE
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::DeleteIndexConcat { dst, obj, name, key, strict } => {
                 // `delete obj["name" + i]` (W19 M3). This is the op that kept
                 // the whole delete loop off the JIT: there was no Delete arm at
@@ -687,16 +796,19 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::SetIndexConcat { obj, name, key, val } => {
-                // `obj["name" + i] = v`. An own writable data-slot HIT is
-                // written in place (scratch key, no alloc, no version bump —
-                // the interpreter's hit arm exactly). A NEW key now delegates
-                // to `set_index_concat`, the same function the interpreter's
-                // arm calls, instead of deopting (B86) — so the helper can
-                // ALLOCATE and can run an inherited setter, and both the throw
-                // sentinel and the pinned-pointer refetch below are required.
-                // A non-Int key / exotic receiver still deopts. `val` rides the
-                // stack as the 5th arg (the set_prop_miss shape).
+                // `obj["name" + i] = v`. The selected pure helper returns a
+                // distinct sentinel for an own writable-data HIT or a
+                // proven-clean new append. Those two arms share the
+                // interpreter's prebuilt-key proof and cannot allocate a VM
+                // heap object, collect, or run user code, so their r13/r14 and
+                // TypedArray snapshots remain valid. Every slow case keeps the
+                // B86 delegation to `Vm::set_index_concat` and returns generic
+                // success / throw / deopt, which retains the historical full
+                // refetch. `ZIPP_NO_CONCAT_PURE_APPEND=1` selects the historical
+                // helper and emits this arm without a pure-sentinel branch.
+                // `val` rides the stack as arg 5 (the set_prop_miss shape).
                 let packed: u64 = ((heap.func_id as u64) << 32) | (name as u64);
+                let pure_done = heap.concat_pure_append.then(|| ops.new_dynamic_label());
                 dynasm!(ops
                     ; mov rcx, rdi                       // vm
                     ; mov rdx, [rbx + dreg(obj)]         // receiver bits
@@ -713,16 +825,30 @@ pub(crate) fn compile_region_mem(
                     ; cmp rax, r10
                     ; je => bail                         // threw: unwind, do NOT re-execute
                 );
-                // The new-key path allocates and may frame-call an inherited
-                // setter, so the heap version array, the IC table and the
-                // pinned TypedArray snapshots can all have moved.
+                if let Some(done) = pure_done {
+                    dynasm!(ops
+                        ; mov r10, QWORD CONCAT_SET_PURE as i64
+                        ; cmp rax, r10
+                        ; je => done                     // pure hit/add: pins stayed valid
+                    );
+                }
+                // Generic success may have allocated or frame-called an
+                // inherited setter, so every pinned address/snapshot is stale.
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 if let Some((snap, plan)) = ta_refetch {
                     emit_refetch_ta(&mut ops, snap, plan);
                 }
+                if let Some(done) = pure_done {
+                    dynasm!(ops ; => done);
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::ToNum { dst, a } => {
+                if scalar_matchall.is_some_and(|p| p.capture_tonum_ip == ip) {
+                    // The exact preceding scalar capture helper wrote this
+                    // instruction's destination directly.
+                    continue;
+                }
                 // `+x`. A number passes through UNCHANGED — note the raw `mov`
                 // rather than a round trip through xmm, which would re-tag an
                 // Int as a double and diverge from the interpreter. A non-number
@@ -1252,6 +1378,73 @@ pub(crate) fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::GetIndex { dst, obj, key } => {
+                if let Some(plan) = scalar_exec.filter(|p| p.input_get_ip == ip) {
+                    let decline = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    let off = ta_slot_off(plan.input_pin_slot);
+                    // Unlike the ordinary pinned-Array lane, every miss exits:
+                    // falling through to jit_get_index could invoke a prototype
+                    // getter while the previous logical `m` is still pending.
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(obj)]
+                        ; cmp rax, [rsp + off]
+                        ; jne => decline
+                    );
+                    emit_ta_key(&mut ops, key, decline);
+                    dynasm!(ops
+                        ; cmp rcx, [rsp + off + 16]
+                        ; jae => decline
+                        ; mov rdx, [rsp + off + 8]
+                        ; mov rax, [rdx + rcx * 8]
+                        ; mov r10, QWORD ARR_HOLE_BITS as i64
+                        ; cmp rax, r10
+                        ; je => decline
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        ; => decline
+                        ; mov rcx, rdi
+                        ; mov edx, plan.result_global as i32
+                        ; mov r8d, 2                         // input-pin decline
+                        ; mov rax, QWORD heap.regexp_scalar_exec_flush as i64
+                        ; call rax
+                        ; mov DWORD [rsi], ip as i32
+                        ; jmp => epilogue
+                        ; => done
+                    );
+                    continue;
+                }
+                if let Some(plan) = scalar_matchall.filter(|p| p.capture_get_ip == ip) {
+                    let scalar_decline = ops.new_dynamic_label();
+                    let scalar_done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(plan.iter_reg)]
+                        ; mov r8d, plan.capture as i32
+                        ; mov rax, QWORD heap.regexp_scalar_capture_num as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => scalar_decline
+                        // The helper already performed the exact unary-plus
+                        // grammar, so write the following ToNum's destination.
+                        ; mov [rbx + dreg(plan.tonum_dst)], rax
+                        ; jmp => scalar_done
+                        ; => scalar_decline
+                        // Materialization allocates and updates result_global;
+                        // resume at its LoadGlobal (393 in regex-log-scan), not
+                        // this GetIndex, whose pre-flush object register is stale.
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(plan.iter_reg)]
+                        ; mov r8d, plan.result_global as i32
+                        ; xor r9d, r9d
+                        ; mov rax, QWORD heap.regexp_scalar_flush as i64
+                        ; call rax
+                        ; mov DWORD [rsi], plan.result_load_ip as i32
+                        ; jmp => epilogue
+                        ; => scalar_done
+                    );
+                    continue;
+                }
                 // ── pinned-TypedArray fast path ── when the OSR-time plan tied
                 // this access to a pin: identity-guard the receiver against the
                 // pin's snapshot, bounds-check against the snapshot len, then a
@@ -1517,6 +1710,47 @@ pub(crate) fn compile_region_mem(
             }
             Instr::CallMethod { dst, obj, name, arg_base, argc } => {
                 let key = proto.string_constants[name as usize].as_str();
+                if let Some(plan) = scalar_exec.filter(|p| p.call_ip == ip) {
+                    debug_assert_eq!(key, "exec");
+                    debug_assert_eq!(argc, 1);
+                    debug_assert_eq!(obj, plan.re_reg);
+                    debug_assert_eq!(arg_base, plan.input_reg);
+                    debug_assert_eq!(dst, plan.call_result_reg);
+                    let packed_dsts = plan
+                        .tonum_dsts
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |bits, (g, &reg)| bits | ((reg as u64) << (16 * g)));
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, rbx
+                        ; mov r8, [rbx + dreg(obj)]
+                        ; mov r9, [rbx + dreg(arg_base)]
+                        ; mov rax, QWORD packed_dsts as i64
+                        ; mov [rsp + 32], rax               // fifth Win64 arg
+                        ; mov rax, QWORD heap.regexp_scalar_exec as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail                        // pure prefix; replay CallMethod
+                        ; mov [rbx + dreg(dst)], rax        // TRUE success / NULL miss
+                    );
+                    // The helper runs the loop safe point and may alter every
+                    // heap/pin side vector. Re-derive all snapshots before the
+                    // next iteration's direct Array load.
+                    if refetch_pinned {
+                        emit_refetch_pinned(
+                            &mut ops,
+                            heap.versions_base,
+                            Some(heap.ic_base),
+                        );
+                    }
+                    if let Some((snap, pin_plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, pin_plan);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    continue;
+                }
                 // Exact `Object.prototype.hasOwnProperty.call(array, numericKey)`
                 // intrinsic. The helper proves both the `hasOwnProperty`
                 // callable and its inherited `%Function.prototype%.call` slot,
@@ -1577,6 +1811,192 @@ pub(crate) fn compile_region_mem(
                         );
                     }
                     dynasm!(ops ; => hasown_done);
+                    continue;
+                }
+                // Pristine primitive-string `matchAll(RegExp)` /
+                // `replace(RegExp, string)`: the helper proves receiver kind,
+                // active main realm, the live metadata-derived String method
+                // slot, and every RegExp protocol dependency before doing any
+                // observable operation. A miss is therefore a pure prefix and
+                // falls through to the unchanged generic call site below.
+                if ((key == "matchAll" && argc == 1) || (key == "replace" && argc == 2))
+                    && crate::vm::string_regexp_call_direct_enabled()
+                {
+                    let srx_slow = ops.new_dynamic_label();
+                    let srx_done = ops.new_dynamic_label();
+                    let srx_bail = ops.new_dynamic_label();
+                    // In the scalar outer plan, a direct-helper miss must
+                    // resume the original CallMethod at 381. Falling through
+                    // to the generic helper could execute observable work and
+                    // then enter scalar protocol guards at 382, violating the
+                    // pure-prefix proof.
+                    let srx_decline = if scalar_matchall.is_some_and(|p| p.call_ip == ip) {
+                        srx_bail
+                    } else {
+                        srx_slow
+                    };
+                    dynasm!(ops
+                        ; mov rcx, rdi                          // vm
+                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
+                        ; lea r8, [rbx + dreg(arg_base)]        // &args[0..argc]
+                        ; mov r9d, (key == "replace") as i32   // 0 matchAll, 1 replace
+                        ; mov rax, QWORD heap.string_regexp_call_direct as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => srx_decline                     // pure guard miss
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => srx_bail                        // committed throw
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // Matcher/iterator/result construction and replacement
+                    // assembly allocate. Re-derive every potentially moved or
+                    // patched pinned/TypedArray snapshot, matching the generic
+                    // method helper's post-call contract.
+                    if refetch_pinned {
+                        emit_refetch_pinned(
+                            &mut ops,
+                            heap.versions_base,
+                            Some(heap.ic_base),
+                        );
+                    }
+                    if let Some((snap, plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, plan);
+                    }
+                    emit_region_bail(&mut ops, ip, srx_bail, epilogue);
+                    dynasm!(ops
+                        ; jmp => srx_done
+                        ; => srx_slow
+                    );
+
+                    let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                    let packed_args =
+                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    if let Some(mp) = method_plan.get(&ip) {
+                        emit_inline_method_call(
+                            &mut ops,
+                            ip,
+                            epilogue,
+                            leaf_flag_off,
+                            mp,
+                            obj,
+                            arg_base,
+                            argc,
+                            dst,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                            ta_refetch,
+                        );
+                    } else {
+                        emit_region_call_ic(
+                            &mut ops,
+                            ip,
+                            bail,
+                            epilogue,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            argc,
+                            dst,
+                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                            ta_refetch,
+                        );
+                    }
+                    dynasm!(ops ; => srx_done);
+                    continue;
+                }
+                // Pristine RegExp `test` / `exec`: collapse the generic
+                // CallMethod helper, IC probe, builtin dispatch and native
+                // wrapper into one guarded helper call. The helper reuses the
+                // interpreter's exact per-call intrinsic proofs. A miss has
+                // done no observable work and falls through to the unchanged
+                // generic call emission below; a throw is committed and exits.
+                if matches!(key, "test" | "exec")
+                    && crate::vm::regexp_call_direct_enabled()
+                {
+                    let rx_slow = ops.new_dynamic_label();
+                    let rx_done = ops.new_dynamic_label();
+                    let rx_bail = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi                          // vm
+                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
+                    );
+                    if argc == 0 {
+                        dynasm!(ops ; mov r8, QWORD Value::UNDEFINED.bits() as i64);
+                    } else {
+                        dynasm!(ops ; mov r8, [rbx + dreg(arg_base)]); // input bits
+                    }
+                    dynasm!(ops
+                        ; mov r9d, (key == "test") as i32       // 0 exec, 1 test
+                        ; mov rax, QWORD heap.regexp_call_direct as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => rx_slow                         // pure guard miss
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => rx_bail                         // committed throw
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // Input coercion and `lastIndex.valueOf` can run arbitrary
+                    // user code; exec/result construction allocates. Re-derive
+                    // every potentially moved/patched region snapshot exactly
+                    // as the generic method helper does.
+                    if refetch_pinned {
+                        emit_refetch_pinned(
+                            &mut ops,
+                            heap.versions_base,
+                            Some(heap.ic_base),
+                        );
+                    }
+                    if let Some((snap, plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, plan);
+                    }
+                    emit_region_bail(&mut ops, ip, rx_bail, epilogue);
+                    dynasm!(ops
+                        ; jmp => rx_done
+                        ; => rx_slow
+                    );
+
+                    let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                    let packed_args =
+                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    if let Some(mp) = method_plan.get(&ip) {
+                        emit_inline_method_call(
+                            &mut ops,
+                            ip,
+                            epilogue,
+                            leaf_flag_off,
+                            mp,
+                            obj,
+                            arg_base,
+                            argc,
+                            dst,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                            ta_refetch,
+                        );
+                    } else {
+                        emit_region_call_ic(
+                            &mut ops,
+                            ip,
+                            bail,
+                            epilogue,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            argc,
+                            dst,
+                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                            ta_refetch,
+                        );
+                    }
+                    dynasm!(ops ; => rx_done);
                     continue;
                 }
                 // ── `s.indexOf(t)` intrinsic ──
@@ -2060,6 +2480,149 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::AddRightPair { dst, a, b, c, in_place } => {
+                // Exact `a + (b + c)` through the shared interpreter helper.
+                // Its primitive ASCII arm allocates one flat result; the
+                // fallback can run user coercion code while performing the two
+                // ordinary Adds.  Consequently every served call gets the full
+                // pinned/TA refetch discipline, and a committed throw exits as
+                // CALL_THREW (never redo).
+                let pair_helper = if in_place {
+                    crate::vm::jit_append_right_pair as usize
+                } else {
+                    crate::vm::jit_add_right_pair as usize
+                };
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // outer left bits
+                    ; mov r8, [rbx + dreg(b)]             // inner left bits
+                    ; mov r9, [rbx + dreg(c)]             // inner right bits
+                    ; mov rax, QWORD pair_helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // helper never returns redo; defensive
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // pending_throw set: unwind
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::Pad2Concat { dst, src, zero } => {
+                // Tagged-Int/range hits construct the pinned heap Value bits
+                // call-free. A miss has performed no observable operation and
+                // enters the shared exact helper; only that path needs the full
+                // refetch/CALL_THREW protocol. Under ICSTATS route all cases to
+                // the helper so its mechanism counters remain exact.
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !crate::vm::pad2_concat_stats_enabled() {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(src)]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => slow
+                        ; mov r10d, eax                    // signed i32 payload, upper bits clear
+                    );
+                    if zero {
+                        // Unsigned `ja` rejects negative payloads as well as >9.
+                        dynasm!(ops ; cmp r10d, 9 ; ja => slow);
+                    } else {
+                        dynasm!(ops
+                            ; cmp r10d, 10
+                            ; jb => slow
+                            ; cmp r10d, 99
+                            ; ja => slow
+                        );
+                    }
+                    dynasm!(ops
+                        ; add r10d, crate::heap::INTERN_PAD2_START as i32
+                        ; mov rax, QWORD HEAP_TAG as i64
+                        ; or rax, r10
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                    );
+                }
+                dynasm!(ops
+                    ; => slow
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(src)]          // RHS bits
+                    ; mov r8d, zero as i32                // literal prefix selector
+                    ; mov rax, QWORD crate::vm::jit_pad2_concat as usize as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // defensive; helper never redoes
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // pending_throw set: unwind
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done);
+            }
+            Instr::Pad2Conditional { dst, src } => {
+                // The whole conditional maps every tagged Int 0..99 directly
+                // to the same-numbered canonical slot. A miss is pristine and
+                // calls the exact relational-then-Add helper. ICSTATS routes
+                // hits through that helper so its counters remain exact.
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !crate::vm::pad2_concat_stats_enabled() {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(src)]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => slow
+                        ; mov r10d, eax
+                        // Unsigned `ja` rejects negative payloads and >99.
+                        ; cmp r10d, 99
+                        ; ja => slow
+                        ; add r10d, crate::heap::INTERN_PAD2_START as i32
+                        ; mov rax, QWORD HEAP_TAG as i64
+                        ; or rax, r10
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                    );
+                }
+                dynasm!(ops
+                    ; => slow
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD crate::vm::jit_pad2_conditional as usize as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if refetch_pinned {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done);
+            }
             Instr::StrConcatChain { dst, a, b } => {
                 if crate::codegen::chain_fast_enabled() {
                     // Fused chain link via the single-dispatch fast sibling
@@ -2214,7 +2777,70 @@ pub(crate) fn compile_region_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::GetIterator { dst, src } => {
+                let Some(_plan) = scalar_matchall.filter(|p| p.get_iterator_ip == ip) else {
+                    return None;
+                };
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD heap.regexp_scalar_get_iterator as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // pure guard miss → original GetIterator
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::IterPrime { dst, iter } => {
+                let Some(_plan) = scalar_matchall.filter(|p| p.iter_prime_ip == ip) else {
+                    return None;
+                };
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(iter)]
+                    ; mov rax, QWORD heap.regexp_scalar_iter_prime as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // pure guard miss → original observable Get
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::IterNext { value_dst, done_dst, iter, idx, next } => {
+                if let Some(plan) = scalar_matchall.filter(|p| p.iter_next_ip == ip) {
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(iter)]
+                        ; mov r8, [rbx + dreg(next)]
+                        ; mov r9d, plan.result_global as i32
+                        ; mov rax, QWORD heap.regexp_scalar_step as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail                      // no visible step committed
+                        // Success returns false; exhausted returns true only
+                        // AFTER flushing the final pending km before IP 405.
+                        ; mov [rbx + dreg(done_dst)], rax
+                    );
+                    // The step's safe point and Annex-B string publication can
+                    // move every pinned side vector. Exhaustion additionally
+                    // materializes the final observable result.
+                    if refetch_pinned {
+                        emit_refetch_pinned(
+                            &mut ops,
+                            heap.versions_base,
+                            Some(heap.ic_base),
+                        );
+                    }
+                    if let Some((snap, pin_plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, pin_plan);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    continue;
+                }
                 // The for-of step via `jit_iter_next` — serves the intrinsic
                 // iterator kinds only (see the helper); anything else deopts
                 // BEFORE state moves, so the interpreter re-executes this op
@@ -2277,6 +2903,27 @@ pub(crate) fn compile_region_mem(
                     ; call rax
                 );
             }
+            Instr::IterCloseFinally { .. } => {
+                if !scalar_matchall.is_some_and(|p| p.close_ip == ip) {
+                    return None;
+                }
+                // Handler bodies remain interpreter-owned. No normal native
+                // predecessor reaches this label, but fail closed if that CFG
+                // invariant ever changes.
+                dynasm!(ops
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => epilogue
+                );
+            }
+            Instr::EndFinally { .. } => {
+                if !scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) {
+                    return None;
+                }
+                dynasm!(ops
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => epilogue
+                );
+            }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 // Resume interpreting at this ip so the interpreter performs the
                 // return (popping frames is its job, not the region's).
@@ -2308,9 +2955,31 @@ pub(crate) fn compile_region_mem(
         );
     }
 
-    // ── epilogue ── restore and return; [rsi] already holds the resume ip.
+    // ── epilogue ── every native exit first publishes any pending scalar
+    // result. This single closure covers guard deopts, committed throws,
+    // eviction exits, out-of-region branches, and the defensive handler stubs.
+    dynasm!(ops ; => epilogue);
+    if let Some(plan) = scalar_matchall {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, [rbx + dreg(plan.iter_reg)]
+            ; mov r8d, plan.result_global as i32
+            ; xor r9d, r9d
+            ; mov rax, QWORD heap.regexp_scalar_flush as i64
+            ; call rax
+        );
+    }
+    if let Some(plan) = scalar_exec {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov edx, plan.result_global as i32
+            ; xor r8d, r8d
+            ; mov rax, QWORD heap.regexp_scalar_exec_flush as i64
+            ; call rax
+        );
+    }
+    // Restore and return; [rsi] already holds the resume ip.
     dynasm!(ops
-        ; => epilogue
         ; add rsp, frame
         ; pop r14
         ; pop r13
@@ -2431,4 +3100,3 @@ pub(crate) fn chain_capacity_hint(code: &[Instr], ip: usize, acc: u16, end: usiz
         _ => 0,
     }
 }
-

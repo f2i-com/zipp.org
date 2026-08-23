@@ -9,6 +9,51 @@ use crate::parse::ast::{
     self, AssignOp, CallExpr, Expr, MemberProp, PropKey, Target, TargetElem, TargetProp,
 };
 
+/// `ZIPP_NO_CONCAT_PAIR_FUSE=1` restores identifier `x += (b + c)` to the
+/// historical inner `Add` followed by the outer `Add`, byte-for-byte.  The
+/// switch is compiler-side because the fused instruction is a lowering, not a
+/// speculative runtime shortcut.
+#[inline]
+fn concat_pair_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CONCAT_PAIR_FUSE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// A syntactic producer whose result is unconditionally a primitive String.
+/// Keep this deliberately narrow: the two benchmark shapes are a literal and
+/// a conditional with string-producing arms.  A template is also exact by
+/// construction.  Calls, identifiers, logical expressions and overloaded `+`
+/// are not inferred from surrounding types.
+fn definitely_string(e: &Expr) -> bool {
+    match e {
+        Expr::Str(_) | Expr::Template(_) => true,
+        Expr::Cond { cons, alt, .. } => definitely_string(cons) && definitely_string(alt),
+        _ => false,
+    }
+}
+
+/// The RHS pair accepted by `AddRightPair`: exactly `b + c`, with a
+/// definitely-string left operand.  That proof guarantees the INNER `+` takes
+/// its string-concatenation branch after `c`'s ToPrimitive, but the runtime op
+/// still retains the full two-Add fallback for adversarial values/coercions.
+fn add_right_pair_parts(value: &Expr) -> Option<(&Expr, &Expr)> {
+    match value {
+        Expr::Binary { op: ast::BinaryOp::Add, left, right } if definitely_string(left) => {
+            Some((left, right))
+        }
+        _ => None,
+    }
+}
+
 // NOTE: signatures this file assumes of functions owned by other groups. Each
 // follows mechanically from the type mapping; if one lands differently, these
 // are the only call sites to adjust.
@@ -1180,6 +1225,12 @@ impl<'a> FnCompiler<'a> {
             other => {
                 if let Binding::Local(r) = binding {
                     if !self.const_regs.contains(&r) && !self.is_self_name_reg(r) {
+                        // Do not plant AddRightPair here. A plain local may be a
+                        // proven-linear loop accumulator; the post-pass then
+                        // upgrades its outer Add to StrAppendInPlace. Replacing
+                        // that Add here would silently discard the stronger
+                        // no-result-allocation licence. The motivating top-level
+                        // `var path` is a Global and takes the branch below.
                         // Plain mutable local: compute in place.
                         let rhs = self.expr(value)?;
                         let instr = compound_assign_instr(other, r, r, rhs)
@@ -1198,10 +1249,29 @@ impl<'a> FnCompiler<'a> {
                 let save_p = self.next_reg;
                 let snap = self.eval_snap_probe(&binding);
                 let cur = self.load_binding(&binding, dst); // == dst
-                let rhs = self.expr(value)?;
-                let instr = compound_assign_instr(other, dst, cur, rhs)
-                    .ok_or("unsupported assignment operator (zipp-vm v1)")?;
-                self.emit(instr);
+                if other == AssignOp::Add && concat_pair_fuse_enabled() {
+                    if let Some((left, right)) = add_right_pair_parts(value) {
+                        let b = self.expr(left)?;
+                        let c = self.expr(right)?;
+                        self.emit(Instr::AddRightPair {
+                            dst,
+                            a: cur,
+                            b,
+                            c,
+                            in_place: false,
+                        });
+                    } else {
+                        let rhs = self.expr(value)?;
+                        let instr = compound_assign_instr(other, dst, cur, rhs)
+                            .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                        self.emit(instr);
+                    }
+                } else {
+                    let rhs = self.expr(value)?;
+                    let instr = compound_assign_instr(other, dst, cur, rhs)
+                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                    self.emit(instr);
+                }
                 // read-first: the `load_binding` above already resolved the
                 // reference, so the store may not raise "is not defined".
                 self.store_binding_snapped_ex(&binding, dst, snap, true);

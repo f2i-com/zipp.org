@@ -671,6 +671,28 @@ impl<'p> Vm<'p> {
     /// `Get(@@iterator)` (sm/destructuring/order.js counts them).
     pub(crate) fn get_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_heap() {
+            let idx = v.heap_index();
+            // A %RegExpStringIterator% is only an identity iterator while its
+            // live @@iterator data method is the pristine ITER_SELF native.
+            // The scalar outer-region guard resumes at this operation on a
+            // miss, so the unchanged interpreter fallback must observe an own
+            // override, prototype accessor, replacement, or deletion exactly
+            // once rather than silently taking the generic Iterator shortcut.
+            if self.regexp_string_iters.contains_key(&idx)
+                && matches!(self.heap.get(idx), HeapObj::Iterator { .. })
+            {
+                if self
+                    .regexp_string_iter_intrinsic_method(
+                        v,
+                        "@@iterator",
+                        crate::vm::native::ITER_SELF,
+                    )
+                    .is_some()
+                {
+                    return Ok(v);
+                }
+                return self.get_iterator_direct(v);
+            }
             match self.heap.get(v.heap_index()) {
                 // A plain array: fast-path the default iterator (IterNext walks the
                 // array directly), but honour a replaced Array.prototype[@@iterator]

@@ -167,6 +167,13 @@ pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
     classicalbacktrack::rx_stats()
 }
 
+/// PATCH (see suffix_start.rs): local `ZIPP_RXSTATS=1` ASCII start-prefilter
+/// counters: (derived-literal hits, attempted candidates, cap fallbacks).
+#[cfg(feature = "std")]
+pub fn rx_suffix_start_stats() -> (u64, u64, u64) {
+    classicalbacktrack::rx_suffix_start_stats()
+}
+
 /// PATCH (see VENDORED.md and rxjit.rs): `ZIPP_RXSTATS=1` regex-JIT counters —
 /// (regexes compiled, declined: unsupported insn, declined: limits,
 /// native attempts, interpreter attempts, native bails). Zeros when the
@@ -254,6 +261,7 @@ mod possessify;
 mod rxjit;
 mod scm;
 mod startpredicate;
+mod suffix_start;
 mod types;
 mod unicode;
 mod unicodetables;

@@ -196,6 +196,23 @@ pub(crate) fn gpr_spill_slots_enabled() -> bool {
     }
 }
 
+/// Kill switch: `ZIPP_NO_GPR_DEOPT_SHADOW=1` restores the per-definition
+/// boxed write-through used by B94/B97 and narrowed globals. The shadow mode
+/// is selected per plan below; an empty/refused plan emits the old bytes too.
+fn gpr_deopt_shadow_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_GPR_DEOPT_SHADOW").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// `compile_region_int_gpr`'s result. `PoolOverflow` is the one decline worth
 /// acting on: every OTHER gate passed and only the live set didn't fit, so the
 /// caller can re-plan with forced home sharing (B119 — the nested-loop
@@ -260,6 +277,319 @@ fn loc_src(l: Loc) -> Src {
 /// than this declines to the other tiers exactly as before the wave (the
 /// failure mode stays "decline as today", never "engage mostly-spilled").
 const GPR_SPILL_CAP: usize = 8;
+
+/// Deferred-deopt shadows are deliberately a small, local escape hatch, not a
+/// second register file. Thirty-two qwords is enough for every DV plan seen in
+/// the suite while bounding frame growth and compile-time scans.
+const GPR_DEOPT_SHADOW_CAP: usize = 32;
+
+/// An EMPTY raw slot has the high dword of `i64::MIN`. A successfully entered
+/// INT body holds values in [-2^53, 2^53]; the only pre-guard transient is an
+/// Add/Sub result in [-2^54, 2^54]. Neither can have high dword 0x80000000.
+/// Generic `Mul` is refused by the local planner, and entry conversion's
+/// cvttsd2si indefinite value bails before any home or shadow is written.
+const GPR_DEOPT_SHADOW_EMPTY_HI: i32 = i32::MIN;
+
+/// Raw qword snapshots for memory-authoritative logical slots. Physical homes
+/// may be shared, so the provenance is the exact VM register/global, never the
+/// home id. Vectors stay sorted for deterministic code and bounded lookup.
+#[derive(Default)]
+struct GprDeoptShadow {
+    regs: Vec<(u16, i32)>,
+    globs: Vec<(u32, i32)>,
+    reg_writes: usize,
+    glob_writes: usize,
+    recv_resets: usize,
+}
+
+impl GprDeoptShadow {
+    fn len(&self) -> usize {
+        self.regs.len().saturating_add(self.globs.len())
+    }
+
+    fn reg_slot(&self, r: u16) -> Option<i32> {
+        self.regs
+            .binary_search_by_key(&r, |&(rr, _)| rr)
+            .ok()
+            .map(|i| self.regs[i].1)
+    }
+
+    fn glob_slot(&self, gi: u32) -> Option<i32> {
+        self.globs
+            .binary_search_by_key(&gi, |&(g, _)| g)
+            .ok()
+            .map(|i| self.globs[i].1)
+    }
+}
+
+/// Exact destination model for the closed V1 instruction whitelist below.
+/// Keep this local instead of inheriting the broader planner's `writes_reg`:
+/// in particular, pinned `CallMethod` and inline `Math.imul` have explicit
+/// emitter write-through hooks and must be counted/proved here as definitions.
+fn gpr_deopt_shadow_def(instr: &Instr) -> Option<u16> {
+    match *instr {
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::Move { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Mod { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Neg { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::Bitwise { dst, .. }
+        | Instr::MathOp {
+            dst,
+            op: MathFn::Imul,
+            argc: 2,
+            ..
+        }
+        | Instr::CallMethod { dst, .. } => Some(dst),
+        _ => None,
+    }
+}
+
+/// Build the fail-closed V1 shadow layout. This proof is intentionally local
+/// to the emitter: it changes no shared `RegionPlan`, and returning `None`
+/// means the old boxed write-through/frame layout is emitted byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+fn gpr_deopt_shadow_plan(
+    proto: &FuncProto,
+    plan: &RegionPlan,
+    ta_plan: &TaPinPlan,
+    entry: &IntEntry<'_>,
+    s: usize,
+    e: usize,
+    map: &FxHashMap<u8, Loc>,
+    spill_base: i32,
+    n_spill: usize,
+) -> Option<GprDeoptShadow> {
+    if !gpr_deopt_shadow_enabled()
+        || ta_plan.pins.is_empty()
+        || ta_plan.pins.iter().any(|p| p.kind != DV_PIN_KIND)
+        || !entry.resume.is_empty()
+        || !entry.guards.is_empty()
+        || entry.regs_fits != (0, 0)
+        || !plan.split_recvs.is_disjoint(&plan.write_through)
+    {
+        return None;
+    }
+
+    // Closed, call-free body. CallMethod is admitted only when this exact ip
+    // is a pinned integer DataView getter; Math.imul is emitted inline too.
+    // Mul is admitted only when the existing range proof elides its guard, so
+    // its result is inside the i53 domain. An unproved Mul stays excluded: i64
+    // overflow is the one way a numeric def could collide with the EMPTY
+    // sentinel before a deopt.
+    for ip in s..=e {
+        match &proto.code[ip] {
+            Instr::Mul { .. } if plan.elide_guard.contains(&ip) => {}
+            Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::Move { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mod { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::Bitwise { .. } => {}
+            Instr::MathOp {
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } => {}
+            Instr::CallMethod { name, .. } => {
+                let &j = ta_plan.access.get(&ip)?;
+                if ta_plan.pins.get(j as usize)?.kind != DV_PIN_KIND
+                    || proto
+                        .string_constants
+                        .get(*name as usize)
+                        .and_then(|k| dv_get_kind(k))
+                        .map_or(true, |kind| kind > 6)
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    // Numeric B94/B97 logical registers get independent slots. A Bool B97
+    // member keeps its established Bool-home flush; a missing/inconsistent
+    // home or duplicate num_regs provenance refuses the whole optimization.
+    let mut reg_ids: Vec<u16> = plan
+        .split_recvs
+        .iter()
+        .chain(plan.write_through.iter())
+        .filter_map(|r| match plan.reg_home.get(r) {
+            Some(&Home::Xmm(_)) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    reg_ids.sort_unstable();
+    reg_ids.dedup();
+    for &r in plan.split_recvs.iter().chain(plan.write_through.iter()) {
+        match plan.reg_home.get(&r) {
+            Some(&Home::Xmm(_)) => {}
+            Some(&Home::Gpr(_)) if plan.write_through.contains(&r) => {}
+            _ => return None,
+        }
+    }
+    for &r in &reg_ids {
+        let Some(&Home::Xmm(x)) = plan.reg_home.get(&r) else {
+            return None;
+        };
+        let mut members = plan.num_regs.iter().filter(|&&(rr, _)| rr == r);
+        if members.next().map(|&(_, xx)| xx) != Some(x)
+            || members.next().is_some()
+            || plan.bool_regs.iter().any(|&(br, _)| br == r)
+            || !map.contains_key(&x)
+        {
+            return None;
+        }
+    }
+
+    let mut glob_ids: Vec<u32> = plan.narrow_globs.iter().copied().collect();
+    glob_ids.sort_unstable();
+    for &gi in &glob_ids {
+        let mut members = plan.globs.iter().filter(|&&(g, _)| g == gi);
+        let Some(x) = members.next().map(|&(_, x)| x) else {
+            return None;
+        };
+        if members.next().is_some() || !map.contains_key(&x) {
+            return None;
+        }
+    }
+
+    // A pin guard/snapshot is one of the few body/prologue paths that reads an
+    // interpreter slot directly. Never defer a slot it can observe. Likewise,
+    // receiver LoadGlobal reads its global from memory rather than glob_home.
+    for pin in &ta_plan.pins {
+        match pin.src {
+            TaPinSrc::Reg(r) if reg_ids.binary_search(&r).is_ok() => return None,
+            TaPinSrc::Global(gi) if glob_ids.binary_search(&gi).is_ok() => return None,
+            _ => {}
+        }
+    }
+
+    let mut reg_writes = 0usize;
+    let mut glob_writes = 0usize;
+    let mut recv_resets = 0usize;
+    let mut written_globs: FxHashSet<u32> = FxHashSet::default();
+    for ip in s..=e {
+        let instr = &proto.code[ip];
+        if plan.split_recv_lg.contains(&ip) {
+            match instr {
+                Instr::LoadGlobal { dst, .. }
+                    if plan.split_recvs.contains(dst) && reg_ids.binary_search(dst).is_ok() =>
+                {
+                    recv_resets = recv_resets.saturating_add(1);
+                }
+                _ => return None,
+            }
+        }
+        if let Some(d) = gpr_deopt_shadow_def(instr) {
+            // CallMethod/Math.imul use explicit emitter hooks. If either ever
+            // defines a split/write-through logical slot that is not one of
+            // the proven numeric shadows, declining is safer than relying on
+            // a Bool-home or missing-home path that V1 does not model.
+            if matches!(
+                instr,
+                Instr::CallMethod { .. }
+                    | Instr::MathOp {
+                        op: MathFn::Imul,
+                        argc: 2,
+                        ..
+                    }
+            ) && (plan.split_recvs.contains(&d) || plan.write_through.contains(&d))
+                && reg_ids.binary_search(&d).is_err()
+            {
+                return None;
+            }
+            if reg_ids.binary_search(&d).is_ok() {
+                if plan.dead.contains(&d)
+                    || plan.hoisted.contains(&d)
+                    || plan.hoist_len_ips.contains(&ip)
+                    || plan.dv_flag_elide.contains(&ip)
+                {
+                    return None;
+                }
+                if !plan.split_recv_lg.contains(&ip) {
+                    reg_writes = reg_writes.saturating_add(1);
+                }
+            }
+        }
+        match instr {
+            Instr::LoadGlobal { dst, idx }
+                if glob_ids.binary_search(idx).is_ok()
+                    && (plan.ta_recv_regs.contains(dst) || plan.split_recv_lg.contains(&ip)) =>
+            {
+                return None;
+            }
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. }
+                if glob_ids.binary_search(idx).is_ok() =>
+            {
+                glob_writes = glob_writes.saturating_add(1);
+                written_globs.insert(*idx);
+            }
+            _ => {}
+        }
+    }
+    if glob_ids.iter().any(|gi| !written_globs.contains(gi)) {
+        return None;
+    }
+
+    let n_shadow = reg_ids.len().saturating_add(glob_ids.len());
+    if n_shadow == 0 || n_shadow > GPR_DEOPT_SHADOW_CAP {
+        return None;
+    }
+    let spill_bytes = i32::try_from(n_spill).ok()?.checked_mul(8)?;
+    let mut next = spill_base.checked_add(spill_bytes)?;
+    let shadow_bytes = i32::try_from(n_shadow).ok()?.checked_mul(8)?;
+    next.checked_add(shadow_bytes)?;
+
+    let mut regs = Vec::with_capacity(reg_ids.len());
+    for r in reg_ids {
+        regs.push((r, next));
+        next = next.checked_add(8)?;
+    }
+    let mut globs = Vec::with_capacity(glob_ids.len());
+    for gi in glob_ids {
+        globs.push((gi, next));
+        next = next.checked_add(8)?;
+    }
+    Some(GprDeoptShadow {
+        regs,
+        globs,
+        reg_writes,
+        glob_writes,
+        recv_resets,
+    })
+}
 
 /// The home map and the hoisted-constant table, or the decline reason when
 /// the region is outside this mode's bounded scope (`Err(true)` = the live set
@@ -1033,6 +1363,61 @@ fn emit_int_box_branchless_from_loc(
     );
 }
 
+/// Mark one raw deopt-shadow slot EMPTY. Only the high dword is authoritative;
+/// a later numeric definition replaces the whole qword before it can be read.
+/// A dword mov preserves FLAGS, which matters for a receiver LoadGlobal between
+/// a fused compare and branch.
+fn emit_gpr_deopt_shadow_empty(ops: &mut dynasmrt::x64::Assembler, slot: i32) {
+    dynasm!(ops ; mov DWORD [rsp + slot + 4], GPR_DEOPT_SHADOW_EMPTY_HI);
+}
+
+/// Snapshot a canonical raw home into its logical deopt slot. A lazy source is
+/// sign-extended while copying; split/write-through register homes are already
+/// non-lazy by `lazy_sx_sets`, but narrowed globals can share a lazy home.
+/// Plain mov/movsxd instructions preserve FLAGS.
+fn emit_gpr_deopt_shadow_store(
+    ops: &mut dynasmrt::x64::Assembler,
+    src: Loc,
+    slot: i32,
+    lazy: &FxHashSet<u8>,
+) {
+    match src {
+        Loc::R(h) if lazy.contains(&h) => {
+            dynasm!(ops ; movsxd rax, Rd(h) ; mov [rsp + slot], rax);
+        }
+        Loc::R(h) => dynasm!(ops ; mov [rsp + slot], Rq(h)),
+        Loc::S(d) => dynasm!(ops ; mov rax, [rsp + d] ; mov [rsp + slot], rax),
+    }
+}
+
+enum GprDeoptShadowDst {
+    Reg(u16),
+    Glob(u32),
+}
+
+/// If `slot` is non-empty, box its raw integer and publish it to the exact
+/// interpreter destination. This runs only at `flush_exit`; entry_bail never
+/// reaches it. The high-dword test is collision-free by the planner's domain
+/// proof above.
+fn emit_gpr_deopt_shadow_flush(
+    ops: &mut dynasmrt::x64::Assembler,
+    slot: i32,
+    dst: GprDeoptShadowDst,
+) {
+    let empty = ops.new_dynamic_label();
+    dynasm!(ops
+        ; cmp DWORD [rsp + slot + 4], GPR_DEOPT_SHADOW_EMPTY_HI
+        ; je => empty
+        ; mov rax, [rsp + slot]
+    );
+    emit_int_box_from_rax(ops);
+    match dst {
+        GprDeoptShadowDst::Reg(r) => dynasm!(ops ; mov [rbx + dreg(r)], rax),
+        GprDeoptShadowDst::Glob(gi) => dynasm!(ops ; mov [r12 + (gi as i32) * 8], rax),
+    }
+    dynasm!(ops ; => empty);
+}
+
 /// B94 write-through on GPR homes (W8) — the twin of `emit_int_wt`: a numeric
 /// def of a split receiver (or write-through register) must reach MEMORY boxed
 /// as well as its home, because this emitter's flush_exit deliberately skips
@@ -1044,12 +1429,14 @@ fn emit_int_box_branchless_from_loc(
 /// branchless int-tag; the generic path boxes exactly as flush_exit would.
 /// Scratch: rax/rcx/rdx/xmm0 — never a home (the map hands those out from
 /// r15/rbp/r8..r11/rsi/rdi/r13/r14 only). Returns whether anything was
-/// emitted (the caller must then drop any live compare-flag fusion — the
-/// boxing clobbers FLAGS).
+/// emitted. The caller drops live compare-flag fusion only for the incumbent
+/// boxing path; a raw shadow copy preserves FLAGS.
 fn emit_int_wt_gpr(
     ops: &mut dynasmrt::x64::Assembler,
     plan: &RegionPlan,
     map: &FxHashMap<u8, Loc>,
+    shadow: &GprDeoptShadow,
+    lazy: &FxHashSet<u8>,
     dst: u16,
     known_i32: bool,
 ) -> bool {
@@ -1058,6 +1445,10 @@ fn emit_int_wt_gpr(
     }
     if let Some(&Home::Xmm(x)) = plan.reg_home.get(&dst) {
         if let Some(&l) = map.get(&x) {
+            if let Some(slot) = shadow.reg_slot(dst) {
+                emit_gpr_deopt_shadow_store(ops, l, slot, lazy);
+                return true;
+            }
             if known_i32 {
                 // Zero-extend the i32 payload (a 32-bit load/mov zero-extends;
                 // a W10.3 slot holds the canonical i64, whose low 32 IS the
@@ -1248,6 +1639,12 @@ pub(crate) fn compile_region_int_gpr(
     // write-through and W10.3 spilled homes are never members — see
     // `lazy_sx_sets`).
     let (lazy, strict) = lazy_sx_sets(proto, plan, s, e, &map, &hoist_c);
+    // V1 deopt shadows are local to call-free, unspliced, all-DV plans. Any
+    // failed proof produces the empty plan and therefore the exact old boxed
+    // write-through/frame bytes.
+    let shadow =
+        gpr_deopt_shadow_plan(proto, plan, ta_plan, entry, s, e, &map, spill_base, n_spill)
+            .unwrap_or_default();
     // Home location of raw xmm-index `x` / dst register `r` (dsts are never
     // hoisted-const, so their home is always mapped).
     let gx = |x: u8| map[&x];
@@ -1281,6 +1678,16 @@ pub(crate) fn compile_region_int_gpr(
         for sr in srs {
             eprintln!("[jit] INT-GPR region [{start},{end}] B94 split receiver r{sr}");
         }
+        if shadow.len() > 0 {
+            eprintln!(
+                "[jit] INT-GPR region [{start},{end}] GPR deopt-shadow engaged regs={} globs={} reg-writes={} glob-writes={} recv-resets={}",
+                shadow.regs.len(),
+                shadow.globs.len(),
+                shadow.reg_writes,
+                shadow.glob_writes,
+                shadow.recv_resets
+            );
+        }
     }
 
     let mut ops = match dynasmrt::x64::Assembler::new() {
@@ -1301,12 +1708,14 @@ pub(crate) fn compile_region_int_gpr(
     // pool) and minus the xmm6..15 save area (no xmm homes; only the volatile
     // xmm0/xmm1 are scratched). 8 pushes keep rsp ≡ 8 (mod 16) before the subs,
     // so both call sites below stay 16-aligned. Frame: [shadow 32]
-    // [TA snapshot slots 32·n_ta][resume-ip pointer 8][W10.3 spill slots
-    // 8·n_spill, rounded up to 16]; the ip slot frees rsi. The spill area must
-    // be a 16-byte multiple so frame stays ≡ 8 (mod 16) — the pin-snapshot
+    // [TA snapshot slots 32·n_ta][resume-ip pointer 8][W10.3 spill slots]
+    // [raw deopt-shadow slots], with the combined tail rounded up to 16; the
+    // ip slot frees rsi. The tail must be a 16-byte multiple so frame stays
+    // ≡ 8 (mod 16) — the pin-snapshot
     // `call rax` sites below run after `sub rsp, frame` and need rsp ≡ 0.
     let n_ta = ta_plan.pins.len() as i32;
-    let frame = 40 + 32 * n_ta + ((8 * n_spill as i32 + 15) & !15);
+    let n_raw_slots = n_spill.saturating_add(shadow.len());
+    let frame = 40 + 32 * n_ta + ((8 * n_raw_slots as i32 + 15) & !15);
     let ta_base = 32i32;
     let ip_slot = 32 + 32 * n_ta;
     debug_assert_eq!(spill_base, 40 + 32 * n_ta);
@@ -1361,6 +1770,15 @@ pub(crate) fn compile_region_int_gpr(
         if plan.hoist_pins.contains(&(j as u8)) {
             dynasm!(ops ; cmp QWORD [rsp + ta_base + 32 * j as i32], 0 ; je => entry_bail);
         }
+    }
+    // All helper calls are now behind us. Raw slots are not GC roots and the
+    // proven body issues no calls/re-entry; initialize only their high-word
+    // EMPTY marker. Any later numeric definition overwrites the whole qword.
+    for &(_, slot) in &shadow.regs {
+        emit_gpr_deopt_shadow_empty(&mut ops, slot);
+    }
+    for &(_, slot) in &shadow.globs {
+        emit_gpr_deopt_shadow_empty(&mut ops, slot);
     }
     // Live-in loads (globals, regs, then bools — same order and same guards as
     // the xmm tier; the bool loader's rdx scratch never aliases a home). A
@@ -1515,6 +1933,14 @@ pub(crate) fn compile_region_int_gpr(
                 if plan.ta_recv_regs.contains(&dst) || plan.split_recv_lg.contains(&ip) =>
             {
                 emit_recv_slot_store(&mut ops, dst, idx);
+                // The frame now holds the receiver object. A stale numeric
+                // split snapshot must not overwrite it if the following DV
+                // guard exits before defining the recycled register again.
+                if plan.split_recv_lg.contains(&ip) {
+                    if let Some(slot) = shadow.reg_slot(dst) {
+                        emit_gpr_deopt_shadow_empty(&mut ops, slot);
+                    }
+                }
                 flag_cmp = prev_flag;
             }
             Instr::LoadGlobal { dst, idx } => {
@@ -1534,7 +1960,14 @@ pub(crate) fn compile_region_int_gpr(
                 if !same {
                     emit_loc_copy(&mut ops, gg, src(sr), &lazy);
                 }
-                if plan.narrow_globs.contains(&idx) {
+                if let Some(slot) = shadow.glob_slot(idx) {
+                    // The call-free proof makes the interpreter global slot
+                    // unobservable until an exit. Preserve the logical store
+                    // as a raw per-global snapshot; a shared physical home may
+                    // be reused immediately afterwards.
+                    emit_gpr_deopt_shadow_store(&mut ops, gg, slot, &lazy);
+                    flag_cmp = prev_flag; // raw copy/store leaves FLAGS intact
+                } else if plan.narrow_globs.contains(&idx) {
                     // Write-through: flush_exit skips this slot (at a
                     // mid-iteration exit the narrowed home may already belong
                     // to another value), so memory must receive the value HERE
@@ -1590,7 +2023,7 @@ pub(crate) fn compile_region_int_gpr(
                         Loc::R(dg) => dynasm!(ops ; mov Rq(dg), rax),
                         Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
                     }
-                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
+                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                     if !plan.elide_guard.contains(&ip) {
                         emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                     }
@@ -1657,7 +2090,7 @@ pub(crate) fn compile_region_int_gpr(
                         }
                     }
                 }
-                wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
+                wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                 if !plan.elide_guard.contains(&ip) {
                     emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                 }
@@ -1743,7 +2176,7 @@ pub(crate) fn compile_region_int_gpr(
                         ; jmp => flush_exit
                         ; => done
                     );
-                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
+                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                     emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                 }
             }
@@ -1801,7 +2234,7 @@ pub(crate) fn compile_region_int_gpr(
                                 dynasm!(ops ; mov Rq(d), Rq(ag));
                             }
                             dynasm!(ops ; add Rq(d), imm); // sign-extended imm32 == i64 add
-                            wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
+                            wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                             if !plan.elide_guard.contains(&ip) {
                                 emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                             }
@@ -1828,7 +2261,7 @@ pub(crate) fn compile_region_int_gpr(
                             if let Loc::R(d) = dl {
                                 dynasm!(ops ; mov Rq(d), rax);
                             }
-                            wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
+                            wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                             if !plan.elide_guard.contains(&ip) {
                                 emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                             }
@@ -1856,7 +2289,7 @@ pub(crate) fn compile_region_int_gpr(
                     Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
                     Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
                 }
-                wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, dst, false);
+                wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
                 if !plan.elide_guard.contains(&ip) {
                     emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                 }
@@ -2171,11 +2604,14 @@ pub(crate) fn compile_region_int_gpr(
                     ; jmp => flush_exit
                     ; => done
                 );
-                // W9: writes_reg is blind to CallMethod, so the generic
-                // write-through hook below never fires for this def — emit it
-                // explicitly (a membership no-op unless dst is a split or
-                // W9-wt-shared register). 0..255 is provably i32.
-                emit_int_wt_gpr(&mut ops, plan, &map, dst, true);
+                // Emit the write-through at the explicit CallMethod def site;
+                // the generic hook sees it too, so `wt_pre` suppresses that
+                // duplicate only for an engaged shadow. The empty/switch-off
+                // plan deliberately retains the incumbent bytes. 0..255 is i32.
+                let emitted = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, true);
+                if shadow.reg_slot(dst).is_some() {
+                    wt_pre = emitted;
+                }
             }
             // ── W9: pinned-DataView get* on GPR homes ── the B115 DOUBLE arm's
             // guard set MINUS the integral-pos cvttsd2si round-trip (every home
@@ -2320,12 +2756,15 @@ pub(crate) fn compile_region_int_gpr(
                     ; jmp => flush_exit
                     ; => done
                 );
-                // A DV dst can be a split receiver's numeric half, and
-                // writes_reg is blind to CallMethod so the generic post-op
-                // write-through hook never fires — emit it explicitly (a
-                // membership no-op otherwise). Kinds 0-5 are provably i32;
-                // kind 6 (u32) takes the generic box.
-                emit_int_wt_gpr(&mut ops, plan, &map, dst, kindid <= 5);
+                // A DV dst can be a split receiver's numeric half. Emit its
+                // explicit write-through here; `wt_pre` suppresses the generic
+                // duplicate only for an engaged shadow, preserving old bytes
+                // for an empty/switch-off plan. Kinds 0-5 are provably i32.
+                let emitted =
+                    emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, kindid <= 5);
+                if shadow.reg_slot(dst).is_some() {
+                    wt_pre = emitted;
+                }
             }
             // ── pinned length ── str.length / arr.length from the snapshot.
             Instr::GetProp { dst, .. }
@@ -2422,7 +2861,10 @@ pub(crate) fn compile_region_int_gpr(
                 // The generic writes_reg hook covers MathOp dsts, but this arm
                 // writes through explicitly like the DV arm (membership no-op
                 // otherwise). An imul result is ToInt32 — provably i32.
-                emit_int_wt_gpr(&mut ops, plan, &map, dst, true);
+                let emitted = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, true);
+                if shadow.reg_slot(dst).is_some() {
+                    wt_pre = emitted;
+                }
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 emit_store_ip(&mut ops, ip_slot, rip_at);
@@ -2453,8 +2895,11 @@ pub(crate) fn compile_region_int_gpr(
                     proto.code[ip],
                     Instr::MathOp { op: MathFn::Imul, argc: 2, .. }
                 );
-                if emit_int_wt_gpr(&mut ops, plan, &map, d, known_i32) {
-                    flag_cmp = None; // the boxing clobbered FLAGS
+                let shadowed = shadow.reg_slot(d).is_some();
+                if emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, d, known_i32)
+                    && !shadowed
+                {
+                    flag_cmp = None; // the incumbent boxing path clobbered FLAGS
                 }
             }
         }
@@ -2488,6 +2933,17 @@ pub(crate) fn compile_region_int_gpr(
     lazy_fix.sort_unstable();
     for h in lazy_fix {
         dynasm!(ops ; movsxd Rq(h), Rd(h));
+    }
+    // Publish only logical slots whose def ran on this path. EMPTY register
+    // shadows leave the frame's prior Value (or a freshly loaded receiver
+    // object) intact; EMPTY global shadows leave the prior global intact.
+    // Every V1-eligible native exit reaches this block, including meter/branch
+    // stubs, arithmetic guards and pinned-DV deopts (Return is locally refused).
+    for &(r, slot) in &shadow.regs {
+        emit_gpr_deopt_shadow_flush(&mut ops, slot, GprDeoptShadowDst::Reg(r));
+    }
+    for &(gi, slot) in &shadow.globs {
+        emit_gpr_deopt_shadow_flush(&mut ops, slot, GprDeoptShadowDst::Glob(gi));
     }
     for &(r, x) in &plan.num_regs {
         // A B94 split receiver is written through (boxed) at each numeric def,

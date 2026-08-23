@@ -59,6 +59,10 @@ where
     /// This is true for ASCII and UTF8, but not for UCS2 or UTF16.
     const CODE_UNITS_ARE_BYTES: bool;
 
+    /// Whether each input element is one byte with ASCII matcher semantics.
+    /// UTF-8 is byte-addressed too, but must not use ASCII-twin-only plans.
+    const ASCII_ELEMENTS: bool = false;
+
     /// PATCH (see rxjit.rs): the raw bytes when this input is byte-addressed
     /// with ASCII element semantics (`AsciiInput`) — the only input type the
     /// native regex code path may run over. Default: none.
@@ -652,6 +656,7 @@ impl<'a> InputIndexer for AsciiInput<'a> {
     type Element = u8;
     type CharProps = matchers::ASCIICharProperties;
     const CODE_UNITS_ARE_BYTES: bool = true;
+    const ASCII_ELEMENTS: bool = true;
 
     /// PATCH (see rxjit.rs): AsciiInput is the byte-addressed input the
     /// native code path understands.

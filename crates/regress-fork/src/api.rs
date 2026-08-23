@@ -521,10 +521,14 @@ impl Regex {
         #[cfg(feature = "linear-ascii")]
         let linear_candidate = crate::linear::collect_candidate(pattern.clone(), flags);
         let mut ire = parse::try_parse(pattern, flags)?;
+        // Plan against the parser IR, before mandatory loop iterations are
+        // unrolled. This preserves the exact P + one-required-loop-byte proof.
+        let suffix_start = crate::suffix_start::derive(&ire);
         if !flags.no_opt {
             optimizer::optimize_bytes(&mut ire);
         }
-        let cr = emit::emit(&ire);
+        let mut cr = emit::emit(&ire);
+        cr.suffix_start = suffix_start;
         Ok(Regex {
             cr,
             #[cfg(feature = "linear-ascii")]
@@ -532,6 +536,12 @@ impl Regex {
             #[cfg(feature = "linear-ascii")]
             linear_ascii: Default::default(),
         })
+    }
+
+    /// Test/debug hook for the local ASCII start-prefilter mechanism.
+    #[doc(hidden)]
+    pub fn __rx_suffix_start_kind(&self) -> Option<&'static str> {
+        self.cr.suffix_start.as_ref().map(|plan| plan.kind())
     }
 
     /// Return the executor available for ASCII-only subjects.

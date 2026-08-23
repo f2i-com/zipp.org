@@ -130,6 +130,24 @@ pub(crate) fn concat_fuse_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_PAD2_CACHE=1` restores literal `"0" + x` / `"" + x` to the
+/// historical `LoadConst` + `Add` bytecode. The specialized opcode retains the
+/// exact `+` fallback; this compiler-side switch also removes its dispatch cost.
+#[inline]
+pub(crate) fn pad2_cache_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PAD2_CACHE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// How a property's value arrives: an ordinary expression (`k: v`, `[k]: v`), or
 /// a method/accessor's own `Function` node (`m(){}`, `get k(){}`). oxc modelled
 /// the second as a `FunctionExpression` in `value`; `ast` names it directly, so
@@ -1687,6 +1705,24 @@ impl<'a> FnCompiler<'a> {
                     imm = -imm;
                 }
                 self.emit(Instr::AddInt { dst, a, imm, upd: false });
+                return Ok(dst);
+            }
+        }
+        // `pad2(n) { return n < 10 ? "0" + n : "" + n; }`: the literal
+        // evaluation is unobservable, and Pad2Concat retains an exact ordinary
+        // `+` fallback for every non-eligible runtime value. Keep the pattern
+        // deliberately literal-left and two-leaf: swapping operands would
+        // change string output and accepting an expression prefix could change
+        // evaluation/ToPrimitive order.
+        if matches!(op, Op::Add) && pad2_cache_enabled() {
+            let zero = match left {
+                ast::Expr::Str(StrVal::Utf8(s)) if s == "0" => Some(true),
+                ast::Expr::Str(StrVal::Utf8(s)) if s.is_empty() => Some(false),
+                _ => None,
+            };
+            if let Some(zero) = zero {
+                let src = self.expr(right)?;
+                self.emit(Instr::Pad2Concat { dst, src, zero });
                 return Ok(dst);
             }
         }

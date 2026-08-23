@@ -14,6 +14,7 @@ use crate::matchers::CharProperties;
 use crate::position::PositionType;
 use crate::scm;
 use crate::scm::SingleCharMatcher;
+use crate::suffix_start;
 use crate::types::{CaptureGroupID, GroupData, IP, LoopData, LoopID, MAX_CAPTURE_GROUPS};
 use crate::util::DebugCheckIndex;
 #[cfg(not(feature = "std"))]
@@ -33,6 +34,9 @@ pub(crate) mod rxstats {
     pub static GREEDY1_RETRIES: AtomicU64 = AtomicU64::new(0);
     pub static POSSESSIVE_ELIDED: AtomicU64 = AtomicU64::new(0);
     pub static SKIPS: AtomicU64 = AtomicU64::new(0);
+    pub static SUFFIX_LITERAL_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static SUFFIX_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+    pub static SUFFIX_CAP_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
     /// Cached read of `ZIPP_RXSTATS`.
     #[inline(always)]
@@ -68,6 +72,18 @@ pub fn rx_stats() -> (u64, u64, u64, u64, u64) {
         rxstats::GREEDY1_RETRIES.load(Relaxed),
         rxstats::POSSESSIVE_ELIDED.load(Relaxed),
         rxstats::SKIPS.load(Relaxed),
+    )
+}
+
+/// Local `ZIPP_RXSTATS=1` counters for the ASCII suffix-start mechanism:
+/// (derived-literal hits, engine candidates, cap-triggered incumbent fallbacks).
+#[cfg(feature = "std")]
+pub fn rx_suffix_start_stats() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        rxstats::SUFFIX_LITERAL_HITS.load(Relaxed),
+        rxstats::SUFFIX_CANDIDATES.load(Relaxed),
+        rxstats::SUFFIX_CAP_FALLBACKS.load(Relaxed),
     )
 }
 
@@ -129,6 +145,19 @@ enum BacktrackInsn<Input: InputIndexer> {
 struct State<Position: PositionType> {
     loops: Vec<LoopData<Position>>,
     groups: Vec<GroupData<Position>>,
+}
+
+enum SuffixSearch<Position> {
+    Found {
+        candidate: Position,
+        /// If this candidate fails, every other possible start using the same
+        /// delimiter fails too. Resume at delimiter+1 to retain overlaps.
+        fail_resume: Position,
+    },
+    Exhausted,
+    /// The bounded proof became ambiguous. Retry the incumbent search from the
+    /// caller's original position; do not advance past any untested start.
+    Fallback,
 }
 
 #[derive(Debug)]
@@ -1133,6 +1162,124 @@ impl<'r, Input: InputIndexer> BacktrackExecutor<'r, Input> {
 }
 
 impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
+    #[inline(always)]
+    fn suffix_candidate(&self, start: Input::Position) -> SuffixSearch<Input::Position> {
+        debug_assert!(Input::ASCII_ELEMENTS);
+        let inp = self.input;
+        let Some(plan) = self.matcher.re.suffix_start.as_ref() else {
+            return SuffixSearch::Fallback;
+        };
+        match plan {
+            suffix_start::Plan::RequiredPrefix { literal } => {
+                let Some(candidate) = inp.find_bytes(start, literal.finder()) else {
+                    return SuffixSearch::Exhausted;
+                };
+                rxstat!(SUFFIX_LITERAL_HITS);
+                let Some(fail_resume) = inp.next_right_pos(candidate) else {
+                    return SuffixSearch::Exhausted;
+                };
+                rxstat!(SUFFIX_CANDIDATES);
+                SuffixSearch::Found {
+                    candidate,
+                    fail_resume,
+                }
+            }
+            suffix_start::Plan::RunLiteral {
+                literal,
+                class,
+                min,
+                max,
+            } => {
+                let Some(mut literal_resume) = inp.try_move_right(start, *min) else {
+                    return SuffixSearch::Exhausted;
+                };
+                loop {
+                    let Some(delimiter) = inp.find_bytes(literal_resume, literal.finder()) else {
+                        return SuffixSearch::Exhausted;
+                    };
+                    rxstat!(SUFFIX_LITERAL_HITS);
+                    // The literal is nonempty, so delimiter is strictly before
+                    // right_end and delimiter+1 always exists.
+                    let Some(fail_resume) = inp.next_right_pos(delimiter) else {
+                        return SuffixSearch::Exhausted;
+                    };
+
+                    let proof_limit = max.unwrap_or(usize::MAX);
+                    let scan_limit = proof_limit.min(suffix_start::MAX_BACKSCAN);
+                    let mut candidate = delimiter;
+                    let mut run_len = 0usize;
+                    while candidate != start && run_len < scan_limit {
+                        let Some(byte) = inp.peek_byte_left(candidate) else {
+                            break;
+                        };
+                        if !class.contains(byte) {
+                            break;
+                        }
+                        let Some(previous) = inp.next_left_pos(candidate) else {
+                            break;
+                        };
+                        candidate = previous;
+                        run_len += 1;
+                    }
+
+                    // If a wider/unbounded run still has a class byte before
+                    // the cap, an earlier candidate may exist. Abandon this
+                    // prefilter for the current caller start; the incumbent
+                    // search restarts at `start`, not delimiter or candidate.
+                    if scan_limit == suffix_start::MAX_BACKSCAN
+                        && proof_limit > scan_limit
+                        && candidate != start
+                        && inp
+                            .peek_byte_left(candidate)
+                            .is_some_and(|b| class.contains(b))
+                    {
+                        rxstat!(SUFFIX_CAP_FALLBACKS);
+                        return SuffixSearch::Fallback;
+                    }
+
+                    if run_len >= *min {
+                        rxstat!(SUFFIX_CANDIDATES);
+                        return SuffixSearch::Found {
+                            candidate,
+                            fail_resume,
+                        };
+                    }
+                    // This occurrence has too few class bytes immediately
+                    // before it. d+1 retains overlapping literal occurrences.
+                    literal_resume = fail_resume;
+                }
+            }
+        }
+    }
+
+    /// Resolve one attempt position. A cap ambiguity disables the prefilter
+    /// for the rest of this search call and immediately retries the incumbent
+    /// prefix search from the unmodified `start`.
+    #[inline(always)]
+    fn find_attempt_start<PrefixSearch: bytesearch::ByteSearcher>(
+        &self,
+        start: Input::Position,
+        prefix_search: &PrefixSearch,
+        suffix_active: &mut bool,
+    ) -> Option<(Input::Position, Option<Input::Position>)> {
+        if *suffix_active {
+            match self.suffix_candidate(start) {
+                SuffixSearch::Found {
+                    candidate,
+                    fail_resume,
+                } => return Some((candidate, Some(fail_resume))),
+                SuffixSearch::Exhausted => return None,
+                SuffixSearch::Fallback => *suffix_active = false,
+            }
+        }
+        let candidate = if Input::CODE_UNITS_ARE_BYTES {
+            self.input.find_bytes(start, prefix_search)?
+        } else {
+            start
+        };
+        Some((candidate, None))
+    }
+
     /// PATCH (see rxjit.rs): one top-level forward match attempt — native
     /// code when this regex has compiled and the input is byte-addressed,
     /// the interpreter otherwise. Both paths leave identical observable
@@ -1229,6 +1376,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         prefix_search: &PrefixSearch,
     ) -> Option<Match> {
         let inp = self.input;
+        let mut suffix_active = Input::ASCII_ELEMENTS && self.matcher.re.suffix_start.is_some();
         // PATCH (see rxjit.rs): when this regex has native code and the input
         // is byte-addressed, run the whole advance loop inside one scan
         // session — the per-attempt TLS borrow and context build hoist out.
@@ -1250,9 +1398,9 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                 if let Some(code) = code {
                     return crate::rxjit::with_session(code, bytes, |sess| {
                         loop {
-                            if Input::CODE_UNITS_ARE_BYTES {
-                                pos = inp.find_bytes(pos, prefix_search)?;
-                            }
+                            let (candidate, suffix_fail_resume) =
+                                self.find_attempt_start(pos, prefix_search, &mut suffix_active)?;
+                            pos = candidate;
                             // PATCH (see possessify.rs): a fresh attempt must
                             // not observe a hint recorded by an earlier one.
                             self.matcher.skip_hint = None;
@@ -1293,7 +1441,11 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                             // PATCH (see possessify.rs): if the failed attempt proved a whole
                             // run matchless, resume after the run instead.
                             let hint = self.matcher.skip_hint.take();
-                            pos = inp.next_right_pos(pos)?;
+                            pos = if let Some(resume) = suffix_fail_resume {
+                                resume
+                            } else {
+                                inp.next_right_pos(pos)?
+                            };
                             if let Some(h) = hint {
                                 if h > pos {
                                     rxstat!(SKIPS);
@@ -1306,12 +1458,9 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             }
         }
         loop {
-            // Find the next start location, or None if none.
-            // Don't try this unless CODE_UNITS_ARE_BYTES - i.e. don't do byte searches
-            // on UTF-16 or UCS2.
-            if Input::CODE_UNITS_ARE_BYTES {
-                pos = inp.find_bytes(pos, prefix_search)?;
-            }
+            let (candidate, suffix_fail_resume) =
+                self.find_attempt_start(pos, prefix_search, &mut suffix_active)?;
+            pos = candidate;
             // PATCH (see possessify.rs): a fresh attempt must not observe a
             // hint recorded by an earlier one.
             self.matcher.skip_hint = None;
@@ -1329,7 +1478,11 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             // PATCH (see possessify.rs): if the failed attempt proved a whole
             // run matchless, resume after the run instead.
             let hint = self.matcher.skip_hint.take();
-            pos = inp.next_right_pos(pos)?;
+            pos = if let Some(resume) = suffix_fail_resume {
+                resume
+            } else {
+                inp.next_right_pos(pos)?
+            };
             if let Some(h) = hint {
                 if h > pos {
                     rxstat!(SKIPS);
@@ -1448,6 +1601,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         let Some(mut pos) = inp.try_move_right(inp.left_end(), start) else {
             return true;
         };
+        let mut suffix_active = Input::ASCII_ELEMENTS && self.matcher.re.suffix_start.is_some();
         let mut caps_buf: Vec<Option<Range<usize>>> =
             Vec::with_capacity(self.matcher.re.groups as usize);
         let mut emitted = 0usize;
@@ -1468,12 +1622,15 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                     return crate::rxjit::with_session(code, bytes, |sess| {
                         'hits: while emitted < cap {
                             loop {
-                                if Input::CODE_UNITS_ARE_BYTES {
-                                    pos = match inp.find_bytes(pos, prefix_search) {
-                                        Some(p) => p,
-                                        None => return true,
-                                    };
-                                }
+                                let (candidate, suffix_fail_resume) = match self.find_attempt_start(
+                                    pos,
+                                    prefix_search,
+                                    &mut suffix_active,
+                                ) {
+                                    Some(found) => found,
+                                    None => return true,
+                                };
+                                pos = candidate;
                                 // PATCH (see possessify.rs): a fresh attempt must
                                 // not observe a hint recorded by an earlier one.
                                 self.matcher.skip_hint = None;
@@ -1524,9 +1681,13 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                                 // proved a whole run matchless, resume after the
                                 // run instead.
                                 let hint = self.matcher.skip_hint.take();
-                                pos = match inp.next_right_pos(pos) {
-                                    Some(p) => p,
-                                    None => return true,
+                                pos = if let Some(resume) = suffix_fail_resume {
+                                    resume
+                                } else {
+                                    match inp.next_right_pos(pos) {
+                                        Some(p) => p,
+                                        None => return true,
+                                    }
                                 };
                                 if let Some(h) = hint {
                                     if h > pos {
@@ -1543,12 +1704,12 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         }
         'hits: while emitted < cap {
             loop {
-                if Input::CODE_UNITS_ARE_BYTES {
-                    pos = match inp.find_bytes(pos, prefix_search) {
-                        Some(p) => p,
+                let (candidate, suffix_fail_resume) =
+                    match self.find_attempt_start(pos, prefix_search, &mut suffix_active) {
+                        Some(found) => found,
                         None => return true,
                     };
-                }
+                pos = candidate;
                 // PATCH (see possessify.rs): a fresh attempt must not observe a
                 // hint recorded by an earlier one.
                 self.matcher.skip_hint = None;
@@ -1572,9 +1733,13 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                 // PATCH (see possessify.rs): if the failed attempt proved a whole
                 // run matchless, resume after the run instead.
                 let hint = self.matcher.skip_hint.take();
-                pos = match inp.next_right_pos(pos) {
-                    Some(p) => p,
-                    None => return true,
+                pos = if let Some(resume) = suffix_fail_resume {
+                    resume
+                } else {
+                    match inp.next_right_pos(pos) {
+                        Some(p) => p,
+                        None => return true,
+                    }
                 };
                 if let Some(h) = hint {
                     if h > pos {

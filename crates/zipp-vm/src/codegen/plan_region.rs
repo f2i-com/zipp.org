@@ -2080,6 +2080,9 @@ fn plan_region_cold_inner(
                     | Instr::Mod { .. }
                     | Instr::StrConcat { .. }
                     | Instr::StrAppendInPlace { .. }
+                    | Instr::AddRightPair { .. }
+                    | Instr::Pad2Concat { .. }
+                    | Instr::Pad2Conditional { .. }
                     | Instr::StrConcatChain { .. }
                     | Instr::Bitwise { .. }
                     | Instr::Lt { .. }
@@ -3692,6 +3695,9 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::LooseNe { a, b, .. }
         | Instr::JumpIfNotLt { a, b, .. }
         | Instr::JumpIfNotLe { a, b, .. } => vec![a, b],
+        Instr::AddRightPair { a, b, c, .. } => vec![a, b, c],
+        Instr::Pad2Concat { src, .. } => vec![src],
+        Instr::Pad2Conditional { src, .. } => vec![src],
         // Unary value ops. `TypeOf`/`TypeOfIs` are the pair this table was
         // missing; see the note above.
         Instr::ToNum { a, .. }
@@ -4123,4 +4129,3 @@ pub(crate) fn plan_field_promotion(
     }
     Some(FieldPromotePlan { obj_global: g, fields, obj_idx, obj_version: heap.version_of(obj_idx) })
 }
-

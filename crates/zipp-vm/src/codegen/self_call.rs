@@ -21,6 +21,12 @@ pub const SELF_CALL_DEOPT: u64 = 0x7FFE_DEAD_BEEF_0000;
 /// produces.
 pub const CALL_THREW: u64 = 0x7FFE_DEAD_BEEF_0001;
 
+/// Completed allocation-free `SetIndexConcat` write. Unlike zero (the generic
+/// helper-success result), this proves no VM heap allocation, GC safe point, or
+/// user-code re-entry occurred, so a region may keep its pinned heap/IC bases
+/// and TypedArray snapshots. Another impossible quiet-NaN Value pattern.
+pub const CONCAT_SET_PURE: u64 = 0x7FFE_DEAD_BEEF_0003;
+
 /// Sentinel the `*_prop_miss` helpers return when the access resolves to
 /// something only the interpreter's per-site IC machinery can serve — an
 /// ACCESSOR that must frame-call user code, or a CLASS-INSTANCE receiver

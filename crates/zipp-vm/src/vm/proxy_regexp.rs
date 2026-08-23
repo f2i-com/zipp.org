@@ -179,6 +179,40 @@ pub(crate) const ITFB_FUSED: u8 = 1 << 2;
 pub(crate) const ITFB_STICKY: u8 = 1 << 3;
 pub(crate) const ITFB_INDICES: u8 = 1 << 4;
 
+/// One not-yet-observable matchAll result. Offsets are byte indices into the
+/// iterator record's immutable flat-ASCII subject; `u32::MAX` in both capture
+/// cells denotes an unparticipating group. The exact plan admits at most four
+/// captures, so this contains no heap Values and adds no GC tracing work.
+#[derive(Clone, Copy)]
+pub(crate) struct RegexpScalarMatch {
+    mstart: u32,
+    mend: u32,
+    ncaps: u8,
+    caps: [u32; 8],
+}
+
+/// One not-yet-observable result from the exact non-global exec region.  The
+/// subject is an explicit VM root; all remaining fields are byte ranges into
+/// that immutable flat-ASCII string.
+#[derive(Clone, Copy)]
+pub(crate) struct RegexpScalarExecPending {
+    pub(crate) subject: Value,
+    subj_units: u32,
+    matched: RegexpScalarMatch,
+}
+
+pub(crate) enum RegexpScalarExecStep {
+    Success([Value; 4]),
+    Miss,
+    Decline,
+}
+
+pub(crate) enum RegexpScalarStep {
+    Success,
+    Done,
+    Decline,
+}
+
 /// One lazy %RegExpStringIterator%'s state — the value of
 /// `Vm::regexp_string_iters`, keyed by the iterator's heap index. Its
 /// `next()` drives RegExpExec (honouring a user `exec`) one match at a time,
@@ -202,6 +236,9 @@ pub(crate) struct RegexpIterRec {
     /// Done latch: set by a null result or the single match of a non-global
     /// regex; every later step answers `(undefined, true)`.
     pub done: bool,
+    /// Range-only result held strictly inside an active exact scalar region.
+    /// Every native exit/re-entry materialises and clears it.
+    pub(crate) scalar_pending: Option<RegexpScalarMatch>,
 }
 
 /// Matches served per drain of the fused matchAll batch. The drain runs at
@@ -312,7 +349,10 @@ impl<'p> Vm<'p> {
             _ => return false,
         }
         if self.arr_props.get(&re).is_some_and(|m| {
-            m.pos("exec").is_some() || m.pos("flags").is_some() || m.pos("@@replace").is_some()
+            m.pos("exec").is_some()
+                || m.pos("flags").is_some()
+                || m.pos("@@replace").is_some()
+                || Self::FLAG_ACCESSORS.iter().any(|(name, _)| m.pos(name).is_some())
         }) {
             return false;
         }
@@ -340,34 +380,55 @@ impl<'p> Vm<'p> {
         // regex and, when global, sets it to 0 before matching and leaves it
         // there — `"aaaa".replace(/a/g, "b")` must end with `lastIndex === 0`,
         // and a sticky `re` with `lastIndex === 5` must resume at 5.
-        let (flags, last_index) = match self.heap.get(re) {
-            HeapObj::RegExp { flags, last_index, .. } => (flags.clone(), *last_index),
+        let (sticky, global, last_index) = match self.heap.get(re) {
+            HeapObj::RegExp { flags, last_index, .. } => {
+                (flags.contains('y'), flags.contains('g'), *last_index)
+            }
             _ => return false,
         };
-        if flags.contains('y') {
+        if sticky {
             return false;
         }
-        if !(last_index.is_number() && last_index.as_f64() == 0.0) {
+        // `-0` compares equal to `+0`, but a GLOBAL @@replace performs
+        // `Set(rx, "lastIndex", +0, true)` before matching.  Skipping that
+        // write would leave an observably negative zero behind
+        // (`Object.is(rx.lastIndex, -0)`).  A non-global replace never writes
+        // lastIndex, so retaining -0 is correct there.
+        if !last_index.is_number()
+            || last_index.as_f64() != 0.0
+            || (global && last_index.as_f64().is_sign_negative())
+        {
             return false;
         }
         // `@@replace` step 8.b is `Set(rx, "lastIndex", 0, true)` for a GLOBAL
         // regex. The fast path skips it because `lastIndex` is already 0 — which
         // is unobservable only while the property is writable; on a frozen regex
         // that Set is a TypeError, and the fast path swallowed it.
-        if flags.contains('g') && !self.regexp_last_index_writable(re) {
+        if global && !self.regexp_last_index_writable(re) {
             return false;
         }
-        // `@@replace` also reads `global` and `unicode` off the INSTANCE, so a
-        // patched accessor on the prototype is observable.
+        // `@@replace` reads `flags`; the intrinsic flags getter in turn reads
+        // all eight flag accessors. Prove every live accessor's exact Native id
+        // (not merely "some native": swapping e.g. the `global` and `unicode`
+        // getters is observable). This is allocation-free, so a direct-call
+        // decline remains a pure prefix.
         match self.heap.get(self.regexp_proto) {
-            HeapObj::Object(m) => ["global", "unicode", "flags", "source"].iter().all(|k| {
-                m.pos(k).is_none_or(|i| {
-                    let a = m.attrs[i];
-                    a.accessor
-                        && m.vals[i].is_heap()
-                        && matches!(self.heap.get(m.vals[i].heap_index()), HeapObj::Native(_))
-                })
-            }),
+            HeapObj::Object(m) => {
+                let accessor = |name: &str, want: u16| {
+                    m.pos(name).is_some_and(|i| {
+                        m.attrs[i].accessor
+                            && m.vals[i].is_heap()
+                            && matches!(
+                                self.heap.get(m.vals[i].heap_index()),
+                                HeapObj::Native(id) if *id == want
+                            )
+                    })
+                };
+                accessor("flags", native::REGEXP_GET_FLAGS)
+                    && Self::FLAG_ACCESSORS
+                        .iter()
+                        .all(|(name, want)| accessor(name, *want))
+            }
             _ => false,
         }
     }
@@ -2184,18 +2245,21 @@ impl<'p> Vm<'p> {
     ///
     /// Eight `contains` scans of a ≤8-byte string replace eight full property
     /// traversals, so the shortcut still stands.
-    pub(crate) fn regexp_pristine_flags(&self, re: u32, receiver: Value) -> Option<String> {
+    /// Allocation-free proof for the full observable `Get(rx, "flags")`
+    /// sequence: exact receiver/prototype, no own shadows, the live `flags`
+    /// getter, and all eight flag accessors still hold their exact natives.
+    /// The stored internal flag string itself is intentionally not copied.
+    pub(crate) fn regexp_pristine_flag_accessors_ok(&self, re: u32, receiver: Value) -> bool {
         if !receiver.is_heap() || receiver.heap_index() != re {
-            return None;
+            return false;
         }
-        let flags = match self.heap.get(re) {
-            HeapObj::RegExp { flags, .. } => flags.clone(),
-            _ => return None,
-        };
+        if !matches!(self.heap.get(re), HeapObj::RegExp { .. }) {
+            return false;
+        }
         match self.proto_of.get(&re) {
             None => {}
             Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
-            _ => return None,
+            _ => return false,
         }
         // An own shadow of any flag name (or of `flags` itself) makes the reads
         // observable again.
@@ -2203,24 +2267,43 @@ impl<'p> Vm<'p> {
             if m.pos("flags").is_some()
                 || Self::FLAG_ACCESSORS.iter().any(|(n, _)| m.pos(n).is_some())
             {
-                return None;
+                return false;
             }
         }
         let proto = match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => m,
-            _ => return None,
+            _ => return false,
         };
-        let mut out = String::with_capacity(8);
-        for (i, (name, want)) in Self::FLAG_ACCESSORS.iter().enumerate() {
+        let flags_ok = proto.pos("flags").is_some_and(|p| {
+            proto.attrs[p].accessor
+                && proto.vals[p].is_heap()
+                && matches!(
+                    self.heap.get(proto.vals[p].heap_index()),
+                    HeapObj::Native(n) if *n == native::REGEXP_GET_FLAGS
+                )
+        });
+        flags_ok
+            && Self::FLAG_ACCESSORS.iter().all(|(name, want)| {
             let ok = proto.pos(name).is_some_and(|p| {
                 proto.attrs[p].accessor
                     && proto.vals[p].is_heap()
                     && matches!(self.heap.get(proto.vals[p].heap_index()),
                                 HeapObj::Native(n) if n == want)
             });
-            if !ok {
-                return None;
-            }
+            ok
+        })
+    }
+
+    pub(crate) fn regexp_pristine_flags(&self, re: u32, receiver: Value) -> Option<String> {
+        if !self.regexp_pristine_flag_accessors_ok(re, receiver) {
+            return None;
+        }
+        let flags = match self.heap.get(re) {
+            HeapObj::RegExp { flags, .. } => flags,
+            _ => return None,
+        };
+        let mut out = String::with_capacity(8);
+        for (i, _) in Self::FLAG_ACCESSORS.iter().enumerate() {
             // Canonical `dgimsuvy` order, by membership — the stored string is in
             // SOURCE order, so it cannot be returned as-is.
             let ch = Self::FLAG_CHARS[i];
@@ -2292,6 +2375,65 @@ impl<'p> Vm<'p> {
             }),
             _ => false,
         }
+    }
+
+    /// Serve a direct bytecode `CallMethod` whose statically-known name is
+    /// `test` (`is_test = true`) or `exec` (`is_test = false`). `Ok(None)` is a
+    /// PURE guard decline: the caller must run the unchanged method IC/builtin/
+    /// property-resolution path, which can then observe an override, accessor,
+    /// Proxy, subclass prototype, or custom `exec`.
+    ///
+    /// The proof is deliberately the existing one, not a second approximation:
+    /// `regexp_method_is_intrinsic` establishes that the method Get is
+    /// unobservable and resolves to the wanted native; intrinsic `test` also
+    /// uses `regexp_exec_fast_ok`, because RegExpExec performs a second,
+    /// separately observable Get of `exec`. Only after both proofs succeed may
+    /// the native wrappers be collapsed into their shared implementation.
+    ///
+    /// Callers gate this with [`regexp_call_direct_enabled`]. `from_jit` exists
+    /// only to keep the mechanism counters non-vacuous across both entry paths.
+    pub(crate) fn regexp_call_direct(
+        &mut self,
+        recv: Value,
+        input: Value,
+        is_test: bool,
+        from_jit: bool,
+    ) -> Result<Option<Value>, Thrown> {
+        if !recv.is_heap()
+            || !matches!(self.heap.get(recv.heap_index()), HeapObj::RegExp { .. })
+            // RegExp.prototype.test performs ToString(input) BEFORE its
+            // observable RegExpExec Get of `exec`. An object coercion can patch
+            // that slot, invalidating a proof taken here; fail closed to the
+            // native's full protocol. Primitive ToString cannot run user code.
+            || (is_test && self.is_object_value(input))
+        {
+            rxstats::count_call_direct_decline();
+            return Ok(None);
+        }
+        let re = recv.heap_index();
+        let (name, want) = if is_test {
+            ("test", native::REGEXP_TEST)
+        } else {
+            ("exec", native::REGEXP_EXEC)
+        };
+        if !self.regexp_method_is_intrinsic(re, name, want)
+            || (is_test && !self.regexp_exec_fast_ok(re))
+        {
+            rxstats::count_call_direct_decline();
+            return Ok(None);
+        }
+
+        // Preserve ZIPP_BUILTINSTATS' promise that a builtin invocation is
+        // counted even though this lane no longer reaches builtins.rs.
+        super::builtins::builtin_stats_count(self, recv, name);
+        rxstats::count_call_direct_hit(is_test, from_jit);
+        let result = if is_test {
+            let r = self.regexp_exec_impl(re, input, false)?;
+            Value::bool(r != Value::NULL)
+        } else {
+            self.regexp_exec(re, input)?
+        };
+        Ok(Some(result))
     }
 
     /// Ensure the BYTE-OPTIMIZED twin compile (`HeapObj::RegExp::ascii_twin`)
@@ -2392,7 +2534,7 @@ impl<'p> Vm<'p> {
         &mut self,
         it_idx: u32,
     ) -> Option<Result<(Value, bool), Thrown>> {
-        let &RegexpIterRec { matcher: regexp, subject: string, subj_units, fbits, done } =
+        let &RegexpIterRec { matcher: regexp, subject: string, subj_units, fbits, done, .. } =
             self.regexp_string_iters.get(&it_idx)?;
         if fbits & ITFB_FUSED != 0 && !done && matchall_step_enabled() {
             if let Some(r) =
@@ -2402,6 +2544,503 @@ impl<'p> Vm<'p> {
             }
         }
         Some(self.regexp_string_iter_step_inner(it_idx, regexp, string, fbits, done))
+    }
+
+    /// Return one live own data method from the pristine
+    /// %RegExpStringIteratorPrototype%, checking the iterator's exact embedded
+    /// prototype and lack of an own-property overlay. The returned Value is
+    /// read live, so a configurable method replacement/accessor is never
+    /// hidden behind a cached version.
+    pub(crate) fn regexp_string_iter_intrinsic_method(
+        &self,
+        it: Value,
+        name: &str,
+        native: u16,
+    ) -> Option<Value> {
+        if !it.is_heap() {
+            return None;
+        }
+        let it_idx = it.heap_index();
+        if !self.regexp_string_iters.contains_key(&it_idx)
+            || (!self.arr_props.is_empty() && self.arr_props.contains_key(&it_idx))
+        {
+            return None;
+        }
+        let proto = match self.heap.get(it_idx) {
+            HeapObj::Iterator { proto, .. } if *proto == self.regexp_string_iter_proto => *proto,
+            _ => return None,
+        };
+        let p = match self.heap.get(proto) {
+            HeapObj::Object(p) => p,
+            _ => return None,
+        };
+        let slot = p.pos(name)?;
+        if p.attrs[slot].accessor {
+            return None;
+        }
+        let v = p.vals[slot];
+        (v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == native))
+        .then_some(v)
+    }
+
+    /// Pure guard for the source `GetIterator` at the exact scalar outer-loop
+    /// IP. A miss has executed no getter/call and therefore resumes that same
+    /// bytecode; a hit is identity because the live @@iterator is ITER_SELF.
+    pub(crate) fn regexp_scalar_get_iterator_identity(&self, it: Value) -> Option<Value> {
+        let rec = it.is_heap().then(|| self.regexp_string_iters.get(&it.heap_index())).flatten()?;
+        if rec.fbits & ITFB_FUSED == 0 || rec.scalar_pending.is_some() {
+            return None;
+        }
+        self.regexp_string_iter_intrinsic_method(
+            it,
+            "@@iterator",
+            crate::vm::native::ITER_SELF,
+        )?;
+        Some(it)
+    }
+
+    /// Pure guard for the following `IterPrime` Get(it,"next"). It returns
+    /// the actual live data-property Value only when it is the pristine
+    /// ITER_NEXT native; a replacement/accessor declines before observation.
+    pub(crate) fn regexp_scalar_iter_prime(&self, it: Value) -> Option<Value> {
+        let rec = it.is_heap().then(|| self.regexp_string_iters.get(&it.heap_index())).flatten()?;
+        if rec.fbits & ITFB_FUSED == 0 || rec.scalar_pending.is_some() {
+            return None;
+        }
+        self.regexp_string_iter_intrinsic_method(it, "next", crate::vm::native::ITER_NEXT)
+    }
+
+    /// Result-array-allocation-free matchAll step for the exact scalar outer
+    /// region (Annex-B statics still publish their required strings).
+    /// Every eligibility/protocol check precedes lastIndex/statics/pending/done
+    /// mutation. A refill only installs a pure integer scan memo and is safe to
+    /// retain across a decline.
+    pub(crate) fn regexp_string_iter_step_scalar(&mut self, it_idx: u32) -> RegexpScalarStep {
+        if !rx_scalar_matchall_enabled() {
+            return RegexpScalarStep::Decline;
+        }
+        let (regexp, string, subj_units, fbits, done) = match self.regexp_string_iters.get(&it_idx) {
+            Some(r) => (r.matcher, r.subject, r.subj_units, r.fbits, r.done),
+            None => return RegexpScalarStep::Decline,
+        };
+        if done
+            || fbits & (ITFB_GLOBAL | ITFB_FUSED) != (ITFB_GLOBAL | ITFB_FUSED)
+            || fbits & (ITFB_UNICODE | ITFB_STICKY | ITFB_INDICES) != 0
+            || subj_units >= u32::MAX as usize
+            || !self.matchall_fast_from_slots()
+        {
+            return RegexpScalarStep::Decline;
+        }
+        let s_idx = if string.is_heap() { string.heap_index() } else { return RegexpScalarStep::Decline };
+        if !matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii()) {
+            return RegexpScalarStep::Decline;
+        }
+        match self.heap.get(regexp) {
+            HeapObj::RegExp { regex, .. } if !regex.has_named_groups() => {}
+            _ => return RegexpScalarStep::Decline,
+        }
+        let li_v = match self.heap.get(regexp) {
+            HeapObj::RegExp { last_index, .. } if last_index.is_number() => *last_index,
+            _ => return RegexpScalarStep::Decline,
+        };
+        let li = {
+            let d = li_v.as_f64().trunc();
+            let d = if d.is_nan() { 0.0 } else { d };
+            d.max(0.0).min(((1u64 << 53) - 1) as f64) as usize
+        };
+        if li > u32::MAX as usize {
+            return RegexpScalarStep::Decline;
+        }
+
+        loop {
+            let mut pending = None;
+            let mut exhausted = false;
+            if let Some(b) = self.matchall_batches.get_mut(&it_idx) {
+                if b.expected_li as usize == li {
+                    let stride = 2 + 2 * b.ncaps as usize;
+                    let next = b.next as usize;
+                    if next < b.flat.len() / stride {
+                        if b.ncaps > 4 {
+                            return RegexpScalarStep::Decline;
+                        }
+                        let base = next * stride;
+                        let mut caps = [u32::MAX; 8];
+                        for g in 0..b.ncaps as usize {
+                            caps[2 * g] = b.flat[base + 2 + 2 * g];
+                            caps[2 * g + 1] = b.flat[base + 3 + 2 * g];
+                        }
+                        let p = RegexpScalarMatch {
+                            mstart: b.flat[base],
+                            mend: b.flat[base + 1],
+                            ncaps: b.ncaps as u8,
+                            caps,
+                        };
+                        b.next += 1;
+                        b.expected_li = p.mend + (p.mstart == p.mend) as u32;
+                        pending = Some(p);
+                    } else if b.exhausted {
+                        exhausted = true;
+                    }
+                }
+            }
+
+            if let Some(p) = pending {
+                // All guards have committed. Preserve the ordinary publish
+                // order: lastIndex first, then Annex-B statics, then the
+                // internally pending result; empty-match advancement is last.
+                debug_assert!(self.arr_props.get(&regexp).is_none());
+                if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(regexp) {
+                    *last_index = Value::num(p.mend as f64);
+                }
+                let mut caps = std::mem::take(&mut self.matchall_caps_scratch);
+                debug_assert!(caps.is_empty());
+                caps.reserve(p.ncaps as usize);
+                for g in 0..p.ncaps as usize {
+                    let (s, e) = (p.caps[2 * g], p.caps[2 * g + 1]);
+                    caps.push((s != u32::MAX).then(|| s as usize..e as usize));
+                }
+                let m = regress::Match::from_scan_parts(p.mstart as usize..p.mend as usize, caps);
+                let mka = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+                    vm.ascii_slice_value(s_idx, r)
+                };
+                self.regexp_record_statics(
+                    &m,
+                    string,
+                    s_idx,
+                    p.mstart as usize,
+                    p.mend as usize,
+                    subj_units,
+                    true,
+                    &mka,
+                );
+                let mut caps = m.captures;
+                caps.clear();
+                self.matchall_caps_scratch = caps;
+                let replaced = self
+                    .regexp_string_iters
+                    .get_mut(&it_idx)
+                    .and_then(|r| r.scalar_pending.replace(p))
+                    .is_some();
+                if replaced {
+                    rxstats::count_scalar_elided();
+                }
+                if p.mstart == p.mend {
+                    self.set_regexp_last_index(regexp, p.mend as usize + 1);
+                }
+                rxstats::count_step_fused();
+                rxstats::count_scalar_success();
+                return RegexpScalarStep::Success;
+            }
+
+            if exhausted {
+                if let Some(dead) = self.matchall_batches.remove(&it_idx) {
+                    let mut flat = dead.flat;
+                    flat.clear();
+                    self.matchall_flat_scratch = flat;
+                }
+                debug_assert!(self.arr_props.get(&regexp).is_none());
+                if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(regexp) {
+                    *last_index = Value::int(0);
+                }
+                if let Some(r) = self.regexp_string_iters.get_mut(&it_idx) {
+                    r.done = true;
+                }
+                rxstats::count_step_fused();
+                return RegexpScalarStep::Done;
+            }
+
+            self.matchall_batches.remove(&it_idx);
+            if !self.matchall_batch_refill(it_idx, regexp, s_idx, subj_units, li) {
+                return RegexpScalarStep::Decline;
+            }
+        }
+    }
+
+    /// Apply the exact unary-`+` consumer to capture `capture` (1-based)
+    /// directly from the pending subject range. No capture string/Array exists.
+    pub(crate) fn regexp_scalar_capture_number(
+        &self,
+        it_idx: u32,
+        capture: u32,
+    ) -> Option<Value> {
+        let r = self.regexp_string_iters.get(&it_idx)?;
+        let p = r.scalar_pending?;
+        if capture == 0 {
+            return None;
+        }
+        if capture > p.ncaps as u32 {
+            // Outside the result Array's own dense length. Array.prototype may
+            // supply this index (including through an observable getter), so
+            // only the interpreter can perform the Get.
+            return None;
+        }
+        let g = capture as usize - 1;
+        let (start, end) = (p.caps[2 * g], p.caps[2 * g + 1]);
+        if start == u32::MAX {
+            rxstats::count_scalar_capture_num();
+            return Some(Value::num(f64::NAN));
+        }
+        if end < start || end as usize > r.subj_units {
+            return None;
+        }
+        let s = match self.heap.get(r.subject.heap_index()) {
+            HeapObj::Str(js) if js.is_ascii() => js.as_str_wf(),
+            _ => return None,
+        };
+        let piece = s.get(start as usize..end as usize)?;
+        rxstats::count_scalar_capture_num();
+        Some(Value::num(super::coerce::string_to_number(piece)))
+    }
+
+    /// Materialise the one pending result into the exact skipped global
+    /// binding. This intentionally does NOT record Annex-B statics again: the
+    /// success step already published them once in source order.
+    pub(crate) fn regexp_scalar_flush(
+        &mut self,
+        it_idx: u32,
+        global: u32,
+        slow_reentry: bool,
+    ) -> bool {
+        if global as usize >= self.globals.len() {
+            return false;
+        }
+        let (p, string, subj_units) = match self.regexp_string_iters.get_mut(&it_idx) {
+            Some(r) => match r.scalar_pending.take() {
+                Some(p) => (p, r.subject, r.subj_units),
+                None => return false,
+            },
+            None => return false,
+        };
+        let s_idx = string.heap_index();
+        let mut caps = std::mem::take(&mut self.matchall_caps_scratch);
+        debug_assert!(caps.is_empty());
+        caps.reserve(p.ncaps as usize);
+        for g in 0..p.ncaps as usize {
+            let (s, e) = (p.caps[2 * g], p.caps[2 * g + 1]);
+            caps.push((s != u32::MAX).then(|| s as usize..e as usize));
+        }
+        let m = regress::Match::from_scan_parts(p.mstart as usize..p.mend as usize, caps);
+        let mka =
+            |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.ascii_slice_value(s_idx, r) };
+        let _gc = self.gc_lock_guard();
+        let out = self.regexp_build_result(
+            &m,
+            string,
+            p.mstart as usize,
+            p.mend as usize,
+            false,
+            &mka,
+        );
+        let mut caps = m.captures;
+        caps.clear();
+        self.matchall_caps_scratch = caps;
+        self.globals[global as usize] = out;
+        rxstats::count_scalar_materialized(slow_reentry);
+        let _ = subj_units; // retained in the record as the range bound/root proof
+        true
+    }
+
+    /// Allocation-free `RegExp.prototype.exec` success for the exact MEM
+    /// scalar region.  Every guard and the complete one-match scan precede
+    /// Annex-B/pending mutation, so `Decline` is a pure prefix and the original
+    /// CallMethod may be replayed exactly once by the interpreter.
+    pub(crate) fn regexp_scalar_exec_step(
+        &mut self,
+        recv: Value,
+        input: Value,
+    ) -> RegexpScalarExecStep {
+        if !rx_scalar_exec_enabled() || !recv.is_heap() || !input.is_heap() {
+            return RegexpScalarExecStep::Decline;
+        }
+        let re_idx = recv.heap_index();
+        if !self.regexp_method_is_intrinsic(re_idx, "exec", native::REGEXP_EXEC) {
+            return RegexpScalarExecStep::Decline;
+        }
+        let (flags_ok, last_index_ok, matcher_ok, twin_ready) = match self.heap.get(re_idx) {
+            HeapObj::RegExp { regex, flags, last_index, ascii_twin, .. } => (
+                !flags.bytes().any(|b| matches!(b, b'g' | b'y' | b'u' | b'v' | b'd')),
+                last_index.is_number(),
+                !regex.has_named_groups(),
+                ascii_twin.is_some(),
+            ),
+            _ => return RegexpScalarExecStep::Decline,
+        };
+        if !flags_ok || !last_index_ok || !matcher_ok || !twin_ready {
+            return RegexpScalarExecStep::Decline;
+        }
+        let s_idx = input.heap_index();
+        let subj_units = match self.heap.get(s_idx) {
+            HeapObj::Str(js) if js.is_ascii() && js.as_bytes().len() < u32::MAX as usize => {
+                js.as_bytes().len()
+            }
+            _ => return RegexpScalarExecStep::Decline,
+        };
+
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::RegexExec);
+        // The callback's ranges and the previous pending subject are held in
+        // VM/Rust state until commit.  Collection already ran at the FFI safe
+        // point; keep it suspended for this pure scan/publication sequence.
+        let _gc = self.gc_lock_guard();
+        let mut pending: Option<RegexpScalarMatch> = None;
+        let mut malformed = false;
+        {
+            let subj = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => return RegexpScalarExecStep::Decline,
+            };
+            let regex: &regress::Regex = match self.heap.get(re_idx) {
+                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => twin,
+                HeapObj::RegExp { ascii_twin: Some(None), regex, .. } => regex,
+                _ => return RegexpScalarExecStep::Decline,
+            };
+            let _ = regex.scan_ascii(subj, 0, 1, &mut |range, captures| {
+                if captures.len() != 4
+                    || range.start > range.end
+                    || range.end > subj_units
+                {
+                    malformed = true;
+                    return;
+                }
+                let mut caps = [u32::MAX; 8];
+                for (g, cap) in captures.iter().enumerate() {
+                    if let Some(cap) = cap {
+                        if cap.start > cap.end || cap.end > subj_units {
+                            malformed = true;
+                            return;
+                        }
+                        caps[2 * g] = cap.start as u32;
+                        caps[2 * g + 1] = cap.end as u32;
+                    }
+                }
+                pending = Some(RegexpScalarMatch {
+                    mstart: range.start as u32,
+                    mend: range.end as u32,
+                    ncaps: 4,
+                    caps,
+                });
+            });
+        }
+        if malformed {
+            return RegexpScalarExecStep::Decline;
+        }
+
+        // From here onward this invocation is committed and must not be
+        // replayed. Preserve the existing direct-call/builtin mechanism census.
+        super::builtins::builtin_stats_count(self, recv, "exec");
+        rxstats::count_call_direct_hit(false, true);
+        let Some(p) = pending else {
+            if self.regexp_scalar_exec_pending.take().is_some() {
+                rxstats::count_scalar_exec_elided();
+            }
+            rxstats::count_scalar_exec_miss();
+            return RegexpScalarExecStep::Miss;
+        };
+
+        // Unary plus over each own primitive capture is pure.  Compute all four
+        // before publishing anything so an impossible range/parser failure can
+        // still decline without visible state.
+        let nums = {
+            let subj = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => return RegexpScalarExecStep::Decline,
+            };
+            let mut out = [Value::UNDEFINED; 4];
+            for g in 0..4 {
+                let (start, end) = (p.caps[2 * g], p.caps[2 * g + 1]);
+                out[g] = if start == u32::MAX {
+                    Value::num(f64::NAN)
+                } else {
+                    let Some(piece) = subj.get(start as usize..end as usize) else {
+                        return RegexpScalarExecStep::Decline;
+                    };
+                    Value::num(super::coerce::string_to_number(piece))
+                };
+            }
+            out
+        };
+
+        // Publish Annex-B statics exactly once, in RegExpBuiltinExec's source
+        // position. Result construction and the global store remain pending.
+        let mut caps = std::mem::take(&mut self.matchall_caps_scratch);
+        debug_assert!(caps.is_empty());
+        caps.reserve(4);
+        for g in 0..4 {
+            let (start, end) = (p.caps[2 * g], p.caps[2 * g + 1]);
+            caps.push((start != u32::MAX).then(|| start as usize..end as usize));
+        }
+        let m = regress::Match::from_scan_parts(p.mstart as usize..p.mend as usize, caps);
+        let mka =
+            |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.ascii_slice_value(s_idx, r) };
+        self.regexp_record_statics(
+            &m,
+            input,
+            s_idx,
+            p.mstart as usize,
+            p.mend as usize,
+            subj_units,
+            true,
+            &mka,
+        );
+        let mut caps = m.captures;
+        caps.clear();
+        self.matchall_caps_scratch = caps;
+        let replaced = self
+            .regexp_scalar_exec_pending
+            .replace(RegexpScalarExecPending {
+                subject: input,
+                subj_units: subj_units as u32,
+                matched: p,
+            })
+            .is_some();
+        if replaced {
+            rxstats::count_scalar_exec_elided();
+        }
+        rxstats::count_scalar_exec_capture_nums(4);
+        rxstats::count_scalar_exec_success();
+        RegexpScalarExecStep::Success(nums)
+    }
+
+    /// Materialize the direct-exec result skipped by the exact region.  Annex-B
+    /// statics were already published by the success helper and are not touched
+    /// again. `reason == 1` denotes an observable slow-Add/re-entry exit.
+    pub(crate) fn regexp_scalar_exec_flush(&mut self, global: u32, reason: u32) -> bool {
+        if global as usize >= self.globals.len() {
+            return false;
+        }
+        // Taking the record removes its GC root.  Lock first so allocations in
+        // the canonical result builder cannot collect the local-only subject.
+        let _gc = self.gc_lock_guard();
+        let Some(pending) = self.regexp_scalar_exec_pending.take() else {
+            return false;
+        };
+        let p = pending.matched;
+        let s_idx = pending.subject.heap_index();
+        let mut caps = std::mem::take(&mut self.matchall_caps_scratch);
+        debug_assert!(caps.is_empty());
+        caps.reserve(p.ncaps as usize);
+        for g in 0..p.ncaps as usize {
+            let (start, end) = (p.caps[2 * g], p.caps[2 * g + 1]);
+            caps.push((start != u32::MAX).then(|| start as usize..end as usize));
+        }
+        let m = regress::Match::from_scan_parts(p.mstart as usize..p.mend as usize, caps);
+        let mka =
+            |vm: &mut Self, r: std::ops::Range<usize>| -> Value { vm.ascii_slice_value(s_idx, r) };
+        let out = self.regexp_build_result(
+            &m,
+            pending.subject,
+            p.mstart as usize,
+            p.mend as usize,
+            false,
+            &mka,
+        );
+        let mut caps = m.captures;
+        caps.clear();
+        self.matchall_caps_scratch = caps;
+        self.globals[global as usize] = out;
+        debug_assert!(p.mend <= pending.subj_units);
+        rxstats::count_scalar_exec_materialized(reason == 1);
+        true
     }
 
     /// The fused pristine matchAll STEP (B118). Reaching here requires the
@@ -2760,20 +3399,24 @@ impl<'p> Vm<'p> {
                 // The generic `get_index` path must still account for arguments
                 // mapping, element overlays, holes, and a custom prototype. When
                 // we built the array ourselves (real RegExp, pristine `exec`, so
-                // no user code could have replaced element 0 with a getter), read
-                // `items[0]` straight out of the dense store instead.
-                let fast0 = pristine_exec.then(|| match self.heap.get(r.heap_index()) {
-                    HeapObj::Array(items) => items.first().copied(),
-                    _ => None,
-                });
-                let m0 = match fast0 {
-                    Some(Some(v)) => v,
-                    _ => self.get_index(r, Value::int(0))?,
+                // no user code could have replaced element 0 with a getter), we
+                // can read it directly from dense store; otherwise full Get/ToString.
+                let empty = if pristine_exec {
+                    match self.heap.get(r.heap_index()) {
+                        HeapObj::Array(items) => {
+                            let m0 = items.first().copied().unwrap_or(Value::UNDEFINED);
+                            m0.is_heap() && self.heap.str_units(m0.heap_index()) == Some(0)
+                        }
+                        _ => false,
+                    }
+                } else {
+                    let m0 = self.get_index(r, Value::int(0))?;
+                    // ToString(Get(match,"0")) — identity for a string value;
+                    // only a custom exec result can need coercion here.
+                    let m0v = self.to_str_value(m0)?;
+                    self.heap.str_units(m0v.heap_index()) == Some(0)
                 };
-                // ToString(Get(match,"0")) — IDENTITY for a string value (no
-                // copy); only a non-string coerces.
-                let m0v = self.to_str_value(m0)?;
-                if self.heap.str_units(m0v.heap_index()) == Some(0) {
+                if empty {
                     let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
                     // ToLength(Get(R,"lastIndex")) — a throwing
                     // lastIndex.valueOf must propagate, not be swallowed; the
@@ -2854,6 +3497,31 @@ impl<'p> Vm<'p> {
         // observably identical to a fresh copy.
         if matches.is_empty() {
             return Ok(Value::heap(s_idx));
+        }
+        // Intrinsic RegExpExec refreshes the Annex-B RegExp statics for every
+        // successful match.  This internal matcher collects the same results
+        // without building exec arrays, so publish the final successful match
+        // now.  No user code can run between the collected matches on this
+        // path; consequently the only observable state is exactly the final
+        // record that the ordinary exec loop would leave behind.  Keep this
+        // after replacement ToString: @@replace coerces a non-callable
+        // replacement before it starts its exec loop, so a throwing coercion
+        // must not update the statics.
+        if let Some(m) = matches.last() {
+            let (mstart, mend) = (m.start(), m.end());
+            let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+                vm.units_value(&u16s[r])
+            };
+            self.regexp_record_statics(
+                m,
+                Value::heap(s_idx),
+                s_idx,
+                mstart,
+                mend,
+                u16s.len(),
+                false,
+                &mk,
+            );
         }
         let mut out: Vec<u8> = Vec::new();
         let mut last = 0usize;
@@ -2989,6 +3657,25 @@ impl<'p> Vm<'p> {
             HeapObj::Str(js) => js.as_str_wf().to_string(),
             _ => String::new(),
         };
+        // See the UTF-16 arm above.  An ASCII subject can retain the same lazy
+        // range record used by RegExpBuiltinExec, avoiding thirteen eager
+        // subject slices unless a legacy static is actually read.
+        if let Some(m) = matches.last() {
+            let (mstart, mend) = (m.start(), m.end());
+            let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+                vm.ascii_slice_value(s_idx, r)
+            };
+            self.regexp_record_statics(
+                m,
+                Value::heap(s_idx),
+                s_idx,
+                mstart,
+                mend,
+                subject.len(),
+                subject.len() <= u32::MAX as usize,
+                &mk,
+            );
+        }
         let mut out: Vec<u8> = Vec::with_capacity(subject.len() + 16);
         let mut last = 0usize;
         for m in &matches {
@@ -3201,6 +3888,94 @@ pub(crate) fn match_variant_enabled() -> bool {
     }
 }
 
+/// Exact outer-region scalar matchAll package. The dependent fused-step,
+/// slim-exec and batch rungs are part of the proof: disabling any one restores
+/// the ordinary result-array path rather than a partially enabled protocol.
+#[inline]
+pub(crate) fn rx_scalar_matchall_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = (std::env::var_os("ZIPP_NO_RX_SCALAR_MATCHALL").is_none()
+                && std::env::var_os("ZIPP_NO_MATCHALL_PRISTINE").is_none()
+                && std::env::var_os("ZIPP_NO_FASTOK_MEMO").is_none()
+                && matchall_step_enabled()
+                && slim_exec_enabled()
+                && matchall_batch_enabled()
+                && match_variant_enabled()
+                && string_regexp_call_direct_enabled()
+                && std::env::var_os("ZIPP_NO_ITER_REGION").is_none()
+                && std::env::var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Exact MEM-only non-global exec scalarization.  Every dependent switch is
+/// part of the isolation contract: turning off the direct call, canonical
+/// string-number grammar, compact result representation, or slim ASCII exec
+/// restores the pre-scalar native byte stream rather than a partial package.
+#[inline]
+pub(crate) fn rx_scalar_exec_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = (std::env::var_os("ZIPP_NO_RX_SCALAR_EXEC").is_none()
+                && regexp_call_direct_enabled()
+                && slim_exec_enabled()
+                && match_variant_enabled()
+                && std::env::var_os("ZIPP_NO_TONUM_STR").is_none()) as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_RX_CALL_DIRECT=1` restores the pre-direct `CallMethod` route on one
+/// binary. Codegen reads the same cached latch while compiling a region, so the
+/// off mode emits the old generic call site rather than paying a failed helper
+/// probe on every iteration.
+#[inline]
+pub(crate) fn regexp_call_direct_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_RX_CALL_DIRECT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_RX_STRING_CALL_DIRECT=1` restores the generic primitive-string
+/// `CallMethod` route for `matchAll(RegExp)` and `replace(RegExp, string)` on
+/// one binary.  Codegen consults the same process latch, so off mode emits no
+/// helper probe and all five mechanism counters remain zero.
+#[inline]
+pub(crate) fn string_regexp_call_direct_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_RX_STRING_CALL_DIRECT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// `ZIPP_RXSTATS=1` — how many match results were CONSTRUCTED in the compact
 /// record vs how many were later MATERIALISED into an ordinary `arr_props`
 /// `ObjMap` (by mutation/reflection — or by `ZIPP_NO_MATCH_VARIANT=1`, which
@@ -3215,6 +3990,30 @@ pub(crate) mod rxstats {
     static MATERIALIZED: AtomicU64 = AtomicU64::new(0);
     static STEP_FUSED: AtomicU64 = AtomicU64::new(0);
     static STEP_FULL: AtomicU64 = AtomicU64::new(0);
+    static CALL_INTERP_TEST: AtomicU64 = AtomicU64::new(0);
+    static CALL_INTERP_EXEC: AtomicU64 = AtomicU64::new(0);
+    static CALL_JIT_TEST: AtomicU64 = AtomicU64::new(0);
+    static CALL_JIT_EXEC: AtomicU64 = AtomicU64::new(0);
+    static CALL_DECLINE: AtomicU64 = AtomicU64::new(0);
+    static STRING_CALL_INTERP_MATCHALL: AtomicU64 = AtomicU64::new(0);
+    static STRING_CALL_INTERP_REPLACE: AtomicU64 = AtomicU64::new(0);
+    static STRING_CALL_JIT_MATCHALL: AtomicU64 = AtomicU64::new(0);
+    static STRING_CALL_JIT_REPLACE: AtomicU64 = AtomicU64::new(0);
+    static STRING_CALL_DECLINE: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_SUCCESS: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_CAPTURE_NUM: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_ELIDED: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_GUARD_DECLINE: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_SLOW_FLUSH: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_EXEC_SUCCESS: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_EXEC_MISS: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_EXEC_CAPTURE_NUM: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_EXEC_MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_EXEC_ELIDED: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_EXEC_GUARD_DECLINE: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_EXEC_PIN_DECLINE: AtomicU64 = AtomicU64::new(0);
+    static SCALAR_EXEC_SLOW_FLUSH: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
     pub(crate) fn enabled() -> bool {
@@ -3262,6 +4061,146 @@ pub(crate) mod rxstats {
         }
     }
 
+    /// A guarded direct `RegExp.prototype.test` / `exec` CallMethod actually
+    /// served. Split by interpreter/JIT so a hot test cannot pass solely on its
+    /// warmup calls.
+    #[inline]
+    pub(crate) fn count_call_direct_hit(is_test: bool, from_jit: bool) {
+        if enabled() {
+            match (from_jit, is_test) {
+                (false, true) => &CALL_INTERP_TEST,
+                (false, false) => &CALL_INTERP_EXEC,
+                (true, true) => &CALL_JIT_TEST,
+                (true, false) => &CALL_JIT_EXEC,
+            }
+            .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A direct-call probe that declined before any observable operation.
+    #[inline]
+    pub(crate) fn count_call_direct_decline() {
+        if enabled() {
+            CALL_DECLINE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A guarded primitive-string `matchAll` / regex `replace` direct call was
+    /// served.  Split by interpreter/JIT to make hot generated-code coverage
+    /// independently non-vacuous.
+    #[inline]
+    pub(crate) fn count_string_call_direct_hit(is_replace: bool, from_jit: bool) {
+        if enabled() {
+            match (from_jit, is_replace) {
+                (false, false) => &STRING_CALL_INTERP_MATCHALL,
+                (false, true) => &STRING_CALL_INTERP_REPLACE,
+                (true, false) => &STRING_CALL_JIT_MATCHALL,
+                (true, true) => &STRING_CALL_JIT_REPLACE,
+            }
+            .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A string/RegExp direct-call probe that declined before any observable
+    /// operation.
+    #[inline]
+    pub(crate) fn count_string_call_direct_decline() {
+        if enabled() {
+            STRING_CALL_DECLINE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_success() {
+        if enabled() {
+            SCALAR_SUCCESS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_capture_num() {
+        if enabled() {
+            SCALAR_CAPTURE_NUM.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_materialized(slow_reentry: bool) {
+        if enabled() {
+            SCALAR_MATERIALIZED.fetch_add(1, Ordering::Relaxed);
+            if slow_reentry {
+                SCALAR_SLOW_FLUSH.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_elided() {
+        if enabled() {
+            SCALAR_ELIDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A scalar helper guard that declined before any observable operation.
+    #[inline]
+    pub(crate) fn count_scalar_guard_decline() {
+        if enabled() {
+            SCALAR_GUARD_DECLINE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_exec_success() {
+        if enabled() {
+            SCALAR_EXEC_SUCCESS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_exec_miss() {
+        if enabled() {
+            SCALAR_EXEC_MISS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_exec_capture_nums(n: u64) {
+        if enabled() {
+            SCALAR_EXEC_CAPTURE_NUM.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_exec_materialized(slow_reentry: bool) {
+        if enabled() {
+            SCALAR_EXEC_MATERIALIZED.fetch_add(1, Ordering::Relaxed);
+            if slow_reentry {
+                SCALAR_EXEC_SLOW_FLUSH.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_exec_elided() {
+        if enabled() {
+            SCALAR_EXEC_ELIDED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_exec_guard_decline() {
+        if enabled() {
+            SCALAR_EXEC_GUARD_DECLINE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn count_scalar_exec_pin_decline() {
+        if enabled() {
+            SCALAR_EXEC_PIN_DECLINE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// `(compact_constructions, materialized, steps_fused, steps_fallback)`.
     pub fn dump() -> (u64, u64, u64, u64) {
         (
@@ -3271,6 +4210,60 @@ pub(crate) mod rxstats {
             STEP_FULL.load(Ordering::Relaxed),
         )
     }
+
+    /// `(interp_test, interp_exec, jit_test, jit_exec, guard_declines)`.
+    pub fn dump_call_direct() -> (u64, u64, u64, u64, u64) {
+        (
+            CALL_INTERP_TEST.load(Ordering::Relaxed),
+            CALL_INTERP_EXEC.load(Ordering::Relaxed),
+            CALL_JIT_TEST.load(Ordering::Relaxed),
+            CALL_JIT_EXEC.load(Ordering::Relaxed),
+            CALL_DECLINE.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(interp_matchall, interp_replace, jit_matchall, jit_replace,
+    /// guard_declines)`.
+    pub fn dump_string_call_direct() -> (u64, u64, u64, u64, u64) {
+        (
+            STRING_CALL_INTERP_MATCHALL.load(Ordering::Relaxed),
+            STRING_CALL_INTERP_REPLACE.load(Ordering::Relaxed),
+            STRING_CALL_JIT_MATCHALL.load(Ordering::Relaxed),
+            STRING_CALL_JIT_REPLACE.load(Ordering::Relaxed),
+            STRING_CALL_DECLINE.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(successes, direct_capture_numbers, materialized, elided,
+    /// guard_declines, slow_reentry_flushes)` for the exact matchAll scalar
+    /// outer-region package.
+    pub fn dump_scalar_matchall() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            SCALAR_SUCCESS.load(Ordering::Relaxed),
+            SCALAR_CAPTURE_NUM.load(Ordering::Relaxed),
+            SCALAR_MATERIALIZED.load(Ordering::Relaxed),
+            SCALAR_ELIDED.load(Ordering::Relaxed),
+            SCALAR_GUARD_DECLINE.load(Ordering::Relaxed),
+            SCALAR_SLOW_FLUSH.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `(successes, semantic_misses, direct_capture_numbers, materialized,
+    /// elided, guard_declines, input_pin_declines, slow_reentry_flushes)` for
+    /// the exact non-global exec scalar package.
+    pub fn dump_scalar_exec() -> (u64, u64, u64, u64, u64, u64, u64, u64) {
+        (
+            SCALAR_EXEC_SUCCESS.load(Ordering::Relaxed),
+            SCALAR_EXEC_MISS.load(Ordering::Relaxed),
+            SCALAR_EXEC_CAPTURE_NUM.load(Ordering::Relaxed),
+            SCALAR_EXEC_MATERIALIZED.load(Ordering::Relaxed),
+            SCALAR_EXEC_ELIDED.load(Ordering::Relaxed),
+            SCALAR_EXEC_GUARD_DECLINE.load(Ordering::Relaxed),
+            SCALAR_EXEC_PIN_DECLINE.load(Ordering::Relaxed),
+            SCALAR_EXEC_SLOW_FLUSH.load(Ordering::Relaxed),
+        )
+    }
+
 }
 
 /// Assemble a RegExp `flags` string in the canonical order `dgimsuvy`,

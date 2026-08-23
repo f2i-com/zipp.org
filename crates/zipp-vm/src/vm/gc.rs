@@ -460,6 +460,12 @@ impl Vm<'_> {
             root_idx!(rec.matcher);
             root_val!(rec.subject);
         }
+        // A scalarized direct exec result is still logically held by its
+        // skipped global store.  Its capture ranges therefore root the one
+        // immutable subject until the region overwrites or materializes it.
+        if let Some(pending) = &self.regexp_scalar_exec_pending {
+            root_val!(pending.subject);
+        }
         // The legacy RegExp statics' last-match record (input/match/capture
         // strings) is live until the next match replaces it.
         for v in &self.regexp_last {

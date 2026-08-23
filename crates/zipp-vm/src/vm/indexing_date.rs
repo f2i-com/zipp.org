@@ -7,6 +7,18 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Result of the allocation-free prefix for a fused
+/// `obj["prefix" + int] = value` write. `Hit` and `Add` are complete ordinary
+/// writes: they cannot invoke JavaScript or allocate a VM heap object. `Slow`
+/// has made no observable change, so the caller must run the ordinary computed
+/// assignment path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConcatSetFast {
+    Hit,
+    Add,
+    Slow,
+}
+
 impl<'p> Vm<'p> {
     /// ToPropertyKey for a computed index: a Symbol or already-flat string keys
     /// as-is and primitives (numbers/bool/null) fall through unchanged, but an
@@ -698,6 +710,75 @@ impl<'p> Vm<'p> {
         self.get_index(obj, full)
     }
 
+    /// Apply the allocation-free ordinary-object prefix for a fused computed
+    /// write whose complete property key has already been assembled in reusable
+    /// scratch storage. This is the single semantic proof shared by the
+    /// interpreter and the JIT helper.
+    ///
+    /// `allow_add = false` is the pre-B86 JIT shape: an own writable data hit is
+    /// still served, but a new key declines before walking the prototype chain.
+    /// With it enabled, a new property is appended only after the same complete
+    /// OrdinarySet proof used by the interpreter. Neither successful arm can
+    /// run user code, allocate a `HeapObj`, or collect. The owned key and ObjMap
+    /// vectors may allocate through Rust's allocator; that cannot move the VM
+    /// heap/version/IC vectors. The version bump guards any `vals` reallocation.
+    pub(crate) fn try_set_index_concat_prebuilt(
+        &mut self,
+        obj: Value,
+        key: &str,
+        val: Value,
+        allow_add: bool,
+    ) -> ConcatSetFast {
+        if !obj.is_heap() {
+            return ConcatSetFast::Slow;
+        }
+        let idx = obj.heap_index();
+        if (idx == self.global_this && self.global_this != 0)
+            || idx == self.obj_proto
+            || !self.realm_global_objs.is_empty()
+            || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
+        {
+            return ConcatSetFast::Slow;
+        }
+
+        let (hit, add) = match self.heap.get(idx) {
+            HeapObj::Object(m) if key != "__proto__" => match m.pos(key) {
+                Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => {
+                    (Some(i), false)
+                }
+                Some(_) => (None, false),
+                None => (
+                    None,
+                    allow_add
+                        && m.extensible
+                        && m.class.is_none()
+                        && !m.is_ctor
+                        && self.plain_add_chain_clear(idx, key),
+                ),
+            },
+            _ => (None, false),
+        };
+
+        if let Some(i) = hit {
+            self.heap.write_barrier_val(idx, val);
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.vals[i] = val;
+                return ConcatSetFast::Hit;
+            }
+        }
+        if add {
+            let owned = key.to_owned();
+            self.heap.write_barrier_val(idx, val);
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.push_data(owned, val);
+                self.heap.bump_version(idx);
+                return ConcatSetFast::Add;
+            }
+        }
+        ConcatSetFast::Slow
+    }
+
     /// `obj[<string-const `name`> + key] = val` — the `SetIndexConcat` op; the
     /// `set_index` twin of `get_index_concat`. The fast path handles an own
     /// writable-data overwrite and a proven-clean new-key append without ever
@@ -714,53 +795,16 @@ impl<'p> Vm<'p> {
         func_id: u32,
     ) -> Result<(), Thrown> {
         if key.is_int() && obj.is_heap() {
-            let idx = obj.heap_index();
-            if !(idx == self.global_this && self.global_this != 0)
-                && idx != self.obj_proto
-                && self.realm_global_objs.is_empty()
-                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
-                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
-                && matches!(self.heap.get(idx), HeapObj::Object(_))
-            {
-                let mut scratch = std::mem::take(&mut self.idx_key_scratch);
-                self.build_concat_key(&mut scratch, name, key.as_int(), func_id);
-                // hit: own writable data slot; add: proven-clean new key.
-                let (hit, add) = match self.heap.get(idx) {
-                    HeapObj::Object(m) if scratch != "__proto__" => match m.pos(&scratch) {
-                        Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => (Some(i), false),
-                        Some(_) => (None, false),
-                        None => (
-                            None,
-                            m.extensible
-                                && m.class.is_none()
-                                && !m.is_ctor
-                                && self.plain_add_chain_clear(idx, &scratch),
-                        ),
-                    },
-                    _ => (None, false),
-                };
-                if let Some(i) = hit {
-                    // Nursery barrier: in-place store outside `set_index`'s
-                    // barriered entry (the slow path below re-enters it).
-                    self.heap.write_barrier_val(idx, val);
-                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                        m.vals[i] = val;
-                        self.idx_key_scratch = scratch;
-                        return Ok(());
-                    }
-                }
-                if add {
-                    let ks = scratch.clone(); // the unavoidable owned ObjMap key
-                    self.heap.write_barrier_val(idx, val);
-                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                        m.push_data(ks, val);
-                        self.heap.bump_version(idx); // key add reallocs vals (IC)
-                        self.idx_key_scratch = scratch;
-                        return Ok(());
-                    }
-                }
+            let mut scratch = std::mem::take(&mut self.idx_key_scratch);
+            self.build_concat_key(&mut scratch, name, key.as_int(), func_id);
+            if !matches!(
+                self.try_set_index_concat_prebuilt(obj, &scratch, val, true),
+                ConcatSetFast::Slow
+            ) {
                 self.idx_key_scratch = scratch;
+                return Ok(());
             }
+            self.idx_key_scratch = scratch;
         }
         // SLOW PATH: materialise + ordinary computed write.
         let full = self.concat_key_value(name, key, func_id)?;

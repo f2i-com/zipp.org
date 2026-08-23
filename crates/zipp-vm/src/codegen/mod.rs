@@ -129,12 +129,16 @@ const INT_TAG_HI: u32 = 0x7FF9;
 const TAG_LO: u32 = 0x7FF9;
 const TAG_HI: u32 = 0x7FFD;
 const TAG_HEAP_HI: u32 = 0x7FFD;
+/// Full Heap Value tag, for direct construction of immutable prefix strings.
+const HEAP_TAG: u64 = 0x7FFD_0000_0000_0000;
 /// Low 48 bits of a Value = a heap index (when the tag is Heap).
 const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-/// First non-interned heap index: indices `< 129` are the interned single-ASCII
-/// chars (0..128) + the empty string (128); user objects start here. A heap
-/// value `>=` this needs full `strict_eq` (the region bits-compare bails on it).
-const USER_OBJ_START: i32 = 129;
+/// First non-interned heap index: the prefix holds single-ASCII chars, empty,
+/// and the immutable `"00".."99"` Pad2 table. Every prefix slot has unique
+/// contents, so bits equality is exact between two prefix Values. A heap value
+/// at/above this boundary needs full `strict_eq` (equal-content dynamic strings
+/// and object identity).
+const USER_OBJ_START: i32 = (crate::heap::INTERN_PINNED_END + 1) as i32;
 
 /// Canonical NaN bits (`Value::num` canonicalises every NaN to this pattern so
 /// raw TypedArray bytes can never alias a NaN-box tag). Mirror of value.rs QNAN.
@@ -596,6 +600,10 @@ pub struct HeapHelperAddrs {
     /// op in the interpreter), or `CALL_THREW` (exception pending → the region
     /// exits and the interpreter unwinds WITHOUT re-executing the call).
     pub call_method_ic: usize,
+    /// Guarded direct `RegExp.prototype.test` / `exec` CallMethod helper.
+    pub regexp_call_direct: usize,
+    /// Guarded primitive-string `matchAll` / regex `replace` helper.
+    pub string_regexp_call_direct: usize,
     /// Guarded intrinsic for
     /// `Object.prototype.hasOwnProperty.call(array, numeric_key)`.
     pub has_own_call: usize,
@@ -676,6 +684,17 @@ pub struct HeapHelperAddrs {
     /// `SELF_CALL_DEOPT` / `CALL_THREW`. ALLOCATES (a match step builds the
     /// result array) and carries the region loop's GC safe point.
     pub iter_next: usize,
+    /// Exact matchAll outer-region scalar helpers: two pure protocol guards,
+    /// one allocation-free range step, direct capture StringToNumber, and the
+    /// materialize-before-exit/re-entry closure.
+    pub regexp_scalar_get_iterator: usize,
+    pub regexp_scalar_iter_prime: usize,
+    pub regexp_scalar_step: usize,
+    pub regexp_scalar_capture_num: usize,
+    pub regexp_scalar_flush: usize,
+    /// Exact non-global exec scalar step and materialize-before-exit closure.
+    pub regexp_scalar_exec: usize,
+    pub regexp_scalar_exec_flush: usize,
     /// Helper for a region `PushFinally` (handler-stack push; total).
     pub push_finally: usize,
     /// Helper for a region `PopFinally` (handler-stack pop; total).
@@ -699,7 +718,15 @@ pub struct HeapHelperAddrs {
     pub typeof_is: usize,
     pub static_fn: usize,
     pub to_concat_key: usize,
+    /// Historical delegated entry (selected by
+    /// `ZIPP_NO_CONCAT_PURE_APPEND=1`).
     pub set_index_concat: usize,
+    /// Pure-success entry: returns `CONCAT_SET_PURE` only for an allocation-free
+    /// own hit or proven-clean append.
+    pub set_index_concat_pure: usize,
+    /// Narrow ordinary `DeleteIndex` helper: exact descriptor-free Array plus
+    /// non-negative tagged Int; returns true bits or the deopt sentinel.
+    pub delete_index: usize,
     /// W19 M3 -- `DeleteIndexConcat` (`delete obj["k" + i]`) via the shared
     /// `Vm::delete_index_concat`. Allocates and can run user code (Proxy
     /// `deleteProperty`); returns the result Value bits or `CALL_THREW`.
@@ -715,11 +742,31 @@ pub struct HeapHelperAddrs {
     pub forin_keys: usize,
 }
 
+/// Same-binary A/B switch for the allocation-free fused computed-write lane.
+/// Read while constructing the codegen helper bundle, never by generated code
+/// or on the helper hot path. OFF selects the historical helper entry and makes
+/// the emitter retain its unconditional post-call refetch byte stream.
+#[inline]
+fn concat_pure_append_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CONCAT_PURE_APPEND").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 impl HeapHelperAddrs {
     /// Bundle these helper addresses with the COMPILING function's id and the
     /// reserved inline-cache base into the codegen-internal `HeapHelpers`. Used
     /// by both the OSR region path and Tier C (whole-function mem path).
     fn to_heap_helpers(&self, func_id: u32, ic_base_idx: u32) -> HeapHelpers {
+        let concat_pure_append = concat_pure_append_enabled();
         HeapHelpers {
             func_id,
             get_prop_miss: self.get_prop_miss,
@@ -733,6 +780,8 @@ impl HeapHelperAddrs {
             concat: self.concat,
             str_append: self.str_append,
             call_method_ic: self.call_method_ic,
+            regexp_call_direct: self.regexp_call_direct,
+            string_regexp_call_direct: self.string_regexp_call_direct,
             has_own_call: self.has_own_call,
             call_ic: self.call_ic,
             cross_call: self.cross_call,
@@ -757,6 +806,13 @@ impl HeapHelperAddrs {
             coll_lookup: self.coll_lookup,
             forin_live: self.forin_live,
             iter_next: self.iter_next,
+            regexp_scalar_get_iterator: self.regexp_scalar_get_iterator,
+            regexp_scalar_iter_prime: self.regexp_scalar_iter_prime,
+            regexp_scalar_step: self.regexp_scalar_step,
+            regexp_scalar_capture_num: self.regexp_scalar_capture_num,
+            regexp_scalar_flush: self.regexp_scalar_flush,
+            regexp_scalar_exec: self.regexp_scalar_exec,
+            regexp_scalar_exec_flush: self.regexp_scalar_exec_flush,
             push_finally: self.push_finally,
             pop_finally: self.pop_finally,
             to_num: self.to_num,
@@ -766,7 +822,13 @@ impl HeapHelperAddrs {
             typeof_is: self.typeof_is,
             static_fn: self.static_fn,
             to_concat_key: self.to_concat_key,
-            set_index_concat: self.set_index_concat,
+            set_index_concat: if concat_pure_append {
+                self.set_index_concat_pure
+            } else {
+                self.set_index_concat
+            },
+            concat_pure_append,
+            delete_index: self.delete_index,
             delete_index_concat: self.delete_index_concat,
             is_array: self.is_array,
             len_of: self.len_of,
@@ -898,6 +960,24 @@ pub(crate) fn jit_delete_enabled() -> bool {
         2 => false,
         _ => {
             let on = std::env::var_os("ZIPP_NO_JIT_DELETE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Ordinary `DeleteIndex` on the narrow allocation-free Array+Int MEM lane.
+/// `ZIPP_NO_JIT_ARRAY_DELETE=1` restores the historical admission failure, so
+/// a function/region containing the op generates no new native byte stream.
+/// Read only at admission time, never on the generated hot path.
+pub(crate) fn jit_array_delete_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JIT_ARRAY_DELETE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

@@ -220,6 +220,11 @@ pub struct CompiledRegex {
     // Predicate to rapidly find the first potential match.
     pub start_pred: StartPredicate,
 
+    // PATCH (see suffix_start.rs): optional byte-element-only start search.
+    // This is populated exclusively for the ASCII byteopt twin; ordinary
+    // Unicode/UTF-16 programs always carry None.
+    pub(crate) suffix_start: Option<crate::suffix_start::Plan>,
+
     // Number of loops, used to populate loop data.
     pub loops: u32,
 

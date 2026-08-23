@@ -418,13 +418,13 @@ pub(crate) fn single_char_const_bits(proto: &FuncProto, c: Value) -> Option<u64>
 ///   1. EITHER operand is a DOUBLE (NaN-box high16 ∉ [TAG_LO, TAG_HI]) → the f64
 ///      numeric compare (identical to `dcmp` Eq/Ne) — keeps `0.5===0.5`,
 ///      `NaN!==NaN`, `0===-0` correct, and bails on a num-vs-non-num operand mix.
-///   2. else EITHER operand is HEAP (high16 == 0x7FFD) with index ≥ 129 (a
-///      multi-char string or a user object — NOT an interned single-char/empty
-///      string) → the read-only `jit_strict_eq` helper (full `strict_eq`
+///   2. else EITHER operand is HEAP (high16 == 0x7FFD) with index at/above
+///      USER_OBJ_START (a dynamic string or user object — NOT an immutable
+///      prefix string) → the read-only `jit_strict_eq` helper (full `strict_eq`
 ///      semantics: equal-content strings, BigInts, identity for objects) —
 ///      `line === "##"` scans stay native instead of deopting.
 ///   3. else → 64-bit BITS equality. Exactly JS `===` for Int, Bool, Null,
-///      Undefined, and interned single-char/empty strings (indices < 129). This
+///      Undefined, and immutable prefix strings (indices < USER_OBJ_START). This
 ///      is the `s[i] === "7"` and `charCodeAt === 55` hot path (call-free).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn region_poly_eq(
@@ -468,8 +468,8 @@ pub(crate) fn region_poly_eq(
         ; sub edx, TAG_LO as i32
         ; cmp edx, (TAG_HI - TAG_LO) as i32
         ; ja => b_is_dbl                      // b is a double, a is tagged
-        // Neither is a double. Bail if EITHER is a heap value with index ≥ 129
-        // (a non-interned string / object — needs full strict_eq).
+        // Neither is a double. Bail if EITHER is a heap value outside the
+        // immutable prefix (a dynamic string / object — needs full strict_eq).
         ; mov rdx, rax
         ; shr rdx, 48
         ; cmp edx, TAG_HEAP_HI as i32

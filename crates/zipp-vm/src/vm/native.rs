@@ -884,6 +884,30 @@ pub fn proto_method(id: u16) -> Option<(&'static str, u8, u8)> {
         .and_then(|i| PROTO_METHODS.get(i as usize).copied())
 }
 
+/// Native id of the two String prototype methods served by the guarded
+/// RegExp-string direct-call lane.  Resolve these from [`PROTO_METHODS`]
+/// rather than baking positional ids: inserting an Array/String method above
+/// either entry must not silently make the guard accept a different native.
+pub fn string_regexp_proto_method_id(name: &str) -> Option<u16> {
+    use std::sync::OnceLock;
+    static IDS: OnceLock<[u16; 2]> = OnceLock::new();
+    let ids = IDS.get_or_init(|| {
+        let find = |want: &str| {
+            PROTO_METHODS
+                .iter()
+                .position(|&(n, kind, _)| kind == 1 && n == want)
+                .map(|i| PROTO_METHOD_BASE + i as u16)
+                .expect("String prototype RegExp method is present in native metadata")
+        };
+        [find("matchAll"), find("replace")]
+    });
+    match name {
+        "matchAll" => Some(ids[0]),
+        "replace" => Some(ids[1]),
+        _ => None,
+    }
+}
+
 /// The native id of `Promise.prototype.<name>` for the three methods
 /// `dispatch_builtin_method_inner` claims (kind 7), or `None` for any other
 /// name. The reverse of [`proto_method`] for exactly that slice.

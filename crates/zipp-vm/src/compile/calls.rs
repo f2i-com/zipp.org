@@ -20,6 +20,70 @@ fn arg_expr(a: &Arg) -> Option<&Expr> {
     }
 }
 
+/// `ZIPP_NO_PAD2_COND_FUSE=1` restores the ordinary conditional lowering
+/// byte-for-byte. This is a separate latch from `ZIPP_NO_PAD2_CACHE`: the
+/// latter disables the whole two-digit cache package and therefore also gates
+/// this fusion at its use site.
+#[inline]
+fn pad2_cond_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PAD2_COND_FUSE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Recognise only `n < 10 ? "0" + n : "" + n`, with the SAME identifier at
+/// all three reads. Parentheses are absent from this AST and are semantically
+/// transparent. Binding stability is checked separately by `conditional`.
+fn pad2_cond_ident<'e>(test: &'e Expr, cons: &'e Expr, alt: &'e Expr) -> Option<&'e str> {
+    let name = match test {
+        Expr::Binary {
+            op: BinaryOp::Lt,
+            left,
+            right,
+        } if matches!(right.as_ref(), Expr::Num(n) if *n == 10.0) => match left.as_ref() {
+            Expr::Ident(n) => &**n,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let add_ident = |e: &'e Expr, want_zero: bool| -> Option<&'e str> {
+        match e {
+            Expr::Binary {
+                op: BinaryOp::Add,
+                left,
+                right,
+            } => {
+                let literal_ok = match left.as_ref() {
+                    Expr::Str(StrVal::Utf8(s)) => {
+                        if want_zero {
+                            &**s == "0"
+                        } else {
+                            s.is_empty()
+                        }
+                    }
+                    _ => false,
+                };
+                match (literal_ok, right.as_ref()) {
+                    (true, Expr::Ident(n)) => Some(&**n),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
+    let cons_name = add_ident(cons, true)?;
+    let alt_name = add_ident(alt, false)?;
+    (name == cons_name && name == alt_name).then_some(name)
+}
+
 impl<'a> FnCompiler<'a> {
     // NOTE: signature. `ox::YieldExpression` has no struct counterpart — the
     // payload lives on `Expr::Yield { arg, delegate }` — so this takes the two
@@ -61,14 +125,22 @@ impl<'a> FnCompiler<'a> {
                 // fallback / a raw array): its values get the AsyncFromSync
                 // await-unwrap before each yield.
                 let is_sync = self.alloc_reg();
-                self.emit(Instr::GetAsyncIterator { dst: iter, src: iter, sync_dst: is_sync });
+                self.emit(Instr::GetAsyncIterator {
+                    dst: iter,
+                    src: iter,
+                    sync_dst: is_sync,
+                });
                 let idx = self.alloc_reg();
                 self.emit(Instr::LoadInt { dst: idx, val: 0 });
                 // Cache the inner iterator's `next` ONCE (IteratorRecord.[[NextMethod]]),
                 // matching the spec's get-next-once ordering for a user iterator.
                 let next_fn = self.alloc_reg();
                 let next_name = self.string_name("next");
-                self.emit(Instr::GetProp { dst: next_fn, obj: iter, name: next_name });
+                self.emit(Instr::GetProp {
+                    dst: next_fn,
+                    obj: iter,
+                    name: next_name,
+                });
                 let excr = self.alloc_reg(); // catch reg for an injected outer .throw()
                 let cerr = self.alloc_reg(); // abrupt unwrap completion (close-on-rejection)
                 let step = self.alloc_reg();
@@ -88,13 +160,30 @@ impl<'a> FnCompiler<'a> {
                 let value_name = self.string_name("value");
                 // --- one next(sent) step: r = await iter.next(sent); require Object ---
                 let top = self.here();
-                self.emit(Instr::AsyncIterNextStep { dst: step, iter, idx, sent, next_fn });
+                self.emit(Instr::AsyncIterNextStep {
+                    dst: step,
+                    iter,
+                    idx,
+                    sent,
+                    next_fn,
+                });
                 self.emit(Instr::Await { dst: r, val: step });
                 self.emit(Instr::RequireObject { val: r });
-                self.emit(Instr::GetProp { dst: done, obj: r, name: done_name });
+                self.emit(Instr::GetProp {
+                    dst: done,
+                    obj: r,
+                    name: done_name,
+                });
                 let jdone = self.here();
-                self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → yield* value (r.value)
-                self.emit(Instr::GetProp { dst: value, obj: r, name: value_name });
+                self.emit(Instr::JumpIfTrue {
+                    cond: done,
+                    target: 0,
+                }); // done → yield* value (r.value)
+                self.emit(Instr::GetProp {
+                    dst: value,
+                    obj: r,
+                    name: value_name,
+                });
                 // AsyncFromSyncIterator unwrap (AsyncFromSyncIteratorContinuation,
                 // closeOnRejection = true): a SYNC inner iterator's stepped value
                 // is AWAITED before the async-yield; an abrupt unwrap — the Await's
@@ -106,11 +195,20 @@ impl<'a> FnCompiler<'a> {
                 // throw-delegation's not-done path re-enters here at `unwrap_pt`.
                 let unwrap_pt = self.here();
                 let jskip_aw = self.here();
-                self.emit(Instr::JumpIfFalse { cond: is_sync, target: 0 });
+                self.emit(Instr::JumpIfFalse {
+                    cond: is_sync,
+                    target: 0,
+                });
                 let ph_aw = self.here();
-                self.emit(Instr::PushHandler { catch_target: 0, catch_reg: cerr });
+                self.emit(Instr::PushHandler {
+                    catch_target: 0,
+                    catch_reg: cerr,
+                });
                 self.handler_depth += 1;
-                self.emit(Instr::Await { dst: value, val: value });
+                self.emit(Instr::Await {
+                    dst: value,
+                    val: value,
+                });
                 self.emit(Instr::PopHandler);
                 self.handler_depth -= 1;
                 let jaw_ok = self.here();
@@ -128,66 +226,129 @@ impl<'a> FnCompiler<'a> {
                 //     .throw() into the inner iterator's `throw` ---
                 let yield_pt = self.here();
                 let ph = self.here();
-                self.emit(Instr::PushHandler { catch_target: 0, catch_reg: excr });
+                self.emit(Instr::PushHandler {
+                    catch_target: 0,
+                    catch_reg: excr,
+                });
                 self.handler_depth += 1;
                 // Suspend; resume delivers (mode, value) into (mode, sent).
-                self.emit(Instr::AsyncYieldDelegate { mode_dst: mode, val_dst: sent, val: value });
+                self.emit(Instr::AsyncYieldDelegate {
+                    mode_dst: mode,
+                    val_dst: sent,
+                    val: value,
+                });
                 self.emit(Instr::PopHandler);
                 self.handler_depth -= 1;
                 // mode 2 (return) → return-delegation; mode 0 (next, falsy) → loop.
                 let jret = self.here();
-                self.emit(Instr::JumpIfTrue { cond: mode, target: 0 });
+                self.emit(Instr::JumpIfTrue {
+                    cond: mode,
+                    target: 0,
+                });
                 self.emit(Instr::Jump { target: top });
                 // --- return delegation: outer .return(sent). Delegate to inner.return;
                 //     no method → outer returns `sent`; else await, then finish-return
                 //     (done) or yield the value and continue. ---
                 let ret_label = self.here();
                 self.patch_jump(jret, ret_label);
-                self.emit(Instr::AsyncIterReturnStep { dst: tstep, has_dst: hasret, iter, ret: sent });
+                self.emit(Instr::AsyncIterReturnStep {
+                    dst: tstep,
+                    has_dst: hasret,
+                    iter,
+                    ret: sent,
+                });
                 let jhas = self.here();
-                self.emit(Instr::JumpIfTrue { cond: hasret, target: 0 });
+                self.emit(Instr::JumpIfTrue {
+                    cond: hasret,
+                    target: 0,
+                });
                 // No inner `return` method: the received return value is AWAITED
                 // (spec: if return is undefined and generatorKind is async, set
                 // received.[[Value]] to ? Await(received.[[Value]])) before the
                 // generator returns it — a thenable is adopted (observable `then`
                 // read + one tick), and a rejection unwinds instead.
-                self.emit(Instr::Await { dst: sent, val: sent });
+                self.emit(Instr::Await {
+                    dst: sent,
+                    val: sent,
+                });
                 self.emit(Instr::Return { src: sent });
                 let has_ret = self.here();
                 self.patch_jump(jhas, has_ret);
-                self.emit(Instr::Await { dst: taw, val: tstep });
+                self.emit(Instr::Await {
+                    dst: taw,
+                    val: tstep,
+                });
                 self.emit(Instr::RequireObject { val: taw });
-                self.emit(Instr::GetProp { dst: done, obj: taw, name: done_name });
+                self.emit(Instr::GetProp {
+                    dst: done,
+                    obj: taw,
+                    name: done_name,
+                });
                 let jretdone = self.here();
-                self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // inner.return done → generator returns value
-                self.emit(Instr::GetProp { dst: value, obj: taw, name: value_name });
+                self.emit(Instr::JumpIfTrue {
+                    cond: done,
+                    target: 0,
+                }); // inner.return done → generator returns value
+                self.emit(Instr::GetProp {
+                    dst: value,
+                    obj: taw,
+                    name: value_name,
+                });
                 self.emit(Instr::Jump { target: yield_pt }); // not done → yield value, continue
                 let ret_done = self.here();
                 self.patch_jump(jretdone, ret_done);
-                self.emit(Instr::GetProp { dst: value, obj: taw, name: value_name });
+                self.emit(Instr::GetProp {
+                    dst: value,
+                    obj: taw,
+                    name: value_name,
+                });
                 // A SYNC inner's `return()` result value is unwrapped by the
                 // AsyncFromSync continuation (closeOnRejection = false here):
                 // await it before completing (iterator-result-unwrap-promise).
                 let jrv = self.here();
-                self.emit(Instr::JumpIfFalse { cond: is_sync, target: 0 });
-                self.emit(Instr::Await { dst: value, val: value });
+                self.emit(Instr::JumpIfFalse {
+                    cond: is_sync,
+                    target: 0,
+                });
+                self.emit(Instr::Await {
+                    dst: value,
+                    val: value,
+                });
                 let after_rv = self.here();
                 self.patch_jump(jrv, after_rv);
                 self.emit(Instr::Return { src: value }); // generator returns inner.return's value
-                // --- catch: an outer .throw(excr) was injected here. Delegate to the
-                //     inner iterator's throw (or TypeError if it has none), await the
-                //     result, then either finish (done) or yield the delegated value. ---
+                                                         // --- catch: an outer .throw(excr) was injected here. Delegate to the
+                                                         //     inner iterator's throw (or TypeError if it has none), await the
+                                                         //     result, then either finish (done) or yield the delegated value. ---
                 let catch_label = self.here();
                 if let Instr::PushHandler { catch_target, .. } = &mut self.code[ph as usize] {
                     *catch_target = catch_label;
                 }
-                self.emit(Instr::AsyncIterThrowStep { dst: tstep, iter, exc: excr });
-                self.emit(Instr::Await { dst: taw, val: tstep });
+                self.emit(Instr::AsyncIterThrowStep {
+                    dst: tstep,
+                    iter,
+                    exc: excr,
+                });
+                self.emit(Instr::Await {
+                    dst: taw,
+                    val: tstep,
+                });
                 self.emit(Instr::RequireObject { val: taw });
-                self.emit(Instr::GetProp { dst: done, obj: taw, name: done_name });
+                self.emit(Instr::GetProp {
+                    dst: done,
+                    obj: taw,
+                    name: done_name,
+                });
                 let jdone2 = self.here();
-                self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // inner.throw done → value
-                self.emit(Instr::GetProp { dst: value, obj: taw, name: value_name });
+                self.emit(Instr::JumpIfTrue {
+                    cond: done,
+                    target: 0,
+                }); // inner.throw done → value
+                self.emit(Instr::GetProp {
+                    dst: value,
+                    obj: taw,
+                    name: value_name,
+                });
                 // Not done: a SYNC inner's delegated value takes the same
                 // close-on-rejection unwrap as a next() step (the AsyncFromSync
                 // throw() continuation also has closeOnRejection = true), then
@@ -198,9 +359,16 @@ impl<'a> FnCompiler<'a> {
                 // no close-on-rejection, a plain await).
                 let done_label2 = self.here();
                 self.patch_jump(jdone2, done_label2);
-                self.emit(Instr::GetProp { dst, obj: taw, name: value_name });
+                self.emit(Instr::GetProp {
+                    dst,
+                    obj: taw,
+                    name: value_name,
+                });
                 let jtv = self.here();
-                self.emit(Instr::JumpIfFalse { cond: is_sync, target: 0 });
+                self.emit(Instr::JumpIfFalse {
+                    cond: is_sync,
+                    target: 0,
+                });
                 self.emit(Instr::Await { dst, val: dst });
                 let after_tv = self.here();
                 self.patch_jump(jtv, after_tv);
@@ -209,7 +377,11 @@ impl<'a> FnCompiler<'a> {
                 // done via next(): yield* value = r.value.
                 let done_label = self.here();
                 self.patch_jump(jdone, done_label);
-                self.emit(Instr::GetProp { dst, obj: r, name: value_name });
+                self.emit(Instr::GetProp {
+                    dst,
+                    obj: r,
+                    name: value_name,
+                });
                 let end = self.here();
                 self.patch_jump(jend, end);
                 self.next_reg = save;
@@ -227,7 +399,10 @@ impl<'a> FnCompiler<'a> {
             if v != iter {
                 self.emit(Instr::Move { dst: iter, src: v });
             }
-            self.emit(Instr::GetIteratorObj { dst: iter, src: iter });
+            self.emit(Instr::GetIteratorObj {
+                dst: iter,
+                src: iter,
+            });
             let mode = self.alloc_reg();
             self.emit(Instr::LoadInt { dst: mode, val: 0 }); // start as a `next`
             let sent = self.alloc_reg();
@@ -245,11 +420,21 @@ impl<'a> FnCompiler<'a> {
                 sent,
             });
             let jret = self.here();
-            self.emit(Instr::JumpIfTrue { cond: ret, target: 0 }); // → generator return
+            self.emit(Instr::JumpIfTrue {
+                cond: ret,
+                target: 0,
+            }); // → generator return
             let jdone = self.here();
-            self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // → yield* completes
-            // Neither: yield the value; on resume (mode,sent) are delivered, loop.
-            self.emit(Instr::YieldDelegate { mode_dst: mode, val_dst: sent, val: value });
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            }); // → yield* completes
+                // Neither: yield the value; on resume (mode,sent) are delivered, loop.
+            self.emit(Instr::YieldDelegate {
+                mode_dst: mode,
+                val_dst: sent,
+                val: value,
+            });
             self.emit(Instr::Jump { target: top });
             // ret: the inner iterator's return (or a missing one) ends the generator.
             let ret_label = self.here();
@@ -305,6 +490,45 @@ impl<'a> FnCompiler<'a> {
     // NOTE: signature. `Expr::Cond { test, cons, alt }` inlines the three
     // operands, so this takes them directly.
     pub(crate) fn conditional(&mut self, test: &Expr, cons: &Expr, alt: &Expr, dst: Reg) -> R<Reg> {
+        // Whole pad2 conditional: for a stable plain binding, a tagged Int in
+        // 0..99 can select the canonical result without materialising the 10,
+        // the Bool, either control edge, or a second register load. A miss is
+        // handled by the opcode's exact relational-then-Add fallback.
+        //
+        // Captured/direct-eval bindings are cells and fail `Binding::Local`;
+        // active `with` scopes fail explicitly. Sloppy parameters are declined
+        // because a mapped `arguments[0]` write during valueOf could change the
+        // binding between the condition and selected arm. Strict parameters
+        // and ordinary non-parameter locals have no such observable alias.
+        if super::exprs::pad2_cache_enabled() && pad2_cond_fuse_enabled() {
+            if let Some(name) = pad2_cond_ident(test, cons, alt) {
+                let special = matches!(name, "undefined" | "NaN" | "Infinity" | "arguments");
+                // Eligibility must be a pure query. `with_obj_regs` emits a
+                // CellGet while materialising each with-object, which would
+                // leave dead bytecode behind when this recogniser declines.
+                // An eventual Binding::Local plus `in_scope` proves the name
+                // is bound in this function, so an inherited with cannot
+                // apply; only this function's applicable with stack matters.
+                let shadowable = !self.with_objs_for(name).is_empty();
+                let bad_tdz = self.param_tdz.contains(name);
+                let bad_strict_name = self.cx.in_strict && is_strict_reserved_word(name);
+                if !special && !shadowable && !bad_tdz && !bad_strict_name && !self.box_all_locals {
+                    if let Binding::Local(src) = self.resolve(name) {
+                        // Exclude a named-function-expression self binding:
+                        // "plain local/parameter" means a binding in `scopes`.
+                        let in_scope =
+                            self.scopes.iter().rev().any(|scope| {
+                                scope.iter().rev().any(|(n, r)| n == name && *r == src)
+                            });
+                        let is_param = src != 0 && (src as usize) <= self.param_names.len();
+                        if in_scope && (!is_param || self.cx.in_strict) {
+                            self.emit(Instr::Pad2Conditional { dst, src });
+                            return Ok(dst);
+                        }
+                    }
+                }
+            }
+        }
         let cond = self.expr(test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 });
@@ -350,7 +574,12 @@ impl<'a> FnCompiler<'a> {
             }
             None => self.emit(Instr::LoadUndefined { dst: ft }),
         }
-        self.emit(Instr::NewRegExp { dst, pattern: pt, flags: ft, is_construct });
+        self.emit(Instr::NewRegExp {
+            dst,
+            pattern: pt,
+            flags: ft,
+            is_construct,
+        });
         self.next_reg -= 2;
         Ok(dst)
     }
@@ -405,10 +634,15 @@ impl<'a> FnCompiler<'a> {
             }
             None => None,
         };
-        self.emit(Instr::NewError { dst, kind: kidx, arg, opts, errors });
+        self.emit(Instr::NewError {
+            dst,
+            kind: kidx,
+            arg,
+            opts,
+            errors,
+        });
         // Reclaim the errors + message + options temps (allocated in that order).
-        self.next_reg -=
-            errors.is_some() as Reg + arg.is_some() as Reg + opts.is_some() as Reg;
+        self.next_reg -= errors.is_some() as Reg + arg.is_some() as Reg + opts.is_some() as Reg;
         Ok(dst)
     }
 
@@ -444,10 +678,20 @@ impl<'a> FnCompiler<'a> {
                             }
                             let name = self.string_name(prop);
                             let callee = self.alloc_reg();
-                            self.emit(Instr::GetProp { dst: callee, obj, name });
+                            self.emit(Instr::GetProp {
+                                dst: callee,
+                                obj,
+                                name,
+                            });
                             self.emit_optional_check(callee);
                             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                            self.emit(Instr::CallWithThis {
+                                dst,
+                                callee,
+                                this_v: obj,
+                                arg_base,
+                                argc,
+                            });
                             return Ok(dst);
                         }
                         MemberProp::Computed(key_expr) if !is_super => {
@@ -461,10 +705,20 @@ impl<'a> FnCompiler<'a> {
                             }
                             let key = self.expr(key_expr)?;
                             let callee = self.alloc_reg();
-                            self.emit(Instr::GetIndex { dst: callee, obj, key });
+                            self.emit(Instr::GetIndex {
+                                dst: callee,
+                                obj,
+                                key,
+                            });
                             self.emit_optional_check(callee);
                             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                            self.emit(Instr::CallWithThis {
+                                dst,
+                                callee,
+                                this_v: obj,
+                                arg_base,
+                                argc,
+                            });
                             return Ok(dst);
                         }
                         MemberProp::Private(field) => {
@@ -479,10 +733,20 @@ impl<'a> FnCompiler<'a> {
                             }
                             let name = self.string_name(&private_key(field));
                             let callee = self.alloc_reg();
-                            self.emit(Instr::GetProp { dst: callee, obj, name });
+                            self.emit(Instr::GetProp {
+                                dst: callee,
+                                obj,
+                                name,
+                            });
                             self.emit_optional_check(callee);
                             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                            self.emit(Instr::CallWithThis {
+                                dst,
+                                callee,
+                                this_v: obj,
+                                arg_base,
+                                argc,
+                            });
                             return Ok(dst);
                         }
                         // `super.m?.()` / `super[k]?.()`: the member lowering performs
@@ -491,7 +755,13 @@ impl<'a> FnCompiler<'a> {
                             let callee = self.expr(inner)?;
                             self.emit_optional_check(callee);
                             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::CallWithThis { dst, callee, this_v: 0, arg_base, argc });
+                            self.emit(Instr::CallWithThis {
+                                dst,
+                                callee,
+                                this_v: 0,
+                                arg_base,
+                                argc,
+                            });
                             return Ok(dst);
                         }
                     }
@@ -505,7 +775,13 @@ impl<'a> FnCompiler<'a> {
                     if let Some((callee, obj)) = self.chain_member_callee(ce)? {
                         self.emit_optional_check(callee);
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                        self.emit(Instr::CallWithThis {
+                            dst,
+                            callee,
+                            this_v: obj,
+                            arg_base,
+                            argc,
+                        });
                         return Ok(dst);
                     }
                 }
@@ -516,11 +792,20 @@ impl<'a> FnCompiler<'a> {
             if has_spread {
                 // `fn?.(...xs)`: spread args after the nullish bail.
                 let args_arr = self.build_spread_args(&c.args)?;
-                self.emit(Instr::CallSpread { dst, callee, args: args_arr });
+                self.emit(Instr::CallSpread {
+                    dst,
+                    callee,
+                    args: args_arr,
+                });
                 return Ok(dst);
             }
             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-            self.emit(Instr::Call { dst, callee, arg_base, argc });
+            self.emit(Instr::Call {
+                dst,
+                callee,
+                arg_base,
+                argc,
+            });
             return Ok(dst);
         }
         // Spread call: `f(...args)`, `obj.m(...args)`, `arr.push(...xs)`, etc.
@@ -541,9 +826,16 @@ impl<'a> FnCompiler<'a> {
                     .ok_or("`super(...)` is only valid in a derived class constructor")?;
                 // GetSuperConstructor BEFORE the args (spec SuperCall order).
                 let ctor = self.temp();
-                self.emit(Instr::SuperCtorFetch { dst: ctor, home_class_id: pid });
+                self.emit(Instr::SuperCtorFetch {
+                    dst: ctor,
+                    home_class_id: pid,
+                });
                 let args_arr = self.build_spread_args(&c.args)?;
-                self.emit(Instr::SuperCtorSpread { ctor, home_class_id: pid, args: args_arr });
+                self.emit(Instr::SuperCtorSpread {
+                    ctor,
+                    home_class_id: pid,
+                    args: args_arr,
+                });
                 // `super(...)` evaluates to the new bound `this` (BindThisValue's
                 // result) — SuperCtorSpread rebinds reg 0 to it (call-expr-value).
                 self.emit(Instr::Move { dst, src: 0 });
@@ -557,7 +849,11 @@ impl<'a> FnCompiler<'a> {
                         if &**obj == "Math" {
                             if let Some(op) = crate::bytecode::MathFn::from_name(prop) {
                                 let args_arr = self.build_spread_args(&c.args)?;
-                                self.emit(Instr::MathSpread { dst, op, args: args_arr });
+                                self.emit(Instr::MathSpread {
+                                    dst,
+                                    op,
+                                    args: args_arr,
+                                });
                                 return Ok(dst);
                             }
                         }
@@ -576,7 +872,11 @@ impl<'a> FnCompiler<'a> {
                     let arg = self.alloc_reg();
                     let zero = self.alloc_reg();
                     self.emit(Instr::LoadInt { dst: zero, val: 0 });
-                    self.emit(Instr::GetIndex { dst: arg, obj: args_arr, key: zero });
+                    self.emit(Instr::GetIndex {
+                        dst: arg,
+                        obj: args_arr,
+                        key: zero,
+                    });
                     self.emit_direct_eval(arg, dst, false);
                     return Ok(dst);
                 }
@@ -593,7 +893,12 @@ impl<'a> FnCompiler<'a> {
                         self.this_check();
                         let name = self.string_name(prop);
                         let args_arr = self.build_spread_args(&c.args)?;
-                        self.emit(Instr::SuperMethodSpread { dst, home_class_id: pid, name, args: args_arr });
+                        self.emit(Instr::SuperMethodSpread {
+                            dst,
+                            home_class_id: pid,
+                            name,
+                            args: args_arr,
+                        });
                         return Ok(dst);
                     }
                 }
@@ -608,7 +913,12 @@ impl<'a> FnCompiler<'a> {
                     }
                     let name = self.string_name(prop);
                     let args_arr = self.build_spread_args(&c.args)?;
-                    self.emit(Instr::CallMethodSpread { dst, obj, name, args: args_arr });
+                    self.emit(Instr::CallMethodSpread {
+                        dst,
+                        obj,
+                        name,
+                        args: args_arr,
+                    });
                     return Ok(dst);
                 }
             }
@@ -643,13 +953,22 @@ impl<'a> FnCompiler<'a> {
                     }
                     let key = self.expr(key_expr)?;
                     let args_arr = self.build_spread_args(&c.args)?;
-                    self.emit(Instr::CallMethodComputedSpread { dst, obj, key, args: args_arr });
+                    self.emit(Instr::CallMethodComputedSpread {
+                        dst,
+                        obj,
+                        key,
+                        args: args_arr,
+                    });
                     return Ok(dst);
                 }
             }
             let callee = self.expr(&c.callee)?;
             let args_arr = self.build_spread_args(&c.args)?;
-            self.emit(Instr::CallSpread { dst, callee, args: args_arr });
+            self.emit(Instr::CallSpread {
+                dst,
+                callee,
+                args: args_arr,
+            });
             return Ok(dst);
         }
 
@@ -665,9 +984,17 @@ impl<'a> FnCompiler<'a> {
             // GetSuperConstructor BEFORE the args (spec SuperCall order: the
             // fetch, then ArgumentListEvaluation, then the IsConstructor check).
             let ctor = self.temp();
-            self.emit(Instr::SuperCtorFetch { dst: ctor, home_class_id: pid });
+            self.emit(Instr::SuperCtorFetch {
+                dst: ctor,
+                home_class_id: pid,
+            });
             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-            self.emit(Instr::SuperCtor { ctor, home_class_id: pid, arg_base, argc });
+            self.emit(Instr::SuperCtor {
+                ctor,
+                home_class_id: pid,
+                arg_base,
+                argc,
+            });
             // `super()` evaluates to the new bound `this` (BindThisValue's
             // result) — SuperCtor rebinds reg 0 to it (call-expr-value).
             self.emit(Instr::Move { dst, src: 0 });
@@ -684,12 +1011,27 @@ impl<'a> FnCompiler<'a> {
                         // the argument list runs (an arg may retarget the home
                         // object's prototype — superPropOrdering's testProp).
                         let b = self.temp();
-                        self.emit(Instr::SuperBase { dst: b, home_class_id: pid });
+                        self.emit(Instr::SuperBase {
+                            dst: b,
+                            home_class_id: pid,
+                        });
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::SuperMethod { dst, base: b, home_class_id: pid, name, arg_base, argc });
+                        self.emit(Instr::SuperMethod {
+                            dst,
+                            base: b,
+                            home_class_id: pid,
+                            name,
+                            arg_base,
+                            argc,
+                        });
                     } else if self.super_home_obj {
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::SuperMethodObj { dst, name, arg_base, argc });
+                        self.emit(Instr::SuperMethodObj {
+                            dst,
+                            name,
+                            arg_base,
+                            argc,
+                        });
                     } else {
                         return Err("`super.method(...)` is only valid in a method".into());
                     }
@@ -729,13 +1071,23 @@ impl<'a> FnCompiler<'a> {
                     let callee_reg = self.alloc_reg();
                     let this_reg = self.alloc_reg();
                     let found = self.alloc_reg();
-                    self.emit(Instr::LoadBool { dst: found, val: false });
+                    self.emit(Instr::LoadBool {
+                        dst: found,
+                        val: false,
+                    });
                     let mut hits = Vec::new();
                     for &obj in &with_objs {
                         let flag = self.temp();
-                        self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+                        self.emit(Instr::WithHas {
+                            dst: flag,
+                            obj,
+                            name: nidx,
+                        });
                         let jf = self.here();
-                        self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+                        self.emit(Instr::JumpIfFalse {
+                            cond: flag,
+                            target: 0,
+                        });
                         self.next_reg -= 1;
                         self.emit(Instr::WithGet {
                             dst: callee_reg,
@@ -743,8 +1095,14 @@ impl<'a> FnCompiler<'a> {
                             name: nidx,
                             strict: self.cx.in_strict,
                         });
-                        self.emit(Instr::Move { dst: this_reg, src: obj });
-                        self.emit(Instr::LoadBool { dst: found, val: true });
+                        self.emit(Instr::Move {
+                            dst: this_reg,
+                            src: obj,
+                        });
+                        self.emit(Instr::LoadBool {
+                            dst: found,
+                            val: true,
+                        });
                         let jd = self.here();
                         self.emit(Instr::Jump { target: 0 });
                         hits.push(jd);
@@ -758,14 +1116,23 @@ impl<'a> FnCompiler<'a> {
                     // Arguments evaluate AFTER the callee reference resolved.
                     let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                     let jf = self.here();
-                    self.emit(Instr::JumpIfFalse { cond: found, target: 0 });
+                    self.emit(Instr::JumpIfFalse {
+                        cond: found,
+                        target: 0,
+                    });
                     // A with-object carried `eval`: direct only when its value
                     // IS %eval%; otherwise an ordinary call with `this` = the
                     // with-object.
                     let is_eval = self.temp();
-                    self.emit(Instr::IsEvalFn { dst: is_eval, src: callee_reg });
+                    self.emit(Instr::IsEvalFn {
+                        dst: is_eval,
+                        src: callee_reg,
+                    });
                     let jf2 = self.here();
-                    self.emit(Instr::JumpIfFalse { cond: is_eval, target: 0 });
+                    self.emit(Instr::JumpIfFalse {
+                        cond: is_eval,
+                        target: 0,
+                    });
                     let jd = self.here();
                     self.emit(Instr::Jump { target: 0 });
                     let with_call = self.here();
@@ -863,9 +1230,15 @@ impl<'a> FnCompiler<'a> {
                 let callee = self.expr(&c.callee)?;
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                 let is_eval = self.temp();
-                self.emit(Instr::IsEvalFn { dst: is_eval, src: callee });
+                self.emit(Instr::IsEvalFn {
+                    dst: is_eval,
+                    src: callee,
+                });
                 let jf = self.here();
-                self.emit(Instr::JumpIfFalse { cond: is_eval, target: 0 });
+                self.emit(Instr::JumpIfFalse {
+                    cond: is_eval,
+                    target: 0,
+                });
                 let arg = if argc == 0 {
                     let r = self.temp();
                     self.emit(Instr::LoadUndefined { dst: r });
@@ -878,7 +1251,12 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::Jump { target: 0 });
                 let indirect = self.here();
                 self.patch_jump(jf, indirect);
-                self.emit(Instr::Call { dst, callee, arg_base, argc });
+                self.emit(Instr::Call {
+                    dst,
+                    callee,
+                    arg_base,
+                    argc,
+                });
                 let end = self.here();
                 self.patch_jump(je, end);
                 self.next_reg = save.max(dst + 1);
@@ -938,13 +1316,22 @@ impl<'a> FnCompiler<'a> {
         if let Expr::Ident(id) = &c.callee {
             if let Some(op) = crate::bytecode::GlobalFn::from_name(id) {
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::GlobalFn { dst, op, arg_base, argc });
+                self.emit(Instr::GlobalFn {
+                    dst,
+                    op,
+                    arg_base,
+                    argc,
+                });
                 return Ok(dst);
             }
             // Bare `Array(…)` / `Object()` behave like their `new` forms.
             if &**id == "Array" {
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::ArrayCtor { dst, arg_base, argc });
+                self.emit(Instr::ArrayCtor {
+                    dst,
+                    arg_base,
+                    argc,
+                });
                 return Ok(dst);
             }
             if &**id == "Object" {
@@ -969,7 +1356,11 @@ impl<'a> FnCompiler<'a> {
                         // node routes console.error / console.warn to stderr.
                         let to_stderr = matches!(&**prop, "error" | "warn");
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::Print { arg_base, argc, to_stderr });
+                        self.emit(Instr::Print {
+                            arg_base,
+                            argc,
+                            to_stderr,
+                        });
                         self.emit(Instr::LoadUndefined { dst });
                         return Ok(dst);
                     }
@@ -989,7 +1380,11 @@ impl<'a> FnCompiler<'a> {
                 )
             {
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::Print { arg_base, argc, to_stderr: false });
+                self.emit(Instr::Print {
+                    arg_base,
+                    argc,
+                    to_stderr: false,
+                });
                 self.emit(Instr::LoadUndefined { dst });
                 return Ok(dst);
             }
@@ -1012,7 +1407,11 @@ impl<'a> FnCompiler<'a> {
                     // `Date.UTC(y, m0, …)` → ms; `Date.parse(str)` → ms.
                     if &**obj == "Date" && &**prop == "UTC" {
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::DateUTC { dst, arg_base, argc });
+                        self.emit(Instr::DateUTC {
+                            dst,
+                            arg_base,
+                            argc,
+                        });
                         return Ok(dst);
                     }
                     if &**obj == "Date" && &**prop == "parse" && c.args.len() == 1 {
@@ -1107,7 +1506,12 @@ impl<'a> FnCompiler<'a> {
                         }
                         if let Some(op) = crate::bytecode::MathFn::from_name(prop) {
                             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::MathOp { dst, op, arg_base, argc });
+                            self.emit(Instr::MathOp {
+                                dst,
+                                op,
+                                arg_base,
+                                argc,
+                            });
                             return Ok(dst);
                         }
                     }
@@ -1122,7 +1526,12 @@ impl<'a> FnCompiler<'a> {
                 if let Expr::Ident(obj) = &m.object {
                     if let Some(op) = crate::bytecode::StaticFn::from_name(obj, prop) {
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::StaticFn { dst, op, arg_base, argc });
+                        self.emit(Instr::StaticFn {
+                            dst,
+                            op,
+                            arg_base,
+                            argc,
+                        });
                         return Ok(dst);
                     }
                     // `Array.from(src[, mapFn])` — needs iteration + optional callback.
@@ -1165,7 +1574,13 @@ impl<'a> FnCompiler<'a> {
             if !c.args.iter().any(|a| matches!(a, Arg::Spread(_))) {
                 if let Some((callee, obj)) = self.chain_member_callee(ce)? {
                     let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                    self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                    self.emit(Instr::CallWithThis {
+                        dst,
+                        callee,
+                        this_v: obj,
+                        arg_base,
+                        argc,
+                    });
                     return Ok(dst);
                 }
             }
@@ -1196,7 +1611,13 @@ impl<'a> FnCompiler<'a> {
                 }
                 let name = self.string_name(prop);
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc });
+                self.emit(Instr::CallMethod {
+                    dst,
+                    obj,
+                    name,
+                    arg_base,
+                    argc,
+                });
                 return Ok(dst);
             }
         }
@@ -1207,7 +1628,13 @@ impl<'a> FnCompiler<'a> {
                 let obj = self.expr(&m.object)?;
                 let name = self.string_name(&private_key(field));
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc });
+                self.emit(Instr::CallMethod {
+                    dst,
+                    obj,
+                    name,
+                    arg_base,
+                    argc,
+                });
                 return Ok(dst);
             }
         }
@@ -1225,17 +1652,35 @@ impl<'a> FnCompiler<'a> {
                     let key = self.expr(key_expr)?;
                     let key_reg = self.alloc_reg();
                     if key != key_reg {
-                        self.emit(Instr::Move { dst: key_reg, src: key });
+                        self.emit(Instr::Move {
+                            dst: key_reg,
+                            src: key,
+                        });
                     }
                     if let Some(pid) = is_class {
                         // GetSuperBase after the key, BEFORE the argument list.
                         let b = self.temp();
-                        self.emit(Instr::SuperBase { dst: b, home_class_id: pid });
+                        self.emit(Instr::SuperBase {
+                            dst: b,
+                            home_class_id: pid,
+                        });
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::SuperMethodComputed { dst, base: b, home_class_id: pid, key: key_reg, arg_base, argc });
+                        self.emit(Instr::SuperMethodComputed {
+                            dst,
+                            base: b,
+                            home_class_id: pid,
+                            key: key_reg,
+                            arg_base,
+                            argc,
+                        });
                     } else {
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::SuperMethodObjComputed { dst, key: key_reg, arg_base, argc });
+                        self.emit(Instr::SuperMethodObjComputed {
+                            dst,
+                            key: key_reg,
+                            arg_base,
+                            argc,
+                        });
                     }
                     return Ok(dst);
                 }
@@ -1247,7 +1692,10 @@ impl<'a> FnCompiler<'a> {
                 let obj = self.expr(&m.object)?;
                 let obj_reg = self.alloc_reg();
                 if obj != obj_reg {
-                    self.emit(Instr::Move { dst: obj_reg, src: obj });
+                    self.emit(Instr::Move {
+                        dst: obj_reg,
+                        src: obj,
+                    });
                 }
                 if m.optional {
                     self.emit_optional_check(obj_reg);
@@ -1255,10 +1703,19 @@ impl<'a> FnCompiler<'a> {
                 let key = self.expr(key_expr)?;
                 let key_reg = self.alloc_reg();
                 if key != key_reg {
-                    self.emit(Instr::Move { dst: key_reg, src: key });
+                    self.emit(Instr::Move {
+                        dst: key_reg,
+                        src: key,
+                    });
                 }
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::CallMethodComputed { dst, obj: obj_reg, key: key_reg, arg_base, argc });
+                self.emit(Instr::CallMethodComputed {
+                    dst,
+                    obj: obj_reg,
+                    key: key_reg,
+                    arg_base,
+                    argc,
+                });
                 return Ok(dst);
             }
         }
@@ -1270,7 +1727,12 @@ impl<'a> FnCompiler<'a> {
         // General call: evaluate callee, then contiguous args.
         let callee = self.expr(&c.callee)?;
         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-        self.emit(Instr::Call { dst, callee, arg_base, argc });
+        self.emit(Instr::Call {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        });
         Ok(dst)
     }
 
@@ -1289,7 +1751,7 @@ impl<'a> FnCompiler<'a> {
     /// `tail`: the site is a proper-tail-call return position, so a REBOUND
     /// `eval` (ordinary call at runtime) reuses the frame.
     pub(crate) fn emit_direct_eval(&mut self, arg: Reg, dst: Reg, tail: bool) {
-                // The visible caller bindings (boxed cells, innermost shadowing
+        // The visible caller bindings (boxed cells, innermost shadowing
         // first) — the eval program closes over them. An EVAL ROOT also
         // maps its own cell locals AND its seeded caller upvalues (kind
         // 1), so nested evals keep reaching the original caller scope.
@@ -1305,7 +1767,11 @@ impl<'a> FnCompiler<'a> {
                         // eval'd `var` of the same name still declares into the
                         // function's varEnv (Annex B.3.5) instead of being
                         // absorbed by the caller binding.
-                        let kind = if self.catch_param_regs.contains(r) { 3u8 } else { 0u8 };
+                        let kind = if self.catch_param_regs.contains(r) {
+                            3u8
+                        } else {
+                            0u8
+                        };
                         map.push((n.clone(), kind, *r));
                     }
                 }
@@ -1331,8 +1797,12 @@ impl<'a> FnCompiler<'a> {
                     .iter()
                     .rev()
                     .flat_map(|enc| {
-                        let mut ns: Vec<String> =
-                            enc.cell_locals.iter().rev().map(|(n, _)| n.clone()).collect();
+                        let mut ns: Vec<String> = enc
+                            .cell_locals
+                            .iter()
+                            .rev()
+                            .map(|(n, _)| n.clone())
+                            .collect();
                         ns.extend(enc.upvalues.borrow().iter().map(|(n, _)| n.clone()));
                         ns
                     })
@@ -1353,8 +1823,12 @@ impl<'a> FnCompiler<'a> {
             // root (those cells ARE the eval's variable environment); kind 2
             // otherwise — an ENCLOSING function's binding is readable but a
             // top-level `var` of that name shadows it instead of assigning it.
-            let ups: Vec<String> =
-                self.upvalues.borrow().iter().map(|(n, _)| n.clone()).collect();
+            let ups: Vec<String> = self
+                .upvalues
+                .borrow()
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect();
             let kind = if eval_root { 1u8 } else { 2u8 };
             for (i, n) in ups.iter().enumerate() {
                 if !map.iter().any(|(m, _, _)| m == n) {
@@ -1366,9 +1840,7 @@ impl<'a> FnCompiler<'a> {
             // and, for non-arrows, the implicit `arguments`).
             let param_collisions = if self.in_param_init {
                 let mut names = self.param_names.clone();
-                if self.arguments_reg.is_some()
-                    && !names.iter().any(|n| n == "arguments")
-                {
+                if self.arguments_reg.is_some() && !names.iter().any(|n| n == "arguments") {
                     names.push("arguments".to_string());
                 }
                 Some(names)
@@ -1444,7 +1916,11 @@ impl<'a> FnCompiler<'a> {
     /// Consumed by `CallSpread` / `CallMethodSpread`.
     pub(crate) fn build_spread_args(&mut self, args: &[Arg]) -> R<Reg> {
         let args_arr = self.temp();
-        self.emit(Instr::NewArray { dst: args_arr, arg_base: self.next_reg, argc: 0 });
+        self.emit(Instr::NewArray {
+            dst: args_arr,
+            arg_base: self.next_reg,
+            argc: 0,
+        });
         for a in args {
             let save = self.next_reg;
             // `Arg` has exactly the two forms, so the old
@@ -1453,11 +1929,19 @@ impl<'a> FnCompiler<'a> {
             match a {
                 Arg::Spread(s) => {
                     let v = self.expr(s)?;
-                    self.emit(Instr::ArrayAppend { arr: args_arr, val: v, spread: true });
+                    self.emit(Instr::ArrayAppend {
+                        arr: args_arr,
+                        val: v,
+                        spread: true,
+                    });
                 }
                 Arg::Expr(e) => {
                     let v = self.expr(e)?;
-                    self.emit(Instr::ArrayAppend { arr: args_arr, val: v, spread: false });
+                    self.emit(Instr::ArrayAppend {
+                        arr: args_arr,
+                        val: v,
+                        spread: false,
+                    });
                 }
             }
             self.next_reg = save;

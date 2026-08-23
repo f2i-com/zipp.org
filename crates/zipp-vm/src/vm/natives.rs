@@ -1952,7 +1952,14 @@ impl<'p> Vm<'p> {
                 // Fast path: a pristine RegExp whose `exec` is still the
                 // intrinsic. The Get and the call are then unobservable, so go
                 // straight to the builtin and skip the match-array build too.
-                if is_re && self.regexp_exec_fast_ok(this.heap_index()) {
+                // The proof must remain valid across ToString(S), which occurs
+                // before RegExpExec reads `exec`. Primitive coercion cannot run
+                // user code; an object can patch `exec`, so it takes the full
+                // protocol below and performs the Get after coercion.
+                if is_re
+                    && !self.is_object_value(a0)
+                    && self.regexp_exec_fast_ok(this.heap_index())
+                {
                     let r = self.regexp_exec_impl(this.heap_index(), a0, false)?;
                     return Ok(Value::bool(r != Value::NULL));
                 }
@@ -2454,6 +2461,7 @@ impl<'p> Vm<'p> {
                                 subj_units,
                                 fbits,
                                 done: false,
+                                scalar_pending: None,
                             },
                         );
                         return Ok(Value::heap(it));
@@ -2520,6 +2528,7 @@ impl<'p> Vm<'p> {
                         subj_units,
                         fbits,
                         done: false,
+                        scalar_pending: None,
                     },
                 );
                 Value::heap(it)

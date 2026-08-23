@@ -125,6 +125,102 @@ pub(crate) extern "win64" fn jit_call_method_ic(
     }
 }
 
+/// Guarded direct `RegExp.prototype.exec` / `test` CallMethod helper. The
+/// emitter uses it only for those two static names and only while
+/// `ZIPP_NO_RX_CALL_DIRECT` is absent. `op = 0` selects exec, `op = 1` test.
+///
+/// `SELF_CALL_DEOPT` means the shared pristine-method proof declined before an
+/// observable operation, so generated code falls through to the unchanged
+/// `jit_call_method_ic` path. A served call returns its Value bits; a JS throw
+/// becomes `CALL_THREW` with `pending_throw` populated and must never be
+/// re-executed. The implementation may allocate or run user code through input
+/// ToString / `lastIndex.valueOf`, so callers perform the full post-call pinned
+/// pointer and TypedArray-snapshot refetch.
+///
+/// ABI: rcx=vm, rdx=receiver bits, r8=input bits, r9d=op.
+///
+/// # Safety
+/// `vm` is the live `Vm`; operands are raw Value bits from the running frame.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_call_direct(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    input_bits: u64,
+    op: u32,
+) -> u64 {
+    if op > 1 {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        match vm.regexp_call_direct(
+            Value::from_bits(recv_bits),
+            Value::from_bits(input_bits),
+            op == 1,
+            true,
+        ) {
+            Ok(Some(v)) => v.bits(),
+            Ok(None) => crate::codegen::SELF_CALL_DEOPT,
+            Err(t) => vm.jit_thrown_to_sentinel(t),
+        }
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Guarded direct primitive-string `matchAll(RegExp)` / `replace(RegExp,
+/// string)` CallMethod helper. `op = 0` selects matchAll (one argument),
+/// `op = 1` selects replace (two arguments).
+///
+/// `SELF_CALL_DEOPT` is a pure guard decline and generated code falls through
+/// to the unchanged generic `jit_call_method_ic` site.  Once the intrinsic is
+/// entered, a JS throw is committed as `CALL_THREW` with `pending_throw` set;
+/// it must never be replayed.  Both served operations allocate and may trigger
+/// GC; the emitter performs the full pinned/TypedArray snapshot refetch.
+///
+/// ABI: rcx=vm, rdx=receiver bits, r8=&args[0], r9d=op.
+///
+/// # Safety
+/// `vm` is the live `Vm`; `args` points into the running, pinned register
+/// window and contains at least one Value for matchAll or two for replace.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_string_regexp_call_direct(
+    vm: *mut core::ffi::c_void,
+    recv_bits: u64,
+    args: *const u64,
+    op: u32,
+) -> u64 {
+    if op > 1 || args.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        let arg0 = Value::from_bits(*args);
+        let replacement = if op == 1 {
+            Value::from_bits(*args.add(1))
+        } else {
+            Value::UNDEFINED
+        };
+        match vm.string_regexp_call_direct(
+            Value::from_bits(recv_bits),
+            arg0,
+            replacement,
+            op == 1,
+            true,
+        ) {
+            Ok(Some(v)) => v.bits(),
+            Ok(None) => crate::codegen::SELF_CALL_DEOPT,
+            Err(t) => vm.jit_thrown_to_sentinel(t),
+        }
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper for the Tier C CROSS-CALL fast path (B83): a compiled body's
 /// `Call` site whose live callee is itself a Tier-C-compiled plain function is
 /// dispatched native→native — no `ic_call` probe, no `setup_call` frame push,
@@ -608,17 +704,21 @@ pub(crate) extern "win64" fn jit_get_index(
     // user code, and parity with the interpreter is what makes this sound.
     if key.is_heap() {
         let oidx = arr.heap_index();
-        if !(oidx == vm.global_this && vm.global_this != 0)
-            && !(!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
-            && !(!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
-        {
-            if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(key.heap_index()) {
-                if let (Ok(k), HeapObj::Object(m)) = (std::str::from_utf8(b), vm.heap.get(oidx)) {
-                    if let Some(i) = m.pos(k) {
-                        if !m.attrs[i].accessor {
-                            let v = m.vals[i];
-                            if !v.is_uninitialized() {
-                                return v.bits();
+        if let Some(std::borrow::Cow::Borrowed(b)) = vm.heap.str_wtf8_cow(key.heap_index()) {
+            if let Ok(k) = std::str::from_utf8(b) {
+                if !(oidx == vm.global_this && vm.global_this != 0)
+                    && !(!vm.module_namespaces.is_empty()
+                        && vm.module_namespaces.contains_key(&oidx))
+                    && !(!vm.deferred_ns_state.is_empty()
+                        && vm.deferred_ns_state.contains_key(&oidx))
+                {
+                    if let HeapObj::Object(m) = vm.heap.get(oidx) {
+                        if let Some(i) = m.pos(k) {
+                            if !m.attrs[i].accessor {
+                                let v = m.vals[i];
+                                if !v.is_uninitialized() {
+                                    return v.bits();
+                                }
                             }
                         }
                     }
@@ -1422,6 +1522,89 @@ pub(crate) extern "win64" fn jit_concat(
     }
 }
 
+/// `dst = a + (b + c)` for `AddRightPair` in a MEM region / Tier C.  Delegates
+/// to the interpreter's exact shared entry: the bounded flat-ASCII primitive
+/// arm allocates one result; every other case executes the inner ordinary Add
+/// followed by the outer one.  The fallback may run user ToPrimitive code, so
+/// a throw is committed as `CALL_THREW` and must never become a redo deopt.
+///
+/// Win64 ABI: rcx=vm, rdx=a bits, r8=b bits, r9=c bits.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_add_right_pair(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+    c_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.add_values_right_pair(
+        Value::from_bits(a_bits),
+        Value::from_bits(b_bits),
+        Value::from_bits(c_bits),
+    ) {
+        Ok(v) => v.bits(),
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
+/// Proven-linear `AddRightPair` sibling selected by the opcode's `in_place`
+/// licence.  It shares the interpreter entry and therefore retains the exact
+/// fresh-result fallback; a fast hit mutates only the licensed accumulator.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_append_right_pair(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+    c_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.add_values_right_pair_inplace(
+        Value::from_bits(a_bits),
+        Value::from_bits(b_bits),
+        Value::from_bits(c_bits),
+    ) {
+        Ok(v) => v.bits(),
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
+/// Literal `"0" + src` / `"" + src` for `Pad2Concat` in a MEM region or
+/// Tier C. The shared VM entry returns the immutable two-digit slot on an Int
+/// hit and otherwise performs the exact ordinary `+`. A fallback can execute
+/// user coercion code, so a throw is committed as CALL_THREW, never redo-deopt.
+///
+/// Win64 ABI: rcx=vm, rdx=src bits, r8=zero flag.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_pad2_concat(
+    vm: *mut core::ffi::c_void,
+    src_bits: u64,
+    zero: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.pad2_concat(Value::from_bits(src_bits), zero != 0) {
+        Ok(v) => v.bits(),
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
+/// Whole `src < 10 ? "0" + src : "" + src` for `Pad2Conditional`.
+/// The bounded Int hit returns a canonical slot; every miss executes the exact
+/// relational comparison and selected Add. A miss can run user code and throw,
+/// so errors are committed as CALL_THREW and never interpreter-redone.
+///
+/// Win64 ABI: rcx=vm, rdx=src bits.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_pad2_conditional(
+    vm: *mut core::ffi::c_void,
+    src_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.pad2_conditional(Value::from_bits(src_bits)) {
+        Ok(v) => v.bits(),
+        Err(t) => vm.jit_thrown_to_sentinel(t),
+    }
+}
+
 /// `dst = a + b` for one `StrConcatChain` link (W11 B124) in a MEM region or a
 /// Tier-C body: `Vm::add_values_chain` — the in-place chain append when `a` is
 /// the chain's fresh flat-Str accumulator, the full pairwise `+` otherwise.
@@ -1545,7 +1728,7 @@ pub(crate) extern "win64" fn jit_concat_chain_fast(
     // The chain's last link asks for the trim; every other hint is a capacity.
     let last = cap_hint & crate::codegen::CHAIN_HINT_LAST as u64 != 0;
     let cap = (cap_hint & !(crate::codegen::CHAIN_HINT_LAST as u64)) as usize;
-    if a.is_heap() && a.heap_index() > crate::heap::INTERN_EMPTY {
+    if a.is_heap() && a.heap_index() > crate::heap::INTERN_PINNED_END {
         let ai = a.heap_index();
         #[cfg(debug_assertions)]
         let heap_len = vm.heap.len();
@@ -1981,6 +2164,12 @@ pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
 #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
 pub fn cross_fill_stats() -> (u64, u64) {
     (0, 0)
+}
+
+/// Without the JIT there is no fused computed-write helper to classify.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+pub fn concat_set_stats() -> (u64, u64, u64) {
+    (0, 0, 0)
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -2861,14 +3050,71 @@ fn concat_append_enabled() -> bool {
     }
 }
 
-/// Win64 helper for a region `SetIndexConcat`: the own writable DATA-slot HIT
-/// on a plain object with an Int key, mirroring `jit_get_index_concat` — the
-/// key is formatted into the reused scratch buffer (no allocation), the slot
-/// value is overwritten in place (no shape change, no version bump — exactly
-/// the interpreter's hit arm), and EVERYTHING else deopts: a NEW key (the
-/// append reallocs `vals` and bumps the version — let the interpreter do it),
-/// a non-writable/accessor slot, `__proto__`, an exotic receiver, a non-Int
-/// key. Runs no user code.
+/// `ZIPP_ICSTATS=1` engagement counters for the fused computed-write helper.
+/// `hit` and `add` are writes completed by the shared allocation-free prefix;
+/// `slow` declined before an observable change and used the historical
+/// delegated/deopt path. Off-switch code uses the old helper entry, for which a
+/// new key deliberately counts as `slow` and `add` stays zero.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod concatsetstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static HIT: AtomicU64 = AtomicU64::new(0);
+    static ADD: AtomicU64 = AtomicU64::new(0);
+    static SLOW: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn hit() {
+        if enabled() {
+            HIT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn add() {
+        if enabled() {
+            ADD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn slow() {
+        if enabled() {
+            SLOW.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump() -> (u64, u64, u64) {
+        (
+            HIT.load(Ordering::Relaxed),
+            ADD.load(Ordering::Relaxed),
+            SLOW.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub use concatsetstats::dump as concat_set_stats;
+
+/// Historical Win64 entry for a region `SetIndexConcat`. It serves an own data
+/// hit, but delegates a new key through `Vm::set_index_concat` and returns the
+/// generic zero-success result, so its emitter must retain the unconditional
+/// pinned-pointer/snapshot refetch. `ZIPP_NO_CONCAT_PURE_APPEND=1` selects this
+/// entry at codegen time and restores the pre-change emission and helper path.
 ///
 /// `packed = (func_id << 32) | name_idx`; `val` rides the stack as arg 5.
 ///
@@ -2882,44 +3128,65 @@ pub(crate) extern "win64" fn jit_set_index_concat(
     key_bits: u64,
     val_bits: u64,
 ) -> u64 {
+    jit_set_index_concat_impl(vm, obj_bits, packed, key_bits, val_bits, false)
+}
+
+/// Pure-success sibling of [`jit_set_index_concat`]. An own writable-data hit
+/// or proven-clean new append returns `CONCAT_SET_PURE`; generated code may skip
+/// all pin/snapshot refetches only for that sentinel. A slow case is still the
+/// exact historical delegation and returns zero / `CALL_THREW` / deopt.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_set_index_concat_pure(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    packed: u64,
+    key_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    jit_set_index_concat_impl(vm, obj_bits, packed, key_bits, val_bits, true)
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline(always)]
+fn jit_set_index_concat_impl(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    packed: u64,
+    key_bits: u64,
+    val_bits: u64,
+    pure_entry: bool,
+) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let obj = Value::from_bits(obj_bits);
     let key = Value::from_bits(key_bits);
     if !key.is_int() || !obj.is_heap() {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    let oidx = obj.heap_index();
-    if (oidx == vm.global_this && vm.global_this != 0)
-        || oidx == vm.obj_proto
-        || !vm.realm_global_objs.is_empty()
-        || (!vm.module_namespaces.is_empty() && vm.module_namespaces.contains_key(&oidx))
-        || (!vm.deferred_ns_state.is_empty() && vm.deferred_ns_state.contains_key(&oidx))
-        || !matches!(vm.heap.get(oidx), HeapObj::Object(_))
-    {
+        concatsetstats::slow();
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let func_id = (packed >> 32) as u32;
     let name = packed as u32;
     let mut scratch = std::mem::take(&mut vm.idx_key_scratch);
     vm.build_concat_key(&mut scratch, name, key.as_int(), func_id);
-    let hit = match vm.heap.get(oidx) {
-        HeapObj::Object(m) if scratch != "__proto__" => match m.pos(&scratch) {
-            Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => Some(i),
-            _ => None,
-        },
-        _ => None,
-    };
-    let out = match hit {
-        Some(i) => {
-            // Nursery barrier: an in-place store into a possibly-old holder
-            // (the miss arm delegates to `set_index_concat`, which barriers).
-            vm.heap.write_barrier_val(oidx, Value::from_bits(val_bits));
-            if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
-                m.vals[i] = Value::from_bits(val_bits);
-                0
+    let append = concat_append_enabled();
+    let fast = vm.try_set_index_concat_prebuilt(
+        obj,
+        &scratch,
+        Value::from_bits(val_bits),
+        pure_entry && append,
+    );
+    let out = match fast {
+        super::indexing_date::ConcatSetFast::Hit => {
+            concatsetstats::hit();
+            if pure_entry {
+                crate::codegen::CONCAT_SET_PURE
             } else {
-                crate::codegen::SELF_CALL_DEOPT
+                0
             }
+        }
+        super::indexing_date::ConcatSetFast::Add => {
+            concatsetstats::add();
+            debug_assert!(pure_entry && append);
+            crate::codegen::CONCAT_SET_PURE
         }
         // B86: a NEW key used to deopt here, and that was the whole cost of
         // `polymorphic-objects`. Its dict-churn loop builds a FRESH `{}` per
@@ -2944,8 +3211,12 @@ pub(crate) extern "win64" fn jit_set_index_concat(
         // `CALL_THREW` rather than the redo sentinel, because the append may
         // already have run a setter's side effects and re-executing the op in
         // the interpreter would run them twice.
-        None if !concat_append_enabled() => crate::codegen::SELF_CALL_DEOPT,
-        None => {
+        super::indexing_date::ConcatSetFast::Slow if !append => {
+            concatsetstats::slow();
+            crate::codegen::SELF_CALL_DEOPT
+        }
+        super::indexing_date::ConcatSetFast::Slow => {
+            concatsetstats::slow();
             let strict = vm.func(func_id as usize).is_strict;
             let o = Value::from_bits(obj_bits);
             let v = Value::from_bits(val_bits);
@@ -2963,6 +3234,57 @@ pub(crate) extern "win64" fn jit_set_index_concat(
         vm.idx_key_scratch = scratch;
     }
     out
+}
+
+/// Win64 helper for the narrow MEM-tier ordinary `DeleteIndex` lane. It serves
+/// only a non-negative tagged Int key on an exact, descriptor-free Array that
+/// is not an arguments exotic. Such a key is necessarily a canonical array
+/// index (the Int payload is i32, hence below 2^32-1), and deleting it is always
+/// configurable/successful: replace the dense slot with HOLE when it exists,
+/// keep `length`, and bump the receiver version exactly like `delete_prop`.
+///
+/// Every guard runs before the first mutation. A negative Int is a named key;
+/// double -0 / integral doubles / larger indices need ToPropertyKey semantics;
+/// an `arr_props` entry can be sealed/frozen or a special descriptor; and an
+/// arguments object must sever its parameter map. All of those return
+/// `SELF_CALL_DEOPT` so the interpreter re-executes the untouched operation.
+///
+/// This helper cannot allocate, re-enter, throw, or reallocate the element Vec.
+/// Existing array-pin `{identity, base, len}` snapshots therefore stay valid;
+/// a later pinned read observes the written HOLE and takes its normal hole arm.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; both Values are rooted in the caller's frame.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_delete_index(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    key_bits: u64,
+) -> u64 {
+    let obj = Value::from_bits(obj_bits);
+    let key = Value::from_bits(key_bits);
+    if !obj.is_heap() || !key.is_int() || key.as_int() < 0 {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: exclusive view for one in-place slot overwrite + version bump;
+    // no allocation or user-code call occurs on the supported path.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let idx = obj.heap_index();
+    if vm.arr_props.contains_key(&idx)
+        || vm.arguments_objs.contains_key(&idx)
+        || !matches!(vm.heap.get(idx), HeapObj::Array(_))
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let i = key.as_int() as usize;
+    if let HeapObj::Array(items) = vm.heap.get_mut(idx) {
+        if let Some(slot) = items.get_mut(i) {
+            *slot = Value::HOLE;
+        }
+    }
+    // The interpreter bumps even for an OOB index or an already-HOLE slot.
+    vm.heap.bump_version(idx);
+    Value::TRUE.bits()
 }
 
 /// Win64 helper for a region `DeleteIndexConcat` (`delete obj["name" + i]`) --
@@ -3179,6 +3501,185 @@ pub(crate) mod iterstats {
 }
 
 pub use iterstats::dump as iter_region_stats;
+
+/// Pure identity guard for the scalar matchAll plan's source `GetIterator`.
+/// A sentinel miss means no getter/call/state mutation has occurred, so the
+/// region may resume the original bytecode exactly once.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_scalar_get_iterator(
+    vm: *mut core::ffi::c_void,
+    it_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.regexp_scalar_get_iterator_identity(Value::from_bits(it_bits)) {
+        Some(v) => v.bits(),
+        None => {
+            super::proxy_regexp::rxstats::count_scalar_guard_decline();
+            crate::codegen::SELF_CALL_DEOPT
+        }
+    }
+}
+
+/// Pure live `%RegExpStringIteratorPrototype%.next` guard for the exact
+/// scalar plan's `IterPrime`. A miss resumes at the original observable Get.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_scalar_iter_prime(
+    vm: *mut core::ffi::c_void,
+    it_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.regexp_scalar_iter_prime(Value::from_bits(it_bits)) {
+        Some(v) => v.bits(),
+        None => {
+            super::proxy_regexp::rxstats::count_scalar_guard_decline();
+            crate::codegen::SELF_CALL_DEOPT
+        }
+    }
+}
+
+/// Result-array-allocation-free success step for the exact matchAll scalar
+/// region (Annex-B strings still allocate). The helper runs its GC safe point
+/// before copying frame-rooted Values into Rust locals. On exhaustion it MUST
+/// flush the final pending result before
+/// returning `done=true`: generated code branches directly to outer IP 405,
+/// so no later native instruction can perform that materialization.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_scalar_step(
+    vm: *mut core::ffi::c_void,
+    it_bits: u64,
+    next_bits: u64,
+    result_global: u32,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.maybe_gc();
+    let it = Value::from_bits(it_bits);
+    let next = Value::from_bits(next_bits);
+    if !it.is_heap()
+        || !next.is_heap()
+        || !matches!(
+            vm.heap.get(next.heap_index()),
+            HeapObj::Native(n) if *n == crate::vm::native::ITER_NEXT
+        )
+    {
+        iterstats::deopt();
+        super::proxy_regexp::rxstats::count_scalar_guard_decline();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match vm.regexp_string_iter_step_scalar(it.heap_index()) {
+        super::proxy_regexp::RegexpScalarStep::Success => {
+            iterstats::native_step();
+            Value::bool(false).bits()
+        }
+        super::proxy_regexp::RegexpScalarStep::Done => {
+            // Ordering is load-bearing: the scalar region's done edge skips
+            // directly to IP 405, where source code may observe the final km.
+            vm.regexp_scalar_flush(it.heap_index(), result_global, false);
+            iterstats::native_step();
+            Value::bool(true).bits()
+        }
+        super::proxy_regexp::RegexpScalarStep::Decline => {
+            iterstats::deopt();
+            super::proxy_regexp::rxstats::count_scalar_guard_decline();
+            crate::codegen::SELF_CALL_DEOPT
+        }
+    }
+}
+
+/// Direct unary-`+` capture consumer for the scalar plan's fixed GetIndex →
+/// ToNum pair. It returns number Value bits and never allocates or re-enters.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_scalar_capture_num(
+    vm: *mut core::ffi::c_void,
+    it_bits: u64,
+    capture: u32,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let it = Value::from_bits(it_bits);
+    if !it.is_heap() {
+        super::proxy_regexp::rxstats::count_scalar_guard_decline();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match vm.regexp_scalar_capture_number(it.heap_index(), capture) {
+        Some(v) => v.bits(),
+        None => {
+            super::proxy_regexp::rxstats::count_scalar_guard_decline();
+            crate::codegen::SELF_CALL_DEOPT
+        }
+    }
+}
+
+/// Materialize-and-clear any pending scalar result before a native exit or a
+/// helper that can run user code. No-op when no result is pending.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_scalar_flush(
+    vm: *mut core::ffi::c_void,
+    it_bits: u64,
+    result_global: u32,
+    slow_reentry: u32,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let it = Value::from_bits(it_bits);
+    if it.is_heap() {
+        vm.regexp_scalar_flush(it.heap_index(), result_global, slow_reentry != 0);
+    }
+    0
+}
+
+/// Exact non-global exec scalar helper.  The fifth Win64 argument packs the
+/// four future ToNum destination registers (one u16 each); all outputs are
+/// committed only after the full protocol/shape/capture scan succeeds.
+/// `TRUE` denotes a successful match, `NULL` a semantic miss, and
+/// `SELF_CALL_DEOPT` a pure guard decline.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_scalar_exec(
+    vm: *mut core::ffi::c_void,
+    regs: *mut u64,
+    recv_bits: u64,
+    input_bits: u64,
+    packed_dsts: u64,
+) -> u64 {
+    if regs.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    // The live frame still roots both operands and any previous pending
+    // subject. No Value is retained solely in an untraced Rust local yet.
+    vm.maybe_gc();
+    match vm.regexp_scalar_exec_step(
+        Value::from_bits(recv_bits),
+        Value::from_bits(input_bits),
+    ) {
+        super::proxy_regexp::RegexpScalarExecStep::Success(values) => {
+            for (g, value) in values.into_iter().enumerate() {
+                let dst = ((packed_dsts >> (16 * g)) & 0xFFFF) as usize;
+                unsafe { *regs.add(dst) = value.bits() };
+            }
+            Value::TRUE.bits()
+        }
+        super::proxy_regexp::RegexpScalarExecStep::Miss => Value::NULL.bits(),
+        super::proxy_regexp::RegexpScalarExecStep::Decline => {
+            super::proxy_regexp::rxstats::count_scalar_exec_guard_decline();
+            crate::codegen::SELF_CALL_DEOPT
+        }
+    }
+}
+
+/// Materialize-and-clear the exact direct-exec pending result.  `reason` is 0
+/// for an ordinary native exit, 1 for a slow Add that can re-enter, and 2 for
+/// an input dense-pin miss that is about to replay an observable GetIndex.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regexp_scalar_exec_flush(
+    vm: *mut core::ffi::c_void,
+    result_global: u32,
+    reason: u32,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    if reason == 2 {
+        super::proxy_regexp::rxstats::count_scalar_exec_pin_decline();
+    }
+    vm.regexp_scalar_exec_flush(result_global, reason);
+    0
+}
 
 /// Win64 helper for a region `IterNext` — the for-of step over an iterator the
 /// engine can drive INTRINSICALLY: a %RegExpStringIterator% (`s.matchAll(re)`),

@@ -132,6 +132,7 @@ impl<'p> Vm<'p> {
             matchall_batches: rustc_hash::FxHashMap::default(),
             matchall_caps_scratch: Vec::new(),
             matchall_flat_scratch: Vec::new(),
+            regexp_scalar_exec_pending: None,
             regexp_last: Vec::new(),
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,

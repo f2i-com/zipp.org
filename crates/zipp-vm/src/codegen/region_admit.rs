@@ -4,6 +4,7 @@
 // each other. No logic changed.
 #![allow(unused_imports)]
 use super::*;
+use crate::bytecode::{BitwiseOp, Reg};
 
 /// Top-16 bits of the canonical bool tag (`0x7FFA`). The five tag patterns
 /// 0x7FF9..=0x7FFD are: Int, Bool, Null, Undefined, Heap — only Int is a number.
@@ -22,6 +23,454 @@ fn iter_region_enabled() -> bool {
     std::env::var_os("ZIPP_NO_ITER_REGION").is_none()
 }
 
+/// Proof token for the deliberately tiny matchAll scalarization V1. The
+/// detector accepts only the compiler's exact 36-op outer-loop shape used by
+/// regex-log-scan; every skipped publication/consumer is named here so the
+/// emitter cannot accidentally scalarize a merely similar loop.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RxScalarMatchallPlan {
+    pub(crate) call_ip: usize,
+    pub(crate) get_iterator_ip: usize,
+    pub(crate) iter_prime_ip: usize,
+    pub(crate) iter_next_ip: usize,
+    pub(crate) result_store_ip: usize,
+    pub(crate) result_load_ip: usize,
+    pub(crate) capture_get_ip: usize,
+    pub(crate) capture_tonum_ip: usize,
+    pub(crate) add_ip: usize,
+    pub(crate) close_ip: usize,
+    pub(crate) end_finally_ip: usize,
+    pub(crate) iter_reg: Reg,
+    pub(crate) result_global: u32,
+    pub(crate) capture: u32,
+    pub(crate) tonum_dst: Reg,
+}
+
+/// Proof token for the exact non-global `RegExp.prototype.exec` loop used by
+/// regex-log-scan.  Unlike the matchAll token above this shape is already an
+/// ordinary MEM region; the token only permits eliding the result publication
+/// and its four fixed `GetIndex -> ToNum` consumers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RxScalarExecPlan {
+    pub(crate) input_get_ip: usize,
+    pub(crate) call_ip: usize,
+    pub(crate) result_store_ip: usize,
+    pub(crate) result_reload_ip: usize,
+    pub(crate) capture_load_ips: [usize; 4],
+    pub(crate) capture_key_ips: [usize; 4],
+    pub(crate) capture_get_ips: [usize; 4],
+    pub(crate) capture_tonum_ips: [usize; 4],
+    pub(crate) add_ips: [usize; 4],
+    pub(crate) input_pin_slot: usize,
+    pub(crate) re_reg: Reg,
+    pub(crate) input_reg: Reg,
+    pub(crate) call_result_reg: Reg,
+    pub(crate) result_test_reg: Reg,
+    pub(crate) result_global: u32,
+    pub(crate) tonum_dsts: [Reg; 4],
+}
+
+impl RxScalarExecPlan {
+    #[inline]
+    pub(crate) fn elides_capture_ip(&self, ip: usize) -> bool {
+        self.capture_load_ips.contains(&ip)
+            || self.capture_key_ips.contains(&ip)
+            || self.capture_get_ips.contains(&ip)
+            || self.capture_tonum_ips.contains(&ip)
+    }
+}
+
+/// Recognize exactly:
+///
+/// `for (i<N) { m=re.exec(lines[i]); if(m) { count++;` followed by four
+/// `sum += +m[k]` additions and `|0`; then `i++`.  The dense input pin is a
+/// load-bearing part of the proof: while the previous result is pending, a
+/// hole/proxy/accessor-capable `GetIndex` must exit and materialize before the
+/// interpreter performs any observable lookup.
+pub(crate) fn rx_scalar_exec_plan(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+) -> Option<RxScalarExecPlan> {
+    if !crate::vm::rx_scalar_exec_enabled() || end != start.checked_add(41)? {
+        return None;
+    }
+    let s = start as usize;
+    let code = &proto.code;
+    if end as usize >= code.len() {
+        return None;
+    }
+
+    let (i0, i_global) = match code[s] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let (n, n_global) = match code[s + 1] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    if !matches!(code[s + 2], Instr::JumpIfNotLt { a, b, target }
+        if a == i0 && b == n && target == end + 1)
+    {
+        return None;
+    }
+    let (re_reg, re_global) = match code[s + 3] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let (lines, lines_global) = match code[s + 4] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let i1 = match code[s + 5] {
+        Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
+        _ => return None,
+    };
+    let input_reg = match code[s + 6] {
+        Instr::GetIndex { dst, obj, key } if obj == lines && key == i1 => dst,
+        _ => return None,
+    };
+    let input_pin_slot = ta_plan.access.get(&(s + 6)).copied()? as usize;
+    if !ta_plan
+        .pins
+        .get(input_pin_slot)
+        .is_some_and(|p| is_arr_pin(p.kind))
+    {
+        return None;
+    }
+    let call_result_reg = match code[s + 7] {
+        Instr::CallMethod { dst, obj, name, arg_base, argc }
+            if obj == re_reg
+                && arg_base == input_reg
+                && argc == 1
+                && proto.string_constants.get(name as usize).map(String::as_str) == Some("exec") =>
+        {
+            dst
+        }
+        _ => return None,
+    };
+    let result_global = match code[s + 8] {
+        Instr::StoreGlobal { idx, src }
+        | Instr::StoreGlobalStrict { idx, src }
+        | Instr::StoreGlobalResolved { idx, src }
+            if src == call_result_reg => idx,
+        _ => return None,
+    };
+    let result_test_reg = match code[s + 9] {
+        Instr::LoadGlobal { dst, idx } if idx == result_global => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 10], Instr::JumpIfFalse { cond, target }
+            if cond == result_test_reg && target == start + 38)
+    {
+        return None;
+    }
+    let (count, count_global) = match code[s + 11] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    if !matches!(code[s + 12], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if dst == count && a == count)
+        || !matches!(code[s + 13],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == count_global && src == count)
+    {
+        return None;
+    }
+    let (sum, sum_global) = match code[s + 14] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    // Suppressing result_global's per-iteration store is sound only when no
+    // other source load/store can alias it before the pending result is flushed.
+    if [i_global, n_global, re_global, lines_global, count_global, sum_global]
+        .contains(&result_global)
+    {
+        return None;
+    }
+
+    let mut capture_load_ips = [0usize; 4];
+    let mut capture_key_ips = [0usize; 4];
+    let mut capture_get_ips = [0usize; 4];
+    let mut capture_tonum_ips = [0usize; 4];
+    let mut add_ips = [0usize; 4];
+    let mut tonum_dsts = [0u16; 4];
+    let mut accum = sum;
+    for g in 0..4 {
+        let base = s + 15 + 5 * g;
+        let result_obj = match code[base] {
+            Instr::LoadGlobal { dst, idx } if idx == result_global => dst,
+            _ => return None,
+        };
+        let key = match code[base + 1] {
+            Instr::LoadInt { dst, val } if val == (g + 1) as i32 => dst,
+            _ => return None,
+        };
+        let capture = match code[base + 2] {
+            Instr::GetIndex { dst, obj, key: k } if obj == result_obj && k == key => dst,
+            _ => return None,
+        };
+        let num = match code[base + 3] {
+            Instr::ToNum { dst, a } if a == capture => dst,
+            _ => return None,
+        };
+        let next = match code[base + 4] {
+            Instr::Add { dst, a, b } if a == accum && b == num => dst,
+            _ => return None,
+        };
+        capture_load_ips[g] = base;
+        capture_key_ips[g] = base + 1;
+        capture_get_ips[g] = base + 2;
+        capture_tonum_ips[g] = base + 3;
+        add_ips[g] = base + 4;
+        tonum_dsts[g] = num;
+        accum = next;
+    }
+    let zero = match code[s + 35] {
+        Instr::LoadInt { dst, val: 0 } => dst,
+        _ => return None,
+    };
+    let final_sum = match code[s + 36] {
+        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if a == accum && b == zero => dst,
+        _ => return None,
+    };
+    let i2 = match code[s + 38] {
+        Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 37],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == sum_global && src == final_sum)
+        || !matches!(code[s + 39], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if dst == i2 && a == i2)
+        || !matches!(code[s + 40],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == i_global && src == i2)
+        || !matches!(code[s + 41], Instr::Jump { target } if target == start)
+    {
+        return None;
+    }
+
+    Some(RxScalarExecPlan {
+        input_get_ip: s + 6,
+        call_ip: s + 7,
+        result_store_ip: s + 8,
+        result_reload_ip: s + 9,
+        capture_load_ips,
+        capture_key_ips,
+        capture_get_ips,
+        capture_tonum_ips,
+        add_ips,
+        input_pin_slot,
+        re_reg,
+        input_reg,
+        call_result_reg,
+        result_test_reg,
+        result_global,
+        tonum_dsts,
+    })
+}
+
+/// Recognize exactly:
+///
+/// `for (i<N) for (km of lines[i].matchAll(re)) { count++; sum=(sum+(+km[k]))|0 }`
+///
+/// including the compiler's for-of finally bracket. The plan is only exposed
+/// on the MEM path and only while every prerequisite switch is enabled.
+pub(crate) fn rx_scalar_matchall_plan(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+) -> Option<RxScalarMatchallPlan> {
+    if !crate::vm::rx_scalar_matchall_enabled() || end != start.checked_add(35)? {
+        return None;
+    }
+    let s = start as usize;
+    let code = &proto.code;
+    if end as usize >= code.len() {
+        return None;
+    }
+
+    let (i0, i_global) = match code[s] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let (n, n_global) = match code[s + 1] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    if !matches!(code[s + 2], Instr::JumpIfNotLt { a, b, target }
+        if a == i0 && b == n && target == end + 1)
+    {
+        return None;
+    }
+    let (lines, lines_global) = match code[s + 3] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let i1 = match code[s + 4] {
+        Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
+        _ => return None,
+    };
+    let line = match code[s + 5] {
+        Instr::GetIndex { dst, obj, key } if obj == lines && key == i1 => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 6], Instr::CheckCoercible { src } if src == line) {
+        return None;
+    }
+    let (re, re_global) = match code[s + 7] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    let iter = match code[s + 8] {
+        Instr::CallMethod { dst, obj, name, arg_base, argc }
+            if obj == line
+                && arg_base == re
+                && argc == 1
+                && proto.string_constants.get(name as usize).map(String::as_str)
+                    == Some("matchAll") => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 9], Instr::GetIterator { dst, src } if dst == iter && src == iter) {
+        return None;
+    }
+    let next = match code[s + 10] {
+        Instr::IterPrime { dst, iter: it } if it == iter => dst,
+        _ => return None,
+    };
+    let cursor = match code[s + 11] {
+        Instr::LoadInt { dst, val: 0 } => dst,
+        _ => return None,
+    };
+    let (result, done) = match code[s + 12] {
+        Instr::IterNext { value_dst, done_dst, iter: it, idx, next: nx }
+            if it == iter && idx == cursor && nx == next => (value_dst, done_dst),
+        _ => return None,
+    };
+    if !matches!(code[s + 13], Instr::JumpIfTrue { cond, target }
+        if cond == done && target == start + 32)
+    {
+        return None;
+    }
+    let (kind, completion) = match code[s + 14] {
+        Instr::PushFinally { target, kind_reg, val_reg } if target == start + 30 => {
+            (kind_reg, val_reg)
+        }
+        _ => return None,
+    };
+    let result_global = match code[s + 15] {
+        Instr::StoreGlobal { idx, src }
+        | Instr::StoreGlobalStrict { idx, src }
+        | Instr::StoreGlobalResolved { idx, src }
+            if src == result => idx,
+        _ => return None,
+    };
+    let (count, count_global) = match code[s + 16] {
+        Instr::LoadGlobal { dst, idx } if dst == done => (dst, idx),
+        _ => return None,
+    };
+    if !matches!(code[s + 17], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if dst == count && a == count)
+        || !matches!(code[s + 18],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == count_global && src == count)
+    {
+        return None;
+    }
+    let (sum, sum_global) = match code[s + 19] {
+        Instr::LoadGlobal { dst, idx } => (dst, idx),
+        _ => return None,
+    };
+    // The publication store at +15 is the only source operation scalarization
+    // suppresses. If its binding aliases ANY other template global, the store
+    // changes a later read/update (or the next outer condition/call); deferring
+    // it to exhaustion would be observably wrong. Other non-result aliases are
+    // harmless because their source loads/stores remain emitted in order.
+    if [i_global, n_global, lines_global, re_global, count_global, sum_global]
+        .contains(&result_global)
+    {
+        return None;
+    }
+    let result_obj = match code[s + 20] {
+        Instr::LoadGlobal { dst, idx } if idx == result_global => dst,
+        _ => return None,
+    };
+    let (capture_key, capture) = match code[s + 21] {
+        Instr::LoadInt { dst, val } if (1..=4).contains(&val) => (dst, val as u32),
+        _ => return None,
+    };
+    let capture_value = match code[s + 22] {
+        Instr::GetIndex { dst, obj, key } if obj == result_obj && key == capture_key => dst,
+        _ => return None,
+    };
+    let capture_num = match code[s + 23] {
+        Instr::ToNum { dst, a } if a == capture_value => dst,
+        _ => return None,
+    };
+    let added = match code[s + 24] {
+        Instr::Add { dst, a, b } if a == sum && b == capture_num => dst,
+        _ => return None,
+    };
+    let zero = match code[s + 25] {
+        Instr::LoadInt { dst, val: 0 } => dst,
+        _ => return None,
+    };
+    if !matches!(code[s + 26], Instr::Bitwise { dst, a, b, op: BitwiseOp::Or }
+            if dst == result && a == added && b == zero)
+        || !matches!(code[s + 27],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == sum_global && src == result)
+        || !matches!(code[s + 28], Instr::PopFinally)
+        || !matches!(code[s + 29], Instr::Jump { target } if target == start + 12)
+        || !matches!(code[s + 30], Instr::IterCloseFinally { iter: it, kind_reg }
+            if it == iter && kind_reg == kind)
+        || !matches!(code[s + 31], Instr::EndFinally { kind_reg, val_reg }
+            if kind_reg == kind && val_reg == completion)
+        || !matches!(code[s + 32], Instr::LoadGlobal { dst, idx }
+            if dst == cursor && idx == i_global)
+        || !matches!(code[s + 33], Instr::AddInt { dst, a, imm: 1, upd: true }
+            if dst == cursor && a == cursor)
+        || !matches!(code[s + 34],
+            Instr::StoreGlobal { idx, src }
+            | Instr::StoreGlobalStrict { idx, src }
+            | Instr::StoreGlobalResolved { idx, src }
+                if idx == i_global && src == cursor)
+        || !matches!(code[s + 35], Instr::Jump { target } if target == start)
+    {
+        return None;
+    }
+
+    Some(RxScalarMatchallPlan {
+        call_ip: s + 8,
+        get_iterator_ip: s + 9,
+        iter_prime_ip: s + 10,
+        iter_next_ip: s + 12,
+        result_store_ip: s + 15,
+        result_load_ip: s + 20,
+        capture_get_ip: s + 22,
+        capture_tonum_ip: s + 23,
+        add_ip: s + 24,
+        close_ip: s + 30,
+        end_finally_ip: s + 31,
+        iter_reg: iter,
+        result_global,
+        capture,
+        tonum_dst: capture_num,
+    })
+}
+
 pub(crate) fn region_can_compile(
     proto: &FuncProto,
     start: u32,
@@ -33,6 +482,13 @@ pub(crate) fn region_can_compile(
     if e <= s || e >= code.len() {
         return false;
     }
+    // Scalar matchAll is MEM-only: numeric/register callers pass `None` and
+    // retain the historical rejection for the four otherwise unsupported
+    // protocol/finally ops.
+    let scalar_matchall = const_strs
+        .is_some()
+        .then(|| rx_scalar_matchall_plan(proto, start, end))
+        .flatten();
     // Under `ZIPP_JITDUMP` the scan runs to completion and reports EVERY op it
     // has no arm for, rather than stopping at the first. The first-only report
     // was actively misleading when prioritising admission work: it names one op,
@@ -60,7 +516,8 @@ pub(crate) fn region_can_compile(
         Instr::Jump { target } if target == start => {}
         _ => return false,
     }
-    for instr in &code[s..=e] {
+    for (ip, instr) in code[s..=e].iter().enumerate() {
+        let ip = s + ip;
         match *instr {
             Instr::LoadInt { .. }
             | Instr::Move { .. }
@@ -114,6 +571,9 @@ pub(crate) fn region_can_compile(
             // int/regalloc paths don't list them, so they decline → mem path).
             | Instr::StrConcat { .. }
             | Instr::StrAppendInPlace { .. }
+            | Instr::AddRightPair { .. }
+            | Instr::Pad2Concat { .. }
+            | Instr::Pad2Conditional { .. }
             // W11 (B124) fused chain link — MEM path via `jit_concat_chain`
             // (same decline-to-mem shape as the two ops above). LOAD-BEARING:
             // without this the fused gen-loop regions (regex-log-scan) would
@@ -249,6 +709,13 @@ pub(crate) fn region_can_compile(
             // protocol — the `SetIndexConcat` treatment, for stronger reasons.
             // Only the MEM tier gets it; `region_int.rs` keeps its own list.
             Instr::DeleteIndexConcat { .. } if crate::codegen::jit_delete_enabled() => {}
+            // Ordinary computed delete, but only through the fail-closed helper:
+            // exact Array + non-negative tagged Int + no descriptor/arguments
+            // side table. Every rejected shape bails before mutation and lets
+            // the interpreter perform ToPropertyKey, strict failure and exotic
+            // semantics. The admission-time switch restores the historical
+            // blacklist when disabled.
+            Instr::DeleteIndex { .. } if crate::codegen::jit_array_delete_enabled() => {}
             // `ForInLive` — the per-iteration for-in liveness check — MEM path via
             // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
             // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
@@ -285,6 +752,14 @@ pub(crate) fn region_can_compile(
                     reject!("[decline] IterNext at region [{start},{end}]");
                 }
             }
+            Instr::GetIterator { .. }
+                if scalar_matchall.is_some_and(|p| p.get_iterator_ip == ip) => {}
+            Instr::IterPrime { .. }
+                if scalar_matchall.is_some_and(|p| p.iter_prime_ip == ip) => {}
+            Instr::IterCloseFinally { .. }
+                if scalar_matchall.is_some_and(|p| p.close_ip == ip) => {}
+            Instr::EndFinally { .. }
+                if scalar_matchall.is_some_and(|p| p.end_finally_ip == ip) => {}
             // The for-of close-handler bracket around each iteration. Both
             // are ONE Vec push/pop on the current frame's handler stack via
             // helpers that mirror the interpreter arms exactly, keeping the
@@ -668,7 +1143,11 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
 /// iteration — the `for (i < s.length)` / `for (i < a.length)` idiom. Returns
 /// `(get_ip, dst_reg, global_slot, name_idx)`, or `None` if no single such GetProp
 /// qualifies (only the unique-GetProp case is hoisted, to keep it simple/safe).
-pub(crate) fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Option<(usize, u16, u32, u32)> {
+pub(crate) fn hoistable_length(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+) -> Option<(usize, u16, u32, u32)> {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
     // The region must not change any container's length. A generic call
@@ -680,7 +1159,10 @@ pub(crate) fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Optio
         match instr {
             Instr::SetIndex { .. } | Instr::SetProp { .. } | Instr::Call { .. } => return None,
             Instr::CallMethod { name, .. } => {
-                if proto.string_constants.get(*name as usize).map(|s| s.as_str())
+                if proto
+                    .string_constants
+                    .get(*name as usize)
+                    .map(|s| s.as_str())
                     != Some("charCodeAt")
                 {
                     return None;
@@ -693,7 +1175,12 @@ pub(crate) fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Optio
     let mut found: Option<(usize, u16, u16)> = None; // (ip, dst, obj)
     for ip in s..=e {
         if let Instr::GetProp { dst, obj, name } = code[ip] {
-            if proto.string_constants.get(name as usize).map(|s| s.as_str()) == Some("length") {
+            if proto
+                .string_constants
+                .get(name as usize)
+                .map(|s| s.as_str())
+                == Some("length")
+            {
                 if found.is_some() {
                     return None; // more than one — bail
                 }
@@ -775,6 +1262,10 @@ pub(crate) struct HeapHelpers {
     pub(crate) str_append: usize,
     /// Helper for a generic `obj.m(args…)` via the interpreter's per-site IC.
     pub(crate) call_method_ic: usize,
+    /// Guarded direct `RegExp.prototype.test` / `exec` CallMethod helper.
+    pub(crate) regexp_call_direct: usize,
+    /// Guarded primitive-string `matchAll` / regex `replace` helper.
+    pub(crate) string_regexp_call_direct: usize,
     /// Guarded `hasOwnProperty.call(array, numeric_key)` intrinsic.
     pub(crate) has_own_call: usize,
     /// Helper for a generic `f(args…)` via the interpreter's per-site IC.
@@ -820,6 +1311,13 @@ pub(crate) struct HeapHelpers {
     pub(crate) forin_live: usize,
     /// `IterNext` helper (regs base + packed reg numbers → 0 / deopt / threw).
     pub(crate) iter_next: usize,
+    pub(crate) regexp_scalar_get_iterator: usize,
+    pub(crate) regexp_scalar_iter_prime: usize,
+    pub(crate) regexp_scalar_step: usize,
+    pub(crate) regexp_scalar_capture_num: usize,
+    pub(crate) regexp_scalar_flush: usize,
+    pub(crate) regexp_scalar_exec: usize,
+    pub(crate) regexp_scalar_exec_flush: usize,
     /// `PushFinally` helper (packed target/kind_reg/val_reg; total).
     pub(crate) push_finally: usize,
     /// `PopFinally` helper (no args; total).
@@ -835,7 +1333,13 @@ pub(crate) struct HeapHelpers {
     pub(crate) typeof_is: usize,
     pub(crate) static_fn: usize,
     pub(crate) to_concat_key: usize,
+    /// Selected historical or pure-success helper entry.
     pub(crate) set_index_concat: usize,
+    /// True only when `set_index_concat` can return `CONCAT_SET_PURE`; controls
+    /// the conditional no-refetch branch in the memory emitter.
+    pub(crate) concat_pure_append: bool,
+    /// Narrow ordinary `DeleteIndex` helper (true bits / deopt sentinel).
+    pub(crate) delete_index: usize,
     /// W19 M3 -- `DeleteIndexConcat` helper (result bits / `CALL_THREW`).
     pub(crate) delete_index_concat: usize,
     /// Tier C `IsArray` helper (v bits → Bool bits / deopt sentinel).
@@ -847,6 +1351,93 @@ pub(crate) struct HeapHelpers {
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     pub(crate) ic_base_idx: u32,
+}
+
+/// W21 fallback-plan correction. `build_ta_pin_plan` deliberately adds a
+/// snapshot for an `arr.push(x)` receiver so the INTEGER tier can inline the
+/// append. If that tier later declines, however, the memory emitter cannot use
+/// that push-only snapshot: it still calls the generic push helper, then used to
+/// re-snapshot every pin in the region after every append. On tokenizer-shaped
+/// loops that turned a failed INTEGER offer into substantial boxed-tier work.
+///
+/// Keep the switch local to planning so one binary can reproduce the old
+/// fallback byte stream. The full push-inclusive plan has already been consumed
+/// by the INTEGER attempt before this module is called; this filter affects only
+/// REGALLOC/MEM fallback compilation.
+fn push_pin_filter_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PUSH_PIN_FILTER").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+#[derive(Default)]
+struct PushPinFilterStats {
+    push_accesses: usize,
+    dropped_push_only: usize,
+    retained_shared: usize,
+}
+
+/// Compact `plan` for a non-INTEGER fallback. A pin is dropped iff every access
+/// mapped to it is an exact one-argument `.push` site. Pins shared by push and a
+/// real fallback consumer (`GetIndex`, `GetProp length`, `charCodeAt`, DataView,
+/// …) keep both the pin and all of their access metadata. Unknown/orphaned plan
+/// entries are retained fail-closed.
+fn filter_push_only_pins(proto: &FuncProto, plan: &TaPinPlan) -> (TaPinPlan, PushPinFilterStats) {
+    let mut push_use = vec![false; plan.pins.len()];
+    let mut nonpush_use = vec![false; plan.pins.len()];
+    let mut stats = PushPinFilterStats::default();
+
+    let is_push = |ip: usize| {
+        matches!(
+            proto.code.get(ip),
+            Some(Instr::CallMethod { name, argc: 1, .. })
+                if proto.string_constants.get(*name as usize).is_some_and(|key| key == "push")
+        )
+    };
+    for (&ip, &slot) in &plan.access {
+        let Some(used) = ((slot as usize) < plan.pins.len()).then_some(slot as usize) else {
+            continue;
+        };
+        if is_push(ip) {
+            push_use[used] = true;
+            stats.push_accesses += 1;
+        } else {
+            nonpush_use[used] = true;
+        }
+    }
+
+    let mut remap = vec![u8::MAX; plan.pins.len()];
+    let mut filtered = TaPinPlan::default();
+    for (old, pin) in plan.pins.iter().copied().enumerate() {
+        let push_only = push_use[old] && !nonpush_use[old];
+        if push_only {
+            stats.dropped_push_only += 1;
+            continue;
+        }
+        if push_use[old] && nonpush_use[old] {
+            stats.retained_shared += 1;
+        }
+        let new = filtered.pins.len();
+        debug_assert!(new < u8::MAX as usize);
+        filtered.pins.push(pin);
+        remap[old] = new as u8;
+    }
+    for (&ip, &old) in &plan.access {
+        if let Some(&new) = remap.get(old as usize) {
+            if new != u8::MAX {
+                filtered.access.insert(ip, new);
+            }
+        }
+    }
+    (filtered, stats)
 }
 
 /// Compile the loop region `[start, end]` (entered at `start`). Tries the
@@ -875,22 +1466,71 @@ pub(crate) fn compile_region(
     // `(code, is_mem, engaged_boxref)`.
 ) -> Option<(JitFn, bool, bool)> {
     // The register/SROA paths decline any region containing a Call/CallMethod, so
-    // leaf inlining and method inlining (which apply only to those sites) are
-    // reachable only via the memory path below.
+    // leaf and method-call inlining remain reachable only through the memory path.
+    // The register path does consume one accessor-plan shape: an exact, call-free
+    // own getter (`return this.field`) in front of a BOXREF GetProp probe.
     //
     // The returned flag is `is_mem` — true when the register-homed path declined
     // and this region runs out of `[rbx + dreg(r)]`. It exists so the sampling
     // profiler can charge time to `jit-mem` rather than `jit-fast`: B92 showed the
     // two tiers differ by ~4x on the same loop, so a single `jit-native` bucket
     // cannot say whether a row that is 99% native is fast or slow.
+    // `Jit::compile_region` has already tried `compile_region_int` with the
+    // original, push-inclusive plan. From here onward a pin used solely to make
+    // `push` INTEGER-admissible is dead metadata: neither fallback tier has a
+    // pinned-push arm. Compact it before either fallback planner sees it.
+    let filtered_plan;
+    let fallback_plan = if push_pin_filter_enabled() {
+        let (plan, stats) = filter_push_only_pins(proto, ta_plan);
+        if std::env::var_os("ZIPP_JITLOG").is_some() && stats.push_accesses != 0 {
+            eprintln!(
+                "[jit] fallback push-pin filter fn{} [{start},{end}] pins={}->{} accesses={}->{} push_accesses={} dropped_push_only={} retained_shared={} remaining_push_only=0",
+                heap.func_id,
+                ta_plan.pins.len(),
+                plan.pins.len(),
+                ta_plan.access.len(),
+                plan.access.len(),
+                stats.push_accesses,
+                stats.dropped_push_only,
+                stats.retained_shared,
+            );
+        }
+        filtered_plan = plan;
+        &filtered_plan
+    } else {
+        ta_plan
+    };
+
     if let Some((f, bx)) = compile_region_regalloc(
-        proto, start, end, globals_base_helper, ta_plan, heap.ta_snapshot, Some(&heap),
-        acc_emit, boxref_ok, meter,
+        proto,
+        start,
+        end,
+        globals_base_helper,
+        fallback_plan,
+        heap.ta_snapshot,
+        Some(&heap),
+        Some(method_plan),
+        acc_emit,
+        boxref_ok,
+        meter,
     ) {
         return Some((f, false, bx));
     }
-    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan, method_plan, cross_plan, acc_emit, meter)
-        .map(|f| (f, true, false))
+    compile_region_mem(
+        proto,
+        start,
+        end,
+        globals_base_helper,
+        heap,
+        const_strs,
+        fallback_plan,
+        leaf_plan,
+        method_plan,
+        cross_plan,
+        acc_emit,
+        meter,
+    )
+    .map(|f| (f, true, false))
 }
 
 /// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
@@ -906,16 +1546,35 @@ pub(crate) fn compile_region_numeric(
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<(JitFn, bool)> {
     // SROA-rewritten code has no index ops, so an empty TA plan (no snapshot) is correct.
-    if let Some(f) =
-        compile_region_int(proto, start, end, gh, &TaPinPlan::default(), 0, &IntEntry::default(), meter)
-    {
+    if let Some(f) = compile_region_int(
+        proto,
+        start,
+        end,
+        gh,
+        &TaPinPlan::default(),
+        0,
+        &IntEntry::default(),
+        meter,
+    ) {
         return Some((f, true));
     }
     // SROA-rewritten code has no index ops, so an empty TA plan is correct here.
     // No heap helpers: the SROA rewrite left no heap op, so the W20 boxed arms
     // are unreachable here by construction.
-    compile_region_regalloc(proto, start, end, gh, &TaPinPlan::default(), 0, None, &[], false, meter)
-        .map(|(f, _)| (f, false))
+    compile_region_regalloc(
+        proto,
+        start,
+        end,
+        gh,
+        &TaPinPlan::default(),
+        0,
+        None,
+        None,
+        &[],
+        false,
+        meter,
+    )
+    .map(|(f, _)| (f, false))
 }
 
 /// Clone `proto` and rewrite the region's heap ops to scratch field-globals so
@@ -945,10 +1604,16 @@ pub(crate) fn rewrite_for_field_promotion(
     for ip in start as usize..=end as usize {
         match p.code[ip] {
             Instr::GetProp { dst, name, .. } => {
-                p.code[ip] = Instr::LoadGlobal { dst, idx: slot_of(name) };
+                p.code[ip] = Instr::LoadGlobal {
+                    dst,
+                    idx: slot_of(name),
+                };
             }
             Instr::SetProp { name, val, .. } => {
-                p.code[ip] = Instr::StoreGlobal { idx: slot_of(name), src: val };
+                p.code[ip] = Instr::StoreGlobal {
+                    idx: slot_of(name),
+                    src: val,
+                };
             }
             // The object-ref loads (`LoadGlobal o → r`) are LEFT EXACTLY AS THEY
             // ARE. The rewrite above removed their only in-region consumers, so
@@ -976,4 +1641,3 @@ pub(crate) fn rewrite_for_field_promotion(
     }
     p
 }
-

@@ -161,7 +161,7 @@ impl<'p> Vm<'p> {
     /// per call: an in-place `RegExp.prototype.exec = f`-style overwrite bumps
     /// no version (B67/B110), so nothing here is trusted from a cache.
     #[inline(never)]
-    fn matchall_pristine_dispatch(
+    pub(crate) fn matchall_pristine_dispatch(
         &mut self,
         recv: Value,
         arg0: Value,
@@ -177,6 +177,9 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
+        if !self.regexp_pristine_flag_accessors_ok(re, arg0) {
+            return None;
+        }
         let proto_ok = match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
                 let data_native = |k: &str, id: u16| {
@@ -187,14 +190,7 @@ impl<'p> Vm<'p> {
                                         HeapObj::Native(n) if *n == id)
                     })
                 };
-                let flags_ok = m.pos("flags").is_some_and(|i| {
-                    m.attrs[i].accessor
-                        && m.vals[i].is_heap()
-                        && matches!(self.heap.get(m.vals[i].heap_index()),
-                                    HeapObj::Native(n) if *n == native::REGEXP_GET_FLAGS)
-                });
-                flags_ok
-                    && data_native("@@match", native::REGEXP_SYM_MATCH)
+                data_native("@@match", native::REGEXP_SYM_MATCH)
                     && data_native("@@matchAll", native::REGEXP_SYM_MATCHALL)
             }
             _ => false,
@@ -202,11 +198,96 @@ impl<'p> Vm<'p> {
         if !proto_ok {
             return None;
         }
-        let flags = self.regexp_pristine_flags(re, arg0)?;
-        if !flags.contains('g') {
+        if !matches!(
+            self.heap.get(re),
+            HeapObj::RegExp { flags, .. } if flags.contains('g')
+        ) {
             return None;
         }
         Some(self.call_native(native::REGEXP_SYM_MATCHALL, arg0, &[recv]))
+    }
+
+    /// Guarded direct bytecode `CallMethod` for the two hot primitive-string /
+    /// RegExp combinations: `s.matchAll(re)` and `s.replace(re, string)`.
+    ///
+    /// `Ok(None)` is a PURE decline.  Every type, realm, live method-slot and
+    /// RegExp-protocol proof is complete before coercion, getters, writes,
+    /// allocation, or matching.  The caller can therefore run the unchanged
+    /// generic method route without replaying an effect.  `is_replace = false`
+    /// selects matchAll; `true` selects replace.  `from_jit` is diagnostic only.
+    pub(crate) fn string_regexp_call_direct(
+        &mut self,
+        recv: Value,
+        arg0: Value,
+        replacement: Value,
+        is_replace: bool,
+        from_jit: bool,
+    ) -> Result<Option<Value>, Thrown> {
+        let name = if is_replace { "replace" } else { "matchAll" };
+        let s_idx = if recv.is_heap()
+            && matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
+        {
+            recv.heap_index()
+        } else {
+            super::proxy_regexp::rxstats::count_string_call_direct_decline();
+            return Ok(None);
+        };
+
+        // This proves both that primitive lookup is in the main realm and that
+        // the live own String.prototype slot is the exact metadata-derived
+        // native DATA property.  It re-reads attr/Value/Native id every call.
+        if !self.string_regexp_method_is_intrinsic(name) {
+            super::proxy_regexp::rxstats::count_string_call_direct_decline();
+            return Ok(None);
+        }
+
+        let Some(re) = self.as_regexp(arg0) else {
+            super::proxy_regexp::rxstats::count_string_call_direct_decline();
+            return Ok(None);
+        };
+
+        if !is_replace {
+            // Keep the older matchAll pristine mechanism's rollback contract:
+            // disabling it also removes this direct route's final sub-proof.
+            if !matchall_pristine_enabled() {
+                super::proxy_regexp::rxstats::count_string_call_direct_decline();
+                return Ok(None);
+            }
+            let Some(result) = self.matchall_pristine_dispatch(recv, arg0) else {
+                super::proxy_regexp::rxstats::count_string_call_direct_decline();
+                return Ok(None);
+            };
+            // The dispatcher has now committed to (and run) the intrinsic.  An
+            // Err is still a served call and must be counted before propagation.
+            super::builtins::builtin_stats_count(self, recv, name);
+            super::proxy_regexp::rxstats::count_string_call_direct_hit(false, from_jit);
+            return result.map(Some);
+        }
+
+        // A replacement object can run ToString (or be callable) at a spec point
+        // that precedes the live `exec`/flags reads.  It could invalidate proofs
+        // made above, so this lane accepts only already-primitive heap strings.
+        if !replacement.is_heap()
+            || !matches!(
+                self.heap.get(replacement.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+            // Conservative exact-instance proof: even an unrelated expando
+            // sends the call to the fully observable protocol.
+            || self.arr_props.get(&re).is_some()
+            || !self.regexp_replace_fast_ok(re)
+        {
+            super::proxy_regexp::rxstats::count_string_call_direct_decline();
+            return Ok(None);
+        }
+
+        let global = matches!(
+            self.heap.get(re),
+            HeapObj::RegExp { flags, .. } if flags.contains('g')
+        );
+        super::builtins::builtin_stats_count(self, recv, name);
+        super::proxy_regexp::rxstats::count_string_call_direct_hit(true, from_jit);
+        self.regex_replace(s_idx, re, replacement, global).map(Some)
     }
 
     /// UTF-16 unit length (JS `.length`) of a flat string by heap index — O(1).
@@ -608,7 +689,19 @@ impl<'p> Vm<'p> {
                 // or a patched prototype must run the OBSERVABLE @@replace
                 // protocol — user exec result, `groups` via Get (incl. the
                 // prototype chain), GetSubstitution $<name> via Get.
-                if self.regexp_replace_fast_ok(re) {
+                // An object replacement's ToString (or callable invocation)
+                // participates in the observable @@replace ordering.  In
+                // particular `repl.toString()` may install `re.exec` before the
+                // first RegExpExec lookup.  The internal matcher proves exec
+                // before it coerces the replacement, so reserve it for an
+                // already-primitive string and send every effectful shape to
+                // the full Symbol.replace protocol below.
+                let primitive_string = repl.is_heap()
+                    && matches!(
+                        self.heap.get(repl.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. }
+                    );
+                if primitive_string && self.regexp_replace_fast_ok(re) {
                     let global = matches!(
                         self.heap.get(re),
                         HeapObj::RegExp { flags, .. } if flags.contains('g')

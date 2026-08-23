@@ -62,6 +62,213 @@ pub(crate) fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
     (buf, i)
 }
 
+/// ECMAScript StringNumericLiteral over an already-decoded string. Keeping
+/// this grammar in one allocation-free entry lets the RegExp scalar-result
+/// path apply unary `+` directly to an immutable subject range without first
+/// allocating the capture string. `Vm::to_number` delegates its ordinary
+/// string arm here, so the two paths cannot drift.
+pub(crate) fn string_to_number(s: &str) -> f64 {
+    // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
+    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+    if t.is_empty() {
+        return 0.0;
+    }
+    // Non-decimal integer literals `0x…`/`0o…`/`0b…`
+    // (StringNumericLiteral; no sign allowed). Fold digits into an f64 so
+    // arbitrarily long literals don't overflow.
+    let radix = match t.as_bytes() {
+        [b'0', b'x' | b'X', ..] => Some((16u32, &t[2..])),
+        [b'0', b'o' | b'O', ..] => Some((8, &t[2..])),
+        [b'0', b'b' | b'B', ..] => Some((2, &t[2..])),
+        _ => None,
+    };
+    if let Some((base, digits)) = radix {
+        let mut acc = 0.0f64;
+        for c in digits.chars() {
+            match c.to_digit(base) {
+                Some(d) => acc = acc * base as f64 + d as f64,
+                None => return f64::NAN,
+            }
+        }
+        return if digits.is_empty() { f64::NAN } else { acc };
+    }
+    // The only Infinity spellings a StringNumericLiteral accepts are these
+    // exact capital-I forms.
+    match t {
+        "Infinity" | "+Infinity" => return f64::INFINITY,
+        "-Infinity" => return f64::NEG_INFINITY,
+        _ => {}
+    }
+    // Rust's parser also accepts word forms JS rejects. A valid decimal or
+    // scientific literal begins (after an optional sign) with a digit or `.`.
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if body.as_bytes().first().is_some_and(|b| b.is_ascii_alphabetic()) {
+        return f64::NAN;
+    }
+    t.parse::<f64>().unwrap_or(f64::NAN)
+}
+
+/// `ZIPP_ICSTATS=1` engagement census for `AddRightPair`.  `fast_str` and
+/// `fast_int` are the bounded one-allocation ASCII arms classified by the
+/// rightmost leaf; `fallback` ran the original inner Add followed by the outer
+/// Add.  Off, the hot path pays one relaxed byte load, matching chainstats.
+mod pairstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static FAST_STR: AtomicU64 = AtomicU64::new(0);
+    static FAST_INT: AtomicU64 = AtomicU64::new(0);
+    static IN_PLACE: AtomicU64 = AtomicU64::new(0);
+    static FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn fast_str() {
+        if enabled() {
+            FAST_STR.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn fast_int() {
+        if enabled() {
+            FAST_INT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn in_place() {
+        if enabled() {
+            IN_PLACE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn fallback() {
+        if enabled() {
+            FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn dump() -> (u64, u64, u64, u64) {
+        (
+            FAST_STR.load(Ordering::Relaxed),
+            FAST_INT.load(Ordering::Relaxed),
+            IN_PLACE.load(Ordering::Relaxed),
+            FALLBACK.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(crate) fn concat_pair_stats() -> (u64, u64, u64, u64) {
+    pairstats::dump()
+}
+
+/// `ZIPP_ICSTATS=1` engagement census for `Pad2Concat`. `zero` is a cached
+/// `"0" + int(0..9)` result, `plain` a cached `"" + int(10..99)` result, and
+/// `fallback` delegates to the exact ordinary `+` path. Off, each opcode pays
+/// one relaxed byte load; the compiler rollback emits no opcode at all.
+mod pad2stats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static ZERO: AtomicU64 = AtomicU64::new(0);
+    static PLAIN: AtomicU64 = AtomicU64::new(0);
+    static FALLBACK: AtomicU64 = AtomicU64::new(0);
+    static COND_HIT: AtomicU64 = AtomicU64::new(0);
+    static COND_SLOW: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    pub(super) fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let v = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                ON.store(v, Ordering::Relaxed);
+                v == 1
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn zero() {
+        if enabled() {
+            ZERO.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn plain() {
+        if enabled() {
+            PLAIN.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn fallback() {
+        if enabled() {
+            FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn cond_hit() {
+        if enabled() {
+            COND_HIT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn cond_slow() {
+        if enabled() {
+            COND_SLOW.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn dump() -> (u64, u64, u64) {
+        (
+            ZERO.load(Ordering::Relaxed),
+            PLAIN.load(Ordering::Relaxed),
+            FALLBACK.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(super) fn cond_dump() -> (u64, u64) {
+        (
+            COND_HIT.load(Ordering::Relaxed),
+            COND_SLOW.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(crate) fn pad2_concat_stats() -> (u64, u64, u64) {
+    pad2stats::dump()
+}
+
+pub(crate) fn pad2_conditional_stats() -> (u64, u64) {
+    pad2stats::cond_dump()
+}
+
+/// Native emitters inline the allocation-free hit unless counters are enabled;
+/// an ICSTATS run deliberately routes hits through the shared helper so the
+/// mechanism census remains exact without burdening production code.
+pub(crate) fn pad2_concat_stats_enabled() -> bool {
+    pad2stats::enabled()
+}
+
 impl<'p> Vm<'p> {
     /// Clone an array's current elements out of the heap. Used before invoking
     /// callbacks so a heap reallocation during the call can't dangle a borrow.
@@ -673,6 +880,195 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Exact literal-prefix concatenation for `Pad2Concat`:
+    /// `zero == true` is `"0" + value`, otherwise `"" + value`.
+    ///
+    /// The compiler removes only a side-effect-free string literal evaluation.
+    /// A tagged Int in the branch-compatible range can therefore return the
+    /// immutable `"00".."99"` prefix slot directly. Every other Value runs the
+    /// ordinary `add_values` operator with the exact literal prefix, retaining
+    /// ToPrimitive, Symbol/BigInt, throw and re-entry behaviour unchanged.
+    pub(crate) fn pad2_concat(&mut self, value: Value, zero: bool) -> Result<Value, Thrown> {
+        if value.is_int() {
+            let n = value.as_int();
+            let hit = if zero { (0..=9).contains(&n) } else { (10..=99).contains(&n) };
+            if hit {
+                if zero {
+                    pad2stats::zero();
+                } else {
+                    pad2stats::plain();
+                }
+                return Ok(Value::heap(crate::heap::INTERN_PAD2_START + n as u32));
+            }
+        }
+        pad2stats::fallback();
+        let prefix = if zero {
+            Value::heap(b'0' as u32)
+        } else {
+            Value::heap(crate::heap::INTERN_EMPTY)
+        };
+        self.add_values(prefix, value)
+    }
+
+    /// Exact `value < 10 ? "0" + value : "" + value` for a compiler-proven
+    /// stable binding. Only tagged Ints 0..99 bypass the source operations.
+    /// Every other Value performs the full number-hint relational conversion,
+    /// then the selected ordinary literal-prefix Add (which independently
+    /// performs its default-hint conversion). Keeping the original object in
+    /// `value` is deliberate: mutation of its coercion methods by the first
+    /// conversion is observed by the second.
+    pub(crate) fn pad2_conditional(&mut self, value: Value) -> Result<Value, Thrown> {
+        if value.is_int() {
+            let n = value.as_int();
+            if (0..=99).contains(&n) {
+                pad2stats::cond_hit();
+                if n < 10 {
+                    pad2stats::zero();
+                } else {
+                    pad2stats::plain();
+                }
+                return Ok(Value::heap(crate::heap::INTERN_PAD2_START + n as u32));
+            }
+        }
+        pad2stats::cond_slow();
+        let zero = self.cmp_lt_values(value, Value::int(10), true)?;
+        self.pad2_concat(value, zero)
+    }
+
+    /// Exact `a + (b + c)` for the compiler's identifier-`+=` right-pair
+    /// lowering.  The fallback literally invokes the same two `add_values`
+    /// operations in the same order as the historical bytecode: `b+c` first,
+    /// then `a+inner`.  This preserves ToPrimitive order, throws, BigInt/Symbol
+    /// rules and every user-code re-entry.
+    ///
+    /// The only shortcut is fully primitive and therefore unobservable:
+    /// flat-ASCII `a` and `b`, plus a flat-ASCII String or Int `c`, whose total
+    /// is within the engine's ordinary small-flat bound.  It copies the three
+    /// pieces into one fresh flat string rather than allocating `b+c` and then
+    /// allocating/copying the outer result.  The 256-unit bound retains the
+    /// rope/O(n) policy for large builders.
+    pub(crate) fn add_values_right_pair(
+        &mut self,
+        a: Value,
+        b: Value,
+        c: Value,
+    ) -> Result<Value, Thrown> {
+        if a.is_heap() && b.is_heap() {
+            let (ab, bb) = match (self.heap.get(a.heap_index()), self.heap.get(b.heap_index())) {
+                (HeapObj::Str(x), HeapObj::Str(y)) if x.is_ascii() && y.is_ascii() => {
+                    (x.as_bytes(), y.as_bytes())
+                }
+                _ => (&[][..], &[][..]),
+            };
+            // Empty strings are legitimate operands, so eligibility is the
+            // object-shape check, not `ab`/`bb` non-emptiness.
+            let left_ok = matches!(
+                (self.heap.get(a.heap_index()), self.heap.get(b.heap_index())),
+                (HeapObj::Str(x), HeapObj::Str(y)) if x.is_ascii() && y.is_ascii()
+            );
+            if left_ok {
+                if c.is_heap() {
+                    if let HeapObj::Str(cs) = self.heap.get(c.heap_index()) {
+                        if cs.is_ascii() {
+                            let cb = cs.as_bytes();
+                            let total = ab.len().saturating_add(bb.len()).saturating_add(cb.len());
+                            if total <= SMALL_CONCAT_FLAT_UNITS {
+                                let mut out = Vec::with_capacity(total);
+                                out.extend_from_slice(ab);
+                                out.extend_from_slice(bb);
+                                out.extend_from_slice(cb);
+                                pairstats::fast_str();
+                                return Ok(Value::heap(
+                                    self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out))),
+                                ));
+                            }
+                        }
+                    }
+                } else if c.is_int() {
+                    let (digits, start) = fmt_i32_buf(c.as_int());
+                    let cb = &digits[start..];
+                    let total = ab.len().saturating_add(bb.len()).saturating_add(cb.len());
+                    if total <= SMALL_CONCAT_FLAT_UNITS {
+                        let mut out = Vec::with_capacity(total);
+                        out.extend_from_slice(ab);
+                        out.extend_from_slice(bb);
+                        out.extend_from_slice(cb);
+                        pairstats::fast_int();
+                        return Ok(Value::heap(
+                            self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(out))),
+                        ));
+                    }
+                }
+            }
+        }
+        pairstats::fallback();
+        let inner = self.add_values(b, c)?;
+        self.add_values(a, inner)
+    }
+
+    /// Proven-linear accumulator sibling of [`Self::add_values_right_pair`].
+    /// The compiler post-pass sets `in_place` only under the same global-buffer
+    /// non-alias proof that licenses `StrAppendInPlace`.  This arm additionally
+    /// requires three flat ASCII primitive pieces and refuses self-aliasing
+    /// leaves before touching the accumulator.  A decline delegates to the
+    /// fresh-result helper with no mutation, preserving exact pairwise fallback
+    /// semantics.
+    pub(crate) fn add_values_right_pair_inplace(
+        &mut self,
+        a: Value,
+        b: Value,
+        c: Value,
+    ) -> Result<Value, Thrown> {
+        let mutable = a.is_heap()
+            && a.heap_index() > crate::heap::INTERN_PINNED_END
+            && matches!(self.heap.get(a.heap_index()), HeapObj::Str(s) if s.is_ascii());
+        let distinct = b.is_heap()
+            && b.heap_index() != a.heap_index()
+            && (!c.is_heap() || c.heap_index() != a.heap_index());
+        if mutable && distinct {
+            let b_ok = matches!(self.heap.get(b.heap_index()), HeapObj::Str(s) if s.is_ascii());
+            let c_ok = c.is_int()
+                || (c.is_heap()
+                    && matches!(self.heap.get(c.heap_index()), HeapObj::Str(s) if s.is_ascii()));
+            if b_ok && c_ok {
+                let ai = a.heap_index();
+                let taken = std::mem::replace(
+                    self.heap.get_mut(ai),
+                    HeapObj::Str(crate::heap::JsStr::from_ascii(Vec::new())),
+                );
+                let mut out = match taken {
+                    HeapObj::Str(s) => s,
+                    other => {
+                        *self.heap.get_mut(ai) = other;
+                        return self.add_values_right_pair(a, b, c);
+                    }
+                };
+                let bb = match self.heap.get(b.heap_index()) {
+                    HeapObj::Str(s) => s.as_bytes(),
+                    _ => &[],
+                };
+                if c.is_int() {
+                    let (digits, start) = fmt_i32_buf(c.as_int());
+                    out.reserve_bytes(bb.len() + digits.len() - start);
+                    out.push_wtf8(bb);
+                    out.push_wtf8(&digits[start..]);
+                } else {
+                    let cb = match self.heap.get(c.heap_index()) {
+                        HeapObj::Str(s) => s.as_bytes(),
+                        _ => &[],
+                    };
+                    out.reserve_bytes(bb.len() + cb.len());
+                    out.push_wtf8(bb);
+                    out.push_wtf8(cb);
+                }
+                *self.heap.get_mut(ai) = HeapObj::Str(out);
+                pairstats::in_place();
+                return Ok(a);
+            }
+        }
+        self.add_values_right_pair(a, b, c)
+    }
+
     /// `acc + b` for one link of a W11 (B124) fused concat chain
     /// (`StrConcatChain`): result EQUALS `add_values(acc, b)` — the `+`
     /// operator — for every operand pair; the only difference is HOW a string
@@ -693,7 +1089,7 @@ impl<'p> Vm<'p> {
     /// region) and Tier C — interpreter-vs-JIT byte identity by construction.
     pub(crate) fn add_values_chain(&mut self, acc: Value, b: Value) -> Result<Value, Thrown> {
         if acc.is_heap()
-            && acc.heap_index() > crate::heap::INTERN_EMPTY
+            && acc.heap_index() > crate::heap::INTERN_PINNED_END
             && matches!(self.heap.get(acc.heap_index()), HeapObj::Str(_))
         {
             if let Some(r) = self.str_append_inplace(acc, b) {
@@ -729,7 +1125,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let mutable = acc.is_heap()
-            && acc.heap_index() > crate::heap::INTERN_EMPTY
+            && acc.heap_index() > crate::heap::INTERN_PINNED_END
             && matches!(self.heap.get(acc.heap_index()), HeapObj::Str(_));
         // Fast path: appending a single decimal digit (the `s += i%10` shape) —
         // no temporary allocation for the value's string form.
@@ -845,6 +1241,19 @@ impl<'p> Vm<'p> {
     pub(crate) fn cmp_lt(&mut self, base: usize, a: u16, b: u16, left_first: bool) -> Result<bool, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
+        self.cmp_lt_values(va, vb, left_first)
+    }
+
+    /// Raw-Value sibling of `cmp_lt`, used when a fused opcode carries one
+    /// operand and the other is a fixed literal. Semantics and coercion order
+    /// are exactly the register form above.
+    #[inline]
+    pub(crate) fn cmp_lt_values(
+        &mut self,
+        va: Value,
+        vb: Value,
+        left_first: bool,
+    ) -> Result<bool, Thrown> {
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() < vb.as_int());
         }
@@ -1065,47 +1474,7 @@ impl<'p> Vm<'p> {
             _ => {}
         }
         if let Some(s) = self.heap.str_cow(v.heap_index()) {
-            // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
-                let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
-            if t.is_empty() {
-                return Ok(0.0);
-            }
-            // Non-decimal integer literals `0x…`/`0o…`/`0b…` (StringNumericLiteral;
-            // no sign allowed). Fold digits into an f64 so arbitrarily long
-            // literals don't overflow.
-            let radix = match t.as_bytes() {
-                [b'0', b'x' | b'X', ..] => Some((16u32, &t[2..])),
-                [b'0', b'o' | b'O', ..] => Some((8, &t[2..])),
-                [b'0', b'b' | b'B', ..] => Some((2, &t[2..])),
-                _ => None,
-            };
-            if let Some((base, digits)) = radix {
-                let mut acc = 0.0f64;
-                for c in digits.chars() {
-                    match c.to_digit(base) {
-                        Some(d) => acc = acc * base as f64 + d as f64,
-                        None => return Ok(f64::NAN),
-                    }
-                }
-                return Ok(if digits.is_empty() { f64::NAN } else { acc });
-            }
-            // The only Infinity spellings a StringNumericLiteral accepts are the
-            // exact `Infinity` / `+Infinity` / `-Infinity` (capital I, full word).
-            match t {
-                "Infinity" | "+Infinity" => return Ok(f64::INFINITY),
-                "-Infinity" => return Ok(f64::NEG_INFINITY),
-                _ => {}
-            }
-            // Rust's f64 parser also accepts word forms (`inf`, `infinity`, `INF`,
-            // `nan`, …) that are NOT valid JS numeric strings. A valid JS decimal /
-            // scientific literal begins (after an optional sign) with a digit or `.`,
-            // never a letter — so reject a letter-led body (`Infinity` was handled
-            // above). A decimal that overflows (`1e400`) still parses to Infinity.
-            let body = t.strip_prefix(['+', '-']).unwrap_or(t);
-            if body.as_bytes().first().is_some_and(|b| b.is_ascii_alphabetic()) {
-                return Ok(f64::NAN);
-            }
-            return Ok(t.parse::<f64>().unwrap_or(f64::NAN));
+            return Ok(string_to_number(&s));
         }
         Ok(f64::NAN)
     }
@@ -1910,6 +2279,74 @@ mod add_values_fresh_index_tests {
             if r2.is_heap() {
                 assert_ne!(r2.heap_index(), lhs.heap_index());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pad2_pinned_mutation_tests {
+    use super::*;
+
+    fn vm() -> Vm<'static> {
+        // Leak the tiny test Program so the returned VM's borrow is valid for
+        // the test lifetime; production ownership is unchanged.
+        let src = "var x = 0;";
+        let ast = crate::front::parse_script(src).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_program(&ast, src).expect("source compiles"),
+        ));
+        let mut vm = Vm::new(program);
+        vm.run().expect("program runs");
+        vm
+    }
+
+    #[test]
+    fn pad2_slots_are_exact_and_all_inplace_paths_decline() {
+        let mut vm = vm();
+        for n in 0..100i32 {
+            let v = vm.pad2_concat(Value::int(n), n < 10).expect("pad2 hit");
+            assert_eq!(v.heap_index(), crate::heap::INTERN_PAD2_START + n as u32);
+            assert_eq!(vm.display(v), format!("{n:02}"));
+        }
+        let plain_nine = vm.pad2_concat(Value::int(9), false).unwrap();
+        let zero_ten = vm.pad2_concat(Value::int(10), true).unwrap();
+        assert_eq!(vm.display(plain_nine), "9");
+        assert_eq!(vm.display(zero_ten), "010");
+
+        let cached = vm.pad2_concat(Value::int(7), true).unwrap();
+        let x = Value::heap(b'x' as u32);
+        let slash = Value::heap(b'/' as u32);
+
+        // Direct StrAppendInPlace materialisation gate.
+        let appended = vm.str_append_inplace(cached, x).expect("primitive append");
+        assert_ne!(appended.heap_index(), cached.heap_index());
+        assert_eq!(vm.display(appended), "07x");
+        assert_eq!(vm.display(cached), "07");
+
+        // Interpreter fused-chain gate.
+        let chained = vm.add_values_chain(cached, x).expect("chain append");
+        assert_ne!(chained.heap_index(), cached.heap_index());
+        assert_eq!(vm.display(chained), "07x");
+        assert_eq!(vm.display(cached), "07");
+
+        // Proven-linear AddRightPair runtime guard (the compiler can never
+        // license a cached slot, but the helper remains defensive).
+        let paired = vm
+            .add_values_right_pair_inplace(cached, slash, Value::int(1))
+            .expect("right-pair append");
+        assert_ne!(paired.heap_index(), cached.heap_index());
+        assert_eq!(vm.display(paired), "07/1");
+        assert_eq!(vm.display(cached), "07");
+
+        // Native chain-fast gate is a separate direct mutation path.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            let vm_ptr = (&mut vm as *mut Vm<'_>).cast::<core::ffi::c_void>();
+            let bits = crate::vm::jit_concat_chain_fast(vm_ptr, cached.bits(), x.bits(), 0);
+            let native = Value::from_bits(bits);
+            assert_ne!(native.heap_index(), cached.heap_index());
+            assert_eq!(vm.display(native), "07x");
+            assert_eq!(vm.display(cached), "07");
         }
     }
 }

@@ -114,6 +114,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // allocates (grows the heap) ⇒ the emitter refetches r13/r14 when
             // the function pins them.
             | Instr::StrAppendInPlace { .. }
+            | Instr::AddRightPair { .. }
+            | Instr::Pad2Concat { .. }
+            | Instr::Pad2Conditional { .. }
             // W11 (B124) fused chain link — same helper protocol as the two
             // ops above (`jit_concat_chain`). Tier C NEEDS it: the fusion
             // plants chains INSIDE function bodies Tier C compiles today
@@ -332,6 +335,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
         let u0 = || Uses::new();
         let u1 = |a: u16| Uses::one(a);
         let u2 = |a: u16, b: u16| Uses::two(a, b);
+        let u3 = |a: u16, b: u16, c: u16| Uses::three(a, b, c);
         Some(match *i {
             Instr::LoadConst { dst, .. }
             | Instr::LoadInt { dst, .. }
@@ -355,6 +359,9 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             | Instr::Ge { dst, a, b }
             | Instr::Eq { dst, a, b }
             | Instr::Ne { dst, a, b } => (u2(a, b), Some(dst)),
+            Instr::AddRightPair { dst, a, b, c, .. } => (u3(a, b, c), Some(dst)),
+            Instr::Pad2Concat { dst, src, .. } => (u1(src), Some(dst)),
+            Instr::Pad2Conditional { dst, src } => (u1(src), Some(dst)),
             Instr::AddInt { dst, a, .. } => (u1(a), Some(dst)),
             Instr::Not { dst, a }
             | Instr::TypeOf { dst, a }
@@ -406,6 +413,9 @@ mod smallvec {
             }
             pub(super) fn two(a: u16, b: u16) -> Uses {
                 Uses { regs: [a, b, 0], len: 2, range: (0, 0) }
+            }
+            pub(super) fn three(a: u16, b: u16, c: u16) -> Uses {
+                Uses { regs: [a, b, c], len: 3, range: (0, 0) }
             }
             pub(super) fn range(base: u16, count: u16) -> Uses {
                 Uses { regs: [0; 3], len: 0, range: (base, count) }
@@ -1452,6 +1462,134 @@ pub(crate) fn compile_proto_mem(
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::AddRightPair { dst, a, b, c, in_place } => {
+                // Exact right-associated pair through the same helper as the
+                // interpreter and region MEM path. It may allocate or run user
+                // coercion code, so always refetch pinned state after a served
+                // call; CALL_THREW is a committed unwind, never a redo.
+                let pair_helper = if in_place {
+                    crate::vm::jit_append_right_pair as usize
+                } else {
+                    crate::vm::jit_add_right_pair as usize
+                };
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // outer left bits
+                    ; mov r8, [rbx + dreg(b)]             // inner left bits
+                    ; mov r9, [rbx + dreg(c)]             // inner right bits
+                    ; mov rax, QWORD pair_helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // defensive; helper never redoes
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // pending_throw set
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::Pad2Concat { dst, src, zero } => {
+                // Mirror the MEM-region call-free tagged-Int hit. A miss is
+                // still pristine and enters the shared exact helper; only the
+                // miss path can allocate/run user code/throw and needs refetch.
+                // ICSTATS deliberately uses the helper for exact counters.
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !crate::vm::pad2_concat_stats_enabled() {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(src)]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => slow
+                        ; mov r10d, eax
+                    );
+                    if zero {
+                        dynasm!(ops ; cmp r10d, 9 ; ja => slow);
+                    } else {
+                        dynasm!(ops
+                            ; cmp r10d, 10
+                            ; jb => slow
+                            ; cmp r10d, 99
+                            ; ja => slow
+                        );
+                    }
+                    dynasm!(ops
+                        ; add r10d, crate::heap::INTERN_PAD2_START as i32
+                        ; mov rax, QWORD HEAP_TAG as i64
+                        ; or rax, r10
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                    );
+                }
+                dynasm!(ops
+                    ; => slow
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(src)]          // RHS bits
+                    ; mov r8d, zero as i32                // literal prefix selector
+                    ; mov rax, QWORD crate::vm::jit_pad2_concat as usize as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // defensive; helper never redoes
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // pending_throw set
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done);
+            }
+            Instr::Pad2Conditional { dst, src } => {
+                // Whole pad2 conditional: direct canonical result for tagged
+                // Int 0..99; pristine shared fallback otherwise. ICSTATS uses
+                // the helper on hits so the mechanism census is exact.
+                let slow = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !crate::vm::pad2_concat_stats_enabled() {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(src)]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => slow
+                        ; mov r10d, eax
+                        ; cmp r10d, 99
+                        ; ja => slow
+                        ; add r10d, crate::heap::INTERN_PAD2_START as i32
+                        ; mov rax, QWORD HEAP_TAG as i64
+                        ; or rax, r10
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                    );
+                }
+                dynasm!(ops
+                    ; => slow
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD crate::vm::jit_pad2_conditional as usize as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+                dynasm!(ops ; => done);
             }
             Instr::StrConcatChain { dst, a, b } => {
                 if crate::codegen::chain_fast_enabled() {

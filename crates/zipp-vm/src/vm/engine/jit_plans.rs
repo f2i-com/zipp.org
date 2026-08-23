@@ -110,6 +110,9 @@ impl<'p> Vm<'p> {
                 | Instr::HasProp { dst, .. }
                 | Instr::StrConcat { dst, .. }
                 | Instr::StrAppendInPlace { dst, .. }
+                | Instr::AddRightPair { dst, .. }
+                | Instr::Pad2Concat { dst, .. }
+                | Instr::Pad2Conditional { dst, .. }
                 | Instr::StrConcatChain { dst, .. }
                 | Instr::Call { dst, .. }
                 | Instr::CallMethod { dst, .. } => dst,
@@ -1878,6 +1881,19 @@ fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
         Instr::StoreGlobalStrict { idx, src } => Instr::StoreGlobalStrict { idx, src: s(src) },
         Instr::StoreGlobalResolved { idx, src } => Instr::StoreGlobalResolved { idx, src: s(src) },
         Instr::Add { dst, a, b } => Instr::Add { dst: s(dst), a: s(a), b: s(b) },
+        Instr::AddRightPair { dst, a, b, c: r, in_place } => Instr::AddRightPair {
+            dst: s(dst),
+            a: s(a),
+            b: s(b),
+            c: s(r),
+            in_place,
+        },
+        Instr::Pad2Concat { dst, src, zero } => {
+            Instr::Pad2Concat { dst: s(dst), src: s(src), zero }
+        }
+        Instr::Pad2Conditional { dst, src } => {
+            Instr::Pad2Conditional { dst: s(dst), src: s(src) }
+        }
         Instr::Sub { dst, a, b } => Instr::Sub { dst: s(dst), a: s(a), b: s(b) },
         Instr::Mul { dst, a, b } => Instr::Mul { dst: s(dst), a: s(a), b: s(b) },
         Instr::Div { dst, a, b } => Instr::Div { dst: s(dst), a: s(a), b: s(b) },
@@ -1938,6 +1954,9 @@ fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
         | Instr::GetIndex { dst, .. }
         | Instr::GetProp { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
+        | Instr::AddRightPair { dst, .. }
+        | Instr::Pad2Concat { dst, .. }
+        | Instr::Pad2Conditional { dst, .. }
         | Instr::StrConcatChain { dst, .. }
         | Instr::Eq { dst, .. }
         | Instr::Ne { dst, .. }

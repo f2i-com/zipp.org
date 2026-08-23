@@ -747,6 +747,20 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
         ),
 
         // ── arithmetic ──
+        // AddRightPair represents TWO ordered Adds and the AIR row has room
+        // for only one binary relation. Keep it explicitly OTHER rather than
+        // making a false single-Add claim.
+        AddRightPair { dst, a, b, .. } => {
+            (op::OTHER, Claim::None, Some(a), Some(b), 0, Some(dst))
+        }
+        // The left operand is an implicit fixed string literal, so there is no
+        // second register with which to make a truthful arithmetic AIR claim.
+        Pad2Concat { dst, src, zero } => {
+            (op::OTHER, Claim::None, Some(src), None, zero as u64, Some(dst))
+        }
+        Pad2Conditional { dst, src } => {
+            (op::OTHER, Claim::None, Some(src), None, 0, Some(dst))
+        }
         // StrConcat/StrAppendInPlace are `Add` with a JIT routing hint; they are
         // the same operator and the post-check decides whether the row's values
         // actually satisfy addition.

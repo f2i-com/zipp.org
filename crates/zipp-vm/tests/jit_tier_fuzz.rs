@@ -4800,7 +4800,7 @@ console.log(h);
     assert!(found, "the generator no longer emits the Tier A recursion shape");
 }
 
-/// Every axis W17 added must still be GENERATED. Cheap (no engine), and it is
+/// Every axis W17/W20 added must still be GENERATED. Cheap (no engine), and it is
 /// the thing that fails when a later edit turns an axis off by accident — a
 /// widened generator that silently stops widening is worse than none, because
 /// the coverage claim outlives the coverage.
@@ -4812,6 +4812,7 @@ fn widened_axes_are_still_generated() {
     let (mut script, mut typeof_, mut ident, mut dblshape) = (0, 0, 0, 0);
     let (mut probe, mut escape, mut loop2, mut dblscan) = (0, 0, 0, 0);
     let (mut split, mut dead_out, mut cond_def) = (0, 0, 0);
+    let (mut push, mut not) = (0, 0);
     for i in 0..1500u64 {
         let prog = gen_program(prog_seed(0x5A17_2026_0F1E_2D3C, i), false);
         if prog.scope == Scope::Script {
@@ -4845,6 +4846,13 @@ fn widened_axes_are_still_generated() {
         {
             cond_def += 1;
         }
+        // Check emitted source, not just the internal enum, so a deleted emit
+        // arm cannot leave this test green while the actual soak loses an axis.
+        push += src.matches("parr.push(").count();
+        // A negated BoolDef is emitted as an assignment. Restricting this to
+        // ` = !(` avoids counting a negated `if`, which the bytecode compiler
+        // may fold into the branch rather than materialising `Instr::Not`.
+        not += src.lines().filter(|line| line.contains(" = !(")).count();
     }
     for (n, what) in [
         (script, "script-scope programs"),
@@ -4858,6 +4866,8 @@ fn widened_axes_are_still_generated() {
         (split, "Flavor::Split bodies"),
         (dead_out, "dead-out locals"),
         (cond_def, "Stmt::CondDef (a def that does not dominate)"),
+        (push, "Stmt::Push / parr.push emission"),
+        (not, "negated Stmt::BoolDef / Instr::Not emission"),
     ] {
         assert!(n > 0, "{what} is no longer generated at all (0 in 1500 programs)");
     }

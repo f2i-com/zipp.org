@@ -108,11 +108,20 @@ fn split_propindex_enabled() -> bool {
 #[derive(Clone, Debug)]
 pub enum PropIndex {
     /// Pre-W19: one flat `Vec<(tag, slot)>`.
-    Inter { table: Vec<(u32, u32)>, mask: usize, len: usize },
+    Inter {
+        table: Vec<(u32, u32)>,
+        mask: usize,
+        len: usize,
+    },
     /// W19 M1: parallel `tags` / `slots`, same length, same bucket index.
     /// INVARIANT: `tags.len() == slots.len() == mask + 1`, a bucket is occupied
     /// iff `slots[i] != PROP_EMPTY`, and `tags[i]` is meaningful only then.
-    Split { tags: Vec<u32>, slots: Vec<u32>, mask: usize, len: usize },
+    Split {
+        tags: Vec<u32>,
+        slots: Vec<u32>,
+        mask: usize,
+        len: usize,
+    },
 }
 
 impl PropIndex {
@@ -134,7 +143,11 @@ impl PropIndex {
                 len: 0,
             }
         } else {
-            PropIndex::Inter { table: vec![(0, PROP_EMPTY); cap], mask: cap - 1, len: 0 }
+            PropIndex::Inter {
+                table: vec![(0, PROP_EMPTY); cap],
+                mask: cap - 1,
+                len: 0,
+            }
         }
     }
 
@@ -164,7 +177,9 @@ impl PropIndex {
                     i = (i + 1) & mask;
                 }
             }
-            PropIndex::Split { tags, slots, mask, .. } => {
+            PropIndex::Split {
+                tags, slots, mask, ..
+            } => {
                 let mut i = tag as usize & mask;
                 loop {
                     let ss = slots[i];
@@ -215,7 +230,9 @@ impl PropIndex {
                 }
                 table[i] = (tag, slot);
             }
-            PropIndex::Split { tags, slots, mask, .. } => {
+            PropIndex::Split {
+                tags, slots, mask, ..
+            } => {
                 let mut i = tag as usize & *mask;
                 while slots[i] != PROP_EMPTY {
                     i = (i + 1) & *mask;
@@ -271,7 +288,12 @@ impl PropIndex {
                     }
                 }
             }
-            PropIndex::Split { tags, slots, mask, len } => {
+            PropIndex::Split {
+                tags,
+                slots,
+                mask,
+                len,
+            } => {
                 let mask = *mask;
                 let mut j = tag as usize & mask;
                 while slots[j] != slot {
@@ -326,7 +348,9 @@ impl PropIndex {
                     }
                 }
             }
-            PropIndex::Split { tags, slots, mask, .. } => {
+            PropIndex::Split {
+                tags, slots, mask, ..
+            } => {
                 let cap = slots.len() * 2;
                 let old_tags = std::mem::replace(tags, vec![0; cap]);
                 let old_slots = std::mem::replace(slots, vec![PROP_EMPTY; cap]);
@@ -348,7 +372,10 @@ impl PropIndex {
     #[cfg(test)]
     fn verify(&self, keys: &[String]) {
         let cap = self.cap();
-        if let PropIndex::Split { tags, slots, mask, .. } = self {
+        if let PropIndex::Split {
+            tags, slots, mask, ..
+        } = self
+        {
             assert_eq!(tags.len(), slots.len(), "tags/slots length desync");
             assert_eq!(tags.len(), mask + 1, "arrays do not match mask");
         }
@@ -363,7 +390,11 @@ impl PropIndex {
             }
             live += 1;
             assert!((sl as usize) < keys.len(), "slot {sl} out of range");
-            assert_eq!(t, prop_tag(&keys[sl as usize]), "tag/slot desync at bucket {i}");
+            assert_eq!(
+                t,
+                prop_tag(&keys[sl as usize]),
+                "tag/slot desync at bucket {i}"
+            );
         }
         assert_eq!(live, self.len(), "len disagrees with occupancy");
         for (i, k) in keys.iter().enumerate() {
@@ -501,7 +532,13 @@ impl PropAttr {
     /// The default attributes for an ordinary created property (`obj.x = v`,
     /// object literals): a writable, enumerable, configurable data property.
     pub fn data() -> PropAttr {
-        PropAttr { writable: true, enumerable: true, configurable: true, accessor: false, setter: Value::UNDEFINED }
+        PropAttr {
+            writable: true,
+            enumerable: true,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        }
     }
 }
 
@@ -659,12 +696,8 @@ impl ObjMap {
                 ));
             }
             let a = self.attrs[i];
-            let actual = crate::shape::attr_bits(
-                a.writable,
-                a.enumerable,
-                a.configurable,
-                a.accessor,
-            );
+            let actual =
+                crate::shape::attr_bits(a.writable, a.enumerable, a.configurable, a.accessor);
             if *bits != actual {
                 return Err(format!(
                     "shape {} slot {} ({:?}) claims attr bits {:#04b}, object has {:#04b}",
@@ -807,7 +840,11 @@ impl ObjMap {
 
     /// `Object.isFrozen`: sealed and every own data property non-writable.
     pub fn is_frozen(&self) -> bool {
-        !self.extensible && self.attrs.iter().all(|a| !a.configurable && (a.accessor || !a.writable))
+        !self.extensible
+            && self
+                .attrs
+                .iter()
+                .all(|a| !a.configurable && (a.accessor || !a.writable))
     }
 
     /// `Object.seal`: clear extensibility and make every own property non-configurable.
@@ -1079,7 +1116,11 @@ pub fn unit_to_byte(s: &str, u: usize) -> usize {
 /// lone surrogate — 2 for an astral scalar).
 #[inline]
 pub fn cp_units(cp: u32) -> usize {
-    if cp < 0x10000 { 1 } else { 2 }
+    if cp < 0x10000 {
+        1
+    } else {
+        2
+    }
 }
 
 /// The `off`-th UTF-16 unit of code point `cp` (`off` 0 = the code point
@@ -1110,7 +1151,10 @@ pub fn wtf8_decode(b: &[u8], i: usize) -> (u32, usize) {
     } else if b0 < 0xE0 {
         (((b0 & 0x1F) << 6) | (b[i + 1] as u32 & 0x3F), 2)
     } else if b0 < 0xF0 {
-        ((((b0 & 0x0F) << 12) | ((b[i + 1] as u32 & 0x3F) << 6)) | (b[i + 2] as u32 & 0x3F), 3)
+        (
+            (((b0 & 0x0F) << 12) | ((b[i + 1] as u32 & 0x3F) << 6)) | (b[i + 2] as u32 & 0x3F),
+            3,
+        )
     } else {
         (
             ((b0 & 0x07) << 18)
@@ -1125,13 +1169,16 @@ pub fn wtf8_decode(b: &[u8], i: usize) -> (u32, usize) {
 /// UTF-16 unit count of a WTF-8 buffer: one per lead byte, plus one extra per
 /// 4-byte (astral) sequence. A 3-byte lone-surrogate encoding counts 1.
 pub fn wtf8_units(b: &[u8]) -> usize {
-    b.iter().map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize).sum()
+    b.iter()
+        .map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize)
+        .sum()
 }
 
 /// Whether WTF-8 buffer `b` contains NO surrogate encodings — for engine-built
 /// buffers this is exactly "the bytes are valid UTF-8".
 pub fn wtf8_is_wellformed(b: &[u8]) -> bool {
-    !b.windows(2).any(|w| w[0] == 0xED && (0xA0..=0xBF).contains(&w[1]))
+    !b.windows(2)
+        .any(|w| w[0] == 0xED && (0xA0..=0xBF).contains(&w[1]))
 }
 
 /// Raw WTF-8 encode of `cp` (a surrogate allowed) onto `out` — NO seam
@@ -1324,8 +1371,17 @@ impl JsStr {
     /// path for every string the engine builds out of `&str` material.
     pub fn new(bytes: String) -> JsStr {
         let ascii = bytes.is_ascii();
-        let units = if ascii { bytes.len() } else { str_units(&bytes) };
-        JsStr { bytes: bytes.into_bytes(), units, ascii, wellformed: true }
+        let units = if ascii {
+            bytes.len()
+        } else {
+            str_units(&bytes)
+        };
+        JsStr {
+            bytes: bytes.into_bytes(),
+            units,
+            ascii,
+            wellformed: true,
+        }
     }
 
     /// Construct from WTF-8 bytes (the creation sites that can produce lone
@@ -1339,12 +1395,22 @@ impl JsStr {
     /// regex-log-scan takes ~1.8M such slices per run.
     pub fn from_ascii(bytes: Vec<u8>) -> JsStr {
         debug_assert!(bytes.is_ascii(), "from_ascii: caller's ascii proof failed");
-        JsStr { units: bytes.len(), bytes, ascii: true, wellformed: true }
+        JsStr {
+            units: bytes.len(),
+            bytes,
+            ascii: true,
+            wellformed: true,
+        }
     }
 
     pub fn from_wtf8(bytes: Vec<u8>) -> JsStr {
         if bytes.is_ascii() {
-            return JsStr { units: bytes.len(), bytes, ascii: true, wellformed: true };
+            return JsStr {
+                units: bytes.len(),
+                bytes,
+                ascii: true,
+                wellformed: true,
+            };
         }
         let wellformed = wtf8_is_wellformed(&bytes);
         debug_assert!(
@@ -1365,7 +1431,12 @@ impl JsStr {
             "from_wtf8: non-canonical surrogate pair encoding"
         );
         let units = wtf8_units(&bytes);
-        JsStr { bytes, units, ascii: false, wellformed }
+        JsStr {
+            bytes,
+            units,
+            ascii: false,
+            wellformed,
+        }
     }
 
     /// A 1-code-point string (`cp` may be a lone surrogate).
@@ -1384,7 +1455,10 @@ impl JsStr {
     #[allow(dead_code)]
     #[inline]
     pub fn as_str_wf(&self) -> &str {
-        assert!(self.wellformed, "as_str_wf on a string containing lone surrogates");
+        assert!(
+            self.wellformed,
+            "as_str_wf on a string containing lone surrogates"
+        );
         // SAFETY: `wellformed` records that `bytes` holds no surrogate
         // encodings; the bytes otherwise originate from safe `String`s or the
         // engine's WTF-8 encoders, so they are valid UTF-8 (checked by
@@ -1436,6 +1510,15 @@ impl JsStr {
         self.wellformed
     }
 
+    /// Reserve raw backing bytes for a caller that has already proved the
+    /// appended pieces' exact byte lengths. Metadata is unchanged until the
+    /// subsequent `push_*` calls. Used by the proven-linear right-pair append
+    /// to make both leaves share one capacity growth.
+    #[inline]
+    pub(crate) fn reserve_bytes(&mut self, additional: usize) {
+        self.bytes.reserve(additional);
+    }
+
     /// Append one ASCII byte (the `s += digit` fast path), updating metadata.
     #[inline]
     pub fn push_ascii(&mut self, b: u8) {
@@ -1460,7 +1543,11 @@ impl JsStr {
     /// canonicalizing the seam. Unit length stays additive across the merge.
     pub fn push_wtf8(&mut self, add: &[u8]) {
         let add_ascii = add.is_ascii();
-        self.units += if add_ascii { add.len() } else { wtf8_units(add) };
+        self.units += if add_ascii {
+            add.len()
+        } else {
+            wtf8_units(add)
+        };
         if self.wellformed && (add_ascii || wtf8_is_wellformed(add)) {
             // Surrogate-free on both sides: plain append, no seam possible.
             self.ascii &= add_ascii;
@@ -1506,8 +1593,13 @@ impl JsStr {
     /// addresses a lead unit, the trail surrogate's value mid-pair, and a lone
     /// surrogate's own value.
     pub fn code_point_at(&self, i: usize) -> Option<u32> {
-        self.locate_unit(i)
-            .map(|(cp, off)| if off == 0 { cp } else { unit_of_cp(cp, 1) as u32 })
+        self.locate_unit(i).map(|(cp, off)| {
+            if off == 0 {
+                cp
+            } else {
+                unit_of_cp(cp, 1) as u32
+            }
+        })
     }
 
     /// Substring by UNIT positions `[a, b)`. A bound that splits a surrogate
@@ -1518,7 +1610,11 @@ impl JsStr {
     pub fn slice_units(&self, a: usize, b: usize) -> JsStr {
         if self.ascii {
             let (a, b) = (a.min(self.bytes.len()), b.min(self.bytes.len()));
-            return JsStr::from_wtf8(if a >= b { Vec::new() } else { self.bytes[a..b].to_vec() });
+            return JsStr::from_wtf8(if a >= b {
+                Vec::new()
+            } else {
+                self.bytes[a..b].to_vec()
+            });
         }
         let mut out: Vec<u8> = Vec::new();
         if a < b {
@@ -1582,8 +1678,15 @@ pub enum GenState {
 /// thrown reason), which `EndFinally` then resumes.
 #[derive(Clone, Copy, Debug)]
 pub enum Handler {
-    Catch { target: u32, reg: u16 },
-    Finally { target: u32, kind_reg: u16, val_reg: u16 },
+    Catch {
+        target: u32,
+        reg: u16,
+    },
+    Finally {
+        target: u32,
+        kind_reg: u16,
+        val_reg: u16,
+    },
 }
 
 /// A Promise's settlement state.
@@ -2138,7 +2241,11 @@ pub enum HeapObj {
     /// shared between the closure and its defining scope. `this_val` is the
     /// lexically-captured `this` for an ARROW function (its proto has
     /// `lexical_this`); it is `UNDEFINED` and unused for ordinary closures.
-    Closure { func: u32, upvalues: Vec<u32>, this_val: Value },
+    Closure {
+        func: u32,
+        upvalues: Vec<u32>,
+        this_val: Value,
+    },
     /// A boxed mutable variable cell (an upvalue's storage).
     Cell(Value),
     /// A sloppy direct eval's DYNAMIC variable environment for a FUNCTION
@@ -2148,13 +2255,21 @@ pub enum HeapObj {
     EvalScope(std::collections::HashMap<String, Value>),
     /// A bound function (`fn.bind(thisArg, ...boundArgs)`): calling it invokes
     /// `target` with `this` fixed to `this` and `args` prepended to the call args.
-    Bound { target: Value, this: Value, args: Vec<Value> },
+    Bound {
+        target: Value,
+        this: Value,
+        args: Vec<Value>,
+    },
     /// A ShadowRealm WrappedFunction exotic: a fresh wrapper created each time
     /// a callable crosses the realm boundary. Calling it wraps the arguments,
     /// calls `target` with `this` = undefined, and wraps the result; any abrupt
     /// target completion surfaces as a caller-realm TypeError. `name`/`length`
     /// are the CopyNameAndLength snapshot taken at wrap time.
-    Wrapped { target: Value, name: String, length: f64 },
+    Wrapped {
+        target: Value,
+        name: String,
+        length: f64,
+    },
     /// A built-in (native) function value, identified by a small id (see the
     /// `native` ids in vm.rs). Callable as a first-class value — this is what backs
     /// `Object.defineProperty`, `Array.isArray`, `Object.prototype.hasOwnProperty`,
@@ -2175,7 +2290,12 @@ pub enum HeapObj {
     /// `name`/`length` are the CreateBuiltinFunction values (the spec names these
     /// closures — "addInitializer", "get", "set", "has"), since a state-carrying
     /// native has no entry in the static `native::static_name_length` table.
-    NativeClosure { id: u16, state: Vec<Value>, name: &'static str, length: u8 },
+    NativeClosure {
+        id: u16,
+        state: Vec<Value>,
+        name: &'static str,
+        length: u8,
+    },
     /// A dense array.
     Array(Vec<Value>),
     /// A plain object.
@@ -2201,7 +2321,11 @@ pub enum HeapObj {
     /// function consumes it and every later call is a spec no-op — even while the
     /// promise is still Pending because the first resolve deferred to a thenable
     /// job (see `Vm::resolver_pair_fire`).
-    BoundResolver { promise: u32, is_reject: bool, pair: u32 },
+    BoundResolver {
+        promise: u32,
+        is_reject: bool,
+        pair: u32,
+    },
     /// A `Date`: milliseconds since the Unix epoch (NaN = Invalid Date). The
     /// engine treats all component getters/setters as UTC (a documented
     /// simplification — node uses the host time zone for the non-UTC ones).
@@ -2224,14 +2348,24 @@ pub enum HeapObj {
     /// A native resolve/reject element for a combinator: performs one combinator
     /// step (`is_reject` selects fulfill vs reject when CALLED directly by a custom
     /// thenable; via the native reaction the kind comes from the reaction list).
-    CombinatorResolver { combinator: u32, index: u32, is_reject: bool },
+    CombinatorResolver {
+        combinator: u32,
+        index: u32,
+        is_reject: bool,
+    },
     /// A suspended generator (`function*`). Owns a DETACHED register window (off
     /// the contiguous live `regs` Vec, so the JIT's pinned-capacity invariant
     /// holds while parked); `func`/`closure` re-create the frame on resume, and
     /// `state` carries the resume ip / completion. `handlers` preserves the
     /// frame's active `try` handlers across a yield, so `gen.throw(e)` resumes
     /// into an enclosing `try`/`catch` (and `gen.return(v)` can run `finally`).
-    Generator { func: u32, closure: u32, state: GenState, regs: Vec<Value>, handlers: Vec<Handler> },
+    Generator {
+        func: u32,
+        closure: u32,
+        state: GenState,
+        regs: Vec<Value>,
+        handlers: Vec<Handler>,
+    },
     /// An `async function*` activation — see [`AsyncGenState`]. Its `.next()`
     /// returns a Promise; the body may both `yield` and `await`.
     AsyncGenerator(Box<AsyncGenState>),
@@ -2304,12 +2438,25 @@ pub enum HeapObj {
     /// A JS TypedArray view (`Int8Array`, `Float64Array`, …). `kind` indexes the
     /// element type (see `vm::native::TA_KINDS`); `buffer` is the backing
     /// `ArrayBuffer`'s heap index; `byte_offset`/`length` (in elements) frame the view.
-    TypedArray { buffer: u32, kind: u8, byte_offset: usize, length: usize },
+    TypedArray {
+        buffer: u32,
+        kind: u8,
+        byte_offset: usize,
+        length: usize,
+    },
     /// A JS `DataView` over an ArrayBuffer (`buffer` heap index, byte window).
-    DataView { buffer: u32, byte_offset: usize, byte_length: usize },
+    DataView {
+        buffer: u32,
+        byte_offset: usize,
+        byte_length: usize,
+    },
     /// A JS `Proxy`: property/call operations route through `handler`'s traps (or
     /// fall through to `target`). `revoked` cuts it off (every op then throws).
-    Proxy { target: Value, handler: Value, revoked: bool },
+    Proxy {
+        target: Value,
+        handler: Value,
+        revoked: bool,
+    },
     /// A `Temporal.*` value. `kind` selects the type (0=Duration, 1=PlainDate,
     /// 2=PlainTime, 3=PlainDateTime, …); `fields` holds its integer slots in a
     /// per-kind layout (Duration: y,mo,w,d,h,mi,s,ms,us,ns; PlainDate: isoY,isoM,isoD).
@@ -2348,7 +2495,12 @@ pub enum HeapObj {
     /// collection `coll` at `index` (skipping tombstoned/HOLE slots) instead of the
     /// `items` snapshot, so a delete/add after the iterator is created is observed
     /// (`kind`: 0 = keys, 1 = values, 2 = entries `[k, v]`).
-    Iterator { items: Vec<Value>, index: usize, proto: u32, live: Option<(u32, u8)> },
+    Iterator {
+        items: Vec<Value>,
+        index: usize,
+        proto: u32,
+        live: Option<(u32, u8)>,
+    },
     /// A lazy Iterator Helper (the result of `Iterator.prototype.{map,filter,
     /// take,drop,flatMap}`). `source` is the underlying iterator; `kind` selects
     /// the transform (0=map,1=filter,2=take,3=drop,4=flatMap); `arg` is the
@@ -2382,9 +2534,17 @@ pub enum HeapObj {
 }
 
 /// Heap index of the interned empty string. The 128 single-ASCII-char strings
-/// occupy indices `0..128`; the empty string is `128`; user objects start at
-/// `129` (see [`Heap::new`]).
+/// occupy indices `0..128`; the empty string is `128`.
 pub const INTERN_EMPTY: u32 = 128;
+/// First/last slots of the immutable two-digit decimal table (`"00".."99"`).
+/// These primitive strings are returned by `Pad2Concat` without allocation.
+pub const INTERN_PAD2_START: u32 = INTERN_EMPTY + 1;
+pub const INTERN_PAD2_COUNT: u32 = 100;
+pub const INTERN_PAD2_END: u32 = INTERN_PAD2_START + INTERN_PAD2_COUNT - 1;
+/// Last immutable engine-interned slot. In-place string builders must accept
+/// only indices strictly above this boundary; unlike the single-character
+/// prefix, the pad2 table contains multi-character `Str`s.
+pub const INTERN_PINNED_END: u32 = INTERN_PAD2_END;
 
 pub struct Heap {
     objs: Vec<HeapObj>,
@@ -2633,26 +2793,41 @@ impl Default for Heap {
 
 impl Heap {
     pub fn new() -> Heap {
-        // Pre-intern the 128 single-ASCII-char strings (indices 0..128) and the
-        // empty string (index 128). These are immutable and ubiquitous — every
-        // `s[i]` and every `s += <digit>` produces one — so sharing a single
-        // heap slot eliminates per-iteration allocation in string loops.
-        let mut objs = Vec::with_capacity(160);
-        let mut versions = Vec::with_capacity(160);
+        // Pre-intern the 128 single-ASCII-char strings (indices 0..127), the
+        // empty string (128), and the fixed `"00".."99"` pad2 table
+        // (INTERN_PAD2_START..=INTERN_PAD2_END). These are immutable and
+        // ubiquitous; the final table lets Pad2Concat return a primitive
+        // String without allocating. The entire prefix is OLD and pinned.
+        let mut objs = Vec::with_capacity(256);
+        let mut versions = Vec::with_capacity(256);
         for b in 0u8..128 {
             objs.push(HeapObj::Str(JsStr::new((b as char).to_string())));
             versions.push(0);
         }
         objs.push(HeapObj::Str(JsStr::new(String::new())));
         versions.push(0);
+        for n in 0u8..100 {
+            let bytes = vec![b'0' + n / 10, b'0' + n % 10];
+            objs.push(HeapObj::Str(JsStr::from_ascii(bytes)));
+            versions.push(0);
+        }
+        debug_assert_eq!(objs.len(), INTERN_PINNED_END as usize + 1);
         let live = objs.len();
         let oracle = std::env::var_os("ZIPP_GCSTATS").is_some();
-        let born = if oracle { vec![0; objs.len()] } else { Vec::new() };
+        let born = if oracle {
+            vec![0; objs.len()]
+        } else {
+            Vec::new()
+        };
         // Default-on since W9 (B122) — see the `nursery` field doc. The
         // ZIPP_NURSERY opt-in from waves 7-8 is subsumed (harmless if set).
         let nursery = std::env::var_os("ZIPP_NO_NURSERY").is_none();
         // The pre-interned prefix is pinned and immutable — OLD from birth.
-        let gen = if nursery { vec![GEN_OLD; objs.len()] } else { Vec::new() };
+        let gen = if nursery {
+            vec![GEN_OLD; objs.len()]
+        } else {
+            Vec::new()
+        };
         let budget_env = std::env::var("ZIPP_NURSERY_YOUNG_BUDGET")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -2671,7 +2846,10 @@ impl Heap {
             free: Vec::new(),
             live,
             gc_requested: false,
-            gc_threshold: GC_MIN_THRESHOLD,
+            // Keep the historical number of collectable allocations before
+            // the first GC: the 100 new pad2 prefix slots are permanent OLD
+            // objects, not young allocation pressure.
+            gc_threshold: GC_MIN_THRESHOLD + INTERN_PAD2_COUNT as usize,
             born,
             epoch: 0,
             allocs_epoch: 0,
@@ -2682,7 +2860,10 @@ impl Heap {
             remset: Vec::new(),
             scan_roots: Vec::new(),
             live_at_major: live,
-            major_at: GC_MIN_THRESHOLD,
+            // Same offset as gc_threshold: a first minor's occupied count
+            // includes these permanent slots, so preserve the old boundary in
+            // terms of collectable survivors rather than total prefix size.
+            major_at: GC_MIN_THRESHOLD + INTERN_PAD2_COUNT as usize,
             major_due: false,
             minors_since_major: 0,
             young_budget,
@@ -2749,8 +2930,11 @@ impl Heap {
             if self.oracle {
                 // A pretenured slot is stamped one epoch back so the oracle's
                 // survival tables don't misread it as surviving young.
-                self.born[idx as usize] =
-                    if self.pretenure == 0 { self.epoch } else { self.epoch.saturating_sub(1) };
+                self.born[idx as usize] = if self.pretenure == 0 {
+                    self.epoch
+                } else {
+                    self.epoch.saturating_sub(1)
+                };
                 self.allocs_epoch += 1;
             }
             return idx;
@@ -2767,8 +2951,11 @@ impl Heap {
             }
         }
         if self.oracle {
-            self.born
-                .push(if self.pretenure == 0 { self.epoch } else { self.epoch.saturating_sub(1) });
+            self.born.push(if self.pretenure == 0 {
+                self.epoch
+            } else {
+                self.epoch.saturating_sub(1)
+            });
             self.allocs_epoch += 1;
         }
         idx
@@ -2827,7 +3014,11 @@ impl Heap {
     /// safe point exercises both paths densely, not minors alone.
     #[inline]
     pub fn minor_due(&self, stress: bool) -> bool {
-        let cap = if stress { NURSERY_STRESS_MINORS } else { NURSERY_MAX_MINORS };
+        let cap = if stress {
+            NURSERY_STRESS_MINORS
+        } else {
+            NURSERY_MAX_MINORS
+        };
         self.nursery && !self.major_due && self.minors_since_major < cap
     }
 
@@ -3029,7 +3220,10 @@ impl Heap {
     /// `free_slot`), so the shared root walk and the unchanged `trace_edges`
     /// push — and therefore trace — ONLY young objects.
     pub fn gen_nonyoung_marks(&self) -> Vec<bool> {
-        self.gen.iter().map(|&g| g & GEN_STATE != GEN_YOUNG).collect()
+        self.gen
+            .iter()
+            .map(|&g| g & GEN_STATE != GEN_YOUNG)
+            .collect()
     }
 
     /// W10: the minor's mark vector WITHOUT the O(heap) rebuild. Building
@@ -3308,7 +3502,12 @@ impl Heap {
                 bytes.extend_from_slice(&l.bytes);
                 bytes.extend_from_slice(&r.bytes);
                 let ascii = l.ascii && r.ascii;
-                return self.alloc(HeapObj::Str(JsStr { bytes, units, ascii, wellformed: true }));
+                return self.alloc(HeapObj::Str(JsStr {
+                    bytes,
+                    units,
+                    ascii,
+                    wellformed: true,
+                }));
             }
         }
         let mut out = Vec::with_capacity(units * 3); // ≤ 3 WTF-8 bytes per UTF-16 unit
@@ -3541,7 +3740,10 @@ impl Heap {
         // source 3 of NURSERY_DESIGN.md §1 (CellSet/CellSetChecked/UpvalSet
         // all land here — the JIT's `jit_cell_set`/`jit_upval_set` too).
         self.write_barrier_val(idx, v);
-        if self.oracle && v.is_heap() && !self.oracle_young(idx) && self.oracle_young(v.heap_index())
+        if self.oracle
+            && v.is_heap()
+            && !self.oracle_young(idx)
+            && self.oracle_young(v.heap_index())
         {
             gcoracle::hit(gcoracle::CELL_SET);
         }
@@ -3588,7 +3790,11 @@ pub(crate) mod gcoracle {
 
     /// `(site name, would-be old→young store count)` per chokepoint.
     pub fn dump() -> Vec<(&'static str, u64)> {
-        NAMES.iter().zip(&COUNTS).map(|(&n, c)| (n, c.load(Ordering::Relaxed))).collect()
+        NAMES
+            .iter()
+            .zip(&COUNTS)
+            .map(|(&n, c)| (n, c.load(Ordering::Relaxed)))
+            .collect()
     }
 }
 
@@ -3665,9 +3871,21 @@ mod tests {
                     split.remove_slot(tag, i as u32);
                 }
 
-                assert_eq!(inter.len(), keys.len(), "seed {seed} step {step}: inter len");
-                assert_eq!(split.len(), keys.len(), "seed {seed} step {step}: split len");
-                assert_eq!(inter.cap(), split.cap(), "seed {seed} step {step}: capacity diverged");
+                assert_eq!(
+                    inter.len(),
+                    keys.len(),
+                    "seed {seed} step {step}: inter len"
+                );
+                assert_eq!(
+                    split.len(),
+                    keys.len(),
+                    "seed {seed} step {step}: split len"
+                );
+                assert_eq!(
+                    inter.cap(),
+                    split.cap(),
+                    "seed {seed} step {step}: capacity diverged"
+                );
                 inter.verify(&keys);
                 split.verify(&keys);
                 for (want, k) in keys.iter().enumerate() {
@@ -3726,7 +3944,10 @@ mod tests {
             }
             // Delete every other key front-first, then re-add them.
             for i in (0..n).step_by(2) {
-                assert!(m.remove(&format!("prop_{i}")), "n={n}: prop_{i} not removed");
+                assert!(
+                    m.remove(&format!("prop_{i}")),
+                    "n={n}: prop_{i} not removed"
+                );
                 assert_map_consistent(&m);
             }
             for i in (0..n).step_by(2) {
@@ -3822,7 +4043,9 @@ mod tests {
         m.attrs[1].enumerable = false;
         assert_shape_agrees(&m);
         // ...and the shape is now lying about slot 1's descriptor.
-        let why = m.verify_shape().expect_err("a changed attr bit must be caught");
+        let why = m
+            .verify_shape()
+            .expect_err("a changed attr bit must be caught");
         assert!(why.contains("attr bits"), "unexpected reason: {why}");
         assert!(why.contains("slot 1"), "reason should name the slot: {why}");
     }
@@ -3843,7 +4066,10 @@ mod tests {
 
         assert_ne!(m.shape(), before);
         assert!(!m.shape_guardable(), "a descriptor change must leave DICT");
-        assert!(m.verify_shape().is_ok(), "DICT claims nothing, so it cannot lie");
+        assert!(
+            m.verify_shape().is_ok(),
+            "DICT claims nothing, so it cannot lie"
+        );
     }
 
     /// A descriptor change that changes NOTHING must not cost the shape: writing
@@ -3943,7 +4169,13 @@ mod tests {
         redefined.define(
             "a",
             Value::num(9.0),
-            PropAttr { writable: false, enumerable: true, configurable: true, accessor: false, setter: Value::UNDEFINED },
+            PropAttr {
+                writable: false,
+                enumerable: true,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
         );
         assert!(!redefined.shape_guardable(), "attrs changed mid-sequence");
 
@@ -3967,7 +4199,11 @@ mod tests {
         }
         assert_map_consistent(&m);
         let c = m.clone();
-        assert_eq!(c.shape(), m.shape(), "a clone has identical keys at identical slots");
+        assert_eq!(
+            c.shape(),
+            m.shape(),
+            "a clone has identical keys at identical slots"
+        );
         assert_map_consistent(&c);
     }
 
@@ -4014,7 +4250,11 @@ mod tests {
         }
         assert_map_consistent(&m);
         for i in 0..60 {
-            let want = if i % 2 == 0 { (i * 100) as f64 } else { i as f64 };
+            let want = if i % 2 == 0 {
+                (i * 100) as f64
+            } else {
+                i as f64
+            };
             let got = m.get(&format!("prop_{i}")).expect("key vanished");
             assert_eq!(got.as_f64(), want, "prop_{i} wrong value");
         }
@@ -4061,9 +4301,17 @@ mod tests {
         marks[b as usize] = false;
         let mut freed = Vec::new();
         let swept = h.sweep_young(&marks, &mut freed);
-        assert_eq!((swept, freed.as_slice()), (1, &[b][..]), "only the unmarked young slot");
+        assert_eq!(
+            (swept, freed.as_slice()),
+            (1, &[b][..]),
+            "only the unmarked young slot"
+        );
         assert_eq!(h.free_indices(), &[b], "the freed slot is on the free list");
-        assert_eq!(h.version_of(b), vb.wrapping_add(1), "free must bump the version");
+        assert_eq!(
+            h.version_of(b),
+            vb.wrapping_add(1),
+            "free must bump the version"
+        );
         assert_eq!(h.version_of(a), va, "a marked slot's version is untouched");
         assert_eq!(h.version_of(c), vc, "a marked slot's version is untouched");
         assert!(h.young_log().is_empty(), "survivors age out of the log");
@@ -4161,7 +4409,11 @@ mod tests {
         h.free_slot(holder);
         let reused = h.alloc(HeapObj::Str(JsStr::new("rr".into())));
         assert_eq!(reused, holder, "the freed slot is reused first");
-        assert_eq!(h.dirty_for_trace(), Vec::<u32>::new(), "registration expired");
+        assert_eq!(
+            h.dirty_for_trace(),
+            Vec::<u32>::new(),
+            "registration expired"
+        );
     }
 
     /// The stage-3 schedule: a minor that leaves the heap at/above the
@@ -4175,14 +4427,14 @@ mod tests {
         // Post-minor occupancy below major_at: keep minoring.
         h.note_minor_done(1000);
         assert!(h.minor_due(false));
-        // Post-minor occupancy at/above major_at (GC_MIN_THRESHOLD here —
-        // no major has run yet): the young sweep failed to shrink the heap,
-        // so the next collection must be a major.
-        h.note_minor_done(GC_MIN_THRESHOLD);
+        // Post-minor occupancy at/above major_at (the historical collectable
+        // boundary plus the permanent pad2 prefix — no major has run yet):
+        // the young sweep failed to shrink the heap, so the next collection
+        // must be a major.
+        h.note_minor_done(GC_MIN_THRESHOLD + INTERN_PAD2_COUNT as usize);
         assert!(!h.minor_due(false));
         // The major resets the anchor from its TRUE live count.
         h.note_gc_done(2000);
         assert!(h.minor_due(false));
     }
 }
-

@@ -13,9 +13,13 @@
 //!     DISTINCT bool temp even though at most two are ever live at once. M1
 //!     linear-scan-reuses them over non-overlapping live ranges.
 //!
-//! Neither rung is worth anything alone — rung 1 declines first everywhere, so
-//! rung 2's decline string appears in no bench row today — so both are gated
-//! here together.
+//! The useful speedup requires both rungs. Bool reuse alone leaves the tokenizer
+//! on MEM; push admission alone gets one rung farther and then declines at the
+//! bool pool. W21 found a second-order hazard in that latter case: push-only
+//! snapshots leaked into the fallback plan and the MEM helper re-derived all of
+//! them after every append. [`push_pin_filter_is_tier_specific_and_non_vacuous`]
+//! proves the full plan still reaches INT with both rungs, while a declined
+//! fallback drops only pins introduced exclusively by push.
 //!
 //! WHAT THESE TESTS ARE DEFENDING, and why the list is what it is.
 //!
@@ -27,10 +31,10 @@
 //! W16's `Bitwise` sentinel and `emit_box_to_home`), so every one of those
 //! surfaces gets a case:
 //!
-//!   * [`intpush_parity_live_bools_across_the_append`] — 1..8 live bools around
-//!     the push, so every `BOOL_GPRS` register is occupied in turn while the
-//!     call runs. This is `bool_home_clobber.rs`'s sweep pointed at the one arm
-//!     that calls out.
+//!   * [`intpush_parity_live_homes_across_append_and_deopt`] — 1..4 bool homes
+//!     and four numeric locals are defined before the push and first consumed
+//!     after it. The last invocation then deopts on a pinned read immediately
+//!     after the call, so both the call spill and the exit flush are observable.
 //!   * [`intpush_parity_realloc_boundary`] — the append is read back through
 //!     the SAME pin (`out[out.length - 1]`) on the same iteration, across every
 //!     `Vec` capacity doubling from 0 to 4096. A stale `base` or `len` in the
@@ -66,9 +70,11 @@
 //! bug that also existed in the interpreter would pass that oracle.
 //! [`intpush_all_modes_answer_identically`] re-runs the whole set in child
 //! processes under each switch (including both off-switches and GC stress), and
-//! [`intpush_mechanism_reaches_the_int_tier`] reads the tier back out of a
-//! child's `ZIPP_JITLOG` so an admission change that quietly drops these
-//! kernels to the memory tier fails the suite instead of making it vacuous.
+//! [`intpush_mechanism_reaches_the_int_tier`] and
+//! [`push_pin_filter_is_tier_specific_and_non_vacuous`] read the tier/plan back
+//! out of a child's `ZIPP_JITLOG` so an admission change that quietly drops
+//! these kernels to the memory tier—or carries dead push pins there—fails the
+//! suite instead of making it vacuous.
 
 use std::process::Command;
 
@@ -76,7 +82,11 @@ use std::process::Command;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -98,7 +108,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -120,7 +134,12 @@ fn assert_matches_node(src: &str) {
 /// so a bool that reads back wrong changes the printed answer.
 fn push_bools_case(k: usize, n: usize) -> String {
     let body: String = (0..k)
-        .map(|j| format!("    if ((c + {j}) % {m} === 0) {{ h = (h + {j} + 1) | 0; }}\n", m = k + 2))
+        .map(|j| {
+            format!(
+                "    if ((c + {j}) % {m} === 0) {{ h = (h + {j} + 1) | 0; }}\n",
+                m = k + 2
+            )
+        })
         .collect();
     format!(
         r#"var out = [];
@@ -135,6 +154,64 @@ function kernel(n) {{
 var s = "";
 for (var r = 0; r < 3; r++) {{ out = []; s += "|" + kernel({n}) + ":" + out.length + ":" + out[0] + ":" + out[out.length - 1]; }}
 console.log("pushbools-{k} " + s);
+"#
+    )
+}
+
+/// `k` private bool homes and four numeric locals genuinely LIVE across the
+/// append call. The first two invocations keep `shift == 0`, warming and then
+/// running the INT region normally. The last uses `shift == 1`: iteration zero
+/// appends first, then the negative pinned-array read deopts. Every bool and
+/// numeric local is consumed only after that read, so a bad call restore OR a
+/// bad deopt flush changes the accumulator. The post-loop `typeof`/value probes
+/// also make the frame slots themselves observable.
+fn live_homes_across_push_case(k: usize, n: usize) -> String {
+    assert!((1..=4).contains(&k));
+    let ref_items = (0..=n)
+        .map(|i| ((i * 7 + 3) & 63).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let bool_init: String = (0..k).map(|j| format!("var b{j} = false;\n  ")).collect();
+    let bool_defs: String = (0..k)
+        .map(|j| {
+            let modulus = j + 2;
+            format!("    b{j} = ((i + {j}) % {modulus}) === 0;\n")
+        })
+        .collect();
+    let bool_uses: String = (0..k)
+        .map(|j| {
+            format!(
+                "    if (b{j}) {{ h = (h + p{j} + {yes}) | 0; }} else {{ h = (h - p{j} - {no}) | 0; }}\n",
+                yes = j + 1,
+                no = j + 3,
+            )
+        })
+        .collect();
+    let bool_out: String = (0..k)
+        .map(|j| format!(r#" + ":" + (typeof b{j}) + ":" + b{j}"#))
+        .collect();
+    format!(
+        r#"var out = [];
+var ref = [{ref_items}];
+function kernel(n, shift) {{
+  var h = 0, i = 0, probe = 0;
+  var p0 = 0, p1 = 0, p2 = 0, p3 = 0;
+  {bool_init}for (i = 0; i < n; i++) {{
+    p0 = (i + 3) | 0;
+    p1 = (i * 3 + 5) | 0;
+    p2 = (h ^ i) | 0;
+    p3 = ((i & 63) + 11) | 0;
+{bool_defs}    out.push((h + i) & 255);
+    probe = ref[i - shift];
+{bool_uses}    h = (h + p0 + p1 + p2 + p3 + probe) | 0;
+  }}
+  return "" + h + ":" + probe + ":" + p0 + ":" + p1 + ":" + p2 + ":" + p3{bool_out};
+}}
+var s = "";
+out = []; s += "|" + kernel({n}, 0) + ":" + out.length;
+out = []; s += "|" + kernel({n}, 0) + ":" + out.length;
+out = []; s += "|" + kernel({n}, 1) + ":" + out.length;
+console.log("livehomes-{k} " + s);
 "#
     )
 }
@@ -163,6 +240,30 @@ function kernel(n) {{
 var s = "";
 for (var r = 0; r < 3; r++) {{ out = []; s += "|" + kernel({n}) + ":" + out.length + ":" + out[0] + ":" + out[out.length - 1]; }}
 console.log("realloc-{n} " + s);
+"#
+    )
+}
+
+/// One receiver is both the push target and a pinned element/length source, but
+/// a unary `Math.abs` makes the loop deliberately non-INT while remaining
+/// MEM-admissible. This forces the fallback-plan filter to run and must retain
+/// the shared pin; it cannot pass merely because the successful INT tier used
+/// the original plan.
+fn shared_push_getindex_mem_case(n: usize) -> String {
+    format!(
+        r#"var out = [];
+function kernel(n) {{
+  var h = 0;
+  for (var i = 0; i < n; i++) {{
+    out.push((i * 7) & 255);
+    h = (h + out[out.length - 1] + out.length) | 0;
+    h = Math.abs(h);
+  }}
+  return h;
+}}
+var s = "";
+for (var r = 0; r < 3; r++) {{ out = []; s += "|" + kernel({n}) + ":" + out.length; }}
+console.log("shared-mem-{n} " + s);
 "#
     )
 }
@@ -275,13 +376,22 @@ console.log("tok " + s);
 
 // ── M2 parity ───────────────────────────────────────────────────────────────
 
-/// 1..8 live bool temps around the append, so every `BOOL_GPRS` register (and,
-/// past four, every SHARED one) is occupied while the win64 call runs. A save
-/// or restore this arm forgets shows up here as a wrong boolean.
+/// 1..8 distinct bool sites with disjoint ranges around the append. This is the
+/// tokenizer-shaped allocator/reuse sweep; the separate live-home test below
+/// is the call-clobber and exit-flush oracle.
 #[test]
 fn intpush_parity_live_bools_across_the_append() {
     for k in 1..=8 {
         assert_matches_node(&push_bools_case(k, 400));
+    }
+}
+
+/// The actual call-clobber matrix: bools and numeric homes are live across the
+/// append and observed after both the normal return and a post-call deopt.
+#[test]
+fn intpush_parity_live_homes_across_append_and_deopt() {
+    for k in 1..=4 {
+        assert_matches_node(&live_homes_across_push_case(k, 180));
     }
 }
 
@@ -393,7 +503,11 @@ function kernel(n) { var h = 0;
 try { kernel(1200); } catch (err) { console.log("threw " + (err instanceof TypeError)); }
 console.log("len " + out.length);
 "#;
-    assert_eq!(run_ok(src), node_output(src), "frozen push diverged:\n{src}");
+    assert_eq!(
+        run_ok(src),
+        node_output(src),
+        "frozen push diverged:\n{src}"
+    );
 }
 
 /// Pushed values that leave the i32 range, where the helper's boxing rule
@@ -423,7 +537,12 @@ console.log("boxing " + s);
 /// linear scan; 21 is the real `tokenize` count.
 fn disjoint_bools_case(k: usize, n: usize) -> String {
     let body: String = (0..k)
-        .map(|j| format!("    if (c === {j}) {{ h = (h + {w}) | 0; }}\n", w = j * 3 + 1))
+        .map(|j| {
+            format!(
+                "    if (c === {j}) {{ h = (h + {w}) | 0; }}\n",
+                w = j * 3 + 1
+            )
+        })
         .collect();
     format!(
         r#"function kernel(n) {{
@@ -457,7 +576,12 @@ fn boolreuse_parity_disjoint_bools() {
 fn boolreuse_parity_conditional_def_bool() {
     for k in [0usize, 4, 8, 16] {
         let extra: String = (0..k)
-            .map(|j| format!("    if ((i + {j}) % {m} === 0) {{ h = (h + 1) | 0; }}\n", m = k + 3))
+            .map(|j| {
+                format!(
+                    "    if ((i + {j}) % {m} === 0) {{ h = (h + 1) | 0; }}\n",
+                    m = k + 3
+                )
+            })
             .collect();
         let src = format!(
             r#"function kernel(n) {{
@@ -486,8 +610,9 @@ console.log("conddef-{k} " + s);
 fn boolreuse_parity_read_after_the_loop() {
     for k in [2usize, 5, 9, 20] {
         let decls: String = (0..k).map(|j| format!("var b{j} = false; ")).collect();
-        let defs: String =
-            (0..k).map(|j| format!("    if (i === {t}) b{j} = true;\n", t = j * 5 + 1)).collect();
+        let defs: String = (0..k)
+            .map(|j| format!("    if (i === {t}) b{j} = true;\n", t = j * 5 + 1))
+            .collect();
         let outs: String = (0..k).map(|j| format!(r#" + ":" + b{j}"#)).collect();
         let src = format!(
             r#"function kernel(n) {{
@@ -519,8 +644,11 @@ fn intpush_all_modes_answer_identically() {
         push_bools_case(1, 400),
         push_bools_case(5, 400),
         push_bools_case(8, 400),
+        live_homes_across_push_case(1, 180),
+        live_homes_across_push_case(4, 180),
         realloc_boundary_case(1000),
         realloc_boundary_case(4097),
+        shared_push_getindex_mem_case(800),
         sibling_pin_case(2000),
         aliased_pin_case(2000),
         tokenizer_case(400),
@@ -532,11 +660,18 @@ fn intpush_all_modes_answer_identically() {
         &[("ZIPP_NO_INT_PUSH", "1")],
         &[("ZIPP_NO_BOOL_REUSE", "1")],
         &[("ZIPP_NO_INT_PUSH", "1"), ("ZIPP_NO_BOOL_REUSE", "1")],
+        &[("ZIPP_NO_PUSH_PIN_FILTER", "1")],
         &[("ZIPP_NO_GPR_HOMES", "1")],
         &[("ZIPP_NO_GUARD_HOIST", "1")],
         &[("ZIPP_NO_MULTI_SPLIT", "1")],
         &[("ZIPP_JIT_THRESHOLD", "1")],
         &[("ZIPP_GC_STRESS", "1")],
+        &[("ZIPP_NO_BOOL_REUSE", "1"), ("ZIPP_GC_STRESS", "1")],
+        &[
+            ("ZIPP_NO_PUSH_PIN_FILTER", "1"),
+            ("ZIPP_NO_BOOL_REUSE", "1"),
+            ("ZIPP_GC_STRESS", "1"),
+        ],
         &[("ZIPP_NOJIT", "1")],
     ];
     for src in &cases {
@@ -554,13 +689,20 @@ fn intpush_all_modes_answer_identically() {
 fn child_output(src: &str, env: &[(&str, &str)]) -> Vec<String> {
     let exe = std::env::current_exe().expect("test exe path");
     let mut cmd = Command::new(exe);
-    cmd.arg("--ignored").arg("--exact").arg("w20_push_child").arg("--nocapture");
+    cmd.arg("--ignored")
+        .arg("--exact")
+        .arg("w20_push_child")
+        .arg("--nocapture");
     cmd.env("ZIPP_W20_SRC", src);
     for (k, v) in env {
         cmd.env(k, v);
     }
     let out = cmd.output().expect("child test process runs");
-    assert!(out.status.success(), "child failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "child failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.strip_prefix("W20OUT ").map(|s| s.to_string()))
@@ -570,7 +712,9 @@ fn child_output(src: &str, env: &[(&str, &str)]) -> Vec<String> {
 #[test]
 #[ignore = "worker: spawned by child_output with ZIPP_W20_SRC set"]
 fn w20_push_child() {
-    let Some(src) = std::env::var_os("ZIPP_W20_SRC") else { return };
+    let Some(src) = std::env::var_os("ZIPP_W20_SRC") else {
+        return;
+    };
     for line in run_any(&src.to_string_lossy()) {
         println!("W20OUT {line}");
     }
@@ -583,8 +727,13 @@ fn w20_push_child() {
 fn jitlog_of(src: &str, env: &[(&str, &str)]) -> String {
     let exe = std::env::current_exe().expect("test exe path");
     let mut cmd = Command::new(exe);
-    cmd.arg("--ignored").arg("--exact").arg("w20_push_child").arg("--nocapture");
-    cmd.env("ZIPP_W20_SRC", src).env("ZIPP_JITLOG", "1").env("ZIPP_JITDECLINE", "1");
+    cmd.arg("--ignored")
+        .arg("--exact")
+        .arg("w20_push_child")
+        .arg("--nocapture");
+    cmd.env("ZIPP_W20_SRC", src)
+        .env("ZIPP_JITLOG", "1")
+        .env("ZIPP_JITDECLINE", "1");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -595,7 +744,7 @@ fn jitlog_of(src: &str, env: &[(&str, &str)]) -> String {
 /// B94's rule, applied to this wave: a green differential proves nothing until
 /// the log shows the mechanism RAN. The tokenizer kernel must reach an `INT
 /// region` compile with the package on, and must NOT with either rung off —
-/// which is also the evidence that neither rung pays alone.
+/// the useful tier transition requires both rungs.
 #[test]
 fn intpush_mechanism_reaches_the_int_tier() {
     let src = tokenizer_case(400);
@@ -616,6 +765,74 @@ fn intpush_mechanism_reaches_the_int_tier() {
     assert!(
         no_bools.contains("bool live-in, or bool gpr pool exhausted"),
         "ZIPP_NO_BOOL_REUSE=1 did not expose the bool-pool rung; log was:\n{no_bools}"
+    );
+
+    // Keep the call-clobber/deopt oracle non-vacuous too: it must be the INT
+    // emitter, not the interpreter or memory tier, that executes the push.
+    let live_homes = jitlog_of(&live_homes_across_push_case(4, 180), &[]);
+    assert!(
+        live_homes.contains("[jit] INT region fn")
+            && live_homes.contains("compiled")
+            && live_homes.contains("deopt at ip"),
+        "live-home kernel did not compile on INT and then deopt after its push; log was:\n{live_homes}"
+    );
+}
+
+/// The push-inclusive snapshot plan belongs to the INTEGER attempt, not
+/// automatically to the fallback emitters. Three facts make this gate
+/// non-vacuous:
+///
+/// 1. With both rungs on, the tokenizer still compiles INT (the filter is never
+///    on that path).
+/// 2. With bool reuse off, INT declines and the MEM fallback reports that it
+///    dropped at least one push-only snapshot and retained none of that class.
+/// 3. A receiver used by BOTH `push` and `GetIndex` remains pinned/shared; the
+///    filter may not mistake the push access for the pin's only consumer.
+///
+/// The off switch must reproduce the unfiltered fallback on the same binary.
+#[test]
+fn push_pin_filter_is_tier_specific_and_non_vacuous() {
+    let tokenizer = tokenizer_case(400);
+    let on = jitlog_of(&tokenizer, &[]);
+    assert!(
+        on.contains("[jit] INT region fn") && on.contains("compiled"),
+        "both-rung tokenizer stopped compiling INT; log was:\n{on}"
+    );
+
+    let fallback = jitlog_of(&tokenizer, &[("ZIPP_NO_BOOL_REUSE", "1")]);
+    let dropped = fallback.lines().any(|line| {
+        line.contains("fallback push-pin filter")
+            && line.contains("remaining_push_only=0")
+            && !line.contains("dropped_push_only=0")
+    });
+    assert!(
+        fallback.contains("bool live-in, or bool gpr pool exhausted")
+            && fallback.contains("[jit] MEM region fn")
+            && dropped,
+        "bool-declined tokenizer did not compact push-only fallback pins; log was:\n{fallback}"
+    );
+
+    let unfiltered = jitlog_of(
+        &tokenizer,
+        &[
+            ("ZIPP_NO_BOOL_REUSE", "1"),
+            ("ZIPP_NO_PUSH_PIN_FILTER", "1"),
+        ],
+    );
+    assert!(
+        unfiltered.contains("[jit] MEM region fn")
+            && !unfiltered.contains("fallback push-pin filter"),
+        "off switch did not restore the unfiltered MEM fallback; log was:\n{unfiltered}"
+    );
+
+    let shared = jitlog_of(&shared_push_getindex_mem_case(800), &[]);
+    assert!(
+        shared.contains("[jit] MEM region fn")
+            && shared.lines().any(|line| {
+                line.contains("fallback push-pin filter")
+                    && !line.contains("retained_shared=0")
+            }),
+        "push+GetIndex receiver was not retained as a shared fallback pin; log was:\n{shared}"
     );
 }
 

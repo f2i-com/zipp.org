@@ -497,6 +497,10 @@ pub struct Vm<'p> {
     /// and integers — never traced, never pruned.
     matchall_caps_scratch: Vec<Option<std::ops::Range<usize>>>,
     matchall_flat_scratch: Vec<u32>,
+    /// Single pending result for the exact MEM-only non-global exec region.
+    /// No native/user-code re-entry is permitted while populated; every
+    /// region exit first materializes it into its skipped global binding.
+    regexp_scalar_exec_pending: Option<proxy_regexp::RegexpScalarExecPending>,
     /// RegExp legacy statics backing `RegExp.input`/`$_`/`lastMatch`/`$&`/
     /// `lastParen`/`$+`/`leftContext`/`$``/`rightContext`/`$'`/`$1`–`$9`, laid
     /// out as [input, lastMatch, lastParen, leftContext, rightContext, $1..$9]
@@ -1518,8 +1522,21 @@ pub(crate) use gc::gc_gen_stats;
 pub(crate) use gc::gc_nursery_stats;
 pub(crate) use gc::gc_young_budget_stats;
 pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
+pub(crate) use proxy_regexp::rxstats::dump_call_direct as regexp_call_direct_stats;
+pub(crate) use proxy_regexp::rxstats::dump_scalar_exec as regexp_scalar_exec_stats;
+pub(crate) use proxy_regexp::rxstats::dump_scalar_matchall as regexp_scalar_matchall_stats;
+pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_call_direct_stats;
+pub(crate) use proxy_regexp::regexp_call_direct_enabled;
+pub(crate) use proxy_regexp::rx_scalar_exec_enabled;
+pub(crate) use proxy_regexp::rx_scalar_matchall_enabled;
+pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 pub(crate) use async_runtime::async_stats;
+pub(crate) use coerce::concat_pair_stats;
+pub(crate) use coerce::pad2_concat_stats;
+pub(crate) use coerce::pad2_concat_stats_enabled;
+pub(crate) use coerce::pad2_conditional_stats;
 pub(crate) use helpers_misc::call_inline_stats;
+pub(crate) use helpers_misc::concat_set_stats;
 pub(crate) use helpers_misc::cross_fill_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;

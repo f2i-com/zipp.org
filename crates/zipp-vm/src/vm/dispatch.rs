@@ -1086,6 +1086,34 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    // Exact right-associated pair `a + (b + c)`.  The shared
+                    // helper owns both the bounded primitive fast arm and the
+                    // literal two-Add fallback, so interpreter/JIT semantics
+                    // cannot drift.
+                    Instr::AddRightPair { dst, a, b, c, in_place } => {
+                        let av = self.get(base, a);
+                        let bv = self.get(base, b);
+                        let cv = self.get(base, c);
+                        let r = if in_place {
+                            self.add_values_right_pair_inplace(av, bv, cv)?
+                        } else {
+                            self.add_values_right_pair(av, bv, cv)?
+                        };
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::Pad2Concat { dst, src, zero } => {
+                        let v = self.get(base, src);
+                        let r = self.pad2_concat(v, zero)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::Pad2Conditional { dst, src } => {
+                        let v = self.get(base, src);
+                        let r = self.pad2_conditional(v)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     // W11 (B124) fused concat-chain link: `+` semantics exactly
                     // (add_values_chain delegates every non-in-place case to
                     // add_values); `a` is the chain's dead fresh accumulator
@@ -5582,6 +5610,63 @@ impl<'p> Vm<'p> {
                                 private_callee = self.private_field_scan(recv, key);
                             }
                         }
+                        // Pristine primitive-string `matchAll(RegExp)` and
+                        // `replace(RegExp, string)`: a single read-only guarded
+                        // prefix proves the active main-realm String method and
+                        // the complete RegExp protocol, then enters the shared
+                        // implementation directly. Exact arity keeps the JIT
+                        // helper ABI and this sibling byte-for-byte aligned.
+                        if private_callee.is_none()
+                            && ((key == "matchAll" && argc == 1)
+                                || (key == "replace" && argc == 2))
+                            && string_regexp_call_direct_enabled()
+                        {
+                            let arg0 = self.get(base, arg_base);
+                            let replacement = if key == "replace" {
+                                self.get(base, arg_base + 1)
+                            } else {
+                                Value::UNDEFINED
+                            };
+                            if let Some(result) = self.string_regexp_call_direct(
+                                recv,
+                                arg0,
+                                replacement,
+                                key == "replace",
+                                false,
+                            )? {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
+                        // Pristine `RegExp.prototype.test` / `exec`: prove the
+                        // named method (and test's observable `exec` lookup)
+                        // with the existing guards, then enter the regexp
+                        // implementation directly. A failed proof is a pure
+                        // prefix and preserves the method IC/builtin/property
+                        // path below byte-for-byte. Extra arguments have
+                        // already been evaluated; the intrinsics consume only
+                        // arg0, with an absent argument meaning `undefined`.
+                        if private_callee.is_none()
+                            && matches!(key, "test" | "exec")
+                            && regexp_call_direct_enabled()
+                        {
+                            let input = if argc == 0 {
+                                Value::UNDEFINED
+                            } else {
+                                self.get(base, arg_base)
+                            };
+                            if let Some(result) = self.regexp_call_direct(
+                                recv,
+                                input,
+                                key == "test",
+                                false,
+                            )? {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // ── interpreter method-call IC ── a monomorphic /
                         // low-polymorphic `obj.method()` resolves through the
                         // per-site cache (validated; see vm/ic.rs), skipping
@@ -7066,6 +7151,9 @@ impl<'p> Vm<'p> {
             concat: jit_concat as usize,
             str_append: jit_str_append as usize,
             call_method_ic: jit_call_method_ic as usize,
+            regexp_call_direct: crate::vm::helpers_misc::jit_regexp_call_direct as usize,
+            string_regexp_call_direct:
+                crate::vm::helpers_misc::jit_string_regexp_call_direct as usize,
             has_own_call: crate::vm::helpers_misc::jit_has_own_call as usize,
             call_ic: jit_call_ic as usize,
             cross_call: crate::vm::helpers_misc::jit_cross_call as usize,
@@ -7090,6 +7178,17 @@ impl<'p> Vm<'p> {
             upval_get: jit_upval_get as usize,
             forin_live: jit_forin_live as usize,
             iter_next: crate::vm::helpers_misc::jit_iter_next as usize,
+            regexp_scalar_get_iterator:
+                crate::vm::helpers_misc::jit_regexp_scalar_get_iterator as usize,
+            regexp_scalar_iter_prime:
+                crate::vm::helpers_misc::jit_regexp_scalar_iter_prime as usize,
+            regexp_scalar_step: crate::vm::helpers_misc::jit_regexp_scalar_step as usize,
+            regexp_scalar_capture_num:
+                crate::vm::helpers_misc::jit_regexp_scalar_capture_num as usize,
+            regexp_scalar_flush: crate::vm::helpers_misc::jit_regexp_scalar_flush as usize,
+            regexp_scalar_exec: crate::vm::helpers_misc::jit_regexp_scalar_exec as usize,
+            regexp_scalar_exec_flush:
+                crate::vm::helpers_misc::jit_regexp_scalar_exec_flush as usize,
             push_finally: crate::vm::helpers_misc::jit_push_finally as usize,
             pop_finally: crate::vm::helpers_misc::jit_pop_finally as usize,
             to_num: crate::vm::helpers_misc::jit_to_num as usize,
@@ -7100,6 +7199,9 @@ impl<'p> Vm<'p> {
             static_fn: crate::vm::helpers_misc::jit_static_fn as usize,
             to_concat_key: crate::vm::helpers_misc::jit_to_concat_key as usize,
             set_index_concat: crate::vm::helpers_misc::jit_set_index_concat as usize,
+            set_index_concat_pure:
+                crate::vm::helpers_misc::jit_set_index_concat_pure as usize,
+            delete_index: crate::vm::helpers_misc::jit_delete_index as usize,
             delete_index_concat: crate::vm::helpers_misc::jit_delete_index_concat as usize,
             is_array: jit_is_array as usize,
             len_of: jit_len_of as usize,

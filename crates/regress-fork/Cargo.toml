@@ -90,6 +90,10 @@ name = "scan_drain"
 path = "tests/scan_drain.rs"
 
 [[test]]
+name = "suffix_start"
+path = "tests/suffix_start.rs"
+
+[[test]]
 name = "syntax_error_tests"
 path = "tests/syntax_error_tests.rs"
 

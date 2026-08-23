@@ -162,6 +162,9 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::DeleteIndexConcat { dst, .. }
         | Instr::StrConcat { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
+        | Instr::AddRightPair { dst, .. }
+        | Instr::Pad2Concat { dst, .. }
+        | Instr::Pad2Conditional { dst, .. }
         | Instr::StrConcatChain { dst, .. }
         | Instr::Bitwise { dst, .. }
         | Instr::Call { dst, .. }
@@ -725,4 +728,3 @@ pub(crate) fn jump_if_not_cmp(
     }
     emit_bail(ops, ip, bail);
 }
-

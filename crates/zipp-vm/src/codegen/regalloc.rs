@@ -188,6 +188,51 @@ fn emit_probe_spill(ops: &mut dynasmrt::x64::Assembler, spill_off: i32, save: bo
     }
 }
 
+/// The one accessor body the BOXREF tier can execute without running user code:
+///
+/// ```text
+/// get v() { return this.field; }
+/// ```
+///
+/// The accessor planner has already proved that this is a plain, non-arrow
+/// getter and that `field` is an own DATA slot of the guarded receiver. Keep the
+/// emitter gate exact anyway: widening it here would silently skip an accessor
+/// body's effects. The returned tuple is the accessor-function address/bits
+/// guard plus the baked DATA-field slot.
+fn boxref_passthrough_getter(shape: &MethodInlineShape) -> Option<(u64, u64, u32)> {
+    if shape.param_count != 0
+        || !shape.supers.is_empty()
+        || shape.method_slot.is_some()
+        || shape.proto_method.is_some()
+    {
+        return None;
+    }
+    let name = match shape.body.as_slice() {
+        [Instr::GetProp { dst, obj: 0, name }, Instr::Return { src }] if dst == src => *name,
+        _ => return None,
+    };
+    let slot = *shape.field_slots.get(&name)?;
+    let (acc_addr, acc_bits) = shape.own_acc?;
+    Some((acc_addr, acc_bits, slot))
+}
+
+/// Same-binary A/B switch for the exact BOXREF own-getter prefix. Plan-time
+/// only; OFF leaves the register tier's pre-bridge byte stream unchanged, so the
+/// first accessor fill takes the existing site-gate eviction and MEM retry.
+fn boxref_own_getter_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_BOXREF_OWN_GETTER").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Register-promoting region codegen: each region value lives in a fixed xmm
 /// (numbers) or gpr (booleans) home for the whole loop. Live-in values are
 /// loaded + type-guarded ONCE at entry; the loop body is then pure register SSE
@@ -205,6 +250,10 @@ pub(crate) fn compile_region_regalloc(
     // `None` for the SROA/numeric caller, whose rewritten bytecode has no heap
     // op at all — so the boxed arms are unreachable there by construction.
     heap: Option<&HeapHelpers>,
+    // The ordinary region compiler's guarded method/accessor plans. The
+    // register tier consumes only the exact, call-free own-getter shape screened
+    // by `boxref_passthrough_getter`; `None` for the numeric/SROA caller.
+    method_plan: Option<&FxHashMap<usize, MethodInlinePlan>>,
     // Per-site accessor-arm flags, in the same order `register_ic_sites` built
     // them (the k-th GetProp/SetProp of the region).
     acc_emit: &[bool],
@@ -426,6 +475,7 @@ pub(crate) fn compile_region_regalloc(
     // which is sound because a SetProp DECLINES the whole region at the
     // catch-all below, so no site after one is ever emitted.
     let mut ic_site = heap.map_or(0, |h| h.ic_base_idx);
+    let mut own_getter_arms = 0usize;
     for ip in s..=e {
         dynasm!(ops ; => lbl(ip as u32, &in_region));
         let charged =
@@ -1134,6 +1184,59 @@ pub(crate) fn compile_region_regalloc(
                 let h = heap.expect("getprop_ips non-empty implies heap helpers");
                 let d = xh(&plan, dst);
                 let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+
+                // W21: a BOXREF receiver may be the row's one OWN accessor.
+                // Intercept only the already-planned, byte-for-byte pass-through
+                // getter before the IC probe. The guards are the same guards the
+                // memory-tier accessor prefix uses, rewritten to clobber only
+                // rax/rcx/rdx: r8..r11 are live Bool homes on this tier.
+                //
+                // No call, allocation or other user code occurs between the
+                // receiver-version check and either absolute pointer read. A key
+                // mutation/realloc therefore misses before a stale pointer is
+                // dereferenced; an in-place __defineGetter__ swap is caught by
+                // the independent accessor-function re-read. The field result is
+                // dynamically guarded into the numeric home, so Int and double
+                // both hit while any other Value falls through to the unchanged
+                // probe/site-gate path with no home modified.
+                if boxref_own_getter_enabled() {
+                    if let Some(gp) = method_plan.and_then(|plans| plans.get(&ip)) {
+                        for shape in &gp.shapes {
+                            let Some((acc_addr, acc_bits, field_slot)) =
+                                boxref_passthrough_getter(shape)
+                            else {
+                                continue;
+                            };
+                            own_getter_arms += 1;
+                            let next = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; mov rax, [rbx + dreg(obj)]
+                                ; mov rcx, QWORD shape.recv_bits as i64
+                                ; cmp rax, rcx
+                                ; jne => next
+                                ; mov ecx, eax
+                                ; mov edx, [r13 + rcx * 4]
+                                ; cmp edx, DWORD shape.recv_ver as i32
+                                ; jne => next
+                                // The version check MUST precede both baked-address
+                                // reads: either Vec may have reallocated.
+                                ; mov rcx, QWORD acc_addr as i64
+                                ; mov rcx, [rcx]
+                                ; mov rdx, QWORD acc_bits as i64
+                                ; cmp rcx, rdx
+                                ; jne => next
+                                ; mov rcx, QWORD shape.vals_ptr as i64
+                                ; mov rax, [rcx + (field_slot as i32) * 8]
+                            );
+                            emit_box_to_home(&mut ops, d, next);
+                            dynasm!(ops
+                                ; jmp => done
+                                ; => next
+                            );
+                        }
+                    }
+                }
                 emit_regalloc_ic_probe(
                     &mut ops, h, ic_site, obj, name, probe_off, spill_off, deopt,
                 );
@@ -1141,7 +1244,6 @@ pub(crate) fn compile_region_regalloc(
                 // anything else (a string, an object, undefined, a bool) DEOPTs:
                 // the dst is an f64 home and cannot hold it. Nothing has been
                 // written yet, so re-execution at this ip is sound.
-                let done = ops.new_dynamic_label();
                 emit_box_to_home(&mut ops, d, deopt);
                 dynasm!(ops
                     ; jmp => done
@@ -1259,7 +1361,7 @@ pub(crate) fn compile_region_regalloc(
         let mut gps: Vec<usize> = plan.getprop_ips.iter().copied().collect();
         gps.sort_unstable();
         eprintln!(
-            "[jit] DOUBLE region [{start},{end}] BOXREF box_regs={} getprops={gps:?} code={}b",
+            "[jit] DOUBLE region [{start},{end}] BOXREF box_regs={} getprops={gps:?} own_getters={own_getter_arms} code={}b",
             plan.box_regs.len(),
             buf.len()
         );
@@ -1267,4 +1369,3 @@ pub(crate) fn compile_region_regalloc(
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some((JitFn { _buf: buf, entry: entry_ptr, self_binding: None }, needs_ic))
 }
-

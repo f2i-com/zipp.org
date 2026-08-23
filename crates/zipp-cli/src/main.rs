@@ -97,6 +97,22 @@ fn main() -> ExitCode {
             "[rx] {compact} compact match results  {materialized} materialized ({pct:.2}%)"
         );
         eprintln!("[rx] matchAll steps: {fused} fused  {fallback} eligible-fallback");
+        let (it, ie, jt, je, declines) = zipp_vm::regexp_call_direct_stats();
+        eprintln!(
+            "[rx] direct CallMethod: interp test {it} exec {ie}  jit test {jt} exec {je}  guard declines {declines}"
+        );
+        let (im, ir, jm, jr, sdeclines) = zipp_vm::regexp_string_call_direct_stats();
+        eprintln!(
+            "[rx] direct String/RegExp CallMethod: interp matchAll {im} replace {ir}  jit matchAll {jm} replace {jr}  guard declines {sdeclines}"
+        );
+        let (ss, sn, sm, se, sd, sf) = zipp_vm::regexp_scalar_matchall_stats();
+        eprintln!(
+            "[rx] scalar matchAll: successes {ss}  capture numbers {sn}  materialized {sm}  elided {se}  guard declines {sd}  slow flushes {sf}"
+        );
+        let (es, em, en, ez, ee, ed, ep, ef) = zipp_vm::regexp_scalar_exec_stats();
+        eprintln!(
+            "[rx] scalar exec: successes {es}  misses {em}  capture numbers {en}  materialized {ez}  elided {ee}  guard declines {ed}  pin declines {ep}  slow flushes {ef}"
+        );
     }
     if std::env::var_os("ZIPP_ASYNCSTATS").is_some() {
         let (reparks, reused, grew, values, subs_in, subs_sp) = zipp_vm::async_stats();
@@ -122,6 +138,16 @@ fn main() -> ExitCode {
             pct(sg, sm), pct(sd, sm)
         );
         eprintln!("[ic] accessor-way hits  get {gah}  set {sah}");
+        let (csh, csa, css) = zipp_vm::concat_set_stats();
+        eprintln!("[ic] SetIndexConcat  pure hits {csh}  pure adds {csa}  slow {css}");
+        let (cps, cpi, cpin, cpf) = zipp_vm::concat_pair_stats();
+        eprintln!(
+            "[ic] AddRightPair  one-alloc str {cps}  int {cpi}  in-place {cpin}  fallback {cpf}"
+        );
+        let (p2z, p2p, p2f) = zipp_vm::pad2_concat_stats();
+        eprintln!("[ic] Pad2Concat  cached zero {p2z}  plain {p2p}  fallback {p2f}");
+        let (p2ch, p2cs) = zipp_vm::pad2_conditional_stats();
+        eprintln!("[ic] Pad2Conditional  cached {p2ch}  exact-slow {p2cs}");
         let (cih, aih, hoh) = zipp_vm::call_inline_stats();
         eprintln!(
             "[ic] call/apply target inlines  call {cih}  apply {aih}  hasOwn-intrinsic {hoh}"
@@ -135,6 +161,10 @@ fn main() -> ExitCode {
         let (att, pushes, retries, elided, skips) = zipp_vm::rx_stats();
         eprintln!(
             "[rx] attempts {att}  greedy1 pushes {pushes}  retries {retries}  possessive elided {elided}  run skips {skips}"
+        );
+        let (literal_hits, candidates, cap_fallbacks) = zipp_vm::rx_suffix_start_stats();
+        eprintln!(
+            "[rx] suffix starts: literal hits {literal_hits}  candidates {candidates}  cap fallbacks {cap_fallbacks}"
         );
         let (jc, jdu, jdl, jn, jf, jb) = zipp_vm::rx_jit_stats();
         eprintln!(

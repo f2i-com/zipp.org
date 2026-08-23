@@ -670,6 +670,9 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::Ne { dst, a, b }
         | Instr::LooseEq { dst, a, b }
         | Instr::LooseNe { dst, a, b } => r(vec![a, b], Some(dst)),
+        Instr::AddRightPair { dst, a, b, c, .. } => r(vec![a, b, c], Some(dst)),
+        Instr::Pad2Concat { dst, src, .. } => r(vec![src], Some(dst)),
+        Instr::Pad2Conditional { dst, src } => r(vec![src], Some(dst)),
         Instr::AddInt { dst, a, .. }
         | Instr::Neg { dst, a }
         | Instr::Not { dst, a }
