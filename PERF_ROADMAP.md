@@ -4,9 +4,9 @@
 >
 > Engine: `crates/zipp-vm/src` — a NaN-boxed, explicit-frame register VM with
 > per-call-site inline caches, a native x86-64 OSR JIT (dynasm), and a
-> whole-heap mark-sweep GC.
+> generational nursery backed by a mark-sweep old space.
 >
-> Last re-measured **2026-07-28**. Every number below was measured on this repo;
+> Last re-measured **2026-08-24**. Every number below was measured on this repo;
 > nothing here is an estimate unless it says "inferred".
 >
 > **Sections 1 and 3 below were written at 3.31x and several of their
@@ -15,17 +15,21 @@
 > interning and inline storage both measured slower), and B16 (which loops the
 > JIT never reaches). Read those before acting on anything here.
 
-## Current experiment registry — 2026-08-19
+## Current experiment registry — 2026-08-24
 
 This is the short, current view. Detailed measurements and retained raw results
-are in B58.
+are in the numbered B entries and under `bench/`.
 
 | item | current disposition | measured result |
 |---|---|---|
+| **B136 headline Node parity on a clean PGO build** | **GOAL REACHED FOR THE RETAINED TEN — zipp/Node 0.969460× [0.965450, 0.974097]** | Clean commit `200cbfc`, 21 counterbalanced pairs, Node 24.12 / Bun 1.3.14 / Deno 2.6.10, `publishable:true`, and **ALL_CORRECT=1**. The entire headline interval is below 1.0: zipp is ~3.1% faster than Node, ~18.8% faster than Bun and ~4.1% faster than Deno on the retained ten. Rows vs Node: map 0.779, typedarray 0.935, class 0.951, parse 0.956, async 0.974, JSON 1.012, markdown 1.016, regex 1.018, sparse 1.038, poly 1.048. Startup is 10.6ms vs Node 34.4, Deno 52.9, Bun 63.7. **Classification matters:** diagnostics are separately 2.206709× [2.195027, 2.217186], making the legacy all-13 number 1.172099×; neither number retracts headline parity, and headline parity is not a claim of broad architectural parity. Binary SHA-256 `e9d91210985faa49f093480631b3b1fb972578b62a2d1cba72e7191034ef5d02`. `bench/four_engine_200cbfc_pgo_2026-08-24.json` |
+| **B135 suffix starts + scalar matchAll + scalar exec + exact Array delete** | **LANDED — default/off-switch headline ratio 0.967348× [0.962856, 0.970919]** | The final four mechanisms compound to `regex-log-scan` **−19.35% [−20.08, −18.76]** and `sparse-array` **−8.35% [−8.95, −6.74]** versus their off-switch comparator, with diagnostics 0.99896× (flat) and all 13 outputs exact. (1) a conservative ASCII suffix-start plan (`RequiredPrefix` or `RunLiteral`, capped at 64) cuts regex **5.32%**; 239,110 deterministic comparisons and the full rx-jit suite agree. (2) Exact-shape scalar `matchAll` keeps the pending match rooted and materialises only at an observable boundary: **−7.28%**, 299,984 results elided. (3) Exact non-global four-capture `exec` scalarisation directly feeds four `ToNumber`s while preserving Annex-B statics and every deopt/throw/re-entry exit: **−7.40%**, 149,991/149,992 results elided. (4) MEM-tier `DeleteIndex` on an exact Array preserves version bumps and rejects overlays/arguments: headline sparse **−7.61%** isolated. Switches: `ZIPP_NO_RX_SUFFIX_START` plus its two plan switches, `ZIPP_NO_RX_SCALAR_MATCHALL`, `ZIPP_NO_RX_SCALAR_EXEC`, `ZIPP_NO_JIT_ARRAY_DELETE`. `bench/w24_regex_delete_exec_combined_all13_abenv_2026-08-24.json` |
+| **B134 wave 21 verified; concat/direct-call/GPR follow-ons landed** | **LANDED AFTER THE GATE THE WIP COMMIT LACKED** | The original boxed-home/GetProp/own-accessor and INT-push/bool-reuse work is no longer “unverified.” Follow-ons add own-getter BOXREF, pinned-push filtering, pure concat append, right-pair and `pad2` fusion, direct RegExp/string call lowering, and a GPR deopt shadow. The deopt shadow alone is **0.987765× vs its off-switch** on the headline [0.982016, 0.990063]; concat pair + `pad2` moves regex 6.31% in its focused off-switch gate. Verification: full release suites (`zipp-vm` library 364 pass/2 ignored plus integrations, `zipp-regress --features rx-jit`, CLI, wasm); 20,000 fresh generated programs ×40 modes with **0 divergence / 0 nondeterminism**; Test262 `defaaf15` in default, NOJIT, forced-JIT, and no-nursery modes, each **95,936 pass / the same 6 expected failures**; 13/13 benchmark outputs exact in JIT and interpreter modes. The only workspace-test exception is the pre-existing process-global `rx_acqgate_threshold_and_streams` force race under combined `utf16,rx-jit`; standalone rx-jit passes. Source and evidence committed at `200cbfc`. |
+| **B133 tempting follow-ons that died to measurement** | **REFUTED AND REMOVED; RAW EVIDENCE RETAINED** | DataView bounds reuse did not survive its A/B. Sparse Array overlay `GetIndex` was **−0.13% headline [−1.06%, +0.88%]** and +0.05% on its diagnostic, so it was removed while the exact delete helper stayed. Weak capture caching, lazy-result/lazy-element variants, and iterative regex either had no valid mechanism or failed the benefit/risk gate. The stale `target/release/zipp.exe` once contained the rejected DataView code; published numbers use a freshly rebuilt `target/x86_64-pc-windows-msvc/release/zipp.exe`. `bench/dv_bounds_reuse_abenv_2026-08-23.json`, `bench/w24_sparse_overlay_get_*` |
 | M0.1 counterbalanced harness | **IMPLEMENTED; A/A DRIFT OPEN** | paired AB/BA observations, raw schedules, bootstrap intervals, metadata, timeouts, and schema-v1/v2 reading; an A/A regex rerun reversed from −0.4% to +1.1% with both nominal CIs excluding zero, so ~1% claims still require independent replication |
-| M1.1 compiler global lookup | **IMPLEMENTED IN WORKTREE** | 3k/6k/12k/24k generated-function sweep stays approximately linear; largest/middle ns-per-MB ratio 0.975 |
-| M1.2 expression-arrow analysis | **IMPLEMENTED IN WORKTREE** | analysis consumes the expression directly; capture/`this`/`arguments`/`super`/`await` tests pass |
-| M1.3 first-way shape `SetProp` | **IMPLEMENTED IN WORKTREE** | NOJIT own-store microbenchmark −46.66% (95% CI −47.80% to −45.51%); removing it was +0.52% on four affected suite rows (95% CI −0.66% to +1.53%) |
+| M1.1 compiler global lookup | **HISTORICAL WORKTREE RESULT — RE-AUDIT BEFORE REUSE** | 3k/6k/12k/24k generated-function sweep stayed approximately linear; largest/middle ns-per-MB ratio 0.975 |
+| M1.2 expression-arrow analysis | **HISTORICAL WORKTREE RESULT — RE-AUDIT BEFORE REUSE** | analysis consumed the expression directly; capture/`this`/`arguments`/`super`/`await` tests passed at the time |
+| M1.3 first-way shape `SetProp` | **HISTORICAL WORKTREE RESULT — SUPERSEDED BY LATER IC WAVES** | NOJIT own-store microbenchmark −46.66% (95% CI −47.80% to −45.51%); removing it was +0.52% on four affected suite rows (95% CI −0.66% to +1.53%) |
 | M2 regular-subset regex tier | **EXPERIMENTAL, OFF BY DEFAULT** | regex row −2.82% (95% CI −3.8% to −2.0%), far below the 25% promotion gate; feature binary +14.7% |
 | default regex capture-name clone removal | **REVERTED** | restoring the original code measured −0.51% (95% CI −1.05% to −0.24%), inside the independently observed ~1% A/A drift floor |
 | M4.0 TypedArray guard reduction | **REVERTED** | −0.11% (95% CI −1.10% to +0.55%): statistically neutral |
@@ -112,7 +116,9 @@ are in B58.
 | ECMA-262 + `staging`, sloppy **and** strict | 95,942 | 95,936 (99.994%) | 6 |
 | `intl402` (opt-in) | 6,714 | 6,502 (96.8%) | 212 |
 
-Both tiers (`ZIPP_NOJIT=1` and JIT) produce a **byte-identical** failure set.
+The 2026-08-24 gate ran default JIT, `ZIPP_NOJIT=1`, forced JIT
+(`ZIPP_JIT_THRESHOLD=1`), and majors-only GC (`ZIPP_NO_NURSERY=1`). All four
+produce the same ordered six failure identities.
 
 The main-suite denominator moved twice, both times for a reason worth recording.
 It dropped by 2 (95,848 → 95,846) when a leftover scratch file from a crashed
@@ -234,7 +240,18 @@ is a `diff`, not a remembered number. It was stale for a long stretch (the
 2,194-line oxc-era list against a 938-failure run), which made that diff
 meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — cold geomean 1.86× at HEAD (2026-07-29, 21 reps)
+### Performance — current cold headline 0.9695× Node (2026-08-24, 21 reps)
+
+The authoritative current capture is
+`bench/four_engine_200cbfc_pgo_2026-08-24.json`: headline ten **0.969460× Node
+[0.965450, 0.974097]**, diagnostics-only 2.206709×, all outputs exact, clean PGO
+source `200cbfc`. See B136 for the row table and classification boundary.
+
+Everything below in this subsection is a retained historical snapshot of how
+the campaign moved from 1.86×; its old “at HEAD” language refers to the commit
+named beside it, not the current tree.
+
+### Historical performance snapshot — 1.86× at `7c760c1` (2026-07-29, 21 reps)
 
 > **B63/B64/B65 moved it three times in one session**, from a clean tree each
 > time — `zipp --version --json` reports `dirty: false` at `7c760c1`

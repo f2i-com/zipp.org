@@ -19,40 +19,44 @@ cargo build --release
 
 ## Where it stands
 
-Two numbers, both measured on this repo, neither finished.
+Two numbers, both measured on this repo. The headline speed goal is met; the
+architecture diagnostics below are not.
 
 | | |
 |---|---|
-| **Conformance** | **99.994% of test262** — 95,936 of 95,942 executions, both tiers byte-identical |
-| **Performance** | **1.10× Node** on the ten-benchmark suite; **8% faster than Bun**, level with Deno |
+| **Conformance** | **99.994% of test262** — 95,936 of 95,942 executions, four modes with the same 6 expected failures |
+| **Performance** | **0.9695× Node** [0.9655, 0.9741] on the headline ten — about **3.1% faster than Node** |
 
 ### Speed vs Node, Bun and Deno
 
-Cold wall time including process launch, 15 counterbalanced paired runs per
-row, bold = fastest. Every output byte-identical across all four engines.
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `0f1a4c7` (PGO build).
+Cold wall time including process launch, 21 counterbalanced paired runs per
+row. Bold time = fastest engine; bold ratio = zipp beats Node. Every output is
+byte-identical across all four engines.
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `200cbfc` (PGO build).
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| map-set-heavy | 569ms | 712ms | 1005ms | **474ms** | **0.82×** |
-| class-prototype-hot | 295ms | 333ms | **290ms** | 300ms | 1.01× |
-| async-promise-chain | 329ms | 368ms | **316ms** | 338ms | 1.03× |
-| markdown-render | 265ms | **209ms** | 270ms | 276ms | 1.04× |
-| json-large | 255ms | **192ms** | 270ms | 269ms | 1.05× |
-| typedarray-math | 201ms | 911ms | **132ms** | 221ms | 1.10× |
-| sparse-array | **79ms** | 100ms | 90ms | 89ms | 1.13× |
-| parse-large-js | 267ms | **229ms** | 247ms | 336ms | 1.25× |
-| polymorphic-objects | 327ms | 332ms | **298ms** | 419ms | 1.28× |
-| regex-log-scan | 451ms | 562ms | **418ms** | 628ms | 1.40× |
-| **geomean vs zipp** | 1.10× | **0.92×** | 1.10× | — | |
+| map-set-heavy | 609ms | 744ms | 1045ms | **470ms** | **0.78×** |
+| typedarray-math | 207ms | 916ms | **140ms** | 194ms | **0.94×** |
+| class-prototype-hot | 300ms | 341ms | 294ms | **286ms** | **0.95×** |
+| parse-large-js | 274ms | **236ms** | 255ms | 262ms | **0.96×** |
+| async-promise-chain | 337ms | 375ms | **325ms** | 327ms | **0.97×** |
+| json-large | 261ms | **199ms** | 281ms | 264ms | 1.01× |
+| markdown-render | 270ms | **217ms** | 282ms | 277ms | 1.02× |
+| regex-log-scan | 454ms | 571ms | **428ms** | 457ms | 1.02× |
+| sparse-array | **84ms** | 109ms | 96ms | 89ms | 1.04× |
+| polymorphic-objects | 329ms | 339ms | **305ms** | 346ms | 1.05× |
+| **zipp / engine geomean** | **0.97×** | **0.81×** | **0.96×** | — | |
 
-zipp is **8% faster than Bun** across the suite and within ~10% of Node and
-Deno. Seven of the ten rows are now within 13% of Node, and two engines are
-beaten outright on `map-set-heavy`.
+The paired zipp/Node headline is **0.9695× [0.9655, 0.9741]**: the full interval
+is below parity. By median geomeans zipp is also about **19% faster than Bun**
+and **4% faster than Deno**. No headline row is more than 5% slower than Node,
+while zipp wins `map-set-heavy` and `class-prototype-hot` outright and starts
+far faster than all three engines.
 
 Read the Bun result carefully: it is *consistency*, not uniform speed. Bun is
-the fastest engine here on three rows, and its geomean is dragged by two
-collapses (`typedarray-math` 911ms, `sparse-array-v2` 369ms).
+the fastest engine here on three rows, while its headline geomean is dragged by
+`typedarray-math` (916ms) and clear losses on map/set and class workloads.
 
 ### Startup
 
@@ -61,7 +65,7 @@ margin — no snapshot to load:
 
 | zipp | node | deno | bun |
 |---|---|---|---|
-| **7.9ms** | 29.5ms | 45.7ms | 56.2ms |
+| **10.6ms** | 34.4ms | 52.9ms | 63.7ms |
 
 A long-running server would amortize that away; a CLI tool would not.
 
@@ -72,26 +76,28 @@ they expose what the ten cannot:
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| sparse-array-v2 | 171ms | 369ms | **145ms** | 337ms | 1.98× |
-| polymorphic-objects-v2 | **81ms** | 90ms | 92ms | 210ms | 2.60× |
-| property-ic-shapes | 262ms | **160ms** | 273ms | 802ms | 3.07× |
+| sparse-array-v2 | 175ms | 375ms | **152ms** | 329ms | 1.88× |
+| polymorphic-objects-v2 | **86ms** | 98ms | 100ms | 190ms | 2.21× |
+| property-ic-shapes | 266ms | **165ms** | 273ms | 686ms | 2.58× |
 
-`sparse-array-v2` was 3.76× one wave ago and now beats Bun. The other two are
-the acceptance benchmarks for stable shape metadata, the largest piece of
-architecture this engine does not yet have — two thirds of `property-ic-shapes`
-sits beneath the inline caches and is not reachable by any contained fix.
+`sparse-array-v2` was 3.76× before the sparse campaign and is now 1.88×. The
+other two are acceptance benchmarks for stable shape metadata, the largest
+piece of architecture this engine does not yet have — much of
+`property-ic-shapes` sits beneath the inline caches and is not reachable by a
+contained call-site fast path.
 
-Node parity is now a three-row problem rather than a five-row one: taking
-`regex-log-scan` and `polymorphic-objects` to parity reaches **1.04×**, and
-adding `parse-large-js` reaches **1.01×**.
+Node parity on the published cold headline is complete. The next performance
+work is deliberately broader: bring the three architecture diagnostics down and
+improve startup-adjusted compute without giving the cold result back.
 
 ---
 
 ## Correctness
 
 The engine is gated hardest against **tier divergence**: the JIT disagreeing
-with the interpreter. Both tiers produce a byte-identical test262 failure set,
-which is the cheapest evidence a JIT change has not quietly diverged.
+with the interpreter. Default JIT, interpreter-only, forced-JIT, and
+majors-only-GC Test262 runs produce the same six failure identities, which is
+the cheapest evidence a JIT change has not quietly diverged.
 
 That gate is not sufficient on its own, and this repo has the scar tissue to
 prove it. For about a month the INT tier returned silently wrong answers for an
@@ -159,7 +165,7 @@ back in ([`DOC.md`](DOC.md#embedding)).
 
 ```sh
 bash tools/pgo.sh                                    # the measured binary
-python tools/bench.py --engines node,bun,deno,zipp --reps 15
+python tools/bench.py --engines node,bun,deno,zipp --reps 21
 ```
 
 The harness counterbalances engine order, deterministically shuffles benchmark
