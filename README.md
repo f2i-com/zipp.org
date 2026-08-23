@@ -24,34 +24,35 @@ Two numbers, both measured on this repo, neither finished.
 | | |
 |---|---|
 | **Conformance** | **99.994% of test262** — 95,936 of 95,942 executions, both tiers byte-identical |
-| **Performance** | **1.16× Node** on the ten-benchmark suite; **faster than Bun**, level with Deno |
+| **Performance** | **1.10× Node** on the ten-benchmark suite; **8% faster than Bun**, level with Deno |
 
 ### Speed vs Node, Bun and Deno
 
 Cold wall time including process launch, 15 counterbalanced paired runs per
 row, bold = fastest. Every output byte-identical across all four engines.
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `d06e81f` (PGO build).
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `0f1a4c7` (PGO build).
 
-| benchmark | node | bun | deno | **zipp** | best |
+| benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| map-set-heavy | 577ms | 712ms | 1014ms | **473ms** | **zipp** |
-| async-promise-chain | 327ms | 363ms | **320ms** | 337ms | deno |
-| markdown-render | 263ms | **206ms** | 276ms | 273ms | bun |
-| json-large | 255ms | **189ms** | 272ms | 266ms | bun |
-| typedarray-math | 199ms | 908ms | **131ms** | 220ms | deno |
-| parse-large-js | 266ms | **228ms** | 246ms | 332ms | bun |
-| class-prototype-hot | 295ms | 336ms | **288ms** | 372ms | deno |
-| sparse-array | **81ms** | 99ms | 90ms | 108ms | node |
-| polymorphic-objects | 324ms | 331ms | **297ms** | 454ms | deno |
-| regex-log-scan | 452ms | 558ms | **414ms** | 624ms | deno |
-| **geomean vs zipp** | 1.15× | **0.97×** | 1.14× | — | |
+| map-set-heavy | 569ms | 712ms | 1005ms | **474ms** | **0.82×** |
+| class-prototype-hot | 295ms | 333ms | **290ms** | 300ms | 1.01× |
+| async-promise-chain | 329ms | 368ms | **316ms** | 338ms | 1.03× |
+| markdown-render | 265ms | **209ms** | 270ms | 276ms | 1.04× |
+| json-large | 255ms | **192ms** | 270ms | 269ms | 1.05× |
+| typedarray-math | 201ms | 911ms | **132ms** | 221ms | 1.10× |
+| sparse-array | **79ms** | 100ms | 90ms | 89ms | 1.13× |
+| parse-large-js | 267ms | **229ms** | 247ms | 336ms | 1.25× |
+| polymorphic-objects | 327ms | 332ms | **298ms** | 419ms | 1.28× |
+| regex-log-scan | 451ms | 562ms | **418ms** | 628ms | 1.40× |
+| **geomean vs zipp** | 1.10× | **0.92×** | 1.10× | — | |
 
-zipp is **faster than Bun** across the suite and within ~15% of Node and Deno.
-It wins `map-set-heavy` outright against all three.
+zipp is **8% faster than Bun** across the suite and within ~10% of Node and
+Deno. Seven of the ten rows are now within 13% of Node, and two engines are
+beaten outright on `map-set-heavy`.
 
 Read the Bun result carefully: it is *consistency*, not uniform speed. Bun is
-the fastest engine here on four rows, and its geomean is dragged by two
-collapses (`typedarray-math` 908ms, `sparse-array-v2` 365ms).
+the fastest engine here on three rows, and its geomean is dragged by two
+collapses (`typedarray-math` 911ms, `sparse-array-v2` 369ms).
 
 ### Startup
 
@@ -60,7 +61,7 @@ margin — no snapshot to load:
 
 | zipp | node | deno | bun |
 |---|---|---|---|
-| **7.9ms** | 29.2ms | 45.2ms | 55.1ms |
+| **7.9ms** | 29.5ms | 45.7ms | 56.2ms |
 
 A long-running server would amortize that away; a CLI tool would not.
 
@@ -69,19 +70,20 @@ A long-running server would amortize that away; a CLI tool would not.
 Three *diagnostic* benchmarks sit outside the headline ten precisely because
 they expose what the ten cannot:
 
-| benchmark | node | bun | deno | **zipp** |
-|---|---|---|---|---|
-| polymorphic-objects-v2 | **81ms** | 89ms | 92ms | 209ms |
-| property-ic-shapes | 259ms | **157ms** | 272ms | 799ms |
-| sparse-array-v2 | 169ms | 365ms | **143ms** | 628ms |
+| benchmark | node | bun | deno | **zipp** | ratio to node |
+|---|---|---|---|---|---|
+| sparse-array-v2 | 171ms | 369ms | **145ms** | 337ms | 1.98× |
+| polymorphic-objects-v2 | **81ms** | 90ms | 92ms | 210ms | 2.60× |
+| property-ic-shapes | 262ms | **160ms** | 273ms | 802ms | 3.07× |
 
-Every engine beats zipp on these by 3–5×. They are the acceptance benchmarks
-for stable shape metadata, the largest piece of architecture this engine does
-not yet have. Two thirds of `property-ic-shapes` sits beneath the inline
-caches and is not reachable by any contained fix.
+`sparse-array-v2` was 3.76× one wave ago and now beats Bun. The other two are
+the acceptance benchmarks for stable shape metadata, the largest piece of
+architecture this engine does not yet have — two thirds of `property-ic-shapes`
+sits beneath the inline caches and is not reachable by any contained fix.
 
-Taking the two worst headline rows to parity would move the geomean to 1.08×.
-No single row dominates any more — further progress needs breadth.
+Node parity is now a three-row problem rather than a five-row one: taking
+`regex-log-scan` and `polymorphic-objects` to parity reaches **1.04×**, and
+adding `parse-large-js` reaches **1.01×**.
 
 ---
 
