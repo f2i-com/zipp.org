@@ -220,11 +220,25 @@ not the W9 DV retry gate (it passes; the GPR emitter declines after it), not the
 dark `ZIPP_GPR_SPILL_SLOTS` mechanism (built for 12-14-home regions exactly like
 this; 361ms -> 369ms), not identifier text, not program size.
 
-**The fix is register PRESSURE, not register SPILLING**: a block-scoped
-`let`/`const` in a loop body that no closure captures should occupy the same
-register a `var` would, instead of adding a live home. That is a compiler change
-upstream of the emitter that currently declines, and it is where the next wave
-should start.
+**The fix is register PRESSURE, not register SPILLING** — and B143 pins down
+exactly which pressure. It is *not* block scoping: hoisting both `let`s out of
+the loop does not help (365ms in-body vs 364ms hoisted). What matters is where
+the value lives. At top level a `var` is a global SLOT, and wave 13's
+stored-global live-range narrowing (`ZIPP_NO_GLOB_RANGE`) narrows exactly those
+— the fast plan logs `narrowed=[14, 21]`, which *are* `le` and `v`, freeing two
+permanent homes down to `homes=9`. A `let` is a lexical binding outside that
+slot space and is invisible to the pass, so homes stay high and
+`plan_region_cold` declines. Proved by its own off-switch: `ZIPP_NO_GLOB_RANGE=1`
+on the **`var`** program reproduces the failure (0ms → 202ms).
+
+So: **a value is currently cheaper as a top-level global than as a local**,
+which is backwards from every other engine, and is why the suite's
+top-level-`var` style is the engine's best case rather than a neutral one. The
+pass already computes segments for registers (`seg_map` over `reg_order` in
+`plan_region.rs`) but is gated behind
+`(admit_dv || share_homes) && reuse && cold.is_empty()` and does not run for
+these regions in the `let` shape. **That gate, plus extending narrowing to
+non-global bindings, is the next wave's exact target.**
 
 Ratios are zipp / Node, 9 interleaved paired reps, plain release build:
 

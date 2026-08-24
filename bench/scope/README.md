@@ -116,10 +116,43 @@ is what puts zipp 3.8x *behind* Node.
 - **Not program size.** Top-level `let` involves no function wrapper at all and
   still costs +60% geomean.
 
-So the fix is register **pressure**, not register **spilling**: a block-scoped
-`let`/`const` in a loop body that no closure captures should compile to the same
-register a `var` would, instead of adding a live home. That is a compiler-side
-change, upstream of the emitter that currently declines.
+### What actually distinguishes the fast case (corrected)
+
+A follow-up narrowed this further, and it is *not* about block scoping or
+per-iteration bindings. Hoisting the two `let`s out of the loop entirely — one
+`let le, v;` before the outer loop, assigned inside — does **not** recover it:
+
+```
+  var in loop body     zipp   1ms     node 95ms
+  let in loop body     zipp 365ms     node 95ms
+  let hoisted out      zipp 364ms     node 95ms   <-- hoisting does not help
+```
+
+The real distinction is **where the value lives**. At top level a `var` is a
+GLOBAL SLOT, and wave 13's stored-global live-range narrowing
+(`ZIPP_NO_GLOB_RANGE`) narrows exactly those: the fast plan logs
+`narrowed=[14, 21]` — slots 14 and 21 are `le` and `v` — which frees two
+permanent homes and brings the region to `homes=9`, inside the 8-GPR pool after
+sharing. A `let` is a lexical binding that does not live in a plain global slot,
+so it is invisible to that pass: the plan logs `narrowed=[]`, homes stay high,
+and `plan_region_cold` declines before it ever reports a home count.
+
+Proof by its own off-switch: disabling the pass on the *`var`* program
+reproduces the failure — `ZIPP_NO_GLOB_RANGE=1` moves the phase 0ms → **202ms**
+(it falls to the DOUBLE tier). So glob-range narrowing is precisely what is
+carrying the fast case, and it only reaches global slots.
+
+This is the inversion worth internalising: **a value is currently cheaper as a
+top-level global than as a local**, which is backwards from every other engine.
+The narrowing pass computes segments for registers too (`seg_map` over
+`reg_order` in `plan_region.rs`), but the whole block is gated behind
+`(admit_dv || share_homes) && reuse && cold.is_empty()` and never runs for these
+regions in the `let` shape.
+
+So the fix is register **pressure**, not register **spilling**: give
+non-global bindings the same live-range narrowing that global slots already get,
+so a local costs no more homes than the global it replaced. That is a
+compiler/planner change upstream of the emitter that currently declines.
 
 ## Why
 
