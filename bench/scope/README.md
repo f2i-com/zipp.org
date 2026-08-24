@@ -52,6 +52,75 @@ purely by being wrapped in a function.
 and a one-binary ablation confirms the mechanism exactly — `ZIPP_NO_DV_NESTED_REDUCE=1`
 moves that phase 0ms → 63ms with byte-identical output.
 
+## Suite-wide (2026-08-24, `python bench/scope/sweep.py`)
+
+The two-row result above is not a two-row problem. Across the whole suite:
+
+| rewrite | rows | geomean penalty | rows that cross from beating Node to losing |
+|---|---|---|---|
+| wrapped in an IIFE | 13 | **+159%** | **8** |
+| `var` → `let` | 12 | **+60%** | **6** |
+
+Worst cases, zipp/Node before → after: `property-ic-shapes` 0.043 → 4.621 under
+IIFE (11ms → 1208ms), `parse-large-js` 0.947 → 3.619, `regex-log-scan`
+0.969 → 3.106, `polymorphic-objects-v2` 0.360 → 3.650, `typedarray-math`
+0.665 → 2.443 under `let`.
+
+`parse-large-js` is excluded from the `let` sweep only: it embeds JavaScript
+source as *data*, so a textual `var`→`let` rewrite edits the corpus it parses.
+That is a property of the rewrite, not of the engine; the sweep checks every
+variant against Node and drops any whose answer changed.
+
+**The published "lowest median on all 13" result is a result for top-level `var`
+code.** It is honest for what it measures, and the programs are unchanged from
+the historical series — but essentially all real JavaScript is inside a function
+and spelled with `let`/`const`, and in that form zipp currently loses most of
+these rows to Node.
+
+## Root cause of the worst case, traced to the opcode
+
+Two words do it. In `ta_phase.js`, changing the DataView inner loop's body
+locals — `var le` / `var v` — to `let`:
+
+```
+                       zipp dataview phase    node
+  orig (all var)                     1ms       95ms     0.01x
+  loop COUNTERS let only            61ms       95ms     0.64x
+  loop BODY let only               361ms       95ms     3.80x   <-- the cliff
+  all let                          358ms       86ms     4.16x
+```
+
+Node is flat. The chain, from `ZIPP_JITLOG=1` + `ZIPP_JITDECLINE=1`:
+
+1. With `let` body locals the region carries more live homes.
+2. `INT-GPR decline: 13 homes > 8 gprs` — the GPR pool is exhausted.
+3. The region falls to the **MEM (boxed) tier**, which the ledger prices at
+   ~3.5ns per boxed op. That is the ~6x.
+
+Note this is *not* the reducer declining. Losing the reducer costs 1ms → 61ms
+and zipp still beats Node. The extra 61ms → 361ms is the tier demotion, and it
+is what puts zipp 3.8x *behind* Node.
+
+### Refuted along the way (do not re-chase)
+
+- **Not GC/allocation.** `ZIPP_GCSTATS=1` reports **0 collections** in both.
+- **Not the pin plan.** Instrumenting every `continue` in `build_ta_pin_plan`
+  showed zero pin declines; the DataView pins are built in both.
+- **Not the DV retry gate.** Instrumented, it *passes*:
+  `admit_dv_unadmitted=Some(0) pins=1 access=3`. The retry fires and the GPR
+  emitter declines afterwards, on pool exhaustion.
+- **Not the existing spill-slot mechanism.** `ZIPP_GPR_SPILL_SLOTS=1` was built
+  for 12–14-home regions exactly like this and does not recover it:
+  361ms → 369ms. The wave-9 refutation holds on this shape too.
+- **Not identifier text.** Renaming is free (see the table above).
+- **Not program size.** Top-level `let` involves no function wrapper at all and
+  still costs +60% geomean.
+
+So the fix is register **pressure**, not register **spilling**: a block-scoped
+`let`/`const` in a loop body that no closure captures should compile to the same
+register a `var` would, instead of adding a live home. That is a compiler-side
+change, upstream of the emitter that currently declines.
+
 ## Why
 
 `dv_nested_reduce_plan` in `codegen/region_int_gpr.rs` matches only

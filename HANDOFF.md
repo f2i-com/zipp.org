@@ -193,11 +193,38 @@ and mid-loop mutations. Treat the current reducers as a fast proved subset to
 generalise, not permission to retire randomized shape-transition and
 delete/prototype matrices or the longer-term shape-keyed-cache work.
 
-### 2b. Make the reducers reach lexical and frame-local bindings
+### 2b. Close the scope penalty - the biggest open item in the project
 
 **This is the largest generalisation opportunity currently open, and it is
 measured.** The wave 25/26 reducers key on top-level `var` globals, so the same
 program wrapped in a function or written with `let` does not get them.
+
+**Suite-wide, via `python bench/scope/sweep.py`:** wrapping each program in an
+IIFE costs a **geomean +159% across 13 rows and moves 8 of them from beating
+Node to losing to it**; `var`->`let` costs **+60% across 12 rows, 6 crossing**.
+So the published all-13 result is a result for *top-level `var`* code. That is
+honest for what it measures - the programs are the unchanged historical series -
+but real JavaScript is inside functions and spelled `let`/`const`.
+
+**And the worst case is NOT a declining reducer.** On `typedarray-math`, losing
+the reducer costs 1ms -> 61ms and zipp still beats Node; it is the *next* step
+that loses. `let` on the DataView loop's body locals adds live homes, `INT-GPR`
+declines with `13 homes > 8 gprs`, and the region falls to the MEM boxed tier:
+61ms -> **361ms** against Node's flat 95ms. Loop *counters* as `let` are nearly
+free. So this is a general tier defect, not an overfitting story, and it is
+worth more than the reducer work.
+
+Refuted en route, with instrumentation - do not re-chase: not GC (0
+collections), not the pin plan (zero pin declines; DV pins built on both sides),
+not the W9 DV retry gate (it passes; the GPR emitter declines after it), not the
+dark `ZIPP_GPR_SPILL_SLOTS` mechanism (built for 12-14-home regions exactly like
+this; 361ms -> 369ms), not identifier text, not program size.
+
+**The fix is register PRESSURE, not register SPILLING**: a block-scoped
+`let`/`const` in a loop body that no closure captures should occupy the same
+register a `var` would, instead of adding a live home. That is a compiler change
+upstream of the emitter that currently declines, and it is where the next wave
+should start.
 
 Ratios are zipp / Node, 9 interleaved paired reps, plain release build:
 
