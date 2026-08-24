@@ -349,10 +349,12 @@ impl<'p> Vm<'p> {
         self.module_base_dir = dir;
     }
 
-    /// Set the canonical filesystem boundary and per-module read ceiling.
+    /// Set the canonical filesystem boundary and confined loader budgets.
     ///
     /// The boundary is fail-closed: the root must already exist and be a
-    /// directory before any module loader is enabled.
+    /// directory before any module loader is enabled. A confined VM accepts at
+    /// most 256 canonical module files, 64 MiB of aggregate observed source,
+    /// and 64 levels of loader recursion. Repeated reads share one path ledger.
     pub(crate) fn set_module_root(
         &mut self,
         root: std::path::PathBuf,
@@ -371,6 +373,9 @@ impl<'p> Vm<'p> {
         }
         self.module_root = Some(root);
         self.module_max_bytes = Some(max_bytes);
+        self.module_read_bytes.clear();
+        self.module_total_bytes = 0;
+        self.module_load_depth = 0;
         Ok(())
     }
 

@@ -62,17 +62,67 @@ JSON text and not `ToString`. Three rules, each because the alternative is worse
 `JSON.stringify` can express none of the three: it *drops* function-valued
 properties and *throws* on a cycle.
 
+## Resource limits
+
+Every `Engine` has fixed fail-closed ceilings. They are intentionally lifetime
+limits rather than per-entry allowances, so repeatedly re-entering one VM cannot
+reset its meter:
+
+| Resource | Limit |
+| --- | ---: |
+| Initial guest source | 2,097,152 UTF-8 bytes, checked before preamble concatenation or compilation |
+| One `evalInContext` expression | 65,490 UTF-8 bytes (plus its fixed 46-byte host wrapper) |
+| Retained `evalInContext` wrapper source | 1,048,576 UTF-8 bytes total and 256 calls per engine |
+| All runtime compilation (`eval`, `Function`, `ShadowRealm`, and host eval) | 65,536 UTF-8 bytes per complete source, 1,048,576 source bytes and 256 attempts total; at most 4,096 retained function definitions and 1,024 retained class definitions |
+| VM execution | 50,000,000 bytecode instructions total, starting at guest top-level execution |
+| Approximate VM heap | 134,217,728 bytes |
+| Lifetime console output | 98,304 UTF-8 bytes total, including newlines |
+| Synchronous host bridge | 64-byte kind, at most 16 arguments, 1,048,576 combined kind/argument bytes, and a 1,048,576-byte serialized reply |
+
+The instruction, dynamic-compilation and output counters are not credited when
+an entry returns or when `takeOutput()` drains buffered lines. Dynamic source and
+attempt counts are charged before parsing, so syntax errors consume the lifetime
+allowance too. Successful runtime compilations need stable function/class
+definitions; the concrete definition caps are checked before those allocations
+are retained. The current stable-address allocations deliberately survive
+`Engine.dispose()`, so the caps strictly bound one Engine's contribution, not the
+sum from repeatedly constructing Engines in one WASM instance. Tear down and
+recreate the dedicated Worker/WASM instance to reclaim them between untrusted
+tenants; do not treat `dispose()` as compiler-allocation reclamation.
+
+The heap figure is the VM object-table high-water estimate, checked periodically
+during execution and after host writes/calls; it can overshoot by a bounded amount
+and does not count every string/array payload or represent exact WASM memory/RSS.
+The retained-source limits are conservative source-size proxies for compilations
+the VM must keep alive, not exact measurements of compiler allocations.
+
+An initialization failure, an initial/eval source-growth violation, or any VM
+instruction/abort/heap/output/dynamic-compilation limit violation disposes the
+engine and drops its guest state and bridge handles. This stays terminal even if
+guest code catches the resulting error or a promise turns it into a rejection;
+the host reads a typed recorder status rather than matching guest-controlled
+exception text. A synchronous bridge envelope violation is a guest-visible
+`RangeError` raised before the bridge method is called (or before an oversized
+reply enters the VM). Ordinary script throws and host-value marshalling errors
+remain recoverable.
+
 ## Notes
 
 - `Engine::new()` must not be constructed before the module's `start` function has
   run — wasm32 has no clock, `Vm::new` reads one, and an un-shimmed VM traps on
   construction. `wasm-bindgen(start)` handles this; nothing else should.
 - `callFunction` resolves by slot. `evalInContext` compiles fresh on every call and
-  the compilation is interned for the VM's lifetime, so it is for one-off host
-  queries, never a per-frame path.
-- The engine is interpreter-only here: the JIT tier is native x86-64 codegen and has
-  no meaning on wasm.
+  installs stable-address definitions, so it is for one-off host
+  queries, never a per-frame path; the per-source, retained-source and call-count
+  ceilings above enforce that boundary. Guest `eval`, `Function` constructors and
+  `ShadowRealm.evaluate` share the VM-wide runtime-compilation ceilings rather
+  than bypassing the host helper's counters.
+- The engine is interpreter-only here: the x86-64 and ARM64 JIT tiers emit
+  native machine code and have no meaning on wasm.
 - Engine entry points are synchronous and this API has no wall-time preemption. Run
   untrusted WASM/script execution in a dedicated Web Worker and terminate the
   Worker when its deadline expires; a timer on the blocked Worker or main thread
-  cannot interrupt an in-progress engine call.
+  cannot interrupt an in-progress engine call. A native builtin, regex operation,
+  JSON conversion, or host bridge implementation can perform substantial work as
+  one VM instruction, so the instruction and approximate-heap meters are not an
+  OS sandbox, an exact RSS cap, or a substitute for Worker termination.

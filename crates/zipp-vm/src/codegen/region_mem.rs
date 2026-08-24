@@ -44,12 +44,13 @@ fn field_write_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool
         return false;
     }
     let c = &proto.code;
-    let (limit, i) = match (&c[start], &c[start + 1]) {
-        (Instr::LoadGlobal { dst: limit, .. }, Instr::JumpIfNotLt { a: i, b, target })
-            if b == limit && *target as usize == end + 1 =>
-        {
-            (*limit, *i)
-        }
+    let limit = match &c[start] {
+        Instr::LoadGlobal { dst, .. } => *dst,
+        Instr::UpvalGet { dst, idx } if (*idx as usize) < proto.upvalues.len() => *dst,
+        _ => return false,
+    };
+    let i = match &c[start + 1] {
+        Instr::JumpIfNotLt { a, b, target } if *b == limit && *target as usize == end + 1 => *a,
         _ => return false,
     };
     let (receiver, k) = match &c[start + 2] {
@@ -258,6 +259,38 @@ pub(crate) fn compile_region_mem(
         ; call rax
         ; mov r14, rax                    // pinned inline-cache table base
     );
+    // A captured-limit cyclic field read cannot stay on the DOUBLE tier because
+    // its ordinary fallback header executes `UpvalGet`. Host that exact shape
+    // here, where the unchanged MEM region already implements the fallback op.
+    // The helper repeats the complete recognition and receiver/effect preflight;
+    // a miss has changed no JS state and falls through below.
+    let captured_field_read_prefix = meter.is_none()
+        && field_read_stream_enabled()
+        && matches!(proto.code[s], Instr::UpvalGet { .. })
+        && field_cyclic_read_stream_shape(proto, s, e);
+    if captured_field_read_prefix {
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!(
+                "[jit] MEM region fn{} [{start},{end}] upvalue-field-read-stream prefix",
+                heap.func_id
+            );
+        }
+        let packed = ((heap.func_id as u64) << 32) | ((s as u64) << 16) | e as u64;
+        let fallback = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, rbx
+            ; mov r8, QWORD packed as i64
+            ; mov rax, QWORD crate::vm::jit_field_read_loop as usize as i64
+            ; call rax
+            ; test rax, rax
+            ; je => fallback
+            ; mov DWORD [rsi], (e + 1) as i32
+            ; jmp => epilogue
+            ; => fallback
+        );
+    }
+
     // The property-shape write phase is an exact cyclic loop whose only
     // observable effects are existing own-data-slot stores.  A guarded helper
     // preflights every receiver, then commits only the final value of each

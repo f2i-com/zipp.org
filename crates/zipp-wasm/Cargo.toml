@@ -9,9 +9,9 @@ description = "WebAssembly embedding of the zipp JavaScript engine: a persistent
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# The engine, interpreter-only: the JIT tier is x86-64 native codegen and has
-# no meaning on wasm (see zipp-vm's `jit` feature).
-zipp-vm = { path = "../zipp-vm", default-features = false }
+# The engine, interpreter-only: the JIT tiers emit x86-64/ARM64 native code and
+# have no meaning on wasm (see zipp-vm's `jit` feature).
+zipp-vm = { path = "../zipp-vm", default-features = false, features = ["instrument"] }
 wasm-bindgen = "0.2.126"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"

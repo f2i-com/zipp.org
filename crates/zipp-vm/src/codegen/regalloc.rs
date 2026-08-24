@@ -7,7 +7,7 @@ use super::*;
 
 /// Same-binary escape hatch for the guarded pure cyclic field-read reducer.
 /// Read only while compiling a hot loop; there is no per-iteration switch cost.
-fn field_read_stream_enabled() -> bool {
+pub(crate) fn field_read_stream_enabled() -> bool {
     std::env::var_os("ZIPP_NO_FIELD_READ_STREAM").is_none()
 }
 
@@ -19,18 +19,19 @@ fn field_sum_stream_enabled() -> bool {
 /// merely omits the prefix; the helper repeats the full recognition before it
 /// can commit, so this function is a profitability/admission filter, never a
 /// correctness assumption.
-fn field_cyclic_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
+pub(crate) fn field_cyclic_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
     use crate::bytecode::BitwiseOp;
     if end.checked_sub(start) != Some(16) || end + 1 >= proto.code.len() {
         return false;
     }
     let c = &proto.code;
-    let (limit, i) = match (&c[start], &c[start + 1]) {
-        (Instr::LoadGlobal { dst: limit, .. }, Instr::JumpIfNotLt { a: i, b, target })
-            if b == limit && *target as usize == end + 1 =>
-        {
-            (*limit, *i)
-        }
+    let limit = match &c[start] {
+        Instr::LoadGlobal { dst, .. } => *dst,
+        Instr::UpvalGet { dst, idx } if (*idx as usize) < proto.upvalues.len() => *dst,
+        _ => return false,
+    };
+    let i = match &c[start + 1] {
+        Instr::JumpIfNotLt { a, b, target } if *b == limit && *target as usize == end + 1 => *a,
         _ => return false,
     };
     let (elem, k) = match &c[start + 2] {
@@ -654,7 +655,11 @@ pub(crate) fn compile_region_regalloc(
     // miss has changed no JS state and falls through to the byte-identical
     // ordinary prologue.  Metered VMs must observe every bytecode charge, so
     // they never receive the prefix.
-    if meter.is_none() && field_read_stream_enabled() && field_read_stream_shape(proto, s, e) {
+    if meter.is_none()
+        && !matches!(proto.code[s], Instr::UpvalGet { .. })
+        && field_read_stream_enabled()
+        && field_read_stream_shape(proto, s, e)
+    {
         if let Some(h) = heap {
             if std::env::var_os("ZIPP_JITLOG").is_some() {
                 eprintln!(

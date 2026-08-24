@@ -137,6 +137,72 @@ pub(crate) const ABORT_MSG: &str = "RangeError: script execution was aborted by 
 /// Raised when a script exceeds the heap ceiling its host set.
 pub(crate) const MEMORY_MSG: &str = "RangeError: script exceeded its memory budget";
 pub(crate) const OUTPUT_MSG: &str = "RangeError: script exceeded its output budget";
+pub(crate) const DYNAMIC_SOURCE_MSG: &str =
+    "RangeError: dynamic code source exceeds its per-compilation limit";
+pub(crate) const DYNAMIC_TOTAL_SOURCE_MSG: &str =
+    "RangeError: dynamic code exceeded its lifetime source limit";
+pub(crate) const DYNAMIC_CALLS_MSG: &str =
+    "RangeError: dynamic code exceeded its lifetime compilation-call limit";
+pub(crate) const DYNAMIC_FUNCTIONS_MSG: &str =
+    "RangeError: dynamic code exceeded its retained-function limit";
+pub(crate) const DYNAMIC_CLASSES_MSG: &str =
+    "RangeError: dynamic code exceeded its retained-class limit";
+
+/// The first resource ceiling an instrumented VM actually attempted to cross.
+///
+/// This is deliberately typed and sticky. In particular, `remaining == 0` is
+/// not itself an error: a program may consume its final permitted instruction
+/// and halt successfully. `Steps` is recorded only when another instruction is
+/// attempted. Keeping the first cause also prevents a guest-thrown string from
+/// impersonating a host resource failure and makes caught/promise-wrapped
+/// failures visible to the embedder after execution returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResourceExhaustion {
+    Steps,
+    Abort,
+    Heap,
+    Output,
+    DynamicSource,
+    DynamicTotalSource,
+    DynamicCalls,
+    DynamicFunctions,
+    DynamicClasses,
+}
+
+impl ResourceExhaustion {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Steps => BUDGET_MSG,
+            Self::Abort => ABORT_MSG,
+            Self::Heap => MEMORY_MSG,
+            Self::Output => OUTPUT_MSG,
+            Self::DynamicSource => DYNAMIC_SOURCE_MSG,
+            Self::DynamicTotalSource => DYNAMIC_TOTAL_SOURCE_MSG,
+            Self::DynamicCalls => DYNAMIC_CALLS_MSG,
+            Self::DynamicFunctions => DYNAMIC_FUNCTIONS_MSG,
+            Self::DynamicClasses => DYNAMIC_CLASSES_MSG,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DynamicCodeLimits {
+    per_source_bytes: usize,
+    lifetime_source_bytes: usize,
+    calls: usize,
+    functions: usize,
+    classes: usize,
+}
+
+impl DynamicCodeLimits {
+    const UNLIMITED: Self = Self {
+        per_source_bytes: usize::MAX,
+        lifetime_source_bytes: usize::MAX,
+        calls: usize::MAX,
+        functions: usize::MAX,
+        classes: usize::MAX,
+    };
+}
 
 /// A row whose operands have been sampled but whose result has not: the
 /// destination register is not written until the instruction runs, so the row is
@@ -216,6 +282,12 @@ pub(crate) struct Recorder {
     pub(crate) output_limit: usize,
     pub(crate) output_used: usize,
     pub(crate) output_exhausted: bool,
+    /// First resource ceiling actually crossed. Never inferred from exception
+    /// text or from a merely-empty step balance.
+    pub(crate) exhaustion: Option<ResourceExhaustion>,
+    dynamic_limits: DynamicCodeLimits,
+    dynamic_calls: usize,
+    dynamic_source_bytes: usize,
     steps: Vec<TraceStep>,
     /// Whether to record rows at all — metering works without tracing.
     tracing: bool,
@@ -240,6 +312,10 @@ impl Recorder {
             output_limit: usize::MAX,
             output_used: 0,
             output_exhausted: false,
+            exhaustion: None,
+            dynamic_limits: DynamicCodeLimits::UNLIMITED,
+            dynamic_calls: 0,
+            dynamic_source_bytes: 0,
             steps: Vec::new(),
             tracing: false,
             max_steps: usize::MAX,
@@ -264,6 +340,88 @@ impl Recorder {
 
     pub(crate) fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    #[inline]
+    fn exhaust(&mut self, cause: ResourceExhaustion) -> &'static str {
+        self.exhaustion.get_or_insert(cause).message()
+    }
+
+    #[inline]
+    fn terminal_message(&self) -> Option<&'static str> {
+        self.exhaustion.map(ResourceExhaustion::message)
+    }
+
+    fn set_dynamic_code_limits(
+        &mut self,
+        per_source_bytes: usize,
+        lifetime_source_bytes: usize,
+        calls: usize,
+        functions: usize,
+        classes: usize,
+    ) {
+        self.dynamic_limits = DynamicCodeLimits {
+            per_source_bytes,
+            lifetime_source_bytes,
+            calls,
+            functions,
+            classes,
+        };
+        self.dynamic_calls = 0;
+        self.dynamic_source_bytes = 0;
+    }
+
+    /// Charge a dynamic compilation attempt before parsing or compiler
+    /// allocation. Failed parses count too: otherwise a guest can repeatedly
+    /// spend parser work without consuming the lifetime allowance.
+    fn charge_dynamic_code_attempt(&mut self, source_bytes: usize) -> Tick {
+        if let Some(message) = self.terminal_message() {
+            return Err(message);
+        }
+        if source_bytes > self.dynamic_limits.per_source_bytes {
+            return Err(self.exhaust(ResourceExhaustion::DynamicSource));
+        }
+        if self.dynamic_calls >= self.dynamic_limits.calls {
+            return Err(self.exhaust(ResourceExhaustion::DynamicCalls));
+        }
+        let Some(total) = self.dynamic_source_bytes.checked_add(source_bytes) else {
+            return Err(self.exhaust(ResourceExhaustion::DynamicTotalSource));
+        };
+        if total > self.dynamic_limits.lifetime_source_bytes {
+            return Err(self.exhaust(ResourceExhaustion::DynamicTotalSource));
+        }
+        self.dynamic_calls += 1;
+        self.dynamic_source_bytes = total;
+        Ok(())
+    }
+
+    /// Preflight the concrete stable-address allocations produced by a
+    /// successful dynamic compile. The caller passes the already-installed
+    /// counts plus the pending program's counts, and performs this check before
+    /// any `Box::leak`.
+    fn admit_dynamic_code_install(
+        &mut self,
+        installed_functions: usize,
+        new_functions: usize,
+        installed_classes: usize,
+        new_classes: usize,
+    ) -> Tick {
+        if let Some(message) = self.terminal_message() {
+            return Err(message);
+        }
+        if installed_functions
+            .checked_add(new_functions)
+            .is_none_or(|n| n > self.dynamic_limits.functions)
+        {
+            return Err(self.exhaust(ResourceExhaustion::DynamicFunctions));
+        }
+        if installed_classes
+            .checked_add(new_classes)
+            .is_none_or(|n| n > self.dynamic_limits.classes)
+        {
+            return Err(self.exhaust(ResourceExhaustion::DynamicClasses));
+        }
+        Ok(())
     }
 
     /// Stop recording and hand over the rows, terminated by a [`op::HALT`] row
@@ -327,6 +485,74 @@ fn blank(row: &mut TraceStep) {
 pub(crate) type Tick = Result<(), &'static str>;
 
 impl super::Vm<'_> {
+    /// Configure VM-wide dynamic-code ceilings. Every `do_eval` caller is
+    /// covered: direct/indirect `eval`, Function constructors, ShadowRealm,
+    /// and embedder eval helpers. Requires an attached recorder.
+    pub(crate) fn set_dynamic_code_limits(
+        &mut self,
+        per_source_bytes: usize,
+        lifetime_source_bytes: usize,
+        calls: usize,
+        functions: usize,
+        classes: usize,
+    ) {
+        if let Some(rec) = self.instr_rec.as_mut() {
+            rec.set_dynamic_code_limits(
+                per_source_bytes,
+                lifetime_source_bytes,
+                calls,
+                functions,
+                classes,
+            );
+        }
+    }
+
+    /// Charge one dynamic-code attempt before parsing begins.
+    pub(crate) fn instrument_dynamic_code_attempt(&mut self, source_bytes: usize) -> Tick {
+        match self.instr_rec.as_mut() {
+            Some(rec) => rec.charge_dynamic_code_attempt(source_bytes),
+            None => Ok(()),
+        }
+    }
+
+    /// Preflight the concrete stable-address function/class allocations before
+    /// the eval program is installed (and therefore before any `Box::leak`).
+    pub(crate) fn instrument_dynamic_code_install(
+        &mut self,
+        new_functions: usize,
+        new_classes: usize,
+    ) -> Tick {
+        let installed_functions = self.eval_funcs.len();
+        let installed_classes = self.eval_classes.len();
+        match self.instr_rec.as_mut() {
+            Some(rec) => rec.admit_dynamic_code_install(
+                installed_functions,
+                new_functions,
+                installed_classes,
+                new_classes,
+            ),
+            None => Ok(()),
+        }
+    }
+
+    /// Return the recorder's typed terminal status, first turning a heap
+    /// overshoot that happened outside the bytecode loop (for example during a
+    /// host-to-guest write) into the same sticky status as an in-loop check.
+    pub(crate) fn instrument_resource_limit_error(&mut self) -> Option<&'static str> {
+        let heap_bytes = self.heap_bytes();
+        let rec = self.instr_rec.as_mut()?;
+        if rec.exhaustion.is_none() && rec.output_exhausted {
+            rec.exhaust(ResourceExhaustion::Output);
+        }
+        if rec.exhaustion.is_none()
+            && rec.heap_limit != usize::MAX
+            && heap_bytes > rec.heap_limit
+        {
+            rec.exhaust(ResourceExhaustion::Heap);
+        }
+        rec.terminal_message()
+    }
+
     /// Lend the native tier a slice of the step budget, returning what it took.
     ///
     /// Compiled code charges `Vm::jit_steps` directly (two instructions per
@@ -344,11 +570,20 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_mut() else {
             return 0;
         };
+        // Whole-function native entry happens before the interpreter's
+        // `instrument_step` hook. Refuse the loan here as well, or a caught
+        // dynamic/output failure from a prior entry could execute another
+        // compiled function before the sticky status was observed.
+        if rec.terminal_message().is_some() {
+            self.jit_steps = 0;
+            return 0;
+        }
         // Once per native entry is the right cadence for the abort poll: the
         // interpreter's own every-4096-instructions check barely advances while
         // a hot loop is running natively.
         if let Some(flag) = rec.abort.as_ref() {
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                rec.exhaust(ResourceExhaustion::Abort);
                 self.jit_steps = 0;
                 return 0;
             }
@@ -359,13 +594,8 @@ impl super::Vm<'_> {
         let ceiling = rec.heap_limit;
         if ceiling != usize::MAX {
             if self.heap_bytes() > ceiling {
-                // Lend nothing, so control returns to the interpreter, and
-                // arrange for its next instruction to land on a poll — the
-                // error itself is raised there, where there is a `Tick` to
-                // return it in. Without this nudge the script could run
-                // another 4095 instructions before anyone looked.
                 if let Some(rec) = self.instr_rec.as_mut() {
-                    rec.ticks = u64::MAX;
+                    rec.exhaust(ResourceExhaustion::Heap);
                 }
                 self.jit_steps = 0;
                 return 0;
@@ -374,11 +604,31 @@ impl super::Vm<'_> {
             let Some(rec) = self.instr_rec.as_mut() else {
                 return 0;
             };
+            if rec.remaining != i64::MAX && rec.remaining <= 0 {
+                rec.exhaust(ResourceExhaustion::Steps);
+                self.jit_steps = 0;
+                return 0;
+            }
+            if rec.remaining == i64::MAX {
+                rec.used = rec.used.wrapping_add(NATIVE_CHUNK as u64);
+                self.jit_steps = NATIVE_CHUNK;
+                return NATIVE_CHUNK;
+            }
             let lend = rec.remaining.min(NATIVE_CHUNK).max(0);
             rec.remaining -= lend;
             rec.used = rec.used.wrapping_add(lend as u64);
             self.jit_steps = lend;
             return lend;
+        }
+        if rec.remaining != i64::MAX && rec.remaining <= 0 {
+            rec.exhaust(ResourceExhaustion::Steps);
+            self.jit_steps = 0;
+            return 0;
+        }
+        if rec.remaining == i64::MAX {
+            rec.used = rec.used.wrapping_add(NATIVE_CHUNK as u64);
+            self.jit_steps = NATIVE_CHUNK;
+            return NATIVE_CHUNK;
         }
         let lend = rec.remaining.min(NATIVE_CHUNK).max(0);
         rec.remaining -= lend;
@@ -397,6 +647,12 @@ impl super::Vm<'_> {
         if let Some(rec) = self.instr_rec.as_mut() {
             if rec.remaining != i64::MAX {
                 rec.remaining += unspent;
+                // Zero means native code consumed its final permitted block
+                // exactly. Only a negative counter says it attempted to enter a
+                // block that did not fit and took the metering exit.
+                if self.jit_steps < 0 {
+                    rec.exhaust(ResourceExhaustion::Steps);
+                }
             }
             // The lend counted against `used` up front; hand back what native
             // code did not spend even when the budget is unlimited (where
@@ -415,10 +671,17 @@ impl super::Vm<'_> {
     /// charges itself, and charging both would be double-counting.
     pub(crate) fn charge_steps(&mut self, n: i64) {
         if let Some(rec) = self.instr_rec.as_mut() {
+            let n = n.max(0);
             if rec.remaining != i64::MAX {
+                let before = rec.remaining;
                 rec.remaining -= n;
+                // The work has already completed. Exactly consuming the final
+                // allowance is valid; only a strict overshoot is exhaustion.
+                if n > before {
+                    rec.exhaust(ResourceExhaustion::Steps);
+                }
             }
-            rec.used = rec.used.wrapping_add(n.max(0) as u64);
+            rec.used = rec.used.wrapping_add(n as u64);
         }
     }
 
@@ -426,7 +689,7 @@ impl super::Vm<'_> {
     /// rather than because a type guard failed. A metering exit says nothing
     /// about the region's quality, so it must not count toward eviction.
     pub(crate) fn meter_exhausted(&self) -> bool {
-        self.instr_rec.is_some() && self.jit_steps <= 0
+        self.instr_rec.is_some() && self.jit_steps < 0
     }
 
     /// The displacement of [`Self::jit_steps`] from the VM pointer, for the
@@ -450,11 +713,11 @@ impl super::Vm<'_> {
         let bytes = line.len().saturating_add(1);
         let Some(total) = rec.output_used.checked_add(bytes) else {
             rec.output_exhausted = true;
-            return Err(OUTPUT_MSG);
+            return Err(rec.exhaust(ResourceExhaustion::Output));
         };
         if total > rec.output_limit {
             rec.output_exhausted = true;
-            return Err(OUTPUT_MSG);
+            return Err(rec.exhaust(ResourceExhaustion::Output));
         }
         rec.output_used = total;
         Ok(())
@@ -472,13 +735,16 @@ impl super::Vm<'_> {
             Some(r) => r,
             None => return Ok(()),
         };
+        if let Some(message) = rec.terminal_message() {
+            return Err(message);
+        }
         if rec.output_exhausted {
-            return Err(OUTPUT_MSG);
+            return Err(rec.exhaust(ResourceExhaustion::Output));
         }
         rec.ticks = rec.ticks.wrapping_add(1);
         if rec.remaining != i64::MAX {
             if rec.remaining <= 0 {
-                return Err(BUDGET_MSG);
+                return Err(rec.exhaust(ResourceExhaustion::Steps));
             }
             rec.remaining -= 1;
         }
@@ -493,7 +759,7 @@ impl super::Vm<'_> {
         if rec.ticks & ABORT_CHECK_MASK == 0 {
             if let Some(flag) = rec.abort.as_ref() {
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    return Err(ABORT_MSG);
+                    return Err(rec.exhaust(ResourceExhaustion::Abort));
                 }
             }
             ceiling = rec.heap_limit;
@@ -501,7 +767,8 @@ impl super::Vm<'_> {
         let tracing = rec.tracing;
 
         if ceiling != usize::MAX && self.heap_bytes() > ceiling {
-            return Err(MEMORY_MSG);
+            let rec = self.instr_rec.as_mut().expect("recorder checked above");
+            return Err(rec.exhaust(ResourceExhaustion::Heap));
         }
 
         let Some(rec) = self.instr_rec.as_mut() else {
@@ -934,6 +1201,21 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
 mod tests {
     use super::*;
 
+    fn program(src: &str) -> &'static crate::bytecode::Program {
+        let ast = crate::front::parse_script(src).expect("source parses");
+        Box::leak(Box::new(
+            crate::compile::compile_program(&ast, src).expect("source compiles"),
+        ))
+    }
+
+    fn instrumented_vm(src: &str) -> crate::vm::Vm<'static> {
+        let mut vm = crate::vm::Vm::new(program(src));
+        let mut rec = Recorder::new();
+        rec.remaining = 1_000_000;
+        vm.set_instrumentation(rec);
+        vm
+    }
+
     /// The opcode numbers are a wire contract with the prover crate. Change one
     /// and a row starts being held to a DIFFERENT polynomial constraint —
     /// previously valid proofs stop verifying, with no compile error anywhere,
@@ -1007,5 +1289,266 @@ mod tests {
         assert!(exact_uint(Value::int(-1)).is_none());
         assert!(exact_uint(Value::num(2.5)).is_none());
         assert!(exact_uint(Value::num(4_294_967_296.0)).is_none());
+    }
+
+    #[test]
+    fn exact_final_step_is_success_not_exhaustion() {
+        let src = "var answer = 42;";
+
+        let mut measured = crate::vm::Vm::new(program(src));
+        measured.set_instrumentation(Recorder::new());
+        measured.run().expect("measurement run succeeds");
+        let used = measured
+            .instr_rec
+            .as_ref()
+            .expect("recorder attached")
+            .used;
+        assert!(used > 0);
+
+        let mut exact = crate::vm::Vm::new(program(src));
+        let mut exact_rec = Recorder::new();
+        exact_rec.remaining = used as i64;
+        exact.set_instrumentation(exact_rec);
+        exact.run().expect("the final permitted instruction may halt");
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instrument_resource_limit_error(), None);
+
+        let mut short = crate::vm::Vm::new(program(src));
+        let mut short_rec = Recorder::new();
+        short_rec.remaining = (used - 1) as i64;
+        short.set_instrumentation(short_rec);
+        short.run().expect_err("one fewer step is rejected");
+        assert_eq!(
+            short.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::Steps)
+        );
+        assert_eq!(short.instrument_resource_limit_error(), Some(BUDGET_MSG));
+    }
+
+    #[test]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn exact_final_native_block_succeeds_and_the_next_attempt_fails() {
+        const SRC: &str = "function add1(x) { return x + 1; }";
+
+        fn exercise(
+            limit: i64,
+        ) -> (
+            crate::vm::Vm<'static>,
+            Result<Value, crate::vm::Thrown>,
+        ) {
+            let mut vm = crate::vm::Vm::new(program(SRC));
+            let mut rec = Recorder::new();
+            rec.remaining = limit;
+            vm.set_instrumentation(rec);
+            vm.run().expect("top level initializes");
+
+            let slot = vm.func(1).name_global.expect("add1 has a global slot");
+            let callee = vm.globals[slot as usize];
+            for i in 0..8 {
+                assert_eq!(
+                    vm.call_value(callee, Value::UNDEFINED, &[Value::int(i)])
+                        .expect("warm call succeeds"),
+                    Value::int(i + 1)
+                );
+            }
+            assert!(
+                vm.jit.get(1).is_some(),
+                "the boundary call must exercise compiled code"
+            );
+            let result = vm.call_value(callee, Value::UNDEFINED, &[Value::int(8)]);
+            (vm, result)
+        }
+
+        // First measure this deterministic run with an unlimited recorder. The
+        // ninth call is the first one to enter the whole-function native body.
+        let (measured, result) = exercise(i64::MAX);
+        assert_eq!(result.expect("measurement call succeeds"), Value::int(9));
+        let exact_steps = measured.instr_rec.as_ref().unwrap().used;
+        assert!(exact_steps > 0);
+
+        let (mut exact, result) = exercise(exact_steps as i64);
+        assert_eq!(result.expect("exact native call succeeds"), Value::int(9));
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instrument_resource_limit_error(), None);
+
+        let slot = exact.func(1).name_global.unwrap();
+        let callee = exact.globals[slot as usize];
+        let err = exact
+            .call_value(callee, Value::UNDEFINED, &[Value::int(9)])
+            .expect_err("another attempted native instruction must fail");
+        assert!(err.0.contains("instruction budget"), "got {err:?}");
+        assert_eq!(
+            exact.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::Steps)
+        );
+
+        let (mut short, result) = exercise(exact_steps as i64 - 1);
+        let err = result.expect_err("one fewer step must reject the native call");
+        assert!(err.0.contains("instruction budget"), "got {err:?}");
+        assert_eq!(
+            short.instrument_resource_limit_error(),
+            Some(BUDGET_MSG)
+        );
+    }
+
+    #[test]
+    fn abort_and_postflight_heap_have_typed_sticky_status() {
+        let mut aborted = crate::vm::Vm::new(program("var answer = 42;"));
+        let mut abort_rec = Recorder::new();
+        abort_rec.remaining = 1_000;
+        abort_rec.abort = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            true,
+        )));
+        // The next tick wraps to a polling tick, avoiding a 4096-instruction
+        // fixture just to exercise the abort branch.
+        abort_rec.ticks = u64::MAX;
+        aborted.set_instrumentation(abort_rec);
+        aborted.run().expect_err("host abort stops execution");
+        assert_eq!(
+            aborted.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::Abort)
+        );
+        assert_eq!(
+            aborted.instrument_resource_limit_error(),
+            Some(ABORT_MSG)
+        );
+
+        let mut heap = instrumented_vm("var answer = 42;");
+        heap.run().expect("short run need not hit the periodic heap poll");
+        heap.instr_rec.as_mut().unwrap().heap_limit = 0;
+        assert_eq!(
+            heap.instrument_resource_limit_error(),
+            Some(MEMORY_MSG),
+            "postflight must catch allocations made between periodic polls"
+        );
+        assert_eq!(
+            heap.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::Heap)
+        );
+    }
+
+    #[test]
+    fn all_guest_dynamic_compilers_share_the_source_gate() {
+        for src in [
+            "try { eval('12'); } catch (_) {} var after = 1;",
+            "try { Function('return 1'); } catch (_) {} var after = 1;",
+            "try { new ShadowRealm().evaluate('12'); } catch (_) {} var after = 1;",
+        ] {
+            let mut vm = instrumented_vm(src);
+            vm.set_dynamic_code_limits(1, 1024, 16, 128, 32);
+            vm.run()
+                .expect_err("a caught dynamic-source error remains terminal");
+            assert_eq!(
+                vm.instr_rec.as_ref().unwrap().exhaustion,
+                Some(ResourceExhaustion::DynamicSource),
+                "source path: {src}"
+            );
+            assert_eq!(
+                vm.instrument_resource_limit_error(),
+                Some(DYNAMIC_SOURCE_MSG)
+            );
+            assert_eq!(
+                vm.meter_lend(),
+                0,
+                "sticky exhaustion must refuse pre-interpreter native entry"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_parses_consume_dynamic_call_and_source_allowances() {
+        let mut calls = instrumented_vm(
+            "try { eval('('); } catch (_) {} try { eval('1'); } catch (_) {} var after = 1;",
+        );
+        calls.set_dynamic_code_limits(1024, 1024, 1, 128, 32);
+        calls
+            .run()
+            .expect_err("the second attempt exceeds the call allowance");
+        assert_eq!(
+            calls.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::DynamicCalls)
+        );
+
+        let mut bytes = instrumented_vm(
+            "try { eval('('); } catch (_) {} try { eval('1'); } catch (_) {} var after = 1;",
+        );
+        bytes.set_dynamic_code_limits(1024, 1, 16, 128, 32);
+        bytes
+            .run()
+            .expect_err("the second byte exceeds the aggregate allowance");
+        assert_eq!(
+            bytes.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::DynamicTotalSource)
+        );
+    }
+
+    #[test]
+    fn function_constructor_precharges_before_standalone_parameter_parse() {
+        let mut failed = instrumented_vm(
+            "try { Function('('); } catch (_) {} \
+             try { Function('('); } catch (_) {} var after = 1;",
+        );
+        failed.set_dynamic_code_limits(1024, 4096, 1, 128, 32);
+        failed
+            .run()
+            .expect_err("the second malformed parameter list exceeds the call allowance");
+        assert_eq!(
+            failed.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::DynamicCalls)
+        );
+        assert!(failed.eval_funcs.is_empty(), "neither malformed source installs code");
+
+        let mut oversized = instrumented_vm(
+            "try { Function('('.repeat(128)); } catch (_) {} var after = 1;",
+        );
+        oversized.set_dynamic_code_limits(64, 4096, 16, 128, 32);
+        oversized
+            .run()
+            .expect_err("the complete wrapper is gated before its invalid params are parsed");
+        assert_eq!(
+            oversized.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::DynamicSource)
+        );
+        assert!(oversized.eval_funcs.is_empty(), "oversized source installs no code");
+
+        let mut valid = instrumented_vm(
+            "var made = Function('return 7'); var answer = made();",
+        );
+        valid.set_dynamic_code_limits(1024, 4096, 1, 128, 32);
+        valid
+            .run()
+            .expect("one valid constructor is charged exactly once");
+        assert_eq!(valid.instr_rec.as_ref().unwrap().dynamic_calls, 1);
+        assert_eq!(valid.instrument_resource_limit_error(), None);
+    }
+
+    #[test]
+    fn concrete_function_and_class_caps_precede_any_leak() {
+        let mut functions = instrumented_vm(
+            "try { eval('function a(){}; function b(){}'); } catch (_) {} var after = 1;",
+        );
+        functions.set_dynamic_code_limits(1024, 4096, 16, 2, 32);
+        functions
+            .run()
+            .expect_err("eval body plus declarations exceeds two FuncProtos");
+        assert_eq!(
+            functions.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::DynamicFunctions)
+        );
+        assert!(functions.eval_funcs.is_empty(), "rejection must precede leaks");
+
+        let mut classes = instrumented_vm(
+            "try { eval('class A {}; class B {}'); } catch (_) {} var after = 1;",
+        );
+        classes.set_dynamic_code_limits(1024, 4096, 16, 128, 1);
+        classes
+            .run()
+            .expect_err("two ClassDefs exceed the concrete class allowance");
+        assert_eq!(
+            classes.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::DynamicClasses)
+        );
+        assert!(classes.eval_funcs.is_empty(), "rejection must precede leaks");
+        assert!(classes.eval_classes.is_empty(), "rejection must precede leaks");
     }
 }

@@ -25,8 +25,8 @@ impl<'p> Vm<'p> {
     /// the `function` / `function*` / `async function` / `async function*` wrapper
     /// keyword so the eval completion value is a function of the right kind.
     pub(crate) fn build_function_kind(&mut self, args: &[Value], kind: u8) -> Result<Value, Thrown> {
-        let (params, body) = if args.is_empty() {
-            (String::new(), String::new())
+        let (parts, body) = if args.is_empty() {
+            (Vec::new(), String::new())
         } else {
             // CreateDynamicFunction coerces the PARAMETER strings in argument
             // order first, then the body (a throwing toString surfaces in that
@@ -36,7 +36,7 @@ impl<'p> Vm<'p> {
                 parts.push(self.to_js_string(*a)?);
             }
             let body = self.to_js_string(args[args.len() - 1])?;
-            (parts.join(","), body)
+            (parts, body)
         };
         let prefix = match kind {
             1 => "function* ",
@@ -44,6 +44,44 @@ impl<'p> Vm<'p> {
             3 => "async function* ",
             _ => "function ",
         };
+        // Account for the COMPLETE source before joining the parameter pieces,
+        // parsing them, or allocating the assembled wrapper. In particular, a
+        // malformed standalone parameter list must still consume one dynamic
+        // compilation attempt; otherwise repeated caught `Function("(")` calls
+        // spend parser work while bypassing both lifetime counters.
+        const SOURCE_OPEN: &str = "(";
+        const NAME_OPEN: &str = "anonymous(";
+        const PARAM_BODY_SEP: &str = "\n) {\n";
+        const SOURCE_CLOSE: &str = "\n})";
+        let params_len = parts.iter().enumerate().try_fold(0usize, |total, (i, part)| {
+            total
+                .checked_add(usize::from(i != 0))
+                .and_then(|n| n.checked_add(part.len()))
+        });
+        let source_len = params_len.and_then(|params_len| {
+            SOURCE_OPEN
+                .len()
+                .checked_add(prefix.len())
+                .and_then(|n| n.checked_add(NAME_OPEN.len()))
+                .and_then(|n| n.checked_add(params_len))
+                .and_then(|n| n.checked_add(PARAM_BODY_SEP.len()))
+                .and_then(|n| n.checked_add(body.len()))
+                .and_then(|n| n.checked_add(SOURCE_CLOSE.len()))
+        });
+        #[cfg(feature = "instrument")]
+        self.instrument_dynamic_code_attempt(source_len.unwrap_or(usize::MAX))
+            .map_err(|message| Thrown(message.into()))?;
+        let source_len = source_len.ok_or_else(|| {
+            Thrown("RangeError: dynamic code source length overflow".into())
+        })?;
+
+        let mut params = String::with_capacity(params_len.expect("source length checked above"));
+        for (i, part) in parts.into_iter().enumerate() {
+            if i != 0 {
+                params.push(',');
+            }
+            params.push_str(&part);
+        }
         // CreateDynamicFunction parses the parameter STRING on its own as
         // FormalParameters (whole string consumed) before the assembled
         // source: a `/*`, backtick, or `)` in the params could otherwise
@@ -56,11 +94,22 @@ impl<'p> Vm<'p> {
         // The newline before `)` defends against a `//` comment in the last
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.
-        let source = format!("({prefix}anonymous({params}\n) {{\n{body}\n}})");
+        let mut source = String::with_capacity(source_len);
+        source.push_str(SOURCE_OPEN);
+        source.push_str(prefix);
+        source.push_str(NAME_OPEN);
+        source.push_str(&params);
+        source.push_str(PARAM_BODY_SEP);
+        source.push_str(&body);
+        source.push_str(SOURCE_CLOSE);
+        debug_assert_eq!(source.len(), source_len);
         // CreateDynamicFunction builds the function from the separately-parsed
         // params/body, so the "anonymous" name is SetFunctionName only — NO
         // self-name binding (`typeof anonymous` inside is "undefined",
-        // constructor-binding.js). Flag the upcoming compile (one-shot).
+        // constructor-binding.js). Flag the upcoming compile (one-shot). The
+        // same flag tells `do_eval` this exact attempt was already charged
+        // above; setting it only after standalone parsing means a parse failure
+        // cannot leak the exemption into a later, unrelated eval.
         self.pending_fn_ctor_eval = true;
         self.do_eval(&source, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)
     }

@@ -1,9 +1,9 @@
 # zipp
 
 A clean-sheet JavaScript engine in Rust — a NaN-boxed register VM with
-per-call-site inline caches and a native x86-64 OSR JIT. No third-party parser,
-no third-party runtime: the lexer, parser, bytecode compiler, interpreter, JIT
-and GC are all in this repo.
+per-call-site inline caches, a mature native x86-64 JIT, and a guarded ARM64
+integer baseline JIT. No third-party parser, no third-party runtime: the lexer,
+parser, bytecode compiler, interpreter, JIT and GC are all in this repo.
 
 Home: <https://github.com/f2i-com/zipp.org> · Reference: [`DOC.md`](DOC.md) ·
 Measurements and refutations: [`PERF_ROADMAP.md`](PERF_ROADMAP.md)
@@ -32,11 +32,21 @@ compatibility `js` command:
 The sandbox runs the script in a supervised child with a cleared environment,
 closed stdin, a hard wall deadline, an instruction budget, an approximate VM
 heap ceiling, and a combined stdout/stderr cap. Both the VM's native JIT and
-the regex native JIT are disabled before untrusted source is parsed. Module
-loading is off unless `--allow-imports` is supplied; then every dynamic,
+the regex native JIT are disabled before untrusted source is parsed.
+Runtime compilation is also bounded across `eval`, `Function`, and
+`ShadowRealm.evaluate`: 64 KiB per source, 1 MiB and 256 attempts over the
+child lifetime, with at most 4,096 retained function definitions and 1,024
+retained class definitions. Hitting one of these limits is terminal for the
+child even when guest code catches the immediate exception.
+
+Module loading is off unless `--allow-imports` is supplied; then every dynamic,
 static dependency, typed, deferred, source-phase, and re-export path is
 canonicalized and rejected if it escapes that root through `..` or a symlink,
-and each imported module is capped at 16 MiB before its contents are read.
+each imported module is capped at 16 MiB before its contents are read, and the
+whole confined graph is capped at 256 canonical files, 64 MiB of aggregate
+source, with module-loader recursion capped at a depth of 64. Re-reading one
+canonical file through eager, typed, deferred, or source-phase imports shares
+one high-water charge rather than consuming the budget again.
 Keep an enabled import root host-controlled and read-only for the run: path
 canonicalization cannot prevent races in an attacker-writable tree, and a hard
 link inside the root still names its target as an in-root path.
@@ -196,8 +206,12 @@ list and the six remaining test262 failures.
 
 ## Platforms
 
-The JIT is x86-64 only and feature-gated. Every other target builds a pure
-interpreter — aarch64 and wasm32 are both built and tested.
+Native code generation is feature-gated. x86-64 has the mature function, OSR,
+helper, IC, and reducer tiers; ARM64 starts with a deliberately smaller
+whole-function tier for call-free integer code and hot numeric loops, with
+exact-ip fallback to the interpreter on every unsupported value or overflow.
+The ARM tier has bounded executable-code caches and native Linux, Windows, and
+macOS CI. wasm32 and other targets build the pure interpreter.
 `crates/zipp-wasm` embeds the engine for browser hosts, and `embed::ScriptState`
 keeps a VM alive across host calls for runtimes that render, wait, and call
 back in ([`DOC.md`](DOC.md#embedding)).

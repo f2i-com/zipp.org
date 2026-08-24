@@ -36,7 +36,7 @@
 //!
 //! ```text
 //! sub QWORD [rdi + off], <block length>
-//! jle => <out-of-line stub: mov [rsi], ip ; jmp flush_exit>
+//! jl  => <out-of-line stub: mov [rsi], ip ; jmp flush_exit>
 //! ```
 //!
 //! # Chunking, and why native code returns periodically
@@ -69,8 +69,10 @@ pub(crate) struct Meter {
     pub steps_off: i32,
 }
 
-/// Emit the per-block charge: subtract `len` steps and leave for `stub` when the
-/// lent chunk runs out.
+/// Emit the per-block charge: subtract `len` steps and leave for `stub` only
+/// when entering the block would overshoot the lent chunk. Exactly reaching
+/// zero is valid: the block may be the function's final block, in which case it
+/// consumed the last permitted instructions and returned successfully.
 ///
 /// Clobbers flags, so a caller relying on compare→branch fusion must drop the
 /// fused compare for this ip. Every site that calls this is a basic-block head,
@@ -84,7 +86,7 @@ pub(crate) fn emit_charge(
 ) {
     dynasm!(ops
         ; sub QWORD [rdi + m.steps_off], len as i32
-        ; jle => stub
+        ; jl => stub
     );
 }
 

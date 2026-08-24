@@ -1,8 +1,9 @@
 # zipp — a clean-sheet JavaScript engine.
 #
 # `crates/zipp-vm` is the project: a NaN-boxed, explicit-frame register VM with
-# per-call-site inline caches and a native x86-64 OSR JIT. `zipp-cli` is a thin
-# `zipp js <file.js>` front end over it, and `regress-fork` is the ECMAScript
+# per-call-site inline caches, a mature x86-64 JIT, and a guarded ARM64 baseline
+# JIT. `zipp-cli` is a thin `zipp js <file.js>` front end over it, and
+# `regress-fork` is the ECMAScript
 # regex engine it depends on.
 #
 # The workspace previously carried a separate ahead-of-time language (`zippc`
@@ -12,7 +13,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/zipp-vm",      # the JavaScript engine: register VM + native x86-64 OSR JIT
+    "crates/zipp-vm",      # the JavaScript engine: register VM + native x86-64/ARM64 JITs
     "crates/zipp-cli",     # `zipp js file.js` / `zipp mjs file.mjs`
     "crates/zipp-wasm",    # wasm-bindgen embedding: a persistent VM for browser hosts
     "crates/regress-fork", # our fork of regress 0.11.1 — the regex engine (see its FORK.md)
@@ -25,7 +26,7 @@ license = "Apache-2.0"
 
 # Shared dependency versions referenced via `.workspace = true` (one resolved
 # copy each). `rustc-hash` is the engine's fast hasher; `dynasm`/`dynasmrt` back
-# its optional native x86-64 JIT.
+# its optional native x86-64 and ARM64 JITs.
 [workspace.dependencies]
 rustc-hash = "2"
 dynasm = "5.1"

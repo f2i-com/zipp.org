@@ -87,6 +87,94 @@ pub enum HostValue {
 /// graph cannot exhaust the native stack (this walk is natively recursive).
 const MAX_DEPTH: usize = 64;
 
+/// Default structural-conversion limits used at every host boundary.
+///
+/// A depth limit alone is not sufficient: a guest can build a tiny shared DAG
+/// (`x = [x, x]` repeatedly) whose tree-shaped host representation expands
+/// exponentially. These limits bound the representation itself, including
+/// object keys and string payloads, before it is handed to an embedder.
+pub const DEFAULT_HOST_VALUE_MAX_NODES: usize = 100_000;
+pub const DEFAULT_HOST_VALUE_MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct HostValueBudget {
+    max_nodes: usize,
+    used_nodes: usize,
+    max_string_bytes: usize,
+    used_string_bytes: usize,
+}
+
+impl HostValueBudget {
+    pub fn new(max_nodes: usize, max_string_bytes: usize) -> Self {
+        Self {
+            max_nodes,
+            used_nodes: 0,
+            max_string_bytes,
+            used_string_bytes: 0,
+        }
+    }
+
+    pub fn charge_node(&mut self) -> Result<(), String> {
+        if self.used_nodes >= self.max_nodes {
+            return Err(format!(
+                "RangeError: host value exceeds the conversion node limit ({})",
+                self.max_nodes
+            ));
+        }
+        self.used_nodes += 1;
+        Ok(())
+    }
+
+    pub fn charge_string(&mut self, value: &str) -> Result<(), String> {
+        let Some(total) = self.used_string_bytes.checked_add(value.len()) else {
+            return Err(self.string_limit_error());
+        };
+        if total > self.max_string_bytes {
+            return Err(self.string_limit_error());
+        }
+        self.used_string_bytes = total;
+        Ok(())
+    }
+
+    /// Check a lower bound before allocating a UTF-8 copy. UTF-8 always uses
+    /// at least one byte per UTF-16 code unit, so rejection here has no false
+    /// negatives; the exact byte count is charged after conversion.
+    pub fn ensure_string_units(&self, units: usize) -> Result<(), String> {
+        if units > self.max_string_bytes.saturating_sub(self.used_string_bytes) {
+            return Err(self.string_limit_error());
+        }
+        Ok(())
+    }
+
+    /// Check a container's immediate children before cloning/reserving them.
+    /// They are charged individually as the walk visits them.
+    pub fn ensure_nodes(&self, additional: usize) -> Result<(), String> {
+        if additional > self.max_nodes.saturating_sub(self.used_nodes) {
+            return Err(format!(
+                "RangeError: host value exceeds the conversion node limit ({})",
+                self.max_nodes
+            ));
+        }
+        Ok(())
+    }
+
+    fn string_limit_error(&self) -> String {
+        format!(
+            "RangeError: host value exceeds the conversion string limit ({} bytes)",
+            self.max_string_bytes
+        )
+    }
+}
+
+impl Default for HostValueBudget {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_HOST_VALUE_MAX_NODES,
+            DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+        )
+    }
+}
+
 impl<'p> Vm<'p> {
     /// The program's top-level bindings, in slot order.
     ///
@@ -123,17 +211,18 @@ impl<'p> Vm<'p> {
     /// Read global slot `index` as owned data. Out-of-range and
     /// never-initialized slots read as `Undefined`, matching what the script
     /// itself would observe.
-    pub(crate) fn host_get_slot(&mut self, index: u32) -> HostValue {
+    pub(crate) fn host_get_slot(&mut self, index: u32) -> Result<HostValue, String> {
         let v = match self.globals.get(index as usize) {
             Some(v) => *v,
-            None => return HostValue::Undefined,
+            None => return Ok(HostValue::Undefined),
         };
         if v.is_uninitialized() {
-            return HostValue::Undefined;
+            return Ok(HostValue::Undefined);
         }
         let _g = self.gc_lock_guard();
         let mut seen: Vec<u32> = Vec::new();
-        self.host_out(v, 0, &mut seen)
+        let mut budget = HostValueBudget::default();
+        self.host_out(v, 0, &mut seen, &mut budget)
     }
 
     /// Write global slot `index`. Returns `false` — leaving the slot untouched
@@ -186,7 +275,8 @@ impl<'p> Vm<'p> {
             Ok(v) => {
                 let _g = self.gc_lock_guard();
                 let mut seen: Vec<u32> = Vec::new();
-                Ok(self.host_out(v, 0, &mut seen))
+                let mut budget = HostValueBudget::default();
+                self.host_out(v, 0, &mut seen, &mut budget)
             }
             Err(t) => Err(t.0),
         }
@@ -212,43 +302,58 @@ impl<'p> Vm<'p> {
 
     /// `Value` → [`HostValue`]. `seen` carries the heap indices on the path from
     /// the root, so a back-edge becomes `Null` instead of recursing forever.
-    fn host_out(&mut self, v: Value, depth: usize, seen: &mut Vec<u32>) -> HostValue {
+    fn host_out(
+        &mut self,
+        v: Value,
+        depth: usize,
+        seen: &mut Vec<u32>,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, String> {
+        budget.charge_node()?;
         if v.is_undefined() || v.is_uninitialized() {
-            return HostValue::Undefined;
+            return Ok(HostValue::Undefined);
         }
         if v.is_null() {
-            return HostValue::Null;
+            return Ok(HostValue::Null);
         }
         if v.is_bool() {
-            return HostValue::Bool(v.as_bool());
+            return Ok(HostValue::Bool(v.as_bool()));
         }
         if v.is_int() {
-            return HostValue::Number(v.as_int() as f64);
+            return Ok(HostValue::Number(v.as_int() as f64));
         }
         if v.is_double() {
-            return HostValue::Number(v.as_f64());
+            return Ok(HostValue::Number(v.as_f64()));
         }
         if !v.is_heap() {
-            return HostValue::Opaque;
+            return Ok(HostValue::Opaque);
         }
         let idx = v.heap_index();
         if depth >= MAX_DEPTH || seen.contains(&idx) {
-            return HostValue::Null;
+            return Ok(HostValue::Null);
         }
 
         // Classify and copy out of the heap in a short borrow, so the recursive
         // step below is free to allocate and mutate.
         enum Shape {
-            Str,
+            Str { units: usize },
             Array(Vec<Value>),
             Object(Vec<(String, Value)>),
             Opaque,
         }
         let shape = match self.heap.get(idx) {
-            HeapObj::Str(_) | HeapObj::Cons { .. } => Shape::Str,
-            HeapObj::Array(items) => Shape::Array(items.clone()),
+            HeapObj::Str(s) => Shape::Str { units: s.units() },
+            HeapObj::Cons { len, .. } => Shape::Str { units: *len },
+            HeapObj::Array(items) => {
+                budget.ensure_nodes(items.len())?;
+                Shape::Array(items.clone())
+            }
             HeapObj::Object(m) => {
-                let mut pairs = Vec::with_capacity(m.keys.len());
+                let count = (0..m.keys.len())
+                    .filter(|&i| m.attrs[i].enumerable && !m.attrs[i].accessor)
+                    .count();
+                budget.ensure_nodes(count)?;
+                let mut pairs = Vec::with_capacity(count);
                 for i in 0..m.keys.len() {
                     let a = &m.attrs[i];
                     // Accessors are not invoked: running user code in the middle
@@ -256,6 +361,7 @@ impl<'p> Vm<'p> {
                     if !a.enumerable || a.accessor {
                         continue;
                     }
+                    budget.charge_string(&m.keys[i])?;
                     pairs.push((m.keys[i].clone(), m.vals[i]));
                 }
                 Shape::Object(pairs)
@@ -264,34 +370,40 @@ impl<'p> Vm<'p> {
         };
 
         match shape {
-            Shape::Opaque => HostValue::Opaque,
-            Shape::Str => match self.to_js_string(v) {
-                Ok(s) => HostValue::String(s),
-                Err(_) => HostValue::String(String::new()),
-            },
+            Shape::Opaque => Ok(HostValue::Opaque),
+            Shape::Str { units } => {
+                budget.ensure_string_units(units)?;
+                let s = self.to_js_string(v).unwrap_or_default();
+                budget.charge_string(&s)?;
+                Ok(HostValue::String(s))
+            }
             Shape::Array(items) => {
                 seen.push(idx);
-                let out = items
+                let out: Result<Vec<_>, _> = items
                     .into_iter()
                     .map(|it| {
                         if it.is_hole() {
-                            HostValue::Undefined
+                            budget.charge_node()?;
+                            Ok(HostValue::Undefined)
                         } else {
-                            self.host_out(it, depth + 1, seen)
+                            self.host_out(it, depth + 1, seen, budget)
                         }
                     })
                     .collect();
                 seen.pop();
-                HostValue::Array(out)
+                Ok(HostValue::Array(out?))
             }
             Shape::Object(pairs) => {
                 seen.push(idx);
-                let out = pairs
+                let out: Result<Vec<_>, String> = pairs
                     .into_iter()
-                    .map(|(k, val)| (k, self.host_out(val, depth + 1, seen)))
+                    .map(|(k, val)| {
+                        self.host_out(val, depth + 1, seen, budget)
+                            .map(|value| (k, value))
+                    })
                     .collect();
                 seen.pop();
-                HostValue::Object(out)
+                Ok(HostValue::Object(out?))
             }
         }
     }

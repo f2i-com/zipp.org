@@ -17,6 +17,11 @@ const DEFAULT_MAX_STEPS: u64 = 50_000_000;
 const DEFAULT_MAX_HEAP_MB: usize = 128;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1 << 20;
 const MAX_SOURCE_BYTES: u64 = 16 << 20;
+const MAX_DYNAMIC_SOURCE_BYTES: usize = 64 << 10;
+const MAX_DYNAMIC_TOTAL_SOURCE_BYTES: usize = 1 << 20;
+const MAX_DYNAMIC_CALLS: usize = 256;
+const MAX_DYNAMIC_FUNCTIONS: usize = 4_096;
+const MAX_DYNAMIC_CLASSES: usize = 1_024;
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const MAX_OUTPUT_BYTES: usize = 64 << 20;
 
@@ -75,6 +80,10 @@ impl Drop for ChildGuard {
 }
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
+    run_supervisor(args).map_err(|error| sanitize_diagnostic(&error))
+}
+
+fn run_supervisor(args: &[String]) -> Result<(), String> {
     if matches!(args, [arg] if arg == "--help" || arg == "-h") {
         print_help();
         return Ok(());
@@ -84,13 +93,18 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
 
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot locate the zipp executable: {e}"))?;
-    let cwd = config
-        .script
+    // The child process must not start in the untrusted script directory. On
+    // Windows the process cwd participates in DLL search and device/path
+    // resolution before the VM has installed any of its language-level
+    // confinement. The executable's install directory is the trusted launch
+    // location; the canonical absolute script path and the explicit module
+    // base below keep relative imports script-relative instead of cwd-relative.
+    let child_cwd = exe
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+        .ok_or("cannot determine the zipp executable directory")?;
 
-    let mut command = Command::new(exe);
+    let mut command = Command::new(&exe);
     command
         .arg("__sandbox-child")
         .arg("--max-steps")
@@ -105,7 +119,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
     command
         .arg("--")
         .arg(&config.script)
-        .current_dir(cwd)
+        .current_dir(child_cwd)
         .env_clear()
         // The VM JIT and regress' regex JIT have independent switches. Set
         // both in the clean child environment before either subsystem can
@@ -228,6 +242,10 @@ fn print_help() {
 /// command; all inputs are still re-validated because users can invoke it
 /// directly.
 pub(crate) fn run_child(args: &[String]) -> Result<(), String> {
+    run_child_inner(args).map_err(|error| sanitize_diagnostic(&error))
+}
+
+fn run_child_inner(args: &[String]) -> Result<(), String> {
     // Defense in depth for direct invocations of this hidden command: both
     // native-code switches must be set before parsing, compiling, or running
     // anything that could initialize either JIT.
@@ -241,6 +259,13 @@ pub(crate) fn run_child(args: &[String]) -> Result<(), String> {
     let mut state = zipp_vm::embed::compile_script(&source)?;
     state.disable_vm_jit();
     state.set_limits(config.max_steps, None);
+    state.set_dynamic_code_limits(
+        MAX_DYNAMIC_SOURCE_BYTES,
+        MAX_DYNAMIC_TOTAL_SOURCE_BYTES,
+        MAX_DYNAMIC_CALLS,
+        MAX_DYNAMIC_FUNCTIONS,
+        MAX_DYNAMIC_CLASSES,
+    );
     state.set_output_limit(config.max_output_bytes);
     let heap_bytes = config
         .max_heap_mb
@@ -258,13 +283,21 @@ pub(crate) fn run_child(args: &[String]) -> Result<(), String> {
     }
 
     let result = state.run_init();
+    // A guest can turn some failures into rejected promises. The recorder's
+    // sticky, typed status is authoritative and must be checked after every
+    // guest entry rather than trusting only the direct return value.
+    let resource_error = state.resource_limit_error();
     for line in state.take_output() {
         println!("{line}");
     }
     for line in state.take_errput() {
         eprintln!("{line}");
     }
-    result.map(|_| ())
+    if let Some(error) = resource_error {
+        Err(error.into())
+    } else {
+        result.map(|_| ())
+    }
 }
 
 fn parse_public(args: &[String]) -> Result<Config, String> {
@@ -419,7 +452,88 @@ fn read_script(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "sandbox script is not valid UTF-8".into())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForbiddenWindowsPrefix {
+    Unc,
+    Device,
+    VerbatimNetwork,
+}
+
+/// Classify Windows path namespaces that must never reach a filesystem API.
+///
+/// This is deliberately a string-level check instead of `Path::components`:
+/// Windows prefixes are otherwise ordinary filename bytes when the same test
+/// runs on Unix, and the security property needs a platform-independent unit
+/// test that cannot accidentally touch a network share. Mixed slash spellings
+/// are accepted by Windows APIs, so both separators are treated alike here.
+fn forbidden_windows_prefix(value: &str) -> Option<ForbiddenWindowsPrefix> {
+    fn sep(byte: u8) -> bool {
+        byte == b'\\' || byte == b'/'
+    }
+
+    fn component_eq(input: &[u8], expected: &[u8]) -> bool {
+        input.len() >= expected.len()
+            && input[..expected.len()].eq_ignore_ascii_case(expected)
+            && (input.len() == expected.len() || sep(input[expected.len()]))
+    }
+
+    fn verbatim_disk(input: &[u8]) -> bool {
+        input.len() >= 3 && input[0].is_ascii_alphabetic() && input[1] == b':' && sep(input[2])
+    }
+
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && sep(bytes[0]) && sep(bytes[1]) {
+        if bytes.len() >= 4 && bytes[2] == b'?' && sep(bytes[3]) {
+            let tail = &bytes[4..];
+            if component_eq(tail, b"UNC") {
+                return Some(ForbiddenWindowsPrefix::VerbatimNetwork);
+            }
+            // `canonicalize` commonly returns this spelling for an ordinary
+            // local drive path, and the supervisor passes that absolute path
+            // to the child. Keep it usable; reject every other verbatim
+            // namespace (`GLOBALROOT`, Volume GUIDs, and similar devices).
+            return (!verbatim_disk(tail)).then_some(ForbiddenWindowsPrefix::Device);
+        }
+        if bytes.len() >= 4 && bytes[2] == b'.' && sep(bytes[3]) {
+            return Some(ForbiddenWindowsPrefix::Device);
+        }
+        return Some(ForbiddenWindowsPrefix::Unc);
+    }
+
+    // Native NT namespace spellings are not ordinary UNC paths but can still
+    // name devices or redirect into the object manager.
+    if !bytes.is_empty() && sep(bytes[0]) {
+        let tail = &bytes[1..];
+        if component_eq(tail, b"??") || component_eq(tail, b"Device") {
+            return Some(ForbiddenWindowsPrefix::Device);
+        }
+    }
+    None
+}
+
+fn reject_forbidden_windows_path(value: &str, what: &str) -> Result<(), String> {
+    // A leading `//` is a valid (and normally local) absolute spelling on
+    // Unix. Keep the classifier portable for pure tests, but enforce these
+    // Windows namespace rules only on the platform where they have device or
+    // network semantics.
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let Some(prefix) = forbidden_windows_prefix(value) else {
+        return Ok(());
+    };
+    let kind = match prefix {
+        ForbiddenWindowsPrefix::Unc => "UNC/network",
+        ForbiddenWindowsPrefix::Device => "device namespace",
+        ForbiddenWindowsPrefix::VerbatimNetwork => "verbatim network",
+    };
+    Err(format!(
+        "{what} uses a Windows {kind} path, which sandbox does not allow"
+    ))
+}
+
 fn canonical_file(value: &str, what: &str) -> Result<PathBuf, String> {
+    reject_forbidden_windows_path(value, what)?;
     let path = std::fs::canonicalize(value)
         .map_err(|e| format!("cannot resolve {what} '{value}': {e}"))?;
     if !path.is_file() {
@@ -429,6 +543,7 @@ fn canonical_file(value: &str, what: &str) -> Result<PathBuf, String> {
 }
 
 fn canonical_dir(value: &str, what: &str) -> Result<PathBuf, String> {
+    reject_forbidden_windows_path(value, what)?;
     let path = std::fs::canonicalize(value)
         .map_err(|e| format!("cannot resolve {what} '{value}': {e}"))?;
     if !path.is_dir() {
@@ -449,24 +564,24 @@ fn parse_usize(name: &str, value: &str) -> Result<usize, String> {
         .map_err(|_| format!("{name} expects a positive integer, got '{value}'"))
 }
 
-fn sanitize_terminal(bytes: &[u8]) -> Vec<u8> {
-    fn unsafe_format(ch: char) -> bool {
-        // Directional overrides/isolates can visually reorder a later status
-        // line without being C0/C1 controls. Preserve ordinary Unicode (and
-        // emoji ZWJ), but neutralize the formatting characters used in bidi
-        // terminal/log spoofing plus Unicode's extra line separators.
-        matches!(
-            ch,
-            '\u{061c}'
-                | '\u{200e}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
-    }
+fn unsafe_terminal_format(ch: char) -> bool {
+    // Directional overrides/isolates can visually reorder a later status line
+    // without being C0/C1 controls. Preserve ordinary Unicode (and emoji ZWJ),
+    // but neutralize bidi formatting plus Unicode's extra line separators.
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{206f}'
+    )
+}
 
-    fn append(out: &mut Vec<u8>, text: &str) {
+fn sanitize_text(bytes: &[u8], preserve_layout: bool) -> Vec<u8> {
+    fn append(out: &mut Vec<u8>, text: &str, preserve_layout: bool) {
         for ch in text.chars() {
-            if (ch.is_control() && ch != '\n' && ch != '\t') || unsafe_format(ch) {
+            let allowed_layout = preserve_layout && matches!(ch, '\n' | '\t');
+            if (ch.is_control() && !allowed_layout) || unsafe_terminal_format(ch) {
                 out.push(b'?');
             } else {
                 let mut encoded = [0_u8; 4];
@@ -480,7 +595,7 @@ fn sanitize_terminal(bytes: &[u8]) -> Vec<u8> {
     while !rest.is_empty() {
         match std::str::from_utf8(rest) {
             Ok(text) => {
-                append(&mut out, text);
+                append(&mut out, text, preserve_layout);
                 break;
             }
             Err(err) => {
@@ -489,6 +604,7 @@ fn sanitize_terminal(bytes: &[u8]) -> Vec<u8> {
                     append(
                         &mut out,
                         std::str::from_utf8(&rest[..valid]).expect("validated UTF-8 prefix"),
+                        preserve_layout,
                     );
                 }
                 out.push(b'?');
@@ -498,6 +614,19 @@ fn sanitize_terminal(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+fn sanitize_terminal(bytes: &[u8]) -> Vec<u8> {
+    sanitize_text(bytes, true)
+}
+
+/// Sanitize a supervisor/argument error as one inert terminal line. Unlike
+/// guest stdout/stderr, a diagnostic has no legitimate embedded layout, so
+/// newlines and tabs are neutralized alongside ESC, OSC terminators, bidi
+/// formatting, C0/C1 controls, and invalid UTF-8.
+fn sanitize_diagnostic(error: &str) -> String {
+    String::from_utf8(sanitize_text(error.as_bytes(), false))
+        .expect("the diagnostic sanitizer always emits UTF-8")
 }
 
 fn drain_bounded<R: Read + Send + 'static>(
@@ -525,4 +654,59 @@ fn drain_bounded<R: Read + Send + 'static>(
             kept
         })
         .map_err(|e| format!("cannot start sandbox output reader: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_network_and_device_prefixes_are_classified_lexically() {
+        let cases = [
+            (r"\\server\share\entry.js", ForbiddenWindowsPrefix::Unc),
+            (r"//server/share/entry.js", ForbiddenWindowsPrefix::Unc),
+            (r"\\.\PIPE\zipp", ForbiddenWindowsPrefix::Device),
+            (r"//./NUL", ForbiddenWindowsPrefix::Device),
+            (
+                r"\\?\UNC\server\share\entry.js",
+                ForbiddenWindowsPrefix::VerbatimNetwork,
+            ),
+            (
+                r"//?/uNc/server/share/entry.js",
+                ForbiddenWindowsPrefix::VerbatimNetwork,
+            ),
+            (
+                r"\\?\GLOBALROOT\Device\HarddiskVolume1",
+                ForbiddenWindowsPrefix::Device,
+            ),
+            (r"\??\C:\entry.js", ForbiddenWindowsPrefix::Device),
+            (r"\Device\NamedPipe\zipp", ForbiddenWindowsPrefix::Device),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(forbidden_windows_prefix(path), Some(expected), "{path}");
+        }
+
+        for path in [
+            r"C:\repo\entry.js",
+            r"relative\entry.js",
+            r"\rooted\entry.js",
+            r"\\?\C:\repo\entry.js",
+            "/tmp/repo/entry.js",
+        ] {
+            assert_eq!(forbidden_windows_prefix(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_sanitizer_removes_layout_controls_and_bidi() {
+        let input = "prefix\x1b]0;pwn\x07\nline\ttab\u{202e}spoof\u{2069}✓";
+        let diagnostic = sanitize_diagnostic(input);
+        assert_eq!(diagnostic, "prefix?]0;pwn??line?tab?spoof?✓");
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert!(!diagnostic.chars().any(unsafe_terminal_format));
+
+        let forwarded = String::from_utf8(sanitize_terminal(input.as_bytes())).unwrap();
+        assert_eq!(forwarded, "prefix?]0;pwn?\nline\ttab?spoof?✓");
+        assert_eq!(sanitize_text(b"ok\xff\x1b", false), b"ok??");
+    }
 }

@@ -27,6 +27,15 @@ impl<'p> Vm<'p> {
         prealloc: Option<&std::collections::HashMap<u32, u32>>,
     ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
+        // Eval and confined modules share these stable-address tables. Bound
+        // their concrete additions before global-map/GDI mutation and before
+        // any FuncProto/ClassDef is leaked into the VM-lifetime tables.
+        #[cfg(feature = "instrument")]
+        self.instrument_dynamic_code_install(
+            eval_prog.functions.len(),
+            eval_prog.classes.len(),
+        )
+        .map_err(|message| Thrown(message.into()))?;
         // A $262.evalScript: SCRIPT GlobalDeclarationInstantiation semantics
         // for THIS program only (lexical-collision SyntaxErrors, realm-
         // persistent lexicals, non-configurable brandNew var/fn bindings).

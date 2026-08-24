@@ -4769,6 +4769,7 @@ fn tier_coverage_report() {
 /// its body with `| 0`, and `fn_int::can_compile` admits no `Bitwise` op, so
 /// every generated recursion landed on Tier C instead. Both halves of that are
 /// pinned here — the engine's new line, and the generator shape that reaches it.
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn tier_a_is_reached() {
     if parent_guard() {

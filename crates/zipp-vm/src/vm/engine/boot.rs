@@ -264,6 +264,9 @@ impl<'p> Vm<'p> {
             module_base_dir: None,
             module_root: None,
             module_max_bytes: None,
+            module_read_bytes: std::collections::HashMap::new(),
+            module_total_bytes: 0,
+            module_load_depth: 0,
             module_cache: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
             module_own: std::collections::HashMap::new(),
@@ -347,9 +350,15 @@ impl<'p> Vm<'p> {
             string_iter_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
-            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            #[cfg(all(
+                feature = "jit",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
             jit: crate::codegen::Jit::new(),
-            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            #[cfg(all(
+                feature = "jit",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
             jit_enabled: std::env::var_os("ZIPP_NOJIT").is_none(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_recurse_depth: 0,
@@ -410,10 +419,26 @@ impl<'p> Vm<'p> {
 
     /// Force the JIT on/off (overrides the `ZIPP_NOJIT` default). Used by the
     /// test suite to run a program both ways and assert the outputs match.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "jit",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[allow(dead_code)] // used by the differential test harness (run_nojit)
     pub(crate) fn set_jit_enabled(&mut self, on: bool) {
+        // The first ARM64 tier has no native step-meter yet. Once a recorder or
+        // budget is attached, it must remain interpreted even if a caller later
+        // tries to re-enable the JIT through the differential-test hook.
+        #[cfg(all(feature = "instrument", target_arch = "aarch64"))]
+        if self.instr_rec.is_some() {
+            self.jit_enabled = false;
+            return;
+        }
         self.jit_enabled = on;
+    }
+
+    #[cfg(all(test, feature = "jit", target_arch = "aarch64"))]
+    pub(crate) fn arm_jit_compiled_count(&self) -> usize {
+        self.jit.compiled_count()
     }
 
     /// Attach a step budget / abort flag / trace recorder to this VM.
@@ -439,6 +464,12 @@ impl<'p> Vm<'p> {
                 self.jit.set_meter(crate::codegen::meter::Meter { steps_off: off });
             }
         }
+        #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+        {
+            // ARM64 native metering is intentionally not claimed by the
+            // baseline backend. Fail closed until the emitted block meter lands.
+            self.jit_enabled = false;
+        }
     }
 
     /// Switch the JIT off for this VM's lifetime, because a trace is being
@@ -452,7 +483,10 @@ impl<'p> Vm<'p> {
     /// natively (it is a counter); a trace cannot.
     #[cfg(feature = "instrument")]
     pub(crate) fn enter_trace_mode(&mut self) {
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        #[cfg(all(
+            feature = "jit",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         {
             self.jit_enabled = false;
         }

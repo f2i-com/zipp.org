@@ -32,7 +32,10 @@ use crate::bytecode::Program;
 use crate::value::Value;
 use crate::vm::Vm;
 
-pub use crate::vm::host_api::{HostValue, Symbol, SymbolScope};
+pub use crate::vm::host_api::{
+    HostValue, HostValueBudget, Symbol, SymbolScope, DEFAULT_HOST_VALUE_MAX_NODES,
+    DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+};
 /// The execution-trace row and its opcode contract. See
 /// [`ScriptState::start_trace`].
 #[cfg(feature = "instrument")]
@@ -132,7 +135,10 @@ pub fn compile_script(src: &str) -> Result<ScriptState, String> {
     // job should reach. This API is the untrusted-code path; it does not get
     // the harness. `zipp js` and the test262 runner still do.
     vm.host_262 = false;
-    Ok(ScriptState { vm: Some(vm), program })
+    Ok(ScriptState {
+        vm: Some(vm),
+        program,
+    })
 }
 
 /// Parse + compile, applying the same Annex B call-assignment-target parse
@@ -192,7 +198,7 @@ impl ScriptState {
     /// both whole-function and loop-region VM JITs without allocating a trace.
     #[cfg(feature = "instrument")]
     pub fn disable_vm_jit(&mut self) {
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         if let Some(vm) = self.vm.as_mut() {
             vm.set_jit_enabled(false);
         }
@@ -298,12 +304,18 @@ impl ScriptState {
     /// buffer. Un-drained output accumulates for the VM's lifetime, so a
     /// long-lived embedder should drain (or discard) periodically.
     pub fn take_output(&mut self) -> Vec<String> {
-        self.vm.as_mut().map(|vm| std::mem::take(&mut vm.output)).unwrap_or_default()
+        self.vm
+            .as_mut()
+            .map(|vm| std::mem::take(&mut vm.output))
+            .unwrap_or_default()
     }
 
     /// Take the `console.error`/`console.warn` lines produced so far.
     pub fn take_errput(&mut self) -> Vec<String> {
-        self.vm.as_mut().map(|vm| std::mem::take(&mut vm.errput)).unwrap_or_default()
+        self.vm
+            .as_mut()
+            .map(|vm| std::mem::take(&mut vm.errput))
+            .unwrap_or_default()
     }
 
     // ---- Rich-value API (see `crate::vm::host_api`) -----------------------
@@ -316,19 +328,34 @@ impl ScriptState {
     /// The program's top-level bindings, each with a stable slot index. Call
     /// after [`Self::run_init`] so function declarations have been hoisted.
     pub fn symbols(&self) -> Vec<Symbol> {
-        self.vm.as_ref().map(|vm| vm.host_symbols()).unwrap_or_default()
+        self.vm
+            .as_ref()
+            .map(|vm| vm.host_symbols())
+            .unwrap_or_default()
     }
 
     /// Read the global in `index` as a structured value.
     pub fn get_slot(&mut self, index: u32) -> HostValue {
-        self.vm.as_mut().map(|vm| vm.host_get_slot(index)).unwrap_or(HostValue::Undefined)
+        self.try_get_slot(index).unwrap_or(HostValue::Opaque)
+    }
+
+    /// Read the global in `index` as a structured value, reporting when its
+    /// representation exceeds the host-conversion budget.
+    pub fn try_get_slot(&mut self, index: u32) -> Result<HostValue, String> {
+        match self.vm.as_mut() {
+            Some(vm) => vm.host_get_slot(index),
+            None => Err("zipp: VM has been torn down".into()),
+        }
     }
 
     /// Write the global in `index`. `false` means the write was declined
     /// because the slot holds something that cannot be represented as data (a
     /// function, a class, a `Map`, …) — see [`HostValue::Opaque`].
     pub fn set_slot(&mut self, index: u32, value: &HostValue) -> bool {
-        self.vm.as_mut().map(|vm| vm.host_set_slot(index, value)).unwrap_or(false)
+        self.vm
+            .as_mut()
+            .map(|vm| vm.host_set_slot(index, value))
+            .unwrap_or(false)
     }
 
     /// Call the function in global slot `index` and drain the microtask queue.
@@ -441,6 +468,43 @@ impl ScriptState {
         }
     }
 
+    /// Bound runtime compilation for this script state.
+    ///
+    /// The source/call gate covers every path through the VM's common dynamic
+    /// compiler: direct/indirect `eval`, `Function` constructors,
+    /// `ShadowRealm`, and [`Self::eval_in_context`]. Source bytes and call
+    /// attempts are charged before parsing, including failed parses. The
+    /// function/class limits cap concrete stable-address definitions retained
+    /// by successful dynamic compilations or confined modules, and are checked
+    /// before those definitions are installed.
+    ///
+    /// Requires [`Self::set_limits`] first; without an instrumentation recorder
+    /// this is a no-op. Limits are lifetime totals for the recorder and a limit
+    /// violation is reported through [`Self::resource_limit_error`]. Stable
+    /// function/class definitions are not broadly reclaimed when a
+    /// `ScriptState` is dropped, so these caps bound one state's contribution;
+    /// a multi-tenant host should recycle its process/WASM instance to reclaim
+    /// them between tenants.
+    #[cfg(feature = "instrument")]
+    pub fn set_dynamic_code_limits(
+        &mut self,
+        per_source_bytes: usize,
+        lifetime_source_bytes: usize,
+        calls: usize,
+        functions: usize,
+        classes: usize,
+    ) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.set_dynamic_code_limits(
+                per_source_bytes,
+                lifetime_source_bytes,
+                calls,
+                functions,
+                classes,
+            );
+        }
+    }
+
     /// Start recording an execution trace, stopping at `max_steps` rows.
     ///
     /// Requires [`Self::set_limits`] first (that is what attaches the recorder);
@@ -478,7 +542,10 @@ impl ScriptState {
     /// to an execution that did not happen.
     #[cfg(feature = "instrument")]
     pub fn finish_trace(&mut self, result: u64) -> Option<Vec<TraceStep>> {
-        self.vm.as_mut().and_then(|vm| vm.instr_rec.as_mut())?.finish(result)
+        self.vm
+            .as_mut()
+            .and_then(|vm| vm.instr_rec.as_mut())?
+            .finish(result)
     }
 
     /// Whether the last recording stopped early at the row cap.
@@ -497,8 +564,12 @@ impl ScriptState {
     /// the same whether or not the JIT happened to be running.
     #[cfg(feature = "instrument")]
     pub fn steps_remaining(&self) -> u64 {
-        let Some(vm) = self.vm.as_ref() else { return u64::MAX };
-        let Some(rec) = vm.instr_rec.as_ref() else { return u64::MAX };
+        let Some(vm) = self.vm.as_ref() else {
+            return u64::MAX;
+        };
+        let Some(rec) = vm.instr_rec.as_ref() else {
+            return u64::MAX;
+        };
         if rec.remaining == i64::MAX {
             return u64::MAX;
         }
@@ -518,8 +589,22 @@ impl ScriptState {
     #[cfg(feature = "instrument")]
     pub fn steps_used(&self) -> u64 {
         let Some(vm) = self.vm.as_ref() else { return 0 };
-        let Some(rec) = vm.instr_rec.as_ref() else { return 0 };
+        let Some(rec) = vm.instr_rec.as_ref() else {
+            return 0;
+        };
         rec.used
+    }
+
+    /// Return the recorder's typed resource-exhaustion state, if any.
+    ///
+    /// This deliberately does not inspect a guest exception's text: a script is
+    /// allowed to throw the same string as a budget error without impersonating
+    /// the recorder. Embedders should check this after each guest entry because
+    /// promise/microtask machinery can turn an execution failure into a rejected
+    /// promise instead of returning it directly from the original call.
+    #[cfg(feature = "instrument")]
+    pub fn resource_limit_error(&mut self) -> Option<&'static str> {
+        self.vm.as_mut()?.instrument_resource_limit_error()
     }
 }
 
@@ -598,7 +683,10 @@ fn marshal(vm: &mut Vm<'static>, v: Value) -> JsValue {
     // `ToString`. A `toString` that throws yields `Object("")` rather than
     // propagating — marshalling a result must not manufacture a new throw.
     let is_string = vm.type_of(v) == "string";
-    let s = vm.to_js_string(v).map(|s| s.to_string()).unwrap_or_default();
+    let s = vm
+        .to_js_string(v)
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     if is_string {
         JsValue::String(s)
     } else {
@@ -638,7 +726,8 @@ mod tests {
     fn eval_declarations_persist_across_calls() {
         let mut st = compile_script("var x = 1;").expect("compiles");
         st.run_init().expect("runs");
-        st.eval_in_context("function later() { return x + 41; }").expect("evals");
+        st.eval_in_context("function later() { return x + 41; }")
+            .expect("evals");
         // Script-goal GDI, not eval semantics: `later` outlived its eval.
         assert_eq!(st.call_global("later", &[]), Ok(JsValue::Number(42.0)));
     }
@@ -657,8 +746,14 @@ mod tests {
             assert_eq!(st.call_global("id", std::slice::from_ref(&v)), Ok(v));
         }
         // Objects cross outbound as ToString, never as a live reference.
-        assert_eq!(st.eval_in_context("({a:1})"), Ok(JsValue::Object("[object Object]".into())));
-        assert_eq!(st.eval_in_context("[1,2]"), Ok(JsValue::Object("1,2".into())));
+        assert_eq!(
+            st.eval_in_context("({a:1})"),
+            Ok(JsValue::Object("[object Object]".into()))
+        );
+        assert_eq!(
+            st.eval_in_context("[1,2]"),
+            Ok(JsValue::Object("1,2".into()))
+        );
         // …so structured data crosses as JSON.
         assert_eq!(
             st.eval_in_context("JSON.stringify({a:1})"),
@@ -687,7 +782,10 @@ mod tests {
             "(function(){ try { __zippHostCall('nope'); return 'unreachable'; } \
              catch (e) { return String(e); } })()",
         );
-        assert_eq!(caught, Ok(JsValue::String("Error: no such host call nope".into())));
+        assert_eq!(
+            caught,
+            Ok(JsValue::String("Error: no such host call nope".into()))
+        );
     }
 
     #[test]
@@ -701,7 +799,10 @@ mod tests {
 
     #[test]
     fn errors_are_reported_not_panicked() {
-        assert!(compile_script("function (").is_err(), "syntax error is a compile failure");
+        assert!(
+            compile_script("function (").is_err(),
+            "syntax error is a compile failure"
+        );
 
         let mut st = compile_script("throw new Error('boom');").expect("compiles");
         let err = st.run_init().expect_err("uncaught throw is an Err");
@@ -711,7 +812,10 @@ mod tests {
 
         let mut st = compile_script("var x = 1;").expect("compiles");
         st.run_init().expect("runs");
-        assert!(st.call_global("nope; evil()", &[]).is_err(), "non-identifier is rejected");
+        assert!(
+            st.call_global("nope; evil()", &[]).is_err(),
+            "non-identifier is rejected"
+        );
         assert!(!st.has_global_function("nope"));
         assert!(st.has_global_function("isNaN"));
     }
@@ -719,7 +823,11 @@ mod tests {
     /// Resolve a symbol by name, for tests that care about a binding rather
     /// than a slot number.
     fn slot_of(st: &ScriptState, name: &str) -> u32 {
-        st.symbols().into_iter().find(|s| s.name == name).unwrap_or_else(|| panic!("no {name}")).index
+        st.symbols()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+            .index
     }
 
     #[test]
@@ -735,7 +843,11 @@ mod tests {
         assert_eq!(by("b"), Some(SymbolScope::Variable));
         assert_eq!(by("c"), Some(SymbolScope::Variable));
         assert_eq!(by("f"), Some(SymbolScope::Function));
-        assert_eq!(by("K"), Some(SymbolScope::Function), "a class is callable state");
+        assert_eq!(
+            by("K"),
+            Some(SymbolScope::Function),
+            "a class is callable state"
+        );
         // `Math` is mentioned by the program, so it has a global slot — but it
         // is not a declaration and a host syncing it would be syncing the
         // standard library.
@@ -803,12 +915,19 @@ mod tests {
         st.run_init().expect("runs");
 
         for name in ["keep", "m", "d"] {
-            assert_eq!(st.get_slot(slot_of(&st, name)), HostValue::Opaque, "{name} is opaque");
+            assert_eq!(
+                st.get_slot(slot_of(&st, name)),
+                HostValue::Opaque,
+                "{name} is opaque"
+            );
         }
         // A host that read the whole global set and wrote it back must not
         // destroy the function it read as `Opaque`.
         let keep = slot_of(&st, "keep");
-        assert!(!st.set_slot(keep, &HostValue::Number(1.0)), "write to a function slot is declined");
+        assert!(
+            !st.set_slot(keep, &HostValue::Number(1.0)),
+            "write to a function slot is declined"
+        );
         assert!(!st.set_slot(keep, &HostValue::Opaque));
         assert_eq!(st.eval_in_context("keep()"), Ok(JsValue::Number(42.0)));
     }
@@ -818,10 +937,9 @@ mod tests {
         // Exactly what a UI host does to a bridge object: read it, spread it,
         // add a key, write it back. The methods it could not see come back as
         // Null, and must not land as Null.
-        let mut st = compile_script(
-            "var bridge = { greet: function (n) { return 'hi ' + n; }, count: 1 };",
-        )
-        .expect("compiles");
+        let mut st =
+            compile_script("var bridge = { greet: function (n) { return 'hi ' + n; }, count: 1 };")
+                .expect("compiles");
         st.run_init().expect("runs");
         let slot = slot_of(&st, "bridge");
 
@@ -851,22 +969,33 @@ mod tests {
 
         // A key the host omits entirely is preserved when opaque, dropped when
         // it is data the host chose not to send back.
-        assert!(st.set_slot(slot, &HostValue::Object(vec![("count".into(), HostValue::Number(3.0))])));
-        assert_eq!(st.eval_in_context("bridge.greet('x')"), Ok(JsValue::String("hi x".into())));
-        assert_eq!(st.eval_in_context("typeof bridge.added"), Ok(JsValue::String("undefined".into())));
+        assert!(st.set_slot(
+            slot,
+            &HostValue::Object(vec![("count".into(), HostValue::Number(3.0))])
+        ));
+        assert_eq!(
+            st.eval_in_context("bridge.greet('x')"),
+            Ok(JsValue::String("hi x".into()))
+        );
+        assert_eq!(
+            st.eval_in_context("typeof bridge.added"),
+            Ok(JsValue::String("undefined".into()))
+        );
 
         // But an explicit value always wins — this protects what the host could
         // not express, never what it deliberately set.
-        assert!(st.set_slot(slot, &HostValue::Object(vec![("greet".into(), HostValue::Number(9.0))])));
+        assert!(st.set_slot(
+            slot,
+            &HostValue::Object(vec![("greet".into(), HostValue::Number(9.0))])
+        ));
         assert_eq!(st.eval_in_context("bridge.greet"), Ok(JsValue::Number(9.0)));
     }
 
     #[test]
     fn cycles_and_holes_do_not_hang_the_walk() {
-        let mut st = compile_script(
-            "var cyc = { name: 'root' }; cyc.self = cyc; var sparse = [1, , 3];",
-        )
-        .expect("compiles");
+        let mut st =
+            compile_script("var cyc = { name: 'root' }; cyc.self = cyc; var sparse = [1, , 3];")
+                .expect("compiles");
         st.run_init().expect("runs");
         // The back-edge becomes Null rather than recursing forever.
         assert_eq!(
@@ -887,6 +1016,37 @@ mod tests {
     }
 
     #[test]
+    fn shared_dag_is_stopped_by_the_host_conversion_budget() {
+        let mut st = compile_script("var dag = 0; for (var i = 0; i < 32; i++) dag = [dag, dag];")
+            .expect("compiles");
+        st.run_init().expect("runs");
+        let err = st
+            .try_get_slot(slot_of(&st, "dag"))
+            .expect_err("the expanded representation must be bounded");
+        assert!(err.contains("conversion node limit"), "got {err:?}");
+        assert_eq!(
+            st.get_slot(slot_of(&st, "dag")),
+            HostValue::Opaque,
+            "the compatibility getter fails closed"
+        );
+    }
+
+    #[test]
+    fn host_conversion_budget_counts_nodes_and_utf8_bytes_exactly() {
+        let mut budget = HostValueBudget::new(2, 4);
+        budget.charge_node().expect("first node");
+        budget.charge_node().expect("second node");
+        assert!(budget.charge_node().unwrap_err().contains("node limit"));
+
+        budget.charge_string("a").expect("one byte");
+        budget.charge_string("é").expect("two bytes");
+        assert!(budget
+            .charge_string("xy")
+            .unwrap_err()
+            .contains("string limit"));
+    }
+
+    #[test]
     fn call_slot_passes_structures_and_sees_mutations() {
         let mut st = compile_script(
             "var log = []; function add(item, n) { for (var i = 0; i < n; i++) log.push(item.id); \
@@ -896,7 +1056,9 @@ mod tests {
         st.run_init().expect("runs");
         let add = slot_of(&st, "add");
         let arg = HostValue::Object(vec![("id".into(), HostValue::String("x".into()))]);
-        let got = st.call_slot(add, &[arg, HostValue::Number(2.0)]).expect("calls");
+        let got = st
+            .call_slot(add, &[arg, HostValue::Number(2.0)])
+            .expect("calls");
         assert_eq!(
             got,
             HostValue::Object(vec![
@@ -907,10 +1069,15 @@ mod tests {
         // The in-place mutation of a global the call performed is visible.
         assert_eq!(
             st.get_slot(slot_of(&st, "log")),
-            HostValue::Array(vec![HostValue::String("x".into()), HostValue::String("x".into())])
+            HostValue::Array(vec![
+                HostValue::String("x".into()),
+                HostValue::String("x".into())
+            ])
         );
         // A throw is an Err, and the VM stays usable afterwards.
-        assert!(st.call_slot(add, &[HostValue::Null, HostValue::Number(1.0)]).is_err());
+        assert!(st
+            .call_slot(add, &[HostValue::Null, HostValue::Number(1.0)])
+            .is_err());
         assert_eq!(st.eval_in_context("1 + 1"), Ok(JsValue::Number(2.0)));
     }
 
@@ -931,8 +1098,10 @@ mod tests {
     /// this a click handler's `setState` never takes effect.
     #[test]
     fn microtasks_scheduled_by_a_reentry_can_be_drained() {
-        let mut st = compile_script("var log = []; function go() { Promise.resolve().then(function(){ log.push('ran') }) }")
-            .expect("compiles");
+        let mut st = compile_script(
+            "var log = []; function go() { Promise.resolve().then(function(){ log.push('ran') }) }",
+        )
+        .expect("compiles");
         st.run_init().expect("runs");
         st.call_global("go", &[]).expect("calls");
         // The reaction is queued, not run: call_global returns as soon as `go` does.
@@ -964,5 +1133,36 @@ mod tests {
         assert!(err.contains("output budget"), "{err}");
         let retained: usize = st.take_output().iter().map(|line| line.len() + 1).sum();
         assert!(retained <= 64, "retained {retained} bytes");
+    }
+
+    #[cfg(feature = "instrument")]
+    #[test]
+    fn resource_limit_status_is_typed_and_survives_microtask_rejection() {
+        let mut spoof =
+            compile_script(r#"throw "RangeError: script exceeded its instruction budget";"#)
+                .expect("compiles");
+        spoof.set_limits(10_000, None);
+        let err = spoof.run_init().expect_err("guest throw surfaces");
+        assert!(err.contains("instruction budget"), "{err}");
+        assert_eq!(
+            spoof.resource_limit_error(),
+            None,
+            "guest-controlled exception text must not impersonate the recorder"
+        );
+
+        let mut exhausted = compile_script(
+            "function go() { Promise.resolve().then(function () { for (;;) {} }); }",
+        )
+        .expect("compiles");
+        exhausted.set_limits(10_000, None);
+        exhausted.run_init().expect("initializes within budget");
+        let go = slot_of(&exhausted, "go");
+        exhausted
+            .call_slot(go, &[])
+            .expect("the callback failure becomes a rejected promise");
+        let error = exhausted
+            .resource_limit_error()
+            .expect("recorder status survives promise rejection");
+        assert!(error.contains("instruction budget"), "{error}");
     }
 }

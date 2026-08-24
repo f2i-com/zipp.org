@@ -28,7 +28,7 @@ dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
 
 [features]
-# Native x86-64 JIT tier (dynasm). On by default on supported targets; the
+# Native x86-64 and ARM64 JIT tiers (dynasm). On by default on supported targets; the
 # `codegen` module is `#[cfg(feature = "jit")]` so a `--no-default-features`
 # build is a pure interpreter with no unsafe codegen.
 default = ["jit"]

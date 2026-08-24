@@ -256,8 +256,9 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             // Dynamic JavaScript engine (zipp-vm): a NaN-boxed, explicit-frame
             // register VM (recursion lives in an explicit frame stack, not the
-            // native stack) with a native x86-64 OSR JIT. console.log streams to
-            // stdout during eval, like `node file.js`. (`js` and `js-vm` are
+            // native stack) with native x86-64 and guarded ARM64 JITs.
+            // console.log streams to stdout during eval, like `node file.js`.
+            // (`js` and `js-vm` are
             // aliases for the same engine.)
             // `--script-goal` parses under the PURE Script goal: top-level
             // `return` is a SyntaxError and `import`/`export` are not accepted
@@ -580,7 +581,9 @@ fn build_identity(json: bool) -> String {
     );
     s += &format!(
         "jit:       {}\n",
-        if jit {
+        if jit && cfg!(target_arch = "aarch64") {
+            "ARM64 native"
+        } else if jit {
             "x86-64 native"
         } else {
             "disabled (interpreter only)"

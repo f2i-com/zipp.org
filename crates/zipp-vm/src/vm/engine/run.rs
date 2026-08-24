@@ -1127,8 +1127,21 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         // One-shot CreateDynamicFunction marker (set by build_function_kind):
         // consumed HERE, at entry, so a parse failure below cannot leak it
-        // into an unrelated later eval.
+        // into an unrelated later eval. Dynamic functions charge their exact
+        // assembled source before standalone parameter parsing/allocation, so
+        // the marker also suppresses exactly this matching second charge.
         let fn_ctor = std::mem::take(&mut self.pending_fn_ctor_eval);
+        // This is the common gate for every runtime compiler entry: direct and
+        // indirect eval, Function constructors, ShadowRealm.evaluate, and the
+        // embedder's global-context eval helper all arrive here. Charge before
+        // parsing so repeated syntax errors cannot spend unaccounted parser
+        // work. The sticky recorder status makes the limit terminal even when
+        // guest code catches the returned RangeError.
+        #[cfg(feature = "instrument")]
+        if !fn_ctor {
+            self.instrument_dynamic_code_attempt(code.len())
+                .map_err(|message| Thrown(message.into()))?;
+        }
         // 1. Parse: the true Script goal plus what only the call site knows
         // (caller strictness, new.target / super validity). `import`/`export`
         // are rejected by the parser itself under this goal, so the old

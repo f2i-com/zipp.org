@@ -146,6 +146,27 @@ fn output_limit_is_fail_closed_even_when_the_child_exits_quickly() {
 }
 
 #[test]
+fn dynamic_code_limit_is_terminal_even_when_guest_code_catches_it() {
+    let scratch = Scratch::new("dynamic-code");
+    let script = scratch.write(
+        "dynamic.js",
+        "try { eval(' '.repeat(65537) + '1'); console.log('unreachable'); } catch (_) { console.log('caught'); } console.log('also-unreachable');",
+    );
+    let output = sandbox(&[
+        "--timeout-ms",
+        "3000",
+        script.to_str().expect("utf-8 test path"),
+    ]);
+
+    assert!(!output.status.success());
+    let error = stderr(&output);
+    assert!(error.contains("dynamic code source"), "{error}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("caught"), "{stdout}");
+    assert!(!stdout.contains("unreachable"), "{stdout}");
+}
+
+#[test]
 fn terminal_controls_are_sanitized_before_forwarding() {
     let scratch = Scratch::new("terminal-controls");
     let script = scratch.write(
@@ -163,6 +184,23 @@ fn terminal_controls_are_sanitized_before_forwarding() {
         String::from_utf8(output.stderr).expect("sanitized stderr is UTF-8"),
         "?[31mBAD?[0m\n"
     );
+}
+
+#[test]
+fn pre_child_diagnostics_are_single_line_and_control_free() {
+    let hostile = "--bad\x1b]0;PWNED\x07\nforged\t\u{202e}spoof\u{2069}";
+    let output = sandbox(&[hostile, "unused"]);
+
+    assert!(!output.status.success());
+    let error = stderr(&output);
+    let line = error.strip_suffix('\n').unwrap_or(&error);
+    assert_eq!(line.lines().count(), 1, "{error:?}");
+    assert!(!line.chars().any(char::is_control), "{error:?}");
+    for bidi in ['\u{061c}', '\u{200e}', '\u{200f}', '\u{202e}', '\u{2069}'] {
+        assert!(!line.contains(bidi), "{error:?}");
+    }
+    assert!(!line.contains('\x1b'), "{error:?}");
+    assert!(!line.contains('\x07'), "{error:?}");
 }
 
 #[test]
@@ -197,6 +235,34 @@ fn imports_are_opt_in_and_cannot_escape_the_canonical_root() {
         "{stdout}"
     );
     assert!(!stdout.contains("DO-NOT-PRINT"), "{stdout}");
+}
+
+#[test]
+fn relative_imports_remain_script_relative_with_trusted_child_cwd() {
+    let scratch = Scratch::new("relative-import-cwd");
+    let root = scratch.path().join("allowed");
+    std::fs::create_dir(&root).expect("create import root");
+    scratch.write(
+        "allowed/nested/value.mjs",
+        "export const value = 'script-relative-import-ok';",
+    );
+    let entry = scratch.write(
+        "allowed/nested/entry.js",
+        "import('./value.mjs').then(m => console.log(m.value)).catch(e => console.error(String(e)));",
+    );
+    let output = sandbox(&[
+        "--timeout-ms",
+        "2000",
+        "--allow-imports",
+        root.to_str().expect("utf-8 test path"),
+        entry.to_str().expect("utf-8 test path"),
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "script-relative-import-ok\n"
+    );
 }
 
 #[test]

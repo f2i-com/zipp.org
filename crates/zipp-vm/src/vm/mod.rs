@@ -1030,11 +1030,22 @@ pub struct Vm<'p> {
     /// Optional canonical filesystem boundary for the module loader. Every
     /// module read (including typed/deferred/source-phase imports and recursive
     /// re-exports) must remain below this directory. `None` preserves the
-    /// unrestricted loader used by the compatibility CLI and test262.
+    /// unrestricted loader used by the compatibility CLI and test262. When set,
+    /// aggregate path/byte/depth budgets in `engine::modules` also apply.
     module_root: Option<std::path::PathBuf>,
-    /// Maximum bytes read from any module while `module_root` is active.
+    /// Maximum bytes read from any one module while `module_root` is active.
     /// `None` preserves the unrestricted compatibility loader.
     module_max_bytes: Option<u64>,
+    /// Canonical confined module paths and the largest byte length successfully
+    /// observed for each. All loader variants share this ledger, so rereading a
+    /// file (including as a typed/deferred/source-phase module) does not charge
+    /// it twice; if it grows, only the growth is charged.
+    module_read_bytes: std::collections::HashMap<std::path::PathBuf, u64>,
+    /// Sum of `module_read_bytes`, bounded independently of the per-file cap.
+    module_total_bytes: u64,
+    /// Current confined module-loader recursion depth. This covers recursive
+    /// evaluation, prescans, and export/request graph walks.
+    module_load_depth: u32,
     /// Dynamic-import namespace cache: resolved module path → its namespace value.
     /// A module is evaluated at most once, so re-importing the same path returns the
     /// SAME namespace object (identity). Values are GC roots (modules persist).
@@ -1406,15 +1417,21 @@ pub struct Vm<'p> {
     /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
     /// program's random sequence is reproducible run-to-run (and JIT-on == off).
     rng_state: u64,
-    /// Native JIT tier (x86-64 only, `feature = "jit"`). Compiles hot leaf
-    /// integer functions to native code that shares this VM's register window;
-    /// any non-int/heap/call op bails back to the interpreter at the exact ip.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    /// Native JIT tier (`feature = "jit"`): the mature x86-64 multi-tier backend
+    /// and the guarded ARM64 integer baseline. Both share this VM's register
+    /// window and bail to the interpreter at an exact bytecode ip.
+    #[cfg(all(
+        feature = "jit",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     jit: crate::codegen::Jit,
     /// JIT on/off (set from `ZIPP_NOJIT` env var at construction) — lets a
     /// single binary A/B the JIT against the pure interpreter for honest
     /// measurement.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[cfg(all(
+        feature = "jit",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     jit_enabled: bool,
     /// Current native self-recursion depth (guards `jit_self_call`).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]

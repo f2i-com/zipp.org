@@ -6,7 +6,124 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
-## Continuation snapshot — 2026-08-24, Wave 28 and security hardening
+## Continuation snapshot — 2026-08-24, Wave 29 ARM64 and boundary hardening
+
+Read this first. **Wave 29 starts from `1af69a6` on `main`; this snapshot
+describes the changes landing together after that base.** The Wave 28 snapshot
+below remains the history of the preceding landing, but its `eb316a7` HEAD
+sentence is superseded by this one.
+
+### ARM64 JIT baseline
+
+- `codegen_aarch64.rs` adds a deliberately small, auditable native tier for hot
+  call-free whole functions: tagged-i32 loads/arithmetic, comparisons,
+  branches, loops, and returns. Type mismatches, overflow, and negative-zero
+  results resume at the exact bytecode ip without clobbering the destination.
+- This first tier has no helper calls, OSR regions, regex codegen, or native
+  metering. Instrumentation and `zipp sandbox` keep it interpreted. One body is
+  capped at 4,096 ops/registers, each VM's emitted-code cache at 16 MiB and
+  4,096 retained executable allocations, and a body is evicted after 64
+  chronic guard exits.
+- Docker Desktop's `linux/arm64` emulation reports `aarch64` and executed the
+  generated code. The five backend mechanism tests, including a greater-than
+  32 KiB far-bail relocation regression, the end-to-end hot/mixed
+  input test, and the complete ARM64 VM library suite passed: **373 passed, 1
+  ignored, 0 failed**. Treat this as correctness/ABI evidence only; emulated
+  timings are not performance evidence.
+- `aarch64-linux-android` cross-checks pass for the VM with all targets and with
+  instrumentation. The CLI cross-check reaches `mimalloc` and then needs an
+  Android C toolchain, so do not quote it as green. A native GitHub Actions
+  matrix covers Linux ARM64, Windows ARM64, and macOS ARM64; Linux also runs the
+  differential slice and sandbox integration tests.
+
+### x86-64 JIT follow-on
+
+- The cyclic field read/write reducer now accepts a live captured (`UpvalGet`)
+  loop bound, not just a top-level global. It reads the current closure cell on
+  every entry and fails closed on TDZ, malformed, non-Int, and observable
+  receiver shapes.
+- This closes B142's worst IIFE row: the official `property-ic-shapes` variant,
+  15 interleaved pairs on one release binary, measured **1,015 ms with the
+  reducer disabled versus 14 ms default** — default/off **0.0137x, 98.6%
+  faster, 95% CI -98.65%..-98.56%**, exact output. The retained schema-v2
+  artifact is `bench/w29_property_ic_iife_field_stream_abenv_2026-08-24.json`;
+  the 15-test field-stream gate passed.
+- This is a narrow but important closure, not a claim that B142 is finished.
+  The suite-wide IIFE/`let` penalty and non-global live-range/register-pressure
+  work remain open.
+
+### Security boundaries strengthened
+
+- Sandbox children start in the trusted executable directory rather than the
+  untrusted script directory. Raw Windows UNC, device, native-NT, and verbatim
+  network namespaces are rejected before filesystem access; supervisor and
+  child diagnostics are reduced to one terminal-safe line while guest output
+  retains its bounded line/tab layout.
+- A confined module graph now has aggregate limits in addition to the 16 MiB
+  per-file ceiling: 256 canonical files, 64 MiB total observed source, and 64
+  levels of loader recursion. Eager, typed, deferred, and source-phase views of
+  one canonical path share a high-water charge; unrestricted compatibility
+  loading is unchanged.
+- Host values crossing the VM/WASM boundary share deterministic 100,000-node
+  and 16 MiB UTF-8 string/key budgets. Shared-DAG expansion returns a controlled
+  `RangeError`, cycles retain the null back-edge contract, `__proto__` is
+  emitted as an own data property, and batch conversions share one budget.
+- A failed compile, failed top-level run, repeated initialization, or disposal
+  now terminally clears the browser engine's VM, symbol, helper, and bridge
+  capabilities. A disposed engine cannot initialize again or reacquire a host
+  bridge; the compatibility slot getter fails closed as `Opaque` when bounded
+  conversion cannot be represented.
+- Dynamic compilation is now a typed, sticky resource boundary across `eval`,
+  Function constructors, ShadowRealm, host eval, and confined modules: 64 KiB
+  per complete dynamic source, 1 MiB and 256 attempts per engine, 4,096 retained
+  functions, and 1,024 retained classes. Function constructors are charged
+  before parameter parsing or wrapper allocation, closing the malformed-input
+  pre-parse bypass; caught and promise-wrapped exhaustion remains terminal.
+- The browser facade additionally caps initial source at 2 MiB, lifetime
+  bytecode execution at 50 million instructions, approximate object-table heap
+  use at 128 MiB, output at 96 KiB, and synchronous bridge messages at a
+  64-byte kind, 16 arguments, and 1 MiB request/reply. The x86 native meter now
+  treats an exactly consumed budget as success and only fails below zero, in
+  agreement with the interpreter.
+
+### Wave 29 validation already complete
+
+- ARM64 Docker execution: backend 5/5; hot/mixed-input 1/1; the exact post-fix
+  VM library passed 373, with 1 ignored and 0 failed. The instrumented library
+  run passed 382 with 1 ignored before the final constructor-accounting fix,
+  and its exact final ARM instrumentation slice passed 9/9. VM Android ARM64
+  all-target checks pass both normally and with instrumentation.
+- Host/embed: 19/19. Confined-loader adversarial cases pass within the VM gate.
+  Sandbox: 2 unit and 11 integration tests. VM instrumentation: 10/10. x86 JIT
+  instrumentation integration: 3/3, including the exact-budget boundary.
+- WASM boundary: native 2/2, wasm32 release build and bindings passed, Node host
+  contract 72/72, and the real SoftN SnakeGame suite 27/27. The
+  no-default-features check also passed.
+- The x86 tier-differential slice passed 1/1; `cargo audit` reports no known
+  advisories across 57 dependencies, `npm audit` reports zero vulnerabilities,
+  and the landing-site production build passed. The exact final tree passes
+  `cargo check --locked --workspace --all-targets`; its all-target test run
+  completed **1,495 passed, 0 failed, 18 ignored across 119 harnesses** (the VM
+  library alone was 395 passed, 0 failed, 2 ignored).
+
+### Deliberately still open
+
+- B142/B143's broad local/live-range pressure problem, the unreproduced
+  negative-modulo residual, sparse-overlay minor-GC root cost, and disabled
+  `unify_homes_with_globals` remain open. None was papered over by ARM support or
+  a special-case security patch.
+- The ARM backend still needs wider opcode/helper tiers and native performance
+  measurements. Grow it only with differential engagement evidence and native
+  ABI gates; QEMU timings are not useful for that decision.
+- Browser heap accounting deliberately covers the VM object-table high-water,
+  not every payload byte or process RSS, and native built-ins do not provide
+  wall-time preemption. Stable dynamic function/class allocations are bounded
+  per engine but require Worker/WASM-instance teardown for full reclamation;
+  multi-tenant hosts must therefore retain an outer Worker time/memory limit.
+
+---
+
+## Prior continuation snapshot — 2026-08-24, Wave 28 and security hardening
 
 Read this first. This snapshot supersedes the historical Wave 28 "in flight"
 warning below. **HEAD is `eb316a7`, pushed to `origin/main`; all work described
@@ -404,6 +521,12 @@ delete/prototype matrices or the longer-term shape-keyed-cache work.
 **This is the largest generalisation opportunity currently open, and it is
 measured.** The wave 25/26 reducers key on top-level `var` globals, so the same
 program wrapped in a function or written with `let` does not get them.
+
+**Wave 29 partial closure:** the captured-limit field-stream work now closes the
+single worst IIFE result (`property-ic-shapes`, 1,015 ms disabled versus 14 ms
+default, exact output). It does not close the suite-wide +159% IIFE geomean or
+the local/register-pressure mechanism described below, so B142/B143 remain open
+at broad scope.
 
 **Suite-wide, via `python bench/scope/sweep.py`:** wrapping each program in an
 IIFE costs a **geomean +159% across 13 rows and moves 8 of them from beating

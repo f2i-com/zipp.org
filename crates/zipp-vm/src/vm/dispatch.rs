@@ -345,6 +345,33 @@ impl<'p> Vm<'p> {
                 }
             }
 
+            // ARM64 baseline whole-function tier. Its accepted bytecode is
+            // deliberately call-free, so it needs neither the x86 self-call
+            // depth guard nor heap/global helper plans: a guard miss simply
+            // reports this instruction and the unchanged interpreter resumes.
+            #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+            if ip == 0
+                && self.jit_enabled
+                && (func_id as usize) < self.main_func_count
+                && self.jit.fn_state(func_id) != crate::codegen::FN_DEAD
+                && !self.func(func_id as usize).is_generator
+                && !self.func(func_id as usize).is_async
+            {
+                if let Some((result, bail)) = self.try_run_jit(func_id, base) {
+                    if bail == crate::codegen::NO_BAIL {
+                        if self.pop_frame_with(result, stop_depth) {
+                            return Ok(result);
+                        }
+                        continue;
+                    }
+                    ip = bail as usize;
+                } else if self.jit.record_and_should_compile(func_id) {
+                    let proto: *const crate::bytecode::FuncProto = self.func(func_id as usize);
+                    // SAFETY: program bytecode is immutable for the VM's life.
+                    self.jit.compile(func_id, unsafe { &*proto });
+                }
+            }
+
             // Inner loop: execute within the current frame until a call pushes
             // a new frame or a return pops this one.
             loop {
@@ -7869,6 +7896,19 @@ impl<'p> Vm<'p> {
             len_of: jit_len_of as usize,
             forin_keys: jit_forin_keys as usize,
         }
+    }
+
+    /// Run the guarded ARM64 whole-function baseline over this frame window.
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    pub(crate) fn try_run_jit(&mut self, func_id: u32, base: usize) -> Option<(Value, u32)> {
+        let jitfn = self.jit.get(func_id)? as *const crate::codegen::JitFn;
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        // SAFETY: the accepted ARM64 subset makes no calls or allocations, so
+        // the register Vec cannot move while its raw window is live.
+        let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
+        self.jit.note_bail(func_id, bail);
+        Some((Value::from_bits(bits), bail))
     }
 
     /// If `func_id` has compiled native code, run it over the register window

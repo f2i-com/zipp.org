@@ -93,6 +93,58 @@ var untouched = own(3, false);
 console.log(write(untouched, 3, 2, 20000) + ":" + dump(untouched));
 "#;
 
+/// The same cyclic read/write forms with the bound captured from an enclosing
+/// function. The first long calls compile and engage the prefixes; later calls
+/// mutate the live cell (including to non-Int values that must fail closed).
+const CAPTURED_LIMIT_MATRIX: &str = r#"
+"use strict";
+function makeRunner(initial) {
+  var LIMIT = initial;
+  function setLimit(value) { LIMIT = value; }
+  function read(objs, n, k, i, sum) {
+    for (; i < LIMIT; i++) {
+      sum = (sum + objs[k].x) | 0;
+      k++;
+      if (k === n) k = 0;
+    }
+    return sum + ":" + k + ":" + i;
+  }
+  function write(objs, n, k, i) {
+    for (; i < LIMIT; i++) {
+      objs[k].x = i;
+      k++;
+      if (k === n) k = 0;
+    }
+    return k + ":" + i;
+  }
+  return { read: read, write: write, setLimit: setLimit };
+}
+function dump(a) {
+  var out = [];
+  for (var i = 0; i < a.length; i++) out.push(a[i].x);
+  return out.join(",");
+}
+var runner = makeRunner(20000);
+var reads = [{x:1}, {x:2}, {x:3}];
+console.log(runner.read(reads, 3, 0, 0, 0));
+runner.setLimit(20009);
+console.log(runner.read(reads, 3, 1, 19990, -5));
+runner.setLimit(20003.5);
+console.log(runner.read(reads, 3, 2, 19999, 7));
+runner.setLimit("20002");
+console.log(runner.read(reads, 3, 0, 19998, 4));
+
+runner.setLimit(20000);
+var writes = [{x:-1}, {x:-2}, {x:-3}];
+console.log(runner.write(writes, 3, 1, 0) + ":" + dump(writes));
+runner.setLimit(20009);
+var writes2 = [{x:-1}, {x:-2}, {x:-3}];
+console.log(runner.write(writes2, 3, 2, 19995) + ":" + dump(writes2));
+runner.setLimit("20003");
+var writes3 = [{x:-1}, {x:-2}, {x:-3}];
+console.log(runner.write(writes3, 3, 0, 19999) + ":" + dump(writes3));
+"#;
+
 const MASK_MATRIX: &str = r#"
 "use strict";
 var READS = 20003;
@@ -238,6 +290,22 @@ fn existing_own_writes_dictionary_slots_and_aliases_match_the_loop() {
             "4:20000:19996,19997,19998,19999,19984,19985,19986,19987,19988,19989,19990,19991,19992,19993,19994,19995",
             "2:20000:19998,19999,19998,19997",
             "2:20000:0,-1,-2",
+        ]
+    );
+}
+
+#[test]
+fn captured_mutable_limit_is_read_live_and_non_int_values_fail_closed() {
+    assert_eq!(
+        run_ok(CAPTURED_LIMIT_MATRIX),
+        [
+            "39999:2:20000",
+            "33:2:20009",
+            "17:1:20004",
+            "11:1:20002",
+            "0:20000:19997,19998,19999",
+            "1:20009:20008,20006,20007",
+            "1:20003:20002,20000,20001",
         ]
     );
 }
@@ -447,6 +515,7 @@ fn mechanism_is_not_vacuous() {
     if std::env::var_os("ZIPP_FIELD_STREAM_LOG_CHILD").is_some() {
         let _ = run_ok(MATRIX);
         let _ = run_ok(WRITE_MATRIX);
+        let _ = run_ok(CAPTURED_LIMIT_MATRIX);
         let _ = run_ok(MASK_MATRIX);
         let _ = run_ok(GLOBAL_SUM_MATRIX);
         let _ = run_ok(MIXED_MATRIX);
@@ -468,6 +537,14 @@ fn mechanism_is_not_vacuous() {
     assert!(
         stderr.contains("field-write-stream prefix"),
         "write prefix did not compile:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("upvalue-field-read-stream committed"),
+        "captured-limit read prefix did not commit:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("upvalue-field-write-stream committed"),
+        "captured-limit write prefix did not commit:\n{stderr}"
     );
     assert!(
         stderr.contains("field-mask-read-stream committed"),

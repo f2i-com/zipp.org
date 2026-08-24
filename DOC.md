@@ -43,9 +43,11 @@ JIT — with no third-party parser. `zipp-cli` is a thin front end over it,
 0.11.1, which adds an API the engine needs plus three test262 correctness
 fixes (see its `FORK.md`).
 
-The JIT is x86-64 only and feature-gated; every other target builds a pure
-interpreter (`--no-default-features` does the same on x86-64). aarch64 and
-wasm32 are built and tested.
+Native code generation is feature-gated. x86-64 has the mature multi-tier JIT;
+ARM64 has a guarded whole-function integer baseline for call-free functions and
+numeric loops. Other targets build a pure interpreter
+(`--no-default-features` does the same on a native target). wasm32 is built and
+tested as interpreter-only.
 
 > The workspace used to carry a separate ahead-of-time language (`zippc`, plus
 > Cranelift/LLVM/WASM/zk back ends and a TypeScript frontend). That predates the
@@ -514,6 +516,8 @@ settled by diffing against node rather than by reading the spec alone:
 
 ## How the JIT is organised
 
+The mature x86-64 backend is organised as follows.
+
 Compilation is triggered by a loop back-edge (OSR) after 8 trips, or
 whole-function once a function is hot enough. A loop region is offered to four
 tiers in order, and takes the first that accepts it:
@@ -546,6 +550,17 @@ tier down. That counter is the most useful debugging signal in the engine — a
 change that makes something slower while still printing the right answer usually
 shows up there first.
 
+ARM64 deliberately starts smaller. Once a function is hot, the backend accepts
+only a bounded, call-free whole-function subset: tagged integer loads and
+arithmetic, comparisons, branches, loops, and returns. Type mismatches,
+overflow, and results that require a non-integer representation leave the
+destination untouched and resume the interpreter at the exact bytecode ip.
+There are no ARM helper calls, OSR regions, regex codegen, or native metering in
+this first tier; attaching instrumentation disables it, and `zipp sandbox`
+disables every native-code tier before parsing untrusted source. Both emitted
+bytes and executable-allocation count are capped, and repeatedly bailing bodies
+are evicted and blacklisted.
+
 ## Source layout
 
 ```
@@ -554,6 +569,7 @@ crates/zipp-vm/src/
   front.rs     the source -> AST entry point
   compile/     AST -> register bytecode (14 modules)
   codegen/     native x86-64 JIT, dynasm (15 modules)
+  codegen_aarch64.rs  guarded ARM64 whole-function baseline, dynasm
   vm/          the runtime: dispatch, natives, props, construct, temporal, …
   vm/clock.rs  the platform time boundary (see Embedding)
   vm/host_api.rs  structural marshalling + slot-addressed globals
@@ -598,6 +614,15 @@ a leak at 60 Hz. `call_slot` compiles nothing.
 
 `crates/zipp-wasm` is this API over wasm-bindgen, plus a JS preamble supplying
 host bridges. Its `README.md` covers the two host channels and why they differ.
+The browser engine applies lifetime instruction, approximate-heap, output,
+host-value, host-bridge, source, runtime-compilation, and retained-definition
+ceilings. Resource exhaustion is a typed terminal state even if guest code
+catches the immediate exception or turns it into a rejected promise. These are
+resource controls, not wall-time or OS isolation: run untrusted browser code in
+a dedicated Web Worker and terminate the Worker at the host deadline. Dynamic
+function/class definitions use VM-lifetime stable addresses, so tearing down
+the Worker/WASM instance—not merely calling `Engine.dispose()`—is also the
+complete reclamation boundary between tenants.
 
 ### wasm32 has no clock
 
@@ -651,14 +676,19 @@ but not the wasm-bindgen boundary (marshalling, the bridge closures, the host
 queue), and that boundary is where the interesting bugs live. One of them drives
 a real third-party bundle unmodified.
 
-A change that builds on x86-64 can still break every other target: the `jit`
-feature and `target_arch = "x86_64"` gate ~120 sites, so an attribute that drifts
-onto the wrong item takes aarch64 and wasm32 down without x86-64 noticing. Cheap
-insurance:
+A change that builds on x86-64 can still break every other target: native JIT
+code is target-gated, and an attribute that drifts onto the wrong item can take
+ARM64 or wasm32 down without x86-64 noticing. Cheap local insurance:
 
 ```sh
 cargo build --target wasm32-unknown-unknown -p zipp-vm --no-default-features
+cargo check --target aarch64-linux-android -p zipp-vm --all-targets
 ```
+
+The hosted ARM64 workflow executes the native mechanism/library tests on Linux,
+Windows, and macOS, with the tier-differential and sandbox slices additionally
+running on Linux; a cross-check alone proves compilation, not that generated
+instructions run correctly.
 
 `ZIPP_NOJIT=1` disables native codegen (it is **presence**-checked, so
 `ZIPP_NOJIT=0` also disables it — unset it for a JIT run); `ZIPP_NO_NURSERY=1`

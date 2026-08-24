@@ -8,6 +8,14 @@ use std::io::Read as _;
 
 const MODULE_NOT_FOUND: &str = "TypeError: module not found";
 
+// Confined loaders are used for hostile input. Keep the graph independently
+// bounded even when every individual source is below `module_max_bytes`.
+// These limits deliberately do not affect the unrestricted compatibility
+// loader used by the regular CLI and test262.
+const CONFINED_MODULE_COUNT_LIMIT: usize = 256;
+const CONFINED_MODULE_TOTAL_BYTES_LIMIT: u64 = 64 * 1024 * 1024;
+const CONFINED_MODULE_RECURSION_LIMIT: u32 = 64;
+
 fn lexical_module_path(raw_path: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut path = std::path::PathBuf::new();
     for component in raw_path.components() {
@@ -93,10 +101,37 @@ impl<'p> Vm<'p> {
         canonical_module_path(self.module_root.as_deref(), raw_path)
     }
 
-    fn read_module_bytes(&self, path: &std::path::Path) -> Result<Vec<u8>, Thrown> {
+    /// Run one recursive loader operation under the confined graph-depth cap.
+    /// The closure shape makes decrementing unconditional on every ordinary
+    /// error return; unrestricted loading does not touch the counter.
+    fn with_confined_module_depth<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Thrown>,
+    ) -> Result<T, Thrown> {
+        if self.module_root.is_none() {
+            return f(self);
+        }
+        if self.module_load_depth >= CONFINED_MODULE_RECURSION_LIMIT {
+            return Err(Thrown(format!(
+                "RangeError: sandbox module recursion limit of {CONFINED_MODULE_RECURSION_LIMIT} exceeded"
+            )));
+        }
+        self.module_load_depth += 1;
+        let result = f(self);
+        self.module_load_depth -= 1;
+        result
+    }
+
+    fn read_module_bytes(&mut self, path: &std::path::Path) -> Result<Vec<u8>, Thrown> {
         let Some(limit) = self.module_max_bytes else {
             return std::fs::read(path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()));
         };
+        let already_seen = self.module_read_bytes.contains_key(path);
+        if !already_seen && self.module_read_bytes.len() >= CONFINED_MODULE_COUNT_LIMIT {
+            return Err(Thrown(format!(
+                "RangeError: sandbox module count limit of {CONFINED_MODULE_COUNT_LIMIT} exceeded"
+            )));
+        }
         let meta = std::fs::metadata(path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
         if meta.len() > limit {
             return Err(Thrown(format!(
@@ -113,10 +148,30 @@ impl<'p> Vm<'p> {
                 "RangeError: module exceeds the sandbox size limit of {limit} bytes"
             )));
         }
+
+        // Charge a canonical path once at its observed high-water mark. This
+        // closes both the many-small-files attack and a mutate-between-reads
+        // variant without double-charging ordinary repeated/typed reads.
+        let observed = bytes.len() as u64;
+        let previous = self.module_read_bytes.get(path).copied().unwrap_or(0);
+        let growth = observed.saturating_sub(previous);
+        let new_total = self
+            .module_total_bytes
+            .checked_add(growth)
+            .filter(|&n| n <= CONFINED_MODULE_TOTAL_BYTES_LIMIT)
+            .ok_or_else(|| {
+                Thrown(format!(
+                    "RangeError: sandbox aggregate module size limit of {CONFINED_MODULE_TOTAL_BYTES_LIMIT} bytes exceeded"
+                ))
+            })?;
+        if !already_seen || observed > previous {
+            self.module_read_bytes.insert(path.to_path_buf(), observed.max(previous));
+            self.module_total_bytes = new_total;
+        }
         Ok(bytes)
     }
 
-    fn read_module_text(&self, path: &std::path::Path) -> Result<String, Thrown> {
+    fn read_module_text(&mut self, path: &std::path::Path) -> Result<String, Thrown> {
         String::from_utf8(self.read_module_bytes(path)?)
             .map_err(|_| Thrown(MODULE_NOT_FOUND.into()))
     }
@@ -208,6 +263,14 @@ impl<'p> Vm<'p> {
     /// `Err`. The given `path` is canonicalized; relative re-export specifiers resolve
     /// against the module's own directory.
     pub(crate) fn import_module(
+        &mut self,
+        raw_path: &std::path::Path,
+        mtype: Option<&str>,
+    ) -> Result<Value, Thrown> {
+        self.with_confined_module_depth(|vm| vm.import_module_inner(raw_path, mtype))
+    }
+
+    fn import_module_inner(
         &mut self,
         raw_path: &std::path::Path,
         mtype: Option<&str>,
@@ -1390,6 +1453,18 @@ impl<'p> Vm<'p> {
         target: &std::path::PathBuf,
         seen: &mut std::collections::HashSet<std::path::PathBuf>,
     ) -> bool {
+        self.with_confined_module_depth(|vm| {
+            Ok(vm.module_graph_reaches_inner(from, target, seen))
+        })
+        .unwrap_or(false)
+    }
+
+    fn module_graph_reaches_inner(
+        &mut self,
+        from: &std::path::PathBuf,
+        target: &std::path::PathBuf,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> bool {
         if !seen.insert(from.clone()) {
             return false;
         }
@@ -1409,6 +1484,14 @@ impl<'p> Vm<'p> {
         path: &std::path::PathBuf,
         seen: &mut std::collections::HashSet<std::path::PathBuf>,
     ) -> Result<(), Thrown> {
+        self.with_confined_module_depth(|vm| vm.prescan_module_requests_inner(path, seen))
+    }
+
+    fn prescan_module_requests_inner(
+        &mut self,
+        path: &std::path::PathBuf,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> Result<(), Thrown> {
         if !seen.insert(path.clone()) || self.module_cache.contains_key(path) {
             return Ok(());
         }
@@ -1422,6 +1505,17 @@ impl<'p> Vm<'p> {
     /// synchronously RIGHT NOW? False when any reachable unevaluated module
     /// is mid-evaluation/loading or contains top-level await.
     pub(crate) fn ready_for_sync_execution(
+        &mut self,
+        path: &std::path::PathBuf,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> bool {
+        self.with_confined_module_depth(|vm| {
+            Ok(vm.ready_for_sync_execution_inner(path, seen))
+        })
+        .unwrap_or(false)
+    }
+
+    fn ready_for_sync_execution_inner(
         &mut self,
         path: &std::path::PathBuf,
         seen: &mut std::collections::HashSet<std::path::PathBuf>,
@@ -1467,6 +1561,15 @@ impl<'p> Vm<'p> {
     /// `seen` is the spec's resolveSet — a repeated (module, name) request is
     /// a circular chain that never grounds → None.
     pub(crate) fn resolve_pending_export(
+        &mut self,
+        dep: &std::path::PathBuf,
+        name: &str,
+        seen: &mut std::collections::HashSet<(std::path::PathBuf, String)>,
+    ) -> Result<Option<u32>, Thrown> {
+        self.with_confined_module_depth(|vm| vm.resolve_pending_export_inner(dep, name, seen))
+    }
+
+    fn resolve_pending_export_inner(
         &mut self,
         dep: &std::path::PathBuf,
         name: &str,
@@ -1550,5 +1653,170 @@ impl<'p> Vm<'p> {
             .map(collect)
             .unwrap_or_default())
     }
+}
 
+#[cfg(test)]
+mod confined_budget_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "zipp-module-budget-{}-{id}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create isolated module fixture directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn with_confined_vm(test: impl FnOnce(&mut Vm<'_>, &std::path::Path)) {
+        let dir = TestDir::new();
+        let ast = crate::front::parse_script("").expect("parse empty host");
+        let program = crate::compile::compile_program(&ast, "").expect("compile empty host");
+        let mut vm = Vm::new(&program);
+        vm.set_module_root(dir.path().to_path_buf(), 1024 * 1024)
+            .expect("confine loader");
+        test(&mut vm, dir.path());
+    }
+
+    #[test]
+    fn repeated_canonical_reads_charge_only_observed_growth() {
+        with_confined_vm(|vm, root| {
+            let path = root.join("same.mjs");
+            std::fs::write(&path, b"export const x=1;").expect("write fixture");
+            let path = std::fs::canonicalize(path).expect("canonical fixture");
+
+            let first = vm.read_module_bytes(&path).expect("first read");
+            assert_eq!(vm.module_read_bytes.len(), 1);
+            assert_eq!(vm.module_total_bytes, first.len() as u64);
+
+            let second = vm.read_module_bytes(&path).expect("repeated read");
+            assert_eq!(second, first);
+            assert_eq!(vm.module_read_bytes.len(), 1);
+            assert_eq!(vm.module_total_bytes, first.len() as u64);
+
+            std::fs::write(&path, b"export const x=123456;").expect("grow fixture");
+            let grown = vm.read_module_bytes(&path).expect("grown read");
+            assert!(grown.len() > first.len());
+            assert_eq!(vm.module_read_bytes.len(), 1);
+            assert_eq!(vm.module_total_bytes, grown.len() as u64);
+        });
+    }
+
+    #[test]
+    fn deferred_typed_and_eager_views_share_the_same_path_charge() {
+        with_confined_vm(|vm, root| {
+            vm.run().expect("initialize host realm");
+            let path = root.join("multi-view.mjs");
+            std::fs::write(&path, b"export const value=7;").expect("write fixture");
+            let path = std::fs::canonicalize(path).expect("canonical fixture");
+            let expected = std::fs::metadata(&path).expect("fixture metadata").len();
+
+            let deferred = vm
+                .deferred_namespace_for(&path, None)
+                .expect("deferred prescan");
+            assert_eq!(vm.module_read_bytes.len(), 1);
+            assert_eq!(vm.module_total_bytes, expected);
+
+            vm.defer_ns_trigger(deferred.heap_index())
+                .expect("trigger eager evaluation");
+            assert_eq!(vm.module_read_bytes.len(), 1);
+            assert_eq!(vm.module_total_bytes, expected);
+
+            vm.import_module(&path, Some("text"))
+                .expect("typed view of same canonical file");
+            assert_eq!(vm.module_read_bytes.len(), 1);
+            assert_eq!(vm.module_total_bytes, expected);
+        });
+    }
+
+    #[test]
+    fn distinct_confined_module_count_is_bounded() {
+        with_confined_vm(|vm, root| {
+            let mut first = None;
+            for i in 0..CONFINED_MODULE_COUNT_LIMIT {
+                let path = root.join(format!("m{i}.mjs"));
+                std::fs::write(&path, []).expect("write fixture");
+                let path = std::fs::canonicalize(path).expect("canonical fixture");
+                vm.read_module_bytes(&path).expect("within module count budget");
+                first.get_or_insert(path);
+            }
+            assert_eq!(vm.module_read_bytes.len(), CONFINED_MODULE_COUNT_LIMIT);
+
+            // Cache/prescan/typed paths may reread an existing file after the
+            // count is full; that must remain allowed and uncharged.
+            vm.read_module_bytes(first.as_ref().expect("first path"))
+                .expect("existing path is not double-charged");
+
+            let extra = root.join("too-many.mjs");
+            std::fs::write(&extra, []).expect("write extra fixture");
+            let extra = std::fs::canonicalize(extra).expect("canonical extra fixture");
+            let err = vm
+                .read_module_bytes(&extra)
+                .expect_err("new path past count cap must fail closed");
+            assert!(err.0.contains("module count limit"), "got {err:?}");
+        });
+    }
+
+    #[test]
+    fn aggregate_bytes_are_checked_before_committing_a_new_path() {
+        with_confined_vm(|vm, root| {
+            let charged = root.join("already-charged.mjs");
+            vm.module_read_bytes
+                .insert(charged, CONFINED_MODULE_TOTAL_BYTES_LIMIT - 2);
+            vm.module_total_bytes = CONFINED_MODULE_TOTAL_BYTES_LIMIT - 2;
+
+            let path = root.join("overflow.mjs");
+            std::fs::write(&path, b"abc").expect("write fixture");
+            let path = std::fs::canonicalize(path).expect("canonical fixture");
+            let err = vm
+                .read_module_bytes(&path)
+                .expect_err("aggregate overflow must fail closed");
+            assert!(err.0.contains("aggregate module size limit"), "got {err:?}");
+            assert!(!vm.module_read_bytes.contains_key(&path));
+            assert_eq!(
+                vm.module_total_bytes,
+                CONFINED_MODULE_TOTAL_BYTES_LIMIT - 2
+            );
+        });
+    }
+
+    #[test]
+    fn recursive_module_prescan_is_bounded_and_unwinds() {
+        with_confined_vm(|vm, root| {
+            for i in 0..=CONFINED_MODULE_RECURSION_LIMIT {
+                let source = if i == CONFINED_MODULE_RECURSION_LIMIT {
+                    String::new()
+                } else {
+                    format!("import './m{}.mjs';", i + 1)
+                };
+                std::fs::write(root.join(format!("m{i}.mjs")), source)
+                    .expect("write chain fixture");
+            }
+            let entry = std::fs::canonicalize(root.join("m0.mjs")).expect("canonical entry");
+            let mut seen = std::collections::HashSet::new();
+            let err = vm
+                .prescan_module_requests(&entry, &mut seen)
+                .expect_err("deep request graph must fail closed");
+            assert!(err.0.contains("module recursion limit"), "got {err:?}");
+            assert_eq!(vm.module_load_depth, 0, "error path must unwind the counter");
+        });
+    }
 }

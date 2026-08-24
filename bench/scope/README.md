@@ -12,6 +12,11 @@ still win when the same code is written the way real programs are written?**
 | `.R2_let.js` | every top-level `var` becomes `let` | how code written after ES2015 is spelled |
 | `.R3_rename.js` | loop counters and accumulators renamed | a control: pure identifier text, nothing structural |
 
+Wave 29 additionally retains `property-ic-shapes.R1_iife.js`, the exact
+whole-program-IIFE rewrite used to price B144's captured-limit field-stream
+generalisation. Its 15-pair schema-v2 observations and source hash are in
+`bench/w29_property_ic_iife_field_stream_abenv_2026-08-24.json`.
+
 Every variant is verified to produce the same output as its original under Node,
 and zipp is verified to agree with Node on all of them — this is a performance
 question, not a correctness one.
@@ -173,4 +178,8 @@ instead of 0.66×.
 ```sh
 python bench/scope/run.py            # 9 reps, both rows, all variants
 python bench/scope/run.py 15         # more reps
+python tools/bench.py --reps 15 --bench-dir bench/scope \
+  --benches property-ic-shapes.R1_iife \
+  --ab target/release/zipp target/release/zipp \
+  --ab-env ZIPP_NO_FIELD_READ_STREAM=1 - --allow-dirty-engine
 ```

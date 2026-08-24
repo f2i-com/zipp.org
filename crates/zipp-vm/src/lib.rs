@@ -22,11 +22,18 @@ mod bytecode;
 mod capture;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod codegen;
+#[cfg(all(feature = "jit", target_arch = "aarch64"))]
+#[path = "codegen_aarch64.rs"]
+mod codegen;
 // These five switches gate semantics-preserving interpreter fast paths as well
 // as their native-JIT twins. Their same-binary A/B latches live in `codegen`
-// on native x86-64 builds; interpreter-only hosts (including wasm) have no JIT
-// comparator, so keep the production paths enabled without pulling in dynasm.
-#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+// on native x86-64 builds; ARM64's baseline backend keeps the interpreter paths
+// enabled too. Interpreter-only hosts (including wasm) have no JIT comparator,
+// so keep the production paths enabled without pulling in dynasm.
+#[cfg(not(all(
+    feature = "jit",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 mod codegen {
     #[inline]
     pub(crate) const fn hole_absent_fast_enabled() -> bool {
@@ -284,12 +291,15 @@ pub fn rx_jit_stats() -> (u64, u64, u64, u64, u64, u64) {
     regress::rx_jit_stats()
 }
 
-/// Whether this build actually has the native codegen tiers, i.e. the `jit`
-/// feature AND an x86-64 target. Exported for `zipp --version`: the feature lives
-/// on THIS crate, so a `cfg!` in the CLI would always read false and quietly
-/// report every build as interpreter-only.
+/// Whether this build actually has a native codegen tier, i.e. the `jit`
+/// feature and a supported CPU target. Exported for `zipp --version`: the
+/// feature lives on THIS crate, so a feature `cfg!` in the CLI would always read
+/// false and quietly report every build as interpreter-only.
 pub fn jit_enabled() -> bool {
-    cfg!(all(feature = "jit", target_arch = "x86_64"))
+    cfg!(all(
+        feature = "jit",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
 }
 pub mod value;
 mod vm;
@@ -948,7 +958,10 @@ mod tests {
         let ast = front::parse_auto(src).expect("parse");
         let program = compile::compile_program(&ast, src).expect("compile");
         let mut vm = vm::Vm::new(&program);
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        #[cfg(all(
+            feature = "jit",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         vm.set_jit_enabled(false);
         vm.run().expect("run");
         vm.output
@@ -962,6 +975,24 @@ mod tests {
         let exp: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
         assert_eq!(on, off, "JIT-on != JIT-off for: {src}");
         assert_eq!(on, exp, "wrong result for: {src}");
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "aarch64"))]
+    #[test]
+    fn arm64_jit_engages_and_resumes_mixed_inputs() {
+        let src = "function sum(n) { let s=0; for(let i=0;i<n;i=i+1) s=s+i; return s; } \
+                   var out=0; for(var k=0;k<20;k=k+1) out=sum(100); \
+                   console.log(out + ',' + sum('3'));";
+        let ast = front::parse_auto(src).expect("parse");
+        let program = compile::compile_program(&ast, src).expect("compile");
+        let mut vm = vm::Vm::new(&program);
+        vm.run().expect("run");
+        assert_eq!(vm.output, vec!["4950,3"]);
+        assert!(
+            vm.arm_jit_compiled_count() > 0,
+            "ARM64 mechanism test ran without compiling native code"
+        );
+        assert_eq!(vm.output, run_nojit(src));
     }
 
     #[test]

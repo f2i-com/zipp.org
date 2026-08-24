@@ -19,6 +19,15 @@
 use super::*;
 use crate::bytecode::{BitwiseOp, Instr};
 
+/// Where an exact cyclic field loop reads its invariant upper bound. Captured
+/// limits are read from the running closure on every prefix entry; they are not
+/// baked into the plan, so mutation between calls remains observable.
+#[derive(Clone, Copy)]
+enum FieldLoopLimit {
+    Global(u32),
+    Upval(u16),
+}
+
 #[derive(Clone, Copy)]
 struct FieldReadLoop {
     array: u16,
@@ -26,7 +35,7 @@ struct FieldReadLoop {
     sum: u16,
     k: u16,
     i: u16,
-    limit_global: u32,
+    limit: FieldLoopLimit,
     name: u32,
 }
 
@@ -82,7 +91,7 @@ struct FieldWriteLoop {
     n: u16,
     k: u16,
     i: u16,
-    limit_global: u32,
+    limit: FieldLoopLimit,
     name: u32,
 }
 
@@ -99,8 +108,11 @@ fn recognize(
         return None;
     }
     let c = &proto.code;
-    let (limit, limit_global) = match c[start] {
-        Instr::LoadGlobal { dst, idx } => (dst, idx),
+    let (limit, limit_source) = match c[start] {
+        Instr::LoadGlobal { dst, idx } => (dst, FieldLoopLimit::Global(idx)),
+        Instr::UpvalGet { dst, idx } if (idx as usize) < proto.upvalues.len() => {
+            (dst, FieldLoopLimit::Upval(idx))
+        }
         _ => return None,
     };
     let (i, exit) = match c[start + 1] {
@@ -186,7 +198,7 @@ fn recognize(
         sum,
         k,
         i,
-        limit_global,
+        limit: limit_source,
         name,
     })
 }
@@ -520,8 +532,11 @@ fn recognize_write(
         return None;
     }
     let c = &proto.code;
-    let (limit, limit_global) = match c[start] {
-        Instr::LoadGlobal { dst, idx } => (dst, idx),
+    let (limit, limit_source) = match c[start] {
+        Instr::LoadGlobal { dst, idx } => (dst, FieldLoopLimit::Global(idx)),
+        Instr::UpvalGet { dst, idx } if (idx as usize) < proto.upvalues.len() => {
+            (dst, FieldLoopLimit::Upval(idx))
+        }
         _ => return None,
     };
     let (i, exit) = match c[start + 1] {
@@ -594,12 +609,41 @@ fn recognize_write(
         n,
         k,
         i,
-        limit_global,
+        limit: limit_source,
         name,
     })
 }
 
 impl<'p> Vm<'p> {
+    /// Read a field-stream bound without executing user code. `UpvalGet` is
+    /// ordinarily lowered through `jit_upval_get`; this prefix performs the
+    /// same live cell read itself because it may skip the header instruction.
+    /// Every malformed/TDZ edge declines to the unchanged native region, whose
+    /// ordinary `UpvalGet` then preserves the interpreter's throw semantics.
+    fn field_loop_limit(&self, source: FieldLoopLimit) -> Option<Value> {
+        match source {
+            FieldLoopLimit::Global(idx) => self.globals.get(idx as usize).copied(),
+            FieldLoopLimit::Upval(idx) => {
+                let closure = self.frames.last()?.closure;
+                if closure == NO_CLOSURE || closure as usize >= self.heap.len() {
+                    return None;
+                }
+                let cell = match self.heap.get(closure) {
+                    HeapObj::Closure { upvalues, .. } => *upvalues.get(idx as usize)?,
+                    _ => return None,
+                };
+                if cell as usize >= self.heap.len() {
+                    return None;
+                }
+                let value = match self.heap.get(cell) {
+                    HeapObj::Cell(value) => *value,
+                    _ => return None,
+                };
+                (!value.is_uninitialized()).then_some(value)
+            }
+        }
+    }
+
     fn plain_empty_closure_func(&self, callable: Value) -> Option<usize> {
         if !callable.is_heap() {
             return None;
@@ -819,9 +863,8 @@ impl<'p> Vm<'p> {
         let load = |r: u16| Value::from_bits(unsafe { *regs.add(r as usize) });
         let (array_v, n_v, sum_v, k_v, i_v) =
             (load(p.array), load(p.n), load(p.sum), load(p.k), load(p.i));
-        let limit_v = match self.globals.get(p.limit_global as usize) {
-            Some(v) => *v,
-            None => return false,
+        let Some(limit_v) = self.field_loop_limit(p.limit) else {
+            return false;
         };
         if !array_v.is_heap()
             || !n_v.is_int()
@@ -883,6 +926,13 @@ impl<'p> Vm<'p> {
             *regs.add(p.sum as usize) = Value::int(sum as i32).bits();
             *regs.add(p.k as usize) = Value::int(k).bits();
             *regs.add(p.i as usize) = Value::int(limit).bits();
+        }
+        if matches!(p.limit, FieldLoopLimit::Upval(_)) && std::env::var_os("ZIPP_JITLOG").is_some()
+        {
+            eprintln!(
+                "[jit] upvalue-field-read-stream committed {} iterations",
+                remaining
+            );
         }
         true
     }
@@ -1164,9 +1214,8 @@ impl<'p> Vm<'p> {
         }
         let load = |r: u16| Value::from_bits(unsafe { *regs.add(r as usize) });
         let (array_v, n_v, k_v, i_v) = (load(p.array), load(p.n), load(p.k), load(p.i));
-        let limit_v = match self.globals.get(p.limit_global as usize) {
-            Some(v) => *v,
-            None => return false,
+        let Some(limit_v) = self.field_loop_limit(p.limit) else {
+            return false;
         };
         if !array_v.is_heap()
             || !n_v.is_int()
@@ -1221,6 +1270,13 @@ impl<'p> Vm<'p> {
         unsafe {
             *regs.add(p.k as usize) = Value::int(final_k).bits();
             *regs.add(p.i as usize) = Value::int(limit).bits();
+        }
+        if matches!(p.limit, FieldLoopLimit::Upval(_)) && std::env::var_os("ZIPP_JITLOG").is_some()
+        {
+            eprintln!(
+                "[jit] upvalue-field-write-stream committed {} iterations",
+                remaining
+            );
         }
         true
     }
