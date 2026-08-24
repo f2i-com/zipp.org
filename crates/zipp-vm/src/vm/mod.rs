@@ -346,6 +346,7 @@ pub struct Vm<'p> {
     /// unreliable for `var o = arr[i]; o.x` (o is loaded indirectly). NOT a GC
     /// root: a stale/reused-slot entry is rebuilt-from-live at compile time and
     /// each arm is runtime identity+version-guarded, so a dead entry is harmless.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     mi_recv: rustc_hash::FxHashMap<u64, Vec<u64>>,
     /// Reusable scratch buffer for the `GetIndexConcat`/`SetIndexConcat` fused
     /// computed-key fast path: the `"prefix" + i` key is assembled here and
@@ -481,6 +482,7 @@ pub struct Vm<'p> {
     /// shape fixes the whole key -> slot mapping, so `(site, shape)` names one
     /// slot for all time. Bounded, because shapes are bounded (`shape::SHAPE_MAX`)
     /// and sites are finite; entries are pure memo and may be dropped freely.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
     /// Prototype objects known to contribute NOTHING to a `for-in`: no own key
     /// is enumerable, and none can shadow a farther level because the walk ends
@@ -514,6 +516,7 @@ pub struct Vm<'p> {
     /// Single pending result for the exact MEM-only non-global exec region.
     /// No native/user-code re-entry is permitted while populated; every
     /// region exit first materializes it into its skipped global binding.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     regexp_scalar_exec_pending: Option<proxy_regexp::RegexpScalarExecPending>,
     /// RegExp legacy statics backing `RegExp.input`/`$_`/`lastMatch`/`$&`/
     /// `lastParen`/`$+`/`leftContext`/`$``/`rightContext`/`$'`/`$1`–`$9`, laid
@@ -1537,6 +1540,7 @@ mod collections;
 mod construct;
 mod dtf_pattern;
 mod enum_stream;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod field_stream;
 mod gc;
 mod helpers_datetime;
@@ -1560,6 +1564,7 @@ pub(crate) use async_runtime::async_inline_await_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use coerce::concat_pair_stats;
 pub(crate) use coerce::pad2_concat_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use coerce::pad2_concat_stats_enabled;
 pub(crate) use coerce::pad2_conditional_stats;
 pub(crate) use gc::gc_gen_stats;
@@ -1572,7 +1577,9 @@ pub(crate) use helpers_misc::cross_fill_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;
 pub(crate) use proxy_regexp::regexp_call_direct_enabled;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use proxy_regexp::rx_scalar_exec_enabled;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use proxy_regexp::rx_scalar_matchall_enabled;
 pub(crate) use proxy_regexp::rxstats::dump as regexp_result_stats;
 pub(crate) use proxy_regexp::rxstats::dump_call_direct as regexp_call_direct_stats;
@@ -1582,10 +1589,12 @@ pub(crate) use proxy_regexp::rxstats::dump_string_call_direct as regexp_string_c
 pub(crate) use proxy_regexp::string_regexp_call_direct_enabled;
 pub(crate) mod prof;
 pub(crate) use prof::dump as prof_stats;
+pub(crate) use temporal::tzdb_version;
 pub(crate) mod decorators;
 mod ic;
 
 pub(crate) use bigint::*;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use field_stream::*;
 pub(crate) use helpers_datetime::*;
 pub(crate) use helpers_json::*;

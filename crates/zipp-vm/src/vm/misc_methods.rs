@@ -117,7 +117,7 @@ impl<'p> Vm<'p> {
         let nv = if recv.is_number() { recv } else { Value::num(n) };
         // ToIntegerOrInfinity(ToNumber(arg)): coerce (valueOf/string), truncate;
         // NaN -> 0. Absent arg behaves as `undefined` -> NaN -> 0.
-        let mut int_arg = |vm: &mut Self, i: usize| -> Result<f64, Thrown> {
+        let int_arg = |vm: &mut Self, i: usize| -> Result<f64, Thrown> {
             // ToIntegerOrInfinity goes through ToNumber, so a BigInt/Symbol digits
             // argument is a TypeError (not silently coerced).
             let raw = vm.to_number_strict(args.get(i).copied().unwrap_or(Value::UNDEFINED))?;

@@ -52,7 +52,7 @@ fn a_replaced_prototype_method_wins() {
 }
 
 #[test]
-fn a_prototype_method_replaced_AFTER_the_loop_is_hot_still_wins() {
+fn a_prototype_method_replaced_after_the_loop_is_hot_still_wins() {
     // The guard is re-checked per call, not cached — `ObjMap::set` does not bump
     // the heap version on a plain overwrite (B67), so a version-keyed cache here
     // would go stale exactly in this case.

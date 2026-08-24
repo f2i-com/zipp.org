@@ -382,7 +382,6 @@ impl<'a> FnCompiler<'a> {
             dec_static_named,
             dec_computed,
             has_dec,
-            instance_order: _,
         } = self.compile_class(class, name)?;
         // The CLASS's own DecoratorList is evaluated FIRST — before the heritage.
         // `ClassDeclaration : DecoratorList class BindingIdentifier ClassTail`
@@ -1747,7 +1746,6 @@ impl<'a> FnCompiler<'a> {
             dec_static_named,
             dec_computed,
             has_dec: plan.class_decorators > 0 || !plan.elements.is_empty(),
-            instance_order,
         })
     }
 

@@ -2099,11 +2099,6 @@ struct LaneBuilder<'a> {
     uentry: FxHashMap<u16, usize>,
     steps: Vec<LaneStep>,
     n_guards: u16,
-    /// W19 (MI-LANE): `Some` for a METHOD-inline body — the baked receiver
-    /// `vals` base, its admitted `this.<field>` slots, and one guard block per
-    /// flattened `super` site. `None` is the leaf lane, whose closed op set
-    /// contains neither, so both mi arms of the walk are unreachable there.
-    mi: Option<&'a MiLaneCtx>,
     /// Side storage for `LaneStep::SuperGuard` hop lists.
     hop_pool: Vec<(u32, u32)>,
 }
@@ -2379,7 +2374,7 @@ impl LaneBuilder<'_> {
             return Ok(());
         }
         // Operand conversions into the scratch pair (a → xmm0, b → xmm1).
-        let mut conv = |slf: &mut Self, sid: usize, scratch: u8| -> u8 {
+        let conv = |slf: &mut Self, sid: usize, scratch: u8| -> u8 {
             match slf.slots[sid] {
                 Av::F64 { h } => h,
                 Av::Int { h, .. } => {
@@ -2852,7 +2847,6 @@ fn build_lane_inner(
         uentry: FxHashMap::default(),
         steps: Vec::new(),
         n_guards: 0,
-        mi,
         hop_pool: Vec::new(),
     };
     // ── entry: hoisted upval loads ── every upval index whose FIRST body op

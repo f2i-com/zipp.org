@@ -131,6 +131,7 @@ pub(crate) enum IcEntry {
 /// `(heap_idx, version)` guards to re-check, and the holder slot + baked fn bits
 /// (a same-slot reassignment value guard, in case an overwrite doesn't bump the
 /// hop version).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) struct MiSuperResolved {
     pub(crate) fid: u32,
     pub(crate) hops: Vec<(u32, u32)>,
@@ -1212,6 +1213,7 @@ impl<'p> Vm<'p> {
     /// for an empty / polymorphic / disabled site — the planner then declines to
     /// inline this call (it keeps the per-call helper). Performs NO fill and NO
     /// side effect (unlike `ic_call`), so it's safe to call at compile time.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_call_mono(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32, u32)> {
         let site = self.ic_site(func_id, ip)?;
         if site.n != 1 {
@@ -1228,6 +1230,7 @@ impl<'p> Vm<'p> {
     /// the Q7 method-inline planner (`build_method_inline_plan`). `None` if no
     /// such way exists yet (unfilled site, or the class resolves a different
     /// entry kind / a different class). Performs no fill / side effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_class_method_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
@@ -1246,6 +1249,7 @@ impl<'p> Vm<'p> {
     /// (prototype-accessor reassignment ignored — verified JIT==NOJIT), so an arm
     /// baked off this fid + the receiver identity/version guard matches the
     /// interpreter. `None` if no such way / not a plain user fn.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_class_getter_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
@@ -1260,6 +1264,7 @@ impl<'p> Vm<'p> {
 
     /// Read-only: the trivial class SETTER `fid` for a `SetProp` site whose
     /// receiver belongs to `class` (Stage 5), from a filled `ClassSetter` IC way.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_class_setter_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
@@ -1280,6 +1285,7 @@ impl<'p> Vm<'p> {
     /// `setPrototypeOf` / method reassignment on the chain bumps one). `None` if
     /// no usable way (unfilled / chain mutated / accessor / not a plain fn).
     /// Performs no fill / side effect. Mirrors `ic_super_method`'s hit validation.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_super_method_baked(
         &self,
         func_id: u32,
@@ -1328,6 +1334,7 @@ impl<'p> Vm<'p> {
     /// Everything else transfers verbatim: the hop version guards catch
     /// `setPrototypeOf` and a holder realloc, and `mi_class_epoch` catches a
     /// re-executed class declaration.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_super_getter_baked(
         &self,
         func_id: u32,
@@ -1383,6 +1390,7 @@ impl<'p> Vm<'p> {
     /// swap of the setter half (`defineProperty` with a new `set`, keeping
     /// `get`) does NOT move the buffer — and is caught by the VALUE compare,
     /// which is the whole point of the re-check.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_super_setter_baked(
         &self,
         func_id: u32,

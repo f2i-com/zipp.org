@@ -140,20 +140,6 @@ pub(crate) struct Cover {
     pub await_ident: Vec<SyntaxError>,
 }
 
-impl Cover {
-    fn pattern_only(&mut self, e: SyntaxError) {
-        if self.pattern_only.is_none() {
-            self.pattern_only = Some(e);
-        }
-    }
-
-    fn expr_only(&mut self, e: SyntaxError) {
-        if self.expr_only.is_none() {
-            self.expr_only = Some(e);
-        }
-    }
-}
-
 /// What kind of binding a name introduces. Decides which duplicate-declaration
 /// rule applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,15 +158,7 @@ pub(crate) enum BindKind {
     /// specifically: `{ function* f(){} function* f(){} }` is an error in every
     /// mode, and so is a plain/generator PAIR in either order.
     GenFunction,
-    Param,
-    CatchParam,
     Import,
-}
-
-impl BindKind {
-    fn is_lexical(self) -> bool {
-        matches!(self, BindKind::Let | BindKind::Const | BindKind::Class | BindKind::Import)
-    }
 }
 
 /// Where a Statement sits. Three Annex B / §14.x rules read this, and they
@@ -451,7 +429,6 @@ pub struct Parser<'s> {
     pub(crate) ctx: Ctx,
     pub(crate) scopes: ScopeStack,
     pub(crate) cover: Cover,
-    pub(crate) opts: ParseOptions,
     /// Labels in scope, for duplicate-label and `break`/`continue` target
     /// checks. Reset at every function boundary.
     pub(crate) labels: Vec<Box<str>>,
@@ -485,13 +462,14 @@ pub struct Parser<'s> {
 }
 
 impl<'s> Parser<'s> {
+    #[cfg(test)]
     pub fn new(src: &'s str, opts: ParseOptions) -> PResult<Parser<'s>> {
         Parser::new_exact(src, None, opts)
     }
 
-    /// As [`Parser::new`], plus the EXACT WTF-8 bytes `src` is a lossy view of
-    /// — see [`Lexer::set_exact_src`]. Only `eval` of a code string holding a
-    /// lone surrogate has any.
+    /// Constructs a parser and supplies the EXACT WTF-8 bytes `src` is a lossy
+    /// view of — see [`Lexer::set_exact_src`]. Only `eval` of a code string
+    /// holding a lone surrogate has any.
     pub fn new_exact(
         src: &'s str,
         exact: Option<&'s [u8]>,
@@ -521,7 +499,6 @@ impl<'s> Parser<'s> {
             ctx,
             scopes: ScopeStack::default(),
             cover: Cover::default(),
-            opts,
             labels: Vec::new(),
             parenthesized: false,
             goal,
@@ -627,10 +604,6 @@ impl<'s> Parser<'s> {
 
     pub(crate) fn err_here(&self, msg: impl Into<String>) -> SyntaxError {
         SyntaxError::new(msg, self.tok.span.start)
-    }
-
-    pub(crate) fn source(&self) -> &'s str {
-        self.src
     }
 
     pub(crate) fn prev_end(&self) -> u32 {

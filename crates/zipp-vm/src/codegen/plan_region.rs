@@ -1048,7 +1048,7 @@ fn plan_region_cold_inner(
     let mut write_through: FxHashSet<u16> = FxHashSet::default();
     let mut split_recv_lg: FxHashSet<usize> = FxHashSet::default();
     let mut recv_glob: Option<u32> = None;
-    let mut split_all_dv = false;
+    let mut split_all_dv;
     {
         // Candidate receiver regs: the `obj` of every pinned index op, and the
         // `obj` of every pinned-STRING charCodeAt/length access.
@@ -2473,7 +2473,7 @@ fn plan_region_cold_inner(
             // moved above this block. Do not hand-roll a FOURTH.
             let mut last_use = ip;
             let mut use_before_def = false;
-            let mut note_use = |uip: usize, last_use: &mut usize, before: &mut bool| {
+            let note_use = |uip: usize, last_use: &mut usize, before: &mut bool| {
                 *last_use = (*last_use).max(uip);
                 *before |= uip < ip;
             };
@@ -4553,7 +4553,6 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::GetIteratorObj { src, .. }
         | Instr::IterToArray { src, .. }
         | Instr::GetAsyncIterator { src, .. }
-        | Instr::CheckIterable { src }
         | Instr::DateParse { src, .. } => vec![src],
         Instr::ObjectRestDyn { src, keys_base, n, .. } => win(&[src], keys_base, n),
 

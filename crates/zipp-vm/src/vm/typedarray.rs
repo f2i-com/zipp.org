@@ -42,6 +42,7 @@ impl<'p> Vm<'p> {
     /// is just as intrinsic. What must be rejected is a chain a user re-pointed
     /// or shadowed (`Object.setPrototypeOf(ta, {length: 7})`), where the spec
     /// requires the ordinary lookup to win.
+    #[allow(dead_code)] // retained until cross-realm TypedArray prototypes carry the intrinsic accessors
     pub(crate) fn ta_named_is_intrinsic(&self, ta_idx: u32, key: &str) -> bool {
         let want = match key {
             "length" => crate::vm::native::TA_GET_LENGTH,
@@ -73,6 +74,7 @@ impl<'p> Vm<'p> {
 
     /// The nearest object on `ta_idx`'s prototype chain with an own `key`
     /// (the instance's own side-table props are checked by the caller first).
+    #[allow(dead_code)] // support for the deliberately staged ta_named_is_intrinsic path above
     fn ta_chain_has_own(&self, ta_idx: u32, key: &str) -> Option<u32> {
         let mut cur = match self.proto_of.get(&ta_idx) {
             Some(p) if p.is_heap() => p.heap_index(),
@@ -105,6 +107,7 @@ impl<'p> Vm<'p> {
     /// prototype is still its kind's intrinsic, that intrinsic does not shadow
     /// `length`, and %TypedArray%.prototype's `length` is still the built-in
     /// accessor (`Native(TA_GET_LENGTH)`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ta_length_is_intrinsic(&self, ta_idx: u32) -> bool {
         let kind = match self.heap.get(ta_idx) {
             HeapObj::TypedArray { kind, .. } => *kind as usize,
@@ -587,36 +590,6 @@ impl<'p> Vm<'p> {
             }
         }
         Ok((n, max_byte_length))
-    }
-
-    /// `new ArrayBuffer(byteLength)`.
-    pub(crate) fn build_array_buffer(&mut self, args: &[Value]) -> Result<Value, Thrown> {
-        let (n, max_byte_length) = self.validate_array_buffer_args(args)?;
-        if n > MAX_ARRAY_BUFFER_LEN as usize {
-            return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
-        }
-        let buf = self.alloc_array_buffer(n);
-        if let Some(m) = max_byte_length {
-            self.ab_max.insert(buf, m);
-        }
-        Ok(Value::heap(buf))
-    }
-
-    /// `new SharedArrayBuffer(length[, {maxByteLength}])`. Reuses the ArrayBuffer
-    /// length/maxByteLength validation, then allocates truly-shared storage,
-    /// marks the buffer shared and links it to %SharedArrayBuffer.prototype%.
-    /// A SAB is growable (never shrinks/detaches); the `maxByteLength` option
-    /// makes `grow` available.
-    pub(crate) fn build_shared_array_buffer(&mut self, args: &[Value]) -> Result<Value, Thrown> {
-        let (n, max_byte_length) = self.validate_array_buffer_args(args)?;
-        if n > MAX_ARRAY_BUFFER_LEN as usize {
-            return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
-        }
-        let idx = self.alloc_shared_array_buffer(n, max_byte_length);
-        if let Some(m) = max_byte_length {
-            self.ab_max.insert(idx, m);
-        }
-        Ok(Value::heap(idx))
     }
 
     /// Validate an Atomics receiver/index: the receiver must be an INTEGER

@@ -1728,7 +1728,7 @@ impl<'p> Vm<'p> {
         ) {
             // (`re.lastIndex = …` was handled above; a `re.exec = fn` override or
             // any `re.x = …` lands in the side table. RegExp accessor keys
-            // source/flags/… are read back via regexp_get_prop, not from here.)
+            // source/flags/… are synthesized by the RegExp member path.)
             // A non-extensible exotic object rejects a NEW own property (sloppy
             // no-op), mirroring the plain-object arm below — its extensibility lives
             // in the arr_props side table's flag (set by Object.preventExtensions).

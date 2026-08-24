@@ -839,8 +839,13 @@ impl<'p> Vm<'p> {
         ) {
             return Err(Thrown("TypeError: value is not iterable".into()));
         }
+        enum DestructureIter {
+            Positional,
+            Existing,
+            Method(Value),
+        }
         let drain = match self.heap.get(v.heap_index()) {
-            HeapObj::Generator { .. } => true,
+            HeapObj::Generator { .. } => DestructureIter::Existing,
             // `HeapObj::Intl` is here for %Segments% and %SegmentIterator%: both
             // are branded exotic objects that carry a `@@iterator` method like an
             // ordinary object, and without this arm they fell through to `_ =>
@@ -850,7 +855,11 @@ impl<'p> Vm<'p> {
             // (Segmenter/prototype/segment/segment-tostring.js).
             HeapObj::Object(_) | HeapObj::Intl { .. } => {
                 let it = self.get_prop(v, "@@iterator")?;
-                self.is_callable(it)
+                if self.is_callable(it) {
+                    DestructureIter::Method(it)
+                } else {
+                    DestructureIter::Positional
+                }
             }
             // Array destructuring's GetIterator reaches
             // %TypedArray%.prototype.values, whose ValidateTypedArray throws for
@@ -863,7 +872,7 @@ impl<'p> Vm<'p> {
                         "TypeError: TypedArray is detached or out of bounds".into(),
                     ));
                 }
-                false
+                DestructureIter::Positional
             }
             // A plain array: fast-path the default iterator (direct indexing), but
             // honour a replaced Array.prototype[Symbol.iterator] by draining via
@@ -871,9 +880,9 @@ impl<'p> Vm<'p> {
             HeapObj::Array(_) => {
                 let it = self.get_prop(v, "@@iterator")?;
                 if it.bits() == self.default_array_iter.bits() {
-                    false // the default array iterator → direct positional indexing
+                    DestructureIter::Positional // the default iterator → direct indexing
                 } else if self.is_callable(it) {
-                    true // a replaced, callable @@iterator → drain via the protocol
+                    DestructureIter::Method(it) // call the already-observed replacement
                 } else {
                     // @@iterator was deleted or poisoned (undefined / non-callable):
                     // GetIterator throws a TypeError rather than silently falling
@@ -888,23 +897,27 @@ impl<'p> Vm<'p> {
             // `var [p, q] = [10, 20].values()` bound two `undefined`s. Arrays,
             // Sets, strings and generators all worked, which is why it survived:
             // the broken shape is the one nobody writes by hand.
-            HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => true,
-            _ => false,
+            HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => {
+                DestructureIter::Existing
+            }
+            _ => DestructureIter::Positional,
         };
-        if !drain {
-            return Ok(v);
-        }
-        // Hold the not-yet-rooted drained values across the `.next()`/`.return()`
-        // user re-entries.
+        // Hold the captured method, returned iterator, and not-yet-rooted
+        // drained values across the user re-entries below.
         let _gc = self.gc_lock_guard();
-        // generator → itself; iterable → its iterator. An array only reaches here
-        // when its @@iterator was replaced, so call that explicitly (get_iterator
-        // returns a plain array unchanged).
-        let iter = if matches!(self.heap.get(v.heap_index()), HeapObj::Array(_)) {
-            let m = self.get_prop(v, "@@iterator")?;
-            self.call_value(m, v, &[])?
-        } else {
-            self.get_iterator(v)?
+        let iter = match drain {
+            DestructureIter::Positional => return Ok(v),
+            DestructureIter::Existing => v,
+            // GetIterator reads @@iterator once and calls that captured method.
+            // Re-reading it here is observable when it is an accessor and can
+            // also select a different method from the one already validated.
+            DestructureIter::Method(method) => {
+                let iter = self.call_value(method, v, &[])?;
+                if !self.is_object_value(iter) {
+                    return Err(Thrown("TypeError: iterator is not an object".into()));
+                }
+                iter
+            }
         };
         let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. });
         let lim = max as usize;
@@ -963,32 +976,6 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("TypeError: {} is not iterable", self.display(iterable))));
         }
         self.call_value(m, iterable, &[])
-    }
-
-    /// Whether `v` can begin iterator-protocol iteration: a built-in with
-    /// positional iteration, or any object whose @@iterator resolves to a
-    /// callable (the Get may run a getter / throw — propagated).
-    pub(crate) fn value_is_iterable(&mut self, v: Value) -> Result<bool, Thrown> {
-        if !v.is_heap() {
-            return Ok(false);
-        }
-        match self.heap.get(v.heap_index()) {
-            HeapObj::Str(_)
-            | HeapObj::Cons { .. }
-            | HeapObj::Array(_)
-            | HeapObj::TypedArray { .. }
-            | HeapObj::Map { .. }
-            | HeapObj::Set(_)
-            | HeapObj::Generator { .. }
-            | HeapObj::AsyncGenerator(_)
-            | HeapObj::Iterator { .. }
-            | HeapObj::IterHelper { .. } => Ok(true),
-            HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Boxed { .. } => {
-                let m = self.get_prop(v, "@@iterator")?;
-                Ok(self.is_callable(m))
-            }
-            _ => Ok(false),
-        }
     }
 
     pub(crate) fn iterator_close(&mut self, iter: Value) -> Result<(), Thrown> {

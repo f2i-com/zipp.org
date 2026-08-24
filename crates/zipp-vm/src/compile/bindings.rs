@@ -508,12 +508,6 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    /// Store through a reference snapshotted by `eval_snap_probe`: the probed
-    /// state (not the store-time state) picks EvalScope vs the static target.
-    pub(crate) fn store_binding_snapped(&mut self, b: &Binding, src: Reg, snap: Option<Reg>) {
-        self.store_binding_snapped_ex(b, src, snap, false)
-    }
-
     pub(crate) fn store_binding_snapped_ex(
         &mut self,
         b: &Binding,

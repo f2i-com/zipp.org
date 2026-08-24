@@ -807,7 +807,6 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         Instr::ArrayRest { dst, src, .. } => r(vec![src], Some(dst)),
         Instr::ObjectSpread { target, src } => r(vec![target, src], None),
         Instr::RequireObject { val } => r(vec![val], None),
-        Instr::CheckIterable { src } => r(vec![src], None),
         Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => r(vec![iter], None),
         Instr::CallSpread { dst, callee, args } => r(vec![callee, args], Some(dst)),
         Instr::CallMethodSpread { dst, obj, args, .. } => r(vec![obj, args], Some(dst)),

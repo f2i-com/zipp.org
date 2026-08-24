@@ -24,8 +24,8 @@
 //! the `)`. It reuses the `( … )` machinery with `is_async` set.
 
 use super::ast::*;
-use super::parser::{Cover, Ctx, PResult, Parser, SyntaxError};
-use super::token::{Keyword, NumKind, Punct, Span, StrVal, TokenKind};
+use super::parser::{Ctx, PResult, Parser, SyntaxError};
+use super::token::{Keyword, NumKind, Punct, StrVal, TokenKind};
 
 /// Binding power of the binary operators, highest binds tightest. `**` is
 /// right-associative and handled by the caller; everything here is left.

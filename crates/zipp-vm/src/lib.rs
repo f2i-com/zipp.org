@@ -46,11 +46,6 @@ mod codegen {
     }
 
     #[inline]
-    pub(crate) const fn index_in_overlay_enabled() -> bool {
-        true
-    }
-
-    #[inline]
     pub(crate) const fn forin_arr_own_enabled() -> bool {
         true
     }
@@ -84,6 +79,11 @@ pub fn shape_stats() -> (usize, usize, usize) {
 /// samples, plus the total sample count. Empty unless the variable was set.
 pub fn prof_stats() -> (Vec<(&'static str, u64, f64)>, u64) {
     vm::prof_stats()
+}
+
+/// IANA time-zone database release embedded by the Temporal implementation.
+pub fn temporal_tzdb_version() -> &'static str {
+    vm::tzdb_version()
 }
 
 /// `ZIPP_GCSTATS=1` per-phase collector timing:
@@ -4238,6 +4238,12 @@ mod tests {
         );
         assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} let [a,...r]=g(); console.log(a,r.join(','))"), vec!["1 2,3"]);
         assert_eq!(run_ok("let it={[Symbol.iterator](){let i=0;return{next:()=>({value:i++,done:false})}}}; let [a,b,c]=it; console.log(a,b,c)"), vec!["0 1 2"]); // infinite iterator, bounded pull (no hang)
+        // GetIterator reads @@iterator exactly once. The retired CheckIterable
+        // prefix used to perform a second observable property access here.
+        assert_eq!(
+            run_ok("let gets=0,i=0,it={}; Object.defineProperty(it,Symbol.iterator,{get(){gets++;return function(){return{next(){return{value:i++,done:false}}}}}}); let [a,b]=it; console.log(a,b,gets)"),
+            vec!["0 1 1"]
+        );
         assert_eq!(run_ok("let [a,b]=[10,20]; console.log(a,b)"), vec!["10 20"]); // array fast path
         assert_eq!(run_ok("let [x,y]='hi'; console.log(x,y)"), vec!["h i"]); // string
         assert_eq!(

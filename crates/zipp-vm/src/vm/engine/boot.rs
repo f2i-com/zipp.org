@@ -95,6 +95,7 @@ impl<'p> Vm<'p> {
             builtin_globals: std::collections::HashMap::new(),
             class_values: vec![None; program.classes.len()],
             mi_class_epoch: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
             json_default_tj: None,
@@ -126,12 +127,14 @@ impl<'p> Vm<'p> {
             microtasks: std::collections::VecDeque::new(),
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_shape_slot: rustc_hash::FxHashMap::default(),
             for_in_barren: rustc_hash::FxHashMap::default(),
             regexp_string_iters: rustc_hash::FxHashMap::default(),
             matchall_batches: rustc_hash::FxHashMap::default(),
             matchall_caps_scratch: Vec::new(),
             matchall_flat_scratch: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regexp_scalar_exec_pending: None,
             regexp_last: Vec::new(),
             typeof_strs: [Value::UNDEFINED; 8],
@@ -396,20 +399,14 @@ impl<'p> Vm<'p> {
     /// not reach either of them, so a metered VM declines them rather than
     /// leaving a native path a script can spend unbounded work in. Both are
     /// throughput optimisations; correctness never depended on them.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn jit_fused_ok(&self) -> bool {
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        {
-            #[cfg(feature = "instrument")]
-            if self.jit.metered() {
-                return false;
-            }
-            self.jit_enabled
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return false;
         }
-        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
-        {
-            false
-        }
+        self.jit_enabled
     }
 
     /// Approximate resident heap in bytes — see `embed::ScriptState::heap_bytes`.

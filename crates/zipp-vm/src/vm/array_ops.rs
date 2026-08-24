@@ -54,6 +54,7 @@ impl<'p> Vm<'p> {
         // any of those (the per-element path below handles every case correctly).
         // A species target also rules them out: they fill `out` densely instead of
         // running CreateDataPropertyOrThrow per element.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         let kernel_ok = this_arg.is_undefined() && species_target.is_none();
         let collect = matches!(mode, EachMode::Map | EachMode::Filter);
         let mut out: Vec<Value> = if collect {
@@ -69,7 +70,10 @@ impl<'p> Vm<'p> {
         // the index it reached, having written results `[0, start)`; the
         // per-element loop below finishes `[start, len)` correctly (handling
         // doubles/strings/etc.), so a mixed array can never give a wrong answer.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         let mut start = 0usize;
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        let start = 0usize;
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Map)
             && kernel_ok
@@ -2381,7 +2385,10 @@ impl<'p> Vm<'p> {
                 let has_init = args.len() >= 2;
                 // Seed + first index to process: with an initial value, start at
                 // element 0; otherwise the first element seeds and we start at 1.
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
                 let mut start = if has_init { 0 } else { 1 };
+                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                let start = if has_init { 0 } else { 1 };
                 let mut acc = if has_init {
                     args[1]
                 } else if !snapshot.is_empty() {

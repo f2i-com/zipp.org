@@ -463,6 +463,7 @@ impl Vm<'_> {
         // A scalarized direct exec result is still logically held by its
         // skipped global store.  Its capture ranges therefore root the one
         // immutable subject until the region overwrites or materializes it.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if let Some(pending) = &self.regexp_scalar_exec_pending {
             root_val!(pending.subject);
         }

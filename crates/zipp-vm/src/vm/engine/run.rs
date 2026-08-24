@@ -263,6 +263,7 @@ impl<'p> Vm<'p> {
     /// If `callee` is an arrow function value, its lexically-captured `this`; else
     /// `None`. Used by call paths that hold the callee Value rather than its
     /// `(func_id, closure)` pair.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn arrow_captured_this(&self, callee: Value) -> Option<Value> {
         if callee.is_heap() {
             if let HeapObj::Closure { func, this_val, .. } = self.heap.get(callee.heap_index()) {

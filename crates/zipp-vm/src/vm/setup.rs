@@ -297,7 +297,7 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
-        let mut build = |vm: &mut Self, methods: &[(&str, u16)], protolink: Option<u32>| -> u32 {
+        let build = |vm: &mut Self, methods: &[(&str, u16)], protolink: Option<u32>| -> u32 {
             let mut m = ObjMap::new();
             for &(name, id) in methods {
                 let nv = Value::heap(vm.heap.alloc(HeapObj::Native(id)));

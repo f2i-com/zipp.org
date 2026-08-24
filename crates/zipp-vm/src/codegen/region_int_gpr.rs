@@ -1393,7 +1393,7 @@ fn gpr_home_map(
     }
     // Homes that need a GPR: every home some NON-hoisted reg or a global uses.
     let mut used: Vec<u8> = Vec::new();
-    let mut push = |x: u8, used: &mut Vec<u8>| {
+    let push = |x: u8, used: &mut Vec<u8>| {
         if !used.contains(&x) {
             used.push(x);
         }
@@ -1660,7 +1660,7 @@ fn spill_census(
             }
         }
         let wt = 8u64.saturating_pow(depth[ip - s].min(20));
-        let mut touch_reg = |r: u16, w: &mut FxHashMap<u8, u64>| {
+        let touch_reg = |r: u16, w: &mut FxHashMap<u8, u64>| {
             if hoist_c.contains_key(&r) {
                 return; // reads as an immediate — no home traffic
             }

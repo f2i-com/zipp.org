@@ -8,6 +8,7 @@ use super::*;
 /// `ZIPP_JITDECLINE` names the constraint a nested-leaf splice failed on —
 /// B75's survey showed a bare "Call" (and then a bare "wrapper's inner call not
 /// inlinable") cannot choose between the possible generalisations.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn nested_reject(why: &str) {
     if std::env::var_os("ZIPP_JITDECLINE").is_some() {
         eprintln!("[nested-reject] {why}");
@@ -1169,7 +1170,7 @@ impl<'p> Vm<'p> {
             // is independently identity+version-guarded, so an extra/wrong guess
             // just yields a dead arm — never a correctness risk.
             let mut cand_bits: Vec<u64> = Vec::new();
-            let mut push_cand = |v: Value, cands: &mut Vec<Value>, bits: &mut Vec<u64>| {
+            let push_cand = |v: Value, cands: &mut Vec<Value>, bits: &mut Vec<u64>| {
                 if v.is_heap() && !bits.contains(&v.bits()) && cands.len() < MAX_ARMS {
                     bits.push(v.bits());
                     cands.push(v);
@@ -1563,7 +1564,6 @@ impl<'p> Vm<'p> {
                 }
                 (f, Some((slot as u32, fv.bits())))
             }
-            _ => return None,
         };
         let callee = self.func(fid as usize);
         // Outer body admits `super.m()` (Stage 3); super targets do not.

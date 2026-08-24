@@ -921,7 +921,7 @@ impl<'p> Vm<'p> {
             // an own property is more specific than the `%RegExp.prototype%` getter.
             // `lastIndex` is the exception: it is a struct-backed own data property
             // (the single source of truth shared with `exec`), so it always resolves
-            // through `regexp_get_prop`, never a side-table entry.
+            // directly from the RegExp record, never a side-table entry.
             if key != "lastIndex" {
                 let entry = self
                     .arr_props

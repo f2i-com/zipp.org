@@ -35,12 +35,6 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// The interim i64 view of a stored Duration for consumers that haven't
-    /// been widened (saturating symmetrically; see dur_to_i64).
-    pub(crate) fn duration_fields_i64(&self, idx: u32) -> Option<[i64; 10]> {
-        self.duration_fields(idx).map(|f| f.map(Self::dur_to_i64))
-    }
-
     /// ToIntegerIfIntegral for a Duration field: a Symbol or BigInt is a TypeError
     /// (ToNumber semantics; our plain to_number is lenient on BigInt), a user
     /// valueOf/toString is honoured, and the result must be a finite integer.

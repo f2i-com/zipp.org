@@ -473,7 +473,7 @@ impl<'s> Parser<'s> {
                             }
                             rest = Some(Box::new(self.expr_to_pattern(inner)?));
                         }
-                        ObjectMember::Prop { key, value, shorthand, init } => {
+                        ObjectMember::Prop { key, value, init, .. } => {
                             let inner = self.expr_to_pattern(value)?;
                             let value = match init {
                                 Some(d) => {
@@ -481,7 +481,7 @@ impl<'s> Parser<'s> {
                                 }
                                 None => inner,
                             };
-                            props.push(PatternProp { key, value, shorthand });
+                            props.push(PatternProp { key, value });
                         }
                         _ => {
                             return Err(
@@ -528,7 +528,7 @@ impl<'s> Parser<'s> {
                         Some(d) => Pattern::Assign { left: Box::new(inner), right: Box::new(d) },
                         None => inner,
                     };
-                    out.push(PatternProp { key: p.key, value, shorthand: p.shorthand });
+                    out.push(PatternProp { key: p.key, value });
                 }
                 Pattern::Object {
                     props: out,

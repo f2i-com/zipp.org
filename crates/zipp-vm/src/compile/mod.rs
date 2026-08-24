@@ -26,9 +26,8 @@ use std::rc::Rc;
 // it did when the AST type was `ox::Program`; the AST's is `ast::Program`.
 use crate::parse::ast::{self, *};
 // Not re-exported by `ast` (it imports them privately), so they come from the
-// token module: `Span` is what a `Function`/`Arrow`/`Class` carries for
-// `Function.prototype.toString`, and `StrVal` is every string literal's value.
-use crate::parse::token::{Span, StrVal};
+// token module: `StrVal` is every string literal's value.
+use crate::parse::token::StrVal;
 
 use crate::bytecode::{
     BitwiseOp, ClassDef, FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource, KEY_WRITEBACK,
@@ -107,12 +106,6 @@ pub(crate) struct CompiledClass<'b> {
     pub dec_computed: Vec<Option<u16>>,
     /// Whether the class carries any decorator at all (class or element).
     pub has_dec: bool,
-    /// Source order of INSTANCE fields: (0 = named field, 1 = computed field)
-    /// -> index into its vec. The two used to be emitted as two back-to-back
-    /// loops, so `class C { [a] = 1; b = 2 }` ran `b`'s initializer before
-    /// `a`'s; this is the instance twin of `static_order`, which never had that
-    /// bug.
-    pub instance_order: Vec<(u8, usize)>,
 }
 
 /// Shared, mutable upvalue list of a function: (name, where-the-cell-comes-from).
@@ -301,10 +294,6 @@ struct Compiler {
     /// top-level (eval-global) binding after the module runs to build its
     /// namespace. Empty for scripts/eval (which have no `export`).
     module_exports: Vec<(String, String)>,
-    /// True if a module has a real `import` declaration or `export * as ns from` —
-    /// dependencies the loader cannot link yet, so such a module rejects the dynamic
-    /// `import()`. RE-EXPORTS are recorded in the two fields below instead.
-    module_has_imports: bool,
     /// `export {imported as exported} from 'spec'` re-exports: (exported, imported,
     /// specifier). Resolved by the loader against the dependency module.
     module_reexports: Vec<(String, String, String)>,
@@ -435,12 +424,8 @@ fn has_use_strict(directives: &[ast::Directive]) -> bool {
 
 /// A function's directive prologue, used to detect its own `"use strict"`.
 ///
-/// NOTE: `FnBody` also carries a `strict` flag, but it is NOT a substitute here.
-/// That flag folds in INHERITED strictness (a class member's body is strict with
-/// no prologue at all), whereas every caller of this wants the body's own
-/// prologue OR'd with `cx.in_strict` itself. Reading `body.strict` would make
-/// `strict_name_err` fire on sloppy-legal parameter names inside class methods,
-/// which is a behaviour change, so the prologue scan stays.
+/// Every caller wants the body's own prologue OR'd with `cx.in_strict`; inherited
+/// strictness is tracked separately, so the prologue scan stays.
 fn fn_directives(f: &ast::Function) -> &[ast::Directive] {
     // A bodiless function (TypeScript declaration / overload signature) is not
     // representable, so the `unwrap_or(&[])` the oxc shape needed is gone.

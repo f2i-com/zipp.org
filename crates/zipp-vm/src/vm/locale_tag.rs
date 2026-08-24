@@ -196,7 +196,7 @@ pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
         return None;
     }
     let mut t = LangTag::default();
-    let mut i = 0usize;
+    let mut i: usize;
     // ── unicode_language_id ──
     if parts[0].eq_ignore_ascii_case("root") {
         // UTS-35's `unicode_language_id` admits a literal "root", but ECMA-402's

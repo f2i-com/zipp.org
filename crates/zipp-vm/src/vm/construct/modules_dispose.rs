@@ -590,18 +590,6 @@ impl<'p> Vm<'p> {
         Ok(mtype)
     }
 
-    /// Build a Module Namespace exotic object from the module's exports, where each
-    /// entry pairs the exported name with the LIVE per-module global slot holding the
-    /// binding. The ObjMap stores a SNAPSHOT value (for key order, descriptors, and
-    /// reflection); the namespace's slot map registered in `module_namespaces` is what
-    /// the live `[[Get]]` (get_member) reads, so re-assignments inside the module are
-    /// observed through `ns.x` (live bindings).
-    pub(crate) fn build_module_namespace(&mut self, exports: &[(String, u32)]) -> Value {
-        let idx = self.alloc_empty_namespace();
-        self.populate_module_namespace(idx, exports);
-        Value::heap(idx)
-    }
-
     /// Allocate an EMPTY Module Namespace exotic (null proto, no keys yet) and an empty
     /// live-slot map. Used to register a module in the loader cache BEFORE its body
     /// runs (so a self/cyclic `import` returns the same object); the caller then calls

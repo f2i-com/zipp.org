@@ -518,15 +518,6 @@ pub struct SuperInline {
     pub win_off: u16,
 }
 
-impl SuperInline {
-    fn const_bits(&self, idx: u32) -> u64 {
-        self.consts.get(&idx).copied().unwrap_or(0)
-    }
-    fn field_slot(&self, name: u32) -> u32 {
-        self.field_slots.get(&name).copied().unwrap_or(0)
-    }
-}
-
 /// The extra guards a PROTOTYPE-CHAIN method arm needs (B78).
 ///
 /// `build_method_shape` originally admitted two receiver shapes — a class
@@ -2331,6 +2322,7 @@ impl Jit {
     /// unmetered native path — the exact hole this machinery exists to close.
     /// Buffers are PARKED rather than dropped, because a native frame may be
     /// live on the stack (see `retired`).
+    #[cfg(feature = "instrument")]
     pub fn set_meter(&mut self, m: meter::Meter) {
         self.meter = Some(m);
         self.retired.extend(self.regions.drain().map(|(_, r)| r));
@@ -2357,6 +2349,7 @@ impl Jit {
     /// off-frame method inliner run user work with no VM pointer and no
     /// interpreter loop, so a metered VM declines them rather than leaving an
     /// uncharged native path open.
+    #[cfg(feature = "instrument")]
     pub fn metered(&self) -> bool {
         self.meter.is_some()
     }

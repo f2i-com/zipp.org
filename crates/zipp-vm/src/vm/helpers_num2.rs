@@ -462,17 +462,7 @@ pub(crate) fn ms_from_utc(y: i64, mo0: i64, d: i64, h: i64, mi: i64, s: i64, ms:
         + ms as f64
 }
 
-/// The legacy 2-digit-year mapping for the numeric Date constructors: 0..=99 →
-/// 1900+y (so `Date.UTC(99,…)` is 1999). Years ≥100 (and negative) pass through.
-pub(crate) fn legacy_year(y: i64) -> i64 {
-    if (0..=99).contains(&y) {
-        1900 + y
-    } else {
-        y
-    }
-}
-
-/// f64 twin of `legacy_year` for the Number-domain constructor path.
+/// The legacy 2-digit-year mapping for the Number-domain constructor path.
 pub(crate) fn legacy_year_f64(y: f64) -> f64 {
     if (0.0..=99.0).contains(&y) {
         1900.0 + y

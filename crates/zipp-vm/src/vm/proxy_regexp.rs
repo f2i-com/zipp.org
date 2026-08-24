@@ -183,6 +183,7 @@ pub(crate) const ITFB_INDICES: u8 = 1 << 4;
 /// iterator record's immutable flat-ASCII subject; `u32::MAX` in both capture
 /// cells denotes an unparticipating group. The exact plan admits at most four
 /// captures, so this contains no heap Values and adds no GC tracing work.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 pub(crate) struct RegexpScalarMatch {
     mstart: u32,
@@ -194,6 +195,7 @@ pub(crate) struct RegexpScalarMatch {
 /// One not-yet-observable result from the exact non-global exec region.  The
 /// subject is an explicit VM root; all remaining fields are byte ranges into
 /// that immutable flat-ASCII string.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 pub(crate) struct RegexpScalarExecPending {
     pub(crate) subject: Value,
@@ -201,12 +203,14 @@ pub(crate) struct RegexpScalarExecPending {
     matched: RegexpScalarMatch,
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) enum RegexpScalarExecStep {
     Success([Value; 4]),
     Miss,
     Decline,
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) enum RegexpScalarStep {
     Success,
     Done,
@@ -238,6 +242,7 @@ pub(crate) struct RegexpIterRec {
     pub done: bool,
     /// Range-only result held strictly inside an active exact scalar region.
     /// Every native exit/re-entry materialises and clears it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) scalar_pending: Option<RegexpScalarMatch>,
 }
 
@@ -1339,38 +1344,6 @@ impl<'p> Vm<'p> {
         let tail = self.units_value(&u16s[p..]);
         a.push(tail);
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))))
-    }
-
-    pub(crate) fn regexp_get_prop(
-        &mut self,
-        idx: u32,
-        source: &str,
-        flags: &str,
-        last_index: Value,
-        key: &str,
-        eff_proto: u32,
-    ) -> Result<Value, Thrown> {
-        Ok(match key {
-            "lastIndex" => last_index,
-            // Exact-WTF-8 when the side table has the pattern's exact bytes
-            // (lone surrogates round-trip), else the lossy escaped source.
-            "source" => self.regexp_source_value(idx, source),
-            "flags" => {
-                let s = canonical_flags(flags);
-                self.alloc_str(s)
-            }
-            "global" => Value::bool(flags.contains('g')),
-            "ignoreCase" => Value::bool(flags.contains('i')),
-            "multiline" => Value::bool(flags.contains('m')),
-            "dotAll" => Value::bool(flags.contains('s')),
-            "unicode" => Value::bool(flags.contains('u')),
-            "unicodeSets" => Value::bool(flags.contains('v')),
-            "sticky" => Value::bool(flags.contains('y')),
-            "hasIndices" => Value::bool(flags.contains('d')),
-            // A subclass instance resolves through ITS prototype (proto_of)
-            // so class [Symbol.replace]/exec overrides shadow the builtin.
-            _ => self.proto_member(eff_proto, key),
-        })
     }
 
     /// `RegExp.prototype.exec(input)`: returns the match-result Array (group 0 +
@@ -2677,6 +2650,7 @@ impl<'p> Vm<'p> {
     /// Pure guard for the source `GetIterator` at the exact scalar outer-loop
     /// IP. A miss has executed no getter/call and therefore resumes that same
     /// bytecode; a hit is identity because the live @@iterator is ITER_SELF.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn regexp_scalar_get_iterator_identity(&self, it: Value) -> Option<Value> {
         let rec = it
             .is_heap()
@@ -2692,6 +2666,7 @@ impl<'p> Vm<'p> {
     /// Pure guard for the following `IterPrime` Get(it,"next"). It returns
     /// the actual live data-property Value only when it is the pristine
     /// ITER_NEXT native; a replacement/accessor declines before observation.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn regexp_scalar_iter_prime(&self, it: Value) -> Option<Value> {
         let rec = it
             .is_heap()
@@ -2708,6 +2683,7 @@ impl<'p> Vm<'p> {
     /// Every eligibility/protocol check precedes lastIndex/statics/pending/done
     /// mutation. A refill only installs a pure integer scan memo and is safe to
     /// retain across a decline.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn regexp_string_iter_step_scalar(&mut self, it_idx: u32) -> RegexpScalarStep {
         if !rx_scalar_matchall_enabled() {
             return RegexpScalarStep::Decline;
@@ -2858,6 +2834,7 @@ impl<'p> Vm<'p> {
 
     /// Apply the exact unary-`+` consumer to capture `capture` (1-based)
     /// directly from the pending subject range. No capture string/Array exists.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn regexp_scalar_capture_number(&self, it_idx: u32, capture: u32) -> Option<Value> {
         let r = self.regexp_string_iters.get(&it_idx)?;
         let p = r.scalar_pending?;
@@ -2897,6 +2874,7 @@ impl<'p> Vm<'p> {
     /// the outer index, Annex-B statics and the final pending `km` are published
     /// only after every scan succeeds. Therefore every `None` is a pure prefix
     /// and the established scalar step can replay the current IterNext.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn regexp_dense_array_matchall_reduce(
         &mut self,
@@ -3188,6 +3166,7 @@ impl<'p> Vm<'p> {
     /// Materialise the one pending result into the exact skipped global
     /// binding. This intentionally does NOT record Annex-B statics again: the
     /// success step already published them once in source order.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn regexp_scalar_flush(
         &mut self,
         it_idx: u32,
@@ -3231,6 +3210,7 @@ impl<'p> Vm<'p> {
     /// scalar region.  Every guard and the complete one-match scan precede
     /// Annex-B/pending mutation, so `Decline` is a pure prefix and the original
     /// CallMethod may be replayed exactly once by the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn regexp_scalar_exec_step(
         &mut self,
         recv: Value,
@@ -3402,6 +3382,7 @@ impl<'p> Vm<'p> {
     /// Materialize the direct-exec result skipped by the exact region.  Annex-B
     /// statics were already published by the success helper and are not touched
     /// again. `reason == 1` denotes an observable slow-Add/re-entry exit.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn regexp_scalar_exec_flush(&mut self, global: u32, reason: u32) -> bool {
         if global as usize >= self.globals.len() {
             return false;
@@ -4325,6 +4306,7 @@ pub(crate) fn match_variant_enabled() -> bool {
 /// slim-exec and batch rungs are part of the proof: disabling any one restores
 /// the ordinary result-array path rather than a partially enabled protocol.
 #[inline]
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn rx_scalar_matchall_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -4352,6 +4334,7 @@ pub(crate) fn rx_scalar_matchall_enabled() -> bool {
 /// plan. `ZIPP_NO_RX_ARRAY_MATCHALL_REDUCE=1` restores the ordinary scalar
 /// iterator path on the same binary.
 #[inline]
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn rx_dense_array_matchall_reduce_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -4371,6 +4354,7 @@ pub(crate) fn rx_dense_array_matchall_reduce_enabled() -> bool {
 /// string-number grammar, compact result representation, or slim ASCII exec
 /// restores the pre-scalar native byte stream rather than a partial package.
 #[inline]
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn rx_scalar_exec_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -4562,6 +4546,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_success() {
         if enabled() {
             SCALAR_SUCCESS.fetch_add(1, Ordering::Relaxed);
@@ -4569,6 +4554,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_capture_num() {
         if enabled() {
             SCALAR_CAPTURE_NUM.fetch_add(1, Ordering::Relaxed);
@@ -4576,6 +4562,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_materialized(slow_reentry: bool) {
         if enabled() {
             SCALAR_MATERIALIZED.fetch_add(1, Ordering::Relaxed);
@@ -4586,6 +4573,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_elided() {
         if enabled() {
             SCALAR_ELIDED.fetch_add(1, Ordering::Relaxed);
@@ -4595,6 +4583,7 @@ pub(crate) mod rxstats {
     /// Account for the observable operations represented by one successful
     /// outer-array reduction without putting an atomic/branch in its match loop.
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_array_reduce(matches: u64, subjects: u64) {
         if enabled() {
             SCALAR_SUCCESS.fetch_add(matches, Ordering::Relaxed);
@@ -4609,6 +4598,7 @@ pub(crate) mod rxstats {
 
     /// A scalar helper guard that declined before any observable operation.
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_guard_decline() {
         if enabled() {
             SCALAR_GUARD_DECLINE.fetch_add(1, Ordering::Relaxed);
@@ -4616,6 +4606,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_exec_success() {
         if enabled() {
             SCALAR_EXEC_SUCCESS.fetch_add(1, Ordering::Relaxed);
@@ -4623,6 +4614,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_exec_miss() {
         if enabled() {
             SCALAR_EXEC_MISS.fetch_add(1, Ordering::Relaxed);
@@ -4630,6 +4622,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_exec_capture_nums(n: u64) {
         if enabled() {
             SCALAR_EXEC_CAPTURE_NUM.fetch_add(n, Ordering::Relaxed);
@@ -4637,6 +4630,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_exec_materialized(slow_reentry: bool) {
         if enabled() {
             SCALAR_EXEC_MATERIALIZED.fetch_add(1, Ordering::Relaxed);
@@ -4647,6 +4641,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_exec_elided() {
         if enabled() {
             SCALAR_EXEC_ELIDED.fetch_add(1, Ordering::Relaxed);
@@ -4654,6 +4649,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_exec_guard_decline() {
         if enabled() {
             SCALAR_EXEC_GUARD_DECLINE.fetch_add(1, Ordering::Relaxed);
@@ -4661,6 +4657,7 @@ pub(crate) mod rxstats {
     }
 
     #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn count_scalar_exec_pin_decline() {
         if enabled() {
             SCALAR_EXEC_PIN_DECLINE.fetch_add(1, Ordering::Relaxed);

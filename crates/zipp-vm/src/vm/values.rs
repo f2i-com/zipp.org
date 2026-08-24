@@ -1095,6 +1095,7 @@ impl<'p> Vm<'p> {
     /// for a non-Proxy chain. `has_property` is `&self`: it performs no VM-heap
     /// allocation (only a transient Rust `key_of` String for the rare arr_props
     /// overlay probe), so no GC safe point and no pinned-pointer concern.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn has_property_jit(&self, obj: Value, key: Value) -> Option<bool> {
         // RHS must be an Object (else `in` throws).
         if !self.is_object_value(obj) {

@@ -57,27 +57,34 @@ pub(crate) enum Phase {
     JsonStringify = 4,
     StringOps = 5,
     PropSlow = 6,
-    Alloc = 7,
-    JitCompile = 8,
-    Sort = 9,
+    #[cfg(all(
+        feature = "jit",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    JitCompile = 7,
     /// Executing NATIVE compiled code (a Tier A/C function body or an OSR
     /// region). Distinct from `Interp` because the two have opposite fixes:
     /// time in `Interp` means not enough code is COMPILED, time in `Jit` means
     /// compiled code is SLOW (M4's register file and per-op boxing).
-    Jit = 10,
+    #[cfg(all(
+        feature = "jit",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    Jit = 8,
     /// Promise / microtask machinery: the event-loop drain and everything it
     /// runs that is not user JS. `async-promise-chain` reported **79.1% `interp`**
     /// before this existed, and almost none of it was interpreting bytecode.
-    Microtask = 11,
+    Microtask = 9,
     /// Native compiled code running on the MEMORY-backed register path
     /// (`region_mem`): every intermediate goes through `[rbx + dreg(r)]` and is
     /// re-boxed at each step. Split out from `Jit` because B92 measured the two
     /// tiers ~4x apart on the SAME loop, so "99.7% jit-native" was compatible
     /// with a row being entirely in the slow tier and said nothing either way.
-    JitMem = 12,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    JitMem = 10,
 }
 
-const N_PHASES: usize = 13;
+const N_PHASES: usize = 11;
 
 const NAMES: [&str; N_PHASES] = [
     "interp/untagged",
@@ -87,9 +94,7 @@ const NAMES: [&str; N_PHASES] = [
     "json-stringify",
     "string-ops",
     "prop-slow",
-    "alloc",
     "jit-compile",
-    "sort",
     "jit-fast",
     "microtask",
     "jit-mem",
@@ -99,7 +104,7 @@ static CURRENT: AtomicU8 = AtomicU8::new(Phase::Interp as u8);
 static COUNTS: [AtomicU64; N_PHASES] = [
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0),
 ];
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicBool = AtomicBool::new(false);

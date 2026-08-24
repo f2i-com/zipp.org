@@ -82,7 +82,7 @@ use crate::value::Value;
 /// is only referenced by the metering loan path, which no build without
 /// `codegen` can reach. Keep the value in step with `codegen::meter` anyway, so
 /// the two never silently disagree about the unit.
-#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+#[cfg(all(test, not(all(feature = "jit", target_arch = "x86_64"))))]
 const NATIVE_CHUNK: i64 = 1 << 20;
 
 /// The trace opcode set — one per AIR selector column. A wire contract with the
@@ -565,6 +565,7 @@ impl super::Vm<'_> {
     /// The caller MUST pair this with [`Self::meter_return`], and must save and
     /// restore `jit_steps` around the pair — native code re-enters Rust through
     /// its call helpers, and that Rust can enter native again.
+    #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
     #[must_use]
     pub(crate) fn meter_lend(&mut self) -> i64 {
         let Some(rec) = self.instr_rec.as_mut() else {
@@ -642,6 +643,7 @@ impl super::Vm<'_> {
     /// A negative `jit_steps` is the overshoot of the block that tripped the
     /// check; it is absorbed rather than refunded, so the budget is never
     /// credited for work that happened.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn meter_return(&mut self) {
         let unspent = self.jit_steps.max(0);
         if let Some(rec) = self.instr_rec.as_mut() {
@@ -669,6 +671,7 @@ impl super::Vm<'_> {
     /// Charge only AFTER the work is known to have completed: a path that
     /// declines half way falls back to a real call, which the interpreter
     /// charges itself, and charging both would be double-counting.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn charge_steps(&mut self, n: i64) {
         if let Some(rec) = self.instr_rec.as_mut() {
             let n = n.max(0);
@@ -688,6 +691,7 @@ impl super::Vm<'_> {
     /// Whether the last native run stopped because it ran out of lent steps
     /// rather than because a type guard failed. A metering exit says nothing
     /// about the region's quality, so it must not count toward eviction.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn meter_exhausted(&self) -> bool {
         self.instr_rec.is_some() && self.jit_steps < 0
     }
@@ -695,6 +699,7 @@ impl super::Vm<'_> {
     /// The displacement of [`Self::jit_steps`] from the VM pointer, for the
     /// compilers to bake into `[rdi + off]`. `None` leaves the compiled code
     /// byte-identical to an unmetered build.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn meter_offset(&self) -> Option<i32> {
         self.instr_rec.as_ref()?;
         let base = self as *const Self as usize;

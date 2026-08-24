@@ -292,6 +292,7 @@ impl Token {
     }
 
     /// The identifier's spelling, if this is one.
+    #[cfg(test)]
     pub fn ident_name(&self) -> Option<&str> {
         match &self.kind {
             TokenKind::Ident { name, .. } => Some(name),

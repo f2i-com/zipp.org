@@ -1008,8 +1008,8 @@ impl<'p> Vm<'p> {
                 // through GetSuperConstructor() — the class object's LIVE
                 // [[GetPrototypeOf]]. Using the `parent` recorded at class-
                 // definition time made `Object.setPrototypeOf(D, Other)` a no-op
-                // for a ctor-less class, while the explicit-ctor form (which goes
-                // through `super_ctor_func`) already retargeted
+                // for a ctor-less class, while the explicit-ctor bytecodes already
+                // retargeted
                 // (staging/sm/class/superCallProperBase.js).
                 let live = self.object_get_prototype_of(cv);
                 let sup = if live.is_heap() { live } else { Value::heap(pidx) };

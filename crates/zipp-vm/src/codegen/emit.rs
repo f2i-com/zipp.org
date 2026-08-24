@@ -305,11 +305,6 @@ pub(crate) fn emit_int_box_from_home(ops: &mut dynasmrt::x64::Assembler, h: u8) 
     );
 }
 
-/// Restore xmm6..15 from the save area and the saved gprs, then `ret`.
-pub(crate) fn emit_region_restore(ops: &mut dynasmrt::x64::Assembler) {
-    emit_region_restore_n(ops, 0, 160);
-}
-
 /// Restore the xmm6..15 saves (from `[rsp + xmm_off + k*16]`), pop the saved gprs,
 /// and `ret`. `frame` is the post-prologue rsp adjustment to undo (`160` for the
 /// legacy layout, `200 + 32·n_ta` for the pinned-TypedArray layout whose snapshot

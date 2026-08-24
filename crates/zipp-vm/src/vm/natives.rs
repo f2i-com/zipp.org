@@ -2461,6 +2461,7 @@ impl<'p> Vm<'p> {
                                 subj_units,
                                 fbits,
                                 done: false,
+                                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
                                 scalar_pending: None,
                             },
                         );
@@ -2528,6 +2529,7 @@ impl<'p> Vm<'p> {
                         subj_units,
                         fbits,
                         done: false,
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
                         scalar_pending: None,
                     },
                 );

@@ -248,11 +248,6 @@ impl<'s> Parser<'s> {
         Ok(Params { items, simple })
     }
 
-    /// A `{ … }` function body, with its own directive prologue.
-    pub(crate) fn parse_fn_body(&mut self) -> PResult<FnBody> {
-        self.parse_fn_body_with_params(None)
-    }
-
     /// The body, with the enclosing parameter list's `BoundNames` seeded into
     /// its scope as VAR-like bindings.
     ///
@@ -260,7 +255,7 @@ impl<'s> Parser<'s> {
     /// `LexicallyDeclaredNames` (`function f(a){ let a; }` is an error) but not
     /// with its `VarDeclaredNames` (`function f(a){ var a; }` is fine, and so is
     /// a body-level `function a(){}`). Recording them in `Scope::var` is exactly
-    /// that asymmetry, and it is why they are not `BindKind::Param` in `lex`.
+    /// that asymmetry, and it is why they are recorded as var-like bindings.
     pub(crate) fn parse_fn_body_with_params(
         &mut self,
         params: Option<&Params>,
@@ -287,7 +282,7 @@ impl<'s> Parser<'s> {
         }
         self.scopes.pop()?;
         self.expect(Punct::RBrace, false)?;
-        let out = FnBody { directives, stmts, strict: self.ctx.strict };
+        let out = FnBody { directives, stmts };
         self.ctx.strict = saved_strict;
         Ok(out)
     }
@@ -362,8 +357,8 @@ impl<'s> Parser<'s> {
             let key = self.parse_prop_key()?;
             // Shorthand is "no colon", not "the key is an identifier" —
             // `{a: b}` has an identifier key and is NOT shorthand.
-            let (value, shorthand) = if self.eat(Punct::Colon, true)? {
-                (self.parse_binding_pattern()?, false)
+            let value = if self.eat(Punct::Colon, true)? {
+                self.parse_binding_pattern()?
             } else {
                 // Shorthand `{a}` / `{a = 1}`.
                 let PropKey::Ident(n) = &key else {
@@ -387,14 +382,14 @@ impl<'s> Parser<'s> {
                         key_pos,
                     ));
                 }
-                (Pattern::Ident(n.clone()), true)
+                Pattern::Ident(n.clone())
             };
             let value = if self.eat(Punct::Eq, true)? {
                 Pattern::Assign { left: Box::new(value), right: Box::new(self.parse_assign_full()?) }
             } else {
                 value
             };
-            props.push(PatternProp { key, value, shorthand });
+            props.push(PatternProp { key, value });
             if !self.eat(Punct::Comma, true)? {
                 break;
             }
@@ -914,7 +909,7 @@ impl<'s> Parser<'s> {
                 optional: false,
             }))
         };
-        let body = |stmts: Vec<Stmt>| FnBody { directives: Vec::new(), stmts, strict: true };
+        let body = |stmts: Vec<Stmt>| FnBody { directives: Vec::new(), stmts };
         let getter = Function {
             name: None,
             params: Params { items: Vec::new(), simple: true },

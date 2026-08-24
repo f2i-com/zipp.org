@@ -450,16 +450,6 @@ pub(crate) fn iso_year_month_in_range(y: i64, m: i64) -> bool {
     (y, m) >= (-271821, 4) && (y, m) <= (275760, 9)
 }
 
-pub(crate) fn parse_month_code(s: &str) -> Option<i64> {
-    // MonthCode grammar: "M" followed by EXACTLY two ASCII digits (so "M1"/"M005"
-    // are malformed). A trailing "L" marks a lunisolar leap month, which the ISO
-    // 8601 calendar does not have — reject it. The two-digit value must be 1..=12.
-    match parse_month_code_syntax(s) {
-        Some((n, false)) if (1..=12).contains(&n) => Some(n),
-        _ => None,
-    }
-}
-
 /// Parse a monthCode for *syntax* only, separating well-formedness from
 /// ISO-calendar validity. Returns `Some((month, is_leap))` for any well-formed
 /// code ("M" + exactly two ASCII digits + optional trailing "L"), or `None` if

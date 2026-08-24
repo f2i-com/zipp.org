@@ -6,6 +6,50 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
+## Windows ARM64 CI follow-up — 2026-08-24
+
+The first native `windows-11-arm` run after Wave 29 built successfully, then
+the VM unit-test process exited immediately with `0xc000001d`
+(`STATUS_ILLEGAL_INSTRUCTION`). Linux and macOS ARM64 passed the same step. The
+failure was in `dynasmrt 5.1.0`, before any Zipp-generated instruction ran:
+its non-macOS AArch64 `commit()` path executes raw `mrs ctr_el0`, `dc cvau`, and
+`ic ivau` cache-maintenance instructions, which Windows ARM64 does not permit
+at user privilege.
+
+The Windows backend now assembles into a non-executable `Vec` and publishes a
+separate allocation using the supported Win32 sequence: `VirtualAlloc` as RW,
+copy, `VirtualProtect` to RX, then `FlushInstructionCache`. This preserves W^X
+and fails closed if allocation, protection, or publication fails. The current
+call-free backend has only buffer-internal PC-relative relocations, making a
+zero-base `VecAssembler` valid; any future external/helper calls must revisit
+that invariant. The exact Windows ARM64 all-target cross-check passes locally.
+A named, single-threaded compile-and-execute smoke test now precedes the
+parallel library suite in CI so future publication failures identify the
+phase. Native execution still requires the workflow rerun before this can be
+called Windows-validated.
+
+The accompanying 94-warning ARM log was also actioned rather than suppressed.
+The 14 ordinary diagnostics (unused imports, bindings, variables, and one
+assignment) were fixed with target-aware declarations so ARM cleanup cannot
+remove mutations required by the x86 JIT. X86-only field-stream, scalar-regexp,
+IC-planner, and helper state now has matching x86 ownership; obsolete shared
+private APIs and stale bytecode/compiler fields were removed. Two TypedArray
+prototype helpers remain behind narrow, documented `dead_code` allowances
+until the known cross-realm prototype setup deviation is fixed. The generated
+TZDB release is now exposed as `temporal_tzdb_version()`, and ARM compilation is
+attributed to the JIT-compile profiler phase. Default x86, interpreter-only,
+all-feature x86, and Windows ARM64 test-target checks pass with `-Dwarnings`.
+The native ARM workflow now enforces that lint policy job-wide, so warning debt
+cannot silently return.
+
+A regression probe added during that cleanup found a separate observable
+destructuring bug: declaration destructuring classified a custom iterable by
+reading `@@iterator`, then read the accessor again when it began draining. The
+first result is now captured and called, so GetIterator observes the getter
+exactly once; the focused x86 and emulated ARM64 tests pass.
+
+---
+
 ## Continuation snapshot — 2026-08-24, Wave 29 ARM64 and boundary hardening
 
 Read this first. **Wave 29 starts from `1af69a6` on `main`; this snapshot

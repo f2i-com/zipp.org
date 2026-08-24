@@ -38,6 +38,7 @@ jobs:
     timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-Dwarnings"
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -46,6 +47,22 @@ jobs:
       - name: Prove the runner is ARM64
         shell: bash
         run: rustc +stable --print cfg | grep -qx 'target_arch="aarch64"'
+      # Keep this single-threaded smoke test ahead of the parallel library
+      # suite. If executable-memory publication regresses on Windows ARM64,
+      # the log will identify the failing phase instead of only reporting that
+      # the complete test process died.
+      - name: Windows ARM64 JIT publication smoke test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $test = 'codegen::tests::native_loop_executes_and_returns_x0'
+          $listed = cargo +stable test --locked -p zipp-vm --lib -- --list
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($listed -notcontains "${test}: test") {
+            throw "required Windows ARM64 publication smoke test is missing: $test"
+          }
+          cargo +stable test --locked -p zipp-vm --lib $test -- --exact --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: ARM64 VM unit and mechanism tests
         run: cargo +stable test --locked -p zipp-vm --lib
       - name: ARM64 tier differential slice

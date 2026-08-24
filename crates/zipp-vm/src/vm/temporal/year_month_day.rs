@@ -761,10 +761,6 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn to_plain_month_day(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
-        self.to_plain_month_day_overflow(v, None).map(|(t, _)| t)
-    }
-
     pub(crate) fn to_plain_month_day_overflow(
         &mut self,
         v: Value,

@@ -102,7 +102,7 @@ fn an_inherited_getter_still_runs() {
 }
 
 #[test]
-fn a_getter_installed_MID_loop_starts_running() {
+fn a_getter_installed_mid_loop_starts_running() {
     // The inline is already compiled when the property turns into an accessor. The
     // helper must notice and defer, not keep returning the old data value.
     let out = run_ok(&format!(

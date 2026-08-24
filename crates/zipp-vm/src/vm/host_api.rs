@@ -185,7 +185,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn host_symbols(&self) -> Vec<Symbol> {
         let p: &Program = self.program;
         let mut out: Vec<Symbol> = Vec::new();
-        let mut push = |slot: u32, scope: SymbolScope, out: &mut Vec<Symbol>| {
+        let push = |slot: u32, scope: SymbolScope, out: &mut Vec<Symbol>| {
             if let Some(name) = p.global_names.get(slot as usize) {
                 if !name.is_empty() {
                     out.push(Symbol { name: name.clone(), index: slot, scope });

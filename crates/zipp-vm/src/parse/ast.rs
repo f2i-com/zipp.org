@@ -381,7 +381,6 @@ pub struct PatternElem {
 pub struct PatternProp {
     pub key: PropKey,
     pub value: Pattern,
-    pub shorthand: bool,
 }
 
 // ============================================================================
@@ -466,8 +465,6 @@ pub struct Function {
 pub struct FnBody {
     pub directives: Vec<Directive>,
     pub stmts: Vec<Stmt>,
-    /// Strict because of its own prologue, or inherited.
-    pub strict: bool,
 }
 
 #[derive(Debug, Clone)]

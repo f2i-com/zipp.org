@@ -235,12 +235,6 @@ impl<'p> Vm<'p> {
     }
 
 
-    pub(crate) fn resolve_locale(&mut self, locales: Value) -> Result<String, Thrown> {
-        let list = self.canonicalize_locale_list(locales)?;
-        Ok(lookup_matcher(&list))
-    }
-
-
     /// Read + ToString-cast a string option (returns `default` if undefined),
     /// WITHOUT any allowed-list validation. The Temporal GetDifferenceSettings
     /// order-of-operations reads (and casts) every option before validating any,
@@ -944,19 +938,6 @@ pub(crate) fn resolved_locale_tag(tag: &str, keys: &[(&str, String)]) -> String 
         t.set_u(k, Some(v.clone()));
     }
     t.canonical()
-}
-
-
-/// Resolve a requested calendar/numberingSystem: ASCII-lowercased (the Unicode
-/// extension keys are case-insensitive), accepted only if supported.
-pub(crate) fn resolve_available(requested: Option<String>, available: &[&str], default: &str) -> String {
-    match requested {
-        Some(s) => {
-            let lower = s.to_ascii_lowercase();
-            if available.contains(&lower.as_str()) { lower } else { default.to_string() }
-        }
-        None => default.to_string(),
-    }
 }
 
 

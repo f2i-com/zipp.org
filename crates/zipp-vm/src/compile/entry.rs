@@ -53,7 +53,6 @@ pub(crate) fn compile_program_inner(
         const_globals: sorted_slots(&c.const_globals),
         eval_dynamic_names: sorted_names(&c.eval_dynamic_names),
         module_exports: std::mem::take(&mut c.module_exports),
-        module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
         module_star_reexports: std::mem::take(&mut c.module_star_reexports),
         module_ns_reexports: std::mem::take(&mut c.module_ns_reexports),
@@ -133,7 +132,7 @@ pub fn compile_eval(
             collect_hoisted_vars(s, &mut vars);
         }
         let mut lexical: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut add_lexical =
+        let add_lexical =
             |n: String, lexical: &mut std::collections::HashSet<String>| -> Result<(), String> {
                 if !lexical.insert(n.clone()) || vars.contains(&n) {
                     return Err(format!("duplicate declaration of '{n}' in module code"));
@@ -142,8 +141,8 @@ pub fn compile_eval(
             };
         // `export <decl>` keeps the declaration it wraps, so the exported form
         // goes through the same three cases as a bare one.
-        let mut check_decl = |d: &ast::Stmt,
-                              lexical: &mut std::collections::HashSet<String>|
+        let check_decl = |d: &ast::Stmt,
+                          lexical: &mut std::collections::HashSet<String>|
          -> Result<(), String> {
             match d {
                 ast::Stmt::VarDecl(vd) if vd.kind.is_lexical() => {
@@ -360,7 +359,6 @@ pub fn compile_eval(
         const_globals: sorted_slots(&c.const_globals),
         eval_dynamic_names: sorted_names(&c.eval_dynamic_names),
         module_exports: std::mem::take(&mut c.module_exports),
-        module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
         module_star_reexports: std::mem::take(&mut c.module_star_reexports),
         module_ns_reexports: std::mem::take(&mut c.module_ns_reexports),

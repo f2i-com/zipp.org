@@ -268,6 +268,7 @@ pub fn len(shape: u32) -> u32 {
 /// Walks the transition chain, so this is O(property count) — fine for an inline
 /// cache FILL, which is the only caller. The hit path never comes here: it
 /// compares the cached shape id and reuses the slot it recorded.
+#[cfg(test)]
 pub fn slot_of(shape: u32, key: &str) -> Option<u32> {
     if shape == DICT {
         return None;
@@ -346,6 +347,7 @@ pub fn stats() -> (usize, usize, usize) {
 /// Number of shapes minted so far. Used by a test to prove that repeating a
 /// construction sequence REUSES a shape rather than minting one per object —
 /// which is the entire premise of the optimisation.
+#[cfg(test)]
 pub fn count() -> usize {
     TABLE.with(|t| t.borrow().nodes.len())
 }

@@ -7,13 +7,6 @@ use crate::heap::{
 };
 use crate::value::Value;
 
-/// Quote a string as a JSON string literal (escaping per the JSON spec).
-pub(crate) fn json_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    json_quote_into(&mut out, s);
-    out
-}
-
 /// `ZIPP_NO_JSON_QUOTE_BULK=1` restores the per-code-point quoting loop
 /// (`json_quote_cp` per char) in `json_quote_into`/`json_quote_wtf8_into`,
 /// so the bulk-run path is A/B-able and bisectable on one binary.
@@ -61,15 +54,6 @@ pub(crate) fn json_quote_into(out: &mut String, s: &str) {
         }
     }
     out.push('"');
-}
-
-/// `json_quote` over a string's exact WTF-8 bytes: a LONE surrogate emits the
-/// `\udXXX` escape (QuoteJSONString / ES2019 well-formed JSON.stringify);
-/// well-formed astral scalars emit as-is.
-pub(crate) fn json_quote_wtf8(b: &[u8]) -> String {
-    let mut out = String::with_capacity(b.len() + 2);
-    json_quote_wtf8_into(&mut out, b);
-    out
 }
 
 /// `json_quote_wtf8` appending into an existing buffer.
@@ -287,17 +271,5 @@ pub(crate) fn json_parse_number(b: &[u8], i: &mut usize) -> Result<Value, Thrown
         Ok(n) => Ok(Value::num(n)),
         Err(_) => Err(err()),
     }
-}
-
-/// Wrap JSON `parts` in `open`/`close`, compact when `indent` is empty, else
-/// one element per line indented `depth+1` deep with the closing bracket at `depth`.
-pub(crate) fn wrap_json(parts: &[String], open: char, close: char, indent: &str, depth: usize) -> String {
-    if indent.is_empty() {
-        return format!("{}{}{}", open, parts.join(","), close);
-    }
-    let pad = indent.repeat(depth + 1);
-    let pad_close = indent.repeat(depth);
-    let sep = format!(",\n{pad}");
-    format!("{open}\n{pad}{}\n{pad_close}{close}", parts.join(&sep))
 }
 

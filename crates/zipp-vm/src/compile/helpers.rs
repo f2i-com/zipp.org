@@ -476,30 +476,6 @@ pub(crate) fn pattern_has_yield_or_await(pat: &Pattern, want_yield: bool, want_a
     }
 }
 
-pub(crate) fn stmt_contains_with(s: &Stmt) -> bool {
-    use crate::parse::ast::Stmt as S;
-    match s {
-        S::With { .. } => true,
-        S::Block(b) => b.iter().any(stmt_contains_with),
-        S::If { cons, alt, .. } => {
-            stmt_contains_with(cons) || alt.as_ref().is_some_and(|a| stmt_contains_with(a))
-        }
-        S::While { body, .. } => stmt_contains_with(body),
-        S::DoWhile { body, .. } => stmt_contains_with(body),
-        S::For { body, .. } => stmt_contains_with(body),
-        S::ForOf { body, .. } => stmt_contains_with(body),
-        S::ForIn { body, .. } => stmt_contains_with(body),
-        S::Try { block, handler, finalizer } => {
-            block.iter().any(stmt_contains_with)
-                || handler.as_ref().is_some_and(|h| h.body.iter().any(stmt_contains_with))
-                || finalizer.as_ref().is_some_and(|f| f.iter().any(stmt_contains_with))
-        }
-        S::Switch { cases, .. } => cases.iter().any(|c| c.body.iter().any(stmt_contains_with)),
-        S::Labeled { body, .. } => stmt_contains_with(body),
-        _ => false,
-    }
-}
-
 pub(crate) fn collect_hoisted_vars(s: &Stmt, out: &mut std::collections::HashSet<String>) {
     use crate::parse::ast::Stmt as S;
     match s {
@@ -758,15 +734,6 @@ pub(crate) fn expected_arg_count(params: &Params) -> u16 {
     n
 }
 
-/// IsSimpleParameterList: every parameter a plain identifier with no default,
-/// and no rest. (A mapped arguments object requires this in sloppy mode.)
-pub(crate) fn params_are_simple(params: &Params) -> bool {
-    // Precomputed by the front end (`Params::simple`, `items.iter().all(Ident)`),
-    // which is the same predicate this used to evaluate: a rest element and a
-    // defaulted parameter are both non-`Ident` items. Reading it rather than
-    // recomputing keeps the two from ever disagreeing.
-    params.simple
-}
 
 pub(crate) fn param_slot_names(params: &Params) -> R<Vec<String>> {
     let mut out = Vec::new();

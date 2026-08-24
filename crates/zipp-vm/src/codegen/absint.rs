@@ -163,35 +163,6 @@ pub(crate) fn refine_cmp(st: &mut AbsState, a: u16, b: u16, cmp: Cmp, truth: boo
     }
 }
 
-/// Run the interval analysis over the (int-eligible) region `[s, e]` and return
-/// the set of arithmetic ips whose 2^53 guard can be elided. `entry` carries the
-/// live-in i32 facts and hoisted-constant values. Returns an empty set on any
-/// op outside the modelled subset or non-convergence (all guards kept).
-pub(crate) fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: AbsState) -> FxHashSet<usize> {
-    analyze_int_guards_ext(proto, s, e, entry, None)
-}
-
-/// W10 (B123): the interval prover with the DV-region arms enabled. `dv` is
-/// `Some(ta_plan)` ONLY for a `region_int` DV-retry plan — every other caller
-/// keeps the strict subset, so existing regions' `elide_guard` sets are
-/// byte-identical. The extension models exactly the ops a DV swizzle region
-/// carries, each bounded BY CONSTRUCTION: a non-`>>>` Bitwise result and
-/// `Math.imul` are ToInt32; `>>>` a u32; a pinned DV get* is bounded by its
-/// kind's value range; a pinned flat-ASCII `charCodeAt` by the byte; a pinned
-/// int element by i32. This is what lets the bsum accumulator chain prove
-/// itself under 2^53 and shed its six per-iteration i53 guards — without it a
-/// DV region kept every guard AND lost r13/r14 from the GPR pool.
-pub(crate) fn analyze_int_guards_ext(
-    proto: &FuncProto,
-    s: usize,
-    e: usize,
-    entry: AbsState,
-    dv: Option<&TaPinPlan>,
-) -> FxHashSet<usize> {
-    let mut none: FxHashSet<u32> = FxHashSet::default();
-    analyze_int_guards_strict(proto, s, e, entry, dv, &mut none)
-}
-
 /// W10 (B123): the DV prover with STRICT-ENTRY seeding. `strict_globs` comes
 /// in holding CANDIDATE global slots (loop-carried accumulators stored in the
 /// region) and leaves holding the verified SURVIVORS: each survivor was
@@ -285,7 +256,7 @@ fn analyze_run(
         let code = &proto.code;
         let mut out = st.clone();
         out.cmp = None;
-        let mut arith = |out: &mut AbsState, dst: u16, iv: Iv, elide: Option<&mut FxHashSet<usize>>| {
+        let arith = |out: &mut AbsState, dst: u16, iv: Iv, elide: Option<&mut FxHashSet<usize>>| {
             if iv_in_bounds(iv) {
                 if let Some(set) = elide {
                     set.insert(ip);
@@ -465,7 +436,7 @@ fn analyze_run(
                 Some(r) => r,
                 None => return None,
             };
-            let mut merge = |tip: usize, ns: AbsState, states: &mut Vec<Option<AbsState>>| {
+            let merge = |tip: usize, ns: AbsState, states: &mut Vec<Option<AbsState>>| {
                 if tip < s || tip > e || ns.infeasible() {
                     return false; // exits the region (or a dead edge)
                 }

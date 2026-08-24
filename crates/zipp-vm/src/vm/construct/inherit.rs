@@ -188,20 +188,6 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// GetSuperConstructor() for a `super(...)` call: the LIVE [[GetPrototypeOf]]
-    /// of the active class object. The common case reads the static parent link
-    /// (`super_parent`); an `Object.setPrototypeOf(C, X)` override (recorded in
-    /// `proto_of`) retargets it — a non-constructor X is a TypeError thrown at
-    /// the SuperCall site (after ArgumentListEvaluation; call-proto-not-ctor).
-    pub(crate) fn super_ctor_func(&mut self, home_class_id: u32) -> Result<Value, Thrown> {
-        let not_ctor = || Thrown("TypeError: superclass is not a constructor".into());
-        let f = self.super_ctor_fetch(home_class_id);
-        if !self.is_constructor(f) {
-            return Err(not_ctor());
-        }
-        Ok(f)
-    }
-
     /// The fetch half of GetSuperConstructor() WITHOUT the IsConstructor check —
     /// the spec evaluates the SuperCall's argument list BETWEEN the two, so the
     /// compiler emits this (SuperCtorFetch) before the args and the check lands
@@ -247,25 +233,6 @@ impl<'p> Vm<'p> {
             None => return Value::UNDEFINED,
         };
         self.object_get_prototype_of(home_proto)
-    }
-
-    /// `super.key = v`: PutValue on a super reference. If the super base's prototype
-    /// chain exposes a setter for `key`, invoke it with `this` = the receiver;
-    /// otherwise create/update an own property on the receiver itself (the spec sets
-    /// on the receiver, not the prototype). `strict` comes from the REFERENCE SITE
-    /// (class methods are always strict; an object-literal method in sloppy code is
-    /// not — a rejected write is then a silent no-op, prop-dot-obj-ref-non-strict).
-    pub(crate) fn super_set(
-        &mut self,
-        home_class_id: u32,
-        key: &str,
-        this: Value,
-        v: Value,
-        is_static: bool,
-        strict: bool,
-    ) -> Result<(), Thrown> {
-        let proto = self.super_base(home_class_id, is_static);
-        self.super_set_obj(proto, key, this, v, strict)
     }
 
     /// The super BASE for an OBJECT-method `super.x`: GetPrototypeOf([[HomeObject]]),
@@ -592,8 +559,8 @@ impl<'p> Vm<'p> {
             // and its `super` resolves through GetSuperConstructor() — the class
             // object's LIVE [[GetPrototypeOf]]. Using the `parent` recorded at
             // class-definition time made `Object.setPrototypeOf(D, Other)` a no-op
-            // for a class with no explicit ctor, while the explicit-ctor form
-            // (which goes through `super_ctor_func`) already retargeted
+            // for a class with no explicit ctor, while the explicit-ctor bytecodes
+            // already retargeted
             // (staging/sm/class/superCallProperBase.js).
             let mut eff = obj;
             if parent.is_some() {

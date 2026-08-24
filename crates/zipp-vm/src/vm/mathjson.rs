@@ -1427,16 +1427,6 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map)))))
     }
 
-    /// If `holder` is an Array and `key` is a canonical index string, the index.
-    fn array_element_index(&self, holder: Value, key: &str) -> Option<usize> {
-        if holder.is_heap() {
-            if let HeapObj::Array(_) = self.heap.get(holder.heap_index()) {
-                return key.parse::<usize>().ok().filter(|i| i.to_string() == key);
-            }
-        }
-        None
-    }
-
     /// `[[Get]](holder, key)` for the reviver walk: a canonical array index goes
     /// through `get_index` (so an absent element reads up the prototype chain), any
     /// other key through the named `[[Get]]`. Both observe getters / Proxy traps.

@@ -83,6 +83,7 @@ fn ascii_char_append_enabled() -> bool {
     }
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn markdown_push_escaped_ascii(out: &mut Vec<u8>, bytes: &[u8]) {
     for &b in bytes {
@@ -445,6 +446,7 @@ pub(crate) fn pad2_conditional_stats() -> (u64, u64) {
 /// Native emitters inline the allocation-free hit unless counters are enabled;
 /// an ICSTATS run deliberately routes hits through the shared helper so the
 /// mechanism census remains exact without burdening production code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn pad2_concat_stats_enabled() -> bool {
     pad2stats::enabled()
 }

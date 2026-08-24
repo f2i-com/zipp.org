@@ -17,10 +17,152 @@
 
 use std::mem;
 
-use dynasmrt::{dynasm, AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer};
+use dynasmrt::{dynasm, AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bytecode::{FuncProto, Instr};
+
+#[cfg(not(target_os = "windows"))]
+use dynasmrt::ExecutableBuffer;
+#[cfg(target_os = "windows")]
+use windows_exec::ExecutableBuffer;
+
+// dynasmrt 5.1's executable assembler synchronizes every non-macOS AArch64
+// mapping with raw `mrs ctr_el0`/`dc cvau`/`ic ivau` instructions. Windows
+// ARM64 does not permit that EL0 cache-maintenance path, so `commit()` raises
+// STATUS_ILLEGAL_INSTRUCTION before generated code can run. Assemble into an
+// ordinary Vec on Windows and use the supported Win32 W^X + cache-flush path.
+#[cfg(not(target_os = "windows"))]
+type ArmAssembler = dynasmrt::aarch64::Assembler;
+#[cfg(target_os = "windows")]
+type ArmAssembler = dynasmrt::VecAssembler<dynasmrt::aarch64::Aarch64Relocation>;
+
+#[cfg(target_os = "windows")]
+mod windows_exec {
+    use std::io;
+    use std::ptr::NonNull;
+
+    use dynasmrt::AssemblyOffset;
+
+    use core::ffi::c_void;
+
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const MEM_RELEASE: u32 = 0x8000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READ: u32 = 0x20;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn VirtualAlloc(
+            address: *mut c_void,
+            size: usize,
+            allocation_type: u32,
+            protect: u32,
+        ) -> *mut c_void;
+        fn VirtualProtect(
+            address: *mut c_void,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
+        fn FlushInstructionCache(
+            process: *mut c_void,
+            base_address: *const c_void,
+            size: usize,
+        ) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
+    }
+
+    /// An immutable Windows executable allocation. Construction is strictly
+    /// RW -> RX; no writable/executable mapping exists at the same time.
+    pub(super) struct ExecutableBuffer {
+        ptr: NonNull<u8>,
+        len: usize,
+    }
+
+    impl ExecutableBuffer {
+        pub(super) fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
+            if bytes.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot execute an empty ARM64 buffer",
+                ));
+            }
+
+            let raw = unsafe {
+                VirtualAlloc(
+                    core::ptr::null_mut(),
+                    bytes.len(),
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            let ptr = NonNull::new(raw.cast::<u8>()).ok_or_else(io::Error::last_os_error)?;
+
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len());
+            }
+
+            let mut old_protect = 0;
+            if unsafe {
+                VirtualProtect(
+                    ptr.as_ptr().cast::<c_void>(),
+                    bytes.len(),
+                    PAGE_EXECUTE_READ,
+                    &mut old_protect,
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    VirtualFree(ptr.as_ptr().cast::<c_void>(), 0, MEM_RELEASE);
+                }
+                return Err(error);
+            }
+
+            if unsafe {
+                FlushInstructionCache(
+                    GetCurrentProcess(),
+                    ptr.as_ptr().cast::<c_void>(),
+                    bytes.len(),
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                unsafe {
+                    VirtualFree(ptr.as_ptr().cast::<c_void>(), 0, MEM_RELEASE);
+                }
+                return Err(error);
+            }
+
+            Ok(Self {
+                ptr,
+                len: bytes.len(),
+            })
+        }
+
+        #[inline]
+        pub(super) fn ptr(&self, offset: AssemblyOffset) -> *const u8 {
+            assert!(offset.0 < self.len, "executable offset is out of bounds");
+            unsafe { self.ptr.as_ptr().add(offset.0) }
+        }
+
+        #[inline]
+        pub(super) fn len(&self) -> usize {
+            self.len
+        }
+    }
+
+    impl Drop for ExecutableBuffer {
+        fn drop(&mut self) {
+            unsafe {
+                VirtualFree(self.ptr.as_ptr().cast::<c_void>(), 0, MEM_RELEASE);
+            }
+        }
+    }
+}
 
 pub const JIT_THRESHOLD: u32 = 8;
 pub const DEOPT_LIMIT: u32 = 64;
@@ -55,11 +197,6 @@ pub(crate) const fn hole_absent_fast_enabled() -> bool {
 
 #[inline]
 pub(crate) const fn hole_undef_enabled() -> bool {
-    true
-}
-
-#[inline]
-pub(crate) const fn index_in_overlay_enabled() -> bool {
     true
 }
 
@@ -161,6 +298,7 @@ impl Jit {
     }
 
     pub fn compile(&mut self, func_id: u32, proto: &FuncProto) {
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JitCompile);
         match compile_function(proto) {
             Some(code)
                 if self.compiled.len() < MAX_COMPILED_FUNCTIONS
@@ -247,7 +385,13 @@ fn compile_function_body(proto: &FuncProto) -> Option<JitFn> {
         }
     }
 
-    let mut ops = dynasmrt::aarch64::Assembler::new().ok()?;
+    #[cfg(not(target_os = "windows"))]
+    let mut ops = ArmAssembler::new().ok()?;
+    // Base zero is correct for this call-free backend: every emitted label
+    // relocation is relative within the same buffer. Revisit this if an ARM64
+    // tier ever starts embedding external/absolute call targets.
+    #[cfg(target_os = "windows")]
+    let mut ops = ArmAssembler::new(0);
     let labels: Vec<DynamicLabel> = (start..=end).map(|_| ops.new_dynamic_label()).collect();
     let bails: Vec<DynamicLabel> = (start..=end).map(|_| ops.new_dynamic_label()).collect();
 
@@ -285,7 +429,10 @@ fn compile_function_body(proto: &FuncProto) -> Option<JitFn> {
     // impossible relocation. Commit explicitly so any future branch-range
     // drift fails closed as a normal JIT decline instead.
     ops.commit().ok()?;
+    #[cfg(not(target_os = "windows"))]
     let buf = ops.finalize().ok()?;
+    #[cfg(target_os = "windows")]
+    let buf = ExecutableBuffer::from_bytes(&ops.finalize().ok()?).ok()?;
     let entry = buf.ptr(AssemblyOffset(0));
     let code_bytes = buf.len();
     Some(JitFn {
@@ -328,7 +475,7 @@ fn supported(instr: &Instr, reg_count: u16, code_len: usize) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn emit_instr(
-    ops: &mut dynasmrt::aarch64::Assembler,
+    ops: &mut ArmAssembler,
     instr: &Instr,
     labels: &[DynamicLabel],
     bail: DynamicLabel,
@@ -462,17 +609,17 @@ fn emit_instr(
     Some(())
 }
 
-fn emit_load_raw(ops: &mut dynasmrt::aarch64::Assembler, reg: u16, out: u8) {
+fn emit_load_raw(ops: &mut ArmAssembler, reg: u16, out: u8) {
     let off = u32::from(reg) * 8;
     dynasm!(ops ; .arch aarch64 ; ldr X(out), [x9, off]);
 }
 
-fn emit_store(ops: &mut dynasmrt::aarch64::Assembler, reg: u16, src: u8) {
+fn emit_store(ops: &mut ArmAssembler, reg: u16, src: u8) {
     let off = u32::from(reg) * 8;
     dynasm!(ops ; .arch aarch64 ; str X(src), [x9, off]);
 }
 
-fn emit_load_int(ops: &mut dynasmrt::aarch64::Assembler, reg: u16, out: u8, bail: DynamicLabel) {
+fn emit_load_int(ops: &mut ArmAssembler, reg: u16, out: u8, bail: DynamicLabel) {
     emit_load_raw(ops, reg, out);
     dynasm!(ops
         ; .arch aarch64
@@ -483,7 +630,7 @@ fn emit_load_int(ops: &mut dynasmrt::aarch64::Assembler, reg: u16, out: u8, bail
     );
 }
 
-fn emit_load_bool(ops: &mut dynasmrt::aarch64::Assembler, reg: u16, out: u8, bail: DynamicLabel) {
+fn emit_load_bool(ops: &mut ArmAssembler, reg: u16, out: u8, bail: DynamicLabel) {
     emit_load_raw(ops, reg, out);
     dynasm!(ops
         ; .arch aarch64
@@ -495,7 +642,7 @@ fn emit_load_bool(ops: &mut dynasmrt::aarch64::Assembler, reg: u16, out: u8, bai
     );
 }
 
-fn emit_u32(ops: &mut dynasmrt::aarch64::Assembler, out: u8, value: u32) {
+fn emit_u32(ops: &mut ArmAssembler, out: u8, value: u32) {
     let lo = value & 0xffff;
     let hi = value >> 16;
     dynasm!(ops
@@ -505,11 +652,11 @@ fn emit_u32(ops: &mut dynasmrt::aarch64::Assembler, out: u8, value: u32) {
     );
 }
 
-fn emit_no_bail(ops: &mut dynasmrt::aarch64::Assembler) {
+fn emit_no_bail(ops: &mut ArmAssembler) {
     dynasm!(ops ; .arch aarch64 ; movn w3, 0 ; str w3, [x10]);
 }
 
-fn emit_resume(ops: &mut dynasmrt::aarch64::Assembler, ip: u32) {
+fn emit_resume(ops: &mut ArmAssembler, ip: u32) {
     emit_u32(ops, 3, ip);
     dynasm!(ops
         ; .arch aarch64
@@ -519,13 +666,13 @@ fn emit_resume(ops: &mut dynasmrt::aarch64::Assembler, ip: u32) {
     );
 }
 
-fn emit_jump(ops: &mut dynasmrt::aarch64::Assembler, target: u32, labels: &[DynamicLabel]) {
+fn emit_jump(ops: &mut ArmAssembler, target: u32, labels: &[DynamicLabel]) {
     let label = labels[target as usize];
     dynasm!(ops ; .arch aarch64 ; b =>label);
 }
 
 fn emit_cond_jump(
-    ops: &mut dynasmrt::aarch64::Assembler,
+    ops: &mut ArmAssembler,
     target: u32,
     labels: &[DynamicLabel],
     jump_if_true: bool,
@@ -538,12 +685,7 @@ fn emit_cond_jump(
     }
 }
 
-fn emit_compare_exit(
-    ops: &mut dynasmrt::aarch64::Assembler,
-    target: u32,
-    labels: &[DynamicLabel],
-    not_le: bool,
-) {
+fn emit_compare_exit(ops: &mut ArmAssembler, target: u32, labels: &[DynamicLabel], not_le: bool) {
     let label = labels[target as usize];
     if not_le {
         dynasm!(ops ; .arch aarch64 ; b.gt =>label);

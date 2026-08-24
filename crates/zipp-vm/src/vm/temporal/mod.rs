@@ -1413,3 +1413,7 @@ mod plain_time;
 mod plain_date_time;
 mod instant_zdt;
 mod year_month_day;
+
+pub(crate) fn tzdb_version() -> &'static str {
+    tzdata::TZDB_VERSION
+}

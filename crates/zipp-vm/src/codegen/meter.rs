@@ -56,6 +56,7 @@ use crate::bytecode::Instr;
 /// compiled code this bounds a native run to about a millisecond, which is the
 /// abort flag's worst-case response time; the cost is one interpreter round trip
 /// and one region re-entry per chunk, which is nothing spread over 2^20 steps.
+#[cfg(feature = "instrument")]
 pub const NATIVE_CHUNK: i64 = 1 << 20;
 
 /// Where the step counter lives, as a displacement from the VM pointer the

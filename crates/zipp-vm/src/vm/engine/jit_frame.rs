@@ -355,6 +355,7 @@ impl<'p> Vm<'p> {
     /// directory before any module loader is enabled. A confined VM accepts at
     /// most 256 canonical module files, 64 MiB of aggregate observed source,
     /// and 64 levels of loader recursion. Repeated reads share one path ledger.
+    #[cfg(any(feature = "instrument", test))]
     pub(crate) fn set_module_root(
         &mut self,
         root: std::path::PathBuf,

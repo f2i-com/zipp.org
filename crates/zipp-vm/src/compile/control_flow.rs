@@ -396,7 +396,7 @@ impl<'a> FnCompiler<'a> {
         // nested block, not just the bindings compiled so far.
         self.note_block_lexicals(stmts);
         for st in stmts {
-            let mut pre = |fc: &mut Self, name: &str| {
+            let pre = |fc: &mut Self, name: &str| {
                 if fc.captured.contains(name)
                     && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
                 {

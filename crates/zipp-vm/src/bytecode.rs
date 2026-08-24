@@ -676,13 +676,6 @@ pub enum Instr {
     IterClose {
         iter: Reg,
     },
-    /// GetIterator's type check, split out for destructuring: TypeError when
-    /// `src` has no usable iterator (primitives without @@iterator, plain
-    /// objects whose @@iterator is not callable). Built-ins with positional
-    /// iteration (Array/String/Map/Set/TypedArray/arguments) pass.
-    CheckIterable {
-        src: Reg,
-    },
     /// IteratorClose in an ERROR context: invoke `iter`'s `return()` (if present)
     /// but SWALLOW any error it throws and skip the result-is-object check, so a
     /// throw/return out of a `for-of` body closes the iterator while preserving the
@@ -2300,12 +2293,6 @@ pub struct Program {
     /// binding after the module runs to build the import's namespace. Empty for
     /// ordinary scripts / eval.
     pub module_exports: Vec<(String, String)>,
-    /// True if the module has a real `import` declaration (binding or side-effect)
-    /// or `export * as ns from` — these need full linking the loader doesn't model,
-    /// so the dynamic import rejects. RE-EXPORTS (`export … from`, `export *`) are
-    /// modelled separately (see `module_reexports`/`module_star_reexports`) and do
-    /// NOT set this flag.
-    pub module_has_imports: bool,
     /// `export {imported as exported} from 'spec'` re-exports, as
     /// (exported, imported, specifier). The loader recursively loads `spec` and
     /// points the namespace's `exported` at the dependency's live `imported` slot.

@@ -634,7 +634,7 @@ pub(crate) fn rewrite_local_accumulators(f: &mut FuncProto) {
                     targets[t] = true;
                 }
             }
-            for (ip, instr) in f.code.iter().enumerate() {
+            for (ip, _) in f.code.iter().enumerate() {
                 if ip == init_ip || appends.contains(&ip) || ip > end {
                     continue; // the exempt sites; post-loop is unrestricted
                 }

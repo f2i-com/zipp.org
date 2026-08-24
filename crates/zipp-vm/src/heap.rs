@@ -593,11 +593,6 @@ impl ObjMap {
         self.keys.len()
     }
 
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-
     /// The property name at `i`. Panics out of range, exactly like the indexing
     /// it replaces — every caller has already established `i` from `pos()`.
     #[inline]
@@ -605,20 +600,10 @@ impl ObjMap {
         &self.keys[i]
     }
 
-    #[inline]
-    pub fn key_get(&self, i: usize) -> Option<&str> {
-        self.keys.get(i).map(|k| &**k)
-    }
-
     /// The stored value at `i` — the data value, or the GETTER for an accessor.
     #[inline]
     pub fn val_at(&self, i: usize) -> Value {
         self.vals[i]
-    }
-
-    #[inline]
-    pub fn val_get(&self, i: usize) -> Option<Value> {
-        self.vals.get(i).copied()
     }
 
     #[inline]
@@ -651,19 +636,6 @@ impl ObjMap {
             self.shape_to_dict();
         }
         self.attrs[i] = a;
-    }
-
-    /// Set just the setter half of an accessor slot.
-    #[inline]
-    pub fn set_setter_at(&mut self, i: usize, setter: Value) {
-        self.attrs[i].setter = setter;
-    }
-
-    /// Own property names in insertion order. NOT spec key order — callers that
-    /// need integer-first ordering go through `spec_key_order`.
-    #[inline]
-    pub fn keys_iter(&self) -> impl Iterator<Item = &str> {
-        self.keys.iter().map(|k| &**k)
     }
 
     /// `(name, value, attrs)` per own property, insertion order.
@@ -772,6 +744,7 @@ impl ObjMap {
     /// indexed load through this — are greppable. A shape migration must keep
     /// `vals` exactly this shape; that constraint is why the values stay in a
     /// per-object vector while the KEYS move into the shared descriptor.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub fn vals_ptr(&self) -> *const Value {
         self.vals.as_ptr()
@@ -3227,6 +3200,7 @@ impl Heap {
     /// receivers ever filled into a Set-capable way, which the 8-way IC and
     /// the ≤8-arm method-inline plans keep small in practice.
     #[inline]
+    #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
     pub fn register_scan_root(&mut self, holder: u32) {
         if self.nursery && self.gen[holder as usize] & GEN_SCAN == 0 {
             self.gen[holder as usize] |= GEN_SCAN;
@@ -3375,11 +3349,6 @@ impl Heap {
         self.objs.len()
     }
 
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.objs.is_empty()
-    }
-
     /// Whether the dispatch loop should run a collection (live count passed the
     /// adaptive threshold). Cleared by `note_gc_done`.
     #[inline]
@@ -3517,6 +3486,7 @@ impl Heap {
     /// Base pointer of the parallel version array (for the JIT inline cache). The
     /// array does not reallocate during a native region run (a region never
     /// allocates a heap object), so this stays valid for the run.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub fn versions_ptr(&self) -> *const u32 {
         self.versions.as_ptr()
@@ -3857,7 +3827,9 @@ pub(crate) mod gcoracle {
 
     pub(crate) const SET_PROP: usize = 0;
     pub(crate) const SET_INDEX: usize = 1;
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) const JIT_SET_PROP: usize = 2;
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) const JIT_SET_INDEX: usize = 3;
     pub(crate) const CELL_SET: usize = 4;
     pub(crate) const PROMISE_SETTLE: usize = 5;

@@ -1141,6 +1141,7 @@ pub struct TaSnap {
     pub flags: u64,
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const TA_SNAP_LOCAL: u64 = 1;
 
 /// Win64 helper: (re)derive a pinned TypedArray's `{obj_bits, base, len, flags}` into
@@ -2453,6 +2454,7 @@ pub(crate) mod chainstats {
     }
 
     /// `(fast_int, fast_str, fallback, reseat, trim)`
+    #[cfg(test)]
     pub fn dump() -> (u64, u64, u64, u64, u64) {
         (
             FAST_INT.load(Ordering::Relaxed),
@@ -2864,6 +2866,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
 
 /// Ceiling on the `(site, shape) -> slot` memo. Pure memo, so overflowing it
 /// only costs the key scan it was avoiding.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const JIT_SHAPE_SLOT_MAX: usize = 1 << 16;
 
 /// Win64 helper: a SITE-FREE named property read, for a `GetProp` inside an

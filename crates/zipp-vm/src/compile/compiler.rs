@@ -68,7 +68,6 @@ impl Compiler {
             lexical_globals: HashSet::new(),
             decl_globals: HashSet::new(),
             module_exports: Vec::new(),
-            module_has_imports: false,
             module_reexports: Vec::new(),
             module_star_reexports: Vec::new(),
             module_ns_reexports: Vec::new(),
