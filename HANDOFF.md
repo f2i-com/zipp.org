@@ -236,6 +236,19 @@ rather than 0.66×. Any generalisation must carry the purity proof with it.
 Reproduce with `python bench/scope/run.py`; see `bench/scope/README.md` and
 ledger **B140**.
 
+Replicated on a quiet machine (0.668× / 0.910× / 0.963× / 0.659× and
+0.962× / 1.260× / 1.120× / 0.951×); the relative penalty moved by at most three
+points. **A measurement-hygiene note worth keeping**, because it nearly cost a
+day: a `ZIPP_GC_STRESS=1` run left over from an earlier agent session was still
+walking `bench/real/` one program every two minutes, holding a core the whole
+time. `ZIPP_GC_STRESS` collects at every safe point, so such a run legitimately
+takes hours and looks exactly like a hung engine — three of them were alive at
+once. Before any measurement, check for strays:
+`Get-Process -Name zipp`, and kill any whose command line carries
+`ZIPP_GC_STRESS` or a scratchpad path. Paired interleaved sampling survived it
+(ratios held, absolutes did not), which is the argument for never pricing a
+mechanism with a base-then-each-switch script — see B141.
+
 ### 3. Improve sustained compute without losing cold parity
 
 The cold objective is won, but removing process launch exposes rows where zipp

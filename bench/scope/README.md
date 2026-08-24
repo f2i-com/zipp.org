@@ -18,17 +18,22 @@ question, not a correctness one.
 
 ## The measured result (2026-08-24, plain release build, 9 interleaved paired reps)
 
-Ratios are zipp / Node, so lower is better and below 1.00 beats Node.
+Ratios are zipp / Node, so lower is better and below 1.00 beats Node. Measured
+twice: first on a machine that turned out to have leftover CPU-bound processes
+on it, then again once it was quiet. **The relative penalty — the finding —
+replicated to within a point**, because engines and variants are interleaved
+inside every repetition and background load therefore hits both sides equally.
+The absolute ratios did move, so the quiet run is the one to quote.
 
-| variant | typedarray-math | sparse-array |
-|---|---|---|
-| original (top-level `var`) | **0.623×** | **0.885×** |
-| `.R1_iife` | 0.864× (+39%) | 1.186× (+34%) |
-| `.R2_let` | 0.899× (+44%) | 1.022× (+15%) |
-| `.R3_rename` | 0.611× (unchanged) | 0.877× (unchanged) |
+| variant | typedarray-math (quiet) | (loaded) | sparse-array (quiet) | (loaded) |
+|---|---|---|---|---|
+| original (top-level `var`) | **0.668×** | 0.623× | **0.962×** | 0.885× |
+| `.R1_iife` | 0.910× (**+36%**) | (+39%) | 1.260× (**+31%**) | (+34%) |
+| `.R2_let` | 0.963× (**+44%**) | (+44%) | 1.120× (**+16%**) | (+15%) |
+| `.R3_rename` | 0.659× (unchanged) | (unchanged) | 0.951× (unchanged) | (unchanged) |
 
-Node is flat across all four variants (227/227/227/231ms and 93/93/94/94ms), so
-the sensitivity is entirely zipp-side.
+Node is flat across all four variants in both runs (203/205/203/203ms and
+82/82/81/82ms quiet), so the sensitivity is entirely zipp-side.
 
 Two things follow. **Renaming is free**, so the reducers are not keyed on
 identifier text — that was the obvious suspicion and it is refuted. But
