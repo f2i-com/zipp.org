@@ -6,6 +6,126 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
+## Snapshot — 2026-08-24, end of the audit session
+
+Read this first; the sections below it are the standing map and are still
+accurate except where this snapshot corrects them.
+
+**HEAD is `572ffec`, pushed to `origin/main`. The working tree may contain
+UNVERIFIED wave-28 work — see "In flight" below. Check `git status` before you
+build anything and trust a measurement.**
+
+### What this session changed
+
+Six commits, `f921c18..572ffec`. The code footprint is deliberately tiny — 61
+lines in `crates/` — because almost everything found was a *measurement* result,
+not a bug to patch:
+
+| commit | what |
+|---|---|
+| `f921c18` | latch the two per-instruction kill switches (`env_off_switch!` macro). **Measures NULL** (13-row A/B 1.0005x, CI [-0.19%, +0.43%]); kept as hygiene only |
+| `7cb9c82` | the reducers are scope-sensitive — two rows |
+| `bb20645` | refute three "net-negative mechanism" leads; correct the GC item's framing |
+| `b327b5d` | replicate on a quiet machine; record the stray-process hazard |
+| `80e98b8` | the scope penalty is **suite-wide** (B142) |
+| `572ffec` | correct B142's mechanism (B143) |
+
+### The one thing to know
+
+**The published "lowest median on all 13" result is a result for top-level `var`
+code.** Measured with `python bench/scope/sweep.py`, which generates a
+semantics-preserving rewrite of every row, checks each against Node for identical
+output, then interleaves all four cells inside every repetition:
+
+| rewrite | rows | geomean penalty | rows crossing from beating Node to losing |
+|---|---|---|---|
+| wrapped in an IIFE | 13 | **+159%** | **8** |
+| `var` -> `let` | 12 | **+60%** | **6** |
+
+That is honest for what it measures — the programs are the unchanged historical
+series — but essentially all real JavaScript is inside a function and spelled
+`let`/`const`. See §2b, which is now the biggest open item, and ledger B142/B143.
+
+There are **two independent causes**, and they matter differently:
+
+| symptom | measured | cause | status |
+|---|---|---|---|
+| loses the reducer, **still beats Node** | `dataview` 0ms -> 61ms vs Node 95ms | `let` per-iteration binding copies break the reducers' exact-shape bytecode matchers | documented, not built |
+| loses the TIER, **3.8x behind Node** | 61ms -> **361ms** vs Node 95ms | `note_def` (`plan_region.rs`) allows a register exactly ONE `VTy`; the compiler recycles one register across a type boundary and the whole region declines to the boxed MEM tier | wave 28, in flight |
+
+The second is the damaging one and the one worth fixing first: it is where zipp
+goes *behind* Node rather than merely winning by less. Its exact signature:
+
+```
+[decline-reason] fn=<script> [238,288]: type conflict on a reused register
+  r119 @280 prev=Some(Bool) new=Num instr=LoadGlobal { dst: 119, idx: 15 }
+```
+
+Scope, from `ZIPP_JITDECLINE=1` over all 13 rows: type-conflict declines occur in
+**zero** original programs and in exactly two `let` variants (typedarray-math 4,
+parse-large-js 2). **So fixing it cannot move the published numbers** — it can
+only help real-world-shaped code. That is the point, not a defect in the plan.
+
+### In flight — DO NOT TRUST THE WORKING TREE
+
+Wave 28 (`Workflow` run `wf_d7eb26c7-121`) was implementing type-aware
+live-range splitting behind `ZIPP_NO_TYPE_SPLIT`, with three independent
+verification lanes (adversarial review, a 60,000-program fuzzer soak plus both
+suites, and a one-binary `--ab-env` measurement that must prove the published 13
+rows do NOT move). At the time of this snapshot the tree had modifications to
+`emit.rs`, `plan.rs`, `plan_region.rs`, `regalloc.rs`, `region_int.rs` and
+`region_int_gpr.rs` that had **not** yet been reviewed, gated, or measured, and
+they are deliberately NOT committed.
+
+If you are picking this up: either wait for those lanes, or
+`git checkout crates/` to return to the pushed, gated state. Do not commit that
+diff on the strength of a green benchmark — this engine shipped a month of
+silent wrong answers from this exact file with a fully green suite.
+
+### Gate status at `572ffec`
+
+- `zipp-vm` **1347 passed / 0 failed / 20 ignored**; `zipp-regress` (rx-jit)
+  108 passed / 0 failed; `zipp-cli` and `zipp-wasm` green.
+- Generative tier-differential fuzzer: **60,000 programs, 0 divergent,
+  0 nondeterministic**.
+- All 13 `bench/real/*.js` byte-identical to Node.
+
+### Diagnostics worth knowing (all already in the engine)
+
+| switch | what it gives you |
+|---|---|
+| `ZIPP_JITDECLINE=1` | names every unadmitted ip with its opcode, **and** drives the `[decline-reason]` channel that names *why a plan declined* |
+| `ZIPP_GLOBRANGE_DEBUG=1` | per-register live-range narrowing segments |
+| `ZIPP_JITLOG=1` | per-region compile/decline lines, tiers, home counts |
+| `ZIPP_GCSTATS=1` | per-phase GC timing |
+
+`ZIPP_JITDECLINE`'s `[decline-reason]` channel is the single highest-yield tool
+for any "why is this shape slow" question and it answered today's in one run.
+
+### Measurement hygiene — this cost most of a session
+
+A `ZIPP_GC_STRESS=1` run left over from a killed agent session was still walking
+`bench/real/` one program every two minutes, holding a core; three were alive at
+once. **GC stress collects at every safe point, so such a run legitimately takes
+hours and is indistinguishable from a hung engine** — I misdiagnosed it as an
+engine livelock before tracing the parent process. Before trusting any timing:
+
+```powershell
+Get-Process -Name zipp        # kill any whose command line has ZIPP_GC_STRESS
+```
+
+and check for orphaned `bash.exe` running a scratchpad `*.sh`.
+
+Paired interleaved sampling survived the contention (ratios held within three
+points; absolute times did not), which is the argument for never pricing a
+mechanism with an ad-hoc base-then-each-switch script — one such script produced
+three false "this shipped mechanism is net-negative" findings, all refuted in
+B141. Also note a two-binary `--ab` carries a fat-LTO code-layout confound that
+moved single rows by -2.1%/+1.4% across rebuilds of a genuinely null change;
+prefer one-binary `--ab-env` wherever the change can be put behind a switch.
+
+---
+
 ## Where the project is
 
 Published capture `bench/four_engine_cc0d557_pgo_2026-08-24.json`,
