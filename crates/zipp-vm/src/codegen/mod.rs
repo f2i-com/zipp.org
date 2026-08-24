@@ -44,6 +44,50 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::bytecode::{FuncProto, Instr, MathFn};
 use crate::value::Value;
 
+/// Declare a same-binary kill switch (`ZIPP_NO_<X>=1` turns the mechanism off)
+/// whose environment read is LATCHED on first use.
+///
+/// Use this for any switch consulted more than once per compile. The two in
+/// `region_admit` are read from inside the per-instruction admission walk, so
+/// an unlatched `env::var_os` there costs a Win32 environment lookup on every
+/// bytecode op examined, on every region compile. The latch itself was already
+/// hand-written at 34 sites and simply omitted at 8 — the same "a fact
+/// maintained by hand in several places" shape behind every silent wrong answer
+/// this engine has had. Declaring a switch is now one line, so there is no copy
+/// to forget.
+///
+/// Latching on FIRST CALL rather than at process start is what keeps the
+/// `--ab-env` ablation idiom honest: every benchmark launch is a fresh process
+/// and the environment is fixed long before any region compiles, so the first
+/// read already sees the ablation's value. In-process mutation of these
+/// variables is deliberately NOT supported — the switch tests all spawn a child
+/// process, which is why latching is safe.
+///
+/// Not applied wholesale: converting the six switches that are read once per
+/// region-compile measured a reproducible +4.3% on `property-ic-shapes` for no
+/// gain anywhere (B-entry below), so they keep their unlatched reads.
+macro_rules! env_off_switch {
+    ($(#[$attr:meta])* fn $name:ident() = $var:literal) => {
+        $(#[$attr])*
+        pub(crate) fn $name() -> bool {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            static STATE: AtomicU8 = AtomicU8::new(0);
+            match STATE.load(Ordering::Relaxed) {
+                1 => true,
+                2 => false,
+                _ => {
+                    let on = std::env::var_os($var).is_none();
+                    STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                    on
+                }
+            }
+        }
+    };
+}
+// Declared above every `mod` in this file, so textual macro scope carries it
+// into the codegen submodules; moving it below them is a hard compile error,
+// not a silent regression.
+
 /// Number of interpreter calls before a function is offered to the JIT.
 pub const JIT_THRESHOLD: u32 = 8;
 

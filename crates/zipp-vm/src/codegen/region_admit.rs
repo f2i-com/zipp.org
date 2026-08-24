@@ -10,17 +10,12 @@ use crate::bytecode::{BitwiseOp, Reg};
 /// 0x7FF9..=0x7FFD are: Int, Bool, Null, Undefined, Heap — only Int is a number.
 pub(crate) const BOOL_TAG: u64 = INT_TAG + (1u64 << 48);
 
-/// Can the loop region `[start, end]` be compiled in the double subset? Every op
-/// in range must be numeric/control-flow with no closure op, and any `LoadConst`
-/// must reference a numeric constant, a single-ASCII-char string, or (MEM path
-/// only — `const_strs` is `Some`) a string constant pre-interned at compile time
-/// whose bits the emitter embeds (`const_strs` maps constant index → bits).
-/// Is the region `IterNext`/finally-bracket admission on? Default ON;
-/// `ZIPP_NO_ITER_REGION=1` restores the decline (the whole for-of region
-/// blacklists and the loop runs interpreted, the pre-change behaviour), so the
-/// mechanism can be A/B'd with `tools/bench.py --ab-env` on ONE binary.
-fn iter_region_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_ITER_REGION").is_none()
+env_off_switch! {
+    /// Is the region `IterNext`/finally-bracket admission on? Default ON;
+    /// `ZIPP_NO_ITER_REGION=1` restores the decline (the whole for-of region
+    /// blacklists and the loop runs interpreted, the pre-change behaviour), so the
+    /// mechanism can be A/B'd with `tools/bench.py --ab-env` on ONE binary.
+    fn iter_region_enabled() = "ZIPP_NO_ITER_REGION"
 }
 
 /// Proof token for the deliberately tiny matchAll scalarization V1. The
@@ -542,6 +537,11 @@ pub(crate) fn rx_scalar_matchall_plan(
     })
 }
 
+/// Can the loop region `[start, end]` be compiled in the double subset? Every op
+/// in range must be numeric/control-flow with no closure op, and any `LoadConst`
+/// must reference a numeric constant, a single-ASCII-char string, or (MEM path
+/// only — `const_strs` is `Some`) a string constant pre-interned at compile time
+/// whose bits the emitter embeds (`const_strs` maps constant index → bits).
 pub(crate) fn region_can_compile(
     proto: &FuncProto,
     start: u32,
@@ -942,12 +942,12 @@ pub fn callee_leaf_ok_one_call(callee: &FuncProto) -> Option<(Vec<Instr>, usize)
     Some((body, call_at?))
 }
 
-/// `ZIPP_NO_LEAF_GETPROP=1` drops `GetProp` back out of the leaf whitelist, so the
-/// change can be A/B'd with `tools/bench.py --ab-env` against ONE binary — which
-/// removes the fat-LTO code-layout confound that §2 warns about and that B70 had to
-/// reason around.
-fn leaf_getprop_enabled() -> bool {
-    std::env::var_os("ZIPP_NO_LEAF_GETPROP").is_none()
+env_off_switch! {
+    /// `ZIPP_NO_LEAF_GETPROP=1` drops `GetProp` back out of the leaf whitelist, so the
+    /// change can be A/B'd with `tools/bench.py --ab-env` against ONE binary — which
+    /// removes the fat-LTO code-layout confound that §2 warns about and that B70 had to
+    /// reason around.
+    fn leaf_getprop_enabled() = "ZIPP_NO_LEAF_GETPROP"
 }
 
 fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>, Option<usize>)> {
