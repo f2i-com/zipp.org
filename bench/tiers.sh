@@ -3,6 +3,8 @@
 # A shift from "INT decline" to "INT region ... compiled" is the signal that a
 # planner admission change actually landed; the timings in quick.sh/run_real.sh
 # say whether it was worth it.
+# Trusted developer benchmark only; use `zipp sandbox` for unreviewed scripts.
+set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 Z=${ZIPP:-./target/release/zipp.exe}
 printf "%-24s %5s %5s %5s %5s\n" bench INT INTdec MEM evict

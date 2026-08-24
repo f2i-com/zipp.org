@@ -4125,6 +4125,9 @@ impl<'p> Vm<'p> {
                             parts.push(self.inspect(v));
                         }
                         let line = parts.join(" ");
+                        #[cfg(feature = "instrument")]
+                        self.instrument_output_line(&line)
+                            .map_err(|msg| Thrown(msg.into()))?;
                         if to_stderr {
                             self.errput.push(line);
                         } else {

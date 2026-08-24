@@ -17,8 +17,14 @@ A test is a .js file with a `/*--- … ---*/` YAML frontmatter:
 Positive tests pass on clean exit; async tests pass when the harness prints
 `Test262:AsyncTestComplete`; negative tests pass when the run errors (matching the
 error type when we can read it from stderr).
+
+Security: this is a trusted-developer conformance harness, not an untrusted-code
+sandbox. Test262 needs the engine's privileged `$262` host surface and exercises
+the JIT deliberately, so use only a reviewed/pinned checkout. Run a checkout you
+do not trust inside an external OS sandbox with filesystem/network/resource
+limits; use `zipp sandbox` for ordinary untrusted application scripts.
 """
-import argparse, os, re, subprocess, sys, tempfile, threading, concurrent.futures, collections
+import argparse, os, re, shutil, subprocess, sys, tempfile, threading, concurrent.futures, collections
 
 FM = re.compile(r"/\*---(.*?)---\*/", re.S)
 
@@ -119,10 +125,18 @@ def parse_frontmatter(src):
 
 def load_harness(h):
     cache = {}
-    root = os.path.dirname(os.path.abspath(h))  # the test262 checkout
+    harness_root = os.path.realpath(h)
+    root = os.path.dirname(harness_root)  # the test262 checkout
     def get(name):
         if name not in cache:
-            cache[name] = read_source(os.path.join(h, name), root)
+            path = os.path.realpath(os.path.join(harness_root, name))
+            try:
+                inside = os.path.commonpath((harness_root, path)) == harness_root
+            except ValueError:  # different drives on Windows
+                inside = False
+            if not inside or not os.path.isfile(path):
+                raise ValueError(f"invalid harness include {name!r}")
+            cache[name] = read_source(path, root)
         return cache[name]
     return get
 
@@ -262,16 +276,16 @@ def run_one(args, get_harness, job):
     fd, tmp = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=".js", dir=os.path.dirname(path))
     hf = None
     try:
-        os.write(fd, assembled.encode("utf-8"))
-        os.close(fd)
+        with os.fdopen(fd, "wb") as tmp_file:
+            tmp_file.write(assembled.encode("utf-8"))
         try:
             # A `flags:[module]` test runs as an ES module (top-level await,
             # module scope); the test text alone is the module, with the harness
             # supplied separately -- the same shape scripts now use.
             subcmd = "mjs" if is_module else "js"
-            env = None
+            env = dict(os.environ)
+            env["RUST_BACKTRACE"] = "0"
             if cannot_block:
-                env = dict(os.environ)
                 env["ZIPP_CAN_BLOCK"] = "0"
             # Module tests run the ORIGINAL file (self-imports resolve to the
             # same module record); scripts run the assembled tmp.
@@ -283,12 +297,12 @@ def run_one(args, get_harness, job):
             cmd = [args.zipp, subcmd] + ([] if is_module else ["--script-goal"]) + [entry]
             if harness_src is not None:
                 hfd, hf = tempfile.mkstemp(prefix=TMP_PREFIX, suffix=".js", dir=os.path.dirname(path))
-                os.write(hfd, harness_src.encode("utf-8"))
-                os.close(hfd)
+                with os.fdopen(hfd, "wb") as harness_file:
+                    harness_file.write(harness_src.encode("utf-8"))
                 cmd.append(hf)
             p = subprocess.run(cmd, capture_output=True,
                                encoding="utf-8", errors="replace", timeout=args.timeout,
-                               env=env)
+                               env=env, cwd=os.path.dirname(path))
             verdict, sig = classify(meta, p.returncode, p.stdout or "", p.stderr or "")
         except subprocess.TimeoutExpired:
             verdict, sig = ("FAIL", "timeout")
@@ -344,8 +358,31 @@ def main():
     ap.add_argument("--no-staging", action="store_true",
                     help="skip test/staging (INTERPRETING.md says it should be run; this opts out)")
     a = ap.parse_args()
+    if a.jobs <= 0:
+        ap.error("--jobs must be positive")
+    if a.timeout <= 0:
+        ap.error("--timeout must be positive")
+    if a.limit < 0:
+        ap.error("--limit must be non-negative")
+    if a.show_fails < 0:
+        ap.error("--show-fails must be non-negative")
+    zipp = os.path.realpath(a.zipp) if os.path.isfile(a.zipp) else shutil.which(a.zipp)
+    if not zipp:
+        ap.error(f"--zipp executable was not found: {a.zipp}")
+    a.zipp = zipp
+    a.t262 = os.path.realpath(a.t262)
+    if not os.path.isdir(a.t262):
+        ap.error(f"test262 root does not exist: {a.t262}")
     report_engine_identity(a.zipp)
-    root = os.path.join(a.t262, a.sub)
+    root = os.path.realpath(os.path.join(a.t262, a.sub))
+    try:
+        inside_checkout = os.path.commonpath((a.t262, root)) == a.t262
+    except ValueError:  # different drives on Windows
+        inside_checkout = False
+    if not inside_checkout:
+        ap.error(f"--sub must stay within the test262 checkout: {a.sub}")
+    if not os.path.isdir(root):
+        ap.error(f"test262 subtree does not exist: {root}")
     files = []
     for dp, _, fns in os.walk(root):
         norm = dp.replace(os.sep, "/")
@@ -357,7 +394,14 @@ def main():
             if fn.startswith(TMP_PREFIX):
                 continue
             if fn.endswith(".js") and not fn.endswith("_FIXTURE.js"):
-                files.append(os.path.join(dp, fn))
+                path = os.path.realpath(os.path.join(dp, fn))
+                try:
+                    inside_checkout = os.path.commonpath((a.t262, path)) == a.t262
+                except ValueError:
+                    inside_checkout = False
+                if not inside_checkout:
+                    ap.error(f"test file escapes the checkout through a link: {path}")
+                files.append(path)
     files.sort()
     if a.limit:
         files = files[: a.limit]

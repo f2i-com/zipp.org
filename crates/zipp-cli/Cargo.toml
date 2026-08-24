@@ -11,7 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
-zipp-vm = { path = "../zipp-vm" }
+# The CLI's explicit `sandbox` command uses the VM's instruction/heap meter.
+# Ordinary `zipp js` does not attach a recorder, preserving its semantics; the
+# feature contributes one predictable null check to interpreted dispatch.
+zipp-vm = { path = "../zipp-vm", features = ["instrument"] }
 
 [features]
 default = []

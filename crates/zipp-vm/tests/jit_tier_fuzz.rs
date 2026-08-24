@@ -377,6 +377,7 @@ const MODES: &[Mode] = &[
     Mode { name: "noglobrange", env: &[("ZIPP_NO_GLOB_RANGE", "1")] },
     Mode { name: "nomultisplit", env: &[("ZIPP_NO_MULTI_SPLIT", "1")] },
     Mode { name: "notypedsplice", env: &[("ZIPP_NO_TYPED_SPLICE", "1")] },
+    Mode { name: "notypesplit", env: &[("ZIPP_NO_TYPE_SPLIT", "1")] },
     Mode { name: "nointsplit", env: &[("ZIPP_NO_INT_SPLIT", "1")] },
     Mode { name: "nointsplice", env: &[("ZIPP_NO_INT_SPLICE", "1")] },
     Mode { name: "intsplit", env: &[("ZIPP_INT_SPLIT", "1")] },
@@ -458,9 +459,17 @@ const MODES: &[Mode] = &[
 ];
 
 /// The subset the normal suite runs: the interpreter, both threshold shifts, and
-/// the three switches whose emitters own the most register-allocation state.
-const CI_MODES: &[&str] =
-    &["base", "nojit", "thr1", "thr200", "nogprhomes", "noicgate", "nointsplice"];
+/// the switches whose emitters own the most register-allocation state.
+const CI_MODES: &[&str] = &[
+    "base",
+    "nojit",
+    "thr1",
+    "thr200",
+    "nogprhomes",
+    "noicgate",
+    "nointsplice",
+    "notypesplit",
+];
 
 fn mode(name: &str) -> &'static Mode {
     MODES.iter().find(|m| m.name == name).unwrap_or_else(|| panic!("unknown mode {name}"))

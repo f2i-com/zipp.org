@@ -529,6 +529,7 @@ class BenchResultTests(unittest.TestCase):
                 reps=1,
                 benches=None,
                 bench_dir=str(bench_dir),
+                allow_external_bench_dir=True,
                 json=str(json_path),
                 read_json=None,
                 overwrite_json=False,

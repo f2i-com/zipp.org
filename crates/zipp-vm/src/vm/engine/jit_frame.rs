@@ -349,4 +349,29 @@ impl<'p> Vm<'p> {
         self.module_base_dir = dir;
     }
 
+    /// Set the canonical filesystem boundary and per-module read ceiling.
+    ///
+    /// The boundary is fail-closed: the root must already exist and be a
+    /// directory before any module loader is enabled.
+    pub(crate) fn set_module_root(
+        &mut self,
+        root: std::path::PathBuf,
+        max_bytes: u64,
+    ) -> Result<(), String> {
+        if max_bytes == 0 || max_bytes == u64::MAX {
+            return Err("module size limit must be in 1..u64::MAX".into());
+        }
+        let root = std::fs::canonicalize(&root)
+            .map_err(|e| format!("invalid module import root '{}': {e}", root.display()))?;
+        if !root.is_dir() {
+            return Err(format!(
+                "module import root '{}' is not a directory",
+                root.display()
+            ));
+        }
+        self.module_root = Some(root);
+        self.module_max_bytes = Some(max_bytes);
+        Ok(())
+    }
+
 }

@@ -262,6 +262,8 @@ impl<'p> Vm<'p> {
             arguments_objs: crate::slot_table::SlotTable::default(),
             gen_args_obj: std::collections::HashMap::new(),
             module_base_dir: None,
+            module_root: None,
+            module_max_bytes: None,
             module_cache: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
             module_own: std::collections::HashMap::new(),

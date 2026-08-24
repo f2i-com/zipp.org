@@ -637,7 +637,7 @@ fn nursery_parity_value_moved_between_old_holders() {
     assert_eq!(out[0], format!("{sum}:true:{}", n - 1));
 }
 
-/// Re-run every `nursery_parity_` case in eight more modes, each in its own
+/// Re-run every `nursery_parity_` case in additional modes, each in its own
 /// child process (the env latches are read once per process). The same
 /// arithmetic assertions passing in all modes IS the parity check; a swept
 /// survivor or stale side-table entry fails the child loudly, and the
@@ -646,7 +646,7 @@ fn nursery_parity_value_moved_between_old_holders() {
 #[test]
 fn all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 12] = [
+    let modes: [&[(&str, &str)]; 13] = [
         &[("ZIPP_NO_NURSERY", "1")],
         &[("ZIPP_GC_STRESS", "1")],
         &[("ZIPP_NO_NURSERY", "1"), ("ZIPP_GC_STRESS", "1")],
@@ -663,6 +663,9 @@ fn all_modes_answer_identically() {
         &[("ZIPP_NO_VALGRAIN_REMSET", "1"), ("ZIPP_NURSERY_VERIFY", "1")],
         // W10: minor-marks cache off (per-minor rebuild).
         &[("ZIPP_NO_NONYOUNG_CACHE", "1")],
+        // Exercise the configurable major backstop at its densest valid
+        // cadence; the arithmetic answers must remain collector-independent.
+        &[("ZIPP_NURSERY_MAX_MINORS", "1")],
     ];
     for envs in modes {
         let mut cmd = std::process::Command::new(&exe);

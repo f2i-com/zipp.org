@@ -3026,7 +3026,11 @@ impl<'p> Vm<'p> {
                 // Mirrors the Print instruction (console.log): inspect each
                 // argument, join with spaces, append one stdout line.
                 let parts: Vec<String> = args.iter().map(|&v| self.inspect(v)).collect();
-                self.output.push(parts.join(" "));
+                let line = parts.join(" ");
+                #[cfg(feature = "instrument")]
+                self.instrument_output_line(&line)
+                    .map_err(|msg| Thrown(msg.into()))?;
+                self.output.push(line);
                 Value::UNDEFINED
             }
             AGENT_SLEEP => {

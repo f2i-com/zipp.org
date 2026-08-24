@@ -393,7 +393,19 @@ pub(crate) fn xh(plan: &RegionPlan, r: u16) -> u8 {
     }
 }
 /// The gpr home index of bool register `r`.
+///
+/// W28: a TYPE-SPLIT register is typed `VTy::Num` and carries a numeric home in
+/// `reg_home`, plus a separate gpr for the range where the bytecode compiler
+/// recycled it as a Bool. This is the ONE place the second home is resolved,
+/// and it needs no ip because every call site is already type-directed: `gh` is
+/// only ever reached from an arm that KNOWS it is handling a bool (a compare
+/// dst, a `JumpIf*` cond, a pinned-DV endian flag). The one arm that dispatches
+/// on the home KIND instead — `Move` — is refused for split registers by the
+/// planner's admission predicate, so it can never land here.
 pub(crate) fn gh(plan: &RegionPlan, r: u16) -> u8 {
+    if let Some(g) = plan.split_bool_gpr(r) {
+        return g;
+    }
     match plan.reg_home[&r] {
         Home::Gpr(g) => g,
         Home::Xmm(_) => unreachable!("bool use of a number-homed register"),

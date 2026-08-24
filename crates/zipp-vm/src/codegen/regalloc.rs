@@ -526,6 +526,15 @@ pub(crate) fn compile_region_regalloc(
     // The regalloc path uses boxed-double semantics and cannot host Bitwise
     // (int32-lane) ops — they decline to the memory path here.
     let plan = plan_region(proto, start, end, ta_plan, false, true, true, boxref)?;
+    // W28: type splits are planned ONLY for `admit_dv`/`share_homes` plans,
+    // which route exclusively into the GPR emitter — this call passes neither,
+    // so the map is empty by construction. Refuse rather than assume: this
+    // emitter's `gh`/`Move`/`flush_exit` contract has never been proven against
+    // a register with two homes of different KINDS.
+    if !plan.ty_splits.is_empty() {
+        decline_emit("regalloc-emit: type-split plan");
+        return None;
+    }
     // W20: does this region carry the inline-cache probe? That decides the frame
     // layout (a shadow window + a volatile-home spill area + 16 bytes of probe
     // scratch) and whether the prologue pins r13/r14. Empty ⇒ every byte below is

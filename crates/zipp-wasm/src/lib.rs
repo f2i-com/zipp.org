@@ -363,11 +363,41 @@ impl Default for Engine {
 
 /// Service one synchronous `__zippHostCall`. Anything structured crosses as
 /// JSON; an `Err` becomes a JS throw the script can catch.
+fn is_allowed_sync_host_call(kind: &str) -> bool {
+    matches!(
+        kind,
+        "db.query"
+            | "db.get"
+            | "db.create"
+            | "db.update"
+            | "db.delete"
+            | "db.hardDelete"
+            | "db.startSync"
+            | "db.stopSync"
+            | "db.getSyncStatus"
+            | "db.getSavedSyncRoom"
+            | "ls.getItem"
+            | "ls.setItem"
+            | "ls.removeItem"
+            | "ls.clear"
+            | "nav.clipboardWrite"
+            | "nav.clipboardRead"
+    )
+}
+
 fn host_dispatch(
     bridges: &Rc<RefCell<Bridges>>,
     kind: &str,
     args: &[String],
 ) -> Result<String, String> {
+    // `kind` is controlled by the guest: it can call `__zippHostCall`
+    // directly instead of going through the preamble wrappers. Reject before
+    // even selecting a bridge or looking up a property, otherwise a planted
+    // getter/method outside the advertised API becomes ambient authority.
+    if !is_allowed_sync_host_call(kind) {
+        return Err(format!("TypeError: unknown host call '{kind}'"));
+    }
+
     let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
 
     // Clone the handle out before calling: the bridge method runs arbitrary JS,
@@ -523,4 +553,53 @@ fn from_js(v: &JsValue, depth: usize) -> HostValue {
         return HostValue::Object(pairs);
     }
     HostValue::Opaque
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_allowed_sync_host_call;
+
+    #[test]
+    fn synchronous_host_call_allowlist_is_exact() {
+        for kind in [
+            "db.query",
+            "db.get",
+            "db.create",
+            "db.update",
+            "db.delete",
+            "db.hardDelete",
+            "db.startSync",
+            "db.stopSync",
+            "db.getSyncStatus",
+            "db.getSavedSyncRoom",
+            "ls.getItem",
+            "ls.setItem",
+            "ls.removeItem",
+            "ls.clear",
+            "nav.clipboardWrite",
+            "nav.clipboardRead",
+        ] {
+            assert!(
+                is_allowed_sync_host_call(kind),
+                "documented kind rejected: {kind}"
+            );
+        }
+
+        for kind in [
+            "db.secret",
+            "db.__proto__",
+            "db.query.extra",
+            "db.query ",
+            "DB.query",
+            "ls.key",
+            "nav.share",
+            "nav.clipboard",
+            "",
+        ] {
+            assert!(
+                !is_allowed_sync_host_call(kind),
+                "unexpected kind admitted: {kind}"
+            );
+        }
+    }
 }

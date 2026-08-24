@@ -7,7 +7,6 @@ See bench/scope/README.md for what the variants are and what they showed.
 """
 from __future__ import annotations
 
-import os
 import statistics
 import subprocess
 import sys
@@ -22,11 +21,15 @@ if not ZIPP.exists():                      # non-Windows checkouts
 
 ROWS = ("typedarray-math", "sparse-array")
 VARIANTS = ("", ".R1_iife", ".R2_let", ".R3_rename")
+TIMEOUT_S = 600
 
 
 def time_once(cmd: list[str]) -> float:
     t = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"{' '.join(cmd)} exceeded {TIMEOUT_S}s") from exc
     dt = time.perf_counter() - t
     if proc.returncode != 0:
         raise SystemExit(f"{' '.join(cmd)} failed:\n{proc.stderr.decode()[:400]}")
@@ -34,7 +37,14 @@ def time_once(cmd: list[str]) -> float:
 
 
 def main() -> int:
-    reps = int(sys.argv[1]) if len(sys.argv) > 1 else 9
+    if len(sys.argv) > 2:
+        raise SystemExit("usage: run.py [positive-repetitions]")
+    try:
+        reps = int(sys.argv[1]) if len(sys.argv) > 1 else 9
+    except ValueError as exc:
+        raise SystemExit("repetitions must be a positive integer") from exc
+    if reps <= 0:
+        raise SystemExit("repetitions must be a positive integer")
     if not ZIPP.exists():
         raise SystemExit(f"no zipp binary at {ZIPP} -- cargo build --release first")
 

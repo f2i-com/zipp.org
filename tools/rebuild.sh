@@ -6,6 +6,7 @@
 # it cannot REMOVE the old file. Renaming it always succeeds — Windows allows a
 # rename of an open file, just not a delete — so move it aside first and sweep
 # the leftovers on the next build.
+set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 rm -f target/release/zipp.stale*.exe 2>/dev/null
 if [ -e target/release/zipp.exe ]; then

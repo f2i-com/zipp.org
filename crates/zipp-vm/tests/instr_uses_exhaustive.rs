@@ -53,7 +53,11 @@ use std::process::Command;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}\nfor:\n{src}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}\nfor:\n{src}",
+        out.error
+    );
     out.output
 }
 
@@ -65,7 +69,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -96,7 +104,13 @@ struct Case {
 }
 
 const fn c(tag: &'static str, init: &'static str, obs: &'static str) -> Case {
-    Case { tag, init, obs, tail: "", epilogue: "" }
+    Case {
+        tag,
+        init,
+        obs,
+        tail: "",
+        epilogue: "",
+    }
 }
 
 const CASES: &[Case] = &[
@@ -122,7 +136,11 @@ const CASES: &[Case] = &[
         tail: "",
         epilogue: "function id(v) { return v; }",
     },
-    c("CallWithThis", "\"keep\"", "String.prototype.concat.call(x, \"!\")"),
+    c(
+        "CallWithThis",
+        "\"keep\"",
+        "String.prototype.concat.call(x, \"!\")",
+    ),
     c("Print", "\"keep\"", "(console.log(x), 0)"),
     c("NewArray", "\"keep\"", "JSON.stringify([x])"),
     Case {
@@ -142,14 +160,26 @@ const CASES: &[Case] = &[
     c("ObjectSpread", "\"keep\"", "JSON.stringify({...{a: x}})"),
     c("NewRegExp", "\"ab\"", "(new RegExp(x)).source"),
     // ── property probes and deletes ──
-    c("DeleteProp", "{a:1}", "(delete x.a) + \":\" + JSON.stringify(x)"),
-    c("DeleteIndex", "{a:1}", "(delete x[\"a\"]) + \":\" + JSON.stringify(x)"),
+    c(
+        "DeleteProp",
+        "{a:1}",
+        "(delete x.a) + \":\" + JSON.stringify(x)",
+    ),
+    c(
+        "DeleteIndex",
+        "{a:1}",
+        "(delete x[\"a\"]) + \":\" + JSON.stringify(x)",
+    ),
     c("HasProp", "{a:1}", "(\"a\" in x)"),
     c("InstanceOf", "[1]", "(x instanceof Array)"),
     c("LenOf", "\"abcd\"", "x.length"),
     c("ObjectKeys", "{a:1,b:2}", "Object.keys(x).join(\",\")"),
     c("ToObject", "\"ab\"", "Object(x).length"),
-    c("CheckCoercible", "{m: function () { return \"ok\"; }}", "x.m()"),
+    c(
+        "CheckCoercible",
+        "{m: function () { return \"ok\"; }}",
+        "x.m()",
+    ),
     // ── control flow and iteration ──
     c("IterPrime", "[1,2,3]", "Array.from(x).length"),
     // The three below are spelled as multi-statement tails rather than one
@@ -326,7 +356,9 @@ fn jitlog_of(src: &str) -> String {
 #[test]
 #[ignore = "worker: spawned by jitlog_of with ZIPP_IUSES_SRC set"]
 fn iuses_jitlog_child() {
-    let Some(src) = std::env::var_os("ZIPP_IUSES_SRC") else { return };
+    let Some(src) = std::env::var_os("ZIPP_IUSES_SRC") else {
+        return;
+    };
     let _ = run_ok(&src.to_string_lossy());
 }
 
@@ -357,7 +389,9 @@ fn iuses_mechanism_every_case_compiles_a_region() {
 #[test]
 fn iuses_the_operand_table_has_no_catch_all_arm() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/codegen/plan_region.rs");
-    let src = std::fs::read_to_string(path).expect("plan_region.rs is readable");
+    let src = std::fs::read_to_string(path)
+        .expect("plan_region.rs is readable")
+        .replace("\r\n", "\n");
     let start = src
         .find("pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {")
         .expect("instr_uses is still declared in plan_region.rs");

@@ -257,12 +257,80 @@ pub(crate) struct RegionPlan {
     ///
     /// Empty under `ZIPP_NO_BOX_HOME=1`, and empty for every non-regalloc plan.
     pub(crate) box_regs: FxHashSet<u16>,
+    /// W28 TYPE-AWARE LIVE-RANGE SPLITTING — a VM register the bytecode
+    /// compiler recycled ACROSS A TYPE BOUNDARY: a `VTy::Bool` compare result
+    /// over one range and a `VTy::Num` value over a disjoint one. Before this
+    /// the planner allowed a register exactly one `VTy` for the whole region
+    /// and declined the WHOLE region ("type conflict on a reused register") to
+    /// the boxed MEM tier, which is what made the same loop written with `let`
+    /// body locals 3.8x slower than Node while the `var` form (whose values
+    /// live in global SLOTS and never recycle) compiled.
+    ///
+    /// A member is typed `VTy::Num` and keeps an ORDINARY numeric home in
+    /// `reg_home` — every numeric lookup (`xh`, `reg_home.get`) therefore sees
+    /// exactly what it saw before — and carries a SECOND, gpr home for its
+    /// Bool range here. Nothing needs an ip to disambiguate: every emitter home
+    /// lookup is already TYPE-DIRECTED (`xh` is only ever called from a numeric
+    /// arm, `gh` only from a bool arm), so `gh` consulting this map is the
+    /// whole emitter-side change. The one op whose arm dispatches on the HOME
+    /// KIND rather than on the opcode is `Move`, and a `Move` touching a member
+    /// is refused by the admission predicate for exactly that reason.
+    ///
+    /// THE EXIT CONTRACT is B94's, for the same reason B94 needs it: the frame
+    /// slot must hold the value LIVE AT THAT EXIT, and which range is live is
+    /// not knowable from the shared `flush_exit` stub. So MEMORY IS
+    /// AUTHORITATIVE — every member is in `write_through` (each numeric def
+    /// boxes into `[rbx + dreg(r)]`), each Bool def stores `BOOL_TAG | gpr`
+    /// there too, and `flush_exit` skips the register on both loops (it is in
+    /// `num_regs` but excluded by the `write_through` test, and never in
+    /// `bool_regs`). Every exit is then correct without knowing which path
+    /// reached it — including an exit in the GAP between the two ranges, where
+    /// the interpreter's slot must still hold the EARLIER range's value.
+    ///
+    /// Populated only for plans routed exclusively into the GPR emitter
+    /// (`admit_dv` or `share_homes`, `cold` empty, `admit_wt_share`); empty
+    /// under `ZIPP_NO_TYPE_SPLIT=1`, and empty for every plan the xmm INT and
+    /// DOUBLE emitters can see (both refuse a non-empty map outright).
+    pub(crate) ty_splits: FxHashMap<u16, TySplit>,
     /// W20 — region ips of `GetProp`s the REGALLOC emitter will serve with its own
     /// inline-cache probe (`emit_regalloc_ic_probe`) instead of declining the
     /// region to the memory tier. The dst is a `VTy::Num` home under a tag guard
     /// on the probe result. Empty unless BOXREF or the read-only-receiver arm
     /// admitted this region.
     pub(crate) getprop_ips: FxHashSet<usize>,
+}
+
+/// W28 — one type-split register's two ranges, plus the gpr its Bool half
+/// lives in. Both ranges are INCLUSIVE region ips. The ranges are disjoint and
+/// each STARTS with a def of the register that does not itself read it, so the
+/// opening def dominates every touch in its own range (no in-region jump target
+/// lands strictly inside either — see `plan_type_splits`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TySplit {
+    pub(crate) bool_lo: usize,
+    pub(crate) bool_hi: usize,
+    pub(crate) num_lo: usize,
+    pub(crate) num_hi: usize,
+    /// The `BOOL_GPRS` register holding the Bool half. Reserved out of the
+    /// numeric pool, never entry-loaded, never flushed.
+    pub(crate) gpr: u8,
+}
+
+impl RegionPlan {
+    /// The gpr home of `r`'s BOOL half, if `r` is a W28 type-split register.
+    /// `gh` consults this FIRST, which is what makes a split register's bool
+    /// arms read the right register while its numeric arms keep reading
+    /// `reg_home`.
+    pub(crate) fn split_bool_gpr(&self, r: u16) -> Option<u8> {
+        self.ty_splits.get(&r).map(|s| s.gpr)
+    }
+    /// Is `ip` inside `r`'s BOOL range? Used by the write-through hook to pick
+    /// the Bool boxing over the numeric one at a bool-range def.
+    pub(crate) fn is_split_bool_ip(&self, r: u16, ip: usize) -> bool {
+        self.ty_splits
+            .get(&r)
+            .is_some_and(|sp| ip >= sp.bool_lo && ip <= sp.bool_hi)
+    }
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops

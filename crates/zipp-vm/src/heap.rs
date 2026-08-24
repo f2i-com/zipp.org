@@ -403,18 +403,6 @@ impl PropIndex {
     }
 }
 
-/// The canonical decimal spelling of an array index, written into a caller-owned
-/// stack buffer.
-///
-/// Exists because the hot indexed-read path looks a numeric index up in a
-/// string-keyed side table, and `i.to_string()` there allocates and frees a
-/// `String` for every element read of every array that has ANY non-index
-/// property. Measured: `a[2]` costs 2.3ns on a plain array and 36.9ns on the
-/// identical array after `a.tag = "x"` — and a RegExp match array always has
-/// `index`/`input`/`groups`, so every `m[i]` paid it.
-///
-/// 20 bytes holds `usize::MAX`.
-#[inline]
 /// Does `key` name an ELEMENT of an exotic object — a canonical decimal index,
 /// or `"length"`? Deliberately allocation-free (unlike `canonical_index_str`,
 /// which round-trips through `to_string`), because it runs on every structural
@@ -2731,6 +2719,11 @@ pub struct Heap {
     major_due: bool,
     /// Minor collections since the last major (the scheduling backstop).
     minors_since_major: u32,
+    /// Maximum consecutive minor collections before the scheduling backstop
+    /// forces a major. `ZIPP_NURSERY_MAX_MINORS=<1..=4096>` overrides the
+    /// default once at construction; malformed, zero, and larger values are
+    /// ignored. `ZIPP_GC_STRESS` deliberately uses its smaller fixed cap.
+    nursery_max_minors: u32,
     /// W9: allocations between minor collections. [`NURSERY_YOUNG_BUDGET`]
     /// unless `ZIPP_NURSERY_YOUNG_BUDGET=<n>` overrides it (latched once at
     /// construction; values below 1024 are ignored as certainly-wrong). Only
@@ -2847,14 +2840,25 @@ const GC_GROWTH: usize = 3;
 /// the schedule off garbage they merely failed to sweep).
 const NURSERY_YOUNG_BUDGET: usize = 1 << 14;
 
-/// Backstop: run a major at least every 64th collection even if the occupied
-/// count never crosses `major_at`, so major-only hygiene (the
+/// Default backstop: run a major after 64 consecutive minors even if the
+/// occupied count never crosses `major_at`, so major-only hygiene (the
 /// `brand_private_names` recompute, reclaiming table capacity) is never
-/// deferred forever. W10 note: at the adaptive cap (`NURSERY_BUDGET_MAX`)
-/// this defers the hygiene major to at most 64×128k allocations; `major_at`
-/// still bounds floats within one (now larger) budget of the pre-nursery
-/// schedule.
-const NURSERY_MAX_MINORS: u32 = 64;
+/// deferred forever. `ZIPP_NURSERY_MAX_MINORS=<n>` is latched by each Heap so
+/// the cadence can be measured rather than compiled in. Only 1..=4096 is
+/// accepted: zero would suppress minors entirely, while an unbounded value
+/// could defer hygiene for an effectively unlimited allocation span. W10 note:
+/// at the adaptive cap (`NURSERY_BUDGET_MAX`) the default defers the hygiene
+/// major to at most 64×128k allocations; `major_at` still bounds floats within
+/// one (now larger) budget of the pre-nursery schedule.
+const NURSERY_MAX_MINORS_DEFAULT: u32 = 64;
+const NURSERY_MAX_MINORS_LIMIT: u32 = 4096;
+
+#[inline]
+fn parse_nursery_max_minors(raw: &str) -> Option<u32> {
+    raw.parse::<u32>()
+        .ok()
+        .filter(|&value| (1..=NURSERY_MAX_MINORS_LIMIT).contains(&value))
+}
 
 /// W10: the survival-adaptive budget's ceiling (the floor is
 /// [`NURSERY_YOUNG_BUDGET`]). 128k: the B122 sweep measured 131072 at +1.31%
@@ -2917,6 +2921,11 @@ impl Heap {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&v| v >= 1024);
+        let nursery_max_minors = std::env::var("ZIPP_NURSERY_MAX_MINORS")
+            .ok()
+            .as_deref()
+            .and_then(parse_nursery_max_minors)
+            .unwrap_or(NURSERY_MAX_MINORS_DEFAULT);
         // W10: an explicit budget (or the adapt kill switch) PINS it — the
         // survival controller below then never moves it.
         let budget_pinned =
@@ -2951,6 +2960,7 @@ impl Heap {
             major_at: GC_MIN_THRESHOLD + INTERN_PAD2_COUNT as usize,
             major_due: false,
             minors_since_major: 0,
+            nursery_max_minors,
             young_budget,
             budget_pinned,
             pretenure: 0,
@@ -3102,7 +3112,7 @@ impl Heap {
         let cap = if stress {
             NURSERY_STRESS_MINORS
         } else {
-            NURSERY_MAX_MINORS
+            self.nursery_max_minors
         };
         self.nursery && !self.major_due && self.minors_since_major < cap
     }
@@ -4552,5 +4562,55 @@ mod tests {
         // The major resets the anchor from its TRUE live count.
         h.note_gc_done(2000);
         assert!(h.minor_due(false));
+    }
+
+    #[test]
+    fn nursery_max_minors_override_accepts_only_bounded_positive_decimals() {
+        assert_eq!(parse_nursery_max_minors("1"), Some(1));
+        assert_eq!(parse_nursery_max_minors("64"), Some(64));
+        assert_eq!(
+            parse_nursery_max_minors(&NURSERY_MAX_MINORS_LIMIT.to_string()),
+            Some(NURSERY_MAX_MINORS_LIMIT)
+        );
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "1.5",
+            " 64 ",
+            "not-a-number",
+            "4097",
+            "4294967295",
+            "4294967296",
+        ] {
+            assert_eq!(
+                parse_nursery_max_minors(invalid),
+                None,
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nursery_backstop_uses_its_latched_cap_and_stress_stays_denser() {
+        let mut h = Heap::new();
+        h.set_nursery(true);
+        h.nursery_max_minors = 2;
+        assert!(h.minor_due(false));
+        h.note_minor_done(0);
+        assert!(h.minor_due(false));
+        h.note_minor_done(0);
+        assert!(!h.minor_due(false), "the configured backstop must force a major");
+
+        h.note_gc_done(0);
+        h.nursery_max_minors = NURSERY_MAX_MINORS_LIMIT;
+        for _ in 0..NURSERY_STRESS_MINORS {
+            assert!(h.minor_due(true));
+            h.note_minor_done(0);
+        }
+        assert!(
+            !h.minor_due(true),
+            "GC stress must retain its fixed three-minor cadence"
+        );
     }
 }

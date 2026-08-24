@@ -30,7 +30,18 @@ pub(crate) const TWO_POW_54: i64 = 18_014_398_509_481_984;
 /// every bool is then in `live_in_bools` and nothing is emitted.
 pub(crate) fn emit_bool_home_zero(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan) {
     let loaded: FxHashSet<u8> = plan.live_in_bools.iter().map(|&(_, g)| g).collect();
-    let mut gs: Vec<u8> = plan.bool_regs.iter().map(|&(_, g)| g).collect();
+    // W28: a type-split register's bool gpr is neither entry-loaded nor
+    // flushed, and its range's opening def dominates every read of it — so the
+    // zero buys no correctness on the value. It buys TAG hygiene: the split's
+    // own bool write-through does `or rax, Rq(g)` against `BOOL_TAG`, and a
+    // register inherited from the caller could make that a Value whose tag bits
+    // are arbitrary, which the GC would walk as a heap pointer.
+    let mut gs: Vec<u8> = plan
+        .bool_regs
+        .iter()
+        .map(|&(_, g)| g)
+        .chain(plan.ty_splits.values().map(|sp| sp.gpr))
+        .collect();
     gs.sort_unstable();
     gs.dedup();
     for g in gs {
@@ -825,6 +836,15 @@ pub(crate) fn compile_region_int_maybe_cold(
             }
             _ => {}
         }
+    }
+    // W28: type splits are planned ONLY for `admit_dv`/`share_homes` plans,
+    // which route exclusively into the GPR emitter — the plan this xmm emitter
+    // holds passes neither, so the map is empty by construction. Refuse rather
+    // than assume: this emitter's `gh`/`Move`/`flush_exit` contract has never
+    // been proven against a register with two homes of different KINDS.
+    if !plan.ty_splits.is_empty() {
+        decline_emit("int-emit: type-split plan");
+        return None;
     }
     let mut ops = match dynasmrt::x64::Assembler::new() {
         Ok(a) => a,

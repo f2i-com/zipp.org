@@ -19,11 +19,18 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 
-def git_show(rev, path):
+def git_show(rev, path, root):
+    if rev.startswith("-"):
+        raise ValueError("revision must not begin with '-'")
     out = subprocess.run(
-        ["git", "show", f"{rev}:{path}"], capture_output=True, check=True
+        ["git", "show", f"{rev}:{path}"],
+        capture_output=True,
+        check=True,
+        cwd=root,
+        timeout=30,
     ).stdout
     return out.decode("utf-8", "replace").splitlines()
 
@@ -70,7 +77,7 @@ def remap_one(doc_text, src_path, rev, root):
     if not os.path.isdir(outdir):
         print(f"  ! {outdir} does not exist — skipping {stem}")
         return doc_text, 0, 0
-    orig = git_show(rev, src_path.replace(os.sep, "/"))
+    orig = git_show(rev, src_path.replace(os.sep, "/"), root)
     mods = load_modules(outdir)
     pat = re.compile(re.escape(stem) + r"\.rs:(\d+)")
 
@@ -109,21 +116,49 @@ def main():
     ap.add_argument("--apply", action="store_true")
     a = ap.parse_args()
 
-    doc_path = os.path.join(a.root, a.doc)
+    root = os.path.realpath(a.root)
+
+    def within_root(value, label):
+        path = os.path.realpath(os.path.join(root, value))
+        try:
+            inside = os.path.commonpath((root, path)) == root
+        except ValueError:  # different drives on Windows
+            inside = False
+        if not inside:
+            ap.error(f"{label} must stay within --root: {value}")
+        return path
+
+    doc_path = within_root(a.doc, "--doc")
+    splits = []
+    for src in a.split:
+        path = within_root(src, "--split")
+        splits.append(os.path.relpath(path, root))
     with open(doc_path, encoding="utf-8", newline="") as f:
         text = f.read()
 
     total_ok = total_bad = 0
-    for src in a.split:
+    for src in splits:
         print(f"{src}:")
-        text, ok, bad = remap_one(text, src, a.rev, a.root)
+        text, ok, bad = remap_one(text, src, a.rev, root)
         print(f"  resolved {ok}, unresolved {bad}")
         total_ok += ok
         total_bad += bad
 
     if a.apply:
-        with open(doc_path, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
+        # Stage beside the document and atomically replace it. A failure can no
+        # longer truncate the only copy of a long roadmap/handoff document.
+        fd, staged = tempfile.mkstemp(prefix=".remap-anchors-", dir=os.path.dirname(doc_path))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(staged, doc_path)
+        finally:
+            try:
+                os.remove(staged)
+            except FileNotFoundError:
+                pass
         print(f"\napplied to {a.doc}: {total_ok} anchors rewritten, {total_bad} left")
     else:
         print(f"\n[dry-run] would rewrite {total_ok}, leave {total_bad}"

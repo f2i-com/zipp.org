@@ -4,8 +4,123 @@
 // each other. No logic changed.
 #![allow(unused_imports)]
 use super::*;
+use std::io::Read as _;
+
+const MODULE_NOT_FOUND: &str = "TypeError: module not found";
+
+fn lexical_module_path(raw_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut path = std::path::PathBuf::new();
+    for component in raw_path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => path.push(prefix.as_os_str()),
+            std::path::Component::RootDir => path.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !path.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(part) => path.push(part),
+        }
+    }
+    Some(path)
+}
+
+fn lexically_confined(root: &std::path::Path, raw_path: &std::path::Path) -> bool {
+    lexical_module_path(raw_path).is_some_and(|path| path.starts_with(root))
+}
+
+fn canonical_module_path(
+    root: Option<&std::path::Path>,
+    raw_path: &std::path::Path,
+) -> Result<std::path::PathBuf, Thrown> {
+    // Reject lexical escapes before touching the filesystem. Besides avoiding
+    // an existence oracle, this prevents a Windows UNC/prefix escape from
+    // triggering network resolution during canonicalization.
+    if let Some(root) = root {
+        if !lexically_confined(root, raw_path) {
+            return Err(Thrown(MODULE_NOT_FOUND.into()));
+        }
+    }
+    let path = std::fs::canonicalize(raw_path)
+        .map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
+    if root.is_some_and(|root| !path.starts_with(root)) {
+        return Err(Thrown(MODULE_NOT_FOUND.into()));
+    }
+    Ok(path)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod lexical_tests {
+    use super::lexically_confined;
+
+    #[test]
+    fn windows_prefixes_and_parent_escapes_are_rejected_without_io() {
+        let root = std::path::Path::new(r"C:\sandbox");
+
+        assert!(lexically_confined(
+            root,
+            std::path::Path::new(r"C:\sandbox\dir\..\ok.mjs")
+        ));
+        assert!(!lexically_confined(
+            root,
+            std::path::Path::new(r"C:\sandbox\..\secret.mjs")
+        ));
+        assert!(!lexically_confined(
+            root,
+            std::path::Path::new(r"C:\sandbox-other\secret.mjs")
+        ));
+        assert!(!lexically_confined(
+            root,
+            std::path::Path::new(r"D:\sandbox\secret.mjs")
+        ));
+        assert!(!lexically_confined(
+            root,
+            std::path::Path::new(r"C:relative\secret.mjs")
+        ));
+        assert!(!lexically_confined(
+            root,
+            std::path::Path::new(r"\\server\share\secret.mjs")
+        ));
+    }
+}
 
 impl<'p> Vm<'p> {
+    pub(crate) fn resolve_module_path(
+        &self,
+        raw_path: &std::path::Path,
+    ) -> Result<std::path::PathBuf, Thrown> {
+        canonical_module_path(self.module_root.as_deref(), raw_path)
+    }
+
+    fn read_module_bytes(&self, path: &std::path::Path) -> Result<Vec<u8>, Thrown> {
+        let Some(limit) = self.module_max_bytes else {
+            return std::fs::read(path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()));
+        };
+        let meta = std::fs::metadata(path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
+        if meta.len() > limit {
+            return Err(Thrown(format!(
+                "RangeError: module exceeds the sandbox size limit of {limit} bytes"
+            )));
+        }
+        let file = std::fs::File::open(path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
+        if bytes.len() as u64 > limit {
+            return Err(Thrown(format!(
+                "RangeError: module exceeds the sandbox size limit of {limit} bytes"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    fn read_module_text(&self, path: &std::path::Path) -> Result<String, Thrown> {
+        String::from_utf8(self.read_module_bytes(path)?)
+            .map_err(|_| Thrown(MODULE_NOT_FOUND.into()))
+    }
+
     /// Allocate a fresh live global slot from the eval pool (UNINITIALIZED),
     /// for module-loader bookkeeping (canonical namespace/source binding slots).
     pub(crate) fn alloc_module_shared_slot(&mut self) -> Result<u32, Thrown> {
@@ -97,8 +212,7 @@ impl<'p> Vm<'p> {
         raw_path: &std::path::Path,
         mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
-        let path = std::fs::canonicalize(raw_path)
-            .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        let path = self.resolve_module_path(raw_path)?;
         // A typed import is a DISTINCT module record from the same file's JS
         // module (e.g. a module importing ITSELF with { type: "text" }):
         // cached under (path, type), checked before the JS cache.
@@ -178,8 +292,7 @@ impl<'p> Vm<'p> {
                 // an IMMUTABLE ArrayBuffer (read as binary — a PNG fixture is
                 // not UTF-8).
                 "bytes" => {
-                    let bytes = std::fs::read(&path)
-                        .map_err(|_| Thrown("TypeError: module not found".into()))?;
+                    let bytes = self.read_module_bytes(&path)?;
                     let buf = self
                         .heap
                         .alloc(HeapObj::ArrayBuffer { data: bytes.into(), detached: false });
@@ -191,8 +304,7 @@ impl<'p> Vm<'p> {
                     self.build_typed_array(1, &[Value::heap(buf)])?
                 }
                 "json" | "text" => {
-                    let text = std::fs::read_to_string(&path)
-                        .map_err(|_| Thrown("TypeError: module not found".into()))?;
+                    let text = self.read_module_text(&path)?;
                     match t {
                         "json" => self.json_parse(text.as_bytes())?,
                         _ => self.alloc_str(text),
@@ -212,8 +324,7 @@ impl<'p> Vm<'p> {
                 .insert((path.clone(), t.to_string()), Value::heap(ns_idx));
             return Ok(Value::heap(ns_idx));
         }
-        let code = std::fs::read_to_string(&path)
-            .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        let code = self.read_module_text(&path)?;
         let ast = crate::front::parse_module(&code).map_err(Thrown)?;
         let prog = match crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), Vec::new(), false, false) {
             Ok(p) => p,
@@ -261,12 +372,13 @@ impl<'p> Vm<'p> {
         // self/in-flight classification below is STABLE for the whole
         // dependency loop: `module_loading` holds exactly the in-flight
         // ancestors throughout it.
+        let module_root = self.module_root.clone();
         let canon_of = |dir: Option<&std::path::Path>, spec: &str| -> std::path::PathBuf {
             let raw = match dir {
                 Some(d) => d.join(spec),
                 None => std::path::PathBuf::from(spec),
             };
-            std::fs::canonicalize(&raw).unwrap_or(raw)
+            canonical_module_path(module_root.as_deref(), &raw).unwrap_or(raw)
         };
         use crate::bytecode::ImportName as IN;
         // EARLY-PREPARE eligibility: every Named/Default import resolves
@@ -442,15 +554,19 @@ impl<'p> Vm<'p> {
                     Some(d) => d.join(&e.specifier),
                     None => std::path::PathBuf::from(&e.specifier),
                 };
-                let dep_canon = std::fs::canonicalize(&dep_raw).unwrap_or_else(|_| dep_raw.clone());
+                let confined = self.module_root.is_some();
+                let dep_canon = self.resolve_module_path(&dep_raw).map_err(|err| {
+                    if confined {
+                        err
+                    } else {
+                        Thrown(format!(
+                            "TypeError: Failed to resolve module specifier '{}'",
+                            e.specifier
+                        ))
+                    }
+                })?;
                 if dep_canon == path {
                     continue; // self-reference: already loaded
-                }
-                if std::fs::metadata(&dep_raw).is_err() {
-                    return Err(Thrown(format!(
-                        "TypeError: Failed to resolve module specifier '{}'",
-                        e.specifier
-                    )));
                 }
             }
             for e in &imports {
@@ -458,7 +574,7 @@ impl<'p> Vm<'p> {
                     Some(d) => d.join(&e.specifier),
                     None => std::path::PathBuf::from(&e.specifier),
                 };
-                let dep_canon = std::fs::canonicalize(&dep_raw).unwrap_or_else(|_| dep_raw.clone());
+                let dep_canon = self.resolve_module_path(&dep_raw)?;
                 // A TYPED import (json/text) is a DISTINCT module record even
                 // for the importing file itself — never self/in-flight.
                 let is_self = dep_canon == path && e.mtype.is_none();
@@ -864,7 +980,7 @@ impl<'p> Vm<'p> {
                 Some(d) => d.join(spec),
                 None => std::path::PathBuf::from(spec),
             };
-            let canon = std::fs::canonicalize(&dep).unwrap_or_else(|_| dep.clone());
+            let canon = self.resolve_module_path(&dep)?;
             let slot = self.module_ns_slot(&canon)?;
             let ns = self.import_module_sync(&dep, None)?;
             self.globals[slot as usize] = ns;
@@ -926,8 +1042,7 @@ impl<'p> Vm<'p> {
         name: &str,
         mtype: Option<&str>,
     ) -> Result<Option<u32>, Thrown> {
-        let dep = std::fs::canonicalize(raw_path)
-            .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        let dep = self.resolve_module_path(raw_path)?;
         // A TYPED request (json/text) is its own module record: resolve via
         // the typed loader, never the (possibly in-flight) JS module's
         // registries — a file may import ITSELF as text.
@@ -988,11 +1103,16 @@ impl<'p> Vm<'p> {
         raw_path: &std::path::Path,
         mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
-        let path = std::fs::canonicalize(raw_path).map_err(|_| {
-            Thrown(format!(
-                "TypeError: Failed to resolve module specifier '{}'",
-                raw_path.display()
-            ))
+        let confined = self.module_root.is_some();
+        let path = self.resolve_module_path(raw_path).map_err(|err| {
+            if confined {
+                err
+            } else {
+                Thrown(format!(
+                    "TypeError: Failed to resolve module specifier '{}'",
+                    raw_path.display()
+                ))
+            }
         })?;
         // Keyed by (path, type): the same file imported with and without
         // `with { type: "json" }` is two different modules, so one cache entry
@@ -1141,7 +1261,10 @@ impl<'p> Vm<'p> {
     /// compiles to an activation containing Await ops). Used by import.defer:
     /// the proposal evaluates a deferred graph's ASYNC modules eagerly.
     pub(crate) fn module_has_tla(&mut self, path: &std::path::Path) -> bool {
-        let Ok(code) = std::fs::read_to_string(path) else {
+        let Ok(path) = self.resolve_module_path(path) else {
+            return false;
+        };
+        let Ok(code) = self.read_module_text(&path) else {
             return false;
         };
         let Ok(ast) = crate::front::parse_module(&code) else {
@@ -1207,11 +1330,17 @@ impl<'p> Vm<'p> {
         &mut self,
         path: &std::path::PathBuf,
     ) -> Result<Vec<std::path::PathBuf>, Thrown> {
-        let code = std::fs::read_to_string(path).map_err(|_| {
-            Thrown(format!(
-                "TypeError: Failed to resolve module specifier '{}'",
-                path.display()
-            ))
+        let path = self.resolve_module_path(path)?;
+        let confined = self.module_root.is_some();
+        let code = self.read_module_text(&path).map_err(|err| {
+            if confined || err.0 != MODULE_NOT_FOUND {
+                err
+            } else {
+                Thrown(format!(
+                    "TypeError: Failed to resolve module specifier '{}'",
+                    path.display()
+                ))
+            }
         })?;
         let ast = crate::front::parse_module(&code).map_err(Thrown)?;
         let dir = path.parent().map(|p| p.to_path_buf());
@@ -1237,12 +1366,17 @@ impl<'p> Vm<'p> {
                     Some(d) => d.join(&spec),
                     None => std::path::PathBuf::from(&spec),
                 };
-                if std::fs::metadata(&raw).is_err() {
-                    return Err(Thrown(format!(
-                        "TypeError: Failed to resolve module specifier '{spec}'"
-                    )));
-                }
-                out.push(std::fs::canonicalize(&raw).unwrap_or(raw));
+                let confined = self.module_root.is_some();
+                let canon = self.resolve_module_path(&raw).map_err(|err| {
+                    if confined {
+                        err
+                    } else {
+                        Thrown(format!(
+                            "TypeError: Failed to resolve module specifier '{spec}'"
+                        ))
+                    }
+                })?;
+                out.push(canon);
             }
         }
         Ok(out)
@@ -1350,16 +1484,18 @@ impl<'p> Vm<'p> {
             // Completed (or never in-flight): normal resolution.
             return self.resolve_export(dep, name, None);
         };
-        let join = |pdir: Option<&std::path::Path>, spec: &str| -> std::path::PathBuf {
+        let module_root = self.module_root.clone();
+        let join =
+            |pdir: Option<&std::path::Path>, spec: &str| -> Result<std::path::PathBuf, Thrown> {
             let raw = match pdir {
                 Some(d) => d.join(spec),
                 None => std::path::PathBuf::from(spec),
             };
-            std::fs::canonicalize(&raw).unwrap_or(raw)
+            canonical_module_path(module_root.as_deref(), &raw)
         };
         for (exported, imported, spec) in &reex {
             if exported == name {
-                let target = join(pdir.as_deref(), spec);
+                let target = join(pdir.as_deref(), spec)?;
                 return self.resolve_pending_export(&target, imported, seen);
             }
         }
@@ -1368,13 +1504,13 @@ impl<'p> Vm<'p> {
         // demand; the value fills in when the dependency links).
         for (exported, spec) in &nsreex {
             if exported == name {
-                let target = join(pdir.as_deref(), spec);
+                let target = join(pdir.as_deref(), spec)?;
                 return Ok(Some(self.module_ns_slot(&target)?));
             }
         }
         if name != "default" {
             for spec in &stars {
-                let target = join(pdir.as_deref(), spec);
+                let target = join(pdir.as_deref(), spec)?;
                 if let Some(slot) = self.resolve_pending_export(&target, name, seen)? {
                     return Ok(Some(slot));
                 }
@@ -1390,8 +1526,7 @@ impl<'p> Vm<'p> {
         &mut self,
         raw_path: &std::path::Path,
     ) -> Result<Vec<(String, u32)>, Thrown> {
-        let dep = std::fs::canonicalize(raw_path)
-            .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        let dep = self.resolve_module_path(raw_path)?;
         let collect = |m: &std::collections::HashMap<String, u32>| -> Vec<(String, u32)> {
             m.iter()
                 .filter(|(n, _)| n.as_str() != "default")

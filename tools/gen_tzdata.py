@@ -16,7 +16,7 @@ Verification (see the generated file's header for the measured numbers) is by
 two independent oracles: node's ICU, and the real zic output embedded in the
 jiff-tzdb crate.
 """
-import hashlib, os, sys
+import hashlib, os, re, sys, tarfile, tempfile
 
 
 
@@ -389,6 +389,34 @@ def compile_zone(name, zlines, rules):
 FILES = ["africa", "antarctica", "asia", "australasia", "europe",
          "northamerica", "southamerica", "etcetera", "backward"]
 
+VERSION_RE = re.compile(r"^[0-9]{4}[a-z]$")
+TZ_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*$")
+
+
+def verify_tarball_sources(tarball, src):
+    """Prove the parsed files are the bytes covered by the recorded digest."""
+    wanted = {"version", *FILES}
+    found = {}
+    with tarfile.open(tarball, "r:*") as archive:
+        for member in archive.getmembers():
+            name = member.name.removeprefix("./")
+            if name not in wanted:
+                continue
+            if not member.isfile() or name in found:
+                raise SystemExit(f"invalid or duplicate {name!r} in {tarball}")
+            stream = archive.extractfile(member)
+            if stream is None:
+                raise SystemExit(f"cannot read {name!r} from {tarball}")
+            found[name] = stream.read()
+    missing = wanted - found.keys()
+    if missing:
+        raise SystemExit(f"tarball is missing tzdata inputs: {sorted(missing)}")
+    for name, archived in found.items():
+        with open(os.path.join(src, name), "rb") as source:
+            extracted = source.read()
+        if archived != extracted:
+            raise SystemExit(f"extracted {name!r} does not match {tarball}")
+
 
 def compile_all(src):
     rules, zones, links = parse_files([os.path.join(src, f) for f in FILES])
@@ -399,11 +427,24 @@ def compile_all(src):
 
 
 def main():
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit("usage: gen_tzdata.py <tzdata-dir> <out.rs> [source.tar.gz]")
     SRC, OUT = sys.argv[1], sys.argv[2]
     VERSION = open(os.path.join(SRC, "version")).read().strip()
     TARBALL = sys.argv[3] if len(sys.argv) > 3 else None
+    if not VERSION_RE.fullmatch(VERSION):
+        raise SystemExit(f"invalid IANA tzdata version {VERSION!r}")
+    if TARBALL:
+        verify_tarball_sources(TARBALL, SRC)
 
     comp, links, zones = compile_all(SRC)
+    emitted_names = set(comp)
+    for target, link in links:
+        emitted_names.add(target)
+        emitted_names.add(link)
+    invalid_names = sorted(name for name in emitted_names if not TZ_NAME_RE.fullmatch(name))
+    if invalid_names:
+        raise SystemExit(f"invalid IANA time-zone identifier(s): {invalid_names[:5]}")
 
     # ECMA-402 sec-availablenamedtimezoneidentifiers step 5.c: the primary
     # identifier of "Etc/UTC", "Etc/GMT" and "GMT" is "UTC", never the tzdb Zone
@@ -578,7 +619,19 @@ def main():
     a("];")
     a("")
 
-    open(OUT, "w", encoding="utf-8", newline="\n").write("\n".join(w) + "\n")
+    out_dir = os.path.dirname(os.path.abspath(OUT))
+    fd, staged = tempfile.mkstemp(prefix=".tzdata-", suffix=".rs", dir=out_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as output:
+            output.write("\n".join(w) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(staged, OUT)
+    finally:
+        try:
+            os.remove(staged)
+        except FileNotFoundError:
+            pass
     print("wrote", OUT, os.path.getsize(OUT), "bytes;",
           len(names), "zones,", len(ids), "ids,", len(trans_at), "transitions,",
           len(finals_out), "final rules")

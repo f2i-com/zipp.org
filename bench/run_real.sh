@@ -6,6 +6,9 @@
 # Env overrides: ITERS (best-of-N, default 5); BENCHES (subset of table rows);
 # APPEND=1 (skip truncate/correctness/header: append rows to an existing
 # results file); FINAL=0 (suppress the trailing DONE when chunking).
+# Trusted developer benchmark only: production JITs are the subject. Use
+# `zipp sandbox` rather than this harness for unreviewed scripts.
+set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ZIPP=${ZIPP:-./target/release/zipp.exe}
 OUT=bench/results_real.txt
@@ -37,6 +40,9 @@ BENCHES=${BENCHES:-$ALLBENCHES}
 CORRECTBENCHES=${CORRECTBENCHES:-"$ALLBENCHES $DIAGBENCHES"}
 APPEND=${APPEND:-0}
 FINAL=${FINAL:-1}
+[[ $ITERS =~ ^[1-9][0-9]*$ ]] || { echo "ITERS must be a positive integer" >&2; exit 2; }
+[[ $APPEND =~ ^[01]$ ]] || { echo "APPEND must be 0 or 1" >&2; exit 2; }
+[[ $FINAL =~ ^[01]$ ]] || { echo "FINAL must be 0 or 1" >&2; exit 2; }
 
 run_node(){ node "$1"; }
 run_bun(){ bun "$1"; }
@@ -44,7 +50,14 @@ run_deno(){ deno run "$1"; }
 run_zipp(){ "$ZIPP" js "$1"; }
 run_nojit(){ ZIPP_NOJIT=1 "$ZIPP" js "$1"; }
 
-ms(){ local s e; s=$(date +%s%N); "$@" >/dev/null 2>&1; e=$(date +%s%N); echo $(( (e-s)/1000000 )); }
+ms(){
+  local s e rc
+  s=$(date +%s%N)
+  if "$@" >/dev/null 2>&1; then rc=0; else rc=$?; fi
+  (( rc == 0 )) || { printf 'benchmark command failed (%d):' "$rc" >&2; printf ' %q' "$@" >&2; printf '\n' >&2; return "$rc"; }
+  e=$(date +%s%N)
+  echo $(( (e-s)/1000000 ))
+}
 best(){
   local m=99999999 v i
   for ((i=0;i<ITERS;i++)); do v=$(ms "$@"); (( v<m )) && m=$v; done

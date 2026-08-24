@@ -6,14 +6,102 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
-## Snapshot — 2026-08-24, end of the audit session
+## Continuation snapshot — 2026-08-24, Wave 28 and security hardening
 
-Read this first; the sections below it are the standing map and are still
-accurate except where this snapshot corrects them.
+Read this first. This snapshot supersedes the historical Wave 28 "in flight"
+warning below. **HEAD is `eb316a7`, pushed to `origin/main`; all work described
+in this continuation is currently an uncommitted working-tree change.**
 
-**HEAD is `572ffec`, pushed to `origin/main`. The working tree may contain
-UNVERIFIED wave-28 work — see "In flight" below. Check `git status` before you
-build anything and trust a measurement.**
+### Wave 28 gate result
+
+- The type-aware live-range split behind `ZIPP_NO_TYPE_SPLIT` passed its gate.
+  The body-`let` DataView case moved from 364 ms with splitting disabled to 1 ms
+  with it enabled, with identical output. A no-engagement R2/`let` workload was
+  null (200 ms enabled, 201 ms disabled across 15 interleaved pairs), so the
+  split is not taxing code that does not use it.
+- The earlier all-13 benchmark gate was null, as required. A focused suite plus
+  640 generated programs in eight execution modes found zero divergences.
+- The WASM synchronous host surface is now an exact 16-kind allowlist. Unknown
+  kinds are rejected before a host property or getter is read. The release WASM
+  build, Rust allowlist test, and 37/37 Node host-contract checks passed.
+
+### Handoff maintenance items actioned
+
+- The negative-modulo-index family received a 100,000-program targeted tier
+  differential soak under `nojit,thr1` (seed `17422515203558315675`): zero
+  divergences in 168.3 seconds. The historical divergence was not reproduced,
+  so the item remains open as a residual rather than being marked fixed.
+- `NURSERY_MAX_MINORS` now has the one-binary gate requested below:
+  `ZIPP_NURSERY_MAX_MINORS=<1..=4096>`, latched per heap. The default remains 64;
+  invalid/out-of-range values fail back to 64, and `ZIPP_GC_STRESS` deliberately
+  retains its fixed cap of 3. Focused parser/default/override tests passed. This
+  makes the backstop priceable but does not resolve the deeper question of
+  keying major-only hygiene to table growth instead of a minor count.
+- The sparse-overlay root walk and disabled `unify_homes_with_globals` remain
+  architectural correctness-sensitive work. Their warnings and required gates
+  below are still current; neither was replaced with a speculative shortcut.
+
+### Security and sandbox result
+
+- `zipp sandbox file.js` and `zipp js --sandbox file.js` run classic scripts in
+  a fresh supervised child with a cleared environment, null stdin, controlled
+  working directory, JIT disabled, wall/instruction/approximate-heap/output and
+  source/module limits, bounded terminal-safe output, and kill-and-reap cleanup.
+- Imports are denied by default. An opt-in import root is checked lexically
+  before filesystem access and canonically afterwards, covering parent,
+  absolute/prefix/UNC, and symlink escapes without providing a path-existence
+  oracle. The root must still be host-controlled and read-only because a path
+  check cannot eliminate concurrent filesystem races or hard-link concerns.
+- ES-module sandbox spellings fail closed. The current VM cannot safely combine
+  static imports and top-level-await with one continuously live meter, so
+  `zipp sandbox --module` and `zipp mjs --sandbox` are intentionally rejected.
+- This is language/process/resource/import containment, **not OS/kernel or
+  memory-safety isolation**. Hostile workloads still need independent network,
+  filesystem, RSS and syscall controls (for example AppContainer plus a Job
+  Object on Windows, namespaces/seccomp/cgroups on Linux, or a container).
+- `tools/run_test262.py` and benchmark/PGO runners are explicitly trusted-only:
+  Test262 needs privileged `$262` behavior and benchmark timing needs normal
+  JIT semantics. Untrusted checkouts must run those tools inside an external OS
+  sandbox; ordinary untrusted classic scripts should use `zipp sandbox`.
+- Rust JIT dependencies were upgraded to `dynasm`/`dynasmrt` 5.1, eliminating
+  the vulnerable `memmap2 < 0.9.11` chain. Landing `nanoid` is 3.3.18, the page
+  has a restrictive CSP/referrer policy, and Dependabot now covers Cargo and
+  landing npm dependencies. Cargo build directives and repository utility
+  scripts were hardened against injection, traversal, unsafe overwrite,
+  unbounded execution, and ignored child failures where applicable.
+
+### Continuation validation
+
+- `cargo test --workspace --all-targets` passed. Two test-only assumptions found
+  by that unified-feature/Windows gate were corrected: the regex acquisition
+  test now explicitly constructs the byte-optimized matcher whose gate it
+  measures, and the instruction-use source guard normalizes CRLF before checking
+  Rust source structure. Neither correction changes engine behavior.
+- `cargo check --workspace --all-targets` passed (with the repository's existing
+  warning set).
+- `cargo test -p zipp-cli --test sandbox`: 8 passed.
+- Focused VM output-budget and Windows lexical-confinement tests passed.
+- `cargo test -p zipp-wasm tests::synchronous_host_call_allowlist_is_exact
+  -- --exact` passed; the release WASM build and Node contract were also green.
+- `cargo audit` and landing `npm audit --audit-level=moderate`: zero advisories.
+- Landing production build, 45 Python benchmark-harness tests, Python syntax,
+  and all seven shell-script syntax checks passed.
+- A high-confidence private-key/API-token pattern scan found no matches outside
+  ignored build/dependency output.
+- Repo-wide `cargo fmt --check` is not baseline-clean; the new sandbox Rust files
+  are individually formatted and checked. Do not mistake the older formatting
+  debt for a regression introduced by this continuation.
+
+---
+
+## Historical snapshot — 2026-08-24, end of the audit session
+
+This records the earlier audit-session state. The continuation snapshot above
+corrects its Wave 28 and security status; the standing map below remains useful.
+
+**At that snapshot, HEAD was `572ffec`, pushed to `origin/main`. The tree could
+contain UNVERIFIED wave-28 work — see the historical in-flight note below.
+Check `git status` before you build anything and trust a measurement.**
 
 ### What this session changed
 
@@ -66,7 +154,7 @@ Scope, from `ZIPP_JITDECLINE=1` over all 13 rows: type-conflict declines occur i
 parse-large-js 2). **So fixing it cannot move the published numbers** — it can
 only help real-world-shaped code. That is the point, not a defect in the plan.
 
-### In flight — DO NOT TRUST THE WORKING TREE
+### Historical in-flight note — resolved by the continuation snapshot
 
 Wave 28 (`Workflow` run `wf_d7eb26c7-121`) was implementing type-aware
 live-range splitting behind `ZIPP_NO_TYPE_SPLIT`, with three independent
@@ -77,10 +165,8 @@ rows do NOT move). At the time of this snapshot the tree had modifications to
 `region_int_gpr.rs` that had **not** yet been reviewed, gated, or measured, and
 they are deliberately NOT committed.
 
-If you are picking this up: either wait for those lanes, or
-`git checkout crates/` to return to the pushed, gated state. Do not commit that
-diff on the strength of a green benchmark — this engine shipped a month of
-silent wrong answers from this exact file with a fully green suite.
+Those lanes have now completed; see the continuation gate result above. The
+historical warning is retained to explain why the gate was deliberately broad.
 
 ### Gate status at `572ffec`
 
@@ -423,19 +509,18 @@ already ahead of the best adjusted competitor in this capture.
 
 - A pre-existing tier divergence in the negative-modulo-index family, visible
   only under `ZIPP_JIT_THRESHOLD=1` (an index from `h % 16` going negative and
-  creating negative-index properties on a dense array mid-loop).
+  creating negative-index properties on a dense array mid-loop). A later
+  100,000-program targeted soak did not reproduce it; retain this as an open
+  residual until the original signature has a deterministic regression.
 - `NURSERY_MAX_MINORS = 64` forces a major every ~1M allocations regardless of
   live set, breaking an amortization invariant the code documents. Worth −0.2%
-  headline — real, small, well-understood. Note before attempting it: it is a
-  compile-time `const` with no env knob, so it can only be A/B'd across two
-  binaries, and at the 0.2% scale that is *below* the fat-LTO code-layout noise
-  floor — a two-binary A/B of an unrelated null change moved single rows by
-  −2.1%/+1.4% across rebuilds (B139). **Give it a `ZIPP_*` knob first** so it
-  can be priced on one binary the way every other mechanism here is; otherwise
-  the number will not be resolvable. The backstop is also keyed on the wrong
-  quantity: its own comment says it exists so major-only hygiene (the
-  `brand_private_names` recompute, reclaiming table capacity) is never deferred
-  forever, which is a function of table growth, not of a minor count.
+  headline — real, small, well-understood. The requested one-binary knob now
+  exists as `ZIPP_NURSERY_MAX_MINORS=<1..=4096>`; default and invalid values use
+  64, while GC stress keeps its fixed cap of 3. Price the change with that knob,
+  not two binaries. The backstop is still keyed on the wrong quantity: its own
+  comment says it exists so major-only hygiene (the `brand_private_names`
+  recompute, reclaiming table capacity) is never deferred forever, which is a
+  function of table growth, not of a minor count.
 - An array past 2²⁰ spills to a sparse overlay that `mark_roots` re-roots **in
   full on every collection** (189.6M inner iterations in a probe). Worth zero on
   the suite (no benchmark has such an array). **Do not "fix" this by deleting

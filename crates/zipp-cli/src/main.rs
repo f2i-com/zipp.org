@@ -6,6 +6,8 @@
 
 use std::process::ExitCode;
 
+mod sandbox;
+
 /// The engine is allocation-bound: every object owns three parallel `Vec`s plus
 /// a `String` per property, so constructing `{a: 1}` costs four allocations.
 /// Measured against the platform allocator that was ~290ns for the first
@@ -244,6 +246,14 @@ fn run(args: &[String]) -> Result<(), String> {
     let cmd = it.next().map(|s| s.as_str());
     match cmd {
         Some("js") | Some("js-vm") => {
+            // `zipp js --sandbox ...` is a discoverable spelling of the
+            // dedicated safe runner. Keep it ahead of the compatibility
+            // parser: sandbox flags deliberately do not leak into the ordinary
+            // unbounded execution path.
+            if it.clone().next().map(String::as_str) == Some("--sandbox") {
+                it.next();
+                return sandbox::run(&it.cloned().collect::<Vec<_>>());
+            }
             // Dynamic JavaScript engine (zipp-vm): a NaN-boxed, explicit-frame
             // register VM (recursion lives in an explicit frame stack, not the
             // native stack) with a native x86-64 OSR JIT. console.log streams to
@@ -291,6 +301,12 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
         Some("mjs") => {
+            if it.clone().next().map(String::as_str) == Some("--sandbox") {
+                return Err(
+                    "sandboxed ES-module entry is not supported; sandbox currently accepts classic scripts only"
+                        .into(),
+                );
+            }
             // Run a file as an ES MODULE (top-level await; module-scoped
             // declarations; the event loop drains to completion). Used for
             // `flags:[module]` test262 tests and `.mjs` entry points.
@@ -441,10 +457,18 @@ fn run(args: &[String]) -> Result<(), String> {
                 Err(format!("{differ} mismatches"))
             }
         }
+        Some("sandbox") => sandbox::run(&it.cloned().collect::<Vec<_>>()),
+        // Private half of the process sandbox. It is still fail-closed and
+        // validates every argument, but is omitted from help so callers use
+        // the supervising command with its hard wall/output limits.
+        Some("__sandbox-child") => sandbox::run_child(&it.cloned().collect::<Vec<_>>()),
         Some("--help") | Some("-h") | None => {
             println!("zipp — a clean-sheet JavaScript engine\n");
             println!("usage:");
             println!("  zipp js  <file.js>              run a script");
+            println!(
+                "  zipp sandbox [limits] <file.js> run an untrusted classic script with limits"
+            );
             println!("  zipp mjs <file.mjs>             run a file as an ES module");
             println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
             println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");
@@ -455,6 +479,12 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("\nenvironment:");
             println!("  ZIPP_NOJIT=1                    interpreter only (no native codegen)");
             println!("  ZIPP_GC_STRESS=1                collect on every allocation");
+            println!("\nsandbox defaults:");
+            println!("  --timeout-ms 5000               hard child-process wall deadline");
+            println!("  --max-steps 50000000            VM instruction budget");
+            println!("  --max-heap-mb 128               approximate VM heap ceiling");
+            println!("  --max-output-bytes 1048576      combined stdout/stderr ceiling");
+            println!("  --allow-imports <root>          opt in to imports confined below root");
             Ok(())
         }
         // Build identity. Exists because a benchmark artifact records the

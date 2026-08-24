@@ -1027,6 +1027,14 @@ pub struct Vm<'p> {
     /// `None` when running from a string (eval/embedding) — then `import()` has no
     /// host loader and rejects.
     module_base_dir: Option<std::path::PathBuf>,
+    /// Optional canonical filesystem boundary for the module loader. Every
+    /// module read (including typed/deferred/source-phase imports and recursive
+    /// re-exports) must remain below this directory. `None` preserves the
+    /// unrestricted loader used by the compatibility CLI and test262.
+    module_root: Option<std::path::PathBuf>,
+    /// Maximum bytes read from any module while `module_root` is active.
+    /// `None` preserves the unrestricted compatibility loader.
+    module_max_bytes: Option<u64>,
     /// Dynamic-import namespace cache: resolved module path → its namespace value.
     /// A module is evaluated at most once, so re-importing the same path returns the
     /// SAME namespace object (identity). Values are GC roots (modules persist).

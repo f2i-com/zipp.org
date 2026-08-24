@@ -124,7 +124,9 @@ fn corpus() -> Vec<(String, String, String)> {
         "a", "b", "c", "0", r"\d", r"\w", r"\s", ".", "[a-c]", "[^a-c]", "[b0-9-]", "ab", "abc",
         "a|b", "(a)", "(b|cd)", r"(\d)", "(?:ab|a)", "[abx]", "=",
     ];
-    let quants = ["", "", "", "*", "+", "?", "*?", "+?", "??", "{1,3}", "{2}", "{0,2}?"];
+    let quants = [
+        "", "", "", "*", "+", "?", "*?", "+?", "??", "{1,3}", "{2}", "{0,2}?",
+    ];
     let flagsets = ["g", "g", "g", "gi", "gm", "gs"];
     let alphabet: Vec<char> = "aabbccdd0123 =-.x\n".chars().collect();
     for _ in 0..400 {
@@ -162,14 +164,19 @@ fn rxjit_differential_vs_interpreter() {
         }
     }
     // Force-on must have actually compiled a good chunk of the corpus.
-    let (compiled, declined_unsup, declined_lim, native, _interp, bails) =
-        regress::rx_jit_stats();
+    let (compiled, declined_unsup, declined_lim, native, _interp, bails) = regress::rx_jit_stats();
     println!(
         "differential: {compared} runs; jit compiled {compiled}, declined {declined_unsup}+{declined_lim}, native attempts {native}, bails {bails}"
     );
     assert!(compared > 800, "corpus unexpectedly small: {compared}");
-    assert!(compiled > 100, "JIT compiled too few corpus patterns: {compiled}");
-    assert_eq!(bails, 0, "native code should not hit the backtrack cap here");
+    assert!(
+        compiled > 100,
+        "JIT compiled too few corpus patterns: {compiled}"
+    );
+    assert_eq!(
+        bails, 0,
+        "native code should not hit the backtrack cap here"
+    );
 }
 
 /// The scan-session path (rxjit.rs `with_session`) hoists the TLS borrow and
@@ -241,7 +248,10 @@ fn rx_session_bt_grow() {
     })
     .join()
     .unwrap();
-    assert_eq!(legacy, session, "session diverged across a mid-scan bt grow");
+    assert_eq!(
+        legacy, session,
+        "session diverged across a mid-scan bt grow"
+    );
     // Deterministic when run filtered to this test alone (no force races):
     // both instances compile, and the spawned drain runs inside sessions.
     let (compiled, _, _, native, _, bails) = regress::rx_jit_stats();
@@ -292,7 +302,12 @@ fn rx_acqgate_threshold_and_streams() {
     // deterministic even while other tests toggle the jit/session forces.
     regress::__rx_acqgate_force(Some(true));
     regress::__rx_scansession_force(Some(true));
-    let re = Regex::with_flags(r"x\d\d", "g").unwrap();
+    // This assertion is specifically about a byte-prefiltered ASCII scan.
+    // Workspace feature unification enables `utf16`, under which `with_flags`
+    // deliberately omits byte-only optimizer passes and the scan legitimately
+    // attempts every position. Compile the same ASCII-only twin the VM uses so
+    // the zero-candidate premise remains true in both feature combinations.
+    let re = Regex::from_unicode_byteopt(r"x\d\d".chars().map(u32::from), "g").unwrap();
     let blank = "a".repeat(256);
     let sessions_before = regress::rx_session_stats();
     for _ in 0..200 {
@@ -309,7 +324,7 @@ fn rx_acqgate_threshold_and_streams() {
     // compiles — and then opens a session per zero-attempt scan. Loop with
     // slack: concurrent tests may transiently force the jit or session off.
     regress::__rx_acqgate_force(Some(false));
-    let ungated = Regex::with_flags(r"x\d\d", "g").unwrap();
+    let ungated = Regex::from_unicode_byteopt(r"x\d\d".chars().map(u32::from), "g").unwrap();
     let sessions_before = regress::rx_session_stats();
     for _ in 0..10_000 {
         assert_eq!(run_all(&ungated, &blank, 0), "");
@@ -329,9 +344,7 @@ fn rx_acqgate_threshold_and_streams() {
     // Deterministic when run filtered to this test alone (no force races):
     // the ungated twin compiles on entry ticks alone and sessions its
     // zero-attempt scans; the gated one opens none.
-    println!(
-        "acqgate zero-attempt sessions: gated {gated_sessions}, ungated {ungated_sessions}"
-    );
+    println!("acqgate zero-attempt sessions: gated {gated_sessions}, ungated {ungated_sessions}");
     regress::__rx_acqgate_force(Some(true));
 
     // Phase B: the SAME instance compiles once scans elsewhere actually
@@ -386,10 +399,12 @@ fn rx_acqgate_threshold_and_streams() {
 #[test]
 fn rxjit_differential_vs_node() {
     let cases = corpus();
-    let hex = |s: &str| s.bytes().fold(String::new(), |mut a, b| {
-        write!(a, "{b:02x}").unwrap();
-        a
-    });
+    let hex = |s: &str| {
+        s.bytes().fold(String::new(), |mut a, b| {
+            write!(a, "{b:02x}").unwrap();
+            a
+        })
+    };
     // One input line per case; node prints the same canonical encoding as
     // run_all, or "ERR" for patterns it rejects.
     let mut input = String::new();
@@ -432,13 +447,15 @@ for (const line of lines) {
         eprintln!("node not on PATH; skipping node differential");
         return;
     };
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "node run failed");
-    let node_lines: Vec<&str> = std::str::from_utf8(&out.stdout)
-        .unwrap()
-        .lines()
-        .collect();
+    let node_lines: Vec<&str> = std::str::from_utf8(&out.stdout).unwrap().lines().collect();
     assert_eq!(node_lines.len(), cases.len(), "node output line count");
     let mut compared = 0usize;
     for ((p, f, s), node) in cases.iter().zip(node_lines) {
@@ -456,6 +473,9 @@ for (const line of lines) {
         assert_eq!(&ours, node, "node divergence on /{p}/{f} over {s:?}");
         compared += 1;
     }
-    println!("node differential: {compared}/{} cases compared", cases.len());
+    println!(
+        "node differential: {compared}/{} cases compared",
+        cases.len()
+    );
     assert!(compared > 300, "too few node comparisons: {compared}");
 }

@@ -28,8 +28,8 @@ license = "Apache-2.0"
 # its optional native x86-64 JIT.
 [workspace.dependencies]
 rustc-hash = "2"
-dynasm = "2.0"
-dynasmrt = "2.0"
+dynasm = "5.1"
+dynasmrt = "5.1"
 
 [profile.release]
 opt-level = 3

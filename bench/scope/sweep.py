@@ -18,7 +18,6 @@ answer. That is a property of the rewrite, not of the engine.
 from __future__ import annotations
 
 import glob
-import os
 import re
 import statistics
 import subprocess
@@ -33,6 +32,7 @@ if not ZIPP.exists():
     ZIPP = ROOT / "target" / "release" / "zipp"
 
 LET_EXCLUDE = {"parse-large-js.js"}      # embeds JS source as data
+TIMEOUT_S = 600
 
 
 def make_iife(text: str) -> str:
@@ -54,7 +54,10 @@ def make_let(text: str) -> str:
 
 def timed(cmd: list[str]) -> float:
     t = time.perf_counter()
-    p = subprocess.run(cmd, capture_output=True, timeout=600)
+    try:
+        p = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"{' '.join(map(str, cmd))} exceeded {TIMEOUT_S}s") from exc
     dt = time.perf_counter() - t
     if p.returncode != 0:
         raise SystemExit(f"{' '.join(map(str, cmd))} failed:\n{p.stderr.decode()[:400]}")
@@ -71,6 +74,8 @@ def main() -> int:
             modes = [a]
         else:
             raise SystemExit(f"usage: sweep.py [reps] [iife|let]  (got {a!r})")
+    if reps <= 0:
+        raise SystemExit("repetitions must be a positive integer")
     if not ZIPP.exists():
         raise SystemExit(f"no zipp binary at {ZIPP} -- cargo build --release first")
 
@@ -87,9 +92,9 @@ def main() -> int:
                 var = Path(tmp) / r
                 var.write_text(gen(orig.read_text(encoding="utf-8")), encoding="utf-8")
                 # a rewrite that changes the answer is not a fair comparison
-                a = subprocess.run(["node", str(orig)], capture_output=True).stdout
-                b = subprocess.run(["node", str(var)], capture_output=True).stdout
-                if a != b:
+                original = timed_output(["node", str(orig)])
+                rewritten = timed_output(["node", str(var)])
+                if original != rewritten:
                     print(f"  !! {r}: rewrite changes Node's output, skipping")
                     continue
                 use.append((r, orig, var))
@@ -117,6 +122,16 @@ def main() -> int:
             print(f"\ngeomean {mode} penalty over {len(pens)} rows: "
                   f"{(g ** (1/len(pens)) - 1) * 100:+.1f}%")
     return 0
+
+
+def timed_output(cmd: list[str]) -> bytes:
+    try:
+        p = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"{' '.join(map(str, cmd))} exceeded {TIMEOUT_S}s") from exc
+    if p.returncode != 0:
+        raise SystemExit(f"{' '.join(map(str, cmd))} failed:\n{p.stderr.decode()[:400]}")
+    return p.stdout
 
 
 if __name__ == "__main__":

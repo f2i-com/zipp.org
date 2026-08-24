@@ -3,10 +3,20 @@
 # distinct engine paths (property/alloc, string, numeric/JIT, regex) without the
 # ~4 minutes the full suite costs. NOT a substitute for bench/run_real.sh —
 # re-run that before quoting a geomean.
+# Trusted developer benchmark only: production JITs are intentional here. Do
+# not point BENCHES/ZIPP at unreviewed code; use `zipp sandbox` for that.
+set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 Z=${ZIPP:-./target/release/zipp.exe}
 BENCHES=${BENCHES:-"json-large class-prototype-hot typedarray-math sparse-array"}
-ms(){ local s e; s=$(date +%s%N); "$@" >/dev/null 2>&1; e=$(date +%s%N); echo $(( (e-s)/1000000 )); }
+ms(){
+  local s e rc
+  s=$(date +%s%N)
+  if "$@" >/dev/null 2>&1; then rc=0; else rc=$?; fi
+  (( rc == 0 )) || { printf 'benchmark command failed (%d):' "$rc" >&2; printf ' %q' "$@" >&2; printf '\n' >&2; return "$rc"; }
+  e=$(date +%s%N)
+  echo $(( (e-s)/1000000 ))
+}
 best(){ local m=99999999 v i; for ((i=0;i<3;i++)); do v=$(ms "$@"); (( v<m )) && m=$v; done; echo "$m"; }
 printf "%-22s %8s %8s %7s\n" bench zipp node ratio
 ratios=""

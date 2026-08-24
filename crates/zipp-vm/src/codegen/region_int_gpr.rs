@@ -1080,6 +1080,12 @@ fn gpr_deopt_shadow_plan(
     n_spill: usize,
 ) -> Option<GprDeoptShadow> {
     if !gpr_deopt_shadow_enabled()
+        // W28: a type-split register's Bool half is boxed with a DIFFERENT tag
+        // than the shadow's raw-qword-then-Int-box model, and its EMPTY
+        // sentinel reasoning is stated only for numeric homes. Refusing keeps
+        // the shadow's V1 proof textually intact; the split region pays the
+        // incumbent per-def boxed write-through instead.
+        || !plan.ty_splits.is_empty()
         || ta_plan.pins.is_empty()
         || ta_plan.pins.iter().any(|p| p.kind != DV_PIN_KIND)
         || !entry.resume.is_empty()
@@ -1401,7 +1407,15 @@ fn gpr_home_map(
         push(x, &mut used);
     }
     used.sort_unstable();
-    let bool_used: FxHashSet<u8> = plan.bool_regs.iter().map(|&(_, g)| g).collect();
+    // W28: a type split's bool gpr is not in `bool_regs` (it is neither flushed
+    // nor entry-loaded), but it is just as reserved — handing it out as a
+    // numeric home would put a live Bool and a live number in one register.
+    let bool_used: FxHashSet<u8> = plan
+        .bool_regs
+        .iter()
+        .map(|&(_, g)| g)
+        .chain(plan.ty_splits.values().map(|sp| sp.gpr))
+        .collect();
     let mut pool: Vec<u8> = vec![15, 5]; // r15, rbp (pushed by this prologue)
     pool.extend(BOOL_GPRS.iter().copied().filter(|g| !bool_used.contains(g)));
     pool.push(6); // rsi — the resume-ip pointer lives in the frame here
@@ -2170,10 +2184,19 @@ fn emit_int_wt_gpr(
     map: &FxHashMap<u8, Loc>,
     shadow: &GprDeoptShadow,
     lazy: &FxHashSet<u8>,
+    ip: usize,
     dst: u16,
     known_i32: bool,
 ) -> bool {
     if !plan.split_recvs.contains(&dst) && !plan.write_through.contains(&dst) {
+        return false;
+    }
+    // W28: inside a type-split register's BOOL range the value in its numeric
+    // home is the OTHER range's, one iteration stale. `emit_split_bool_wt`
+    // stores the Bool instead. Every caller here is a numeric arm, so this can
+    // only fire from the generic post-arm hook — which routes bool-range defs
+    // away itself; the guard is the belt for that brace.
+    if plan.is_split_bool_ip(dst, ip) {
         return false;
     }
     if let Some(&Home::Xmm(x)) = plan.reg_home.get(&dst) {
@@ -2837,7 +2860,7 @@ pub(crate) fn compile_region_int_gpr(
                         Loc::R(dg) => dynasm!(ops ; mov Rq(dg), rax),
                         Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
                     }
-                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, false);
                     if !plan.elide_guard.contains(&ip) {
                         emit_i53_guard_gpr(
                             &mut ops,
@@ -2915,7 +2938,7 @@ pub(crate) fn compile_region_int_gpr(
                             }
                         }
                     }
-                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, false);
                     if !plan.elide_guard.contains(&ip) {
                         emit_i53_guard_gpr(
                             &mut ops,
@@ -3009,7 +3032,7 @@ pub(crate) fn compile_region_int_gpr(
                         ; jmp => flush_exit
                         ; => done
                     );
-                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                    wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, false);
                     emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                 }
             }
@@ -3068,7 +3091,7 @@ pub(crate) fn compile_region_int_gpr(
                             }
                             dynasm!(ops ; add Rq(d), imm); // sign-extended imm32 == i64 add
                             wt_pre =
-                                emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                                emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, false);
                             if !plan.elide_guard.contains(&ip) {
                                 emit_i53_guard_gpr(
                                     &mut ops,
@@ -3103,7 +3126,7 @@ pub(crate) fn compile_region_int_gpr(
                                 dynasm!(ops ; mov Rq(d), rax);
                             }
                             wt_pre =
-                                emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                                emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, false);
                             if !plan.elide_guard.contains(&ip) {
                                 emit_i53_guard_gpr(
                                     &mut ops,
@@ -3138,7 +3161,7 @@ pub(crate) fn compile_region_int_gpr(
                     Loc::R(d) => dynasm!(ops ; mov Rq(d), rax),
                     Loc::S(dd) => dynasm!(ops ; mov [rsp + dd], rax),
                 }
-                wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, false);
+                wt_pre = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, false);
                 if !plan.elide_guard.contains(&ip) {
                     emit_i53_guard_gpr(&mut ops, dl, rip_after, ip_slot, inline_guards, flush_exit);
                 }
@@ -3510,7 +3533,7 @@ pub(crate) fn compile_region_int_gpr(
                 // the generic hook sees it too, so `wt_pre` suppresses that
                 // duplicate only for an engaged shadow. The empty/switch-off
                 // plan deliberately retains the incumbent bytes. 0..255 is i32.
-                let emitted = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, true);
+                let emitted = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, true);
                 if shadow.reg_slot(dst).is_some() {
                     wt_pre = emitted;
                 }
@@ -3668,7 +3691,7 @@ pub(crate) fn compile_region_int_gpr(
                 // duplicate only for an engaged shadow, preserving old bytes
                 // for an empty/switch-off plan. Kinds 0-5 are provably i32.
                 let emitted =
-                    emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, kindid <= 5);
+                    emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, kindid <= 5);
                 if shadow.reg_slot(dst).is_some() {
                     wt_pre = emitted;
                 }
@@ -3777,7 +3800,7 @@ pub(crate) fn compile_region_int_gpr(
                                          // The generic writes_reg hook covers MathOp dsts, but this arm
                                          // writes through explicitly like the DV arm (membership no-op
                                          // otherwise). An imul result is ToInt32 — provably i32.
-                let emitted = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, dst, true);
+                let emitted = emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, true);
                 if shadow.reg_slot(dst).is_some() {
                     wt_pre = emitted;
                 }
@@ -3816,7 +3839,25 @@ pub(crate) fn compile_region_int_gpr(
                     }
                 );
                 let shadowed = shadow.reg_slot(d).is_some();
-                if emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, d, known_i32) && !shadowed
+                // ── W28 type-split write-through ── a def inside the BOOL
+                // range stores `BOOL_TAG | gpr` to the register's frame slot
+                // instead of boxing its numeric home, which holds the OTHER
+                // range's (stale) value there. Both halves writing through is
+                // what makes `flush_exit` able to skip the register entirely,
+                // and that in turn is the only way an exit — including one in
+                // the GAP between the ranges, where the interpreter's slot
+                // must still hold the earlier range's value — is correct
+                // without knowing which range is live at it.
+                if plan.is_split_bool_ip(d, ip) {
+                    let g = plan.split_bool_gpr(d).expect("split bool ip implies a bool gpr");
+                    dynasm!(ops
+                        ; mov rax, QWORD BOOL_TAG as i64
+                        ; or rax, Rq(g)
+                        ; mov [rbx + dreg(d)], rax
+                    );
+                    flag_cmp = None; // `or` clobbered FLAGS
+                } else if emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, d, known_i32)
+                    && !shadowed
                 {
                     flag_cmp = None; // the incumbent boxing path clobbered FLAGS
                 }

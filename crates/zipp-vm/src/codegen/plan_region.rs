@@ -111,6 +111,22 @@ pub(crate) fn decline_emit(reason: impl std::fmt::Display) {
     }
 }
 
+env_off_switch! {
+    /// W28 TYPE-AWARE LIVE-RANGE SPLITTING. Default ON;
+    /// `ZIPP_NO_TYPE_SPLIT=1` restores the pre-wave planner, in which a VM
+    /// register used with two different `VTy`s anywhere in a region declines
+    /// the WHOLE region ("type conflict on a reused register") to the boxed
+    /// MEM tier. With the switch off `plan_type_splits` returns an empty map
+    /// and every downstream site is a no-op, so a binary with
+    /// `ZIPP_NO_TYPE_SPLIT=1` set is behaviourally identical to the pre-wave
+    /// one — which is what lets the mechanism be priced with
+    /// `tools/bench.py --ab <exe> <exe> --ab-env - ZIPP_NO_TYPE_SPLIT=1`.
+    ///
+    /// See `RegionPlan::ty_splits` for the mechanism and `plan_type_splits`
+    /// for the legality predicate.
+    fn type_split_enabled() = "ZIPP_NO_TYPE_SPLIT"
+}
+
 /// Plan register homes for `[start, end]`, or `None` to decline (use mem path).
 /// `ta_plan` (unboxed-region epic): the pinned-TypedArray plan, threaded so a
 /// later increment can admit a pinned-Float64Array element GetIndex/SetIndex as a
@@ -1511,6 +1527,70 @@ fn plan_region_cold_inner(
         }
     }
 
+    // ── W28 type-aware live-range splitting ── see `RegionPlan::ty_splits` for
+    // the mechanism and `plan_type_splits` for the legality predicate. GATE:
+    // only for plans routed EXCLUSIVELY into the GPR emitter (`admit_dv` and
+    // every `share_homes` call site feed `compile_region_int_gpr` alone — the
+    // same routing argument the glob-range pass below stands on), on the
+    // integer path, with no cold side exits, and only where the caller
+    // implements per-def write-through: the exit contract is write-through's.
+    // Every other planner caller sees an empty map and plans byte-identically,
+    // which is what makes the 13 `bench/real` rows unchanged by construction.
+    let ty_splits: FxHashMap<u16, TySplit> = if admit_bitwise
+        && (admit_dv || share_homes)
+        && admit_wt_share
+        && cold.is_empty()
+    {
+        let mut excluded: FxHashSet<u16> = ta_recv_regs.clone();
+        excluded.extend(split_recvs.iter().copied());
+        excluded.extend(box_regs.iter().copied());
+        for pin in &ta_plan.pins {
+            if let TaPinSrc::Reg(r) = pin.src {
+                excluded.insert(r);
+            }
+        }
+        let dv_flag_reg = |ip: usize| -> Option<u16> {
+            match code[ip] {
+                Instr::CallMethod { arg_base, argc: 2, .. } if pinned_dv(ip) => Some(arg_base + 1),
+                _ => None,
+            }
+        };
+        plan_type_splits(
+            code,
+            s,
+            e,
+            &jump_targets,
+            &excluded,
+            &split_recv_lg,
+            &dv_flag_elide,
+            &dv_flag_fuse,
+            &dv_flag_reg,
+        )
+    } else {
+        FxHashMap::default()
+    };
+    if !ty_splits.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+        let mut v: Vec<(u16, TySplit)> = ty_splits.iter().map(|(&r, &sp)| (r, sp)).collect();
+        v.sort_unstable_by_key(|x| x.0);
+        for (r, sp) in v {
+            eprintln!(
+                "[jit] region [{s},{e}] type-split r{r}: bool=[{},{}] num=[{},{}]",
+                sp.bool_lo, sp.bool_hi, sp.num_lo, sp.num_hi
+            );
+        }
+    }
+
+    // W28: is `r` a type-split register whose BOOL half is live at `ip`? Every
+    // `ty`-based Bool test below has to ask this too — a split register is
+    // typed `VTy::Num` (its numeric half is the one `reg_home` names) while
+    // being a genuine Bool inside its bool range, where `gh` resolves to its
+    // own gpr.
+    let split_bool_at = |r: u16, ip: usize| -> bool {
+        ty_splits
+            .get(&r)
+            .is_some_and(|sp| ip >= sp.bool_lo && ip <= sp.bool_hi)
+    };
+
     let mut ty: FxHashMap<u16, VTy> = FxHashMap::default();
     let mut first_seen: FxHashMap<u16, bool> = FxHashMap::default(); // reg → was first occurrence a def?
     let mut glob_first_read: FxHashMap<u32, bool> = FxHashMap::default(); // slot → first touch was a read?
@@ -1682,7 +1762,32 @@ fn plan_region_cold_inner(
                 dty
             };
             if !note_def(d, t, &mut ty, &mut first_seen, &mut reg_order) {
-                decline!("type conflict on a reused register");
+                // ── W28 ── a register the bytecode compiler recycled across a
+                // type boundary is not a decline any more IF `plan_type_splits`
+                // proved its two ranges cannot interfere. The register keeps a
+                // NUMERIC home (so every numeric lookup is unchanged) and takes
+                // a separate gpr for its Bool range, assigned below.
+                //
+                // This is also where the pre-pass's type PREDICTION is checked
+                // against the live typing pass, op by op: the two derive the
+                // def type from separate matches, and a disagreement — a new
+                // opcode, a refined `dty` — must decline, never silently home a
+                // value under the wrong type.
+                let ok = ty_splits.get(&d).is_some_and(|sp| {
+                    let want = if s + off >= sp.bool_lo && s + off <= sp.bool_hi {
+                        VTy::Bool
+                    } else {
+                        VTy::Num
+                    };
+                    want == t && ty.get(&d) == Some(&if t == VTy::Bool { VTy::Num } else { VTy::Bool })
+                });
+                if !ok {
+                    decline!("type conflict on a reused register");
+                }
+                // A split register is typed Num for the whole region: its
+                // numeric half is the one `reg_home` names.
+                ty.insert(d, VTy::Num);
+                first_seen.entry(d).or_insert(true);
             }
         }
         // Globals: order + first-touch direction. A TA-receiver's LoadGlobal is
@@ -1853,6 +1958,7 @@ fn plan_region_cold_inner(
                     && size > 1
                     && !dv_flag_fuse.contains_key(&(s + off))
                     && ty.get(&(arg_base + 1)) != Some(&VTy::Bool)
+                    && !split_bool_at(arg_base + 1, s + off)
                 {
                     decline!("pinned DV endian flag is not a Bool");
                 }
@@ -1891,7 +1997,7 @@ fn plan_region_cold_inner(
             }
             Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => {
                 // Only bool conditions are supported (the loop-guard shape).
-                if ty.get(&cond) != Some(&VTy::Bool) {
+                if ty.get(&cond) != Some(&VTy::Bool) && !split_bool_at(cond, s + off) {
                     decline!("branch condition is not a bool");
                 }
             }
@@ -2678,6 +2784,23 @@ fn plan_region_cold_inner(
             *l = (*l).max(lb);
         }
     }
+    // ── W28 type-split numeric interval ── a split register's NUMERIC home is
+    // live over its numeric range ALONE: the bool range keeps the value in a
+    // gpr of its own, and the gap between the ranges holds nothing (the two
+    // ranges cover every touch of the register by construction). This
+    // narrowing is what the split is FOR — it is the register-pressure relief
+    // that lets a region with a recycled temp fit the pool at all — and it
+    // rests on exactly the facts the range's admission proved: the range opens
+    // with a def, no in-region jump target lands strictly inside it (so that
+    // def dominates every touch in it), and the register is `shareable` with
+    // `flush_exit` skipping it (write-through keeps its slot current), so
+    // lending the home to another value before `num_lo` and after `num_hi` is
+    // unobservable. Deliberately AFTER the `region_liveness` widening: the
+    // narrowing is a claim the split proved, not one the hull can make.
+    for (&r, sp) in &ty_splits {
+        first_ip.insert(r, sp.num_lo);
+        last_ip.insert(r, sp.num_hi);
+    }
     // ── the ONE live-in predicate ── "is the value this register holds when the
     // region is ENTERED still observable?". Every consumer that decides whether a
     // home must be filled from the frame slot, and whether it may be reused or
@@ -2748,6 +2871,71 @@ fn plan_region_cold_inner(
                 || !read_outside.contains(&r)
                 || outside_dead.contains(&r))
     };
+
+    // ── W28 type-split: the conditions that need liveness ──
+    // `plan_type_splits` proved the two ranges cannot interfere structurally.
+    // The rest of the predicate needs analyses that did not exist when it ran,
+    // and every one of them FAILS CLOSED: a candidate that does not clear all
+    // of them declines the region with the pre-wave reason, exactly as if the
+    // split had never been considered.
+    //
+    //   * `!live_in(r)` — the W18 dominance predicate. A value observable at
+    //     region entry could be read before either range's opening def, and
+    //     that read would be under the wrong type. It is also what makes the
+    //     register's frame slot safe to leave alone until its first def.
+    //   * `shareable(r)` — the same bar the numeric reuse path applies. On the
+    //     write-through callers this is `!live_in && !hoisted`, so a
+    //     read-after-region split is admitted precisely because its slot is
+    //     kept current by write-through (below).
+    //   * not hoisted / dead / remat / slot-const / home-unified — each of
+    //     those gives the register a different home story (an immediate, no
+    //     home at all, a shared global home) that the two-home model does not
+    //     express.
+    //   * `str_imul_touch` — the extra live-range mentions `instr_uses` and
+    //     `writes_reg` are blind to. Every one for a split register must land
+    //     inside the matching range; otherwise the pre-pass's touch walk was
+    //     incomplete for it and its ranges are not trustworthy.
+    let mut ty_splits = ty_splits;
+    if !ty_splits.is_empty() {
+        let mut keys: Vec<u16> = ty_splits.keys().copied().collect();
+        keys.sort_unstable();
+        for r in keys {
+            let sp = ty_splits[&r];
+            let in_range = |ip: usize| {
+                (ip >= sp.bool_lo && ip <= sp.bool_hi) || (ip >= sp.num_lo && ip <= sp.num_hi)
+            };
+            let touch_ok = str_imul_touch.iter().all(|&(ip, rr, is_def)| {
+                rr != r
+                    || (in_range(ip)
+                        && (!is_def || (ip >= sp.num_lo && ip <= sp.num_hi)))
+            });
+            if !live_in(r)
+                && shareable(r)
+                && !hoisted.contains(&r)
+                && !dead.contains(&r)
+                && !remat_regs.contains(&r)
+                && !slot_consts.contains_key(&r)
+                && !glob_alias.contains_key(&r)
+                && !move_alias.contains_key(&r)
+                && !split_recvs.contains(&r)
+                && ty.get(&r) == Some(&VTy::Num)
+                && touch_ok
+            {
+                continue;
+            }
+            decline!("type conflict on a reused register");
+        }
+        // MEMORY IS AUTHORITATIVE for a split register — see
+        // `RegionPlan::ty_splits`. Every numeric def boxes into
+        // `[rbx + dreg(r)]` through the standard `write_through` hook, every
+        // Bool def stores `BOOL_TAG | gpr` there through the emitter's split
+        // arm, and `flush_exit` skips the register on both loops. This is the
+        // ONLY way an exit can be correct without knowing which of the two
+        // ranges is live at it — including an exit in the GAP between them.
+        for &r in ty_splits.keys() {
+            write_through.insert(r);
+        }
+    }
 
     // ── B97 write-through set ── every read-after-region register that `shareable`
     // now admits. This MUST be populated for BOTH allocation branches, not just the
@@ -2947,6 +3135,11 @@ fn plan_region_cold_inner(
                 || !shareable(r)
                 || split_recvs.contains(&r)
                 || slot_consts.contains_key(&r)
+                // W28: a type-split register's numeric home must span its whole
+                // mention window. Its BOOL range sits inside that window and
+                // reserves nothing here, so a second segmentation on top would
+                // hand the numeric home out across a hole this pass cannot see.
+                || ty_splits.contains_key(&r)
             {
                 continue;
             }
@@ -3336,6 +3529,28 @@ fn plan_region_cold_inner(
         }
     }
 
+    // ── W28 type-split bool homes ── one DEDICATED gpr per split register,
+    // taken after every real bool so a region that carries no split allocates
+    // byte-identically. Deliberately NO linear-scan reuse: a split's bool half
+    // is never entry-loaded and never flushed, so the whole of what keeps it
+    // correct is that nothing else occupies that register while its range is
+    // live — a private register states that instead of proving it. The gprs
+    // taken here are excluded from the GPR emitter's numeric pool exactly like
+    // `bool_regs` ones (`gpr_home_map`'s `bool_used`).
+    if !ty_splits.is_empty() {
+        let mut keys: Vec<u16> = ty_splits.keys().copied().collect();
+        keys.sort_unstable();
+        for r in keys {
+            if next_bool >= BOOL_GPRS.len() {
+                decline!("type split: bool gpr pool exhausted");
+            }
+            if let Some(sp) = ty_splits.get_mut(&r) {
+                sp.gpr = BOOL_GPRS[next_bool];
+            }
+            next_bool += 1;
+        }
+    }
+
     // ── spare-home constants ──
     // Distinct `AddInt` immediates get a permanent xmm const home when the pool
     // has room (saves a per-iteration materialise+convert in the loop body).
@@ -3516,6 +3731,7 @@ fn plan_region_cold_inner(
         strict_entry_globs,
         box_regs,
         getprop_ips,
+        ty_splits,
     }))
 }
 
@@ -3761,6 +3977,386 @@ pub(crate) fn runs_every_iteration(code: &[Instr], s: usize, e: usize, d: usize)
         }
     }
     true
+}
+
+
+/// W28 — candidate TYPE SPLITS for `[s, e]`: VM registers the bytecode
+/// compiler recycled ACROSS A `VTy` BOUNDARY, whose two ranges are each
+/// provably self-contained. Returns `reg -> TySplit` with `gpr` left at 0 —
+/// the bool gpr is handed out at home-allocation time, where the pool is known.
+///
+/// THE LEGALITY PREDICATE, in full. Everything below must hold; anything
+/// unprovable keeps today's whole-region decline. A decline is a slow correct
+/// answer, a bad split is a silent wrong one, and this file has shipped
+/// several of the latter.
+///
+///  1. (caller's gate, not here) The plan is one only the GPR emitter can
+///     consume — `admit_dv || share_homes`, `admit_bitwise`, `cold` empty —
+///     and the caller implements per-def write-through (`admit_wt_share`),
+///     because the exit contract below IS write-through's.
+///  2. `r` is an ordinary homed value: not a pinned-TA receiver, not a B94
+///     split receiver, not a `box_regs` member, not the source register of any
+///     pin (`excluded`), and never mentioned by a `Move`, a `Not` or a
+///     `ToPropKey`. Those three are exactly the ops whose handling reads a
+///     TYPE or a HOME KIND rather than the opcode: the GPR `Move` arm
+///     dispatches on `home(plan, dst)`, so a split register (numeric home plus
+///     a separate bool gpr) would take the numeric arm for a bool copy.
+///  3. Every DEF of `r` is one of the ops in the whitelist below, whose type
+///     is the same one `plan_region`'s `(def, dty)` match assigns. A def the
+///     two views could disagree about refuses the candidate.
+///  4. `r`'s touches — the same def/use walk `seg_map` uses, with the DV
+///     flag-fuse phantoms dropped — partition into EXACTLY TWO inclusive
+///     ranges `R1 = [a1, b1]`, `R2 = [a2, b2]` with `b1 < a2` STRICTLY, every
+///     def in `R1` of one type and every def in `R2` of the other. `VTy` has
+///     two variants, so one range is the Bool one and the other the Num one.
+///  5. Each range STARTS with a def of `r` that does not itself READ `r`. A
+///     use-first range could read a value written under the other type, and a
+///     def that reads `r` (`Eq { dst: r, a: r, .. }`) is such a read.
+///  6. No in-region jump target `t` satisfies `a < t <= b` for either range.
+///     Native code is entered at `s` alone (and `region_jump_targets` counts
+///     `s` as a target), so region-internal branch targets are the COMPLETE
+///     native control flow: with none strictly inside a range, the opening def
+///     of (5) DOMINATES every touch in that range, and no value can enter the
+///     range from the other one. This is also what makes a loop-carried
+///     register unsplittable — a value crossing a back-edge inside a range
+///     puts that back-edge's target inside the range.
+///  7. Every DEF in the BOOL range is a compare, and every USE in it is one of
+///     the exactly two shapes an emitter reads a bool from: a `JumpIfFalse` /
+///     `JumpIfTrue` condition, or the `littleEndian` flag of a pinned
+///     two-argument DataView `get*`. A whitelist, not a blacklist. No ip in
+///     the bool range may both define and use `r` (a compare's operands are
+///     numeric, so such an ip would read the register as a number).
+///
+/// Three further conditions need analyses that do not exist yet at this point
+/// in the planner — liveness, dead-code, hoisting, home unification. They are
+/// re-checked at the allocation site and DECLINE the region there exactly as
+/// the pre-wave planner did: `!live_in(r)`, `shareable(r)`, and `r` being
+/// neither hoisted, dead, a slot-const, a remat const, nor home-unified.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_type_splits(
+    code: &[Instr],
+    s: usize,
+    e: usize,
+    jump_targets: &FxHashSet<usize>,
+    excluded: &FxHashSet<u16>,
+    split_recv_lg: &FxHashSet<usize>,
+    dv_flag_elide: &FxHashSet<usize>,
+    dv_flag_fuse: &FxHashMap<usize, (u16, u16)>,
+    dv_flag_reg: &dyn Fn(usize) -> Option<u16>,
+) -> FxHashMap<u16, TySplit> {
+    let mut out: FxHashMap<u16, TySplit> = FxHashMap::default();
+    if !type_split_enabled() || e < s {
+        return out;
+    }
+    let is_cmp = |i: &Instr| {
+        matches!(
+            i,
+            Instr::Lt { .. }
+                | Instr::Le { .. }
+                | Instr::Gt { .. }
+                | Instr::Ge { .. }
+                | Instr::Eq { .. }
+                | Instr::Ne { .. }
+        )
+    };
+    // (3) The def ops whose `VTy` this pass may predict. Each entry maps to the
+    // SAME type the `(def, dty)` match in `plan_region_cold_inner` assigns; the
+    // typing loop re-checks the prediction op by op and declines on a mismatch,
+    // so drift here is a decline, never a wrong home.
+    let def_ty_of = |i: &Instr| -> Option<VTy> {
+        match *i {
+            Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. } => Some(VTy::Bool),
+            Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::Bitwise { .. }
+            | Instr::GetIndex { .. }
+            | Instr::CallMethod { .. }
+            | Instr::MathOp {
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } => Some(VTy::Num),
+            _ => None,
+        }
+    };
+    // Cheap candidate prefilter. Most regions contain no recycled register
+    // with both predictable Bool and Num defs, so do not allocate a touch Vec
+    // for every operand in those regions. This scan deliberately uses the
+    // exact same def exclusions and `def_ty_of` whitelist as the full walk
+    // below. A register reaches that walk only if all of its visible defs are
+    // predictable and their type mask contains both variants; that is a
+    // necessary (not sufficient) condition for the existing predicate.
+    const DEF_BOOL: u8 = 1;
+    const DEF_NUM: u8 = 2;
+    const DEF_UNPREDICTABLE: u8 = 4;
+    let mut def_kinds: FxHashMap<u16, u8> = FxHashMap::default();
+
+    // (2) Refuse outright any register a Move/Not/ToPropKey mentions.
+    let mut tainted: FxHashSet<u16> = FxHashSet::default();
+    for ip in s..=e {
+        match code[ip] {
+            Instr::Move { dst, src } => {
+                tainted.insert(dst);
+                tainted.insert(src);
+            }
+            Instr::Not { dst, .. } => {
+                tainted.insert(dst);
+                for u in instr_uses(&code[ip]) {
+                    tainted.insert(u);
+                }
+            }
+            Instr::ToPropKey { dst, src, .. } => {
+                tainted.insert(dst);
+                tainted.insert(src);
+            }
+            _ => {}
+        }
+        if let Some(d) = writes_reg(&code[ip]) {
+            if !dv_flag_elide.contains(&ip) && !split_recv_lg.contains(&ip) {
+                let kind = match def_ty_of(&code[ip]) {
+                    Some(VTy::Bool) => DEF_BOOL,
+                    Some(VTy::Num) => DEF_NUM,
+                    None => DEF_UNPREDICTABLE,
+                };
+                *def_kinds.entry(d).or_insert(0) |= kind;
+            }
+        }
+    }
+    let candidates: FxHashSet<u16> = def_kinds
+        .into_iter()
+        .filter_map(|(r, kinds)| {
+            (kinds == (DEF_BOOL | DEF_NUM) && !excluded.contains(&r) && !tainted.contains(&r))
+                .then_some(r)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return out;
+    }
+    // (4) Touches, exactly as the `seg_map` walk collects them: `instr_uses` /
+    // `writes_reg`, minus the DV flag-fuse phantoms (an elided `Eq` writes no
+    // home, and the fused call reads the Eq's OPERANDS, not its dst) and minus
+    // a B94 receiver `LoadGlobal` (that def stores the object to memory and
+    // never fills a home).
+    let mut touch: FxHashMap<u16, Vec<(usize, bool)>> = FxHashMap::default();
+    for ip in s..=e {
+        let instr = &code[ip];
+        let elided_dst = dv_flag_elide
+            .contains(&ip)
+            .then(|| writes_reg(instr))
+            .flatten()
+            .or_else(|| {
+                (dv_flag_fuse.contains_key(&ip) && ip > s && dv_flag_elide.contains(&(ip - 1)))
+                    .then(|| writes_reg(&code[ip - 1]))
+                    .flatten()
+            });
+        for u in instr_uses(instr) {
+            if !candidates.contains(&u) || (dv_flag_fuse.contains_key(&ip) && elided_dst == Some(u))
+            {
+                continue;
+            }
+            touch.entry(u).or_default().push((ip, false));
+        }
+        if let Some(d) = writes_reg(instr) {
+            if candidates.contains(&d)
+                && !dv_flag_elide.contains(&ip)
+                && !split_recv_lg.contains(&ip)
+            {
+                touch.entry(d).or_default().push((ip, true));
+            }
+        }
+    }
+    let mut regs: Vec<u16> = touch.keys().copied().collect();
+    regs.sort_unstable(); // deterministic plans
+    for r in regs {
+        if excluded.contains(&r) || tainted.contains(&r) {
+            continue;
+        }
+        // Collapse to one entry per ip: (ip, has_def, has_use).
+        let mut ips: Vec<(usize, bool, bool)> = Vec::new();
+        {
+            let mut v = touch[&r].clone();
+            v.sort_unstable();
+            for (ip, is_def) in v {
+                match ips.last_mut() {
+                    Some(last) if last.0 == ip => {
+                        if is_def {
+                            last.1 = true;
+                        } else {
+                            last.2 = true;
+                        }
+                    }
+                    _ => ips.push((ip, is_def, !is_def)),
+                }
+            }
+        }
+        // (5) the first touch is a def that does not read `r`.
+        if ips.is_empty() || !ips[0].1 || ips[0].2 {
+            continue;
+        }
+        // (3) every def op must be predictable.
+        let mut tys: Vec<Option<VTy>> = Vec::with_capacity(ips.len());
+        let mut unpredictable = false;
+        for &(ip, has_def, _) in &ips {
+            if has_def {
+                match def_ty_of(&code[ip]) {
+                    Some(t) => tys.push(Some(t)),
+                    None => {
+                        unpredictable = true;
+                        break;
+                    }
+                }
+            } else {
+                tys.push(None);
+            }
+        }
+        if unpredictable {
+            continue;
+        }
+        let first_ty = match tys[0] {
+            Some(t) => t,
+            None => continue,
+        };
+        // (4) the single type boundary: the first def of the OTHER type.
+        let k = match (0..ips.len()).find(|&i| matches!(tys[i], Some(t) if t != first_ty)) {
+            Some(k) => k,
+            None => continue, // no conflict on this register — nothing to split
+        };
+        // Every def before `k` is `first_ty` by construction; every def from
+        // `k` on must be the other type (a third alternation is refused).
+        let other_ty = match tys[k] {
+            Some(t) => t,
+            None => continue,
+        };
+        if (k..ips.len()).any(|i| matches!(tys[i], Some(t) if t != other_ty)) || k == 0 {
+            continue;
+        }
+        let (a1, b1) = (ips[0].0, ips[k - 1].0);
+        let (a2, b2) = (ips[k].0, ips[ips.len() - 1].0);
+        // (4) strict separation, and (5) the later range opens with a def that
+        // does not read `r`.
+        if b1 >= a2 || !ips[k].1 || ips[k].2 {
+            continue;
+        }
+        // (6) no in-region jump target strictly inside either range.
+        if jump_targets
+            .iter()
+            .any(|&t| (t > a1 && t <= b1) || (t > a2 && t <= b2))
+        {
+            continue;
+        }
+        let (bool_lo, bool_hi, num_lo, num_hi) = if first_ty == VTy::Bool {
+            (a1, b1, a2, b2)
+        } else {
+            (a2, b2, a1, b1)
+        };
+        // (7) the bool range's closed shape.
+        let mut bad = false;
+        for &(ip, has_def, has_use) in &ips {
+            if ip < bool_lo || ip > bool_hi {
+                continue;
+            }
+            if (has_def && has_use) || (has_def && !is_cmp(&code[ip])) {
+                bad = true;
+                break;
+            }
+            if has_use {
+                let ok = match code[ip] {
+                    Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => cond == r,
+                    _ => dv_flag_reg(ip) == Some(r),
+                };
+                if !ok {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if bad {
+            continue;
+        }
+        out.insert(
+            r,
+            TySplit {
+                bool_lo,
+                bool_hi,
+                num_lo,
+                num_hi,
+                gpr: 0,
+            },
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod type_split_tests {
+    use super::*;
+
+    fn splits(code: &[Instr]) -> FxHashMap<u16, TySplit> {
+        let jump_targets: FxHashSet<usize> = [0].into_iter().collect();
+        let excluded = FxHashSet::default();
+        let split_recv_lg = FxHashSet::default();
+        let dv_flag_elide = FxHashSet::default();
+        let dv_flag_fuse = FxHashMap::default();
+        plan_type_splits(
+            code,
+            0,
+            code.len() - 1,
+            &jump_targets,
+            &excluded,
+            &split_recv_lg,
+            &dv_flag_elide,
+            &dv_flag_fuse,
+            &|_| None,
+        )
+    }
+
+    #[test]
+    fn type_split_prefilter_keeps_the_existing_mixed_def_predicate() {
+        if !type_split_enabled() {
+            return;
+        }
+
+        let eligible = [
+            Instr::Lt { dst: 3, a: 0, b: 1 },
+            Instr::JumpIfFalse { cond: 3, target: 3 },
+            Instr::LoadInt { dst: 3, val: 7 },
+        ];
+        let got = splits(&eligible);
+        let sp = got.get(&3).expect("mixed Bool/Num register should split");
+        assert_eq!((sp.bool_lo, sp.bool_hi), (0, 1));
+        assert_eq!((sp.num_lo, sp.num_hi), (2, 2));
+        assert_eq!(sp.gpr, 0);
+
+        let no_conflict = [
+            Instr::LoadInt { dst: 3, val: 1 },
+            Instr::LoadInt { dst: 3, val: 2 },
+        ];
+        assert!(splits(&no_conflict).is_empty());
+
+        // A third, unrecognised def must not be hidden by the cheap mask. The
+        // full predicate has always failed closed when any visible def cannot
+        // be assigned a type by `def_ty_of`.
+        let unpredictable = [
+            Instr::Lt { dst: 3, a: 0, b: 1 },
+            Instr::JumpIfFalse { cond: 3, target: 4 },
+            Instr::LoadInt { dst: 3, val: 7 },
+            Instr::StrConcat { dst: 3, a: 0, b: 1 },
+        ];
+        assert!(splits(&unpredictable).is_empty());
+    }
 }
 
 /// The operand positions of `i` that REQUIRE a number, as opposed to positions

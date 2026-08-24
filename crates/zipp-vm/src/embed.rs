@@ -157,6 +157,47 @@ impl ScriptState {
         }
     }
 
+    /// Enable filesystem module loading, confined to one canonical directory.
+    ///
+    /// Embedded scripts normally have no module loader at all. A host that
+    /// deliberately enables imports should use this method rather than an
+    /// unrestricted base directory: every static/dynamic, typed, deferred,
+    /// source-phase, and re-export load is canonicalized and must remain under
+    /// `root`, so `..` components and symlink escapes are rejected. Each file
+    /// is also rejected before parsing when it exceeds `max_module_bytes`.
+    #[cfg(feature = "instrument")]
+    pub fn set_confined_module_loader(
+        &mut self,
+        base_dir: &std::path::Path,
+        root: &std::path::Path,
+        max_module_bytes: u64,
+    ) -> Result<(), String> {
+        let vm = self.vm.as_mut().ok_or("zipp: VM has been torn down")?;
+        vm.set_module_root(root.to_path_buf(), max_module_bytes)?;
+        let base = vm.resolve_module_path(base_dir).map_err(|e| e.0)?;
+        if !base.is_dir() {
+            return Err(format!(
+                "module base '{}' is not a directory",
+                base_dir.display()
+            ));
+        }
+        vm.set_module_base_dir(Some(base));
+        Ok(())
+    }
+
+    /// Disable the VM's native code generators for this script state.
+    ///
+    /// Sandboxed callers should also disable regress' process-global regex JIT
+    /// (the CLI safe runner does so before process startup). This method covers
+    /// both whole-function and loop-region VM JITs without allocating a trace.
+    #[cfg(feature = "instrument")]
+    pub fn disable_vm_jit(&mut self) {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some(vm) = self.vm.as_mut() {
+            vm.set_jit_enabled(false);
+        }
+    }
+
     /// Execute the program's top level and drain the job queue.
     ///
     /// `Err` carries the uncaught throw's message. Output produced *before* the
@@ -320,6 +361,19 @@ impl ScriptState {
         if let Some(vm) = self.vm.as_mut() {
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.heap_limit = bytes;
+            }
+        }
+    }
+
+    /// Cap combined buffered console output, counted as UTF-8 plus one newline
+    /// per line. Requires [`Self::set_limits`] first; without it this is a no-op.
+    #[cfg(feature = "instrument")]
+    pub fn set_output_limit(&mut self, bytes: usize) {
+        if let Some(vm) = self.vm.as_mut() {
+            if let Some(rec) = vm.instr_rec.as_mut() {
+                rec.output_limit = bytes;
+                rec.output_used = 0;
+                rec.output_exhausted = false;
             }
         }
     }
@@ -894,5 +948,21 @@ mod tests {
         assert_eq!(st.take_output(), vec!["a".to_string()]);
         assert_eq!(st.take_errput(), vec!["b".to_string()]);
         assert!(st.take_output().is_empty(), "draining clears the buffer");
+    }
+
+    #[cfg(feature = "instrument")]
+    #[test]
+    fn output_budget_stops_buffering_even_when_caught() {
+        let mut st = compile_script(
+            "for (let i = 0; i < 1000; i++) { try { console.log('1234567890'); } catch (e) {} }",
+        )
+        .expect("compiles");
+        st.set_limits(1_000_000, None);
+        st.set_output_limit(64);
+
+        let err = st.run_init().expect_err("output cap stops the script");
+        assert!(err.contains("output budget"), "{err}");
+        let retained: usize = st.take_output().iter().map(|line| line.len() + 1).sum();
+        assert!(retained <= 64, "retained {retained} bytes");
     }
 }

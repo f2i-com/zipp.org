@@ -97,7 +97,18 @@ fn main() {
 }
 
 fn emit(key: &str, val: &str) {
-    // Escape so a value containing a quote or backslash cannot break the literal.
+    // Cargo treats each stdout line as a build-script directive. Values derived
+    // from tools/environment must not be able to inject a second directive.
+    let val: String = val
+        .chars()
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\0') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
     println!("cargo:rustc-env={key}={val}");
 }
 

@@ -25,7 +25,9 @@ Usage:
 import argparse
 import os
 import re
+import shutil
 import sys
+import tempfile
 
 # The workspace sources are CRLF; generated lines must match so the file stays
 # consistent under `core.autocrlf` and so diffs stay clean.
@@ -319,8 +321,34 @@ def _header():
 
 
 def split(plan_name, plan, root, dry_run=False):
-    src = os.path.join(root, plan["src"])
-    out = os.path.join(root, plan["out"])
+    root = os.path.realpath(root)
+    # Check the named entries before resolving them. `realpath()` erases the
+    # final symlink component, so testing `islink()` only afterwards would let
+    # an in-tree source symlink through and later delete its target.
+    src_entry = os.path.abspath(os.path.join(root, plan["src"]))
+    out_entry = os.path.abspath(os.path.join(root, plan["out"]))
+
+    def require_inside(label, path):
+        try:
+            inside = os.path.commonpath((root, path)) == root
+        except ValueError:  # different drives on Windows
+            inside = False
+        if not inside:
+            raise SystemExit(f"split_rs: {label} escapes workspace root: {path}")
+
+    # Reject lexical escapes before any file lookup, then repeat the check on
+    # resolved paths to catch symlink/reparse-point escapes in parent folders.
+    require_inside("source", src_entry)
+    require_inside("output", out_entry)
+    if os.path.islink(src_entry) or not os.path.isfile(src_entry):
+        raise SystemExit(f"split_rs: source is not a regular non-symlink file: {src_entry}")
+    if os.path.lexists(out_entry):
+        raise SystemExit(f"split_rs: refusing to overwrite existing output: {out_entry}")
+
+    src = os.path.realpath(src_entry)
+    out = os.path.realpath(out_entry)
+    for label, path in (("source", src), ("output", out)):
+        require_inside(label, path)
     with open(src, encoding="utf-8", newline="") as f:
         text = f.read()
     lines = text.splitlines(keepends=True)
@@ -430,14 +458,24 @@ def split(plan_name, plan, root, dry_run=False):
             print(f"    {m}.rs  {len(emitted[m])} lines")
         return
 
-    os.makedirs(out, exist_ok=True)
-    for m in order:
-        with open(os.path.join(out, m + ".rs"), "w", encoding="utf-8", newline="") as f:
-            f.write(_header())
-            f.write("".join(emitted[m]))
-    with open(os.path.join(out, "mod.rs"), "w", encoding="utf-8", newline="") as f:
-        f.write(mod_text)
-    os.remove(src)
+    # Stage the complete tree beside its destination. The monolithic source is
+    # removed only after the directory rename succeeds, so an interruption can
+    # leave duplicates but can never destroy the only copy of the code.
+    parent = os.path.dirname(out)
+    staged = tempfile.mkdtemp(prefix=f".{os.path.basename(out)}-split-", dir=parent)
+    try:
+        for m in order:
+            with open(os.path.join(staged, m + ".rs"), "w", encoding="utf-8", newline="") as f:
+                f.write(_header())
+                f.write("".join(emitted[m]))
+        with open(os.path.join(staged, "mod.rs"), "w", encoding="utf-8", newline="") as f:
+            f.write(mod_text)
+        os.replace(staged, out)
+        staged = None
+        os.remove(src)
+    finally:
+        if staged is not None:
+            shutil.rmtree(staged, ignore_errors=True)
 
     total_moved = sum(len(v) for v in emitted.values())
     print(f"{plan_name}: {len(lines)} lines -> mod.rs "

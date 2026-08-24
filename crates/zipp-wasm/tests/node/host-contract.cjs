@@ -26,6 +26,13 @@ const db = {
   getSyncStatus: () => ({ connected: true, peers: 2, room: "r", peerId: "p" }),
   getSavedSyncRoom: () => null,
 };
+let forbiddenLookups = 0, forbiddenCalls = 0;
+Object.defineProperty(db, "secret", {
+  get: () => {
+    forbiddenLookups++;
+    return () => { forbiddenCalls++; return "ambient authority reached"; };
+  },
+});
 // The real adapter prefixes keys; this mock is the post-prefix store, so the
 // script's "hi" is the key it sees.
 const store = { hi: "42" };
@@ -59,6 +66,7 @@ function save() { localStorage.setItem("hi", String(score)); return true }
 function buildGrid(n) { grid = []; for (let i = 0; i < n; i++) { grid.push({ i: i, on: i % 2 === 0 }) } return grid.length }
 function fetchIt() { softn.net.fetch("http://x/y", {}, function (r) { score = r.value }) }
 function syncInfo() { return db.getSyncStatus() }
+function probeForbidden() { return __zippHostCall("db.secret", "payload") }
 `;
 
 // SoftN prepends its own softn.* namespace; mimic the shape minimally.
@@ -78,7 +86,7 @@ const names = Object.keys(syms).sort();
 // window/navigator/host are deliberately reported: the host needs a stable
 // slot for the bridge objects it also writes to. Everything else the preamble
 // declares stays hidden.
-eq("symbol names", names, ["addPerson", "best", "buildGrid", "bump", "fetchIt", "grid", "people", "save", "score", "settings", "softn", "syncInfo", "_init", "window", "navigator", "host"].sort());
+eq("symbol names", names, ["addPerson", "best", "buildGrid", "bump", "fetchIt", "grid", "people", "probeForbidden", "save", "score", "settings", "softn", "syncInfo", "_init", "window", "navigator", "host"].sort());
 eq("scope of a function", syms.bump.scope, "function");
 eq("scope of a variable", syms.score.scope, "variable");
 ok("engine internals stay hidden", !names.some((n) => n.startsWith("__z") || ["db", "localStorage"].includes(n)), JSON.stringify(names));
@@ -103,6 +111,14 @@ console.log("— db bridge (synchronous) —");
 eq("create returns the row", e.callFunction("addPerson", ["Ada"]), { name: "Ada", id: "id1" });
 eq("query reflects the write", e.getGlobalByIndex(syms.people.index), [{ name: "Ada", id: "id1" }]);
 eq("object-returning bridge call", e.callFunction("syncInfo", []), { connected: true, peers: 2, room: "r", peerId: "p" });
+
+console.log("— synchronous bridge capability boundary —");
+let forbiddenError = "";
+try { e.callFunction("probeForbidden", []); } catch (err) { forbiddenError = String(err); }
+ok("unknown synchronous host kind is rejected", forbiddenError.includes("unknown host call 'db.secret'"), forbiddenError);
+eq("unknown kind is rejected before property lookup", forbiddenLookups, 0);
+eq("unknown bridge method is never called", forbiddenCalls, 0);
+eq("known kind still works after rejection", e.callFunction("syncInfo", []), { connected: true, peers: 2, room: "r", peerId: "p" });
 
 console.log("— localStorage bridge —");
 e.callFunction("save", []);

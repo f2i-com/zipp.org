@@ -4,6 +4,8 @@
 # COMPUTE time = best wall time minus the engine's own empty-program startup.
 # Correctness compares STDOUT only: some benches print a non-deterministic
 # elapsed-ms line to STDERR (their own internal timer), which can never match.
+# Trusted developer benchmark only; use `zipp sandbox` for unreviewed scripts.
+set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ZIPP=./target/release/zipp.exe
 ENGINE=${ENGINE:-js-vm}
@@ -11,7 +13,14 @@ OUT=bench/results.txt
 ITERS=5
 BENCHES="fib loop array string object sort"
 
-ms(){ local s e; s=$(date +%s%N); "$@" >/dev/null 2>&1; e=$(date +%s%N); echo $(( (e-s)/1000000 )); }
+ms(){
+  local s e rc
+  s=$(date +%s%N)
+  if "$@" >/dev/null 2>&1; then rc=0; else rc=$?; fi
+  (( rc == 0 )) || { printf 'benchmark command failed (%d):' "$rc" >&2; printf ' %q' "$@" >&2; printf '\n' >&2; return "$rc"; }
+  e=$(date +%s%N)
+  echo $(( (e-s)/1000000 ))
+}
 best(){ # min of ITERS runs of: $@
   local m=99999999 v i
   for ((i=0;i<ITERS;i++)); do v=$(ms "$@"); (( v<m )) && m=$v; done

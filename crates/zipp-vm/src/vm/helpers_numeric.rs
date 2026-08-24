@@ -230,11 +230,6 @@ pub(crate) fn parse_float(s: &str) -> f64 {
     t[..end].parse::<f64>().unwrap_or(f64::NAN)
 }
 
-/// A non-negative array index from a numeric key, coercing an integral double
-/// the way JS does (`a[1.0]` is `a[1]`). `None` for a negative, non-integral, or
-/// non-numeric key (those address no dense element → `undefined`). The JIT region
-/// computes loop counters as f64, so `a[i]` arrives here with a double key.
-#[inline]
 /// The array-index value of a canonical integer key -- `"0"`, `"1"`, `"10"`,
 /// but not `"00"`, `"01"`, `"-1"`, `"1.5"`, `""` or `" 1"`, and not `u32::MAX`
 /// (which is not a valid array index).

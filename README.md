@@ -15,6 +15,52 @@ cargo build --release
 ./target/release/zipp mjs file.mjs      # ES module entry (top-level await)
 ```
 
+## Running untrusted scripts
+
+For untrusted classic scripts, use the explicit sandbox runner instead of the
+compatibility `js` command:
+
+```sh
+./target/release/zipp sandbox file.js
+# Equivalent discoverable spelling:
+./target/release/zipp js --sandbox file.js
+
+# Imports are denied by default. Opt in to one canonical filesystem tree:
+./target/release/zipp sandbox --allow-imports ./plugins ./plugins/main.js
+```
+
+The sandbox runs the script in a supervised child with a cleared environment,
+closed stdin, a hard wall deadline, an instruction budget, an approximate VM
+heap ceiling, and a combined stdout/stderr cap. Both the VM's native JIT and
+the regex native JIT are disabled before untrusted source is parsed. Module
+loading is off unless `--allow-imports` is supplied; then every dynamic,
+static dependency, typed, deferred, source-phase, and re-export path is
+canonicalized and rejected if it escapes that root through `..` or a symlink,
+and each imported module is capped at 16 MiB before its contents are read.
+Keep an enabled import root host-controlled and read-only for the run: path
+canonicalization cannot prevent races in an attacker-writable tree, and a hard
+link inside the root still names its target as an in-root path.
+Forwarded output preserves ordinary Unicode, newlines, and tabs; other terminal
+control characters and bidi direction overrides/isolates are replaced with `?`
+before reaching the caller's terminal.
+Run `zipp sandbox --help` for the complete option list and defaults.
+
+The sandbox currently has no ES-module entry mode: `zipp sandbox --module` and
+`zipp mjs --sandbox` fail closed. Do not use the unbounded compatibility `mjs`
+command for hostile input; bundle it as a classic script or add external OS
+isolation first.
+
+This is language, process, resource, and import containment—not a kernel/OS
+sandbox or a memory-safety boundary. The child still has the invoking user's
+OS identity, and the heap meter is approximate (large string/array payloads
+are not fully accounted). Strong isolation for hostile code also requires an
+external restricted account or container plus platform controls such as
+namespaces/seccomp/cgroups on Linux, an AppContainer/restricted token and Job
+Object on Windows, or a sandbox profile on macOS, with filesystem and network
+access denied independently. Making `sandbox` the default spelling would also
+be a deliberate CLI compatibility change: existing `js`/`mjs` callers need an
+import-policy migration before their unbounded execution path can be removed.
+
 ---
 
 ## Where it stands

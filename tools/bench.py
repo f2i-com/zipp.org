@@ -12,6 +12,11 @@ Examples:
   python tools/bench.py --ab old.exe new.exe --reps 21
   python tools/bench.py --metric adjusted --readme
   python tools/bench.py --read-json bench/results.json --historical
+
+This is a trusted developer benchmark harness, not an untrusted-code sandbox:
+it deliberately measures engines with their production JITs. External benchmark
+directories therefore require an explicit opt-in; use ``zipp sandbox`` for
+ordinary untrusted application scripts.
 """
 
 from __future__ import annotations
@@ -1424,6 +1429,11 @@ def parse_args() -> argparse.Namespace:
         default=str(BENCH_DIR),
         help="directory containing benchmark .js files (default bench/real)",
     )
+    parser.add_argument(
+        "--allow-external-bench-dir",
+        action="store_true",
+        help="run trusted benchmark sources outside this workspace",
+    )
     parser.add_argument("--json", help="write schema-v2 raw observations here")
     parser.add_argument(
         "--read-json",
@@ -1668,6 +1678,16 @@ def main() -> int:
     bench_dir = Path(args.bench_dir).resolve()
     if not bench_dir.is_dir():
         raise SystemExit(f"benchmark directory does not exist: {bench_dir}")
+    try:
+        bench_dir.relative_to(ROOT)
+        external_bench_dir = False
+    except ValueError:
+        external_bench_dir = True
+    if external_bench_dir and not getattr(args, "allow_external_bench_dir", False):
+        raise SystemExit(
+            "external --bench-dir sources run with engine host permissions; "
+            "pass --allow-external-bench-dir only for reviewed code"
+        )
     available_benches = discover_benches(bench_dir)
     benches = args.benches.split(",") if args.benches else available_benches
     if not benches or any(not bench for bench in benches):
@@ -1703,7 +1723,7 @@ def main() -> int:
         for name, cmd in (
             ("node", ["node"]),
             ("bun", ["bun", "run"]),
-            ("deno", ["deno", "run", "-A"]),
+            ("deno", ["deno", "run"]),
         ):
             if name not in requested_engines:
                 continue

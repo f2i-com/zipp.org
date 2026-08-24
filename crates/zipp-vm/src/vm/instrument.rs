@@ -136,6 +136,7 @@ pub(crate) const BUDGET_MSG: &str = "RangeError: script exceeded its instruction
 pub(crate) const ABORT_MSG: &str = "RangeError: script execution was aborted by the host";
 /// Raised when a script exceeds the heap ceiling its host set.
 pub(crate) const MEMORY_MSG: &str = "RangeError: script exceeded its memory budget";
+pub(crate) const OUTPUT_MSG: &str = "RangeError: script exceeded its output budget";
 
 /// A row whose operands have been sampled but whose result has not: the
 /// destination register is not written until the instruction runs, so the row is
@@ -210,6 +211,11 @@ pub(crate) struct Recorder {
     /// so noticing a few thousand instructions late costs a bounded overshoot
     /// and keeps the per-instruction path free of an extra memory read.
     pub(crate) heap_limit: usize,
+    /// Combined UTF-8 bytes retained for stdout/stderr lines, including the
+    /// newline written for each line; `usize::MAX` means unlimited.
+    pub(crate) output_limit: usize,
+    pub(crate) output_used: usize,
+    pub(crate) output_exhausted: bool,
     steps: Vec<TraceStep>,
     /// Whether to record rows at all — metering works without tracing.
     tracing: bool,
@@ -231,6 +237,9 @@ impl Recorder {
             used: 0,
             abort: None,
             heap_limit: usize::MAX,
+            output_limit: usize::MAX,
+            output_used: 0,
+            output_exhausted: false,
             steps: Vec::new(),
             tracing: false,
             max_steps: usize::MAX,
@@ -432,6 +441,25 @@ impl super::Vm<'_> {
 }
 
 impl super::Vm<'_> {
+    /// Charge one buffered console line before retaining it. Once exhausted,
+    /// the next instruction also fails so a script cannot catch and continue.
+    pub(crate) fn instrument_output_line(&mut self, line: &str) -> Tick {
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return Ok(());
+        };
+        let bytes = line.len().saturating_add(1);
+        let Some(total) = rec.output_used.checked_add(bytes) else {
+            rec.output_exhausted = true;
+            return Err(OUTPUT_MSG);
+        };
+        if total > rec.output_limit {
+            rec.output_exhausted = true;
+            return Err(OUTPUT_MSG);
+        }
+        rec.output_used = total;
+        Ok(())
+    }
+
     /// The dispatch loop's hook, run once per instruction *before* it executes:
     /// completes the previous row, charges one step against the budget, polls
     /// the abort flag, and opens a row for `instr`.
@@ -444,6 +472,9 @@ impl super::Vm<'_> {
             Some(r) => r,
             None => return Ok(()),
         };
+        if rec.output_exhausted {
+            return Err(OUTPUT_MSG);
+        }
         rec.ticks = rec.ticks.wrapping_add(1);
         if rec.remaining != i64::MAX {
             if rec.remaining <= 0 {
