@@ -252,10 +252,31 @@ already ahead of the best adjusted competitor in this capture.
   creating negative-index properties on a dense array mid-loop).
 - `NURSERY_MAX_MINORS = 64` forces a major every ~1M allocations regardless of
   live set, breaking an amortization invariant the code documents. Worth −0.2%
-  headline — real, small, well-understood.
+  headline — real, small, well-understood. Note before attempting it: it is a
+  compile-time `const` with no env knob, so it can only be A/B'd across two
+  binaries, and at the 0.2% scale that is *below* the fat-LTO code-layout noise
+  floor — a two-binary A/B of an unrelated null change moved single rows by
+  −2.1%/+1.4% across rebuilds (B139). **Give it a `ZIPP_*` knob first** so it
+  can be priced on one binary the way every other mechanism here is; otherwise
+  the number will not be resolvable. The backstop is also keyed on the wrong
+  quantity: its own comment says it exists so major-only hygiene (the
+  `brand_private_names` recompute, reclaiming table capacity) is never deferred
+  forever, which is a function of table growth, not of a minor count.
 - An array past 2²⁰ spills to a sparse overlay that `mark_roots` re-roots **in
   full on every collection** (189.6M inner iterations in a probe). Worth zero on
-  the suite (no benchmark has such an array) but it is a genuine structural bug.
+  the suite (no benchmark has such an array). **Do not "fix" this by deleting
+  the walk** — checked 2026-08-24 and the earlier framing as a plain structural
+  bug is wrong. That walk (`vm/gc.rs:434`, `fn_props`/`arr_props`) is
+  load-bearing for MINOR completeness: the module doc's own proof lists "lands
+  in a VM side table, which the root walk re-scans wholesale each minor" as one
+  of its three disjuncts, and the `arr_props` stores (`vm/access.rs:1295`,
+  `:1608`) go through no write barrier, so nothing else would find a young value
+  held by an old sparse overlay. Making it cheap therefore requires a real
+  design change, not a deletion: either route side-table stores through
+  `Heap::write_barrier_val`/`vremset` and then drop the wholesale re-scan, or
+  keep a per-table epoch/dirty marker so only tables written this epoch are
+  re-scanned. Either has correctness stakes and wants the fuzzer plus
+  `ZIPP_NURSERY_VERIFY=1` on the gate.
 - `unify_homes_with_globals` is dead code behind `const UNIFY_HOMES = false` for
   a documented silent wrong answer. Wave 18's dominance predicate does **not**
   close it (wave 20 checked).
