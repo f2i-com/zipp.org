@@ -193,6 +193,49 @@ and mid-loop mutations. Treat the current reducers as a fast proved subset to
 generalise, not permission to retire randomized shape-transition and
 delete/prototype matrices or the longer-term shape-keyed-cache work.
 
+### 2b. Make the reducers reach lexical and frame-local bindings
+
+**This is the largest generalisation opportunity currently open, and it is
+measured.** The wave 25/26 reducers key on top-level `var` globals, so the same
+program wrapped in a function or written with `let` does not get them.
+
+Ratios are zipp / Node, 9 interleaved paired reps, plain release build:
+
+| variant | typedarray-math | sparse-array |
+|---|---|---|
+| original (top-level `var`) | **0.623×** | **0.885×** |
+| wrapped in an IIFE | 0.864× (+39%) | 1.186× (+34%) |
+| `var` → `let` | 0.899× (+44%) | 1.022× (+15%) |
+| locals renamed | 0.611× (unchanged) | 0.877× (unchanged) |
+
+Node is flat across all four (227/227/227/231ms and 93/93/94/94ms), so this is
+entirely zipp-side. `sparse-array` crosses from beating Node to losing to it
+purely by being wrapped in a function.
+
+Renaming being free is the useful refutation: the reducers are **not** keyed on
+identifier text, which was the obvious suspicion. The gate is structural —
+`dv_nested_reduce_plan` (`codegen/region_int_gpr.rs:521`) matches only
+`Instr::LoadGlobal` / `dv_store_global` for both induction variables and the
+accumulator, so a frame-local or lexically-bound one cannot match. Phase timing
+localises essentially all of the difference to one phase (`dataview` 0ms at top
+level vs 65ms in an IIFE, against Node's 98ms), and `ZIPP_NO_DV_NESTED_REDUCE=1`
+moves that phase 0ms → 63ms with byte-identical output.
+
+Real programs put these loops in functions and spell them with `let`, so the
+benchmark form is the *least* representative one. Extending the plan gate from
+global slots to frame-local and lexical bindings is worth roughly the numbers
+above on any program shaped like these.
+
+While doing it, note what the mechanism is: it executes one real inner pass and
+applies the affine accumulator delta to the remaining outer iterations, so on
+that phase zipp performs ~1/6000 of the arithmetic Node performs. Sound for a
+provably pure nested reduction, but it means `typedarray-math`'s margin over
+Node is attributable to it — with the reducer off the row measures ~1.05× Node
+rather than 0.66×. Any generalisation must carry the purity proof with it.
+
+Reproduce with `python bench/scope/run.py`; see `bench/scope/README.md` and
+ledger **B140**.
+
 ### 3. Improve sustained compute without losing cold parity
 
 The cold objective is won, but removing process launch exposes rows where zipp
