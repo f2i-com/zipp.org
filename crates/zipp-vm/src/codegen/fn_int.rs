@@ -197,6 +197,9 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         // Behind the package latch so `ZIPP_NO_INT_PUSH=1` restores the exact
         // pre-wave def model for every tier, not just this one.
         Instr::Not { dst, .. } if crate::codegen::int_push_enabled() => Some(dst),
+        // The one-step literal DEFINES its dst. No register tier admits it, so
+        // this is def-model exactness rather than an enabling change.
+        Instr::FinalizeObject { dst, .. } => Some(dst),
         _ => None,
     }
 }

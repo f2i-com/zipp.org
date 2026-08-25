@@ -177,6 +177,12 @@ struct Compiler {
     /// the top-level body is an ASYNC context (top-level `await` is allowed), so
     /// func 0 is compiled with `in_async` and the VM runs it as an async activation.
     module_mode: bool,
+    /// True only for a ROOT program `Vm::new` runs directly — never one that
+    /// can be installed through `prepare_eval_program`. Gates lowerings the
+    /// VM-lifetime plan-cap degradation cannot rewrite (`FinalizeObject`):
+    /// compiling dynamic code without the flag is always safe, it only forgoes
+    /// the optimization. See `compile_main_program`.
+    main_goal: bool,
     /// True only for a REAL eval program (do_eval): top-level lexicals are
     /// frame-locals (the spec's discarded eval lexEnv). False for modules,
     /// which also compile through compile_eval but whose top-level lexicals

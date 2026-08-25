@@ -1299,6 +1299,30 @@ impl<'p> Vm<'p> {
         self.obj_realm.insert(idx, r);
     }
 
+    /// Final shape for a `FinalizeObject` plan: the exact fold `shape::add`
+    /// would produce via per-field data appends, memoized per (unified func id,
+    /// plan index) on this VM's thread. Shape ids are thread-local and the
+    /// transition tree never reissues ids, so an entry stays valid for the
+    /// VM's life; the fold's result is deterministic in tree state, which only
+    /// grows, so recomputation could never disagree with the memo.
+    pub(crate) fn finalize_shape(
+        &mut self,
+        func_id: u32,
+        plan_idx: u16,
+        plan: &crate::bytecode::StaticKeyPlan,
+    ) -> u32 {
+        if let Some(&shape) = self.finalize_shapes.get(&(func_id, plan_idx)) {
+            return shape;
+        }
+        let data = crate::shape::attr_bits(true, true, true, false);
+        let mut shape = crate::shape::EMPTY;
+        for key in plan.keys() {
+            shape = crate::shape::add(shape, key, data);
+        }
+        self.finalize_shapes.insert((func_id, plan_idx), shape);
+        shape
+    }
+
     /// Tag a freshly-created function/class with the realm whose code created it
     /// (no-op in the main realm) — functions born inside a child realm's
     /// eval/Function code carry the child's realm for GetFunctionRealm,

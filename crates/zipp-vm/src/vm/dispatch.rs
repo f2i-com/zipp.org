@@ -4659,6 +4659,57 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::FinalizeObject {
+                        dst,
+                        plan,
+                        val_base,
+                        count,
+                    } => {
+                        let plan_idx = plan;
+                        let plan = self
+                            .func(func_id as usize)
+                            .static_key_plans
+                            .get(plan as usize)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Thrown("InternalError: invalid static key plan".to_string())
+                            })?;
+                        // `count` is redundant bytecode metadata; any mismatch
+                        // with the authoritative plan is malformed input and
+                        // fails closed before allocation.
+                        if !plan.runtime_valid()
+                            || plan.len() > 256
+                            || plan.is_empty()
+                            || plan.len() != count as usize
+                            || (val_base as usize)
+                                .checked_add(count as usize)
+                                .is_none_or(|end| end > u16::MAX as usize)
+                        {
+                            return Err(Thrown(
+                                "InternalError: invalid static key plan".to_string(),
+                            ));
+                        }
+                        let shape = self.finalize_shape(func_id, plan_idx, &plan);
+                        let mut vals = Vec::with_capacity(count as usize);
+                        for i in 0..count {
+                            vals.push(self.get(base, val_base + i));
+                        }
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
+                            ObjMap::finalized_from_plan(plan, vals, shape),
+                        ))));
+                        self.realm_born(v.heap_index(), self.obj_proto);
+                        self.set(base, dst, v);
+                        // Historical metering cost: the legacy sequence charged
+                        // one step for the allocation plus one per append. The
+                        // dispatch-loop tick above charged this op's single
+                        // step; charge the per-field remainder now, after the
+                        // completed work, exactly like the off-frame inliner.
+                        #[cfg(feature = "instrument")]
+                        if self.instr_rec.is_some() {
+                            self.charge_steps(count as i64);
+                        }
+                        ip += 1;
+                    }
                     Instr::ToObject { dst, src } => {
                         let v = self.get(base, src);
                         let o = self.to_object(v)?;
@@ -7967,7 +8018,6 @@ impl<'p> Vm<'p> {
             call_ic: jit_call_ic as usize,
             cross_call: crate::vm::helpers_misc::jit_cross_call as usize,
             cross_call_same_proto2: crate::vm::helpers_misc::jit_cross_call_same_proto2 as usize,
-            static_record_factory: crate::vm::helpers_misc::jit_static_record_factory as usize,
             get_prop_slow: jit_get_prop_slow as usize,
             set_prop_slow: jit_set_prop_slow as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as usize,
@@ -8341,6 +8391,7 @@ impl<'p> Vm<'p> {
                 enum PendingAlloc {
                     Object(usize),
                     Array(usize),
+                    Finalized(usize),
                 }
                 let mut pending = Vec::new();
                 for (i, o) in p.objects.iter().enumerate() {
@@ -8351,6 +8402,11 @@ impl<'p> Vm<'p> {
                 for (i, a) in p.arrays.iter().enumerate() {
                     if a.alloc_ip < resume {
                         pending.push((a.alloc_ip, PendingAlloc::Array(i)));
+                    }
+                }
+                for (i, f) in p.finalized.iter().enumerate() {
+                    if f.alloc_ip < resume {
+                        pending.push((f.alloc_ip, PendingAlloc::Finalized(i)));
                     }
                 }
                 pending.sort_by_key(|(ip, _)| *ip);
@@ -8387,6 +8443,39 @@ impl<'p> Vm<'p> {
                             let idx = self.heap.alloc(HeapObj::Array(items));
                             self.realm_born(idx, self.arr_proto);
                             self.set(base, a.dst, Value::heap(idx));
+                        }
+                        PendingAlloc::Finalized(i) => {
+                            // The planner proved the staged block unchanged
+                            // since the (elided) finalize, and the concat-len
+                            // pass above has already restored any virtual
+                            // string into its slot, so this rebuilds the exact
+                            // interpreter object. Plans are immutable per
+                            // FuncProto; a missing/invalid plan is unreachable
+                            // and fails closed to the pre-SROA legacy build.
+                            let f = &p.finalized[i];
+                            let plan = self
+                                .func(func_id as usize)
+                                .static_key_plans
+                                .get(f.plan_idx as usize)
+                                .cloned();
+                            let vals: Vec<Value> = (0..f.count)
+                                .map(|j| self.get(base, f.val_base + j))
+                                .collect();
+                            let map = match plan {
+                                Some(plan)
+                                    if plan.runtime_valid() && plan.len() == f.count as usize =>
+                                {
+                                    let shape = self.finalize_shape(func_id, f.plan_idx, &plan);
+                                    ObjMap::finalized_from_plan(plan, vals, shape)
+                                }
+                                _ => {
+                                    debug_assert!(false, "finalized SROA plan disappeared");
+                                    ObjMap::with_capacity(f.count as usize)
+                                }
+                            };
+                            let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
+                            self.realm_born(idx, self.obj_proto);
+                            self.set(base, f.dst, Value::heap(idx));
                         }
                     }
                 }

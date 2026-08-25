@@ -155,8 +155,9 @@ pub fn compile_script(src: &str) -> Result<ScriptState, String> {
 fn compile_program_source(src: &str) -> Result<Program, String> {
     // The parser handles Annex B call assignment targets natively
     // (`Target::Call`), so the old rewrite-and-reparse retry is gone.
+    // Main-goal: this program is the embedded VM's root activation.
     let ast = crate::front::parse_script(src)?;
-    crate::compile::compile_program(&ast, src)
+    crate::compile::compile_main_program(&ast, src)
 }
 
 impl ScriptState {

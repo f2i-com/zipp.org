@@ -70,6 +70,7 @@ impl Compiler {
             eval_inherit_super: None,
             in_field_init: false,
             module_mode: false,
+            main_goal: false,
             eval_locals: false,
             script_binds_globals: true,
             eval_inherit_super_obj: false,

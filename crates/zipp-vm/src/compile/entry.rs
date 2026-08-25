@@ -12,22 +12,42 @@ use super::*;
 use crate::parse::ast;
 
 pub fn compile_program(prog: &ast::Program, source: &str) -> R<Program> {
-    compile_program_inner(prog, source, false)
+    compile_program_inner(prog, source, false, false)
+}
+
+/// Compile the ROOT program of a VM — one that `Vm::new` will run directly and
+/// that can never be installed through `prepare_eval_program`. Only this goal
+/// is eligible for lowerings the VM-lifetime plan-cap degradation cannot
+/// rewrite (currently the one-step `FinalizeObject` literal): an over-cap
+/// eval/module install rewrites `NewPlannedObject` sites to legacy hints and
+/// clears the plan pool, which a finalize site cannot survive. Compiling
+/// dynamic code with the plain entries instead is always safe — it only
+/// forgoes the optimization.
+pub fn compile_main_program(prog: &ast::Program, source: &str) -> R<Program> {
+    compile_program_inner(prog, source, false, true)
 }
 
 /// Compile a MODULE as the program entry: the top level is an async context
 /// (top-level `await`), and the VM runs func 0 as an async activation.
 pub fn compile_module(prog: &ast::Program, source: &str) -> R<Program> {
-    compile_program_inner(prog, source, true)
+    compile_program_inner(prog, source, true, false)
+}
+
+/// [`compile_main_program`]'s module sibling — for a module program `Vm::new`
+/// runs directly as the root activation (never via the loader's eval install).
+pub fn compile_main_module(prog: &ast::Program, source: &str) -> R<Program> {
+    compile_program_inner(prog, source, true, true)
 }
 
 pub(crate) fn compile_program_inner(
     prog: &ast::Program,
     source: &str,
     module_mode: bool,
+    main_goal: bool,
 ) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.module_mode = module_mode;
+    c.main_goal = main_goal;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);

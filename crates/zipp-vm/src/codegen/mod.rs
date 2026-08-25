@@ -496,7 +496,6 @@ pub type CrossCallPlan = FxHashMap<usize, CrossCallSitePlan>;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrossCallSitePlan {
     pub same_proto2: Option<SameProtoCross2Plan>,
-    pub(crate) static_record_factory: Option<StaticRecordCallPlan>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -915,9 +914,6 @@ pub struct HeapHelperAddrs {
     /// Exact rotating same-prototype lexical-arrow/two-argument sibling of
     /// `cross_call`; it shares the same live-resolution and fallback protocol.
     pub cross_call_same_proto2: usize,
-    /// Bounded immutable-bytecode static-record factory prefix. On a pure guard
-    /// miss it returns SELF_CALL_DEOPT and the ordinary cross/call path runs.
-    pub static_record_factory: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
     /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
@@ -1101,7 +1097,6 @@ impl HeapHelperAddrs {
             call_ic: self.call_ic,
             cross_call: self.cross_call,
             cross_call_same_proto2: self.cross_call_same_proto2,
-            static_record_factory: self.static_record_factory,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
             get_prop_acc: self.get_prop_acc,
@@ -2810,10 +2805,6 @@ pub struct Jit {
         Option<JsonWalkPlan>,
         Option<MarkdownInlinePlan>,
     )>,
-    /// Pointer-free immutable-bytecode plans for the bounded static-record call
-    /// prefix, indexed by unified func_id. Cleared with cross entries on
-    /// eviction/late metering; helpers copy one fixed arm before a GC safe point.
-    static_record_factories: FxHashMap<u32, Box<StaticRecordFactoryPlan>>,
     /// Owned multi-word W7 masks for cross-callable functions with more than
     /// 64 registers, indexed exactly like `cross_entries`. `None` means full
     /// fill. Words contain register indices only — no bytecode, heap, or raw
@@ -2913,7 +2904,6 @@ impl Jit {
         self.self_cache = None;
         self.cross_entries.clear();
         self.cross_wide_uninit.clear();
-        self.static_record_factories.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
@@ -2990,38 +2980,6 @@ impl Jit {
             .and_then(Option::as_deref)
     }
 
-    #[inline]
-    pub(crate) fn static_record_factory_arm(
-        &self,
-        func_id: u32,
-        arg1: i32,
-    ) -> Option<StaticRecordArm> {
-        self.static_record_factories
-            .get(&func_id)
-            .filter(|plan| plan.fid == func_id)
-            .and_then(|plan| plan.arm(arg1))
-    }
-
-    #[inline]
-    pub(crate) fn has_static_record_factory(&self, func_id: u32) -> bool {
-        self.static_record_factories.contains_key(&func_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn install_static_record_factory_for_test(
-        &mut self,
-        func_id: u32,
-        plan: StaticRecordFactoryPlan,
-    ) {
-        assert_eq!(plan.fid, func_id);
-        assert!(
-            self.static_record_factories.contains_key(&func_id)
-                || self.static_record_factories.len()
-                    < static_record::STATIC_RECORD_MAX_RETAINED_PLANS
-        );
-        self.static_record_factories.insert(func_id, Box::new(plan));
-    }
-
     fn set_cross_entry(
         &mut self,
         func_id: u32,
@@ -3030,7 +2988,6 @@ impl Jit {
         wide_uninit_mask: Option<Box<[u64]>>,
         json_walk: Option<JsonWalkPlan>,
         markdown_inline: Option<MarkdownInlinePlan>,
-        static_record_factory: Option<StaticRecordFactoryPlan>,
     ) {
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
@@ -3042,14 +2999,6 @@ impl Jit {
         }
         self.cross_entries[i] = (entry, uninit_mask, json_walk, markdown_inline);
         self.cross_wide_uninit[i] = wide_uninit_mask;
-        self.static_record_factories.remove(&func_id);
-        if let Some(plan) = static_record_factory {
-            if self.static_record_factories.len() < static_record::STATIC_RECORD_MAX_RETAINED_PLANS
-            {
-                self.static_record_factories.insert(func_id, Box::new(plan));
-                static_record_stats::plan();
-            }
-        }
     }
 
     fn clear_cross_entry(&mut self, func_id: u32) {
@@ -3059,7 +3008,6 @@ impl Jit {
         if let Some(mask) = self.cross_wide_uninit.get_mut(func_id as usize) {
             *mask = None;
         }
-        self.static_record_factories.remove(&func_id);
     }
 
     /// Dense tier state of `func_id` — the frame-entry fast path.
@@ -3217,8 +3165,6 @@ impl Jit {
                     .is_none()
                     .then(|| markdown_inline_plan(proto))
                     .flatten();
-                let static_record_factory =
-                    recognize_static_record_factory(proto, func_id, meter.is_none());
                 self.set_cross_entry(
                     func_id,
                     entry,
@@ -3226,7 +3172,6 @@ impl Jit {
                     wide_uninit_mask,
                     json_walk,
                     markdown_inline,
-                    static_record_factory,
                 );
                 return;
             }
@@ -3546,9 +3491,10 @@ impl Jit {
                 ) {
                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                         eprintln!(
-                            "[jit] LOCAL-SROA region fn{func_id} [{start},{end}] objects={} arrays={} concat_lens={} tier={}",
+                            "[jit] LOCAL-SROA region fn{func_id} [{start},{end}] objects={} arrays={} finalized={} concat_lens={} tier={}",
                             local.runtime.objects.len(),
                             local.runtime.arrays.len(),
+                            local.runtime.finalized.len(),
                             local.runtime.concat_lens.len(),
                             if is_mem { "MEM" } else { "DOUBLE" }
                         );
@@ -4229,11 +4175,6 @@ pub(crate) mod meter;
 mod plan;
 mod plan_region;
 mod proto_mem;
-mod static_record;
-pub(crate) use static_record::{
-    recognize_static_record_factory, static_record_stats, StaticRecordArm, StaticRecordCallPlan,
-    StaticRecordFactoryPlan, StaticRecordRecipe,
-};
 mod regalloc;
 mod region_admit;
 mod region_int;

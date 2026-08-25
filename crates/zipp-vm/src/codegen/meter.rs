@@ -170,18 +170,28 @@ pub(crate) fn blocks(code: &[Instr], start: usize, end: usize) -> Vec<(usize, u3
         mark(ip + 1);
     }
 
+    // Per-instruction weights, not positions: `FinalizeObject` charges its
+    // historical `NewPlannedObject` + per-field cost (1 + count), exactly what
+    // the interpreter's tick + `charge_steps` remainder counts for the same op.
+    let weight = |ip: usize| match code[ip] {
+        Instr::FinalizeObject { count, .. } => 1 + count as u32,
+        _ => 1,
+    };
     let mut out = Vec::new();
-    let mut head = None;
+    let mut head: Option<(usize, u32)> = None;
     for ip in start..=end {
         if heads[ip - start] {
-            if let Some(h) = head {
-                out.push((h, (ip - h) as u32));
+            if let Some(block) = head.take() {
+                out.push(block);
             }
-            head = Some(ip);
+            head = Some((ip, 0));
+        }
+        if let Some((_, w)) = &mut head {
+            *w += weight(ip);
         }
     }
-    if let Some(h) = head {
-        out.push((h, (end + 1 - h) as u32));
+    if let Some(block) = head {
+        out.push(block);
     }
     out
 }
@@ -264,6 +274,25 @@ mod tests {
     #[test]
     fn a_single_instruction_region_is_one_block_of_one() {
         assert_eq!(blocks(&[nop()], 0, 0), vec![(0, 1)]);
+    }
+
+    /// `FinalizeObject` charges its historical 1 + per-field cost, matching
+    /// the interpreter's dispatch tick + `charge_steps` remainder exactly.
+    #[test]
+    fn finalize_object_charges_its_field_count() {
+        let fin = Instr::FinalizeObject {
+            dst: 0,
+            plan: 0,
+            val_base: 1,
+            count: 3,
+        };
+        let code = vec![nop(), fin.clone(), nop()];
+        assert_eq!(blocks(&code, 0, 2), vec![(0, 6)]);
+
+        // Weighting must respect block boundaries too: the branch and its
+        // target stay weight-1 blocks; only the literal's block carries 1+3.
+        let code = vec![brf(2), fin, jmp(0)];
+        assert_eq!(blocks(&code, 0, 2), vec![(0, 1), (1, 4), (2, 1)]);
     }
 
     #[test]

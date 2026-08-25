@@ -6,6 +6,82 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
+## Continuation snapshot — 2026-08-25, Wave 53: the one-step literal finalizer
+
+### The static-record candidate is dead
+
+B171's pending promotion gate ran exactly as specified below: 31 same-binary
+pairs on both shape rows measured the default (mechanism ON) **+2.1%
+[+1.0,+2.8] slower** on `shapes-stable` and **+1.9% [+0.6,+4.2] slower** on
+`shapes-megamorphic`. Both fail the ≥5% floor, so the entire mechanism was
+removed (−1,732 lines), zero-symbol audited, and the suite re-verified. Ledger
+**B172**; artifact `bench/hostile/w53_static_record_shapes_abenv_clean_2026-08-25.json`.
+
+### What landed instead: `FinalizeObject` (B173)
+
+The planned-object finalizer sketched below is real. The compiler stages every
+all-static literal value into a contiguous register block (the `NewArray`
+discipline — nested scratch above the block, `SetHomeObject` for concise
+methods deferred until the object exists) and then allocates-and-populates
+with ONE bytecode op, which Tier C emits as ONE helper call. The op carries a
+redundant `count` validated against the plan; metering charges `1 + count` in
+both tiers (interpreter tick + `charge_steps` remainder; weighted native meter
+blocks with a unit test). A per-VM memo folds `shape::add` once per (fid,
+plan). The one-step build skips per-field dispatch, helper ABI crossings,
+existence probes, write-barrier checks (the fresh holder is young by
+construction), and per-key shape transitions.
+
+Same-binary 15-pair `--ab-env` gates (`ZIPP_NO_OBJECT_FINALIZE=1` as OLD):
+
+- shapes-stable **−28.5% [−29.7,−27.6]**, shapes-megamorphic **−31.0%
+  [−31.5,−30.3]**, warm-router **−20.7%**, reactish-reconcile **−20.2%**,
+  allocation-survival **−16.9%**, types-churn **−11.5%**.
+- allocation-ephemeral is **NULL (+0.6% [−3.2,+4.2])**: the local-SROA object
+  lane and the virtual concat-length sub-lane were both ported to the
+  finalized form (`finalized=1 concat_lens=1 tier=DOUBLE` re-verified; the
+  shift-count home moved from the dead mask register to the dead object
+  register, and the projection reads the staged slot).
+- The frozen real-13 measured **0.9932x [−1.49%,−0.06%]** with no row
+  regressing outside its CI.
+
+Two structural constraints matter for whoever extends this:
+
+- **Root programs only.** `prepare_eval_program`'s over-cap plan degradation
+  rewrites `NewPlannedObject` to legacy hints and CLEARS the plan pool — a
+  finalize site cannot survive that. `compile_main_program` /
+  `compile_main_module` (the VM's root activation) are the only entries that
+  set `Compiler::main_goal`; every dynamic install keeps the legacy lowering
+  by construction, so a missed call site is a lost optimization, never a bomb.
+- **The staged block stays allocated** until the enclosing statement reclaims
+  it (exactly like array literals). Reclaiming it early lets the next
+  expression redefine staged slots, which kills SROA eligibility — that was a
+  real 10x ephemeral regression during development, caught by the engagement
+  log line (`[jit] LOCAL-SROA … finalized= concat_lens=`).
+
+### Wave 53 checkpoint
+
+`bench/hostile/w53_finalize_full_dirty_2026-08-25.json` (15 reps, exact, no
+health failures, dirty-tree development diagnostic): cold Zipp/Node is
+**1.1254× by ordinary row geomean** and **1.189× category-balanced**, from
+Wave 50's 1.2786× / 1.3509×. The remaining above-Node rows: survival
+**3.267×**, router **2.938×**, shapes **2.773× / 2.598×**, NanoID **2.642×**,
+React **2.548×**, closures **1.942×**, types-churn **1.345×**, async-lived
+**1.056×**. Everything else is at or below Node.
+
+### Where the remaining time is (measured, ZIPP_PROF)
+
+The object rows now run 55–81% in Tier-C native code; their residual cost is
+per-op HELPER calls and GC, not interpretation — except **reactish-reconcile,
+which is 56% interpreted**: its hot functions (App, diff, Item, makeStore)
+blacklist outright on `MakeCell`/`MakeCellTdz` (arrow capture cells),
+general-shape `UpvalGet`, and `CallMethodComputed`. Admitting closure-creating
+application code to Tier C is the single largest remaining react/closures
+lever. Survival's residual is ~15% GC (survivor tracing; `jit_set_index`
+old→young traffic) plus per-node `MakeFunc` + string concat. The router's is
+Map get/set helpers and 4-shape polymorphic property access.
+
+---
+
 ## Continuation snapshot — 2026-08-25, Waves 40–52 checkpoint
 
 This checkpoint is based on `b950013` and is being committed before the next

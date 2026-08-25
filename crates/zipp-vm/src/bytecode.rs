@@ -1511,6 +1511,22 @@ pub enum Instr {
         name: u32,
         val: Reg,
     },
+    /// Allocate AND fully populate an all-static object literal in one step:
+    /// `dst = { plan.keys[0]: reg[val_base], …, plan.keys[count-1]:
+    /// reg[val_base+count-1] }`. The compiler stages every field value into the
+    /// contiguous block first (the `NewArray` discipline), so the values are
+    /// GC-rooted registers and no partially-initialized object can ever be
+    /// observed — the object exists only after every field is written. `count`
+    /// is redundant with `plan.len()` and revalidated at runtime so the operand
+    /// table can enumerate the block without proto access; a mismatch is a
+    /// fail-closed InternalError. Metering charges `1 + count` steps — the
+    /// exact historical `NewPlannedObject` + count×`AppendDataProp` cost.
+    FinalizeObject {
+        dst: Reg,
+        plan: u16,
+        val_base: Reg,
+        count: u16,
+    },
     /// CreateDataProperty with a COMPUTED key (already ToPropertyKey'd via
     /// `ToPropKey`) on an object literal: an ordinary own data property even
     /// for "__proto__" — only the textual `__proto__:` colon form sets the
@@ -2030,6 +2046,10 @@ struct StaticKeyPlanData {
     /// Cached once at compilation/deserialization boundary so hot allocation
     /// does not rescan up to 256 strings. Invalid hand-built plans fail closed.
     runtime_valid: bool,
+    /// Whether any key names an array element (canonical "0".."4294967294") —
+    /// precomputed so the one-step `FinalizeObject` allocation keeps
+    /// `ObjMap::has_element_key` exact without rescanning keys per object.
+    has_element_key: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2054,6 +2074,25 @@ pub(crate) fn static_key_plans_enabled() -> bool {
         2 => false,
         _ => {
             let on = std::env::var_os("ZIPP_NO_STATIC_KEY_PLANS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Same-binary comparator for the one-step `FinalizeObject` literal lowering.
+/// When disabled, the compiler emits the historical `NewPlannedObject` +
+/// per-field `AppendDataProp` sequence (B167's shipped baseline); runtime
+/// handling of already-compiled `FinalizeObject` bytecode is unchanged.
+#[inline]
+pub(crate) fn object_finalize_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_OBJECT_FINALIZE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -2110,10 +2149,18 @@ impl StaticKeyPlan {
             let mut seen = std::collections::HashSet::with_capacity(keys.len());
             keys.iter().all(|key| seen.insert(key.as_str()))
         };
+        let has_element_key = keys.iter().any(|key| crate::heap::key_names_element(key));
         Self(std::sync::Arc::new(StaticKeyPlanData {
             keys,
             runtime_valid,
+            has_element_key,
         }))
+    }
+
+    /// Precomputed "any key names an array element" bit — see the field doc.
+    #[inline]
+    pub(crate) fn has_element_key(&self) -> bool {
+        self.0.has_element_key
     }
 
     #[inline]

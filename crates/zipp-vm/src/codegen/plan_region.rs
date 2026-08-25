@@ -4655,6 +4655,11 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::SetLiteralProto { obj, val }
         | Instr::ObjectSpread { target: obj, src: val }
         | Instr::WithSet { obj, val, .. } => vec![obj, val],
+        // The staged value block of a one-step literal — exactly `NewArray`'s
+        // contiguous-window pattern, with the count carried in the instruction.
+        Instr::FinalizeObject {
+            val_base, count, ..
+        } => win(&[], val_base, count),
         Instr::GetIndex { obj, key, .. } => vec![obj, key],
         Instr::SetIndex { obj, key, val } => vec![obj, key, val],
         Instr::GetIndexConcat { obj, key, .. } => vec![obj, key],
@@ -4915,6 +4920,20 @@ pub(crate) struct LocalSroaArray {
     pub(crate) argc: u16,
 }
 
+/// Runtime information needed to materialize a one-step `FinalizeObject`
+/// literal after a native guard bail. Like the array case, eligibility proves
+/// the staged value block is not overwritten between the (elided) finalize and
+/// the region end, so `ObjMap::finalized_from_plan` over the live block regs
+/// rebuilds the exact object the interpreter would have produced.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalSroaFinalized {
+    pub(crate) alloc_ip: u32,
+    pub(crate) dst: u16,
+    pub(crate) plan_idx: u16,
+    pub(crate) val_base: u16,
+    pub(crate) count: u16,
+}
+
 /// A string concat whose result is virtual inside a local-SROA region because
 /// its only observation is `.length`. The native clone keeps the proved i32 in
 /// `scratch`; an internal bail recreates the exact primitive string before the
@@ -4938,6 +4957,7 @@ pub(crate) struct LocalSroaConcatLen {
 pub(crate) struct LocalSroaPlan {
     pub(crate) objects: Vec<LocalSroaObject>,
     pub(crate) arrays: Vec<LocalSroaArray>,
+    pub(crate) finalized: Vec<LocalSroaFinalized>,
     pub(crate) concat_lens: Vec<LocalSroaConcatLen>,
     pub(crate) scratch: Vec<u16>,
 }
@@ -4957,6 +4977,7 @@ enum LocalScalarTy {
     Str,
     Object(usize),
     Array(usize),
+    Finalized(usize),
 }
 
 /// Destination cover for the deliberately narrow local-SROA input language.
@@ -4976,6 +4997,7 @@ fn local_sroa_dst(i: &Instr) -> Option<u16> {
         | Instr::GetIndex { dst, .. }
         | Instr::NewObject { dst, .. }
         | Instr::NewPlannedObject { dst, .. }
+        | Instr::FinalizeObject { dst, .. }
         | Instr::NewArray { dst, .. } => Some(dst),
         _ => None,
     }
@@ -5000,6 +5022,7 @@ fn local_sroa_supported_instr(i: &Instr) -> bool {
             | Instr::Jump { .. }
             | Instr::NewObject { .. }
             | Instr::NewPlannedObject { .. }
+            | Instr::FinalizeObject { .. }
             | Instr::AppendDataProp { .. }
             | Instr::GetProp { .. }
             | Instr::NewArray { .. }
@@ -5263,7 +5286,82 @@ pub(crate) fn plan_local_sroa(
         }
         arrays.push((alloc_ip as u32, dst, arg_base, argc, reads));
     }
-    if objects.is_empty() && arrays.is_empty() {
+
+    // One-step `FinalizeObject` literals follow the ARRAY model, not the
+    // append model: every field value already lives in a staged register that
+    // eligibility proves unchanged through every possible bail, and each own
+    // field read forwards directly to its staged slot. No scratch homes.
+    type FinalizedSite = (u32, u16, u16, u16, u16, Vec<(u32, u16)>);
+    let mut finalized: Vec<FinalizedSite> = Vec::new();
+    for alloc_ip in s + 1..e {
+        let (dst, plan_idx, val_base, count) = match code[alloc_ip] {
+            Instr::FinalizeObject {
+                dst,
+                plan,
+                val_base,
+                count,
+            } if count != 0 => (dst, plan, val_base, count),
+            _ => continue,
+        };
+        // SROA erases the allocation, so it enforces the same metadata trust
+        // boundary the interpreter arm would have.
+        let plan = proto.static_key_plans.get(plan_idx as usize)?;
+        if !plan.runtime_valid() || plan.len() > 256 || plan.len() != count as usize {
+            return None;
+        }
+        let mut prefix_killed = false;
+        for instr in &code[s..alloc_ip] {
+            let used = instr_uses(instr).contains(&dst);
+            let wrote = local_sroa_dst(instr) == Some(dst);
+            if used && !prefix_killed {
+                return None;
+            }
+            prefix_killed |= wrote;
+        }
+        let mut reads = Vec::new();
+        for (ip, instr) in code.iter().enumerate().take(e + 1).skip(alloc_ip + 1) {
+            if local_sroa_dst(instr) == Some(dst) {
+                return None;
+            }
+            if !instr_uses(instr).contains(&dst) {
+                continue;
+            }
+            let (name, get_dst) = match *instr {
+                Instr::GetProp {
+                    dst: get_dst,
+                    obj,
+                    name,
+                } if obj == dst => (name, get_dst),
+                _ => return None,
+            };
+            let key = proto.string_constants.get(name as usize)?;
+            let field = plan.keys().iter().position(|k| k == key)?;
+            let src = val_base.checked_add(u16::try_from(field).ok()?)?;
+            if src == get_dst
+                || code[alloc_ip + 1..=e]
+                    .iter()
+                    .any(|i| local_sroa_dst(i) == Some(src))
+            {
+                return None;
+            }
+            reads.push((ip as u32, src));
+        }
+        // As for arrays/objects, a clean loop exit leaves no real object.
+        for instr in &code[e + 1..] {
+            if instr_uses(instr).contains(&dst) {
+                return None;
+            }
+            if local_sroa_dst(instr) == Some(dst) {
+                break;
+            }
+        }
+        if reads.is_empty() {
+            return None;
+        }
+        finalized.push((alloc_ip as u32, dst, plan_idx, val_base, count, reads));
+    }
+
+    if objects.is_empty() && arrays.is_empty() && finalized.is_empty() {
         return None;
     }
     let nfields: usize = objects.iter().map(|o| o.3.len()).sum();
@@ -5312,6 +5410,23 @@ pub(crate) fn plan_local_sroa(
             argc,
         });
     }
+    let mut fin_by_reg: FxHashMap<u16, usize> = FxHashMap::default();
+    let mut fin_reads: FxHashMap<u32, u16> = FxHashMap::default();
+    for (fid_local, &(alloc_ip, dst, plan_idx, val_base, count, ref reads)) in
+        finalized.iter().enumerate()
+    {
+        fin_by_reg.insert(dst, fid_local);
+        for &(ip, src) in reads {
+            fin_reads.insert(ip, src);
+        }
+        runtime.finalized.push(LocalSroaFinalized {
+            alloc_ip,
+            dst,
+            plan_idx,
+            val_base,
+            count,
+        });
+    }
 
     // Static primitive proof. This is what makes the shared MEM emitter's
     // remaining Add/GetProp helpers non-reentrant: every Add is number/string
@@ -5327,6 +5442,7 @@ pub(crate) fn plan_local_sroa(
     }
     let mut field_ty: FxHashMap<(usize, u32), LocalScalarTy> = FxHashMap::default();
     let mut array_ty: Vec<Vec<LocalScalarTy>> = vec![Vec::new(); arrays.len()];
+    let mut fin_ty: Vec<Vec<LocalScalarTy>> = vec![Vec::new(); finalized.len()];
     for (ip, instr) in code.iter().enumerate().take(e + 1).skip(s) {
         match *instr {
             Instr::JumpIfNotLt { a, b, .. } => {
@@ -5384,6 +5500,12 @@ pub(crate) fn plan_local_sroa(
                     let _ = stored_name;
                     tys[dst as usize] = ty;
                 }
+                LocalScalarTy::Finalized(fid_local) => {
+                    let src = *fin_reads.get(&(ip as u32))?;
+                    let (_, _, _, val_base, _, _) = &finalized[fid_local];
+                    let idx = src.checked_sub(*val_base)? as usize;
+                    tys[dst as usize] = *fin_ty.get(fid_local)?.get(idx)?;
+                }
                 LocalScalarTy::Str
                     if proto
                         .string_constants
@@ -5410,6 +5532,23 @@ pub(crate) fn plan_local_sroa(
                 }
                 array_ty[aid] = elems;
                 tys[dst as usize] = LocalScalarTy::Array(aid);
+            }
+            Instr::FinalizeObject {
+                dst,
+                val_base,
+                count,
+                ..
+            } => {
+                let fid_local = *fin_by_reg.get(&dst)?;
+                let elems: Vec<_> = (0..count).map(|j| tys[(val_base + j) as usize]).collect();
+                if elems
+                    .iter()
+                    .any(|t| !matches!(t, LocalScalarTy::Num | LocalScalarTy::Str))
+                {
+                    return None;
+                }
+                fin_ty[fid_local] = elems;
+                tys[dst as usize] = LocalScalarTy::Finalized(fid_local);
             }
             Instr::GetIndex { dst, obj, .. } => {
                 let LocalScalarTy::Array(aid) = tys[obj as usize] else {
@@ -5472,6 +5611,22 @@ pub(crate) fn plan_local_sroa(
         };
         rewritten.code[ip as usize] = Instr::Move { dst, src };
     }
+    for fin in &runtime.finalized {
+        // A benign filler: nothing writes `dst` in the loop once the finalize
+        // is elided, and indices must be preserved. The concat-length sub-lane
+        // may later repurpose this exact slot for its shift-count load.
+        rewritten.code[fin.alloc_ip as usize] = Instr::LoadInt {
+            dst: fin.dst,
+            val: 0,
+        };
+    }
+    for (&ip, &src) in &fin_reads {
+        let dst = match code[ip as usize] {
+            Instr::GetProp { dst, .. } => dst,
+            _ => return None,
+        };
+        rewritten.code[ip as usize] = Instr::Move { dst, src };
+    }
     Some(LocalSroaCompilePlan {
         proto: rewritten,
         runtime,
@@ -5483,6 +5638,11 @@ struct LocalConcatLenCandidate {
     runtime: LocalSroaConcatLen,
     append_ip: u32,
     number_reg: u16,
+    /// Register the rewritten projection (`AddInt` at `get_ip`) reads `n`
+    /// from. The append form keeps `n` live in `number_reg` itself; the
+    /// finalized form reads the staged slot, whose integrity to the region end
+    /// is already part of object eligibility.
+    projection_src: u16,
     shift_reg: u16,
     length_ip: u32,
     length_dst: u16,
@@ -5554,7 +5714,7 @@ pub(crate) fn plan_local_concat_len(
 ) -> bool {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
-    if e >= code.len() || plan.runtime.objects.is_empty() {
+    if e >= code.len() || (plan.runtime.objects.is_empty() && plan.runtime.finalized.is_empty()) {
         return false;
     }
 
@@ -5728,7 +5888,197 @@ pub(crate) fn plan_local_concat_len(
                 },
                 append_ip: append_ip as u32,
                 number_reg,
+                projection_src: number_reg,
                 shift_reg: mask_reg,
+                length_ip: length_ip as u32,
+                length_dst,
+                length_bias: bias as i32,
+            });
+        }
+    }
+
+    // The same exact `"ascii" + (x & MASK)` fold for a field of a one-step
+    // `FinalizeObject` literal. The staged slot doubles as the SROA scratch (n
+    // lives there while native code runs, and bail materialization restores
+    // the real string into it BEFORE any object materializes or the
+    // interpreter re-reads the block). The shift-count load reuses the elided
+    // finalize ip — its `LoadInt {dst, 0}` filler is not load-bearing, because
+    // nothing reads the object register once every own-field read forwards.
+    for fin in &plan.runtime.finalized {
+        let Some(key_plan) = proto.static_key_plans.get(fin.plan_idx as usize) else {
+            continue;
+        };
+        for (j, field_key) in key_plan.keys().iter().enumerate() {
+            let Some(slot) = fin.val_base.checked_add(j as u16) else {
+                continue;
+            };
+            let adds: Vec<usize> = code[s..=e]
+                .iter()
+                .enumerate()
+                .filter_map(|(off, instr)| {
+                    matches!(instr, Instr::Add { dst, .. } if *dst == slot).then_some(s + off)
+                })
+                .collect();
+            let [add_ip] = adds.as_slice() else {
+                continue;
+            };
+            let add_ip = *add_ip;
+            if add_ip < s + 4 || add_ip >= fin.alloc_ip as usize {
+                continue;
+            }
+            let bit_ip = add_ip - 1;
+            let mask_ip = add_ip - 2;
+            let prefix_ip = add_ip - 3;
+            let Instr::Add {
+                dst: add_dst,
+                a: prefix_reg,
+                b: number_reg,
+            } = code[add_ip]
+            else {
+                continue;
+            };
+            debug_assert_eq!(add_dst, slot);
+            let Instr::Bitwise {
+                dst: bit_dst,
+                b: mask_reg,
+                op: crate::bytecode::BitwiseOp::And,
+                ..
+            } = code[bit_ip]
+            else {
+                continue;
+            };
+            let Instr::LoadInt {
+                dst: mask_dst,
+                val: mask,
+            } = code[mask_ip]
+            else {
+                continue;
+            };
+            let Instr::LoadConst {
+                dst: prefix_dst,
+                idx: prefix_const,
+            } = code[prefix_ip]
+            else {
+                continue;
+            };
+            if bit_dst != number_reg
+                || mask_reg != mask_dst
+                || prefix_reg != prefix_dst
+                || !(0..=99).contains(&mask)
+            {
+                continue;
+            }
+            let Some(prefix_units) = local_ascii_const_units(proto, prefix_const) else {
+                continue;
+            };
+            let bias = (prefix_units as i64 + 2)
+                .checked_mul(256)
+                .and_then(|v| v.checked_sub(10));
+            let Some(bias) = bias else {
+                continue;
+            };
+            if bias > i32::MAX as i64 || bias + mask as i64 > i32::MAX as i64 {
+                continue;
+            }
+
+            let reads: Vec<(usize, u16)> = code[s..=e]
+                .iter()
+                .enumerate()
+                .filter_map(|(off, instr)| match *instr {
+                    Instr::GetProp { dst, obj, name }
+                        if obj == fin.dst
+                            && proto.string_constants.get(name as usize) == Some(field_key) =>
+                    {
+                        Some((s + off, dst))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let [(get_ip, get_dst)] = reads.as_slice() else {
+                continue;
+            };
+            let (get_ip, get_dst) = (*get_ip, *get_dst);
+            let length_ip = get_ip + 1;
+            if length_ip > e {
+                continue;
+            }
+            let Instr::GetProp {
+                dst: length_dst,
+                obj: length_obj,
+                name: length_name,
+            } = code[length_ip]
+            else {
+                continue;
+            };
+            if length_obj != get_dst
+                || length_dst == get_dst
+                || proto
+                    .string_constants
+                    .get(length_name as usize)
+                    .map(String::as_str)
+                    != Some("length")
+            {
+                continue;
+            }
+
+            // Interference differs from the append form in two ways. The
+            // staged slot IS the scratch, so it appears once. And the shift
+            // count's home is the DEAD object register `fin.dst` (loaded at
+            // the elided finalize ip) rather than the mask register — the
+            // compiler's tighter staged layout may reuse the mask register
+            // for a later destination, and eligibility already proves
+            // `fin.dst` has no other def or use once every field read
+            // forwards. The mask register therefore needs no liveness beyond
+            // its own And, and `length_dst` may be any register except the
+            // projection's own source.
+            let distinct = [prefix_reg, number_reg, slot, get_dst];
+            if distinct
+                .iter()
+                .enumerate()
+                .any(|(i, r)| distinct[..i].contains(r))
+                || length_dst == get_dst
+                || fin.dst == number_reg
+                || fin.dst == get_dst
+                || fin.dst == slot
+                || fin.dst == prefix_reg
+            {
+                continue;
+            }
+
+            // `n` needs to survive only from the And to the rewritten Move at
+            // `add_ip`; the projection reads the staged SLOT, so the slot must
+            // have no other definition through the projection (the object
+            // eligibility pass already declined any def past the finalize).
+            if !local_uses_until_def_are(code, prefix_ip, prefix_reg, &[add_ip])
+                || !local_uses_until_def_are(code, add_ip, slot, &[fin.alloc_ip as usize])
+                || !local_uses_until_def_are(code, get_ip, get_dst, &[length_ip])
+                || code[bit_ip + 1..=add_ip]
+                    .iter()
+                    .any(|instr| local_sroa_dst(instr) == Some(number_reg))
+                || code[add_ip + 1..length_ip]
+                    .iter()
+                    .any(|instr| local_sroa_dst(instr) == Some(slot))
+            {
+                continue;
+            }
+
+            candidates.push(LocalConcatLenCandidate {
+                runtime: LocalSroaConcatLen {
+                    prefix_const,
+                    prefix_load_ip: prefix_ip as u32,
+                    prefix_reg,
+                    add_ip: add_ip as u32,
+                    add_dst: slot,
+                    add_live_until: next_local_def(code, add_ip, slot),
+                    get_ip: get_ip as u32,
+                    get_dst,
+                    get_live_until: next_local_def(code, get_ip, get_dst),
+                    scratch: slot,
+                },
+                append_ip: fin.alloc_ip,
+                number_reg,
+                projection_src: slot,
+                shift_reg: fin.dst,
                 length_ip: length_ip as u32,
                 length_dst,
                 length_bias: bias as i32,
@@ -5754,7 +6104,7 @@ pub(crate) fn plan_local_concat_len(
     };
     plan.proto.code[candidate.runtime.get_ip as usize] = Instr::AddInt {
         dst: candidate.runtime.get_dst,
-        a: candidate.number_reg,
+        a: candidate.projection_src,
         imm: candidate.length_bias,
         upd: false,
     };

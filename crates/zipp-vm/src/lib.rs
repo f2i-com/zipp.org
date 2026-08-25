@@ -270,20 +270,6 @@ pub fn static_key_plan_stats() -> (u64, u64, u64, u64) {
     heap::static_key_plan_stats()
 }
 
-/// Bounded static-record factory mechanism counters:
-/// `(installed_plans, helper_attempts, hits, pure_declines)`. Enable with
-/// `ZIPP_STATIC_RECORD_STATS=1`; all values are zero otherwise.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub fn static_record_factory_stats() -> (u64, u64, u64, u64) {
-    codegen::static_record_stats::dump()
-}
-
-/// No x86-64 Tier C means no static-record factory prefix.
-#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
-pub fn static_record_factory_stats() -> (u64, u64, u64, u64) {
-    (0, 0, 0, 0)
-}
-
 /// `ZIPP_ICSTATS=1` W7 cross-call window-fill counters:
 /// `(fast_fills, full_fills)` — callee windows exposed via `set_len` under the
 /// register-file high-water mark with only the may-read-before-write registers
@@ -437,7 +423,12 @@ fn compile_only(src: &str, module: bool) -> Result<bytecode::Program, String> {
     } else {
         front::parse_script(src)?
     };
-    compile::compile_program(&ast, src)
+    // Main-goal so the dump reflects what `run_with_base` would execute.
+    if module {
+        compile::compile_main_module(&ast, src)
+    } else {
+        compile::compile_main_program(&ast, src)
+    }
 }
 
 /// Like [`run`], but `base_dir` is the directory the script was loaded from, used
@@ -448,7 +439,7 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
     // source-rewrite-and-reparse any more: the parser produces `Target::Call`
     // directly and the compiler emits the runtime ReferenceError.
     let ast = front::parse_auto(src)?;
-    let program = compile::compile_program(&ast, src)?;
+    let program = compile::compile_main_program(&ast, src)?;
     // Dev aid: `ZIPP_VM_DUMP=1` prints each function's bytecode to stderr before
     // running (so the JIT-able regions can be inspected).
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
@@ -505,7 +496,7 @@ pub fn run_with_harness(
     // script semantics in full; the harness is the prelude. See
     // `Vm::run_with_prelude` for why it is this way round and not the other.
     let ast = front::parse_auto(src)?;
-    let program = compile::compile_program(&ast, src)?;
+    let program = compile::compile_main_program(&ast, src)?;
     let mut vm = vm::Vm::new(&program);
     vm.set_module_base_dir(base_dir);
     match vm.run_with_prelude(Some(harness)) {
@@ -553,7 +544,7 @@ pub fn run_module_file(
     // globals), so it parses script-first — which is also what it compiled as
     // before the front-end swap, oxc's module-flavoured default notwithstanding.
     let host_ast = front::parse_auto(&host_src)?;
-    let host = compile::compile_program(&host_ast, &host_src)?;
+    let host = compile::compile_main_program(&host_ast, &host_src)?;
     let mut vm = vm::Vm::new(&host);
     vm.set_module_base_dir(base_dir.clone());
     if let Err(thrown) = vm.run() {
@@ -589,7 +580,7 @@ pub fn run_module_file(
                 None => src.as_str(),
             };
             let ast2 = front::parse_module(text)?;
-            let program2 = compile::compile_module(&ast2, text)?;
+            let program2 = compile::compile_main_module(&ast2, text)?;
             let mut vm = vm::Vm::new(&program2);
             vm.set_module_base_dir(base_dir);
             match vm.run_module() {
@@ -618,7 +609,7 @@ pub fn run_module_with_base(
     base_dir: Option<std::path::PathBuf>,
 ) -> Result<Outcome, String> {
     let ast = front::parse_module(src)?;
-    let program = compile::compile_module(&ast, src)?;
+    let program = compile::compile_main_module(&ast, src)?;
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
             eprintln!(

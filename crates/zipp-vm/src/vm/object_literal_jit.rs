@@ -203,6 +203,83 @@ pub(crate) extern "win64" fn jit_new_planned_object(
     }
 }
 
+/// Allocate AND fully populate one `FinalizeObject` literal from a validated
+/// native register window. `packed_plan = (func_id << 32) | plan_index`;
+/// `packed_window = (reg_count << 32) | (val_base << 16) | count`.
+///
+/// Every table/window check precedes the GC safe point, and the staged values
+/// live in `vm.regs` window slots (ordinary GC roots) until they are copied
+/// into the fresh object, so the pre-allocation collection is safe. There is
+/// no partially-initialized state: the object exists only once every field is
+/// in place, so no later bail can observe an incomplete literal. Validation
+/// failures decline as a pure prefix and the interpreter replays the exact
+/// `FinalizeObject` bytecode.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_finalize_object(
+    vm: *mut core::ffi::c_void,
+    regs: *const u64,
+    packed_plan: u64,
+    packed_window: u64,
+) -> u64 {
+    if vm.is_null() || regs.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let reg_count = (packed_window >> 32) as u32 as usize;
+    let val_base = (packed_window >> 16) as u16 as usize;
+    let count = packed_window as u16 as usize;
+    if count == 0
+        || count > 256
+        || val_base
+            .checked_add(count)
+            .is_none_or(|end| end > reg_count)
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let func_id = (packed_plan >> 32) as u32;
+        let plan_idx = packed_plan as u32;
+        let func_count = vm.main_func_count.saturating_add(vm.eval_funcs.len());
+        if func_id as usize >= func_count || plan_idx > u16::MAX as u32 {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let Some(plan) = vm
+            .func(func_id as usize)
+            .static_key_plans
+            .get(plan_idx as usize)
+            .cloned()
+        else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        if !plan.runtime_valid() || plan.len() != count {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        vm.maybe_gc();
+        if !regs_window_valid(vm, regs, reg_count) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let mut vals = Vec::with_capacity(count);
+        for offset in 0..count {
+            let bits = unsafe { *regs.add(val_base + offset) };
+            vals.push(Value::from_bits(bits));
+        }
+        let shape = vm.finalize_shape(func_id, plan_idx as u16, &plan);
+        let idx = vm
+            .heap
+            .alloc(HeapObj::Object(Box::new(ObjMap::finalized_from_plan(
+                plan, vals, shape,
+            ))));
+        vm.realm_born(idx, vm.obj_proto);
+        crate::heap::note_static_key_jit_object();
+        Value::heap(idx).bits()
+    })) {
+        Ok(bits) => bits,
+        // Allocation/realm bookkeeping may already be committed. Never replay
+        // after an unwind across this boundary.
+        Err(_) => std::process::abort(),
+    }
+}
+
 /// Allocate a fixed-block array literal from a validated native register
 /// window.  `packed = (reg_count << 32) | (arg_base << 16) | argc`.
 ///
@@ -461,10 +538,15 @@ mod tests {
         ((func_id as u64) << 32) | name as u64
     }
 
+    /// A literal one field past `OBJECT_FINALIZE_MAX_FIELDS`, so the compiler
+    /// keeps the historical `NewPlannedObject` + per-field append lowering the
+    /// per-op helper tests exercise.
+    const WIDE_LITERAL: &str = "{a:1,b:2,f2:0,f3:0,f4:0,f5:0,f6:0,f7:0,f8:0,f9:0,f10:0,f11:0,f12:0,f13:0,f14:0,f15:0,f16:0}";
+
     fn malformed_program(keys: Vec<String>) -> &'static crate::bytecode::Program {
-        let source = "var result={a:1};";
-        let ast = crate::front::parse_script(source).expect("source parses");
-        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let source = format!("var result={WIDE_LITERAL};");
+        let ast = crate::front::parse_script(&source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, &source).expect("source compiles");
         let plan = program.functions[0]
             .code
             .iter()
@@ -478,9 +560,9 @@ mod tests {
     }
 
     fn malformed_append_result(names: [&str; 2]) -> (Vec<String>, Vec<Value>) {
-        let source = "var result={a:1,b:2};";
-        let ast = crate::front::parse_script(source).expect("source parses");
-        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let source = format!("var result={WIDE_LITERAL};");
+        let ast = crate::front::parse_script(&source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, &source).expect("source compiles");
         let indices = names.map(|wanted| {
             program.functions[0]
                 .string_constants
@@ -488,14 +570,18 @@ mod tests {
                 .position(|name| name == wanted)
                 .unwrap_or_else(|| panic!("missing name constant {wanted:?}")) as u32
         });
+        // Rewire only the literal's FIRST TWO appends; the tail keeps its
+        // original unique names so the malformed prefix is the whole probe.
         let mut next = 0usize;
         for instr in &mut program.functions[0].code {
             if let Instr::AppendDataProp { name, .. } = instr {
-                *name = indices[next];
+                if next < 2 {
+                    *name = indices[next];
+                }
                 next += 1;
             }
         }
-        assert_eq!(next, 2, "expected exactly two append ops");
+        assert!(next >= 2, "expected at least two append ops, saw {next}");
 
         let program = Box::leak(Box::new(program));
         let mut vm = Vm::new(program);
@@ -531,9 +617,9 @@ mod tests {
 
     #[test]
     fn malformed_plan_index_is_an_interpreter_error_not_an_index_panic() {
-        let source = "var result={a:1};";
-        let ast = crate::front::parse_script(source).expect("source parses");
-        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let source = format!("var result={WIDE_LITERAL};");
+        let ast = crate::front::parse_script(&source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, &source).expect("source compiles");
         let allocation = program.functions[0]
             .code
             .iter_mut()
@@ -551,9 +637,9 @@ mod tests {
 
     #[test]
     fn malformed_append_name_is_an_interpreter_error_not_an_index_panic() {
-        let source = "var result={a:1};";
-        let ast = crate::front::parse_script(source).expect("source parses");
-        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let source = format!("var result={WIDE_LITERAL};");
+        let ast = crate::front::parse_script(&source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, &source).expect("source compiles");
         let append = program.functions[0]
             .code
             .iter_mut()
@@ -572,15 +658,65 @@ mod tests {
         );
     }
 
+    /// The one-step lowering's own malformed-bytecode defenses: an invalid
+    /// plan index, a count that disagrees with the authoritative plan, and a
+    /// register block escaping the u16 window all fail closed as
+    /// InternalErrors before any allocation.
+    #[test]
+    fn malformed_finalize_object_fails_closed_before_allocation() {
+        for patch in [0u8, 1, 2] {
+            let source = "var result={a:1,b:2};";
+            let ast = crate::front::parse_script(source).expect("source parses");
+            let mut program =
+                crate::compile::compile_main_program(&ast, source).expect("source compiles");
+            let finalize = program.functions[0]
+                .code
+                .iter_mut()
+                .find(|instr| matches!(instr, Instr::FinalizeObject { .. }))
+                .expect("one-step literal op");
+            let Instr::FinalizeObject {
+                plan,
+                val_base,
+                count,
+                ..
+            } = finalize
+            else {
+                unreachable!()
+            };
+            match patch {
+                0 => *plan = u16::MAX,
+                1 => *count = 7,
+                _ => *val_base = u16::MAX,
+            }
+            let program = Box::leak(Box::new(program));
+            let mut vm = Vm::new(program);
+            let err = vm.run().expect_err("malformed finalize must fail closed");
+            assert!(err.0.contains("invalid static key plan"), "got {err:?}");
+            // The failed program's global must never observe a partial object:
+            // validation precedes allocation in the interpreter arm.
+            let slot = vm.global_slot_of_name("result").expect("result global");
+            assert_eq!(vm.globals[slot as usize], Value::UNDEFINED);
+        }
+    }
+
     #[test]
     fn duplicate_and_reordered_planned_bytecode_never_create_duplicate_slots() {
+        // Duplicate first key: the second append overwrites in place, then the
+        // untouched tail materializes through the owned path.
         let (keys, vals) = malformed_append_result(["a", "a"]);
-        assert_eq!(keys, ["a".to_string()]);
-        assert_eq!(vals, [Value::int(2)]);
+        assert_eq!(keys.len(), 16, "one duplicate collapsed: {keys:?}");
+        assert_eq!(keys[0], "a");
+        assert_eq!(keys[1], "f2");
+        assert_eq!(vals[0], Value::int(2));
 
+        // Reordered prefix: both keys land once, in the malformed order.
         let (keys, vals) = malformed_append_result(["b", "a"]);
-        assert_eq!(keys, ["b".to_string(), "a".to_string()]);
-        assert_eq!(vals, [Value::int(1), Value::int(2)]);
+        assert_eq!(keys.len(), 17, "no key may be lost or duplicated: {keys:?}");
+        assert_eq!(
+            &keys[..3],
+            ["b".to_string(), "a".to_string(), "f2".to_string()]
+        );
+        assert_eq!(&vals[..2], [Value::int(1), Value::int(2)]);
     }
 
     #[test]

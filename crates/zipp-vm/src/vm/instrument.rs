@@ -686,12 +686,12 @@ impl super::Vm<'_> {
 
     /// Charge `n` steps for work that ran neither in the dispatch loop nor in
     /// compiled code — the off-frame method inliner evaluates a callee body in
-    /// Rust, outside `run_loop` entirely, so nothing else would see it.
+    /// Rust outside `run_loop`, and `FinalizeObject` charges its per-field
+    /// remainder here, so nothing else would see either.
     ///
     /// Charge only AFTER the work is known to have completed: a path that
     /// declines half way falls back to a real call, which the interpreter
     /// charges itself, and charging both would be double-counting.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn charge_steps(&mut self, n: i64) {
         if let Some(rec) = self.instr_rec.as_mut() {
             let n = n.max(0);

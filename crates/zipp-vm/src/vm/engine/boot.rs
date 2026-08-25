@@ -337,6 +337,7 @@ impl<'p> Vm<'p> {
             module_own: std::collections::HashMap::new(),
             closure_home: ClosureHomeTable::default(),
             closure_new_target: std::collections::HashMap::new(),
+            finalize_shapes: rustc_hash::FxHashMap::default(),
             from_async_fn: None,
             async_dispose_fn: None,
             sync_dispose_shim_fn: None,

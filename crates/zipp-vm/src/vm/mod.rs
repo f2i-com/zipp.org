@@ -1567,6 +1567,14 @@ pub struct Vm<'p> {
     /// non-undefined values are recorded. GC traces the value from a reachable
     /// keyed closure; dead keys are pruned on sweep (mirrors `closure_home`).
     closure_new_target: std::collections::HashMap<u32, Value>,
+    /// Memoized final shape per `FinalizeObject` plan, keyed by (unified
+    /// func id, plan index). The value is the exact fold of `shape::add` over
+    /// the plan's keys with data attributes — what per-field appends would
+    /// produce. Shape ids are thread-local and the transition tree never prunes
+    /// ids, so a memo computed on this VM's thread stays valid for its life;
+    /// (fid, plan) keys are append-only over the program + eval tables, so an
+    /// entry can never alias a different plan.
+    finalize_shapes: rustc_hash::FxHashMap<(u32, u16), u32>,
     /// The lazily-compiled `Array.fromAsync` JS polyfill (an async function value).
     /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
     /// the first `Array.fromAsync(...)` invocation.

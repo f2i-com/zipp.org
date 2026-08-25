@@ -829,7 +829,8 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // each append crosses the helper ABI.
             Instr::NewObject { .. }
             | Instr::NewPlannedObject { .. }
-            | Instr::AppendDataProp { .. } => {
+            | Instr::AppendDataProp { .. }
+            | Instr::FinalizeObject { .. } => {
                 if !crate::vm::tierc_object_literal_enabled() {
                     reject!("[tierC-reject] object literal op (disabled)");
                 }
@@ -1164,6 +1165,12 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 arg_base,
                 argc,
             } => (Uses::range(arg_base, argc), Some(dst)),
+            Instr::FinalizeObject {
+                dst,
+                val_base,
+                count,
+                ..
+            } => (Uses::range(val_base, count), Some(dst)),
             Instr::LooseEq { dst, a, b } => (u2(a, b), Some(dst)),
             Instr::MathOp {
                 dst,
@@ -2054,6 +2061,39 @@ pub(crate) fn compile_proto_mem(
                     ; cmp rax, r10
                     ; je => bail
                 );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::FinalizeObject {
+                dst,
+                plan,
+                val_base,
+                count,
+            } => {
+                // One helper call allocates AND fully populates the literal
+                // from the staged register block — the values are live window
+                // slots, so the helper's pre-allocation safe point sees them
+                // as ordinary GC roots. Validation is a pure prefix; the
+                // committed object is complete before the helper returns, so
+                // no bail can ever observe partial initialization.
+                let helper = crate::vm::jit_finalize_object as usize;
+                let packed_plan = ((func_id as u64) << 32) | plan as u64;
+                let packed_window =
+                    ((proto.reg_count as u64) << 32) | ((val_base as u64) << 16) | count as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_plan as i64
+                    ; mov r9, QWORD packed_window as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::SetHomeObject { method, home } => {
@@ -3233,37 +3273,6 @@ pub(crate) fn compile_proto_mem(
                 let cross_done = ops.new_dynamic_label();
                 if cross {
                     let site = cross_site.expect("cross site disappeared during emission");
-                    if let Some(record) = site.static_record_factory {
-                        debug_assert_eq!(argc, 2);
-                        let record_fallback = ops.new_dynamic_label();
-                        let packed_record = ((record.fid as u64) << 32)
-                            | ((proto.reg_count.max(1) as u64) << 16)
-                            | u64::from(arg_base);
-                        dynasm!(ops
-                            ; mov rcx, rdi
-                            ; mov rdx, rbx
-                            ; lea r8, [rbx + dreg(arg_base)]
-                            ; mov r9, QWORD packed_record as i64
-                            ; mov rax, [rbx + dreg(callee)]
-                            ; mov [rsp + 32], rax
-                            ; mov rax, QWORD heap.static_record_factory as i64
-                            ; call rax
-                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                            ; cmp rax, r10
-                            ; je => record_fallback
-                            ; mov r10, QWORD CALL_THREW as i64
-                            ; cmp rax, r10
-                            ; je => bail
-                            ; mov [rbx + dreg(dst)], rax
-                        );
-                        if let Some((vb, icb)) = refetch {
-                            emit_refetch_pinned(&mut ops, vb, Some(icb));
-                        }
-                        dynasm!(ops
-                            ; jmp => cross_done
-                            ; => record_fallback
-                        );
-                    }
                     let same_proto2 = site.same_proto2;
                     let packed_cross: u64 = match same_proto2 {
                         Some(plan) => {

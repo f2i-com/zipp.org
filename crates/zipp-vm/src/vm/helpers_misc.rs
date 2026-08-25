@@ -385,42 +385,6 @@ pub(crate) extern "win64" fn jit_string_regexp_call_direct(
     })
 }
 
-/// Effectful boundary for the bounded static-record factory prefix. ABI:
-/// rcx=vm, rdx=caller window base, r8=&args[0], r9=(expected_fid<<32) |
-/// (caller_reg_count<<16) | arg_base, and the live callee bits as stack arg 5.
-/// Every ordinary miss returns SELF_CALL_DEOPT before object allocation so the
-/// emitted site can take its unchanged cross/call fallback. A panic after the
-/// required GC safe point or commit is fail-stop via `catch_effectful_jit_u64`;
-/// it is never translated into replay after a partial allocation/mutation.
-///
-/// # Safety
-/// Generated code supplies pointers into the pinned live register window. The
-/// helper validates both by integer bounds before either is dereferenced.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_static_record_factory(
-    vm: *mut core::ffi::c_void,
-    caller_base_ptr: *const u64,
-    args: *const u64,
-    packed: u64,
-    callee_bits: u64,
-) -> u64 {
-    crate::codegen::static_record_stats::attempt();
-    if vm.is_null() {
-        crate::codegen::static_record_stats::decline();
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    let bits = catch_effectful_jit_u64(|| unsafe {
-        let vm = &mut *(vm as *mut Vm);
-        vm.jit_static_record_factory_impl(caller_base_ptr, args, packed, callee_bits)
-    });
-    if bits == crate::codegen::SELF_CALL_DEOPT {
-        crate::codegen::static_record_stats::decline();
-    } else {
-        crate::codegen::static_record_stats::hit();
-    }
-    bits
-}
-
 /// Win64 helper for the Tier C CROSS-CALL fast path (B83): a compiled body's
 /// `Call` site whose live callee is itself a Tier-C-compiled plain function is
 /// dispatched native→native — no `ic_call` probe, no `setup_call` frame push,

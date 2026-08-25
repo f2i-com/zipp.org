@@ -634,6 +634,16 @@ mod static_key_stats {
         }
     }
 
+    /// A one-step `FinalizeObject` build commits `n` allocation-free appends
+    /// at once; count them so the append figure keeps its per-field meaning
+    /// across both lowerings.
+    #[inline]
+    pub(super) fn bulk_appends(n: usize) {
+        if enabled() {
+            APPENDS.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+
     #[inline]
     pub(super) fn materialize() {
         if enabled() {
@@ -1154,6 +1164,52 @@ impl ObjMap {
     /// `ZIPP_NO_STATIC_KEY_PLANS` comparator.
     pub(crate) fn with_static_key_plan(plan: StaticKeyPlan) -> ObjMap {
         Self::with_static_key_plan_mode(plan, static_key_plans_enabled())
+    }
+
+    /// Fully-populated storage for a one-step `FinalizeObject` literal: every
+    /// plan key visible, `vals` already complete, all default data attributes.
+    ///
+    /// `shape` MUST be the exact fold of `shape::add` over the plan's keys with
+    /// data-attribute bits (the caller memoizes that fold per plan on its own
+    /// thread — shape ids are thread-local). Passing the fold keeps this
+    /// constructor equal in every observable respect to `with_static_key_plan`
+    /// followed by one `push_static_data` per key, which is the equivalence the
+    /// finalize tests pin.
+    ///
+    /// The caller guarantees `plan.runtime_valid()` and `vals.len() ==
+    /// plan.len()`; both are debug-asserted here.
+    pub(crate) fn finalized_from_plan(plan: StaticKeyPlan, vals: Vec<Value>, shape: u32) -> ObjMap {
+        debug_assert!(plan.runtime_valid());
+        debug_assert_eq!(vals.len(), plan.len());
+        let n = plan.len();
+        let has_element_key = plan.has_element_key();
+        let mut m = ObjMap::new();
+        m.keys = PropKeys::Planned {
+            all: plan,
+            visible_len: n,
+        };
+        m.vals = vals;
+        m.attrs = vec![PropAttr::data(); n];
+        m.shape = shape;
+        m.has_element_key = has_element_key;
+        // The cold tails the per-append `index_appended` would have built: the
+        // numeric side index for element-naming keys, and the key index past
+        // the probe threshold. Both are rare for finalize-eligible literals.
+        if has_element_key && sparse_num_index_enabled() {
+            let mut numeric = Box::new(rustc_hash::FxHashMap::default());
+            for (slot, key) in m.keys.as_ref().iter().enumerate() {
+                if let Some(idx) = canonical_array_index_key(key) {
+                    numeric.insert(idx, slot as u32);
+                }
+            }
+            m.numeric_index = Some(numeric);
+        }
+        if n >= PROP_INDEX_THRESHOLD {
+            m.index = Some(PropIndex::build(&m.keys));
+        }
+        static_key_stats::object();
+        static_key_stats::bulk_appends(n);
+        m
     }
 
     /// A map used as an engine-internal SIDE TABLE — an Array's or RegExp's

@@ -16,6 +16,11 @@ use crate::parse::token::StrVal;
 const STATIC_KEY_PLAN_MAX_FIELDS: usize = 256;
 const STATIC_KEY_PLAN_MAX_BYTES: usize = 64 * 1024;
 
+/// Field cap for the one-step `FinalizeObject` lowering. Its staged value block
+/// holds this many registers live at once, so the cap bounds literal register
+/// pressure; wider literals keep the per-field append sequence.
+const OBJECT_FINALIZE_MAX_FIELDS: usize = 16;
+
 /// Retain at most one plan's admissible name indices while the literal body is
 /// compiled. `static_keys` continues counting the full unique-static run, so a
 /// wider literal still fails `plan_names.len() == static_keys` and falls back;
@@ -1485,12 +1490,26 @@ impl<'a> FnCompiler<'a> {
             }
         }
         let all_appendable = appendable;
+        let plan_enabled = crate::bytecode::static_key_plans_enabled();
+        // `main_goal` is load-bearing, not a heuristic: a dynamically-installed
+        // program's over-cap plan degradation rewrites planned allocations to
+        // legacy hints and clears the plan pool, which a one-step finalize
+        // site cannot survive. Only the VM's root program is exempt from that
+        // path, so only it takes this lowering.
+        if plan_enabled
+            && self.cx.main_goal
+            && crate::bytecode::object_finalize_enabled()
+            && all_appendable
+            && static_keys > 0
+            && static_keys <= OBJECT_FINALIZE_MAX_FIELDS
+        {
+            return self.object_literal_finalized(props, dst, static_keys);
+        }
         let alloc_ip = self.code.len();
         self.emit(Instr::NewObject {
             dst,
             hint: static_keys.min(u16::MAX as usize) as u16,
         });
-        let plan_enabled = crate::bytecode::static_key_plans_enabled();
         let mut plan_names = Vec::with_capacity(if plan_enabled {
             static_keys.min(STATIC_KEY_PLAN_MAX_FIELDS)
         } else {
@@ -1557,47 +1576,160 @@ impl<'a> FnCompiler<'a> {
     /// arithmetic and pool widths are checked before mutating either counter or
     /// bytecode, so every decline leaves the legacy allocation intact.
     fn install_static_key_plan(&mut self, alloc_ip: usize, dst: Reg, names: &[u32]) {
+        if let Some(plan) = self.try_install_static_key_plan(names) {
+            self.code[alloc_ip] = Instr::NewPlannedObject { dst, plan };
+        }
+    }
+
+    /// Reserve one static-key plan for `names`, honouring every site/byte cap.
+    /// Returns the plan index, or `None` when a cap declines (the caller keeps
+    /// legacy allocation). Shared by the retro-patching `NewPlannedObject` path
+    /// and the one-step `FinalizeObject` lowering.
+    fn try_install_static_key_plan(&mut self, names: &[u32]) -> Option<u16> {
         if names.is_empty()
             || names.len() > STATIC_KEY_PLAN_MAX_FIELDS
             || self.static_key_plans.len() >= u16::MAX as usize
             || self.cx.static_key_plan_sites >= crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
         {
-            return;
+            return None;
         }
         let mut keys = Vec::with_capacity(names.len());
         let mut bytes = 0usize;
         for &name in names {
-            let Some(key) = self.string_constants.get(name as usize) else {
-                return;
-            };
-            let Some(next) = bytes.checked_add(key.len()) else {
-                return;
-            };
+            let key = self.string_constants.get(name as usize)?;
+            let next = bytes.checked_add(key.len())?;
             if next > STATIC_KEY_PLAN_MAX_BYTES {
-                return;
+                return None;
             }
             bytes = next;
             keys.push(key.clone());
         }
-        let Some(plan_charge) = crate::bytecode::static_key_plan_retained_charge(&keys) else {
-            return;
-        };
-        let Some(total_bytes) = self
+        let plan_charge = crate::bytecode::static_key_plan_retained_charge(&keys)?;
+        let total_bytes = self
             .cx
             .static_key_plan_retained_bytes
-            .checked_add(plan_charge)
-        else {
-            return;
-        };
+            .checked_add(plan_charge)?;
         if total_bytes > crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES {
-            return;
+            return None;
         }
         let plan = self.static_key_plans.len() as u16;
         self.static_key_plans
             .push(crate::bytecode::StaticKeyPlan::new(keys));
         self.cx.static_key_plan_sites += 1;
         self.cx.static_key_plan_retained_bytes = total_bytes;
-        self.code[alloc_ip] = Instr::NewPlannedObject { dst, plan };
+        Some(plan)
+    }
+
+    /// One-step lowering for an all-appendable literal: stage every field value
+    /// into a contiguous register block (the `NewArray` discipline — nested
+    /// scratch allocates above the block, values land in their slots), then
+    /// allocate-and-populate with a single `FinalizeObject`. Deferring the
+    /// object's creation past every value expression is unobservable: the
+    /// literal is unreachable until it completes, an abrupt value expression
+    /// discards it either way, and staged registers are GC roots. Concise
+    /// methods get their `[[HomeObject]]` wired immediately after the object
+    /// exists, before any other instruction can run.
+    fn object_literal_finalized(
+        &mut self,
+        props: &[ast::ObjectMember],
+        dst: Reg,
+        static_keys: usize,
+    ) -> R<Reg> {
+        let base = self.next_reg;
+        for _ in 0..static_keys {
+            self.alloc_reg();
+        }
+        let block_top = self.next_reg;
+        let mut names = Vec::with_capacity(static_keys);
+        let mut method_slots: Vec<Reg> = Vec::new();
+        let mut slot = base;
+        for prop in props {
+            let name = match prop {
+                ast::ObjectMember::Prop { key, value, .. } => {
+                    self.object_finalize_prop(slot, key, PropVal::Expr(value), false)?
+                }
+                ast::ObjectMember::Method { key, func } => {
+                    let name = self.object_finalize_prop(slot, key, PropVal::Func(func), true)?;
+                    method_slots.push(slot);
+                    name
+                }
+                _ => return Err("non-appendable member reached the finalize path".into()),
+            };
+            names.push(name);
+            slot += 1;
+            self.next_reg = block_top; // reclaim this value's scratch temps
+        }
+        if let Some(plan) = self.try_install_static_key_plan(&names) {
+            self.emit(Instr::FinalizeObject {
+                dst,
+                plan,
+                val_base: base,
+                count: static_keys as u16,
+            });
+        } else {
+            // Plan capacity declined: the staged block still serves the legacy
+            // allocation+append sequence with identical semantics.
+            self.emit(Instr::NewObject {
+                dst,
+                hint: static_keys.min(u16::MAX as usize) as u16,
+            });
+            for (i, &name) in names.iter().enumerate() {
+                self.emit(Instr::AppendDataProp {
+                    obj: dst,
+                    name,
+                    val: base + i as Reg,
+                });
+            }
+        }
+        for &method in &method_slots {
+            self.emit(Instr::SetHomeObject { method, home: dst });
+        }
+        // The block deliberately stays allocated (exactly `NewArray`'s
+        // discipline): the enclosing statement reclaims it. Immediate reuse
+        // would let the next expression's temps redefine the staged slots,
+        // which is what the SROA/materialization lanes prove never happens.
+        Ok(dst)
+    }
+
+    /// Compile one static-key data property's VALUE into `slot`, preserving
+    /// NamedEvaluation and concise-method semantics exactly as
+    /// `object_data_prop` does, but emitting no append — the caller finalizes
+    /// the whole literal in one step. Returns the interned key name.
+    fn object_finalize_prop(
+        &mut self,
+        slot: Reg,
+        key: &ast::PropKey,
+        val: PropVal<'_>,
+        is_method: bool,
+    ) -> R<u32> {
+        let key = static_key_text(key).ok_or("unsupported object key in the zipp-vm subset")?;
+        let name = self.string_name(&key);
+        // A concise method gets a [[HomeObject]] (for `super`); the flag scopes
+        // exactly the value compilation, as in `object_data_prop`.
+        if is_method {
+            self.cx.obj_method_super = true;
+        }
+        let v = match val {
+            PropVal::Expr(e) => self.compile_named_init(slot, e, &key)?,
+            PropVal::Func(f) => {
+                let n = match &f.name {
+                    Some(own) => own.to_string(),
+                    None => key.clone(),
+                };
+                let (id, has_up) = self.compile_func_expr(Some(n), f)?;
+                self.emit_make_callable(slot, id, has_up);
+                slot
+            }
+        };
+        self.cx.obj_method_super = false;
+        if is_method {
+            let fid = self.cx.functions.len() - 1;
+            self.cx.functions[fid].non_constructable = true; // concise method
+        }
+        if v != slot {
+            self.emit(Instr::Move { dst: slot, src: v });
+        }
+        Ok(name)
     }
 
     /// A property's value into a fresh temp, exactly as `self.expr` would have
