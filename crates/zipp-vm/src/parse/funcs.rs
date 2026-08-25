@@ -301,6 +301,10 @@ impl<'s> Parser<'s> {
     // ---- binding patterns --------------------------------------------------
 
     pub(crate) fn parse_binding_pattern(&mut self) -> PResult<Pattern> {
+        self.with_syntax_recursion(|p| p.parse_binding_pattern_guarded())
+    }
+
+    fn parse_binding_pattern_guarded(&mut self) -> PResult<Pattern> {
         if self.at(Punct::LBracket) {
             return self.parse_array_binding();
         }
@@ -733,7 +737,7 @@ impl<'s> Parser<'s> {
                     return Err(SyntaxError::new(
                         "SyntaxError: a class static block may not be decorated",
                         dec_start,
-                    ))
+                    ));
                 }
             }
         }

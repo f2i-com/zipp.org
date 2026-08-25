@@ -9,6 +9,9 @@ use crate::value::Value;
 
 /// Practical upper bound on an ArrayBuffer/TypedArray byte length. A larger
 /// request is a RangeError rather than an attempted (process-aborting) alloc.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 20;
+#[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
 impl<'p> Vm<'p> {
@@ -216,9 +219,17 @@ impl<'p> Vm<'p> {
             Some(length)
         }
     }
-    pub(crate) fn alloc_array_buffer(&mut self, byte_len: usize) -> u32 {
+    pub(crate) fn alloc_array_buffer(&mut self, byte_len: usize) -> Result<u32, Thrown> {
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(byte_len)
+            .map_err(|message| Thrown(message.into()))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(byte_len)
+            .map_err(|_| Thrown("RangeError: ArrayBuffer allocation failed".into()))?;
+        bytes.resize(byte_len, 0u8);
         let idx = self.heap.alloc(HeapObj::ArrayBuffer {
-            data: vec![0u8; byte_len].into(),
+            data: bytes.into(),
             detached: false,
         });
         if self.arraybuffer_proto != 0 {
@@ -237,14 +248,23 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        idx
+        Ok(idx)
     }
     /// Allocate a SharedArrayBuffer: TRULY-SHARED bytes (`AbData::Shared`, so a
     /// worker agent handed this buffer aliases the same memory), marked in
     /// `shared_buffers` and linked to %SharedArrayBuffer.prototype%. A growable
     /// SAB preallocates `maxByteLength` zeroed bytes; `grow` is a length store.
-    pub(crate) fn alloc_shared_array_buffer(&mut self, byte_len: usize, max: Option<usize>) -> u32 {
-        let mem = crate::heap::SharedMem::new(byte_len, max.unwrap_or(byte_len));
+    pub(crate) fn alloc_shared_array_buffer(
+        &mut self,
+        byte_len: usize,
+        max: Option<usize>,
+    ) -> Result<u32, Thrown> {
+        let capacity = max.unwrap_or(byte_len);
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(capacity)
+            .map_err(|message| Thrown(message.into()))?;
+        let mem = crate::heap::SharedMem::try_new(byte_len, capacity)
+            .map_err(|_| Thrown("RangeError: SharedArrayBuffer allocation failed".into()))?;
         let idx = self.heap.alloc(HeapObj::ArrayBuffer {
             data: crate::heap::AbData::Shared(std::sync::Arc::new(mem)),
             detached: false,
@@ -253,7 +273,7 @@ impl<'p> Vm<'p> {
         if self.sab_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.sab_proto));
         }
-        idx
+        Ok(idx)
     }
     /// Allocate a TypedArray view over `buffer`, linked to that kind's prototype.
     pub(crate) fn alloc_typed_array(
@@ -1262,7 +1282,11 @@ impl<'p> Vm<'p> {
                     (buf_len - byte_offset) / size
                 }
             };
-            if byte_offset + length * size > buf_len {
+            let end = length
+                .checked_mul(size)
+                .and_then(|n| byte_offset.checked_add(n))
+                .ok_or_else(|| Thrown("RangeError: invalid TypedArray length/offset".into()))?;
+            if end > buf_len {
                 return Err(Thrown(
                     "RangeError: invalid TypedArray length/offset".into(),
                 ));
@@ -1296,6 +1320,7 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot construct a TypedArray from an out-of-bounds or detached source".into(),
                     )
                 })?;
+                self.preflight_native_iteration_work(len as u64)?;
                 (0..len).map(|i| self.ta_element_get(src_ta, i)).collect()
             } else {
                 // A custom iterable (callable `@@iterator`) is iterated; anything
@@ -1325,6 +1350,7 @@ impl<'p> Vm<'p> {
                     } else {
                         nf as usize
                     };
+                    self.preflight_native_iteration_work(n as u64)?;
                     let mut v = Vec::with_capacity(n);
                     for i in 0..n {
                         v.push(self.get_index(a0, Value::int(i as i32))?);
@@ -1333,7 +1359,7 @@ impl<'p> Vm<'p> {
                 }
             };
             let len = src.len();
-            let buf = self.alloc_array_buffer(len * size);
+            let buf = self.alloc_array_buffer(len * size)?;
             let ta = self.alloc_typed_array(buf, kind, 0, len);
             for (i, v) in src.into_iter().enumerate() {
                 self.ta_element_set(ta.heap_index(), i, v)?;
@@ -1352,7 +1378,7 @@ impl<'p> Vm<'p> {
                 "RangeError: typed array length exceeds the maximum".into(),
             ));
         }
-        let buf = self.alloc_array_buffer(length * size);
+        let buf = self.alloc_array_buffer(length * size)?;
         Ok(self.alloc_typed_array(buf, kind, 0, length))
     }
 
@@ -1448,6 +1474,7 @@ impl<'p> Vm<'p> {
 /// to the element type here, per NumericToRawBytes. Returns the OLD element
 /// value (current value for `load`), sign/zero-extended to `i64` per the
 /// element kind; the `store` return is unused (callers return the input).
+#[cfg(not(feature = "safe-sandbox"))]
 fn sab_atomic_op(
     mem: &crate::heap::SharedMem,
     kind: u8,
@@ -1497,4 +1524,19 @@ fn sab_atomic_op(
         9 => go!(AtomicI64, i64),
         _ => go!(AtomicU64, u64),
     }
+}
+
+#[cfg(feature = "safe-sandbox")]
+fn sab_atomic_op(
+    _mem: &crate::heap::SharedMem,
+    _kind: u8,
+    _off: usize,
+    _op: &str,
+    _v: i64,
+    _repl: i64,
+) -> i64 {
+    // SharedArrayBuffer and Atomics are absent from the hardened realm. This
+    // keeps internal exhaustive call paths type-correct without exposing raw
+    // shared-memory operations to untrusted code.
+    0
 }

@@ -62,21 +62,24 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn type_of(&self, v: Value) -> &'static str {
-        if v.is_int() || v.is_double() {
-            "number"
-        } else if v.is_bool() {
-            "boolean"
-        } else if v.is_undefined() {
-            "undefined"
-        } else if v.is_null() {
-            "object"
-        } else if v.is_heap() {
+    pub(crate) fn type_of(&self, mut v: Value) -> &'static str {
+        loop {
+            if v.is_int() || v.is_double() {
+                return "number";
+            } else if v.is_bool() {
+                return "boolean";
+            } else if v.is_undefined() {
+                return "undefined";
+            } else if v.is_null() {
+                return "object";
+            } else if !v.is_heap() {
+                return "undefined";
+            }
             // An [[IsHTMLDDA]] exotic (`document.all`): `typeof` is "undefined".
             if self.is_htmldda.contains(&v.heap_index()) {
                 return "undefined";
             }
-            match self.heap.get(v.heap_index()) {
+            return match self.heap.get(v.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "string",
                 // A class is callable (with `new`), so `typeof C === "function"`.
                 // Native builtins and bound functions are callable too.
@@ -89,8 +92,16 @@ impl<'p> Vm<'p> {
                 | HeapObj::Wrapped { .. }
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. } => "function",
-                HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
-                HeapObj::Proxy { target, .. } => self.type_of(*target), // typeof = target's
+                // Transparent wrappers are guest-chainable. Unwrap them in this
+                // frame instead of recursing once per Proxy/Cell.
+                HeapObj::Cell(inner) => {
+                    v = *inner;
+                    continue;
+                }
+                HeapObj::Proxy { target, .. } => {
+                    v = *target;
+                    continue;
+                }
                 HeapObj::Symbol { .. } => "symbol",
                 HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => "bigint",
                 // The built-in constructor globals (Object/Array/Map/…) are callable.
@@ -112,9 +123,7 @@ impl<'p> Vm<'p> {
                     "function"
                 }
                 _ => "object", // Array, ordinary Object, namespace globals
-            }
-        } else {
-            "undefined"
+            };
         }
     }
 
@@ -165,7 +174,7 @@ impl<'p> Vm<'p> {
                     }
                     // No deleteProperty trap: forward to the target's [[Delete]] —
                     // re-enter the proxy-aware path so a Proxy target's own trap fires.
-                    None => self.delete_property(target, key),
+                    None => self.with_native_recursion_guard(|vm| vm.delete_property(target, key)),
                 };
             }
         }
@@ -775,7 +784,9 @@ impl<'p> Vm<'p> {
                     }
                     Ok(true)
                 }
-                None => self.ordinary_set_with_proxy_receiver(t2, receiver, key, val, strict),
+                None => self.with_native_recursion_guard(|vm| {
+                    vm.ordinary_set_with_proxy_receiver(t2, receiver, key, val, strict)
+                }),
             };
         }
         self.materialize_regexp_result_prop_for_key(target.heap_index(), key);
@@ -1203,7 +1214,9 @@ impl<'p> Vm<'p> {
                 // OrdinarySetWithOwnDescriptor consults the RECEIVER's own
                 // descriptor and defines through it, so the proxy's
                 // getOwnPropertyDescriptor and defineProperty traps fire.
-                None => self.ordinary_set_with_proxy_receiver(target, obj, key, val, strict),
+                None => self.with_native_recursion_guard(|vm| {
+                    vm.ordinary_set_with_proxy_receiver(target, obj, key, val, strict)
+                }),
             };
         }
         let idx = obj.heap_index();

@@ -15,9 +15,13 @@ resolver = "2"
 members = [
     "crates/zipp-vm",      # the JavaScript engine: register VM + native x86-64/ARM64 JITs
     "crates/zipp-cli",     # `zipp js file.js` / `zipp mjs file.mjs`
-    "crates/zipp-wasm",    # wasm-bindgen embedding: a persistent VM for browser hosts
     "crates/regress-fork", # our fork of regress 0.11.1 — the regex engine (see its FORK.md)
 ]
+# The hardened WebAssembly embedding intentionally lives in its own workspace.
+# Cargo unifies features across a workspace: keeping it here would combine the
+# native CLI's JIT with zipp-wasm's `safe-sandbox` feature, defeating the
+# compile-time guarantee that the sandbox build contains no unsafe/JIT code.
+exclude = ["crates/zipp-wasm"]
 
 [workspace.package]
 version = "0.0.1"

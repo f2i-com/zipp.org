@@ -7,6 +7,30 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Host timers are not ECMAScript objects, so reject non-finite delays instead
+/// of passing them to `Duration::from_secs_f64` (which panics for +Infinity).
+/// Finite but unrepresentably distant deadlines are capped to one year, as the
+/// Atomics waiter deadline path already does.
+fn host_timeout_duration(timeout_ms: f64) -> Result<std::time::Duration, Thrown> {
+    if !timeout_ms.is_finite() {
+        return Err(Thrown("RangeError: timer delay must be finite".into()));
+    }
+    let seconds = (timeout_ms.max(0.0) / 1000.0).min(86_400.0 * 365.0);
+    Ok(std::time::Duration::from_secs_f64(seconds))
+}
+
+/// Upper bound for one event-loop pass over a timer queue: two linear passes
+/// plus the in-place comparison sort of all timers that may be due together.
+fn timer_queue_work_bound(len: usize) -> u64 {
+    let n = len as u64;
+    let sort_levels = if n <= 1 {
+        0
+    } else {
+        u64::BITS - (n - 1).leading_zeros()
+    } as u64;
+    n.saturating_mul(sort_levels.saturating_add(2))
+}
+
 impl<'p> Vm<'p> {
     /// IteratorToList with a PRE-FETCHED @@iterator method (the observable
     /// trace: no second @@iterator get; `next` fetched once and cached; per
@@ -31,7 +55,19 @@ impl<'p> Vm<'p> {
             if self.truthy(done) {
                 break;
             }
-            out.push(self.get_prop(res, "value")?);
+            let next_count = out.len().saturating_add(1);
+            if let Err(error) = self.preflight_native_iteration_work(next_count as u64) {
+                self.iterator_close_quiet(iter);
+                return Err(error);
+            }
+            let value = self.get_prop(res, "value")?;
+            if out.try_reserve(1).is_err() {
+                self.iterator_close_quiet(iter);
+                return Err(Thrown(
+                    "RangeError: iterator result allocation failed".into(),
+                ));
+            }
+            out.push(value);
         }
         Ok(out)
     }
@@ -67,6 +103,7 @@ impl<'p> Vm<'p> {
         } else {
             nf as usize
         };
+        self.preflight_native_iteration_work(n as u64)?;
         Ok((n, None))
     }
 
@@ -1462,17 +1499,17 @@ impl<'p> Vm<'p> {
     /// Pierces BOUND functions and PROXIES (the spec recurses to the target —
     /// before the tag check, since `new other.Proxy(mainTarget, …)` realm-tags
     /// the proxy object itself while its function realm is the TARGET's).
-    pub(crate) fn get_function_realm(&self, f: Value) -> u32 {
-        if f.is_heap() {
+    pub(crate) fn get_function_realm(&self, mut f: Value) -> u32 {
+        loop {
+            if !f.is_heap() {
+                return 0;
+            }
             match self.heap.get(f.heap_index()) {
                 HeapObj::Bound { target, .. } | HeapObj::Proxy { target, .. } => {
-                    return self.get_function_realm(*target);
+                    f = *target;
                 }
-                _ => {}
+                _ => return self.obj_realm.get(&f.heap_index()).copied().unwrap_or(0),
             }
-            self.obj_realm.get(&f.heap_index()).copied().unwrap_or(0)
-        } else {
-            0
         }
     }
 
@@ -1580,19 +1617,23 @@ impl<'p> Vm<'p> {
     /// Semantics preserved exactly: tombstoned (deleted) slots are skipped,
     /// entries appended after the iterator was created ARE seen, and exhaustion
     /// LATCHES via `usize::MAX` so a later add is not iterated.
-    pub(crate) fn collection_iter_step(&mut self, it_idx: u32) -> Option<(Value, bool)> {
+    pub(crate) fn collection_iter_step(
+        &mut self,
+        it_idx: u32,
+    ) -> Result<Option<(Value, bool)>, Thrown> {
         let (live, mut index) = match self.heap.get(it_idx) {
             HeapObj::Iterator { live, index, .. } => (*live, *index),
-            _ => return None,
+            _ => return Ok(None),
         };
         if let Some((coll, _)) = live {
             if matches!(self.heap.get(coll), HeapObj::TypedArray { .. }) {
-                return None;
+                return Ok(None);
             }
         }
         let out = if let Some((coll, kind)) = live {
             let mut result = (Value::UNDEFINED, true);
             if index != usize::MAX {
+                let mut scanned = 0u64;
                 loop {
                     // Copy out the (key, value) at `index` (or stop), releasing
                     // the heap borrow before any allocation below.
@@ -1613,6 +1654,8 @@ impl<'p> Vm<'p> {
                         }
                         _ => break, // collection gone
                     };
+                    scanned = scanned.saturating_add(1);
+                    self.preflight_native_iteration_work(scanned)?;
                     index += 1;
                     if let Some((k, v)) = pair {
                         let yielded = match kind {
@@ -1644,10 +1687,10 @@ impl<'p> Vm<'p> {
                         (Value::UNDEFINED, true)
                     }
                 }
-                _ => return None,
+                _ => return Ok(None),
             }
         };
-        Some(out)
+        Ok(Some(out))
     }
 
     pub(crate) fn call_native(
@@ -1781,7 +1824,15 @@ impl<'p> Vm<'p> {
             }
             PROTO_TO_STRING => {
                 let tag = self.object_to_string_tag(this)?;
-                self.alloc_str(format!("[object {tag}]"))
+                let total = tag
+                    .len()
+                    .checked_add(9)
+                    .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                let mut out = self.guest_string_with_capacity(total)?;
+                out.push_str("[object ");
+                out.push_str(&tag);
+                out.push(']');
+                self.alloc_str(out)
             }
             ERROR_TO_STRING => {
                 // Step 2: a non-Object receiver is a TypeError (before any Get).
@@ -1805,27 +1856,30 @@ impl<'p> Vm<'p> {
                     self.to_js_string(mv)?
                 };
                 let s = if name.is_empty() {
+                    self.preflight_guest_string_size(msg.len())?;
                     msg
                 } else if msg.is_empty() {
+                    self.preflight_guest_string_size(name.len())?;
                     name
                 } else {
-                    format!("{name}: {msg}")
+                    let total = name
+                        .len()
+                        .checked_add(2)
+                        .and_then(|n| n.checked_add(msg.len()))
+                        .ok_or_else(invalid_native_string_length)?;
+                    let mut out = self.guest_string_with_capacity(total)?;
+                    out.push_str(&name);
+                    out.push_str(": ");
+                    out.push_str(&msg);
+                    out
                 };
                 self.alloc_str(s)
             }
             SYMBOL_TO_STRING => {
                 // `Symbol.prototype.toString` → "Symbol(description)".
                 let sym = self.this_symbol_value(this, "toString")?;
-                let desc = match self.heap.get(sym.heap_index()) {
-                    HeapObj::Symbol { desc, .. } => *desc,
-                    _ => Value::UNDEFINED,
-                };
-                let d = if desc == Value::UNDEFINED {
-                    String::new()
-                } else {
-                    self.display(desc)
-                };
-                self.alloc_str(format!("Symbol({d})"))
+                let descriptive = self.symbol_descriptive_string(sym)?;
+                self.alloc_str(descriptive)
             }
             SYMBOL_VALUE_OF => {
                 // `Symbol.prototype.valueOf` → the Symbol primitive itself.
@@ -1956,15 +2010,35 @@ impl<'p> Vm<'p> {
                     if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
                         let si = this.heap_index();
                         self.heap.flatten(si);
-                        match self.heap.get(si) {
-                            HeapObj::Str(js) => js.code_points().collect(),
-                            _ => Vec::new(),
+                        let byte_len = match self.heap.get(si) {
+                            HeapObj::Str(js) => js.as_bytes().len(),
+                            _ => 0,
+                        };
+                        self.preflight_native_iteration_work(byte_len as u64)?;
+                        let mut list = Vec::new();
+                        list.try_reserve_exact(byte_len).map_err(|_| {
+                            Thrown("RangeError: string iterator allocation failed".into())
+                        })?;
+                        if let HeapObj::Str(js) = self.heap.get(si) {
+                            list.extend(js.code_points());
                         }
+                        list
                     } else {
                         let s = self.to_js_string(this)?;
-                        s.chars().map(|c| c as u32).collect()
+                        self.preflight_native_iteration_work(s.len() as u64)?;
+                        let mut list = Vec::new();
+                        list.try_reserve_exact(s.len()).map_err(|_| {
+                            Thrown("RangeError: string iterator allocation failed".into())
+                        })?;
+                        list.extend(s.chars().map(u32::from));
+                        list
                     };
-                let cps: Vec<Value> = cp_list.into_iter().map(|cp| self.str_from_cp(cp)).collect();
+                let mut cps: Vec<Value> = Vec::new();
+                cps.try_reserve_exact(cp_list.len())
+                    .map_err(|_| Thrown("RangeError: string iterator allocation failed".into()))?;
+                for cp in cp_list {
+                    cps.push(self.str_from_cp(cp));
+                }
                 self.make_iterator(cps, self.string_iter_proto)
             }
             SYMBOL_FOR => {
@@ -1974,7 +2048,9 @@ impl<'p> Vm<'p> {
                     sym
                 } else {
                     let desc = self.alloc_str(key.clone());
-                    let prop_key = format!("@@for:{key}");
+                    let mut prop_key = String::new();
+                    self.append_guest_string(&mut prop_key, "@@for:")?;
+                    self.append_guest_string(&mut prop_key, &key)?;
                     let sym = self.make_named_symbol(desc, &prop_key);
                     self.symbol_registry.insert(key, sym);
                     sym
@@ -2261,64 +2337,11 @@ impl<'p> Vm<'p> {
                     .str_wtf8_cow(a0.heap_index())
                     .unwrap()
                     .into_owned();
-                // EncodeForRegExpEscape's "other punctuators" / WhiteSpace /
-                // LineTerminator / lone-surrogate set: hex-escaped (\xNN if <=0xFF,
-                // else \uNNNN per UTF-16 code unit). Tab/VT/FF/LF/CR use the control
-                // escapes below, so they are excluded here.
-                let other = |u: u32| -> bool {
-                    matches!(
-                        u,
-                        // ,-=<>#&!%:;@~'`"
-                        0x2c | 0x2d | 0x3d | 0x3c | 0x3e | 0x23 | 0x26 | 0x21 | 0x25 | 0x3a
-                            | 0x3b | 0x40 | 0x7e | 0x27 | 0x60 | 0x22
-                        // WhiteSpace (minus tab/VT/FF) + ZWNBSP
-                            | 0x20 | 0xA0 | 0x1680 | 0x202F | 0x205F | 0x3000 | 0xFEFF
-                        // LineTerminator (minus LF/CR)
-                            | 0x2028 | 0x2029
-                    ) || (0x2000..=0x200A).contains(&u)
-                        || (0xD800..=0xDFFF).contains(&u)
-                };
-                let mut out = String::new();
-                for u in crate::heap::wtf8_code_points(&bytes) {
-                    // A LONE surrogate has no `char`: it is in the `other` set —
-                    // emit its \uNNNN escape directly.
-                    let c = match char::from_u32(u) {
-                        Some(c) => c,
-                        None => {
-                            out.push_str(&format!("\\u{u:04x}"));
-                            continue;
-                        }
-                    };
-                    if out.is_empty() && (c.is_ascii_digit() || c.is_ascii_alphabetic()) {
-                        // A leading digit/letter is hex-escaped so the escape can't
-                        // fuse with a preceding regex token (e.g. \0, a quantifier).
-                        out.push_str(&format!("\\x{u:02x}"));
-                        continue;
-                    }
-                    match c {
-                        '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{'
-                        | '}' | '|' | '/' => {
-                            out.push('\\');
-                            out.push(c);
-                        }
-                        '\t' => out.push_str("\\t"),
-                        '\n' => out.push_str("\\n"),
-                        '\u{0b}' => out.push_str("\\v"),
-                        '\u{0c}' => out.push_str("\\f"),
-                        '\r' => out.push_str("\\r"),
-                        _ if other(u) => {
-                            if u <= 0xFF {
-                                out.push_str(&format!("\\x{u:02x}"));
-                            } else {
-                                let mut buf = [0u16; 2];
-                                for cu in c.encode_utf16(&mut buf) {
-                                    out.push_str(&format!("\\u{cu:04x}"));
-                                }
-                            }
-                        }
-                        _ => out.push(c),
-                    }
-                }
+                self.preflight_native_iteration_work((bytes.len() as u64).saturating_mul(2))?;
+                let out_len = regexp_escape_output_len(&bytes)?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                regexp_escape_into(&bytes, &mut out);
+                debug_assert_eq!(out.len(), out_len);
                 self.alloc_str(out)
             }
             REGEXP_TO_STRING => {
@@ -2338,8 +2361,20 @@ impl<'p> Vm<'p> {
                         // assemble `/src/flags` over the exact WTF-8 bytes so
                         // toString round-trips the surrogates too.
                         if let Some(b) = self.regexp_exact_source.get(&this.heap_index()) {
-                            let esc = self.escaped_source_wtf8(b);
-                            let mut out = Vec::with_capacity(esc.len() + f.len() + 2);
+                            self.preflight_native_iteration_work(
+                                (b.len() as u64).saturating_mul(2),
+                            )?;
+                            let esc = self.escaped_source_wtf8(b)?;
+                            let total = esc
+                                .len()
+                                .checked_add(f.len())
+                                .and_then(|n| n.checked_add(2))
+                                .ok_or_else(invalid_native_string_length)?;
+                            self.preflight_guest_string_size(total)?;
+                            let mut out = Vec::new();
+                            out.try_reserve_exact(total).map_err(|_| {
+                                Thrown("RangeError: string allocation failed".into())
+                            })?;
                             out.push(b'/');
                             out.extend_from_slice(&esc);
                             out.push(b'/');
@@ -2347,7 +2382,8 @@ impl<'p> Vm<'p> {
                             let js = crate::heap::JsStr::from_wtf8(out);
                             return Ok(Value::heap(self.heap.alloc_js(js)));
                         }
-                        (self.escaped_source(&s), f)
+                        self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                        (self.escaped_source(&s)?, f)
                     }
                     // Steps 3-4 interleave each Get with its ToString: `source`'s
                     // toString runs before `flags` is even read.
@@ -2358,7 +2394,17 @@ impl<'p> Vm<'p> {
                         (src, self.to_js_string(f)?)
                     }
                 };
-                self.alloc_str(format!("/{src}/{flg}"))
+                let total = src
+                    .len()
+                    .checked_add(flg.len())
+                    .and_then(|n| n.checked_add(2))
+                    .ok_or_else(invalid_native_string_length)?;
+                let mut out = self.guest_string_with_capacity(total)?;
+                out.push('/');
+                out.push_str(&src);
+                out.push('/');
+                out.push_str(&flg);
+                self.alloc_str(out)
             }
             REGEXP_GET_SOURCE => {
                 if !this.is_heap() {
@@ -2373,7 +2419,7 @@ impl<'p> Vm<'p> {
                     let s = source.clone();
                     // Exact-WTF-8 when the side table has the pattern's exact
                     // bytes (lone surrogates round-trip), else lossy.
-                    self.regexp_source_value(idx, &s)
+                    self.regexp_source_value(idx, &s)?
                 } else {
                     return Err(Thrown(
                         "TypeError: get source called on a non-RegExp object".into(),
@@ -2659,7 +2705,11 @@ impl<'p> Vm<'p> {
                 let matcher_idx = matcher.heap_index();
                 // lastIndex = ToLength(Get(R, "lastIndex")); Set(matcher, lastIndex).
                 let li_v = self.get_prop(this, "lastIndex")?;
-                let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+                let li_u64 = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+                // A value beyond the host's addressable string range is still
+                // just an out-of-range RegExp index; saturate instead of
+                // wrapping 2^32 to zero on wasm32.
+                let li = usize::try_from(li_u64).unwrap_or(usize::MAX);
                 self.set_regexp_last_index(matcher_idx, li);
                 // Build a LAZY %RegExpStringIterator%: an empty Iterator object whose
                 // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
@@ -2764,9 +2814,7 @@ impl<'p> Vm<'p> {
                 // throwing accessor propagates before the bound function exists).
                 // HasOwnProperty goes through the DYNAMIC variant so a Proxy
                 // target's getOwnPropertyDescriptor trap fires (the plain
-                // `has_own_property` is trap-blind); the values themselves
-                // resolve lazily from the target for ordinary callables, so the
-                // Get results are only consumed by the Proxy snapshot below.
+                // `has_own_property` is trap-blind).
                 let mut length_get = None;
                 if self.has_own_property_dyn(this, "length")? {
                     length_get = Some(self.get_prop(this, "length")?);
@@ -2783,63 +2831,65 @@ impl<'p> Vm<'p> {
                     args: bound,
                 });
                 self.proto_of.insert(idx, bound_proto);
-                // A PROXY target's name/length do not resolve through the lazy
-                // effective-name machinery (the trap results belong to the
-                // proxy, not the underlying callable): snapshot the spec values
-                // as EXPLICIT own properties — SetFunctionLength/Name's
+                // Snapshot the spec values as EXPLICIT own properties —
+                // SetFunctionLength/Name's
                 // non-writable, non-enumerable, configurable pair — computed as
                 // "bound " + (String name, else "") and
                 // max(0, ToIntegerOrInfinity(length) − boundArgs)
                 // (bound-length-and-name.js).
-                if matches!(self.heap.get(this.heap_index()), HeapObj::Proxy { .. }) {
-                    let nbound = args.len().saturating_sub(1) as f64;
-                    let len = match length_get {
-                        Some(v) if v.is_int() => (v.as_int() as f64 - nbound).max(0.0),
-                        Some(v) if v.is_double() => {
-                            let d = v.as_f64();
-                            if d.is_nan() {
-                                0.0
-                            } else {
-                                (d.trunc() - nbound).max(0.0)
-                            }
-                        }
-                        _ => 0.0,
-                    };
-                    let tname =
-                        if name_get.is_heap() && self.heap.is_str_like(name_get.heap_index()) {
-                            self.display(name_get)
+                let nbound = args.len().saturating_sub(1) as f64;
+                let len = match length_get {
+                    Some(v) if v.is_int() => (v.as_int() as f64 - nbound).max(0.0),
+                    Some(v) if v.is_double() => {
+                        let d = v.as_f64();
+                        if d.is_nan() {
+                            0.0
                         } else {
-                            String::new()
-                        };
-                    let attr = PropAttr {
-                        writable: false,
-                        enumerable: false,
-                        configurable: true,
-                        accessor: false,
-                        setter: Value::UNDEFINED,
-                    };
-                    let nv = self.alloc_str(format!("bound {tname}"));
-                    let lv = if len.is_finite()
-                        && len >= 0.0
-                        && len <= i32::MAX as f64
-                        && len.fract() == 0.0
-                    {
-                        Value::int(len as i32)
-                    } else {
-                        Value::num(len)
-                    };
-                    let m = self
-                        .fn_props
-                        .entry(idx)
-                        .or_insert_with(ObjMap::new_side_table);
-                    m.define("name", nv, attr);
-                    m.define("length", lv, attr);
-                    // The explicit pair IS the bound function's name/length —
-                    // suppress the synthesized intrinsics so they cannot
-                    // reappear if an explicit one is later deleted.
-                    self.deleted_callable_intrinsics.insert((idx, 0));
-                    self.deleted_callable_intrinsics.insert((idx, 1));
-                }
+                            (d.trunc() - nbound).max(0.0)
+                        }
+                    }
+                    _ => 0.0,
+                };
+                let tname = if name_get.is_heap() && self.heap.is_str_like(name_get.heap_index()) {
+                    self.to_js_string(name_get)?
+                } else {
+                    String::new()
+                };
+                let attr = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                let name_len = tname
+                    .len()
+                    .checked_add("bound ".len())
+                    .ok_or_else(invalid_native_string_length)?;
+                let mut bound_name = self.guest_string_with_capacity(name_len)?;
+                bound_name.push_str("bound ");
+                bound_name.push_str(&tname);
+                let nv = self.alloc_str(bound_name);
+                let lv = if len.is_finite()
+                    && len >= 0.0
+                    && len <= i32::MAX as f64
+                    && len.fract() == 0.0
+                {
+                    Value::int(len as i32)
+                } else {
+                    Value::num(len)
+                };
+                let m = self
+                    .fn_props
+                    .entry(idx)
+                    .or_insert_with(ObjMap::new_side_table);
+                m.define("name", nv, attr);
+                m.define("length", lv, attr);
+                // The explicit pair IS the bound function's name/length —
+                // suppress the synthesized intrinsics so they cannot reappear
+                // if an explicit one is later deleted.
+                self.deleted_callable_intrinsics.insert((idx, 0));
+                self.deleted_callable_intrinsics.insert((idx, 1));
                 Value::heap(idx)
             }
             FN_TO_STRING => {
@@ -2887,10 +2937,24 @@ impl<'p> Vm<'p> {
                     )),
                 };
                 let out = match stored {
-                    Some(s) => s,
+                    Some(s) => {
+                        self.preflight_guest_string_size(s.len())?;
+                        s
+                    }
                     None => {
                         let name = self.callable_name(this);
-                        format!("function {name}() {{ [native code] }}")
+                        const OPEN: &str = "function ";
+                        const CLOSE: &str = "() { [native code] }";
+                        let total = OPEN
+                            .len()
+                            .checked_add(name.len())
+                            .and_then(|n| n.checked_add(CLOSE.len()))
+                            .ok_or_else(invalid_native_string_length)?;
+                        let mut source = self.guest_string_with_capacity(total)?;
+                        source.push_str(OPEN);
+                        source.push_str(&name);
+                        source.push_str(CLOSE);
+                        source
                     }
                 };
                 self.alloc_str(out)
@@ -2993,8 +3057,17 @@ impl<'p> Vm<'p> {
                             let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
                                 self.ta_from_source(a0)?
                             } else {
-                                (args.len(), Some(args.to_vec()))
+                                self.preflight_native_iteration_work(args.len() as u64)?;
+                                let mut list = Vec::new();
+                                list.try_reserve_exact(args.len()).map_err(|_| {
+                                    Thrown(
+                                        "RangeError: typed array source allocation failed".into(),
+                                    )
+                                })?;
+                                list.extend_from_slice(args);
+                                (args.len(), Some(list))
                             };
+                            self.preflight_native_iteration_work(n as u64)?;
                             let target = self.construct(this, &[Value::num(n as f64)])?;
                             // TypedArrayCreate: ValidateTypedArray in write mode —
                             // a non-TypedArray, an immutable-backed result, or one
@@ -3061,10 +3134,17 @@ impl<'p> Vm<'p> {
                 let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
                     self.ta_from_source(a0)?
                 } else {
-                    (args.len(), Some(args.to_vec()))
+                    self.preflight_native_iteration_work(args.len() as u64)?;
+                    let mut list = Vec::new();
+                    list.try_reserve_exact(args.len()).map_err(|_| {
+                        Thrown("RangeError: typed array source allocation failed".into())
+                    })?;
+                    list.extend_from_slice(args);
+                    (args.len(), Some(list))
                 };
+                self.preflight_native_iteration_work(n as u64)?;
                 let size = native::TA_KINDS[kind as usize].1;
-                let buf = self.alloc_array_buffer(n * size);
+                let buf = self.alloc_array_buffer(n * size)?;
                 let target = self.alloc_typed_array(buf, kind, 0, n);
                 let tidx = target.heap_index();
                 for i in 0..n {
@@ -3145,8 +3225,17 @@ impl<'p> Vm<'p> {
                     .to_number_coerce(args.get(1).copied().unwrap_or(Value::UNDEFINED))?
                     .max(0.0);
                 if self.is_callable(cb) {
-                    let due = crate::vm::clock::Instant::now()
-                        + std::time::Duration::from_secs_f64(ms / 1000.0);
+                    let next_len = self
+                        .timer_queue
+                        .len()
+                        .checked_add(1)
+                        .ok_or_else(|| Thrown("RangeError: timer queue is too large".into()))?;
+                    let delay = host_timeout_duration(ms)?;
+                    self.preflight_native_iteration_work(timer_queue_work_bound(next_len))?;
+                    self.timer_queue
+                        .try_reserve(1)
+                        .map_err(|_| Thrown("RangeError: timer queue allocation failed".into()))?;
+                    let due = crate::vm::clock::Instant::now() + delay;
                     self.timer_queue.push((due, cb));
                 }
                 Value::UNDEFINED
@@ -3210,9 +3299,8 @@ impl<'p> Vm<'p> {
             }
             GLOBAL_PRINT => {
                 // Mirrors the Print instruction (console.log): inspect each
-                // argument, join with spaces, append one stdout line.
-                let parts: Vec<String> = args.iter().map(|&v| self.inspect(v)).collect();
-                let line = parts.join(" ");
+                // argument into one bounded buffer, append one stdout line.
+                let line = self.inspect_line(args.len(), |i| args[i]);
                 #[cfg(feature = "instrument")]
                 self.instrument_output_line(&line)
                     .map_err(|msg| Thrown(msg.into()))?;
@@ -3223,7 +3311,7 @@ impl<'p> Vm<'p> {
                 let ms = self
                     .to_number_coerce(args.first().copied().unwrap_or(Value::UNDEFINED))?
                     .max(0.0);
-                std::thread::sleep(std::time::Duration::from_secs_f64(ms / 1000.0));
+                std::thread::sleep(host_timeout_duration(ms)?);
                 Value::UNDEFINED
             }
             MODULE_DEP_FAIL => {
@@ -4035,10 +4123,11 @@ impl<'p> Vm<'p> {
                 match self.object_define_property(a0, &key, desc) {
                     Ok(()) => Value::bool(true),
                     Err(e)
-                        if define_trap
-                            && !e.0.starts_with(
-                                "TypeError: proxy 'defineProperty' trap returned falsish",
-                            ) =>
+                        if e.0.starts_with("RangeError:")
+                            || (define_trap
+                                && !e.0.starts_with(
+                                    "TypeError: proxy 'defineProperty' trap returned falsish",
+                                )) =>
                     {
                         return Err(e);
                     }
@@ -4252,12 +4341,21 @@ impl<'p> Vm<'p> {
                     if self.truthy(done) {
                         break;
                     }
+                    let next_count = nums.len().saturating_add(1);
+                    if let Err(error) = self.preflight_native_iteration_work(next_count as u64) {
+                        self.iterator_close_quiet(iter);
+                        return Err(error);
+                    }
                     let v = self.get_prop(res, "value")?;
                     if !(v.is_int() || v.is_double()) {
                         let _ = self.iterator_close(iter);
                         return Err(Thrown(
                             "TypeError: Math.sumPrecise: each element must be a Number".into(),
                         ));
+                    }
+                    if nums.try_reserve(1).is_err() {
+                        self.iterator_close_quiet(iter);
+                        return Err(Thrown("RangeError: precise sum allocation failed".into()));
                     }
                     nums.push(v.as_f64());
                 }
@@ -4414,7 +4512,7 @@ impl<'p> Vm<'p> {
                 // Live Map/Set, or a snapshot iterator. Shared with the
                 // `IterNext` opcode, which takes the pair and never builds the
                 // result object — see `collection_iter_step`.
-                let (val, done) = match self.collection_iter_step(it_idx) {
+                let (val, done) = match self.collection_iter_step(it_idx)? {
                     Some(p) => p,
                     // Unreachable from here: the TypedArray-backed case is
                     // handled above and is the only thing that answers `None`.
@@ -4823,9 +4921,18 @@ impl<'p> Vm<'p> {
             // `host == None` and throws rather than aliasing — the honest failure.
             HOST_CALL => {
                 let kind = self.to_js_string(a0)?;
-                let mut rest: Vec<String> = Vec::with_capacity(args.len().saturating_sub(1));
+                self.preflight_native_iteration_work(args.len().saturating_sub(1) as u64)?;
+                let mut aggregate = kind.len();
+                self.preflight_guest_string_size(aggregate)?;
+                let rest_len = args.len().saturating_sub(1);
+                let mut rest: Vec<String> = Vec::new();
+                rest.try_reserve_exact(rest_len)
+                    .map_err(|_| Thrown("RangeError: host argument allocation failed".into()))?;
                 for &a in args.iter().skip(1) {
-                    rest.push(self.to_js_string(a)?);
+                    let value = self.to_js_string(a)?;
+                    aggregate = checked_native_output_add(aggregate, value.len())?;
+                    self.preflight_guest_string_size(aggregate)?;
+                    rest.push(value);
                 }
                 let Some(mut host) = self.host.take() else {
                     return Err(Thrown(format!(
@@ -4836,8 +4943,14 @@ impl<'p> Vm<'p> {
                 let reply = host(&kind, &rest);
                 self.host = Some(host);
                 match reply {
-                    Ok(s) => self.alloc_str(s),
-                    Err(e) => return Err(Thrown(e)),
+                    Ok(s) => {
+                        self.preflight_guest_string_size(s.len())?;
+                        self.alloc_str(s)
+                    }
+                    Err(e) => {
+                        self.preflight_guest_string_size(e.len())?;
+                        return Err(Thrown(e));
+                    }
                 }
             }
             // Global functions as values.
@@ -4870,54 +4983,58 @@ impl<'p> Vm<'p> {
                 // Encode 6.2.c: a LONE surrogate is a URIError. The lossy
                 // coercion above hides it (U+FFFD) — check the exact bytes.
                 self.uri_check_wellformed(a0)?;
-                match uri_encode(&s, b"#;/?:@&=+$,") {
-                    Ok(r) => self.alloc_str(r),
-                    Err(_) => return Err(Thrown("URIError: URI malformed".into())),
-                }
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let out_len = uri_encode_output_len(&s, b"#;/?:@&=+$,")?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                uri_encode_into(&s, b"#;/?:@&=+$,", &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
             }
             GLOBAL_ENCODE_URI_COMPONENT => {
                 let s = self.to_js_string(a0)?;
                 self.uri_check_wellformed(a0)?; // lone surrogate -> URIError
-                match uri_encode(&s, b"") {
-                    Ok(r) => self.alloc_str(r),
-                    Err(_) => return Err(Thrown("URIError: URI malformed".into())),
-                }
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let out_len = uri_encode_output_len(&s, b"")?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                uri_encode_into(&s, b"", &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
             }
             GLOBAL_DECODE_URI => {
                 // The input must be read EXACTLY (a raw lone surrogate is a
                 // non-'%' code unit the Decode algorithm copies verbatim).
                 let sv = self.to_str_value(a0)?;
-                let bytes = self
-                    .heap
-                    .str_wtf8_cow(sv.heap_index())
-                    .map(|c| c.into_owned())
-                    .unwrap_or_default();
-                match uri_decode(&bytes, b";/?:@&=+$,#") {
-                    Ok(r) => Value::heap(self.heap.alloc_js(r)),
-                    Err(_) => return Err(Thrown("URIError: URI malformed".into())),
-                }
+                let r = {
+                    let bytes = self.heap.str_wtf8_cow(sv.heap_index()).unwrap_or_default();
+                    self.preflight_native_iteration_work(bytes.len() as u64)?;
+                    uri_decode(&bytes, b";/?:@&=+$,#")?
+                };
+                Value::heap(self.heap.alloc_js(r))
             }
             GLOBAL_DECODE_URI_COMPONENT => {
                 let sv = self.to_str_value(a0)?;
-                let bytes = self
-                    .heap
-                    .str_wtf8_cow(sv.heap_index())
-                    .map(|c| c.into_owned())
-                    .unwrap_or_default();
-                match uri_decode(&bytes, b"") {
-                    Ok(r) => Value::heap(self.heap.alloc_js(r)),
-                    Err(_) => return Err(Thrown("URIError: URI malformed".into())),
-                }
+                let r = {
+                    let bytes = self.heap.str_wtf8_cow(sv.heap_index()).unwrap_or_default();
+                    self.preflight_native_iteration_work(bytes.len() as u64)?;
+                    uri_decode(&bytes, b"")?
+                };
+                Value::heap(self.heap.alloc_js(r))
             }
             GLOBAL_ESCAPE => {
                 let s = self.to_js_string(a0)?;
-                let r = escape_str(&s);
-                self.alloc_str(r)
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
+                let out_len = escape_output_len(&s)?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                escape_str_into(&s, &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
             }
             GLOBAL_UNESCAPE => {
                 let s = self.to_js_string(a0)?;
-                let r = unescape_str(&s);
-                self.alloc_str(r)
+                self.preflight_native_iteration_work(s.len() as u64)?;
+                self.preflight_guest_string_size(s.len())?;
+                let r = unescape_str(&s)?;
+                Value::heap(self.heap.alloc_js(r))
             }
             U8_TO_BASE64 => {
                 let idx = self.u8_brand(this)?;
@@ -4954,8 +5071,12 @@ impl<'p> Vm<'p> {
                 let bytes = self
                     .u8_bytes(idx)
                     .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
-                let s = to_base64(&bytes, url, omit);
-                self.alloc_str(s)
+                self.preflight_native_iteration_work(bytes.len() as u64)?;
+                let out_len = base64_output_len(bytes.len(), omit)?;
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                to_base64_into(&bytes, url, omit, &mut out);
+                debug_assert_eq!(out.len(), out_len);
+                self.alloc_str(out)
             }
             U8_FROM_BASE64 => {
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -4967,11 +5088,12 @@ impl<'p> Vm<'p> {
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let (url, lch) = self.read_b64_decode_opts(opts)?;
                 let s = self.to_js_string(arg)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
                 let (_, b, err) = from_base64(&s, url, lch, usize::MAX);
                 if let Some(e) = err {
                     return Err(e);
                 }
-                let buf = self.alloc_array_buffer(b.len());
+                let buf = self.alloc_array_buffer(b.len())?;
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
                     data.copy_from_slice(&b);
                 }
@@ -4999,6 +5121,7 @@ impl<'p> Vm<'p> {
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let (url, lch) = self.read_b64_decode_opts(opts)?;
                 let s = self.to_js_string(arg)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
                 let max = self
                     .ta_effective_len(idx)
                     .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
@@ -5029,7 +5152,12 @@ impl<'p> Vm<'p> {
                 let bytes = self
                     .u8_bytes(idx)
                     .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
-                let mut s = String::with_capacity(bytes.len() * 2);
+                self.preflight_native_iteration_work(bytes.len() as u64)?;
+                let out_len = bytes
+                    .len()
+                    .checked_mul(2)
+                    .ok_or_else(invalid_native_string_length)?;
+                let mut s = self.guest_string_with_capacity(out_len)?;
                 for b in bytes {
                     let h = hex_lower(b);
                     s.push(h[0] as char);
@@ -5058,6 +5186,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let s = self.to_js_string(arg)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
                 let max = self
                     .ta_effective_len(idx)
                     .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
@@ -5092,11 +5221,12 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let s = self.to_js_string(arg)?;
+                self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
                 let (_, bytes, err) = from_hex(&s, usize::MAX);
                 if let Some(e) = err {
                     return Err(e);
                 }
-                let buf = self.alloc_array_buffer(bytes.len());
+                let buf = self.alloc_array_buffer(bytes.len())?;
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
                     data.copy_from_slice(&bytes);
                 }
@@ -5153,7 +5283,16 @@ impl<'p> Vm<'p> {
                 // WTF-8 build: a surrogate code point passes through as a real
                 // lone surrogate (and a high+low argument pair canonicalizes
                 // into the astral scalar, matching the UTF-16 join semantics).
-                let mut out: Vec<u8> = Vec::with_capacity(args.len());
+                self.preflight_native_iteration_work(args.len() as u64)?;
+                let capacity = args
+                    .len()
+                    .checked_mul(4)
+                    .filter(|&n| n <= MAX_STRING_BYTES)
+                    .ok_or_else(invalid_native_string_length)?;
+                self.preflight_guest_string_size(capacity)?;
+                let mut out: Vec<u8> = Vec::new();
+                out.try_reserve_exact(capacity)
+                    .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
                 for &v in args {
                     let n = self.to_number_strict(v)?;
                     if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
@@ -5166,7 +5305,10 @@ impl<'p> Vm<'p> {
             }
             // Date static methods as values.
             DATE_NOW => Value::num(crate::vm::clock::now_epoch_ms()),
-            DATE_PARSE => Value::num(parse_date(&self.display(a0))),
+            DATE_PARSE => {
+                let source = self.to_js_string(a0)?;
+                Value::num(parse_date(&source))
+            }
             DATE_UTC => Value::num(self.date_utc_ms(args)?),
             STR_RAW => {
                 // String.raw(template, ...subs): ToObject(template.raw), then
@@ -5184,18 +5326,19 @@ impl<'p> Vm<'p> {
                 } else {
                     0
                 };
+                self.preflight_native_iteration_work(raw_len as u64)?;
                 let subs = args.get(1..).unwrap_or(&[]);
                 let mut out = String::new();
                 for i in 0..raw_len {
                     let seg = self.get_index(raw, Value::int(i as i32))?;
                     let seg = self.to_js_string(seg)?;
-                    out.push_str(&seg);
+                    self.append_guest_string(&mut out, &seg)?;
                     if i + 1 == raw_len {
                         break;
                     }
                     if let Some(sub) = subs.get(i) {
                         let sub = self.to_js_string(*sub)?;
-                        out.push_str(&sub);
+                        self.append_guest_string(&mut out, &sub)?;
                     }
                 }
                 self.alloc_str(out)
@@ -5918,6 +6061,7 @@ impl<'p> Vm<'p> {
             }
             INTL_SUPPORTED_VALUES_OF => {
                 let key = self.to_js_string(a0)?;
+                self.preflight_native_iteration_work(key.len() as u64)?;
                 let mut zones: Vec<String> = Vec::new();
                 let vals: &[&str] = match key.as_str() {
                     // Shared with the DateTimeFormat/NumberFormat option
@@ -6135,7 +6279,7 @@ impl<'p> Vm<'p> {
                 let resolved = self.intl_this(this, INTL_COLLATOR, "compare")?;
                 let a = self.to_js_string(a0)?;
                 let b = self.to_js_string(a1)?;
-                Value::num(self.collator_compare(resolved, &a, &b))
+                Value::num(self.collator_compare(resolved, &a, &b)?)
             }
             INTL_PLURAL_SELECT => {
                 let _ = self.intl_this(this, INTL_PLURALRULES, "select")?;
@@ -6171,15 +6315,27 @@ impl<'p> Vm<'p> {
                 let st = self.display(self.intl_slot(resolved, "style"));
                 // CreatePartsFromList: the element/literal decomposition IS the
                 // format string, so both entry points derive from one splitter.
-                let parts = list_parts_en(&strs, &t, &st);
+                let parts = list_parts_en(&strs, &t, &st)?;
+                self.preflight_native_iteration_work(parts.len() as u64)?;
                 if to_parts {
-                    let ps: Vec<(String, String, &str)> = parts
-                        .into_iter()
-                        .map(|(t, v)| (t.to_string(), v, ""))
-                        .collect();
+                    let mut ps: Vec<(String, String, &str)> = Vec::new();
+                    ps.try_reserve_exact(parts.len())
+                        .map_err(|_| Thrown("RangeError: list allocation failed".into()))?;
+                    for (ty, value) in parts {
+                        ps.push((ty.to_string(), value, ""));
+                    }
                     self.intl_parts_array(&ps)
                 } else {
-                    let s: String = parts.into_iter().map(|(_, v)| v).collect();
+                    let total = parts.iter().try_fold(0usize, |total, (_, value)| {
+                        total
+                            .checked_add(value.len())
+                            .filter(|&n| n <= MAX_STRING_BYTES)
+                            .ok_or_else(invalid_native_string_length)
+                    })?;
+                    let mut s = self.guest_string_with_capacity(total)?;
+                    for (_, value) in parts {
+                        s.push_str(&value);
+                    }
                     self.alloc_str(s)
                 }
             }
@@ -6200,6 +6356,7 @@ impl<'p> Vm<'p> {
                 // anything else, including "decade" and "millisecond", is a
                 // RangeError.
                 let unit_raw = self.to_js_string(a1)?;
+                self.preflight_native_iteration_work(unit_raw.len() as u64)?;
                 let unit = unit_raw.strip_suffix('s').unwrap_or(&unit_raw).to_string();
                 if ![
                     "second", "minute", "hour", "day", "week", "month", "quarter", "year",
@@ -6289,6 +6446,7 @@ impl<'p> Vm<'p> {
             INTL_DISPLAYNAMES_OF => {
                 let resolved = self.intl_this(this, INTL_DISPLAYNAMES, "of")?;
                 let code = self.to_js_string(a0)?;
+                self.preflight_native_iteration_work(code.len() as u64)?;
                 let ty = self.display(self.intl_slot(resolved, "type"));
                 // Step 5: IsValidDisplayNamesCode — a malformed code is a
                 // RangeError before any lookup. None of these were checked, so
@@ -6397,6 +6555,9 @@ impl<'p> Vm<'p> {
                     n.trunc().clamp(-(i32::MAX as f64), i32::MAX as f64) as i64
                 };
                 let text = self.display(input);
+                self.preflight_native_iteration_work(crate::vm::segmenter::segment_work_bound(
+                    text.len(),
+                ))?;
                 match crate::vm::segmenter::segment_at(&text, &g, n) {
                     Some((start, end)) => self.segment_data_object(input, &g, start, end),
                     None => Value::UNDEFINED,
@@ -6407,6 +6568,9 @@ impl<'p> Vm<'p> {
                 let g = self.display(self.intl_slot(it, "granularity"));
                 let input = self.intl_slot(it, "input");
                 let text = self.display(input);
+                self.preflight_native_iteration_work(crate::vm::segmenter::segment_work_bound(
+                    text.len(),
+                ))?;
                 let start = self.intl_slot(it, "index").as_f64() as usize;
                 let len = crate::heap::str_units(&text);
                 let (value, done) = if start >= len {
@@ -6544,7 +6708,15 @@ impl<'p> Vm<'p> {
                         self.call_value(f, recv, &[])?
                     } else {
                         let tag = self.object_to_string_tag(recv)?;
-                        self.alloc_str(format!("[object {tag}]"))
+                        let total = tag
+                            .len()
+                            .checked_add(9)
+                            .ok_or_else(invalid_native_string_length)?;
+                        let mut out = self.guest_string_with_capacity(total)?;
+                        out.push_str("[object ");
+                        out.push_str(&tag);
+                        out.push(']');
+                        self.alloc_str(out)
                     });
                 }
                 // Number/Boolean receivers are primitive values; the rest are heap.
@@ -6682,6 +6854,116 @@ fn hex_val(b: u8) -> Result<u8, ()> {
 fn hex_lower(b: u8) -> [u8; 2] {
     const D: &[u8; 16] = b"0123456789abcdef";
     [D[(b >> 4) as usize], D[(b & 0xf) as usize]]
+}
+
+fn invalid_native_string_length() -> Thrown {
+    Thrown("RangeError: Invalid string length".into())
+}
+
+fn checked_native_output_add(current: usize, additional: usize) -> Result<usize, Thrown> {
+    current
+        .checked_add(additional)
+        .filter(|&total| total <= MAX_STRING_BYTES)
+        .ok_or_else(invalid_native_string_length)
+}
+
+fn regexp_escape_other(u: u32) -> bool {
+    matches!(
+        u,
+        // ,-=<>#&!%:;@~'`"
+        0x2c | 0x2d | 0x3d | 0x3c | 0x3e | 0x23 | 0x26 | 0x21 | 0x25 | 0x3a
+            | 0x3b | 0x40 | 0x7e | 0x27 | 0x60 | 0x22
+        // WhiteSpace (minus tab/VT/FF) + ZWNBSP
+            | 0x20 | 0xA0 | 0x1680 | 0x202F | 0x205F | 0x3000 | 0xFEFF
+        // LineTerminator (minus LF/CR)
+            | 0x2028 | 0x2029
+    ) || (0x2000..=0x200A).contains(&u)
+        || (0xD800..=0xDFFF).contains(&u)
+}
+
+fn regexp_escape_output_len(bytes: &[u8]) -> Result<usize, Thrown> {
+    let mut total = 0usize;
+    for (index, u) in crate::heap::wtf8_code_points(bytes).enumerate() {
+        let additional = match char::from_u32(u) {
+            None => 6, // lone surrogate -> \uNNNN
+            Some(c) if index == 0 && (c.is_ascii_digit() || c.is_ascii_alphabetic()) => 4,
+            Some(
+                '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                | '/',
+            ) => 2,
+            Some('\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r') => 2,
+            Some(c) if regexp_escape_other(u) => {
+                if u <= 0xFF {
+                    4
+                } else {
+                    let mut units = [0u16; 2];
+                    c.encode_utf16(&mut units)
+                        .len()
+                        .checked_mul(6)
+                        .ok_or_else(invalid_native_string_length)?
+                }
+            }
+            Some(c) => c.len_utf8(),
+        };
+        total = checked_native_output_add(total, additional)?;
+    }
+    Ok(total)
+}
+
+fn push_regexp_unicode_escape(out: &mut String, unit: u16) {
+    let hi = hex_lower((unit >> 8) as u8);
+    let lo = hex_lower(unit as u8);
+    out.push_str("\\u");
+    out.push(hi[0] as char);
+    out.push(hi[1] as char);
+    out.push(lo[0] as char);
+    out.push(lo[1] as char);
+}
+
+fn push_regexp_byte_escape(out: &mut String, byte: u8) {
+    let h = hex_lower(byte);
+    out.push_str("\\x");
+    out.push(h[0] as char);
+    out.push(h[1] as char);
+}
+
+fn regexp_escape_into(bytes: &[u8], out: &mut String) {
+    for (index, u) in crate::heap::wtf8_code_points(bytes).enumerate() {
+        let c = match char::from_u32(u) {
+            Some(c) => c,
+            None => {
+                push_regexp_unicode_escape(out, u as u16);
+                continue;
+            }
+        };
+        if index == 0 && (c.is_ascii_digit() || c.is_ascii_alphabetic()) {
+            push_regexp_byte_escape(out, u as u8);
+            continue;
+        }
+        match c {
+            '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+            | '/' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0b}' => out.push_str("\\v"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            _ if regexp_escape_other(u) => {
+                if u <= 0xFF {
+                    push_regexp_byte_escape(out, u as u8);
+                } else {
+                    let mut units = [0u16; 2];
+                    for unit in c.encode_utf16(&mut units) {
+                        push_regexp_unicode_escape(out, *unit);
+                    }
+                }
+            }
+            _ => out.push(c),
+        }
+    }
 }
 
 /// FromHex(string, maxLength) (Uint8Array base64/hex proposal): decode hex into
@@ -6884,11 +7166,24 @@ fn from_base64(s: &str, url: bool, lch: u8, max_len: usize) -> (usize, Vec<u8>, 
 
 /// Encode bytes as base64 (Uint8Array.prototype.toBase64). `url` selects the
 /// base64url alphabet (`-_` for `+/`); `omit_padding` drops trailing `=`.
-fn to_base64(bytes: &[u8], url: bool, omit_padding: bool) -> String {
+fn base64_output_len(bytes: usize, omit_padding: bool) -> Result<usize, Thrown> {
+    let full = (bytes / 3)
+        .checked_mul(4)
+        .ok_or_else(invalid_native_string_length)?;
+    let tail = match (bytes % 3, omit_padding) {
+        (0, _) => 0,
+        (1, true) => 2,
+        (2, true) => 3,
+        (_, false) => 4,
+        _ => unreachable!(),
+    };
+    checked_native_output_add(full, tail)
+}
+
+fn to_base64_into(bytes: &[u8], url: bool, omit_padding: bool, out: &mut String) {
     const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let t = if url { URL } else { STD };
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
         let (b0, b1, b2) = (bytes[i], bytes[i + 1], bytes[i + 2]);
@@ -6919,16 +7214,30 @@ fn to_base64(bytes: &[u8], url: bool, omit_padding: bool) -> String {
         }
         _ => {}
     }
-    out
 }
 
 /// `escape(string)` (Annex B B.2.1.1): keep `A-Za-z0-9@*_+-./`, encode any
 /// other UTF-16 code unit as `%XX` (unit < 256) or `%uXXXX`. Iterates code
 /// units (not chars) so an astral char yields its two surrogate `%uXXXX`s.
-fn escape_str(s: &str) -> String {
+fn escape_output_len(s: &str) -> Result<usize, Thrown> {
+    const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+    let mut total = 0usize;
+    for u in s.encode_utf16() {
+        let additional = if u < 0x80 && KEEP.contains(&(u as u8)) {
+            1
+        } else if u < 0x100 {
+            3
+        } else {
+            6
+        };
+        total = checked_native_output_add(total, additional)?;
+    }
+    Ok(total)
+}
+
+fn escape_str_into(s: &str, out: &mut String) {
     // A-Za-z0-9 and @ * _ + - . /
     const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
-    let mut out = String::new();
     for u in s.encode_utf16() {
         if u < 0x80 && KEEP.contains(&(u as u8)) {
             out.push(u as u8 as char);
@@ -6948,56 +7257,75 @@ fn escape_str(s: &str) -> String {
             out.push(lo[1] as char);
         }
     }
-    out
 }
 
 /// `unescape(string)` (Annex B B.2.1.2): decode `%uXXXX` (one UTF-16 unit) and
-/// `%XX` (a unit < 256); any other character passes through unchanged. A `%`
-/// not followed by valid hex is literal.
-fn unescape_str(s: &str) -> String {
-    let u: Vec<u16> = s.encode_utf16().collect();
-    let n = u.len();
-    let hexv = |c: u16| -> Option<u16> {
-        match c {
-            0x30..=0x39 => Some(c - 0x30),
-            0x41..=0x46 => Some(c - 0x41 + 10),
-            0x61..=0x66 => Some(c - 0x61 + 10),
-            _ => None,
-        }
-    };
-    let mut out: Vec<u16> = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        let c = u[i];
-        if c == b'%' as u16 {
-            if i + 5 < n && u[i + 1] == b'u' as u16 {
-                if let (Some(a), Some(b), Some(d), Some(e)) = (
-                    hexv(u[i + 2]),
-                    hexv(u[i + 3]),
-                    hexv(u[i + 4]),
-                    hexv(u[i + 5]),
+/// `%XX` (a unit < 256); any other character passes through unchanged. Building
+/// directly as WTF-8 avoids the former pair of input-sized `Vec<u16>`
+/// temporaries and preserves decoded lone surrogates instead of replacing them.
+fn unescape_str(s: &str) -> Result<crate::heap::JsStr, Thrown> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 5 < bytes.len() && bytes[i + 1] == b'u' {
+                if let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
+                    hex_val(bytes[i + 2]),
+                    hex_val(bytes[i + 3]),
+                    hex_val(bytes[i + 4]),
+                    hex_val(bytes[i + 5]),
                 ) {
-                    out.push((a << 12) | (b << 8) | (d << 4) | e);
+                    let unit = (u16::from(a) << 12)
+                        | (u16::from(b) << 8)
+                        | (u16::from(c) << 4)
+                        | u16::from(d);
+                    crate::heap::wtf8_push_cp(&mut out, u32::from(unit));
                     i += 6;
                     continue;
                 }
             }
-            if i + 2 < n {
-                if let (Some(a), Some(b)) = (hexv(u[i + 1]), hexv(u[i + 2])) {
-                    out.push((a << 4) | b);
+            if i + 2 < bytes.len() {
+                if let (Ok(a), Ok(b)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    crate::heap::wtf8_push_cp(
+                        &mut out,
+                        u32::from((u16::from(a) << 4) | u16::from(b)),
+                    );
                     i += 3;
                     continue;
                 }
             }
         }
-        out.push(c);
-        i += 1;
+        let c = s[i..]
+            .chars()
+            .next()
+            .expect("byte index remains a char boundary");
+        crate::heap::wtf8_push_cp(&mut out, u32::from(c));
+        i += c.len_utf8();
     }
-    String::from_utf16_lossy(&out)
+    debug_assert!(out.len() <= bytes.len());
+    Ok(crate::heap::JsStr::from_wtf8(out))
 }
 
-fn uri_encode(s: &str, extra: &[u8]) -> Result<String, ()> {
-    let mut out = String::with_capacity(s.len());
+fn uri_encode_output_len(s: &str, extra: &[u8]) -> Result<usize, Thrown> {
+    let mut total = 0usize;
+    for c in s.chars() {
+        let additional =
+            if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
+                1
+            } else {
+                c.len_utf8()
+                    .checked_mul(3)
+                    .ok_or_else(invalid_native_string_length)?
+            };
+        total = checked_native_output_add(total, additional)?;
+    }
+    Ok(total)
+}
+
+fn uri_encode_into(s: &str, extra: &[u8], out: &mut String) {
     let mut buf = [0u8; 4];
     for c in s.chars() {
         if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
@@ -7011,21 +7339,25 @@ fn uri_encode(s: &str, extra: &[u8]) -> Result<String, ()> {
             }
         }
     }
-    Ok(out)
 }
 
 /// Decode (ECMA-262 19.2.6.4): each `%XX` escape is decoded; a decoded
 /// single-byte char that lies in the `reserved` set is left as its original
 /// `%XX` text (decodeURI keeps uriReserved + "#"; decodeURIComponent keeps
 /// nothing). Multi-byte sequences are validated as UTF-8. Malformed → Err.
-fn uri_decode(bytes: &[u8], reserved: &[u8]) -> Result<crate::heap::JsStr, ()> {
+fn uri_decode(bytes: &[u8], reserved: &[u8]) -> Result<crate::heap::JsStr, Thrown> {
     use crate::heap::{wtf8_push, wtf8_push_cp, JsStr};
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let read = |at: usize| -> Result<u8, ()> {
+    let malformed = || Thrown("URIError: URI malformed".into());
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+    let read = |at: usize| -> Result<u8, Thrown> {
         if at + 2 >= bytes.len() || bytes[at] != b'%' {
-            return Err(());
+            return Err(malformed());
         }
-        Ok((hex_val(bytes[at + 1])? << 4) | hex_val(bytes[at + 2])?)
+        let high = hex_val(bytes[at + 1]).map_err(|_| malformed())?;
+        let low = hex_val(bytes[at + 2]).map_err(|_| malformed())?;
+        Ok((high << 4) | low)
     };
     let mut i = 0;
     while i < bytes.len() {
@@ -7072,13 +7404,13 @@ fn uri_decode(bytes: &[u8], reserved: &[u8]) -> Result<crate::heap::JsStr, ()> {
             } else if b0 >> 3 == 0b11110 {
                 (4, (b0 & 0x07) as u32)
             } else {
-                return Err(());
+                return Err(malformed());
             };
             i += 3;
             for _ in 1..n {
                 let cb = read(i)?;
                 if cb & 0xC0 != 0x80 {
-                    return Err(());
+                    return Err(malformed());
                 }
                 cp = (cp << 6) | (cb & 0x3F) as u32;
                 i += 3;
@@ -7089,7 +7421,7 @@ fn uri_decode(bytes: &[u8], reserved: &[u8]) -> Result<crate::heap::JsStr, ()> {
             // ('%ED%BF%BF') is a URIError — only RAW lone-surrogate code
             // units (the non-'%' copy path above) pass through verbatim.
             if overlong || cp > 0x10FFFF || (0xD800..=0xDFFF).contains(&cp) {
-                return Err(());
+                return Err(malformed());
             }
             wtf8_push_cp(&mut out, cp);
         }

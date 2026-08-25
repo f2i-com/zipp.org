@@ -364,6 +364,67 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc_js(exact))
     }
 
+    /// Append guest-derived text without allowing a native helper to build an
+    /// unbounded Rust `String` between VM meter polls. `total` is charged as an
+    /// external in-flight allocation because `out` is not in the VM heap until
+    /// it is moved into `alloc_str`.
+    pub(crate) fn append_guest_string(
+        &mut self,
+        out: &mut String,
+        text: &str,
+    ) -> Result<(), Thrown> {
+        let total = out
+            .len()
+            .checked_add(text.len())
+            .filter(|&n| n <= MAX_STRING_BYTES)
+            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(total)
+            .map_err(|message| Thrown(message.into()))?;
+        #[cfg(not(feature = "instrument"))]
+        let _ = total;
+        out.try_reserve(text.len())
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        out.push_str(text);
+        Ok(())
+    }
+
+    /// Admit a complete guest-visible string result before constructing it.
+    /// Native helpers use this when a cheap first pass can determine the exact
+    /// size, preventing a large unmetered temporary between interpreter polls.
+    pub(crate) fn preflight_guest_string_size(&mut self, total: usize) -> Result<(), Thrown> {
+        if total > MAX_STRING_BYTES {
+            return Err(Thrown("RangeError: Invalid string length".into()));
+        }
+        #[cfg(feature = "instrument")]
+        self.instrument_preflight_heap_growth(total)
+            .map_err(|message| Thrown(message.into()))?;
+        Ok(())
+    }
+
+    /// Create a fallibly allocated result buffer after applying the guest
+    /// string cap and instrumentation heap budget.
+    pub(crate) fn guest_string_with_capacity(&mut self, total: usize) -> Result<String, Thrown> {
+        self.preflight_guest_string_size(total)?;
+        let mut out = String::new();
+        out.try_reserve_exact(total)
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        Ok(out)
+    }
+
+    pub(crate) fn append_guest_join_part(
+        &mut self,
+        out: &mut String,
+        separator: &str,
+        part: &str,
+        index: usize,
+    ) -> Result<(), Thrown> {
+        if index != 0 {
+            self.append_guest_string(out, separator)?;
+        }
+        self.append_guest_string(out, part)
+    }
+
     pub(crate) fn string_method(
         &mut self,
         idx: u32,
@@ -605,13 +666,24 @@ impl<'p> Vm<'p> {
                 let byte = u2b(&s, pos);
                 Ok(Some(Value::bool(s[byte..].contains(&needle))))
             }
-            "toUpperCase" => Ok(Some(Value::heap(
-                self.heap.alloc_js(case_map_exact(js_recv.as_bytes(), true)),
-            ))),
-            "toLowerCase" => Ok(Some(Value::heap(
-                self.heap
-                    .alloc_js(case_map_exact(js_recv.as_bytes(), false)),
-            ))),
+            "toUpperCase" => {
+                let mapped_len = case_map_exact_len(js_recv.as_bytes(), true)?;
+                self.preflight_guest_string_size(mapped_len)?;
+                Ok(Some(Value::heap(self.heap.alloc_js(case_map_exact(
+                    js_recv.as_bytes(),
+                    true,
+                    mapped_len,
+                )?))))
+            }
+            "toLowerCase" => {
+                let mapped_len = case_map_exact_len(js_recv.as_bytes(), false)?;
+                self.preflight_guest_string_size(mapped_len)?;
+                Ok(Some(Value::heap(self.heap.alloc_js(case_map_exact(
+                    js_recv.as_bytes(),
+                    false,
+                    mapped_len,
+                )?))))
+            }
             // NB: `slice` / `substring` are handled by the no-clone fast path in
             // the early match above (before the receiver is copied).
             "repeat" => {
@@ -625,9 +697,13 @@ impl<'p> Vm<'p> {
                 }
                 // Bound the result (an unbounded build would hang / OOM): a too-long
                 // string is a RangeError per spec. (n_int is now finite and ≥ 0.)
-                if n_int * (s.len() as f64) > (1u64 << 28) as f64 {
+                let result_bytes = n_int * (s.len() as f64);
+                if result_bytes > MAX_STRING_BYTES as f64 {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
+                #[cfg(feature = "instrument")]
+                self.instrument_preflight_heap_growth(result_bytes as usize)
+                    .map_err(|message| Thrown(message.into()))?;
                 if js_recv.is_wellformed() {
                     return Ok(Some(self.alloc_str(s.repeat(n_int as usize))));
                 }
@@ -1015,7 +1091,7 @@ impl<'p> Vm<'p> {
                 let options = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 let coll = self.make_intl(crate::vm::native::INTL_COLLATOR, locales, options)?;
                 let resolved = self.intl_this(coll, crate::vm::native::INTL_COLLATOR, "compare")?;
-                let ord = self.collator_compare(resolved, &s, &other);
+                let ord = self.collator_compare(resolved, &s, &other)?;
                 Ok(Some(Value::int(ord as i32)))
             }
             "normalize" => {
@@ -1037,12 +1113,20 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 use unicode_normalization::UnicodeNormalization;
-                let out: String = match form.as_str() {
-                    "NFC" => s.nfc().collect(),
-                    "NFD" => s.nfd().collect(),
-                    "NFKC" => s.nfkc().collect(),
-                    _ => s.nfkd().collect(),
+                let out_len = match form.as_str() {
+                    "NFC" => checked_char_output_len(s.nfc())?,
+                    "NFD" => checked_char_output_len(s.nfd())?,
+                    "NFKC" => checked_char_output_len(s.nfkc())?,
+                    _ => checked_char_output_len(s.nfkd())?,
                 };
+                let mut out = self.guest_string_with_capacity(out_len)?;
+                match form.as_str() {
+                    "NFC" => extend_chars(&mut out, s.nfc()),
+                    "NFD" => extend_chars(&mut out, s.nfd()),
+                    "NFKC" => extend_chars(&mut out, s.nfkc()),
+                    _ => extend_chars(&mut out, s.nfkd()),
+                }
+                debug_assert_eq!(out.len(), out_len);
                 Ok(Some(self.alloc_str(out)))
             }
             // Real well-formedness: the WTF-8 representation tracks lone
@@ -1063,7 +1147,7 @@ impl<'p> Vm<'p> {
                 let cur = unit_len(&s);
                 let t = self.to_integer_strict(arg0)?;
                 let target = if t > 0 { t as usize } else { 0 };
-                if target as u64 > (1u64 << 28) {
+                if target > MAX_STRING_UNITS {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
                 if cur >= target {
@@ -1217,15 +1301,54 @@ impl<'p> Vm<'p> {
                     "sub" => ("sub", None),
                     _ => ("sup", None),
                 };
-                let open = if let Some(aname) = attr {
-                    // The attribute value is ToString(value) (can throw, e.g. a
-                    // {toString(){throw}}), not the non-throwing display().
-                    let aval = self.to_js_string(arg0)?.replace('"', "&quot;");
-                    format!("<{tag} {aname}=\"{aval}\">")
-                } else {
-                    format!("<{tag}>")
+                // The attribute value is ToString(value) (can throw, e.g. a
+                // {toString(){throw}}), not the non-throwing display(). Keep it
+                // borrowed while quote expansion is streamed into the single
+                // admitted output buffer; `replace` + two `format!` temporaries
+                // could otherwise multiply a near-limit guest string.
+                let aval = match attr {
+                    Some(_) => Some(self.to_js_string(arg0)?),
+                    None => None,
                 };
-                Ok(Some(self.alloc_str(format!("{open}{s}</{tag}>"))))
+                let mut total = checked_string_output_add(0, 1 + tag.len() + 1)?; // <tag>
+                if let (Some(aname), Some(aval)) = (attr, aval.as_deref()) {
+                    total = checked_string_output_add(total, 1 + aname.len() + 2)?; // name="
+                    total = checked_string_output_add(total, aval.len())?;
+                    let quote_growth = aval
+                        .as_bytes()
+                        .iter()
+                        .filter(|&&b| b == b'"')
+                        .count()
+                        .checked_mul("&quot;".len() - 1)
+                        .ok_or_else(invalid_string_length)?;
+                    total = checked_string_output_add(total, quote_growth)?;
+                    total = checked_string_output_add(total, 1)?; // closing quote
+                }
+                total = checked_string_output_add(total, s.len())?;
+                total = checked_string_output_add(total, 2 + tag.len() + 1)?; // </tag>
+
+                let mut out = self.guest_string_with_capacity(total)?;
+                out.push('<');
+                out.push_str(tag);
+                if let (Some(aname), Some(aval)) = (attr, aval.as_deref()) {
+                    out.push(' ');
+                    out.push_str(aname);
+                    out.push_str("=\"");
+                    for (i, part) in aval.split('"').enumerate() {
+                        if i != 0 {
+                            out.push_str("&quot;");
+                        }
+                        out.push_str(part);
+                    }
+                    out.push('"');
+                }
+                out.push('>');
+                out.push_str(s);
+                out.push_str("</");
+                out.push_str(tag);
+                out.push('>');
+                debug_assert_eq!(out.len(), total);
+                Ok(Some(self.alloc_str(out)))
             }
             _ => Ok(None),
         }
@@ -1241,7 +1364,19 @@ impl<'p> Vm<'p> {
         &mut self,
         args: &[Value],
     ) -> Result<crate::heap::JsStr, Thrown> {
-        let mut out: Vec<u8> = Vec::with_capacity(args.len());
+        self.preflight_native_iteration_work(args.len() as u64)?;
+        // One UTF-16 code unit needs at most three WTF-8 bytes. Reserve that
+        // admitted worst case once so a large argument vector cannot drive
+        // geometric, infallible growth inside this single native instruction.
+        let capacity = args
+            .len()
+            .checked_mul(3)
+            .filter(|&n| n <= MAX_STRING_BYTES)
+            .ok_or_else(invalid_string_length)?;
+        self.preflight_guest_string_size(capacity)?;
+        let mut out: Vec<u8> = Vec::new();
+        out.try_reserve_exact(capacity)
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
         for &v in args {
             let u = crate::vm::helpers_num2::to_uint32(self.to_number_strict(v)?) as u16;
             crate::heap::wtf8_push_cp(&mut out, u as u32);
@@ -1317,34 +1452,38 @@ impl<'p> Vm<'p> {
         // (Spec: every UNIT boundary — the position between a surrogate pair's
         // halves is skipped here since the splice can't represent the halves;
         // exact once strings are WTF-8.)
-        let positions: Vec<usize> = if search.is_empty() {
+        let positions = if search.is_empty() {
             if all {
-                let mut v: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
-                v.push(s.len());
-                v
+                PlainReplacePositions::EmptyAll {
+                    indices: s.char_indices(),
+                    end: s.len(),
+                    emitted_end: false,
+                }
             } else {
-                vec![0]
+                PlainReplacePositions::One(Some(0))
             }
         } else if all {
-            s.match_indices(&search).map(|(i, _)| i).collect()
+            PlainReplacePositions::All(s.match_indices(&search))
         } else {
-            s.find(&search).into_iter().collect()
+            PlainReplacePositions::One(s.find(&search))
         };
         let mut out = String::new();
         let mut last = 0usize;
         for pos in positions {
-            out.push_str(&s[last..pos]);
+            self.append_guest_string(&mut out, &s[last..pos])?;
             if functional {
                 let m = self.alloc_str(search.clone());
                 // The replacer's position argument is a UNIT position.
                 let off = Value::num(crate::heap::byte_to_units(s, pos) as f64);
-                let sv = self.alloc_str(s.to_string());
+                // The third callback argument is the original receiver string.
+                // Reuse its immutable heap value: cloning a near-limit source
+                // once per match made replaceAll's native loop an unchecked
+                // O(matches * source_len) allocator despite an O(1) alias being
+                // semantically identical.
+                let sv = Value::heap(s_idx);
                 let r = self.call_value(repl_v, Value::UNDEFINED, &[m, off, sv])?;
                 let rs = self.to_js_string(r)?;
-                if rs.len() > (1usize << 28).saturating_sub(out.len()) {
-                    return Err(Thrown("RangeError: Invalid string length".into()));
-                }
-                out.push_str(&rs);
+                self.append_guest_string(&mut out, &rs)?;
             } else {
                 let rep = self.expand_replacement(
                     &repl_str,
@@ -1354,14 +1493,72 @@ impl<'p> Vm<'p> {
                     false, // a string search has no named captures: `$<…>` is literal
                     &s[..pos],
                     &s[pos + search.len()..],
-                    (1usize << 28).saturating_sub(out.len()),
+                    MAX_STRING_BYTES.saturating_sub(out.len()),
                 )?;
-                out.push_str(&rep);
+                self.append_guest_string(&mut out, &rep)?;
             }
             last = pos + search.len();
         }
-        out.push_str(&s[last..]);
+        self.append_guest_string(&mut out, &s[last..])?;
         Ok(self.alloc_str(out))
+    }
+}
+
+enum PlainReplacePositions<'subject, 'needle> {
+    EmptyAll {
+        indices: std::str::CharIndices<'subject>,
+        end: usize,
+        emitted_end: bool,
+    },
+    All(std::str::MatchIndices<'subject, &'needle str>),
+    One(Option<usize>),
+}
+
+impl Iterator for PlainReplacePositions<'_, '_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::EmptyAll {
+                indices,
+                end,
+                emitted_end,
+            } => indices.next().map(|(index, _)| index).or_else(|| {
+                if *emitted_end {
+                    None
+                } else {
+                    *emitted_end = true;
+                    Some(*end)
+                }
+            }),
+            Self::All(indices) => indices.next().map(|(index, _)| index),
+            Self::One(position) => position.take(),
+        }
+    }
+}
+
+fn invalid_string_length() -> Thrown {
+    Thrown("RangeError: Invalid string length".into())
+}
+
+fn checked_string_output_add(current: usize, additional: usize) -> Result<usize, Thrown> {
+    current
+        .checked_add(additional)
+        .filter(|&total| total <= MAX_STRING_BYTES)
+        .ok_or_else(invalid_string_length)
+}
+
+fn checked_char_output_len(iter: impl Iterator<Item = char>) -> Result<usize, Thrown> {
+    let mut total = 0usize;
+    for c in iter {
+        total = checked_string_output_add(total, c.len_utf8())?;
+    }
+    Ok(total)
+}
+
+fn extend_chars(out: &mut String, iter: impl Iterator<Item = char>) {
+    for c in iter {
+        out.push(c);
     }
 }
 
@@ -1374,40 +1571,107 @@ impl<'p> Vm<'p> {
 /// per-char mapping would be wrong); a surrogate's WTF-8 bytes copy through
 /// verbatim. A surrogate is neither cased nor case-ignorable, so it breaks the
 /// UCD context exactly where the segments break.
-fn case_map_exact(bytes: &[u8], upper: bool) -> crate::heap::JsStr {
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+fn case_map_exact_len(bytes: &[u8], upper: bool) -> Result<usize, Thrown> {
+    let mut total = 0usize;
     let mut rest = bytes;
     while !rest.is_empty() {
         match std::str::from_utf8(rest) {
             Ok(s) => {
-                out.extend_from_slice(
-                    if upper {
-                        s.to_uppercase()
+                for c in s.chars() {
+                    let mapped_len: usize = if upper {
+                        c.to_uppercase().map(char::len_utf8).sum()
                     } else {
-                        s.to_lowercase()
-                    }
-                    .as_bytes(),
-                );
+                        // `str::to_lowercase`'s contextual final sigma has the
+                        // same UTF-8 width as the ordinary sigma emitted here.
+                        c.to_lowercase().map(char::len_utf8).sum()
+                    };
+                    total = checked_string_output_add(total, mapped_len)?;
+                }
+                break;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                let s = std::str::from_utf8(&rest[..valid]).unwrap();
+                for c in s.chars() {
+                    let mapped_len: usize = if upper {
+                        c.to_uppercase().map(char::len_utf8).sum()
+                    } else {
+                        c.to_lowercase().map(char::len_utf8).sum()
+                    };
+                    total = checked_string_output_add(total, mapped_len)?;
+                }
+                let skip = e.error_len().unwrap_or(rest.len() - valid);
+                total = checked_string_output_add(total, skip)?;
+                rest = &rest[valid + skip..];
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn case_map_exact(
+    bytes: &[u8],
+    upper: bool,
+    mapped_len: usize,
+) -> Result<crate::heap::JsStr, Thrown> {
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve_exact(mapped_len)
+        .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                let mapped = if upper {
+                    s.to_uppercase()
+                } else {
+                    s.to_lowercase()
+                };
+                if out
+                    .len()
+                    .checked_add(mapped.len())
+                    .filter(|&total| total <= mapped_len)
+                    .is_none()
+                {
+                    return Err(invalid_string_length());
+                }
+                out.extend_from_slice(mapped.as_bytes());
                 break;
             }
             Err(e) => {
                 let valid = e.valid_up_to();
                 // The valid prefix is UTF-8 by construction.
                 let s = std::str::from_utf8(&rest[..valid]).unwrap();
-                out.extend_from_slice(
-                    if upper {
-                        s.to_uppercase()
-                    } else {
-                        s.to_lowercase()
-                    }
-                    .as_bytes(),
-                );
+                let mapped = if upper {
+                    s.to_uppercase()
+                } else {
+                    s.to_lowercase()
+                };
+                if out
+                    .len()
+                    .checked_add(mapped.len())
+                    .filter(|&total| total <= mapped_len)
+                    .is_none()
+                {
+                    return Err(invalid_string_length());
+                }
+                out.extend_from_slice(mapped.as_bytes());
                 // Copy the invalid (lone-surrogate) bytes verbatim and resume.
                 let skip = e.error_len().unwrap_or(rest.len() - valid);
+                if out
+                    .len()
+                    .checked_add(skip)
+                    .filter(|&total| total <= mapped_len)
+                    .is_none()
+                {
+                    return Err(invalid_string_length());
+                }
                 out.extend_from_slice(&rest[valid..valid + skip]);
                 rest = &rest[valid + skip..];
             }
         }
     }
-    crate::heap::JsStr::from_wtf8(out)
+    if out.len() != mapped_len {
+        return Err(invalid_string_length());
+    }
+    Ok(crate::heap::JsStr::from_wtf8(out))
 }

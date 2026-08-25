@@ -498,6 +498,7 @@ fn gate_setter_introduced_after_region_compiled() {
 /// recompile carries exactly their arms — after which the accessor ways serve
 /// hits natively (asserted via `zipp_vm::ic_stats`). Behaviour is asserted
 /// against node as everywhere else.
+#[cfg(feature = "jit")]
 #[test]
 fn gate_mechanism_child() {
     if std::env::var_os("ZIPP_ACC_GATE_CHILD").is_none() {
@@ -557,6 +558,7 @@ fn gate_mechanism_child() {
 /// flip sequentially, not in one activation); the LAST compile carries both
 /// marked ops' arms (`acc_arms=2/3`); and NOTHING is evicted after it — no
 /// oscillation.
+#[cfg(feature = "jit")]
 #[test]
 fn zz_gate_evicts_once_then_serves_natively() {
     if std::env::var_os("ZIPP_ACC_GATE_CHILD").is_some() {

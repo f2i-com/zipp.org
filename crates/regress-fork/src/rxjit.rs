@@ -263,6 +263,15 @@ impl core::fmt::Debug for JitSlot {
 }
 
 impl JitSlot {
+    /// Executable mapping retained by this slot, rounded to the mapping size
+    /// reported by dynasmrt rather than merely the bytes written into it.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.code
+            .get()
+            .and_then(Option::as_ref)
+            .map_or(0, |code| code._buf.size())
+    }
+
     /// The native code for this regex, compiling it if this attempt crosses
     /// the use threshold. `None` means "run the interpreter" (cold, declined,
     /// or switched off).

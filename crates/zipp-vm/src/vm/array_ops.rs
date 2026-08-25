@@ -7,7 +7,43 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+#[cfg(feature = "safe-sandbox")]
+const MAX_ARRAY_STRINGIFY_DEPTH: usize = 4;
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_ARRAY_STRINGIFY_DEPTH: usize = 1_024;
+
 impl<'p> Vm<'p> {
+    /// Run an Array join/toString/toLocaleString operation with a shared active
+    /// path. Self/mutual recursion contributes an empty element (the established
+    /// Array join behaviour), while a deep acyclic graph fails before exhausting
+    /// the native or WebAssembly stack. The closure guarantees cleanup on every
+    /// ordinary error path.
+    fn with_array_stringify_guard<F>(
+        &mut self,
+        idx: u32,
+        stringify: F,
+    ) -> Result<Option<Value>, Thrown>
+    where
+        F: FnOnce(&mut Self) -> Result<Option<Value>, Thrown>,
+    {
+        if self.array_stringify_active.contains(&idx) {
+            return Ok(Some(Value::heap(crate::heap::INTERN_EMPTY)));
+        }
+        if self.array_stringify_active.len() >= MAX_ARRAY_STRINGIFY_DEPTH {
+            return Err(Thrown(
+                "RangeError: array stringification nesting limit exceeded".into(),
+            ));
+        }
+        self.array_stringify_active
+            .try_reserve(1)
+            .map_err(|_| Thrown("RangeError: array stringification allocation failed".into()))?;
+        self.array_stringify_active.push(idx);
+        let result = stringify(self);
+        let popped = self.array_stringify_active.pop();
+        debug_assert_eq!(popped, Some(idx));
+        result
+    }
+
     /// Shared driver for `map`/`filter`/`forEach` (callback args = [element,
     /// index]). Uses the native callback fast path when the callback is a
     /// compiled non-capturing function: a single reused register window, a direct
@@ -461,6 +497,24 @@ impl<'p> Vm<'p> {
         depth: i64,
         mapper: Option<(Value, Value)>,
     ) -> Result<(), Thrown> {
+        let mut work = 0u64;
+        self.flatten_into_array_at(out, source, source_len, depth, mapper, 0, &mut work)
+    }
+
+    fn flatten_into_array_at(
+        &mut self,
+        out: &mut Vec<Value>,
+        source: Value,
+        source_len: usize,
+        depth: i64,
+        mapper: Option<(Value, Value)>,
+        active_depth: u32,
+        work: &mut u64,
+    ) -> Result<(), Thrown> {
+        *work = work
+            .checked_add(source_len as u64)
+            .ok_or_else(|| Thrown("RangeError: native builtin iteration limit exceeded".into()))?;
+        self.preflight_native_iteration_work(*work)?;
         for k in 0..source_len {
             let Some(got) = self.array_iter_get(source, k)? else {
                 continue;
@@ -478,7 +532,16 @@ impl<'p> Vm<'p> {
                     (lf.trunc().min(9_007_199_254_740_991.0) as usize)
                         .min(crate::vm::MAX_DENSE_ARRAY_LEN)
                 };
-                self.flatten_into_array(out, v, n, depth - 1, None)?;
+                let next_depth = active_depth.checked_add(1).ok_or_else(|| {
+                    Thrown("RangeError: array flattening nesting limit exceeded".into())
+                })?;
+                #[cfg(feature = "safe-sandbox")]
+                if next_depth > 64 {
+                    return Err(Thrown(
+                        "RangeError: array flattening nesting limit exceeded".into(),
+                    ));
+                }
+                self.flatten_into_array_at(out, v, n, depth - 1, None, next_depth, work)?;
             } else {
                 if out.len() >= crate::vm::MAX_DENSE_ARRAY_LEN {
                     return Err(Thrown(
@@ -658,6 +721,7 @@ impl<'p> Vm<'p> {
         }
         let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         let idxv = |k: usize| Value::num(k as f64);
+        self.preflight_native_iteration_work(full_len)?;
 
         match name {
             "forEach" => {
@@ -921,6 +985,11 @@ impl<'p> Vm<'p> {
                 } else {
                     len - 1
                 };
+                self.preflight_native_iteration_work(if k >= 0 {
+                    (k as u64).saturating_add(1)
+                } else {
+                    0
+                })?;
                 while k >= 0 {
                     // Proxy-aware HasProperty: a `has` trap must dispatch, and its
                     // abrupt completion propagate (the &self form swallows both).
@@ -941,6 +1010,7 @@ impl<'p> Vm<'p> {
                 } else {
                     (len + from_raw).max(0)
                 };
+                self.preflight_native_iteration_work(len.saturating_sub(k).max(0) as u64)?;
                 let is_includes = name == "includes";
                 while k < len {
                     // includes visits every index (a hole reads as undefined);
@@ -1006,6 +1076,7 @@ impl<'p> Vm<'p> {
             len
         };
         let mut count = (rel(e0) - from).min(len - to).max(0);
+        self.preflight_native_iteration_work(count as u64)?;
         let mut dir = 1i64;
         if from < to && to < from + count {
             dir = -1;
@@ -1071,6 +1142,7 @@ impl<'p> Vm<'p> {
             len
         };
         let end = rel(e0);
+        self.preflight_native_iteration_work(end.saturating_sub(k) as u64)?;
         while k < end {
             // Set(O, Pk, value, THROW) — the `true` matters: a non-writable
             // element or a non-extensible receiver must raise a TypeError, not
@@ -1159,6 +1231,7 @@ impl<'p> Vm<'p> {
                 }
             }
             "shift" => {
+                self.preflight_native_iteration_work(len.saturating_sub(1).max(0) as u64)?;
                 if len == 0 {
                     self.al_set_len(this, 0)?;
                     Value::UNDEFINED
@@ -1182,6 +1255,7 @@ impl<'p> Vm<'p> {
             "unshift" => {
                 let argc = args.len() as i64;
                 if argc > 0 {
+                    self.preflight_native_iteration_work(len as u64)?;
                     if len + argc > MAX_SAFE {
                         return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
                     }
@@ -1209,6 +1283,7 @@ impl<'p> Vm<'p> {
             }
             "reverse" => {
                 let middle = len / 2;
+                self.preflight_native_iteration_work(middle as u64)?;
                 let mut lower = 0;
                 while lower != middle {
                     let upper = len - lower - 1;
@@ -1262,6 +1337,15 @@ impl<'p> Vm<'p> {
                 if len - actual_delete + insert_count > MAX_SAFE {
                     return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
                 }
+                let shifted_tail = if insert_count == actual_delete {
+                    0
+                } else {
+                    len.saturating_sub(actual_start)
+                };
+                let work = actual_delete.checked_add(shifted_tail).ok_or_else(|| {
+                    Thrown("RangeError: native builtin iteration limit exceeded".into())
+                })?;
+                self.preflight_native_iteration_work(work as u64)?;
                 // Step 9: ArraySpeciesCreate(O, actualDeleteCount) runs BEFORE any
                 // element read; the no-species ArrayCreate path rejects > 2^32-1
                 // immediately (a 2^32-length receiver must not loop 4e9 reads).
@@ -1473,6 +1557,7 @@ impl<'p> Vm<'p> {
                     if len as f64 > 4_294_967_295.0 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
+                    self.preflight_native_iteration_work(len as u64)?;
                     let mut out = Vec::with_capacity(len);
                     for k in 0..len {
                         let v =
@@ -1551,46 +1636,49 @@ impl<'p> Vm<'p> {
                 // toString or an element toLocaleString that resizes the
                 // receiver (resizable-buffer TA) is observed per element.
                 if matches!(name, "join" | "toString" | "toLocaleString") {
-                    let lv = self.get_prop(Value::heap(idx), "length")?;
-                    let lenf = self.to_number_coerce(lv)?;
-                    let len = if lenf.is_nan() || lenf <= 0.0 {
-                        0usize
-                    } else {
-                        (lenf.trunc().min(9_007_199_254_740_991.0) as usize)
-                            .min(crate::vm::MAX_DENSE_ARRAY_LEN)
-                    };
-                    let sep = if name == "join" && arg0 != Value::UNDEFINED {
-                        self.to_js_string(arg0)?
-                    } else {
-                        ",".to_string()
-                    };
-                    let mut parts: Vec<String> = Vec::with_capacity(len.min(4096));
-                    for k in 0..len {
-                        let v = self.get_index(Value::heap(idx), Value::num(k as f64))?;
-                        if v.is_nullish() {
-                            parts.push(String::new());
-                        } else if name == "toLocaleString" {
-                            let f = self.get_prop(v, "toLocaleString")?;
-                            let s = if self.is_callable(f) {
+                    return self.with_array_stringify_guard(idx, |vm| {
+                        let lv = vm.get_prop(Value::heap(idx), "length")?;
+                        let lenf = vm.to_number_coerce(lv)?;
+                        let len = if lenf.is_nan() || lenf <= 0.0 {
+                            0usize
+                        } else {
+                            (lenf.trunc().min(9_007_199_254_740_991.0) as usize)
+                                .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                        };
+                        let sep = if name == "join" && arg0 != Value::UNDEFINED {
+                            vm.to_js_string(arg0)?
+                        } else {
+                            ",".to_string()
+                        };
+                        let mut out = String::new();
+                        for k in 0..len {
+                            let v = vm.get_index(Value::heap(idx), Value::num(k as f64))?;
+                            if v.is_nullish() {
+                                vm.append_guest_join_part(&mut out, &sep, "", k)?;
+                            } else if name == "toLocaleString" {
+                                let f = vm.get_prop(v, "toLocaleString")?;
+                                if !vm.is_callable(f) {
+                                    return Err(Thrown(
+                                        "TypeError: toLocaleString is not callable".into(),
+                                    ));
+                                }
                                 // ECMA-402 sup-array.prototype.toLocaleString:
                                 // Invoke(element, "toLocaleString", «locales,
-                                // options») — the arguments are FORWARDED, so a
-                                // number element honours the same format options.
+                                // options») — the arguments are FORWARDED.
                                 let fwd = [
                                     args.first().copied().unwrap_or(Value::UNDEFINED),
                                     args.get(1).copied().unwrap_or(Value::UNDEFINED),
                                 ];
-                                let r = self.call_value(f, v, &fwd)?;
-                                self.display(r)
+                                let r = vm.call_value(f, v, &fwd)?;
+                                let s = vm.to_js_string(r)?;
+                                vm.append_guest_join_part(&mut out, &sep, &s, k)?;
                             } else {
-                                self.display(v)
-                            };
-                            parts.push(s);
-                        } else {
-                            parts.push(self.to_js_string(v)?);
+                                let s = vm.to_js_string(v)?;
+                                vm.append_guest_join_part(&mut out, &sep, &s, k)?;
+                            }
                         }
-                    }
-                    return Ok(Some(self.alloc_str(parts.join(&sep))));
+                        Ok(Some(vm.alloc_str(out)))
+                    });
                 }
                 // toSpliced runs the spec copy loops directly: a DISCARDED element
                 // (actualStart..actualStart+actualDeleteCount) is never read — the
@@ -1631,6 +1719,7 @@ impl<'p> Vm<'p> {
                     if new_len > 4_294_967_295 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
+                    self.preflight_native_iteration_work(new_len.max(0) as u64)?;
                     let mut out = Vec::with_capacity((new_len.max(0) as usize).min(4096));
                     for k in 0..start {
                         out.push(self.get_index(Value::heap(idx), Value::num(k as f64))?);
@@ -1692,6 +1781,7 @@ impl<'p> Vm<'p> {
                     if count > 4_294_967_295.0 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
+                    self.preflight_native_iteration_work(count as u64)?;
                     let target = self.array_species_create(Value::heap(idx), count as usize)?;
                     return match target {
                         Some(a) => {
@@ -1930,56 +2020,47 @@ impl<'p> Vm<'p> {
             }
             // `Array.prototype.toString()` is `join()` with the default "," sep.
             "join" | "toString" => {
-                // A TypedArray receiver (TypedArray.prototype.toString IS
-                // Array.prototype.toString) goes through this.join, i.e.
-                // %TypedArray%.prototype.join, whose ValidateTypedArray rejects a
-                // detached/out-of-bounds view before any element reads.
-                if matches!(self.heap.get(idx), HeapObj::TypedArray { .. })
-                    && self.ta_effective_len(idx).is_none()
-                {
-                    return Err(Thrown(
-                        "TypeError: TypedArray is detached or out of bounds".into(),
-                    ));
-                }
-                // LengthOfArrayLike is step 2, BEFORE the separator coerces: a
-                // `sep.toString` that shrinks the array still joins `len` slots.
-                let len = match self.heap.get(idx) {
-                    HeapObj::Array(items) => items.len(),
-                    _ => 0,
-                };
-                // ToString the separator (undefined -> ","), and ToString each
-                // element — invoking a custom `toString`/`@@toPrimitive`, not the
-                // infallible `display`. (to_js_string short-circuits primitives to
-                // `display`, so a numeric/string array join stays on the fast path.)
-                let sep = if name == "toString" || arg0 == Value::UNDEFINED {
-                    ",".to_string()
-                } else {
-                    self.to_js_string(arg0)?
-                };
-                // Get(O,k) and ToString(element) INTERLEAVE, one index at a time:
-                // an element's `toString` that installs a prototype index, or that
-                // mutates the array, must be observed by the LATER reads. Reading
-                // every element up front froze them at their pre-toString values.
-                // A side table (defineProperty'd index accessor) makes the dense
-                // slot an unreliable placeholder, so those receivers always take
-                // the proto-aware HasProperty+Get path; everything else reads the
-                // dense slot and only defers for a hole / out-of-range index.
-                let side_table = self.arr_props.contains_key(&idx);
-                let mut parts: Vec<String> = Vec::with_capacity(len.min(4096));
-                for k in 0..len {
-                    let v = if side_table {
-                        self.array_iter_get(Value::heap(idx), k)?
-                    } else {
-                        self.array_dense_or_proto_get(idx, k)?
+                self.with_array_stringify_guard(idx, |vm| {
+                    // A TypedArray receiver (TypedArray.prototype.toString IS
+                    // Array.prototype.toString) goes through this.join. Validate
+                    // it before any element reads.
+                    if matches!(vm.heap.get(idx), HeapObj::TypedArray { .. })
+                        && vm.ta_effective_len(idx).is_none()
+                    {
+                        return Err(Thrown(
+                            "TypeError: TypedArray is detached or out of bounds".into(),
+                        ));
+                    }
+                    // LengthOfArrayLike precedes separator coercion.
+                    let len = match vm.heap.get(idx) {
+                        HeapObj::Array(items) => items.len(),
+                        _ => 0,
                     };
-                    let v = v.unwrap_or(Value::UNDEFINED);
-                    parts.push(if v.is_nullish() {
-                        String::new()
+                    let sep = if name == "toString" || arg0 == Value::UNDEFINED {
+                        ",".to_string()
                     } else {
-                        self.to_js_string(v)?
-                    });
-                }
-                Ok(Some(self.alloc_str(parts.join(&sep))))
+                        vm.to_js_string(arg0)?
+                    };
+                    // Get(O,k) and ToString(element) interleave. The active-path
+                    // guard is shared across nested ToString calls.
+                    let side_table = vm.arr_props.contains_key(&idx);
+                    let mut out = String::new();
+                    for k in 0..len {
+                        let v = if side_table {
+                            vm.array_iter_get(Value::heap(idx), k)?
+                        } else {
+                            vm.array_dense_or_proto_get(idx, k)?
+                        };
+                        let v = v.unwrap_or(Value::UNDEFINED);
+                        let part = if v.is_nullish() {
+                            String::new()
+                        } else {
+                            vm.to_js_string(v)?
+                        };
+                        vm.append_guest_join_part(&mut out, &sep, &part, k)?;
+                    }
+                    Ok(Some(vm.alloc_str(out)))
+                })
             }
             "at" => {
                 // Negative index counts from the end; out of range → undefined.
@@ -2191,6 +2272,7 @@ impl<'p> Vm<'p> {
                                     "TypeError: concat result length exceeds 2**53 - 1".into(),
                                 ));
                             }
+                            self.preflight_native_iteration_work(len as u64)?;
                             for k in 0..len {
                                 let el = self.get_prop(e, &k.to_string())?;
                                 self.concat_emit(species_target, &mut out, &mut n, el)?;
@@ -2225,7 +2307,7 @@ impl<'p> Vm<'p> {
                     }
                 };
                 let snapshot = self.array_snapshot(idx);
-                let out = self.flatten_array(&snapshot, depth);
+                let out = self.flatten_array(&snapshot, depth)?;
                 // flat builds the result via ArraySpeciesCreate(O, 0).
                 Ok(Some(self.array_from_species(Value::heap(idx), out, 0)?))
             }
@@ -2794,34 +2876,36 @@ impl<'p> Vm<'p> {
             "keys" => Ok(Some(self.make_live_iterator(idx, 0, self.array_iter_proto))),
             "entries" => Ok(Some(self.make_live_iterator(idx, 2, self.array_iter_proto))),
             "toLocaleString" => {
-                // Join each element's own toLocaleString(locales, options) with
-                // ","; nullish → "". The two arguments are forwarded per ECMA-402
-                // sup-array.prototype.toLocaleString.
-                let snapshot = if self.arr_props.contains_key(&idx) || self.array_has_holes(idx) {
-                    self.array_snapshot_get(idx)?
-                } else {
-                    self.array_snapshot(idx)
-                };
-                let fwd = [
-                    args.first().copied().unwrap_or(Value::UNDEFINED),
-                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
-                ];
-                let mut parts: Vec<String> = Vec::with_capacity(snapshot.len());
-                for v in snapshot {
-                    if v.is_nullish() {
-                        parts.push(String::new());
+                self.with_array_stringify_guard(idx, |vm| {
+                    // Join each element's own toLocaleString(locales, options)
+                    // with ","; nullish -> "".
+                    let snapshot = if vm.arr_props.contains_key(&idx) || vm.array_has_holes(idx) {
+                        vm.array_snapshot_get(idx)?
                     } else {
-                        let f = self.get_prop(v, "toLocaleString")?;
-                        let s = if self.is_callable(f) {
-                            let r = self.call_value(f, v, &fwd)?;
-                            self.display(r)
+                        vm.array_snapshot(idx)
+                    };
+                    let fwd = [
+                        args.first().copied().unwrap_or(Value::UNDEFINED),
+                        args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    ];
+                    let mut out = String::new();
+                    for (i, v) in snapshot.into_iter().enumerate() {
+                        if v.is_nullish() {
+                            vm.append_guest_join_part(&mut out, ",", "", i)?;
                         } else {
-                            self.display(v)
-                        };
-                        parts.push(s);
+                            let f = vm.get_prop(v, "toLocaleString")?;
+                            if !vm.is_callable(f) {
+                                return Err(Thrown(
+                                    "TypeError: toLocaleString is not callable".into(),
+                                ));
+                            }
+                            let r = vm.call_value(f, v, &fwd)?;
+                            let s = vm.to_js_string(r)?;
+                            vm.append_guest_join_part(&mut out, ",", &s, i)?;
+                        }
                     }
-                }
-                Ok(Some(self.alloc_str(parts.join(","))))
+                    Ok(Some(vm.alloc_str(out)))
+                })
             }
             "with" => {
                 // with(index, value): a COPY with one index replaced. The index is
@@ -3089,5 +3173,104 @@ impl<'p> Vm<'p> {
         }
         items.copy_from_slice(&a);
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "safe-sandbox"))]
+mod array_stringify_safety_tests {
+    #[test]
+    fn guest_visible_array_stringification_handles_cycles() {
+        let outcome = crate::run(
+            r#"
+                let a = [];
+                a[0] = a;
+                console.log("A" + String(a) + "B");
+                console.log("A" + ("" + a) + "B");
+                console.log("A" + a.toLocaleString() + "B");
+                let object = {};
+                object[a] = 7;
+                console.log(object[""]);
+
+                let left = [];
+                let right = [left];
+                left[0] = right;
+                console.log("A" + String(left) + "B");
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.output, vec!["AB", "AB", "AB", "7", "AB"]);
+    }
+
+    #[test]
+    fn deeply_nested_array_stringification_is_a_catchable_range_error() {
+        let outcome = crate::run(
+            r#"
+                let value = [];
+                for (let i = 0; i < 5; i++) value = [value];
+                let caught = "none";
+                try { String(value); } catch (error) {
+                    caught = (error instanceof RangeError) + ":" + error.message;
+                }
+                console.log(caught);
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.output,
+            vec!["true:array stringification nesting limit exceeded"]
+        );
+    }
+
+    #[test]
+    fn array_like_native_loops_fail_before_hostile_length_work() {
+        let outcome = crate::run(
+            r#"
+                const huge = { length: 262146 };
+                const results = [];
+                for (const run of [
+                    () => Array.prototype.forEach.call(huge, () => {}),
+                    () => Array.prototype.indexOf.call(huge, 1),
+                    () => Array.prototype.fill.call(huge, 0),
+                    () => Array.prototype.shift.call(huge),
+                    () => Array.prototype.toReversed.call(huge),
+                    () => Reflect.apply(function () {}, null, huge),
+                ]) {
+                    try { run(); results.push("completed"); }
+                    catch (error) { results.push(error instanceof RangeError ? "range" : "other"); }
+                }
+                console.log(results.join(","));
+                console.log(Array.prototype.indexOf.call({ length: 1000000000 }, 1, 999999999));
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.output,
+            vec!["range,range,range,range,range,range", "-1"]
+        );
+    }
+
+    #[test]
+    fn deeply_nested_flat_is_a_catchable_range_error() {
+        let outcome = crate::run(
+            r#"
+                let value = [1];
+                for (let i = 0; i < 65; i++) value = [value];
+                try {
+                    value.flat(Infinity);
+                    console.log("completed");
+                } catch (error) {
+                    console.log((error instanceof RangeError) + ":" + error.message);
+                }
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.output,
+            vec!["true:array flattening nesting limit exceeded"]
+        );
     }
 }

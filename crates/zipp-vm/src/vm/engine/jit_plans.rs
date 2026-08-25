@@ -3196,8 +3196,21 @@ impl<'p> Vm<'p> {
     /// protect, so the Vec may grow/reallocate freely.)
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
-    pub(crate) fn regs_would_overflow(&self, needed: usize) -> bool {
-        self.reg_capacity != 0 && needed > self.reg_capacity
+    pub(crate) fn regs_would_overflow(&mut self, needed: usize) -> bool {
+        if self.reg_capacity != 0 && needed > self.reg_capacity {
+            return true;
+        }
+        #[cfg(feature = "instrument")]
+        if needed > self.regs.capacity() {
+            let projected = needed.max(self.regs.capacity().saturating_mul(2));
+            let growth = projected
+                .saturating_sub(self.regs.capacity())
+                .saturating_mul(std::mem::size_of::<Value>());
+            if self.instrument_preflight_heap_growth(growth).is_err() {
+                return true;
+            }
+        }
+        false
     }
 
     /// The pinned register-file capacity (slots) for the Q4 leaf-inline headroom
@@ -3210,7 +3223,17 @@ impl<'p> Vm<'p> {
     }
     #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
     #[inline]
-    pub(crate) fn regs_would_overflow(&self, _needed: usize) -> bool {
+    pub(crate) fn regs_would_overflow(&mut self, needed: usize) -> bool {
+        #[cfg(feature = "instrument")]
+        if needed > self.regs.capacity() {
+            let projected = needed.max(self.regs.capacity().saturating_mul(2));
+            let growth = projected
+                .saturating_sub(self.regs.capacity())
+                .saturating_mul(std::mem::size_of::<Value>());
+            if self.instrument_preflight_heap_growth(growth).is_err() {
+                return true;
+            }
+        }
         false
     }
 

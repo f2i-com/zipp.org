@@ -37,6 +37,7 @@ const ls = {
 };
 
 const e = new Engine();
+e.setSyncHostCapabilities(["ls.getItem", "ls.setItem", "ls.removeItem", "ls.clear"]);
 e.setLocalStorageBridge(ls);
 
 console.log("— load the real bundle —");
@@ -108,6 +109,7 @@ ok("high score written to localStorage", "softn-snake-highscore" in store, JSON.
 
 console.log("— reload persists the high score —");
 const e2 = new Engine();
+e2.setSyncHostCapabilities(["ls.getItem", "ls.setItem", "ls.removeItem", "ls.clear"]);
 e2.setLocalStorageBridge(ls);
 const s2 = e2.initScript(src);
 e2.callFunction("_init", []);

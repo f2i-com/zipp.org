@@ -25,6 +25,11 @@
 
 use super::*;
 
+#[cfg(feature = "safe-sandbox")]
+use std::collections::{btree_map::Entry, hash_map::RandomState, BTreeMap};
+#[cfg(feature = "safe-sandbox")]
+use std::hash::{BuildHasher, Hash, Hasher};
+
 /// Collection size at which an indexed operation switches from the linear
 /// scan to building (and from then on maintaining) the hash index. Small
 /// collections never touch the index machinery.
@@ -100,45 +105,105 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The per-collection index: a flat OPEN-ADDRESSING table of
-/// `(tag, meta)` pairs with linear probing — `tag` is the high half of the
-/// mixed repr and ALSO picks the bucket (`tag & mask`), `meta` the slot
-/// position. Chosen over a general HashMap because a 1M-entry index is far
-/// larger than cache and the per-op cost is memory traffic: 8-byte slots
-/// pack EIGHT to a cache line (a whole miss chain at 3/4 load is typically
-/// one line), and a lookup costs one random line plus one confirming read of
-/// the backing key — the V8 OrderedHashTable shape, whose entry data is
-/// hot/sequential for insertion-ordered access while only the small bucket
-/// probe is random. Bucket-from-tag means growth rehashes STRAIGHT from the
-/// stored tags — no key reads, no content re-hashing (`mix64` avalanches, so
-/// the tag's low bits index as well as the full hash's would).
+/// Per-collection acceleration index. Ordinary builds retain the measured flat
+/// open-addressing table: an 8-byte `(tag, slot)` entry and linear probing keep
+/// its memory traffic low. The hostile-code profile instead uses a `BTreeMap`
+/// from a full 128-bit composite content tag to the backing slot. Tree navigation
+/// is O(log n) and has no attacker-selectable bucket chain even on
+/// wasm32-unknown-unknown, where std's `RandomState` seed comes from predictable
+/// linear-memory addresses. An exact collision in BOTH 64-bit tag halves falls
+/// back to a confirmed slot list, so that astronomically difficult case remains
+/// linear in the number of exact composite collisions rather than being claimed
+/// as a strict worst-case logarithmic bound.
 ///
-/// A tag match is always CONFIRMED with `svz_eq` against `keys[meta]` (the
-/// 32-bit tag is lossy). Two `meta` sentinels: `META_EMPTY` (never occupied
-/// — terminates probe chains) and `META_TOMB` (removed — chains walk past
-/// it, inserts may reuse it).
+/// Both representations remain pure acceleration. A tag hit is always
+/// CONFIRMED with `svz_eq` against `keys[slot]`, and the authoritative insertion
+/// order and tombstones remain in the collection's backing `Vec`.
 pub(crate) struct CollIndex {
+    #[cfg(not(feature = "safe-sandbox"))]
     table: Vec<(u32, u32)>,
+    #[cfg(not(feature = "safe-sandbox"))]
     mask: usize,
     /// Live entries (excludes tombstones).
     live: usize,
     /// Occupied slots INCLUDING tombstones — what bounds probe-chain length,
     /// so growth/rehash triggers on this.
+    #[cfg(not(feature = "safe-sandbox"))]
     used: usize,
+    #[cfg(feature = "safe-sandbox")]
+    tree: BTreeMap<u128, CollSlots>,
+    /// The keyed half makes an exact composite-tag collision require defeating
+    /// both this content hash and the independent deterministic representation.
+    /// Tree balancing, unlike a hash bucket layout, does not trust this seed.
+    #[cfg(feature = "safe-sandbox")]
+    hash_builder: RandomState,
 }
 
+#[cfg(feature = "safe-sandbox")]
+enum CollSlots {
+    One(u32),
+    /// Exact composite-tag collisions are extraordinarily unlikely but cannot
+    /// be treated as impossible: correctness still confirms each stored key.
+    Many(Vec<u32>),
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
 const META_EMPTY: u32 = u32::MAX;
+#[cfg(not(feature = "safe-sandbox"))]
 const META_TOMB: u32 = u32::MAX - 1;
 
 impl CollIndex {
+    /// Reserved bytes owned by the separately allocated index storage. The
+    /// header itself is inline in `Vm::collection_index` and is charged there.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            return self
+                .table
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(u32, u32)>());
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            // BTreeMap's node layout is private. Charge a deliberately generous
+            // two entry-layouts plus eight pointers per live tree key, and a
+            // root/node floor; separately include rare collision Vec capacity.
+            let per_key = std::mem::size_of::<(u128, CollSlots)>()
+                .saturating_add(8 * std::mem::size_of::<usize>())
+                .saturating_mul(2);
+            let nodes = 1_024usize.saturating_add(self.tree.len().saturating_mul(per_key));
+            return self.tree.values().fold(nodes, |bytes, slots| {
+                let collision_bytes = match slots {
+                    CollSlots::One(_) => 0,
+                    CollSlots::Many(slots) => {
+                        slots.capacity().saturating_mul(std::mem::size_of::<u32>())
+                    }
+                };
+                bytes.saturating_add(collision_bytes)
+            });
+        }
+    }
+
     fn with_capacity(n: usize) -> CollIndex {
-        // Capacity for `n` entries at < 3/4 load, minimum 128, power of two.
-        let cap = (n * 4 / 3 + 1).next_power_of_two().max(128);
-        CollIndex {
-            table: vec![(0, META_EMPTY); cap],
-            mask: cap - 1,
-            live: 0,
-            used: 0,
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            // Capacity for `n` entries at < 3/4 load, minimum 128, power of two.
+            let cap = (n * 4 / 3 + 1).next_power_of_two().max(128);
+            return CollIndex {
+                table: vec![(0, META_EMPTY); cap],
+                mask: cap - 1,
+                live: 0,
+                used: 0,
+            };
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = n;
+            return CollIndex {
+                live: 0,
+                tree: BTreeMap::new(),
+                hash_builder: RandomState::new(),
+            };
         }
     }
 
@@ -147,47 +212,142 @@ impl CollIndex {
         let mut ix = CollIndex::with_capacity(keys.len());
         for (i, &k) in keys.iter().enumerate() {
             if !k.is_hole() {
-                ix.insert(svz_repr(heap, k), i as u32);
+                ix.insert(heap, k, i as u32);
             }
         }
         ix
     }
 
-    /// The table hash of a repr: `mix64`'s high half — bucket = `tag & mask`.
+    /// The table hash in the ordinary profile: `mix64`'s high half — bucket =
+    /// `tag & mask`.
+    #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     fn tag(repr: u64) -> u32 {
         (mix64(repr) >> 32) as u32
     }
 
-    /// Position of the live slot whose key is SameValueZero-equal to `key`
-    /// (repr `repr`). A tag hit is CONFIRMED with `svz_eq` against the
-    /// stored key (collisions + the tag's lossiness).
+    /// Composite ordered key for the hostile-code tree. The high half hashes
+    /// actual SameValueZero content; the low half is an independent
+    /// equal-consistent representation. Predicting either half cannot unbalance
+    /// the tree, and colliding both still falls back to confirmed slot storage.
+    #[cfg(feature = "safe-sandbox")]
+    fn key_tag(&self, heap: &Heap, v: Value) -> u128 {
+        let mut hasher = self.hash_builder.build_hasher();
+        if v.is_number() {
+            0u8.hash(&mut hasher);
+            let n = v.as_f64();
+            let bits = if n.is_nan() {
+                f64::NAN.to_bits()
+            } else if n == 0.0 {
+                0
+            } else {
+                n.to_bits()
+            };
+            bits.hash(&mut hasher);
+        } else if v.is_heap() {
+            match heap.get(v.heap_index()) {
+                HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                    1u8.hash(&mut hasher);
+                    heap.str_wtf8_cow(v.heap_index())
+                        .expect("string-like heap value")
+                        .as_ref()
+                        .hash(&mut hasher);
+                }
+                HeapObj::BigInt(x) => {
+                    2u8.hash(&mut hasher);
+                    x.hash(&mut hasher);
+                }
+                HeapObj::BigIntBig(x) => {
+                    3u8.hash(&mut hasher);
+                    x.hash(&mut hasher);
+                }
+                _ => {
+                    4u8.hash(&mut hasher);
+                    v.bits().hash(&mut hasher);
+                }
+            }
+        } else {
+            4u8.hash(&mut hasher);
+            v.bits().hash(&mut hasher);
+        }
+        (u128::from(hasher.finish()) << 64) | u128::from(svz_repr(heap, v))
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
-    fn find(&self, heap: &Heap, keys: &[Value], key: Value, repr: u64) -> Option<usize> {
-        let tag = CollIndex::tag(repr);
-        let mut i = tag as usize & self.mask;
-        loop {
-            let (st, sm) = self.table[i];
-            if sm == META_EMPTY {
-                return None;
+    fn key_tag(&self, heap: &Heap, v: Value) -> u32 {
+        CollIndex::tag(svz_repr(heap, v))
+    }
+
+    /// Position of the live slot whose key is SameValueZero-equal to `key`.
+    /// A tag hit is CONFIRMED with `svz_eq` against the stored key (collisions
+    /// plus the tag's lossiness).
+    #[inline]
+    fn find(&self, heap: &Heap, keys: &[Value], key: Value) -> Option<usize> {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let slots = self.tree.get(&self.key_tag(heap, key))?;
+            return match slots {
+                CollSlots::One(slot) => {
+                    svz_eq(heap, keys[*slot as usize], key).then_some(*slot as usize)
+                }
+                CollSlots::Many(slots) => slots
+                    .iter()
+                    .copied()
+                    .find(|&slot| svz_eq(heap, keys[slot as usize], key))
+                    .map(|slot| slot as usize),
+            };
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let tag = self.key_tag(heap, key);
+            let mut i = tag as usize & self.mask;
+            loop {
+                let (st, sm) = self.table[i];
+                if sm == META_EMPTY {
+                    return None;
+                }
+                if st == tag && sm != META_TOMB && svz_eq(heap, keys[sm as usize], key) {
+                    return Some(sm as usize);
+                }
+                i = (i + 1) & self.mask;
             }
-            if st == tag && sm != META_TOMB && svz_eq(heap, keys[sm as usize], key) {
-                return Some(sm as usize);
-            }
-            i = (i + 1) & self.mask;
         }
     }
 
-    /// Record `pos` under `repr`. The caller guarantees the key is absent
+    /// Record `pos` under `key`. The caller guarantees the key is absent
     /// (every insertion path `find`s first), so no duplicate check is needed.
-    fn insert(&mut self, repr: u64, pos: u32) {
-        if (self.used + 1) * 4 >= self.table.len() * 3 {
-            self.grow();
+    fn insert(&mut self, heap: &Heap, key: Value, pos: u32) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let tag = self.key_tag(heap, key);
+            match self.tree.entry(tag) {
+                Entry::Vacant(entry) => {
+                    entry.insert(CollSlots::One(pos));
+                }
+                Entry::Occupied(mut entry) => match entry.get_mut() {
+                    CollSlots::One(first) => {
+                        let first = *first;
+                        entry.insert(CollSlots::Many(vec![first, pos]));
+                    }
+                    CollSlots::Many(slots) => slots.push(pos),
+                },
+            }
+            self.live += 1;
+            return;
         }
-        self.insert_raw(CollIndex::tag(repr), pos);
-        self.live += 1;
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            if (self.used + 1) * 4 >= self.table.len() * 3 {
+                self.grow();
+            }
+            let tag = self.key_tag(heap, key);
+            self.insert_raw(tag, pos);
+            self.live += 1;
+        }
     }
 
+    #[cfg(not(feature = "safe-sandbox"))]
     fn insert_raw(&mut self, tag: u32, meta: u32) {
         let mut i = tag as usize & self.mask;
         loop {
@@ -206,28 +366,64 @@ impl CollIndex {
         }
     }
 
-    /// Tombstone the entry for (`repr`, `pos`): probe chains keep walking
+    /// Tombstone the entry for (`key`, `pos`): probe chains keep walking
     /// past it, and a later insert may reuse the slot.
-    fn remove(&mut self, repr: u64, pos: u32) {
-        let tag = CollIndex::tag(repr);
-        let mut i = tag as usize & self.mask;
-        loop {
-            let slot = &mut self.table[i];
-            if slot.1 == META_EMPTY {
-                return; // absent — remove is only called for indexed entries
+    fn remove(&mut self, heap: &Heap, key: Value, pos: u32) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let tag = self.key_tag(heap, key);
+            let mut remove_tag = false;
+            let mut removed = false;
+            if let Some(entry) = self.tree.get_mut(&tag) {
+                match entry {
+                    CollSlots::One(slot) => {
+                        if *slot == pos {
+                            remove_tag = true;
+                            removed = true;
+                        }
+                    }
+                    CollSlots::Many(slots) => {
+                        if let Some(at) = slots.iter().position(|&slot| slot == pos) {
+                            slots.swap_remove(at);
+                            removed = true;
+                            if slots.len() == 1 {
+                                *entry = CollSlots::One(slots[0]);
+                            }
+                        }
+                    }
+                }
             }
-            if slot.0 == tag && slot.1 == pos {
-                slot.1 = META_TOMB;
+            if remove_tag {
+                self.tree.remove(&tag);
+            }
+            if removed {
                 self.live -= 1;
-                return;
             }
-            i = (i + 1) & self.mask;
+            return;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            let tag = self.key_tag(heap, key);
+            let mut i = tag as usize & self.mask;
+            loop {
+                let slot = &mut self.table[i];
+                if slot.1 == META_EMPTY {
+                    return; // absent — remove is only called for indexed entries
+                }
+                if slot.0 == tag && slot.1 == pos {
+                    slot.1 = META_TOMB;
+                    self.live -= 1;
+                    return;
+                }
+                i = (i + 1) & self.mask;
+            }
         }
     }
 
     /// Rehash: double when genuinely full, same-size when mostly tombstones
     /// (a delete-heavy phase purges them without growing the table). The
     /// stored tags re-index directly (bucket = `tag & mask`) — no key reads.
+    #[cfg(not(feature = "safe-sandbox"))]
     fn grow(&mut self) {
         let cap = if self.live * 2 >= self.table.len() {
             self.table.len() * 2
@@ -303,16 +499,13 @@ impl LocalFinder {
             }
             self.index = Some(CollIndex::build(heap, keys));
         }
-        self.index
-            .as_ref()
-            .unwrap()
-            .find(heap, keys, key, svz_repr(heap, key))
+        self.index.as_ref().unwrap().find(heap, keys, key)
     }
 
     /// Report `key` about to be pushed at `keys.len()` (call BEFORE the push).
     pub(crate) fn record_push(&mut self, heap: &Heap, keys: &[Value], key: Value) {
         if let Some(ix) = &mut self.index {
-            ix.insert(svz_repr(heap, key), keys.len() as u32);
+            ix.insert(heap, key, keys.len() as u32);
         }
     }
 }
@@ -338,7 +531,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         if let Some(ix) = self.collection_index.get(&idx) {
-            return ix.find(heap, keys, key, svz_repr(heap, key));
+            return ix.find(heap, keys, key);
         }
         // A user key can never be HOLE (its bit pattern is engine-internal),
         // so tombstoned slots never match — same as the pre-index scans.
@@ -347,7 +540,7 @@ impl<'p> Vm<'p> {
         }
         // Crossed the threshold: build the index once; maintained from now on.
         let ix = CollIndex::build(heap, keys);
-        let found = ix.find(heap, keys, key, svz_repr(heap, key));
+        let found = ix.find(heap, keys, key);
         self.collection_index.insert(idx, ix);
         found
     }
@@ -373,7 +566,7 @@ impl<'p> Vm<'p> {
             ..
         } = self;
         if let Some(ix) = collection_index.get_mut(&idx) {
-            ix.insert(svz_repr(heap, key), pos as u32);
+            ix.insert(heap, key, pos as u32);
         }
     }
 
@@ -389,7 +582,7 @@ impl<'p> Vm<'p> {
             ..
         } = self;
         if let Some(ix) = collection_index.get_mut(&idx) {
-            ix.remove(svz_repr(heap, key), pos as u32);
+            ix.remove(heap, key, pos as u32);
         }
     }
 
@@ -400,5 +593,139 @@ impl<'p> Vm<'p> {
     /// index rebuilds lazily on the next indexed lookup.
     pub(crate) fn coll_index_invalidate(&mut self, idx: u32) {
         self.collection_index.remove(&idx);
+    }
+}
+
+#[cfg(all(test, feature = "safe-sandbox"))]
+mod safe_index_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn old_deterministic_tag(key: &str) -> u32 {
+        let mut h = 0xCBF2_9CE4_8422_2325u64;
+        for &b in key.as_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((h ^ (h >> 31)) >> 32) as u32
+    }
+
+    #[test]
+    fn ordered_tags_break_the_reusable_deterministic_string_cluster() {
+        // These short strings all occupied bucket zero in a 2,048-bucket table
+        // under the former public FNV/splitmix mapping. A single precomputed
+        // list therefore attacked Object, Map, and Set indexes in every VM.
+        let colliders = [
+            "p244", "p687", "p4225", "p6240", "p13634", "p15844", "p16140", "p16375", "p17447",
+            "p18159", "p19922", "p19997", "p20117", "p21684", "p23891", "p26786", "p27877",
+            "p28218", "p32488", "p34067", "p38609", "p38820", "p39395", "p44096",
+        ];
+        assert!(colliders
+            .iter()
+            .all(|key| old_deterministic_tag(key) & 2_047 == 0));
+
+        let mut heap = Heap::new();
+        let keys: Vec<Value> = colliders
+            .iter()
+            .map(|key| Value::heap(heap.alloc_str((*key).to_string())))
+            .collect();
+        let mut first = CollIndex::with_capacity(1_024);
+        let second = CollIndex::with_capacity(1_024);
+        let tags: HashSet<u128> = keys.iter().map(|&key| first.key_tag(&heap, key)).collect();
+        assert_eq!(tags.len(), colliders.len());
+        assert!(
+            keys.iter()
+                .filter(|&&key| first.key_tag(&heap, key) != second.key_tag(&heap, key))
+                .count()
+                >= colliders.len() / 2,
+            "independent collection indexes unexpectedly reused one hash key"
+        );
+        for (pos, &key) in keys.iter().enumerate() {
+            first.insert(&heap, key, pos as u32);
+        }
+        for (pos, &key) in keys.iter().enumerate() {
+            assert_eq!(first.find(&heap, &keys, key), Some(pos));
+        }
+    }
+
+    #[test]
+    fn keyed_tags_preserve_same_value_zero_equivalence() {
+        let heap = Heap::new();
+        let index = CollIndex::with_capacity(INDEX_THRESHOLD);
+        assert_eq!(
+            index.key_tag(&heap, Value::int(1)),
+            index.key_tag(&heap, Value::from_bits(1.0f64.to_bits()))
+        );
+        assert_eq!(
+            index.key_tag(&heap, Value::from_bits(0.0f64.to_bits())),
+            index.key_tag(&heap, Value::num(-0.0))
+        );
+        assert_eq!(
+            index.key_tag(&heap, Value::num(f64::NAN)),
+            index.key_tag(&heap, Value::num(-f64::NAN))
+        );
+    }
+
+    #[test]
+    fn ordered_index_keeps_tags_valid_across_growth_and_removal() {
+        let mut heap = Heap::new();
+        let keys: Vec<Value> = (0..200)
+            .map(|i| Value::heap(heap.alloc_str(format!("collection-key-{i}"))))
+            .collect();
+        let mut index = CollIndex::with_capacity(0);
+        for (pos, &key) in keys.iter().enumerate() {
+            index.insert(&heap, key, pos as u32);
+        }
+        assert_eq!(index.tree.len(), keys.len());
+        for (pos, &key) in keys.iter().enumerate() {
+            assert_eq!(index.find(&heap, &keys, key), Some(pos));
+        }
+
+        for (pos, &key) in keys.iter().enumerate().step_by(3) {
+            index.remove(&heap, key, pos as u32);
+        }
+        for (pos, &key) in keys.iter().enumerate() {
+            assert_eq!(
+                index.find(&heap, &keys, key),
+                (pos % 3 != 0).then_some(pos),
+                "wrong result for slot {pos} after tombstoning"
+            );
+        }
+    }
+
+    #[test]
+    fn ten_thousand_legacy_low_bit_colliders_stay_structurally_bounded() {
+        // Finding 10k names with seven chosen legacy bucket bits takes about
+        // 1.28m deterministic trials, keeping this regression quick while
+        // presenting an adversarial insertion order. BTree lookup cost depends
+        // only on entry count, never on those attacker-selected hash bits.
+        let mut names = Vec::with_capacity(10_000);
+        let mut candidate = 0u64;
+        while names.len() < 10_000 {
+            let key = format!("tree-flood-{candidate:x}");
+            if old_deterministic_tag(&key) & 127 == 0 {
+                names.push(key);
+            }
+            candidate += 1;
+        }
+
+        let mut heap = Heap::new();
+        let keys: Vec<Value> = names
+            .into_iter()
+            .map(|key| Value::heap(heap.alloc_str(key)))
+            .collect();
+        let mut index = CollIndex::build(&heap, &keys);
+        assert_eq!(index.live, keys.len());
+        for (pos, &key) in keys.iter().enumerate() {
+            assert_eq!(index.find(&heap, &keys, key), Some(pos));
+        }
+
+        for (pos, &key) in keys.iter().enumerate().step_by(97) {
+            index.remove(&heap, key, pos as u32);
+        }
+        for (pos, &key) in keys.iter().enumerate().step_by(97) {
+            assert_eq!(index.find(&heap, &keys, key), None, "slot {pos} survived");
+        }
     }
 }

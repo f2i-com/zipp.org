@@ -1,9 +1,20 @@
 [package]
 name = "zipp-wasm"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
 description = "WebAssembly embedding of the zipp JavaScript engine: a persistent VM a browser host can keep alive across re-entries."
+
+# Keep this package in a separate feature-resolution domain from the native
+# workspace. See the root workspace's `exclude` rationale.
+[workspace]
+resolver = "2"
+
+[profile.release]
+# Integer-wrap bugs in VM bookkeeping should terminate the disposable Worker,
+# never silently become an index/limit bypass in the hardened artifact.
+overflow-checks = true
+panic = "abort"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -11,7 +22,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # The engine, interpreter-only: the JIT tiers emit x86-64/ARM64 native code and
 # have no meaning on wasm (see zipp-vm's `jit` feature).
-zipp-vm = { path = "../zipp-vm", default-features = false, features = ["instrument"] }
-wasm-bindgen = "0.2.126"
-js-sys = "0.3"
-console_error_panic_hook = "0.1"
+zipp-vm = { path = "../zipp-vm", default-features = false, features = ["safe-sandbox"] }
+wasm-bindgen = "=0.2.126"
+# Keep the Function type/call bindings, but do not compile js-sys's
+# `unsafe-eval` constructors into the trusted host surface.
+js-sys = { version = "=0.3.103", default-features = false, features = ["std"] }
+console_error_panic_hook = "=0.1.7"

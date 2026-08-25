@@ -94,311 +94,338 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn has_property(&self, obj: Value, key: Value) -> bool {
-        if !obj.is_heap() {
-            return false;
-        }
-        let idx = obj.heap_index();
-        match self.heap.get(idx) {
-            HeapObj::Object(map) => {
-                let k = self.key_of(key);
-                if map.get(&k).is_some() {
-                    return true;
-                }
-                // %Array.prototype% is an Array exotic: its `length` is a real
-                // own property (virtual, in arr_proto_len), so
-                // `"length" in Object.create(Array.prototype)` is true.
-                if k == "length" && idx == self.arr_proto && self.arr_proto != 0 {
-                    return true;
-                }
-                // The global object's SLOT-backed own properties (script `var`s
-                // and function declarations, and the built-ins that never got an
-                // ObjMap entry). `globalThis.assert` read fine while
-                // `"assert" in globalThis` was false, because only the member-get
-                // and descriptor paths consulted the slot table
-                // (staging/sm/Reflect/set.js line 126).
-                if idx == self.global_this
-                    && self.global_this != 0
-                    && self.global_by_name(&k).is_some()
-                {
-                    return true;
-                }
-                // Inherited method/getter/setter through the class chain.
-                let class = map.class;
-                let mut cur = class;
-                while let Some(cidx) = cur {
-                    match self.heap.get(cidx) {
-                        HeapObj::Class(c) => {
-                            if c.methods.iter().any(|(n, _)| *n == k)
-                                || c.getters.iter().any(|(n, _)| *n == k)
-                                || c.setters.iter().any(|(n, _)| *n == k)
-                            {
-                                return true;
-                            }
-                            cur = c.parent;
-                        }
-                        _ => break,
-                    }
-                }
-                // [[HasProperty]] continues up the prototype chain: an explicit
-                // `Object.create` proto, then the base Object.prototype (which
-                // carries toString/hasOwnProperty/valueOf/…). Mirrors get_member's
-                // proto resolution, minus class-instance C.prototype (its methods
-                // are already covered by the class-chain walk above).
-                let proto = if let Some(&p) = self.proto_of.get(&idx) {
-                    p.is_heap().then_some(p)
-                } else if self.obj_proto != 0 && idx != self.obj_proto {
-                    Some(Value::heap(self.obj_proto))
-                } else {
-                    None
-                };
-                match proto {
-                    Some(p) => self.has_property(p, key),
-                    None => false,
-                }
+    pub(crate) fn has_property(&self, mut obj: Value, key: Value) -> bool {
+        // The infallible/internal variant cannot surface the shared RangeError,
+        // so keep its ordinary (non-Proxy) prototype traversal iterative. The
+        // public `in`/Reflect.has path below is fallible and depth-guards every
+        // dynamic/Proxy edge instead.
+        'prototype_chain: loop {
+            if !obj.is_heap() {
+                return false;
             }
-            HeapObj::Array(items) => {
-                let len = items.len();
-                // A canonical integer index: a numeric Value, or a canonical numeric
-                // string ("0", not "01"/"-1") — decided on the key's bytes in place
-                // (key_array_index; the old spelling allocated two Strings per probe,
-                // once per key per chain level of the for-in liveness re-check).
-                let int_index = self.key_array_index(key);
-                if let Some(i) = int_index {
-                    // An in-range slot is present iff it is not a hole.
-                    if i < len && !items[i].is_hole() {
+            let idx = obj.heap_index();
+            match self.heap.get(idx) {
+                HeapObj::Object(map) => {
+                    let k = self.key_of(key);
+                    if map.get(&k).is_some() {
                         return true;
                     }
-                    // A hole OR an out-of-range index is not an own element, but it may
-                    // be overridden (a defineProperty'd index in arr_props) or inherited
-                    // from the prototype chain — [[HasProperty]] must keep walking (an
-                    // out-of-range `i` was previously reported absent without this check).
-                    // The overlay is keyed by the canonical decimal string, spelled into
-                    // a stack buffer — never a per-probe String allocation.
-                    if let Some(m) = self.arr_props.get(&idx) {
-                        let mut buf = [0u8; 20];
-                        if m.pos(crate::heap::index_key(&mut buf, i)).is_some() {
-                            return true;
+                    // %Array.prototype% is an Array exotic: its `length` is a real
+                    // own property (virtual, in arr_proto_len), so
+                    // `"length" in Object.create(Array.prototype)` is true.
+                    if k == "length" && idx == self.arr_proto && self.arr_proto != 0 {
+                        return true;
+                    }
+                    // The global object's SLOT-backed own properties (script `var`s
+                    // and function declarations, and the built-ins that never got an
+                    // ObjMap entry). `globalThis.assert` read fine while
+                    // `"assert" in globalThis` was false, because only the member-get
+                    // and descriptor paths consulted the slot table
+                    // (staging/sm/Reflect/set.js line 126).
+                    if idx == self.global_this
+                        && self.global_this != 0
+                        && self.global_by_name(&k).is_some()
+                    {
+                        return true;
+                    }
+                    // Inherited method/getter/setter through the class chain.
+                    let class = map.class;
+                    let mut cur = class;
+                    while let Some(cidx) = cur {
+                        match self.heap.get(cidx) {
+                            HeapObj::Class(c) => {
+                                if c.methods.iter().any(|(n, _)| *n == k)
+                                    || c.getters.iter().any(|(n, _)| *n == k)
+                                    || c.setters.iter().any(|(n, _)| *n == k)
+                                {
+                                    return true;
+                                }
+                                cur = c.parent;
+                            }
+                            _ => break,
                         }
                     }
-                    // Walk the ACTUAL [[Prototype]] (a setPrototypeOf custom proto
-                    // carries inherited indices), else %Array.prototype%.
+                    // [[HasProperty]] continues up the prototype chain: an explicit
+                    // `Object.create` proto, then the base Object.prototype (which
+                    // carries toString/hasOwnProperty/valueOf/…). Mirrors get_member's
+                    // proto resolution, minus class-instance C.prototype (its methods
+                    // are already covered by the class-chain walk above).
+                    let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                        p.is_heap().then_some(p)
+                    } else if self.obj_proto != 0 && idx != self.obj_proto {
+                        Some(Value::heap(self.obj_proto))
+                    } else {
+                        None
+                    };
+                    match proto {
+                        Some(p) => {
+                            obj = p;
+                            continue 'prototype_chain;
+                        }
+                        None => return false,
+                    }
+                }
+                HeapObj::Array(items) => {
+                    let len = items.len();
+                    // A canonical integer index: a numeric Value, or a canonical numeric
+                    // string ("0", not "01"/"-1") — decided on the key's bytes in place
+                    // (key_array_index; the old spelling allocated two Strings per probe,
+                    // once per key per chain level of the for-in liveness re-check).
+                    let int_index = self.key_array_index(key);
+                    if let Some(i) = int_index {
+                        // An in-range slot is present iff it is not a hole.
+                        if i < len && !items[i].is_hole() {
+                            return true;
+                        }
+                        // A hole OR an out-of-range index is not an own element, but it may
+                        // be overridden (a defineProperty'd index in arr_props) or inherited
+                        // from the prototype chain — [[HasProperty]] must keep walking (an
+                        // out-of-range `i` was previously reported absent without this check).
+                        // The overlay is keyed by the canonical decimal string, spelled into
+                        // a stack buffer — never a per-probe String allocation.
+                        if let Some(m) = self.arr_props.get(&idx) {
+                            let mut buf = [0u8; 20];
+                            if m.pos(crate::heap::index_key(&mut buf, i)).is_some() {
+                                return true;
+                            }
+                        }
+                        // Walk the ACTUAL [[Prototype]] (a setPrototypeOf custom proto
+                        // carries inherited indices), else %Array.prototype%.
+                        let proto = match self.proto_of.get(&idx) {
+                            Some(&p) => p,
+                            None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                            None => Value::NULL,
+                        };
+                        if !proto.is_heap() {
+                            return false;
+                        }
+                        obj = proto;
+                        continue 'prototype_chain;
+                    }
+                    // A non-index key: `length` is always own; else an arr_props named
+                    // prop; else inherited. A flat string key's bytes are viewed in
+                    // place — key_of allocated a fresh String per probe, per chain
+                    // level (ZIPP_NO_ARRKEY_FAST=1 restores that).
+                    let kbuf;
+                    let k: &str = match arrkey_fast_enabled()
+                        .then(|| self.flat_key_str(key))
+                        .flatten()
+                    {
+                        Some(s) => s,
+                        None => {
+                            kbuf = self.key_of(key);
+                            &kbuf
+                        }
+                    };
+                    if k == "length" {
+                        return true;
+                    }
+                    if self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(k).is_some())
+                    {
+                        return true;
+                    }
+                    if self.regexp_result_prop(idx, &k).is_some() {
+                        return true;
+                    }
+                    // Inherited: the actual [[Prototype]] (custom via setPrototypeOf),
+                    // else Array.prototype (push/map/…) then Object.prototype.
                     let proto = match self.proto_of.get(&idx) {
                         Some(&p) => p,
                         None if self.arr_proto != 0 => Value::heap(self.arr_proto),
                         None => Value::NULL,
                     };
-                    return proto.is_heap() && self.has_property(proto, key);
-                }
-                // A non-index key: `length` is always own; else an arr_props named
-                // prop; else inherited. A flat string key's bytes are viewed in
-                // place — key_of allocated a fresh String per probe, per chain
-                // level (ZIPP_NO_ARRKEY_FAST=1 restores that).
-                let kbuf;
-                let k: &str = match arrkey_fast_enabled()
-                    .then(|| self.flat_key_str(key))
-                    .flatten()
-                {
-                    Some(s) => s,
-                    None => {
-                        kbuf = self.key_of(key);
-                        &kbuf
+                    if !proto.is_heap() {
+                        return false;
                     }
-                };
-                if k == "length" {
-                    return true;
+                    obj = proto;
+                    continue 'prototype_chain;
                 }
-                if self
-                    .arr_props
-                    .get(&idx)
-                    .map_or(false, |m| m.pos(k).is_some())
-                {
-                    return true;
+                HeapObj::Str(s) => {
+                    return match array_index(key) {
+                        Some(i) => i < s.units(),
+                        None => self.display(key) == "length",
+                    }
                 }
-                if self.regexp_result_prop(idx, &k).is_some() {
-                    return true;
+                HeapObj::Cons { len, .. } => {
+                    return match array_index(key) {
+                        Some(i) => i < *len,
+                        None => self.display(key) == "length",
+                    }
                 }
-                // Inherited: the actual [[Prototype]] (custom via setPrototypeOf),
-                // else Array.prototype (push/map/…) then Object.prototype.
-                let proto = match self.proto_of.get(&idx) {
-                    Some(&p) => p,
-                    None if self.arr_proto != 0 => Value::heap(self.arr_proto),
-                    None => Value::NULL,
-                };
-                proto.is_heap() && self.has_property(proto, key)
-            }
-            HeapObj::Str(s) => match array_index(key) {
-                Some(i) => i < s.units(),
-                None => self.display(key) == "length",
-            },
-            HeapObj::Cons { len, .. } => match array_index(key) {
-                Some(i) => i < *len,
-                None => self.display(key) == "length",
-            },
-            // A TypedArray's integer-indexed exotic own properties (`0 in ta`),
-            // then any named own prop (`ta.constructor` override in arr_props),
-            // then the %TypedArray%.prototype chain (`"subarray" in ta`).
-            HeapObj::TypedArray { .. } => {
-                let k = self.key_of(key);
-                // A CanonicalNumericIndexString is absorbed by the integer-indexed
-                // exotic [[HasProperty]]: present iff it's a VALID integer index,
-                // and never inherited from the prototype (so `TA.prototype[5]`
-                // does not make `5 in ta` true on a shorter array).
-                if self.is_canonical_numeric_index(&k) {
-                    return self.ta_valid_index(idx, &k).is_some();
+                // A TypedArray's integer-indexed exotic own properties (`0 in ta`),
+                // then any named own prop (`ta.constructor` override in arr_props),
+                // then the %TypedArray%.prototype chain (`"subarray" in ta`).
+                HeapObj::TypedArray { .. } => {
+                    let k = self.key_of(key);
+                    // A CanonicalNumericIndexString is absorbed by the integer-indexed
+                    // exotic [[HasProperty]]: present iff it's a VALID integer index,
+                    // and never inherited from the prototype (so `TA.prototype[5]`
+                    // does not make `5 in ta` true on a shorter array).
+                    if self.is_canonical_numeric_index(&k) {
+                        return self.ta_valid_index(idx, &k).is_some();
+                    }
+                    if self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(&k).is_some())
+                    {
+                        return true;
+                    }
+                    match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+                        Some(p) => {
+                            obj = p;
+                            continue 'prototype_chain;
+                        }
+                        None => return false,
+                    }
                 }
-                if self
-                    .arr_props
-                    .get(&idx)
-                    .map_or(false, |m| m.pos(&k).is_some())
-                {
-                    return true;
-                }
-                match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
-                    Some(p) => self.has_property(p, key),
-                    None => false,
-                }
-            }
-            // Static members (data + `static get`/`set` accessors) are own
-            // properties of the class value and are inherited up the chain.
-            HeapObj::Class(_) => {
-                let k = self.key_of(key);
-                // A class always owns `prototype`.
-                if k == "prototype" && self.callable_has_prototype(obj) {
-                    return true;
-                }
-                let mut cur = Some(idx);
-                while let Some(cidx) = cur {
-                    match self.heap.get(cidx) {
-                        HeapObj::Class(c) => {
-                            if c.statics.get(&k).is_some()
-                                || c.static_getters.iter().any(|(n, _)| *n == k)
-                                || c.static_setters.iter().any(|(n, _)| *n == k)
-                            {
-                                return true;
+                // Static members (data + `static get`/`set` accessors) are own
+                // properties of the class value and are inherited up the chain.
+                HeapObj::Class(_) => {
+                    let k = self.key_of(key);
+                    // A class always owns `prototype`.
+                    if k == "prototype" && self.callable_has_prototype(obj) {
+                        return true;
+                    }
+                    let mut cur = Some(idx);
+                    while let Some(cidx) = cur {
+                        match self.heap.get(cidx) {
+                            HeapObj::Class(c) => {
+                                if c.statics.get(&k).is_some()
+                                    || c.static_getters.iter().any(|(n, _)| *n == k)
+                                    || c.static_setters.iter().any(|(n, _)| *n == k)
+                                {
+                                    return true;
+                                }
+                                cur = c.parent;
                             }
-                            cur = c.parent;
-                        }
-                        _ => break,
-                    }
-                }
-                false
-            }
-            _ => {
-                let k = self.key_of(key);
-                // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*,
-                // …) keep their named own props in the arr_props side table.
-                if self
-                    .arr_props
-                    .get(&idx)
-                    .map_or(false, |m| m.pos(&k).is_some())
-                {
-                    return true;
-                }
-                // A RegExp instance's `lastIndex` is an own data property held
-                // in the heap object itself (not arr_props) —
-                // `"lastIndex" in re` is true.
-                if k == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
-                    return true;
-                }
-                // A callable's assigned own properties (`fn.x = …`) live in the
-                // SEPARATE fn_props side table — `"x" in fn` must see them too
-                // (mirrors get_own_property; read_descriptor relies on this for a
-                // Function-object descriptor).
-                if matches!(
-                    self.heap.get(idx),
-                    HeapObj::Func(_)
-                        | HeapObj::Closure { .. }
-                        | HeapObj::Bound { .. }
-                        | HeapObj::Wrapped { .. }
-                        | HeapObj::Native(_)
-                        | HeapObj::NativeClosure { .. }
-                ) && self
-                    .fn_props
-                    .get(&idx)
-                    .map_or(false, |m| m.pos(&k).is_some())
-                {
-                    return true;
-                }
-                // A function's synthesized `prototype` own property (ordinary
-                // functions + generators; not arrows/methods/async/bound/native).
-                if k == "prototype" && self.callable_has_prototype(obj) {
-                    return true;
-                }
-                // A boxed String wrapper exposes the wrapped string's chars +
-                // `length` as integer-indexed own properties.
-                if let HeapObj::Boxed { kind: 0, value } = self.heap.get(idx) {
-                    let v = *value;
-                    let clen = match self.heap.get(v.heap_index()) {
-                        HeapObj::Str(s) => Some(s.units()),
-                        HeapObj::Cons { len, .. } => Some(*len),
-                        _ => None,
-                    };
-                    if let Some(n) = clen {
-                        // The index may arrive as a NUMBER (`4 in str`) or as its
-                        // canonical STRING form (`"4" in str`, and every
-                        // `Reflect.has`, which passes ToPropertyKey's result).
-                        // Only `array_index` was consulted, so the string form
-                        // reported absent (staging/sm/Reflect/has.js).
-                        let i = array_index(key).or_else(|| match k.parse::<u32>() {
-                            Ok(u) if u != u32::MAX && u.to_string() == k => Some(u as usize),
-                            _ => None,
-                        });
-                        if let Some(i) = i {
-                            if i < n {
-                                return true;
-                            }
-                        }
-                        if k == "length" {
-                            return true;
+                            _ => break,
                         }
                     }
+                    return false;
                 }
-                // The prototype chain: an explicit `proto_of`, else the intrinsic
-                // prototype for this object's kind — so inherited methods/accessors
-                // are visible to `in` (`"toFixed" in Object(2.5)`, `"call" in fn`),
-                // mirroring get_member. Without this fallback `in` saw only own
-                // props on a boxed primitive / callable / Date / Promise / …
-                let proto = if let Some(&p) = self.proto_of.get(&idx) {
-                    p.is_heap().then_some(p)
-                } else {
-                    let bp = match self.heap.get(idx) {
+                _ => {
+                    let k = self.key_of(key);
+                    // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*,
+                    // …) keep their named own props in the arr_props side table.
+                    if self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(&k).is_some())
+                    {
+                        return true;
+                    }
+                    // A RegExp instance's `lastIndex` is an own data property held
+                    // in the heap object itself (not arr_props) —
+                    // `"lastIndex" in re` is true.
+                    if k == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+                        return true;
+                    }
+                    // A callable's assigned own properties (`fn.x = …`) live in the
+                    // SEPARATE fn_props side table — `"x" in fn` must see them too
+                    // (mirrors get_own_property; read_descriptor relies on this for a
+                    // Function-object descriptor).
+                    if matches!(
+                        self.heap.get(idx),
                         HeapObj::Func(_)
-                        | HeapObj::Closure { .. }
-                        | HeapObj::Bound { .. }
-                        | HeapObj::Native(_)
-                        | HeapObj::NativeClosure { .. } => self.fn_proto,
-                        HeapObj::Boxed { kind: 0, .. } => self.str_proto,
-                        HeapObj::Boxed { kind: 1, .. } => self.num_proto,
-                        HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
-                        HeapObj::Boxed { kind: 3, .. } => self.symbol_proto,
-                        HeapObj::Boxed { kind: 4, .. } => self.bigint_proto,
-                        HeapObj::Date(_) => self.date_proto,
-                        HeapObj::Promise { .. } => self.promise_proto,
-                        HeapObj::RegExp { .. } => self.regexp_proto,
-                        // Map/Set previously answered ONLY `"size"` from a
-                        // dedicated arm, so neither their assigned own props
-                        // (`m.x = 1`) nor their inherited methods (`"has" in m`)
-                        // were visible to `in`/Reflect.has — and a for-in whose
-                        // prototype is a Map dropped every inherited key (the
-                        // per-iteration liveness re-check uses this walk).
-                        HeapObj::Map { .. } => self.map_proto,
-                        HeapObj::Set(_) => self.set_proto,
-                        HeapObj::WeakMap { .. } => self.weakmap_proto,
-                        HeapObj::WeakSet(_) => self.weakset_proto,
-                        HeapObj::WeakRef(_) => self.weakref_proto,
-                        HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
-                        HeapObj::Generator { .. } => self.gen_proto,
-                        HeapObj::AsyncGenerator(_) => self.asyncgen_proto,
-                        HeapObj::Iterator { proto, .. } => *proto,
-                        HeapObj::IterHelper { .. } => self.iterator_helper_proto,
-                        _ => 0,
+                            | HeapObj::Closure { .. }
+                            | HeapObj::Bound { .. }
+                            | HeapObj::Wrapped { .. }
+                            | HeapObj::Native(_)
+                            | HeapObj::NativeClosure { .. }
+                    ) && self
+                        .fn_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(&k).is_some())
+                    {
+                        return true;
+                    }
+                    // A function's synthesized `prototype` own property (ordinary
+                    // functions + generators; not arrows/methods/async/bound/native).
+                    if k == "prototype" && self.callable_has_prototype(obj) {
+                        return true;
+                    }
+                    // A boxed String wrapper exposes the wrapped string's chars +
+                    // `length` as integer-indexed own properties.
+                    if let HeapObj::Boxed { kind: 0, value } = self.heap.get(idx) {
+                        let v = *value;
+                        let clen = match self.heap.get(v.heap_index()) {
+                            HeapObj::Str(s) => Some(s.units()),
+                            HeapObj::Cons { len, .. } => Some(*len),
+                            _ => None,
+                        };
+                        if let Some(n) = clen {
+                            // The index may arrive as a NUMBER (`4 in str`) or as its
+                            // canonical STRING form (`"4" in str`, and every
+                            // `Reflect.has`, which passes ToPropertyKey's result).
+                            // Only `array_index` was consulted, so the string form
+                            // reported absent (staging/sm/Reflect/has.js).
+                            let i = array_index(key).or_else(|| match k.parse::<u32>() {
+                                Ok(u) if u != u32::MAX && u.to_string() == k => Some(u as usize),
+                                _ => None,
+                            });
+                            if let Some(i) = i {
+                                if i < n {
+                                    return true;
+                                }
+                            }
+                            if k == "length" {
+                                return true;
+                            }
+                        }
+                    }
+                    // The prototype chain: an explicit `proto_of`, else the intrinsic
+                    // prototype for this object's kind — so inherited methods/accessors
+                    // are visible to `in` (`"toFixed" in Object(2.5)`, `"call" in fn`),
+                    // mirroring get_member. Without this fallback `in` saw only own
+                    // props on a boxed primitive / callable / Date / Promise / …
+                    let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                        p.is_heap().then_some(p)
+                    } else {
+                        let bp = match self.heap.get(idx) {
+                            HeapObj::Func(_)
+                            | HeapObj::Closure { .. }
+                            | HeapObj::Bound { .. }
+                            | HeapObj::Native(_)
+                            | HeapObj::NativeClosure { .. } => self.fn_proto,
+                            HeapObj::Boxed { kind: 0, .. } => self.str_proto,
+                            HeapObj::Boxed { kind: 1, .. } => self.num_proto,
+                            HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
+                            HeapObj::Boxed { kind: 3, .. } => self.symbol_proto,
+                            HeapObj::Boxed { kind: 4, .. } => self.bigint_proto,
+                            HeapObj::Date(_) => self.date_proto,
+                            HeapObj::Promise { .. } => self.promise_proto,
+                            HeapObj::RegExp { .. } => self.regexp_proto,
+                            // Map/Set previously answered ONLY `"size"` from a
+                            // dedicated arm, so neither their assigned own props
+                            // (`m.x = 1`) nor their inherited methods (`"has" in m`)
+                            // were visible to `in`/Reflect.has — and a for-in whose
+                            // prototype is a Map dropped every inherited key (the
+                            // per-iteration liveness re-check uses this walk).
+                            HeapObj::Map { .. } => self.map_proto,
+                            HeapObj::Set(_) => self.set_proto,
+                            HeapObj::WeakMap { .. } => self.weakmap_proto,
+                            HeapObj::WeakSet(_) => self.weakset_proto,
+                            HeapObj::WeakRef(_) => self.weakref_proto,
+                            HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
+                            HeapObj::Generator { .. } => self.gen_proto,
+                            HeapObj::AsyncGenerator(_) => self.asyncgen_proto,
+                            HeapObj::Iterator { proto, .. } => *proto,
+                            HeapObj::IterHelper { .. } => self.iterator_helper_proto,
+                            _ => 0,
+                        };
+                        (bp != 0).then_some(Value::heap(bp))
                     };
-                    (bp != 0).then_some(Value::heap(bp))
-                };
-                match proto {
-                    Some(p) => self.has_property(p, key),
-                    None => false,
+                    match proto {
+                        Some(p) => {
+                            obj = p;
+                            continue 'prototype_chain;
+                        }
+                        None => return false,
+                    }
                 }
             }
         }
@@ -894,7 +921,7 @@ impl<'p> Vm<'p> {
                     }
                     Ok(present)
                 }
-                None => self.has_property_dyn(target, key),
+                None => self.with_native_recursion_guard(|vm| vm.has_property_dyn(target, key)),
             };
         }
         // A plain object: own data property or an inherited method/getter/setter
@@ -951,7 +978,7 @@ impl<'p> Vm<'p> {
                 None
             };
             return match proto {
-                Some(p) => self.has_property_dyn(p, key),
+                Some(p) => self.with_native_recursion_guard(|vm| vm.has_property_dyn(p, key)),
                 None => Ok(false),
             };
         }
@@ -1002,7 +1029,7 @@ impl<'p> Vm<'p> {
                     return Ok(false);
                 }
                 return match proto.is_heap() {
-                    true => self.has_property_dyn(proto, key),
+                    true => self.with_native_recursion_guard(|vm| vm.has_property_dyn(proto, key)),
                     false => Ok(false),
                 };
             }
@@ -1044,7 +1071,7 @@ impl<'p> Vm<'p> {
                 None => Value::NULL,
             };
             return match proto.is_heap() {
-                true => self.has_property_dyn(proto, key),
+                true => self.with_native_recursion_guard(|vm| vm.has_property_dyn(proto, key)),
                 false => Ok(false),
             };
         }
@@ -1065,7 +1092,7 @@ impl<'p> Vm<'p> {
                 return Ok(true);
             }
             return match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
-                Some(p) => self.has_property_dyn(p, key),
+                Some(p) => self.with_native_recursion_guard(|vm| vm.has_property_dyn(p, key)),
                 None => Ok(false),
             };
         }
@@ -1840,6 +1867,25 @@ impl<'p> Vm<'p> {
         self.build_regexp_snapshot(p, f, pre)
     }
 
+    /// Admit one newly-compiled immutable RegExp program before it is wrapped
+    /// in an `Arc` or retained by a heap object/cache entry.
+    pub(crate) fn preflight_regex_program(&mut self, regex: &regress::Regex) -> Result<(), Thrown> {
+        let bytes = regex.resident_bytes();
+        if bytes > MAX_REGEX_PROGRAM_BYTES {
+            return Err(Thrown(
+                "RangeError: compiled regular expression exceeds the sandbox limit".into(),
+            ));
+        }
+        #[cfg(feature = "instrument")]
+        {
+            return self
+                .instrument_preflight_heap_growth(bytes)
+                .map_err(|message| Thrown(message.into()));
+        }
+        #[cfg(not(feature = "instrument"))]
+        Ok(())
+    }
+
     /// The RegExp constructor's steps 1-4a: every OBSERVABLE read of `pattern`
     /// that PRECEDES RegExpAlloc — `IsRegExp(pattern)` plus, for a real RegExp
     /// exotic, its [[OriginalSource]]/[[OriginalFlags]]. Split out so
@@ -1930,6 +1976,16 @@ impl<'p> Vm<'p> {
         } else {
             self.to_js_string(f)?
         };
+        #[cfg(feature = "safe-sandbox")]
+        {
+            const MAX_SAFE_REGEX_PATTERN_BYTES: usize = 16 << 10;
+            let exact_len = exact_bytes.as_ref().map_or(0, Vec::len);
+            if source.len().max(exact_len) > MAX_SAFE_REGEX_PATTERN_BYTES {
+                return Err(Thrown(
+                    "RangeError: regular expression pattern exceeds the sandbox limit".into(),
+                ));
+            }
+        }
         // Validate: only g/i/m/s/u/y/d/v, each at most once.
         let mut seen = std::collections::HashSet::new();
         for c in flags.chars() {
@@ -2003,9 +2059,14 @@ impl<'p> Vm<'p> {
                             "SyntaxError: Invalid regular expression: /{source}/: {e}"
                         ))
                     })?;
+                self.preflight_regex_program(&r)?;
                 let rc = std::sync::Arc::new(r);
                 if let Some(k) = cache_key {
-                    if self.regex_compile_cache.len() >= 512 {
+                    #[cfg(feature = "safe-sandbox")]
+                    const REGEX_CACHE_LIMIT: usize = 32;
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    const REGEX_CACHE_LIMIT: usize = 512;
+                    if self.regex_compile_cache.len() >= REGEX_CACHE_LIMIT {
                         self.regex_compile_cache.clear();
                     }
                     self.regex_compile_cache.insert(k, rc.clone());

@@ -299,6 +299,23 @@ pub(crate) fn auto_eligible(linear: &LinearRegex) -> bool {
     linear.auto_eligible
 }
 
+/// Conservative retained bytes owned by the optional linear execution tier.
+/// `regex` deliberately keeps its internal automata opaque; its builder is
+/// configured with `MAX_LINEAR_PROGRAM_BYTES`, so charging that ceiling once a
+/// plan is materialised is a stable upper bound rather than an internal-layout
+/// guess.
+pub(crate) fn resident_bytes(candidate: &LinearCandidate, plan: &LinearPlan) -> usize {
+    let source = match candidate {
+        LinearCandidate::Source(source) => source.capacity(),
+        LinearCandidate::Fallback(_) => 0,
+    };
+    source.saturating_add(if plan.get().is_some() {
+        MAX_LINEAR_PROGRAM_BYTES
+    } else {
+        0
+    })
+}
+
 impl<'r, 't> AsciiMatches<'r, 't> {
     pub(crate) fn new(
         compiled: &'r CompiledRegex,

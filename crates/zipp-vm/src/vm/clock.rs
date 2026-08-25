@@ -55,8 +55,14 @@ pub(crate) use wasm_instant::Instant;
 /// not installed). `wasm32-unknown-unknown` is single-threaded, and on native
 /// targets a racing pair of `install` calls simply resolves last-wins, so a
 /// relaxed ordering is all either needs.
+#[cfg(not(feature = "safe-sandbox"))]
 static EPOCH_MS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(feature = "safe-sandbox"))]
 static MONO_MS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "safe-sandbox")]
+static EPOCH_MS: std::sync::RwLock<Option<fn() -> f64>> = std::sync::RwLock::new(None);
+#[cfg(feature = "safe-sandbox")]
+static MONO_MS: std::sync::RwLock<Option<fn() -> f64>> = std::sync::RwLock::new(None);
 
 /// Install the host's clocks. `epoch_ms` returns milliseconds since the Unix
 /// epoch (`Date.now`); `mono_ms` returns a monotonically non-decreasing
@@ -87,12 +93,21 @@ static MONO_MS: AtomicUsize = AtomicUsize::new(0);
 /// );
 /// ```
 pub fn install(epoch_ms: fn() -> f64, mono_ms: fn() -> f64) {
-    EPOCH_MS.store(epoch_ms as usize, Ordering::Relaxed);
-    MONO_MS.store(mono_ms as usize, Ordering::Relaxed);
+    #[cfg(not(feature = "safe-sandbox"))]
+    {
+        EPOCH_MS.store(epoch_ms as usize, Ordering::Relaxed);
+        MONO_MS.store(mono_ms as usize, Ordering::Relaxed);
+    }
+    #[cfg(feature = "safe-sandbox")]
+    {
+        *EPOCH_MS.write().unwrap_or_else(|e| e.into_inner()) = Some(epoch_ms);
+        *MONO_MS.write().unwrap_or_else(|e| e.into_inner()) = Some(mono_ms);
+    }
 }
 
 /// The host function installed in `slot`, or `None`.
 #[inline]
+#[cfg(not(feature = "safe-sandbox"))]
 fn installed(slot: &AtomicUsize) -> Option<fn() -> f64> {
     let f = slot.load(Ordering::Relaxed);
     if f == 0 {
@@ -101,6 +116,12 @@ fn installed(slot: &AtomicUsize) -> Option<fn() -> f64> {
     // SAFETY: `f` is non-zero, so it was written by `install` from a
     // `fn() -> f64`, and nothing ever stores any other kind of value here.
     Some(unsafe { core::mem::transmute::<usize, fn() -> f64>(f) })
+}
+
+#[inline]
+#[cfg(feature = "safe-sandbox")]
+fn installed(slot: &std::sync::RwLock<Option<fn() -> f64>>) -> Option<fn() -> f64> {
+    *slot.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Milliseconds since the Unix epoch — the value behind `Date.now()`.

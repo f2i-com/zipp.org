@@ -16,14 +16,16 @@ const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_MAX_STEPS: u64 = 50_000_000;
 const DEFAULT_MAX_HEAP_MB: usize = 128;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1 << 20;
-const MAX_SOURCE_BYTES: u64 = 16 << 20;
+const MAX_SOURCE_BYTES: u64 = 2 << 20;
 const MAX_DYNAMIC_SOURCE_BYTES: usize = 64 << 10;
 const MAX_DYNAMIC_TOTAL_SOURCE_BYTES: usize = 1 << 20;
 const MAX_DYNAMIC_CALLS: usize = 256;
 const MAX_DYNAMIC_FUNCTIONS: usize = 4_096;
 const MAX_DYNAMIC_CLASSES: usize = 1_024;
-const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
-const MAX_OUTPUT_BYTES: usize = 64 << 20;
+const MAX_TIMEOUT_MS: u64 = 30_000;
+const MAX_STEPS: u64 = 100_000_000;
+const MAX_HEAP_MB: usize = 256;
+const MAX_OUTPUT_BYTES: usize = 4 << 20;
 
 #[derive(Clone)]
 struct Config {
@@ -112,7 +114,9 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         .arg("--max-heap-mb")
         .arg(config.max_heap_mb.to_string())
         .arg("--max-output-bytes")
-        .arg(config.max_output_bytes.to_string());
+        .arg(config.max_output_bytes.to_string())
+        .arg("--timeout-ms")
+        .arg(config.timeout_ms.to_string());
     if let Some(root) = &config.import_root {
         command.arg("--import-root").arg(root);
     }
@@ -126,6 +130,9 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         // latch its process-global policy.
         .env("ZIPP_NOJIT", "1")
         .env("ZIPP_NO_RX_JIT", "1")
+        // Atomics.wait is a blocking host call performed inside one bytecode
+        // instruction. It must never be available to a metered worker.
+        .env("ZIPP_CAN_BLOCK", "0")
         .env("RUST_BACKTRACE", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -224,18 +231,19 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
 fn print_help() {
     println!("usage: zipp sandbox [options] <file.js>");
     println!();
-    println!("Runs an untrusted classic script in a supervised child process.");
+    println!("Applies defense-in-depth limits to a classic script in a supervised child.");
     println!("Imports are denied unless --allow-imports is supplied.");
     println!();
     println!("options:");
     println!("  --timeout-ms <n>        hard wall deadline (default {DEFAULT_TIMEOUT_MS})");
     println!("  --max-steps <n>         VM instruction budget (default {DEFAULT_MAX_STEPS})");
-    println!("  --max-heap-mb <n>       approximate VM heap cap (default {DEFAULT_MAX_HEAP_MB})");
+    println!("  --max-heap-mb <n>       payload-aware VM heap cap (default {DEFAULT_MAX_HEAP_MB})");
     println!("  --max-output-bytes <n>  stdout + stderr cap (default {DEFAULT_MAX_OUTPUT_BYTES})");
     println!("  --allow-imports <root>  confine module loading to a canonical directory");
     println!("  --module               unsupported (fails closed; classic scripts only)");
     println!();
-    println!("This is process/resource/import containment, not an OS security sandbox.");
+    println!("This is not an OS or memory-safety sandbox; use zipp-wasm in a dedicated Worker");
+    println!("for hostile code when an OS sandbox or VM is unavailable.");
 }
 
 /// The child half. This is intentionally callable only through a hidden CLI
@@ -251,8 +259,20 @@ fn run_child_inner(args: &[String]) -> Result<(), String> {
     // anything that could initialize either JIT.
     std::env::set_var("ZIPP_NOJIT", "1");
     std::env::set_var("ZIPP_NO_RX_JIT", "1");
+    std::env::set_var("ZIPP_CAN_BLOCK", "0");
 
     let config = parse_child(args)?;
+    // The supervisor remains authoritative (and produces the user-facing
+    // timeout diagnostic), but a directly-invoked hidden worker must also have
+    // a finite lifetime. The small grace keeps the supervisor's deadline first.
+    let watchdog_ms = config.timeout_ms.saturating_add(250);
+    std::thread::Builder::new()
+        .name("zipp-sandbox-deadline".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_millis(watchdog_ms));
+            std::process::exit(124);
+        })
+        .map_err(|e| format!("cannot start sandbox deadline watchdog: {e}"))?;
     validate_script(&config.script)?;
     let source = read_script(&config.script)?;
 
@@ -371,6 +391,7 @@ fn parse_child(args: &[String]) -> Result<Config, String> {
                 .get(i + 1)
                 .ok_or_else(|| format!("{arg} requires a value"))?;
             match arg.as_str() {
+                "--timeout-ms" => config.timeout_ms = parse_u64(arg, value)?,
                 "--max-steps" => config.max_steps = parse_u64(arg, value)?,
                 "--max-heap-mb" => config.max_heap_mb = parse_usize(arg, value)?,
                 "--max-output-bytes" => config.max_output_bytes = parse_usize(arg, value)?,
@@ -398,11 +419,11 @@ fn validate_config(config: &Config) -> Result<(), String> {
     if config.timeout_ms == 0 || config.timeout_ms > MAX_TIMEOUT_MS {
         return Err(format!("--timeout-ms must be in 1..={MAX_TIMEOUT_MS}"));
     }
-    if config.max_steps == 0 || config.max_steps > i64::MAX as u64 {
-        return Err(format!("--max-steps must be in 1..={}", i64::MAX));
+    if config.max_steps == 0 || config.max_steps > MAX_STEPS {
+        return Err(format!("--max-steps must be in 1..={MAX_STEPS}"));
     }
-    if config.max_heap_mb == 0 || config.max_heap_mb.checked_mul(1024 * 1024).is_none() {
-        return Err("--max-heap-mb must be positive and fit in usize bytes".into());
+    if config.max_heap_mb == 0 || config.max_heap_mb > MAX_HEAP_MB {
+        return Err(format!("--max-heap-mb must be in 1..={MAX_HEAP_MB}"));
     }
     if config.max_output_bytes == 0 || config.max_output_bytes > MAX_OUTPUT_BYTES {
         return Err(format!(
@@ -536,6 +557,7 @@ fn canonical_file(value: &str, what: &str) -> Result<PathBuf, String> {
     reject_forbidden_windows_path(value, what)?;
     let path = std::fs::canonicalize(value)
         .map_err(|e| format!("cannot resolve {what} '{value}': {e}"))?;
+    reject_forbidden_windows_path(&path.to_string_lossy(), what)?;
     if !path.is_file() {
         return Err(format!("{what} '{}' is not a file", path.display()));
     }
@@ -546,6 +568,7 @@ fn canonical_dir(value: &str, what: &str) -> Result<PathBuf, String> {
     reject_forbidden_windows_path(value, what)?;
     let path = std::fs::canonicalize(value)
         .map_err(|e| format!("cannot resolve {what} '{value}': {e}"))?;
+    reject_forbidden_windows_path(&path.to_string_lossy(), what)?;
     if !path.is_dir() {
         return Err(format!("{what} '{}' is not a directory", path.display()));
     }

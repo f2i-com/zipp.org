@@ -92,7 +92,9 @@ impl<'p> Vm<'p> {
             // (ordinary storage only) cannot see — delegate the rest of the walk
             // to the ordinary member path so the trap runs with `receiver`.
             if matches!(self.heap.get(cur), HeapObj::Proxy { .. }) {
-                return self.get_member(Value::heap(cur), key, receiver);
+                return self.with_native_recursion_guard(|vm| {
+                    vm.get_member(Value::heap(cur), key, receiver)
+                });
             }
             if let Some((attr, raw)) = self.own_member(cur, key) {
                 if attr.accessor {
@@ -331,6 +333,7 @@ impl<'p> Vm<'p> {
     /// each iterable lazily — only when iteration reaches it — and yields all of
     /// its values before moving to the next.
     pub(crate) fn iterator_concat(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        self.preflight_native_iteration_work(args.len() as u64)?;
         let mut pairs: Vec<Value> = Vec::with_capacity(args.len());
         for &item in args {
             if !self.is_object_value(item) {
@@ -433,6 +436,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(a) => a.clone(),
                 _ => Vec::new(),
             };
+            self.preflight_native_iteration_work(key_list.len() as u64)?;
             macro_rules! close_and_throw {
                 ($e:expr) => {{
                     self.iz_close_others_abrupt(&iters, usize::MAX);
@@ -506,6 +510,7 @@ impl<'p> Vm<'p> {
             }
         }
         let count = iters.len();
+        self.preflight_native_iteration_work(count as u64)?;
         // Longest-mode padding. For zip the padding option is an ITERABLE (read
         // `count` values, short → undefined fill); for zipKeyed it is an OBJECT
         // whose per-key property supplies that key's padding.
@@ -726,6 +731,7 @@ impl<'p> Vm<'p> {
             _ => Vec::new(),
         };
         let count = iters.len();
+        self.preflight_native_iteration_work(count as u64)?;
         // Zero iterables → the zip iterator is immediately done.
         if count == 0 {
             self.ih_set_done(idx);
@@ -1033,6 +1039,26 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Charge one item of native iterator work that occurs inside a single
+    /// helper call. On exhaustion, close both the current inner iterator (when
+    /// present) and the outer source before surfacing the sandbox RangeError.
+    fn iter_native_work_or_close(
+        &mut self,
+        src: Value,
+        inner: Value,
+        work: &mut u64,
+    ) -> Result<(), Thrown> {
+        *work = work.saturating_add(1);
+        if let Err(e) = self.preflight_native_iteration_work(*work) {
+            if inner != Value::UNDEFINED {
+                self.iterator_close_quiet(inner);
+            }
+            self.iterator_close_quiet(src);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Dispatch an `Iterator.prototype` helper. `this` is the source iterator.
     pub(crate) fn iter_helper_method(
         &mut self,
@@ -1081,7 +1107,13 @@ impl<'p> Vm<'p> {
             ITER_TOARRAY => {
                 let next = self.iter_direct_next(this)?;
                 let mut out = Vec::new();
+                let mut work = 0;
                 while let Some(v) = self.ih_step(this, next)? {
+                    self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
+                    out.try_reserve(1).map_err(|_| {
+                        self.iterator_close_quiet(this);
+                        Thrown("RangeError: iterator result allocation failed".into())
+                    })?;
                     out.push(v);
                 }
                 Ok(self.alloc_array_current_realm(out))
@@ -1100,20 +1132,25 @@ impl<'p> Vm<'p> {
                 };
                 let next = self.iter_direct_next(this)?;
                 let mut out = String::new();
-                let mut first = true;
+                let mut work = 0;
                 while let Some(v) = self.ih_step(this, next)? {
-                    if !first {
-                        out.push_str(&sep);
-                    }
-                    first = false;
-                    if !v.is_nullish() {
+                    self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
+                    let part = if v.is_nullish() {
+                        String::new()
+                    } else {
                         match self.to_js_string(v) {
-                            Ok(s) => out.push_str(&s),
+                            Ok(s) => s,
                             Err(e) => {
                                 self.iterator_close_quiet(this);
                                 return Err(e);
                             }
                         }
+                    };
+                    if let Err(e) =
+                        self.append_guest_join_part(&mut out, &sep, &part, (work - 1) as usize)
+                    {
+                        self.iterator_close_quiet(this);
+                        return Err(e);
                     }
                 }
                 Ok(self.alloc_str(out))
@@ -1121,7 +1158,9 @@ impl<'p> Vm<'p> {
             ITER_FOREACH => {
                 let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;
+                let mut work = 0;
                 while let Some(v) = self.ih_step(this, next)? {
+                    self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
                     // A throwing callback IteratorCloses the source (its error wins).
                     self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     i += 1;
@@ -1131,7 +1170,9 @@ impl<'p> Vm<'p> {
             ITER_SOME => {
                 let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;
+                let mut work = 0;
                 while let Some(v) = self.ih_step(this, next)? {
+                    self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
                     let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if self.truthy(r) {
                         // Early return ALSO closes the iterator (IteratorClose).
@@ -1145,7 +1186,9 @@ impl<'p> Vm<'p> {
             ITER_EVERY => {
                 let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;
+                let mut work = 0;
                 while let Some(v) = self.ih_step(this, next)? {
+                    self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
                     let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if !self.truthy(r) {
                         self.iterator_close(this)?;
@@ -1158,7 +1201,9 @@ impl<'p> Vm<'p> {
             ITER_FIND => {
                 let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;
+                let mut work = 0;
                 while let Some(v) = self.ih_step(this, next)? {
+                    self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
                     let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if self.truthy(r) {
                         self.iterator_close(this)?;
@@ -1177,9 +1222,11 @@ impl<'p> Vm<'p> {
                 let has_init = args.len() >= 2;
                 let mut acc = if has_init { args[1] } else { Value::UNDEFINED };
                 let mut i = 0i64;
+                let mut work = 0;
                 if !has_init {
                     match self.ih_step(this, next)? {
                         Some(v) => {
+                            self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
                             acc = v;
                             i = 1;
                         }
@@ -1191,6 +1238,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 while let Some(v) = self.ih_step(this, next)? {
+                    self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
                     acc = self.iter_call_close(a0, this, &[acc, v, Value::num(i as f64)])?;
                     i += 1;
                 }
@@ -1223,6 +1271,7 @@ impl<'p> Vm<'p> {
     }
 
     fn iter_helper_next_inner(&mut self, idx: u32) -> Result<Value, Thrown> {
+        let mut work = 0;
         loop {
             let (source, kind, arg, n, cidx, done, inner, next) = match self.heap.get(idx) {
                 HeapObj::IterHelper {
@@ -1270,6 +1319,7 @@ impl<'p> Vm<'p> {
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
                         Some(v) => {
+                            self.iter_native_work_or_close(source, Value::UNDEFINED, &mut work)?;
                             let keep =
                                 self.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])?;
                             self.ih_inc_idx(idx);
@@ -1306,7 +1356,14 @@ impl<'p> Vm<'p> {
                                 self.ih_set_done(idx);
                                 return Ok(self.iter_result(Value::UNDEFINED, true));
                             }
-                            Some(_) => nn -= 1,
+                            Some(_) => {
+                                self.iter_native_work_or_close(
+                                    source,
+                                    Value::UNDEFINED,
+                                    &mut work,
+                                )?;
+                                nn -= 1;
+                            }
                         }
                     }
                     self.ih_set_n(idx, 0);
@@ -1315,7 +1372,10 @@ impl<'p> Vm<'p> {
                             self.ih_set_done(idx);
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
-                        Some(v) => return Ok(self.iter_result(v, false)),
+                        Some(v) => {
+                            self.iter_native_work_or_close(source, Value::UNDEFINED, &mut work)?;
+                            return Ok(self.iter_result(v, false));
+                        }
                     }
                 }
                 4 => {
@@ -1327,7 +1387,10 @@ impl<'p> Vm<'p> {
                         // close the OUTER iterator before propagating. Only the inner's
                         // completion survives, so the close is the quiet form.
                         match self.iterator_step(inner) {
-                            Ok(Some(v)) => return Ok(self.iter_result(v, false)),
+                            Ok(Some(v)) => {
+                                self.iter_native_work_or_close(source, inner, &mut work)?;
+                                return Ok(self.iter_result(v, false));
+                            }
                             Ok(None) => {
                                 self.ih_set_inner(idx, Value::UNDEFINED);
                                 continue;
@@ -1344,6 +1407,7 @@ impl<'p> Vm<'p> {
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
                         Some(v) => {
+                            self.iter_native_work_or_close(source, Value::UNDEFINED, &mut work)?;
                             let mapped =
                                 self.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])?;
                             self.ih_inc_idx(idx);
@@ -1368,7 +1432,9 @@ impl<'p> Vm<'p> {
                     // `cidx` is the next pair to open; `inner` is the currently-open
                     // iterator (or UNDEFINED). Drain `inner`, then open the next pair.
                     if inner != Value::UNDEFINED {
-                        match self.iterator_step(inner)? {
+                        let stepped = self.iterator_step(inner)?;
+                        self.iter_native_work_or_close(Value::UNDEFINED, inner, &mut work)?;
+                        match stepped {
                             Some(v) => return Ok(self.iter_result(v, false)),
                             None => self.ih_set_inner(idx, Value::UNDEFINED),
                         }

@@ -72,7 +72,7 @@ impl<'p> Vm<'p> {
                 }
                 // Invariant: if the target is non-extensible, the proxy's prototype
                 // must match the target's actual prototype.
-                if !self.is_extensible(target)? {
+                if !self.with_native_recursion_guard(|vm| vm.is_extensible(target))? {
                     let target_proto = self.object_get_prototype_of(target);
                     if !self.same_value(proto, target_proto) {
                         return Err(Thrown(
@@ -87,7 +87,9 @@ impl<'p> Vm<'p> {
                 // — OrdinarySetPrototypeOf re-enters the proxy path for a Proxy target
                 // (firing its own trap) and applies the cyclic-chain / non-extensible
                 // checks for an ordinary target.
-                Ok(Some(self.ordinary_set_prototype_of(target, proto)?))
+                Ok(Some(self.with_native_recursion_guard(|vm| {
+                    vm.ordinary_set_prototype_of(target, proto)
+                })?))
             }
         }
     }
@@ -112,7 +114,7 @@ impl<'p> Vm<'p> {
                 let r = self.call_value(trap, handler, &[target])?;
                 let result = self.truthy(r);
                 // Invariant: the trap result must equal IsExtensible(target).
-                if result != self.is_extensible(target)? {
+                if result != self.with_native_recursion_guard(|vm| vm.is_extensible(target))? {
                     return Err(Thrown(
                         "TypeError: 'isExtensible' on proxy: trap result does not reflect extensibility of proxy target".into(),
                     ));
@@ -120,7 +122,9 @@ impl<'p> Vm<'p> {
                 Ok(Some(result))
             }
             None => {
-                if let Some(b) = self.proxy_is_extensible(target)? {
+                if let Some(b) =
+                    self.with_native_recursion_guard(|vm| vm.proxy_is_extensible(target))?
+                {
                     return Ok(Some(b)); // nested proxy target
                 }
                 let ext = match self.heap.get(target.heap_index()) {
@@ -160,7 +164,7 @@ impl<'p> Vm<'p> {
                 let r = self.call_value(trap, handler, &[target])?;
                 let result = self.truthy(r);
                 // Invariant: a true result requires the target to be non-extensible.
-                if result && self.is_extensible(target)? {
+                if result && self.with_native_recursion_guard(|vm| vm.is_extensible(target))? {
                     return Err(Thrown(
                         "TypeError: 'preventExtensions' on proxy: trap returned truish but the proxy target is extensible".into(),
                     ));
@@ -168,7 +172,9 @@ impl<'p> Vm<'p> {
                 Ok(Some(result))
             }
             None => {
-                if let Some(b) = self.proxy_prevent_extensions(target)? {
+                if let Some(b) =
+                    self.with_native_recursion_guard(|vm| vm.proxy_prevent_extensions(target))?
+                {
                     return Ok(Some(b)); // nested proxy target
                 }
                 let ti = target.heap_index();
@@ -228,7 +234,11 @@ impl<'p> Vm<'p> {
                 let items = self.create_list_from_array_like(r)?;
                 // CreateListFromArrayLike with «String, Symbol» element-type check
                 // and the no-duplicate-entries invariant (spec 10.5.11 steps 8-9).
-                let mut seen: Vec<String> = Vec::with_capacity(items.len());
+                let mut seen_set: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                seen_set.try_reserve(items.len()).map_err(|_| {
+                    Thrown("RangeError: proxy ownKeys validation allocation failed".into())
+                })?;
                 for k in &items {
                     let is_str = k.is_heap() && self.heap.is_str_like(k.heap_index());
                     let is_sym = k.is_heap()
@@ -244,19 +254,18 @@ impl<'p> Vm<'p> {
                     } else {
                         format!("y:{}", k.heap_index())
                     };
-                    if seen.contains(&id) {
+                    if !seen_set.insert(id.clone()) {
                         return Err(Thrown(
                             "TypeError: ownKeys trap result must not contain duplicate entries"
                                 .into(),
                         ));
                     }
-                    seen.push(id);
                 }
                 // Target-key invariants (10.5.11 steps 10-22). Partition the target's
                 // own keys into configurable / non-configurable, keyed by the same
-                // identity scheme as `seen` (string content / symbol heap index).
-                let extensible = self.is_extensible(target)?;
-                let tkeys_v = self.object_own_keys(target)?;
+                // identity scheme as `seen_set` (string content / symbol heap index).
+                let extensible = self.with_native_recursion_guard(|vm| vm.is_extensible(target))?;
+                let tkeys_v = self.with_native_recursion_guard(|vm| vm.object_own_keys(target))?;
                 let tkeys = self.array_snapshot(tkeys_v.heap_index());
                 let (mut config, mut nonconfig): (Vec<String>, Vec<String>) =
                     (Vec::new(), Vec::new());
@@ -285,33 +294,23 @@ impl<'p> Vm<'p> {
                 // Fast path: an extensible target with no non-configurable keys
                 // imposes no further constraint on the trap result.
                 if !(extensible && nonconfig.is_empty()) {
-                    let mut unchecked = seen.clone();
+                    let mut unchecked = seen_set;
                     // Every non-configurable own key MUST appear in the trap result.
                     for key in &nonconfig {
-                        match unchecked.iter().position(|u| u == key) {
-                            Some(p) => {
-                                unchecked.remove(p);
-                            }
-                            None => {
-                                return Err(Thrown(
-                                    "TypeError: proxy [[OwnPropertyKeys]] must include all non-configurable keys of the target".into(),
-                                ))
-                            }
+                        if !unchecked.remove(key) {
+                            return Err(Thrown(
+                                "TypeError: proxy [[OwnPropertyKeys]] must include all non-configurable keys of the target".into(),
+                            ));
                         }
                     }
                     // A non-extensible target: the trap result must contain EXACTLY
                     // the target's own keys (every configurable key present, none extra).
                     if !extensible {
                         for key in &config {
-                            match unchecked.iter().position(|u| u == key) {
-                                Some(p) => {
-                                    unchecked.remove(p);
-                                }
-                                None => {
-                                    return Err(Thrown(
-                                        "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must contain all of its own keys".into(),
-                                    ))
-                                }
+                            if !unchecked.remove(key) {
+                                return Err(Thrown(
+                                    "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must contain all of its own keys".into(),
+                                ));
                             }
                         }
                         if !unchecked.is_empty() {
@@ -326,7 +325,7 @@ impl<'p> Vm<'p> {
             None => {
                 // No trap: forward the target's full own-key list (Strings AND
                 // Symbols, so getOwnPropertySymbols/Reflect.ownKeys see symbol keys).
-                let keys = self.object_own_keys(target)?;
+                let keys = self.with_native_recursion_guard(|vm| vm.object_own_keys(target))?;
                 Ok(Some(self.array_snapshot(keys.heap_index())))
             }
         }

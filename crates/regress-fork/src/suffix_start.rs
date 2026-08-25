@@ -42,6 +42,10 @@ impl Literal {
         self.finder.as_ref()
     }
 
+    pub(crate) fn resident_bytes(&self) -> usize {
+        core::mem::size_of::<memmem::Finder<'static>>().saturating_add(self.finder.needle().len())
+    }
+
     #[cfg(test)]
     fn bytes(&self) -> &[u8] {
         self.finder.needle()
@@ -73,6 +77,14 @@ impl Plan {
         match self {
             Self::RequiredPrefix { .. } => "required-prefix",
             Self::RunLiteral { .. } => "run-literal",
+        }
+    }
+
+    pub(crate) fn resident_bytes(&self) -> usize {
+        match self {
+            Self::RequiredPrefix { literal } | Self::RunLiteral { literal, .. } => {
+                literal.resident_bytes()
+            }
         }
     }
 }

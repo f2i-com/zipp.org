@@ -614,12 +614,15 @@ a leak at 60 Hz. `call_slot` compiles nothing.
 
 `crates/zipp-wasm` is this API over wasm-bindgen, plus a JS preamble supplying
 host bridges. Its `README.md` covers the two host channels and why they differ.
-The browser engine applies lifetime instruction, approximate-heap, output,
-host-value, host-bridge, source, runtime-compilation, and retained-definition
-ceilings. Resource exhaustion is a typed terminal state even if guest code
-catches the immediate exception or turns it into a rejected promise. These are
-resource controls, not wall-time or OS isolation: run untrusted browser code in
-a dedicated Web Worker and terminate the Worker at the host deadline. Dynamic
+It is a deliberately separate Cargo workspace: its `safe-sandbox` dependency
+cannot be feature-unified with the native CLI's JIT. The browser engine applies
+lifetime instruction, payload-aware heap, output, host-value, host-bridge,
+source, runtime-compilation, and retained-definition ceilings, with a 256 MiB
+link-time maximum on WebAssembly linear memory as the allocator backstop.
+Resource exhaustion is a typed terminal state even if guest code catches the
+immediate exception or turns it into a rejected promise. These are resource
+controls, not wall-time or OS isolation: run untrusted browser code in a
+dedicated Web Worker and terminate the Worker at the host deadline. Dynamic
 function/class definitions use VM-lifetime stable addresses, so tearing down
 the Worker/WASM instance—not merely calling `Engine.dispose()`—is also the
 complete reclamation boundary between tenants.
@@ -641,6 +644,7 @@ The standing gate for any engine change — see `PERF_ROADMAP.md` §2:
 ```sh
 cargo build --release
 cargo test --workspace --release
+(cd crates/zipp-wasm && cargo test --locked --release)
 python tools/run_test262.py --t262 <path> --dump-fails fails.txt
 diff <(sort fails.txt) \
      <(tr -d '\r' < tools/test262-expected-failures.txt | sort)      # REG=0
@@ -670,7 +674,7 @@ benchmarks' stdout. The first run of it found `this.x = 0` globals reading as
 `NaN` from compiled code — live at default thresholds, invisible to all 95,936
 executions (`PERF_ROADMAP.md` B65).
 
-Anything touching the embedding API or the wasm layer also has to clear the node
+Anything touching the embedding API or the wasm layer also has to clear the Node
 harnesses in `crates/zipp-wasm/tests/node/` — `cargo test` covers the Rust side
 but not the wasm-bindgen boundary (marshalling, the bridge closures, the host
 queue), and that boundary is where the interesting bugs live. One of them drives

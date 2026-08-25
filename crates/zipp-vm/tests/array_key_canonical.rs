@@ -46,7 +46,13 @@ const SPARSE_NO_PROTO: &str = r#"
     console.log(r1.join("|"));
     console.log(r2.join("|"));
     console.log((5 in b) + "," + (4294967294 in b) + "," + (4294967295 in b) + "," + (-0 in b) + "," + (1000 in b));
-    console.log(b["5"] + "," + b["05"] + "," + b["+5"] + "," + b[" 5"] + "," + b["4294967294"] + "," + b["4294967295"] + "," + b["4294967296"] + "," + b["-0"] + "," + b["1e3"] + "," + b["300"] + "," + b["0"]);
+    // Keep the canonical-key probe broad without making the test itself rely
+    // on a >16-link binary-expression chain, which the hostile-code parser
+    // profile deliberately rejects.
+    var readKeys = ["5", "05", "+5", " 5", "4294967294", "4294967295", "4294967296", "-0", "1e3", "300", "0"];
+    var readValues = [];
+    for (var j = 0; j < readKeys.length; j++) readValues.push(String(b[readKeys[j]]));
+    console.log(readValues.join(","));
     console.log(b.length);
     delete b[300];
     console.log(("300" in b) + "," + b.hasOwnProperty("300") + "," + b["300"] + "," + (300 in b));

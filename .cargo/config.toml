@@ -1,0 +1,8 @@
+[target.wasm32-unknown-unknown]
+# Mirror the standalone zipp-wasm workspace's allocator backstop for builds
+# launched from the repository root (Cargo discovers config from the current
+# directory, not from --manifest-path).
+rustflags = [
+    "-C", "link-arg=--max-memory=268435456",
+    "-C", "link-arg=-zstack-size=1048576",
+]

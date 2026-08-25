@@ -1,0 +1,10 @@
+[target.wasm32-unknown-unknown]
+# The VM rejects guest growth at its lower 128 MiB accounting limit. Keep an
+# independent WebAssembly maximum as the allocator/compiler backstop: even a
+# missed accounting path or hostile source shape cannot grow this instance's
+# linear memory without bound. Run each tenant in a dedicated Worker so a trap
+# or deadline can discard the complete instance.
+rustflags = [
+    "-C", "link-arg=--max-memory=268435456",
+    "-C", "link-arg=-zstack-size=1048576",
+]

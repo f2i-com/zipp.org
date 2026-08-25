@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "safe-sandbox", forbid(unsafe_code))]
+
 //! # zipp-vm — dynamic JavaScript engine v2
 //!
 //! A clean-sheet engine built around one architectural bet: an **explicit-frame
@@ -17,6 +19,9 @@
 //! clean, but NOT yet faster than the old JIT'd engine or V8 — a from-scratch
 //! engine starts at zero and earns speed back tier by tier. Numbers are
 //! reported honestly at each step.
+
+#[cfg(all(feature = "safe-sandbox", feature = "jit"))]
+compile_error!("zipp-vm features `safe-sandbox` and `jit` are mutually exclusive");
 
 mod bytecode;
 mod capture;
@@ -5182,6 +5187,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "safe-sandbox"))]
     fn sparse_array_iteration_covers_the_whole_length() {
         // REGRESSION: elements past MAX_DENSE_ARRAY_LEN (2^20) live in the sparse
         // overlay, and `array_like_iterate` clamped its ascending probe to that

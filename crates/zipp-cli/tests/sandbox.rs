@@ -70,7 +70,11 @@ fn dedicated_help_describes_the_boundary() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("usage: zipp sandbox"), "{stdout}");
     assert!(stdout.contains("classic script"), "{stdout}");
-    assert!(stdout.contains("not an OS security sandbox"), "{stdout}");
+    assert!(
+        stdout.contains("not an OS or memory-safety sandbox"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("zipp-wasm"), "{stdout}");
 }
 
 #[test]
@@ -132,7 +136,54 @@ fn instruction_budget_stops_an_infinite_loop() {
 }
 
 #[test]
-fn wall_clock_supervisor_stops_a_blocking_native_wait() {
+fn supervisor_enforces_the_wall_clock_deadline() {
+    let scratch = Scratch::new("supervisor-timeout");
+    let script = scratch.write("loop.js", "for (;;) {}");
+    let output = sandbox(&[
+        "--timeout-ms",
+        "1",
+        "--max-steps",
+        "100000000",
+        script.to_str().expect("utf-8 test path"),
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("wall-clock timeout"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn directly_invoked_worker_has_its_own_deadline_watchdog() {
+    let scratch = Scratch::new("worker-watchdog");
+    let script = scratch.write("loop.js", "for (;;) {}");
+    let output = Command::new(env!("CARGO_BIN_EXE_zipp"))
+        .args([
+            "__sandbox-child",
+            "--timeout-ms",
+            "1",
+            "--max-steps",
+            "100000000",
+            "--max-heap-mb",
+            // Keep this probe focused on the independently armed watchdog.
+            // The hardened VM's audited baseline now includes side-table
+            // capacities and can legitimately exceed the old 1 MiB fixture.
+            "128",
+            "--max-output-bytes",
+            "1024",
+            "--",
+            script.to_str().expect("utf-8 test path"),
+        ])
+        .output()
+        .expect("run hidden sandbox worker");
+
+    assert_eq!(output.status.code(), Some(124), "{}", stderr(&output));
+}
+
+#[test]
+fn blocking_native_wait_is_disabled_before_guest_execution() {
     let scratch = Scratch::new("wall-clock");
     let script = scratch.write(
         "blocking.js",
@@ -147,16 +198,46 @@ fn wall_clock_supervisor_stops_a_blocking_native_wait() {
     ]);
 
     assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("wall-clock timeout"),
-        "{}",
-        stderr(&output)
-    );
+    let error = stderr(&output);
+    assert!(error.contains("cannot suspend in this agent"), "{error}");
+    assert!(!error.contains("wall-clock timeout"), "{error}");
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("escaped-wait"),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+#[test]
+fn heap_budget_rejects_large_single_allocations_before_allocation() {
+    for (label, source) in [
+        (
+            "array-buffer",
+            "new ArrayBuffer(32 * 1024 * 1024); console.log('escaped-buffer');",
+        ),
+        (
+            "string-repeat",
+            "'x'.repeat(32 * 1024 * 1024); console.log('escaped-string');",
+        ),
+    ] {
+        let scratch = Scratch::new(label);
+        let script = scratch.write("allocation.js", source);
+        let output = sandbox(&[
+            "--timeout-ms",
+            "5000",
+            "--max-steps",
+            "5000000",
+            "--max-heap-mb",
+            "1",
+            script.to_str().expect("utf-8 test path"),
+        ]);
+
+        assert!(!output.status.success(), "{label} unexpectedly succeeded");
+        let error = stderr(&output);
+        assert!(error.contains("memory budget"), "{label}: {error}");
+        assert!(!error.contains("wall-clock timeout"), "{label}: {error}");
+        assert!(output.stdout.is_empty(), "{label}: unexpected guest output");
+    }
 }
 
 #[test]
@@ -383,7 +464,7 @@ fn oversized_import_is_rejected_before_its_contents_are_loaded() {
         .write(true)
         .open(&large)
         .expect("open oversized import")
-        .set_len((16 << 20) + 1)
+        .set_len((2 << 20) + 1)
         .expect("extend oversized import");
     let output = sandbox(&[
         "--timeout-ms",
@@ -417,6 +498,6 @@ fn oversized_entry_source_is_rejected_before_the_child_starts() {
 
     assert!(!output.status.success());
     let error = stderr(&output);
-    assert!(error.contains("limit is 16777216"), "{error}");
+    assert!(error.contains("limit is 2097152"), "{error}");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("DO-NOT-PRINT"));
 }

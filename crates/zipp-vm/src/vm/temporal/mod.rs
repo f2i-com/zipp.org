@@ -1322,12 +1322,26 @@ fn duration_total_relative(
             // Whole signed units, ALWAYS re-added from the anchor (chaining would let
             // day-of-month clamping accumulate and corrupt the unit length).
             let mut whole = 0i64;
+            let mut bracketed = false;
+            let mut work = 0u64;
             for _ in 0..2_000_000 {
+                work = work.saturating_add(1);
+                if work > MAX_NATIVE_ITERATION_WORK {
+                    return Err(Thrown(
+                        "RangeError: native builtin iteration limit exceeded".into(),
+                    ));
+                }
                 let cand = dt_epoch_ns(dt_add_dur(cal, start, units(whole + sign)));
                 if (sign > 0 && cand > end_ns) || (sign < 0 && cand < end_ns) {
+                    bracketed = true;
                     break;
                 }
                 whole += sign;
+            }
+            if !bracketed {
+                return Err(Thrown(
+                    "RangeError: Temporal calendar iteration limit exceeded".into(),
+                ));
             }
             // NudgeToCalendarUnit brackets the duration between `whole` and `whole+sign`
             // calendar units from the anchor (both via CalendarDateAdd). The FAR bracket

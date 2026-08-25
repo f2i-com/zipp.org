@@ -17,8 +17,18 @@ cargo build --release
 
 ## Running untrusted scripts
 
-For untrusted classic scripts, use the explicit sandbox runner instead of the
-compatibility `js` command:
+For arbitrary hostile scripts without an OS VM, the supported security boundary
+is [`zipp-wasm`](crates/zipp-wasm/README.md), with one WebAssembly instance in a
+dedicated Web Worker per tenant. Its separately resolved `safe-sandbox` build
+forbids unsafe code in zipp-vm and the regex engine, excludes both native JITs
+and guest shared-memory APIs, defaults every synchronous host capability to
+deny, and links WebAssembly memory with a 256 MiB hard maximum. A responsive
+host context must enforce the wall deadline by terminating the Worker; then
+discard and recreate the Worker/WASM instance between tenants. See
+[`SECURITY.md`](SECURITY.md) for the complete threat model and deployment
+checklist.
+
+The native CLI offers additional defense-in-depth limits for classic scripts:
 
 ```sh
 ./target/release/zipp sandbox file.js
@@ -29,10 +39,11 @@ compatibility `js` command:
 ./target/release/zipp sandbox --allow-imports ./plugins ./plugins/main.js
 ```
 
-The sandbox runs the script in a supervised child with a cleared environment,
-closed stdin, a hard wall deadline, an instruction budget, an approximate VM
-heap ceiling, and a combined stdout/stderr cap. Both the VM's native JIT and
-the regex native JIT are disabled before untrusted source is parsed.
+The native runner executes the script in a supervised child with a cleared
+environment, closed stdin, a hard wall deadline, an instruction budget, a
+payload-aware VM heap high-water ceiling, and a combined stdout/stderr cap.
+Blocking `Atomics.wait`, the VM's native JIT, and the regex native JIT are
+disabled before untrusted source is parsed.
 Runtime compilation is also bounded across `eval`, `Function`, and
 `ShadowRealm.evaluate`: 64 KiB per source, 1 MiB and 256 attempts over the
 child lifetime, with at most 4,096 retained function definitions and 1,024
@@ -42,7 +53,7 @@ child even when guest code catches the immediate exception.
 Module loading is off unless `--allow-imports` is supplied; then every dynamic,
 static dependency, typed, deferred, source-phase, and re-export path is
 canonicalized and rejected if it escapes that root through `..` or a symlink,
-each imported module is capped at 16 MiB before its contents are read, and the
+each imported module is capped at 2 MiB before its contents are read, and the
 whole confined graph is capped at 256 canonical files, 64 MiB of aggregate
 source, with module-loader recursion capped at a depth of 64. Re-reading one
 canonical file through eager, typed, deferred, or source-phase imports shares
@@ -60,16 +71,17 @@ The sandbox currently has no ES-module entry mode: `zipp sandbox --module` and
 command for hostile input; bundle it as a classic script or add external OS
 isolation first.
 
-This is language, process, resource, and import containment—not a kernel/OS
-sandbox or a memory-safety boundary. The child still has the invoking user's
-OS identity, and the heap meter is approximate (large string/array payloads
-are not fully accounted). Strong isolation for hostile code also requires an
-external restricted account or container plus platform controls such as
-namespaces/seccomp/cgroups on Linux, an AppContainer/restricted token and Job
-Object on Windows, or a sandbox profile on macOS, with filesystem and network
-access denied independently. Making `sandbox` the default spelling would also
-be a deliberate CLI compatibility change: existing `js`/`mjs` callers need an
-import-policy migration before their unbounded execution path can be removed.
+The native command is language, process, resource, and import containment—not
+a kernel/OS sandbox or a memory-safety boundary. Its child retains the invoking
+user's identity and the native executable still contains unsafe/JIT machinery
+for the ordinary `js` command, even though the child disables JIT execution.
+The heap figure is conservative but is not exact process RSS, and native
+builtins can do work between instruction polls. Do not use this command as the
+sole boundary for arbitrary hostile code: use the Worker/WASM design above, or
+add an external restricted account/container and platform filesystem, network,
+process, CPU, and memory controls. Making `sandbox` the default spelling would
+also be a deliberate CLI compatibility change: existing `js`/`mjs` callers
+need an import-policy migration before their unbounded path can be removed.
 
 ---
 

@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "prohibit-unsafe", forbid(unsafe_code))]
+
 /*!
 
 # regress - REGex in Rust with EcmaScript Syntax

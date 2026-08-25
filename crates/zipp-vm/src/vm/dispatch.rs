@@ -191,11 +191,12 @@ impl<'p> Vm<'p> {
             let base = self.frames[frame_idx].base;
             let mut ip = self.frames[frame_idx].ip;
             let cur_closure = self.frames[frame_idx].closure;
+            #[cfg(not(feature = "safe-sandbox"))]
             let code: *const Vec<Instr> = &self.func(func_id as usize).code;
             // SAFETY: `code` borrows immutable program data that outlives the
             // loop; we never mutate program functions during execution.
+            #[cfg(not(feature = "safe-sandbox"))]
             let code: &Vec<Instr> = unsafe { &*code };
-
             // â”€â”€ JIT tier â”€â”€
             // On fresh frame entry (ip == 0), if this function has compiled
             // native code, run it over the frame's register window. The native
@@ -386,6 +387,16 @@ impl<'p> Vm<'p> {
             // Inner loop: execute within the current frame until a call pushes
             // a new frame or a return pops this one.
             loop {
+                // The hardened interpreter never extends a borrow of program
+                // data across an instruction that mutates the VM. Clone only
+                // the current instruction: cloning the whole function on every
+                // call/return made otherwise-cheap calls an unmetered O(code)
+                // operation that hostile source could amplify.
+                #[cfg(feature = "safe-sandbox")]
+                let owned_instr = self.func(func_id as usize).code[ip].clone();
+                #[cfg(feature = "safe-sandbox")]
+                let instr = &owned_instr;
+                #[cfg(not(feature = "safe-sandbox"))]
                 let instr = &code[ip];
                 // Step budget / abort poll / execution trace. Compiled out
                 // entirely without the `instrument` feature, and a null check
@@ -1880,6 +1891,24 @@ impl<'p> Vm<'p> {
                         parent,
                     } => {
                         let cd = self.class_def(class_id as usize).clone();
+                        // MakeClass materializes and indexes several parallel
+                        // member lists without returning to bytecode dispatch.
+                        // Charge a conservative four visits per declaration
+                        // before any of those native loops begin.
+                        let class_member_work = [
+                            cd.methods.len(),
+                            cd.getters.len(),
+                            cd.setters.len(),
+                            cd.statics.len(),
+                            cd.static_getters.len(),
+                            cd.static_setters.len(),
+                            cd.instance_field_names.len(),
+                            cd.static_field_names.len(),
+                        ]
+                        .into_iter()
+                        .fold(0u64, |sum, len| sum.saturating_add(len as u64))
+                        .saturating_mul(4);
+                        self.preflight_native_iteration_work(class_member_work)?;
                         // A STATIC member named "prototype" is a TypeError at class
                         // definition (a literal `static prototype` is an early
                         // SyntaxError; this catches the constant-computed
@@ -1986,41 +2015,68 @@ impl<'p> Vm<'p> {
                         // 2 = getter, 4 = setter (same-name get/set pairs merge),
                         // 0 = field — drives kind-aware private access.
                         let mut declared: Vec<(String, u8)> = Vec::new();
-                        fn add_declared(declared: &mut Vec<(String, u8)>, n: &str, k: u8) {
+                        // Keep the retained Vec's established representation and
+                        // declaration order, but index it with RandomState while
+                        // building. Repeated Vec::find made N unique private names
+                        // quadratic inside this single instruction.
+                        let mut declared_index: std::collections::HashMap<&str, usize> =
+                            std::collections::HashMap::new();
+                        fn add_declared<'a>(
+                            declared: &mut Vec<(String, u8)>,
+                            declared_index: &mut std::collections::HashMap<&'a str, usize>,
+                            n: &'a str,
+                            k: u8,
+                        ) -> Result<(), Thrown> {
                             if !n.starts_with('#') {
-                                return;
+                                return Ok(());
                             }
-                            if let Some(e) = declared.iter_mut().find(|(dn, _)| dn == n) {
-                                e.1 |= k;
+                            if let Some(&index) = declared_index.get(n) {
+                                declared[index].1 |= k;
                             } else {
-                                declared.push((n.to_string(), k));
+                                declared_index.try_reserve(1).map_err(|_| {
+                                    Thrown(
+                                        "RangeError: private-name index allocation failed".into(),
+                                    )
+                                })?;
+                                declared.try_reserve(1).map_err(|_| {
+                                    Thrown("RangeError: private-name allocation failed".into())
+                                })?;
+                                let mut owned = String::new();
+                                owned.try_reserve_exact(n.len()).map_err(|_| {
+                                    Thrown("RangeError: private-name allocation failed".into())
+                                })?;
+                                owned.push_str(n);
+                                let index = declared.len();
+                                declared.push((owned, k));
+                                declared_index.insert(n, index);
                             }
+                            Ok(())
                         }
                         for (n, _) in &cd.methods {
-                            add_declared(&mut declared, n, 1);
+                            add_declared(&mut declared, &mut declared_index, n, 1)?;
                         }
                         for (n, _) in &cd.getters {
-                            add_declared(&mut declared, n, 2);
+                            add_declared(&mut declared, &mut declared_index, n, 2)?;
                         }
                         for (n, _) in &cd.setters {
-                            add_declared(&mut declared, n, 4);
+                            add_declared(&mut declared, &mut declared_index, n, 4)?;
                         }
                         // STATIC members carry bit 8: their brand lives on the
                         // class VALUE itself, not on constructed instances.
                         for (n, _) in &cd.statics {
-                            add_declared(&mut declared, n, 1 | 8);
+                            add_declared(&mut declared, &mut declared_index, n, 1 | 8)?;
                         }
                         for (n, _) in &cd.static_getters {
-                            add_declared(&mut declared, n, 2 | 8);
+                            add_declared(&mut declared, &mut declared_index, n, 2 | 8)?;
                         }
                         for (n, _) in &cd.static_setters {
-                            add_declared(&mut declared, n, 4 | 8);
+                            add_declared(&mut declared, &mut declared_index, n, 4 | 8)?;
                         }
                         for n in &cd.instance_field_names {
-                            add_declared(&mut declared, n, 0);
+                            add_declared(&mut declared, &mut declared_index, n, 0)?;
                         }
                         for n in &cd.static_field_names {
-                            add_declared(&mut declared, n, 8);
+                            add_declared(&mut declared, &mut declared_index, n, 8)?;
                         }
                         if !declared.is_empty() {
                             self.brand_private_names.insert(private_brand, declared);
@@ -2968,11 +3024,19 @@ impl<'p> Vm<'p> {
                                 // each entry must be an Object; read k/v and call the
                                 // adder; an abrupt completion runs IteratorClose.
                                 let iter = self.get_iterator_object(sv)?;
+                                let mut native_work = 0u64;
                                 loop {
                                     let e = match self.iterator_step(iter)? {
                                         Some(v) => v,
                                         None => break,
                                     };
+                                    native_work = native_work.saturating_add(1);
+                                    if let Err(err) =
+                                        self.preflight_native_iteration_work(native_work)
+                                    {
+                                        self.iterator_close_quiet(iter);
+                                        return Err(err);
+                                    }
                                     if !self.is_object_value(e) {
                                         self.iterator_close_quiet(iter);
                                         return Err(Thrown(
@@ -3016,11 +3080,19 @@ impl<'p> Vm<'p> {
                                 }
                                 // Lazy iteration + IteratorClose on an abrupt adder.
                                 let iter = self.get_iterator_object(sv)?;
+                                let mut native_work = 0u64;
                                 loop {
                                     let e = match self.iterator_step(iter)? {
                                         Some(v) => v,
                                         None => break,
                                     };
+                                    native_work = native_work.saturating_add(1);
+                                    if let Err(err) =
+                                        self.preflight_native_iteration_work(native_work)
+                                    {
+                                        self.iterator_close_quiet(iter);
+                                        return Err(err);
+                                    }
                                     if let Err(err) = self.call_value(adder, set_v, &[e]) {
                                         self.iterator_close_quiet(iter);
                                         return Err(err);
@@ -3254,7 +3326,7 @@ impl<'p> Vm<'p> {
                                 {
                                     // `String(symbol)` is allowed (unlike ToString,
                                     // which throws) and yields "Symbol(desc)".
-                                    let s = self.display(a0);
+                                    let s = self.symbol_descriptive_string(a0)?;
                                     self.alloc_str(s)
                                 } else {
                                     // Proper ToString: routes objects/functions
@@ -4170,12 +4242,8 @@ impl<'p> Vm<'p> {
                         argc,
                         to_stderr,
                     } => {
-                        let mut parts = Vec::with_capacity(argc as usize);
-                        for i in 0..argc {
-                            let v = self.get(base, arg_base + i);
-                            parts.push(self.inspect(v));
-                        }
-                        let line = parts.join(" ");
+                        let line = self
+                            .inspect_line(argc as usize, |i| self.get(base, arg_base + i as u16));
                         #[cfg(feature = "instrument")]
                         self.instrument_output_line(&line)
                             .map_err(|msg| Thrown(msg.into()))?;
@@ -6955,7 +7023,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::DateParse { dst, src } => {
                         let s = self.get(base, src);
-                        let str = self.display(s);
+                        let str = self.to_js_string(s)?;
                         self.set(base, dst, Value::num(parse_date(&str)));
                         ip += 1;
                     }
@@ -7556,7 +7624,7 @@ impl<'p> Vm<'p> {
                                     // whose per-step bounds check can throw, on
                                     // the general path below.
                                     if let Some((val, done)) =
-                                        self.collection_iter_step(it.heap_index())
+                                        self.collection_iter_step(it.heap_index())?
                                     {
                                         self.set(base, value_dst, val);
                                         self.set(base, done_dst, Value::bool(done));
@@ -8436,7 +8504,10 @@ impl<'p> Vm<'p> {
             (base + r as usize) < self.regs.len(),
             "reg read out of bounds"
         );
-        unsafe { *self.regs.get_unchecked(base + r as usize) }
+        #[cfg(feature = "safe-sandbox")]
+        return self.regs[base + r as usize];
+        #[cfg(not(feature = "safe-sandbox"))]
+        return unsafe { *self.regs.get_unchecked(base + r as usize) };
     }
     #[inline(always)]
     pub(crate) fn set(&mut self, base: usize, r: u16, v: Value) {
@@ -8444,6 +8515,11 @@ impl<'p> Vm<'p> {
             (base + r as usize) < self.regs.len(),
             "reg write out of bounds"
         );
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.regs[base + r as usize] = v;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
         unsafe {
             *self.regs.get_unchecked_mut(base + r as usize) = v;
         }

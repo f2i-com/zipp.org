@@ -75,6 +75,7 @@ impl<'p> Vm<'p> {
         if obj.is_heap() && matches!(self.heap.get(obj.heap_index()), HeapObj::TypedArray { .. }) {
             let idx = obj.heap_index();
             let len = self.ta_len_kind(idx).0;
+            self.preflight_native_iteration_work(len as u64)?;
             let mut pairs: Vec<(String, Value)> = Vec::with_capacity(len);
             for i in 0..len {
                 let v = self.ta_element_get(idx, i);

@@ -1,0 +1,119 @@
+name: Security
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native-workspace:
+    name: Native workspace tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Test the root native workspace
+        run: cargo +stable test --locked --workspace
+
+  safe-vm:
+    name: Safe interpreter profile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Test the safe-profile VM library
+        run: cargo +stable test --locked -p zipp-vm --no-default-features --features safe-sandbox --lib
+      - name: Test hostile-input and resource-limit regressions
+        run: |
+          cargo +stable test --locked -p zipp-vm \
+            --no-default-features --features safe-sandbox \
+            --test clock_installed \
+            --test instrument \
+            --test intl_native_limits \
+            --test native_iteration_limits \
+            --test native_meta_recursion_limits \
+            --test regex_memory_limits \
+            --test side_table_heap_limits \
+            --test string_growth_limits \
+            --test syntax_nesting_limits \
+            --test json_plain_stringify
+
+  wasm-sandbox:
+    name: Isolated WebAssembly sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: crates/zipp-wasm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Select stable Rust and wasm32 target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup +stable target add wasm32-unknown-unknown
+      - name: Test the isolated host build
+        run: cargo +stable test --locked
+      - name: Install matching wasm-bindgen CLI
+        run: cargo +stable install wasm-bindgen-cli --locked --version 0.2.126
+      - name: Build the production wasm32 artifact
+        run: cargo +stable build --locked --release --target wasm32-unknown-unknown
+      - name: Test the production host boundary under Node
+        run: |
+          wasm-bindgen --target nodejs --out-dir tests/node/pkg \
+            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
+          node tests/node/host-contract.cjs
+          node tests/node/worker-deadline.cjs
+
+  dependency-audit:
+    name: Dependency vulnerability audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Install pinned cargo-audit
+        run: cargo +stable install cargo-audit --locked --version 0.22.2
+      - name: Audit native workspace dependencies
+        run: cargo +stable audit --deny warnings --file Cargo.lock
+      - name: Audit isolated WebAssembly dependencies
+        run: cargo +stable audit --deny warnings --file crates/zipp-wasm/Cargo.lock
+      - name: Select Node.js for the landing-page lockfile audit
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: landing/package-lock.json
+      - name: Audit landing-page dependencies
+        working-directory: landing
+        run: npm audit --audit-level=low

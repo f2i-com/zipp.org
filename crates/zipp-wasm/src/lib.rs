@@ -14,14 +14,32 @@
 //! - a queue drained by [`Engine::drainPendingHostCalls`] — ASYNCHRONOUS, for
 //!   `host.call(kind, args, cb)`, whose callback the host resolves later.
 //!
-//! The split is not stylistic: a synchronous bridge cannot do IO, and an
-//! asynchronous one cannot be read inline.
+//! The split is not stylistic: a synchronous bridge cannot await (although its
+//! trusted host adapter can still perform arbitrary synchronous host work), and
+//! an asynchronous one cannot be read inline.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 use zipp_vm::embed::{compile_script, HostValue, HostValueBudget, ScriptState, SymbolScope};
+
+// js-sys's stable Array::is_array/Object::keys/Array indexing bindings do not
+// catch JavaScript exceptions. A revoked Proxy, or an ownKeys/length/index trap,
+// can therefore unwind through WebAssembly while wasm-bindgen is holding the
+// exported Engine's mutable WasmRefCell borrow. Rust destructors do not run on
+// that path, leaving the Engine permanently "recursively borrowed". Host values
+// are hostile boundary data, so use catch-enabled bindings for every operation
+// that can invoke a Proxy trap.
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = Array, js_name = isArray, catch)]
+    fn try_array_is_array(value: &JsValue) -> Result<bool, JsValue>;
+
+    #[wasm_bindgen(js_namespace = Object, js_name = keys, catch)]
+    fn try_object_keys(value: &JsValue) -> Result<js_sys::Array, JsValue>;
+}
 
 const PREAMBLE: &str = include_str!("preamble.js");
 const EVAL_PREFIX: &str = "JSON.stringify((function () { return (";
@@ -51,11 +69,34 @@ const MAX_LIFETIME_OUTPUT_BYTES: usize = 96 * 1024;
 const MAX_SYNC_BRIDGE_KIND_BYTES: usize = 64;
 const MAX_SYNC_BRIDGE_ARGS: usize = 16;
 const MAX_SYNC_BRIDGE_BYTES: usize = 1024 * 1024;
+const MAX_SYNC_CAPABILITY_ENTRIES: u32 = 32;
 
 /// Preamble bindings the host may address by slot even though it did not
 /// declare them. `window` in particular is a two-way channel: hosts stash keys
 /// on it and read them back, so it needs a stable index.
 const EXPOSED_PREAMBLE: &[&str] = &["window", "navigator", "host"];
+
+/// Top-level bindings declared by `preamble.js`. Keeping this manifest beside
+/// the embedded source lets initialization filter plumbing names without a
+/// second `compile_script(PREAMBLE)` probe. Under `safe-sandbox` compiled
+/// Programs have stable addresses for the WASM instance lifetime, so avoiding
+/// that redundant probe also avoids one permanent compiler allocation per
+/// Engine. A unit test below compiles the preamble and keeps this list exact.
+const PREAMBLE_BINDINGS: &[&str] = &[
+    "__zEvents",
+    "__zHostQueue",
+    "__zHostCbs",
+    "__zHostId",
+    "window",
+    "navigator",
+    "localStorage",
+    "db",
+    "host",
+    "__zListenerTypes",
+    "__zDispatchEvent",
+    "__zDrainHostCalls",
+    "__zResolveHostCall",
+];
 
 /// Route Rust panics to `console.error` with a message instead of a bare
 /// `unreachable` trap — without this a panic in wasm is undiagnosable.
@@ -80,7 +121,8 @@ fn mono_now() -> f64 {
         .ok()
         .filter(|p| !p.is_undefined() && !p.is_null())
         .and_then(|p| js_sys::Reflect::get(&p, &JsValue::from_str("now")).ok())
-        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .filter(JsValue::is_function)
+        .map(JsValue::unchecked_into::<js_sys::Function>)
         .and_then(|f| f.call0(&JsValue::UNDEFINED).ok())
         .and_then(|v| v.as_f64())
         .unwrap_or_else(js_sys::Date::now)
@@ -92,6 +134,11 @@ fn mono_now() -> f64 {
 struct Bridges {
     db: Option<js_sys::Object>,
     local_storage: Option<js_sys::Object>,
+    clipboard: Option<js_sys::Object>,
+    /// Exact synchronous operations this Engine was explicitly granted. A
+    /// bridge handle and authority are deliberately separate: merely
+    /// installing a host object must not expose all of its methods to a guest.
+    allowed_sync_operations: HashSet<String>,
 }
 
 /// Compile-time-known preamble helpers, resolved to slots once after init so
@@ -124,6 +171,10 @@ pub struct Engine {
     /// Disposal is terminal: a disposed engine cannot acquire new bridges or
     /// be initialized with another tenant's script.
     disposed: bool,
+    /// Set before compilation/top-level execution starts. `state` is populated
+    /// only after successful initialization, so it cannot itself freeze bridge
+    /// handles and grants against a callback during top-level execution.
+    host_configuration_frozen: bool,
 }
 
 #[wasm_bindgen]
@@ -139,6 +190,7 @@ impl Engine {
             eval_calls: 0,
             eval_retained_source_bytes: 0,
             disposed: false,
+            host_configuration_frozen: false,
         }
     }
 
@@ -149,19 +201,70 @@ impl Engine {
     }
 
     /// Install the object backing `db.*`. Its methods are called synchronously
-    /// from inside VM execution, so they must not await.
+    /// from inside VM execution, so they must not await. Installing a bridge
+    /// does not grant any operation; call `setSyncHostCapabilities` separately.
     #[wasm_bindgen(js_name = setDbBridge)]
     pub fn set_db_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
-        self.ensure_live()?;
-        self.bridges.borrow_mut().db = bridge.dyn_into::<js_sys::Object>().ok();
+        self.ensure_host_configuration_open()?;
+        self.bridges.borrow_mut().db = Some(require_bridge(bridge, "db")?);
         Ok(())
     }
 
-    /// Install the object backing `localStorage.*`.
+    /// Install the object backing `localStorage.*`. This never provides the
+    /// clipboard bridge, even when the object happens to have clipboard-like
+    /// methods.
     #[wasm_bindgen(js_name = setLocalStorageBridge)]
     pub fn set_local_storage_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
-        self.ensure_live()?;
-        self.bridges.borrow_mut().local_storage = bridge.dyn_into::<js_sys::Object>().ok();
+        self.ensure_host_configuration_open()?;
+        self.bridges.borrow_mut().local_storage = Some(require_bridge(bridge, "localStorage")?);
+        Ok(())
+    }
+
+    /// Install the object backing `navigator.clipboard.*`. Clipboard authority
+    /// is intentionally separate from local storage authority.
+    #[wasm_bindgen(js_name = setClipboardBridge)]
+    pub fn set_clipboard_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
+        self.ensure_host_configuration_open()?;
+        self.bridges.borrow_mut().clipboard = Some(require_bridge(bridge, "clipboard")?);
+        Ok(())
+    }
+
+    /// Replace the exact allowlist for synchronous guest-to-host operations.
+    /// The list is fixed before initialization so guest execution cannot race
+    /// or influence a later authority upgrade. Unknown operation names reject
+    /// the complete update rather than being silently ignored.
+    #[wasm_bindgen(js_name = setSyncHostCapabilities)]
+    pub fn set_sync_host_capabilities(&mut self, operations: JsValue) -> Result<(), JsValue> {
+        self.ensure_host_configuration_open()?;
+        if !checked_is_array(&operations, "synchronous host capabilities").map_err(to_js_error)? {
+            return Err(JsValue::from_str(
+                "TypeError: synchronous host capabilities must be an array",
+            ));
+        }
+        let len = checked_array_length(&operations, "synchronous host capabilities")
+            .map_err(to_js_error)?;
+        if len > MAX_SYNC_CAPABILITY_ENTRIES {
+            return Err(JsValue::from_str(
+                "RangeError: too many synchronous host capability entries",
+            ));
+        }
+        let mut allowed = HashSet::with_capacity(len as usize);
+        for index in 0..len {
+            let operation = checked_array_get(&operations, index, "synchronous host capabilities")
+                .map_err(to_js_error)?;
+            let Some(operation) = operation.as_string() else {
+                return Err(JsValue::from_str(
+                    "TypeError: synchronous host capability names must be strings",
+                ));
+            };
+            if !is_allowed_sync_host_call(&operation) {
+                return Err(JsValue::from_str(&format!(
+                    "TypeError: unknown synchronous host capability '{operation}'"
+                )));
+            }
+            allowed.insert(operation);
+        }
+        self.bridges.borrow_mut().allowed_sync_operations = allowed;
         Ok(())
     }
 
@@ -179,6 +282,9 @@ impl Engine {
                 "zipp: repeated initialization disposed this engine",
             ));
         }
+        // Freeze authority before compilation and before any guest top-level
+        // code can invoke a synchronous host bridge.
+        self.host_configuration_frozen = true;
         // Reject before allocating the combined preamble+guest buffer or
         // entering the parser. Source size is a compile-time resource, so the
         // VM's execution/heap recorder cannot protect this path for us.
@@ -227,14 +333,6 @@ impl Engine {
             }
             init.map_err(|e| JsValue::from_str(&e))?;
 
-            // Everything the preamble declares is engine plumbing, not script
-            // state; the host must not try to sync it into its own UI.
-            let preamble_names: std::collections::HashSet<String> = {
-                let mut probe = compile_script(PREAMBLE).map_err(|e| JsValue::from_str(&e))?;
-                probe.run_init().map_err(|e| JsValue::from_str(&e))?;
-                probe.symbols().into_iter().map(|s| s.name).collect()
-            };
-
             let mut slots = Vec::new();
             let mut exposed = Vec::new();
             for s in st.symbols() {
@@ -242,7 +340,8 @@ impl Engine {
                 // needs a slot for the bridge objects it also writes to (it syncs
                 // `window.__foo` keys both ways), so those stay visible. Hosts are
                 // expected to exclude them from what they treat as script state.
-                if preamble_names.contains(&s.name) && !EXPOSED_PREAMBLE.contains(&s.name.as_str())
+                if PREAMBLE_BINDINGS.contains(&s.name.as_str())
+                    && !EXPOSED_PREAMBLE.contains(&s.name.as_str())
                 {
                     continue;
                 }
@@ -335,14 +434,14 @@ impl Engine {
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
         let idx = index_list(&indices, &mut budget).map_err(to_js_error)?;
-        let vals = require_array(&values, "values").map_err(to_js_error)?;
+        require_array(&values, "values").map_err(to_js_error)?;
         budget.charge_node().map_err(to_js_error)?;
         budget.ensure_nodes(idx.len()).map_err(to_js_error)?;
         let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
         let mut converted = Vec::with_capacity(idx.len());
         for (n, i) in idx.into_iter().enumerate() {
-            let value =
-                from_js_bounded(&vals.get(n as u32), 0, &seen, &mut budget).map_err(to_js_error)?;
+            let raw = checked_array_get(&values, n as u32, "values").map_err(to_js_error)?;
+            let value = from_js_bounded(&raw, 0, &seen, &mut budget).map_err(to_js_error)?;
             converted.push((i, value));
         }
         if let Some(st) = self.state.as_mut() {
@@ -571,6 +670,17 @@ impl Engine {
         }
     }
 
+    fn ensure_host_configuration_open(&self) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        if self.host_configuration_frozen {
+            Err(JsValue::from_str(
+                "zipp: host bridge configuration is immutable after initialization starts",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Resource exhaustion is terminal. The status comes from the recorder,
     /// never from exception text a guest can spoof, and is checked even when a
     /// microtask converted the failure into a rejected promise. Ordinary guest
@@ -602,25 +712,19 @@ impl Engine {
 /// Service one synchronous `__zippHostCall`. Anything structured crosses as
 /// JSON; an `Err` becomes a JS throw the script can catch.
 fn is_allowed_sync_host_call(kind: &str) -> bool {
-    matches!(
-        kind,
-        "db.query"
-            | "db.get"
-            | "db.create"
-            | "db.update"
-            | "db.delete"
-            | "db.hardDelete"
-            | "db.startSync"
-            | "db.stopSync"
-            | "db.getSyncStatus"
-            | "db.getSavedSyncRoom"
-            | "ls.getItem"
-            | "ls.setItem"
-            | "ls.removeItem"
-            | "ls.clear"
-            | "nav.clipboardWrite"
-            | "nav.clipboardRead"
-    )
+    sync_host_call_arity(kind).is_some()
+}
+
+/// Exact wire arity for every synchronous operation. Guest code can call
+/// `__zippHostCall` directly, so wrapper arity is not a sufficient boundary.
+fn sync_host_call_arity(kind: &str) -> Option<usize> {
+    Some(match kind {
+        "db.query" | "db.get" | "db.create" | "db.update" | "db.hardDelete" | "ls.setItem" => 2,
+        "db.delete" | "db.startSync" | "db.stopSync" | "db.getSyncStatus" | "ls.getItem"
+        | "ls.removeItem" | "nav.clipboardWrite" => 1,
+        "db.getSavedSyncRoom" | "ls.clear" | "nav.clipboardRead" => 0,
+        _ => return None,
+    })
 }
 
 fn host_dispatch(
@@ -637,9 +741,9 @@ fn host_dispatch(
     // directly instead of going through the preamble wrappers. Reject before
     // even selecting a bridge or looking up a property, otherwise a planted
     // getter/method outside the advertised API becomes ambient authority.
-    if !is_allowed_sync_host_call(kind) {
+    let Some(expected_arity) = sync_host_call_arity(kind) else {
         return Err(format!("TypeError: unknown host call '{kind}'"));
-    }
+    };
     // A host bridge invocation is one VM instruction even when the strings it
     // passes cause megabytes of JSON parsing or allocation on the host side.
     // Bound the complete argument envelope before selecting/calling a bridge.
@@ -658,72 +762,74 @@ fn host_dispatch(
             "RangeError: host bridge arguments exceed the {MAX_SYNC_BRIDGE_BYTES}-byte limit"
         ));
     }
-
-    let arg = |i: usize| args.get(i).cloned().unwrap_or_default();
+    if args.len() != expected_arity {
+        return Err(format!(
+            "TypeError: host bridge call '{kind}' requires exactly {expected_arity} arguments"
+        ));
+    }
 
     // Clone the handle out before calling: the bridge method runs arbitrary JS,
     // and holding the RefCell borrow across it would panic if it re-entered.
-    let (target, method) = match kind.split_once('.') {
-        Some(("db", m)) => (bridges.borrow().db.clone(), m),
-        Some(("ls", m)) => (bridges.borrow().local_storage.clone(), m),
-        Some(("nav", m)) => (bridges.borrow().local_storage.clone(), m),
-        _ => return Err(format!("TypeError: unknown host call '{kind}'")),
+    let (target, method) = {
+        let bridges = bridges.borrow();
+        if !bridges.allowed_sync_operations.contains(kind) {
+            return Err("SecurityError: synchronous host capability denied".into());
+        }
+        match kind.split_once('.') {
+            Some(("db", m)) => (bridges.db.clone(), m),
+            Some(("ls", m)) => (bridges.local_storage.clone(), m),
+            // Expose the standard Clipboard method names on the dedicated
+            // object rather than requiring a second bespoke nav-shaped API.
+            Some(("nav", "clipboardWrite")) => (bridges.clipboard.clone(), "writeText"),
+            Some(("nav", "clipboardRead")) => (bridges.clipboard.clone(), "readText"),
+            _ => return Err(format!("TypeError: unknown host call '{kind}'")),
+        }
     };
     let Some(target) = target else {
-        // No bridge installed: reads answer empty rather than throwing, so a
-        // script that merely probes storage still runs.
-        return Ok(match kind {
-            "db.query" => "[]".into(),
-            "db.get" | "db.getSavedSyncRoom" => "null".into(),
-            "db.create" | "db.update" => "{}".into(),
-            "db.getSyncStatus" => r#"{"connected":false,"peers":0,"room":"","peerId":""}"#.into(),
-            _ => "null".into(),
-        });
+        return Err("Error: authorized host bridge is unavailable".into());
+    };
+
+    // Validate structured guest input before even resolving a host property.
+    // Reflect::get may invoke a host getter, so malformed JSON must not reach
+    // that point. Keep the parsed value for the actual call.
+    let structured_argument = match kind {
+        "db.query" | "db.create" | "db.update" => Some(parse_bridge_json(&args[1])?),
+        _ => None,
     };
 
     let f = js_sys::Reflect::get(&target, &JsValue::from_str(method))
         .ok()
-        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
-        .ok_or_else(|| format!("TypeError: host bridge has no method '{kind}'"))?;
+        .filter(JsValue::is_function)
+        .map(JsValue::unchecked_into::<js_sys::Function>)
+        .ok_or_else(|| "Error: authorized host bridge is unavailable".to_owned())?;
 
     // Per-kind argument shapes: which arguments are JSON and which are plain.
     let call = match kind {
-        "db.query" => {
-            let opts = js_sys::JSON::parse(&arg(1)).unwrap_or(JsValue::UNDEFINED);
-            if opts.is_null() || opts.is_undefined() {
-                f.call1(&target, &JsValue::from_str(&arg(0)))
-            } else {
-                f.call2(&target, &JsValue::from_str(&arg(0)), &opts)
-            }
-        }
-        "db.create" | "db.update" => {
-            let data = js_sys::JSON::parse(&arg(1)).unwrap_or(JsValue::UNDEFINED);
-            f.call2(&target, &JsValue::from_str(&arg(0)), &data)
-        }
+        "db.query" | "db.create" | "db.update" => f.call2(
+            &target,
+            &JsValue::from_str(&args[0]),
+            structured_argument
+                .as_ref()
+                .expect("structured bridge argument was validated"),
+        ),
         "db.get" | "db.hardDelete" => f.call2(
             &target,
-            &JsValue::from_str(&arg(0)),
-            &JsValue::from_str(&arg(1)),
+            &JsValue::from_str(&args[0]),
+            &JsValue::from_str(&args[1]),
         ),
         "ls.setItem" => f.call2(
             &target,
-            &JsValue::from_str(&arg(0)),
-            &JsValue::from_str(&arg(1)),
+            &JsValue::from_str(&args[0]),
+            &JsValue::from_str(&args[1]),
         ),
         "db.getSavedSyncRoom" | "ls.clear" | "nav.clipboardRead" => f.call0(&target),
-        _ => f.call1(&target, &JsValue::from_str(&arg(0))),
+        _ => f.call1(&target, &JsValue::from_str(&args[0])),
     };
 
-    let ret = call.map_err(|e| {
-        // A bridge that threw becomes a catchable JS throw inside the script,
-        // carrying the host's own message.
-        let msg = e
-            .dyn_ref::<js_sys::Error>()
-            .map(|er| String::from(er.message()))
-            .or_else(|| e.as_string())
-            .unwrap_or_else(|| format!("host bridge '{kind}' failed"));
-        format!("Error: {msg}")
-    })?;
+    // Host exception text may contain credentials, internal paths, tenant IDs,
+    // or backend details. It remains available to the trusted host at the call
+    // site, but the guest receives only a stable opaque failure.
+    let ret = call.map_err(|_| "Error: host bridge call failed".to_owned())?;
 
     // Every reply crosses as JSON, including `undefined` — which `stringify`
     // answers with the JS value `undefined`, NOT a string. Converting that to a
@@ -749,7 +855,7 @@ fn host_dispatch(
                 raw.as_string().unwrap_or_else(|| "null".into())
             }
         }
-        Err(_) => "null".into(),
+        Err(_) => return Err("Error: host bridge returned an unserializable value".into()),
     };
     if reply.len() > MAX_SYNC_BRIDGE_BYTES {
         return Err(format!(
@@ -759,15 +865,57 @@ fn host_dispatch(
     Ok(reply)
 }
 
+fn require_bridge(bridge: JsValue, label: &str) -> Result<js_sys::Object, JsValue> {
+    // `dyn_into::<Object>` uses JavaScript `instanceof Object`. A Proxy's
+    // getPrototypeOf trap can throw from that non-catch binding and poison the
+    // exported Engine borrow before initialization even starts. `typeof`-style
+    // wasm-bindgen predicates cannot invoke guest/host JavaScript.
+    if bridge.is_null() || (!bridge.is_object() && !bridge.is_function()) {
+        return Err(JsValue::from_str(&format!(
+            "TypeError: {label} bridge must be a non-null object"
+        )));
+    }
+    Ok(bridge.unchecked_into())
+}
+
+fn parse_bridge_json(text: &str) -> Result<JsValue, String> {
+    js_sys::JSON::parse(text)
+        .map_err(|_| "TypeError: malformed JSON in host bridge argument".to_owned())
+}
+
 fn to_js_error(error: String) -> JsValue {
     JsValue::from_str(&error)
 }
 
-fn require_array<'a>(v: &'a JsValue, label: &str) -> Result<&'a js_sys::Array, String> {
-    if !js_sys::Array::is_array(v) {
+fn inspection_error(label: &str) -> String {
+    format!("TypeError: {label} could not be inspected safely")
+}
+
+fn checked_is_array(v: &JsValue, label: &str) -> Result<bool, String> {
+    try_array_is_array(v).map_err(|_| inspection_error(label))
+}
+
+fn require_array(v: &JsValue, label: &str) -> Result<(), String> {
+    if !checked_is_array(v, label)? {
         return Err(format!("TypeError: {label} must be an array"));
     }
-    Ok(v.unchecked_ref())
+    Ok(())
+}
+
+fn checked_array_length(v: &JsValue, label: &str) -> Result<u32, String> {
+    let raw = js_sys::Reflect::get(v, &JsValue::from_str("length"))
+        .map_err(|_| inspection_error(label))?;
+    let Some(length) = raw.as_f64() else {
+        return Err(inspection_error(label));
+    };
+    if !length.is_finite() || length < 0.0 || length > u32::MAX as f64 || length.fract() != 0.0 {
+        return Err(inspection_error(label));
+    }
+    Ok(length as u32)
+}
+
+fn checked_array_get(v: &JsValue, index: u32, label: &str) -> Result<JsValue, String> {
+    js_sys::Reflect::get_u32(v, index).map_err(|_| inspection_error(label))
 }
 
 /// Coerce a JS array of numbers to slot indices.
@@ -775,16 +923,25 @@ fn index_list(v: &JsValue, budget: &mut HostValueBudget) -> Result<Vec<u32>, Str
     if v.is_undefined() || v.is_null() {
         return Ok(Vec::new());
     }
-    let values = require_array(v, "indices")?;
-    let len = values.length() as usize;
+    require_array(v, "indices")?;
+    let len = checked_array_length(v, "indices")?;
     budget.charge_node()?;
-    budget.ensure_nodes(len)?;
-    let mut out = Vec::with_capacity(len);
-    for i in 0..values.length() {
+    budget.ensure_nodes(len as usize)?;
+    let mut out = Vec::with_capacity(len as usize);
+    for i in 0..len {
         budget.charge_node()?;
-        if let Some(n) = values.get(i).as_f64() {
-            out.push(n as u32);
+        let raw = checked_array_get(v, i, "indices")?;
+        let Some(index) = raw.as_f64() else {
+            return Err(
+                "TypeError: indices must contain only finite unsigned 32-bit integers".into(),
+            );
+        };
+        if !index.is_finite() || index < 0.0 || index > u32::MAX as f64 || index.fract() != 0.0 {
+            return Err(
+                "TypeError: indices must contain only finite unsigned 32-bit integers".into(),
+            );
         }
+        out.push(index as u32);
     }
     Ok(out)
 }
@@ -888,19 +1045,19 @@ fn from_js_bounded(
     if depth >= MAX_DEPTH {
         return Ok(HostValue::Null);
     }
-    if js_sys::Array::is_array(v) {
+    if checked_is_array(v, "host value")? {
         let object: js_sys::Object = v.clone().unchecked_into();
         if seen.has(&object) {
             return Ok(HostValue::Null);
         }
         seen.add(&object);
         let result = (|| {
-            let a: &js_sys::Array = v.unchecked_ref();
-            let len = a.length() as usize;
-            budget.ensure_nodes(len)?;
-            let mut items = Vec::with_capacity(len);
-            for i in 0..a.length() {
-                items.push(from_js_bounded(&a.get(i), depth + 1, seen, budget)?);
+            let len = checked_array_length(v, "host array")?;
+            budget.ensure_nodes(len as usize)?;
+            let mut items = Vec::with_capacity(len as usize);
+            for i in 0..len {
+                let value = checked_array_get(v, i, "host array")?;
+                items.push(from_js_bounded(&value, depth + 1, seen, budget)?);
             }
             Ok(HostValue::Array(items))
         })();
@@ -917,15 +1074,24 @@ fn from_js_bounded(
         }
         seen.add(&object);
         let result = (|| {
-            let keys = js_sys::Object::keys(&object);
-            budget.ensure_nodes(keys.length() as usize)?;
-            let mut pairs = Vec::with_capacity(keys.length() as usize);
-            for k in keys.iter() {
+            let keys: JsValue = try_object_keys(v)
+                .map_err(|_| inspection_error("host object"))?
+                .into();
+            require_array(&keys, "host object keys")?;
+            let key_count = checked_array_length(&keys, "host object keys")?;
+            budget.ensure_nodes(key_count as usize)?;
+            let mut pairs = Vec::with_capacity(key_count as usize);
+            for i in 0..key_count {
+                let k = checked_array_get(&keys, i, "host object keys")?;
+                if !k.is_string() {
+                    return Err(inspection_error("host object keys"));
+                }
                 let key: &js_sys::JsString = k.unchecked_ref();
                 budget.ensure_string_units(key.length() as usize)?;
                 let Some(name) = k.as_string() else { continue };
                 budget.charge_string(&name)?;
-                let val = js_sys::Reflect::get(&object, &k).unwrap_or(JsValue::UNDEFINED);
+                let val = js_sys::Reflect::get(&object, &k)
+                    .map_err(|_| inspection_error("host object property"))?;
                 // A method on a host-supplied object is not state; drop it
                 // rather than storing a placeholder the script would call.
                 if val.is_function() {
@@ -944,36 +1110,61 @@ fn from_js_bounded(
 #[cfg(test)]
 mod tests {
     use super::{
-        host_dispatch, is_allowed_sync_host_call, Bridges, MAX_SYNC_BRIDGE_ARGS,
-        MAX_SYNC_BRIDGE_BYTES,
+        compile_script, host_dispatch, is_allowed_sync_host_call, sync_host_call_arity, Bridges,
+        MAX_SYNC_BRIDGE_ARGS, MAX_SYNC_BRIDGE_BYTES, PREAMBLE, PREAMBLE_BINDINGS,
     };
     use std::cell::RefCell;
+    use std::collections::HashSet;
     use std::rc::Rc;
 
     #[test]
+    fn preamble_binding_manifest_matches_the_compiler() {
+        let state = compile_script(PREAMBLE).expect("embedded preamble must compile");
+        let actual: HashSet<String> = state
+            .symbols()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+        let expected: HashSet<String> = PREAMBLE_BINDINGS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(
+            PREAMBLE_BINDINGS.len(),
+            expected.len(),
+            "preamble manifest contains a duplicate"
+        );
+        assert_eq!(
+            actual, expected,
+            "update PREAMBLE_BINDINGS with preamble.js"
+        );
+    }
+
+    #[test]
     fn synchronous_host_call_allowlist_is_exact() {
-        for kind in [
-            "db.query",
-            "db.get",
-            "db.create",
-            "db.update",
-            "db.delete",
-            "db.hardDelete",
-            "db.startSync",
-            "db.stopSync",
-            "db.getSyncStatus",
-            "db.getSavedSyncRoom",
-            "ls.getItem",
-            "ls.setItem",
-            "ls.removeItem",
-            "ls.clear",
-            "nav.clipboardWrite",
-            "nav.clipboardRead",
+        for (kind, arity) in [
+            ("db.query", 2),
+            ("db.get", 2),
+            ("db.create", 2),
+            ("db.update", 2),
+            ("db.delete", 1),
+            ("db.hardDelete", 2),
+            ("db.startSync", 1),
+            ("db.stopSync", 1),
+            ("db.getSyncStatus", 1),
+            ("db.getSavedSyncRoom", 0),
+            ("ls.getItem", 1),
+            ("ls.setItem", 2),
+            ("ls.removeItem", 1),
+            ("ls.clear", 0),
+            ("nav.clipboardWrite", 1),
+            ("nav.clipboardRead", 0),
         ] {
             assert!(
                 is_allowed_sync_host_call(kind),
                 "documented kind rejected: {kind}"
             );
+            assert_eq!(sync_host_call_arity(kind), Some(arity), "wrong arity");
         }
 
         for kind in [
@@ -996,13 +1187,30 @@ mod tests {
 
     #[test]
     fn synchronous_host_call_envelope_is_bounded_before_dispatch() {
-        let bridges = Rc::new(RefCell::new(Bridges::default()));
+        let mut configured = Bridges::default();
+        configured.allowed_sync_operations.insert("db.query".into());
+        let bridges = Rc::new(RefCell::new(configured));
         let too_many = vec![String::new(); MAX_SYNC_BRIDGE_ARGS + 1];
         let err = host_dispatch(&bridges, "db.query", &too_many).unwrap_err();
         assert!(err.contains("argument limit"), "got {err:?}");
 
-        let too_large = vec!["x".repeat(MAX_SYNC_BRIDGE_BYTES + 1)];
+        // Each argument is individually below the envelope ceiling; only their
+        // aggregate (including the kind) is too large.
+        let part = "x".repeat(MAX_SYNC_BRIDGE_BYTES / 2);
+        let too_large = vec![part.clone(), part];
         let err = host_dispatch(&bridges, "db.query", &too_large).unwrap_err();
         assert!(err.contains("arguments exceed"), "got {err:?}");
+
+        let wrong_arity = vec!["collection".into()];
+        let err = host_dispatch(&bridges, "db.query", &wrong_arity).unwrap_err();
+        assert!(err.contains("requires exactly 2 arguments"), "got {err:?}");
+    }
+
+    #[test]
+    fn synchronous_host_calls_are_denied_without_an_engine_grant() {
+        let bridges = Rc::new(RefCell::new(Bridges::default()));
+        let args = vec!["collection".into(), "null".into()];
+        let err = host_dispatch(&bridges, "db.query", &args).unwrap_err();
+        assert_eq!(err, "SecurityError: synchronous host capability denied");
     }
 }

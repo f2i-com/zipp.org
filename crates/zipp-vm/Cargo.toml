@@ -39,3 +39,8 @@ regex-linear = ["regress/linear-ascii"]
 # adds a branch to the inner dispatch loop, and enabling it on a VM turns the
 # JIT off for that VM (native code does not iterate the loop the hook lives in).
 instrument = []
+# Memory-safe interpreter profile for the dedicated untrusted-code runner.
+# This deliberately conflicts with `jit`: native code generation and every
+# performance-only unchecked path are excluded, while the regex engine selects
+# its index-based/safe implementations.
+safe-sandbox = ["instrument", "regress/prohibit-unsafe"]

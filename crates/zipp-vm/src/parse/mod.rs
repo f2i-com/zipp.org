@@ -30,6 +30,7 @@ pub mod cover;
 pub mod expr;
 pub mod funcs;
 pub mod lexer;
+pub(crate) mod limits;
 pub mod parser;
 pub mod stmt;
 pub mod token;

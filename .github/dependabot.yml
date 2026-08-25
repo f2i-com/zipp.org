@@ -7,8 +7,21 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
+  # zipp-wasm is deliberately a separate Cargo workspace and has its own lock.
+  - package-ecosystem: cargo
+    directory: "/crates/zipp-wasm"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
   - package-ecosystem: npm
     directory: "/landing"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

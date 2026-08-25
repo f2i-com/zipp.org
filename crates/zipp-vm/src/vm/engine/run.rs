@@ -70,6 +70,11 @@ impl<'p> Vm<'p> {
         let top = self.func(0);
         let base = 0usize;
         let top_regs = top.reg_count as usize;
+        if self.regs_would_overflow(top_regs) {
+            return Err(Thrown(
+                "RangeError: script exceeded its memory budget".into(),
+            ));
+        }
         self.regs.resize(top_regs, Value::UNDEFINED);
         // A Script's top-level `this` is the global object (a Module's would be
         // undefined). Reg 0 is `this`; seed it with globalThis so sloppy code like
@@ -409,7 +414,9 @@ impl<'p> Vm<'p> {
                         let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
                         self.call_value(trap, handler, &[target, this, arr])
                     }
-                    None => self.call_value(target, this, args),
+                    None => {
+                        self.with_native_recursion_guard(|vm| vm.call_value(target, this, args))
+                    }
                 };
             }
         }
@@ -457,7 +464,8 @@ impl<'p> Vm<'p> {
                 // untagged (main-realm) target runs with no realm active.
                 let prev_ar = self.active_realm;
                 self.active_realm = self.shadow_fn_realm.get(&t.heap_index()).copied();
-                let call_res = self.call_value(t, Value::UNDEFINED, &wargs);
+                let call_res = self
+                    .with_native_recursion_guard(|vm| vm.call_value(t, Value::UNDEFINED, &wargs));
                 self.active_realm = prev_ar;
                 let res = match call_res {
                     Ok(v) => {
@@ -500,7 +508,7 @@ impl<'p> Vm<'p> {
                 let mut all = Vec::with_capacity(bargs.len() + args.len());
                 all.extend_from_slice(bargs);
                 all.extend_from_slice(args);
-                return self.call_value(t, th, &all);
+                return self.with_native_recursion_guard(|vm| vm.call_value(t, th, &all));
             }
             // A createRealm child's `eval` / `evalScript`: run the code against
             // the CHILD realm's global bindings (the active_realm switch, the

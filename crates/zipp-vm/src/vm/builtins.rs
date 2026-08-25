@@ -127,6 +127,21 @@ fn promise_pristine_enabled() -> bool {
     }
 }
 
+/// Conservative comparison bound for the two TypedArray sort implementations.
+/// The callback path is insertion sort (quadratic in the adversarial case); the
+/// intrinsic comparator delegates to Rust's comparison sort (O(n log n)).
+fn typed_array_sort_work_bound(len: usize, callback: bool) -> u64 {
+    let n = len as u64;
+    if callback {
+        n.saturating_mul(n.saturating_sub(1)) / 2
+    } else if n <= 1 {
+        0
+    } else {
+        let levels = u64::BITS - (n - 1).leading_zeros();
+        n.saturating_mul(levels as u64)
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Try a builtin method on an array or string receiver. Returns
     /// `Ok(Some(result))` when `name` is a recognised builtin, `Ok(None)` when
@@ -165,7 +180,7 @@ impl<'p> Vm<'p> {
         self.dispatch_builtin_method(recv, name, args)
     }
 
-    /// Is a `recv.call(…)` / `recv.apply(…)` name-dispatch sound — i.e. would a
+    /// Is a `recv.call(…)` / `recv.apply(…)` / `recv.bind(…)` name-dispatch sound — i.e. would a
     /// real Get on `recv` resolve `name` to the pristine `%Function.prototype%`
     /// native? Requires: an ORDINARY callable (Func/Closure/Native/Bound — a
     /// Class's statics and a Proxy's get trap must resolve generically), no own
@@ -174,7 +189,7 @@ impl<'p> Vm<'p> {
     /// property. Pure reads — a `false` sends the caller to the generic
     /// get_prop + call_value tail, which observes whatever is really installed.
     pub(crate) fn fn_call_apply_pristine(&self, recv: Value, name: &str) -> bool {
-        use crate::vm::native::{FN_APPLY, FN_CALL};
+        use crate::vm::native::{FN_APPLY, FN_BIND, FN_CALL};
         if !recv.is_heap() {
             return false;
         }
@@ -199,7 +214,11 @@ impl<'p> Vm<'p> {
         {
             return false;
         }
-        let want = if name == "apply" { FN_APPLY } else { FN_CALL };
+        let want = match name {
+            "apply" => FN_APPLY,
+            "bind" => FN_BIND,
+            _ => FN_CALL,
+        };
         match self.heap.get(self.fn_proto) {
             HeapObj::Object(m) => m.pos(name).is_some_and(|slot| {
                 !m.attrs[slot].accessor
@@ -521,33 +540,10 @@ impl<'p> Vm<'p> {
                     };
                     return Ok(Some(self.call_value(recv, this, &callargs)?));
                 }
-                "bind" => {
-                    let this = args.first().copied().unwrap_or(Value::UNDEFINED);
-                    let bound: Vec<Value> = if args.len() > 1 {
-                        args[1..].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-                    // Spec 20.2.3.2 steps 3-6 (mirrors FN_BIND): BoundFunctionCreate
-                    // takes the bound function's [[Prototype]] from the TARGET, and
-                    // the HasOwnProperty(length) → Get(length) → Get(name) reads that
-                    // follow it are OBSERVABLE; a throwing accessor propagates here.
-                    // GC stays suspended while the proto is held un-rooted across
-                    // those re-entrant reads.
-                    let _gc = self.gc_lock_guard();
-                    let bound_proto = self.object_get_prototype_of(recv);
-                    if self.has_own_property(recv, "length") {
-                        let _ = self.get_prop(recv, "length")?;
-                    }
-                    let _ = self.get_prop(recv, "name")?;
-                    let b = self.heap.alloc(HeapObj::Bound {
-                        target: recv,
-                        this,
-                        args: bound,
-                    });
-                    self.proto_of.insert(b, bound_proto);
-                    return Ok(Some(Value::heap(b)));
-                }
+                // Bind snapshots target length/name and may reject a sandbox-cap
+                // overflow while composing "bound ". Keep that fallible work in
+                // FN_BIND instead of duplicating an incomplete inline version.
+                "bind" => return Ok(None),
                 _ => {}
             }
         }
@@ -632,7 +628,15 @@ impl<'p> Vm<'p> {
                         // Honour a string `@@toStringTag` (`[object Cool]`), matching
                         // the Object.prototype.toString value form.
                         let tag = self.object_to_string_tag(recv)?;
-                        return Ok(Some(self.alloc_str(format!("[object {tag}]"))));
+                        let total = tag
+                            .len()
+                            .checked_add(9)
+                            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+                        let mut out = self.guest_string_with_capacity(total)?;
+                        out.push_str("[object ");
+                        out.push_str(&tag);
+                        out.push(']');
+                        return Ok(Some(self.alloc_str(out)));
                     }
                 }
             }
@@ -921,7 +925,7 @@ impl<'p> Vm<'p> {
     /// Build a fresh TypedArray of `kind` from element Values (coerced/encoded).
     pub(crate) fn ta_build_from(&mut self, kind: u8, vals: &[Value]) -> Result<Value, Thrown> {
         let size = native::TA_KINDS[kind as usize].1;
-        let buf = self.alloc_array_buffer(vals.len() * size);
+        let buf = self.alloc_array_buffer(vals.len() * size)?;
         let ta = self.alloc_typed_array(buf, kind, 0, vals.len());
         for (i, v) in vals.iter().enumerate() {
             self.ta_element_set(ta.heap_index(), i, *v)?;
@@ -959,7 +963,7 @@ impl<'p> Vm<'p> {
         if species == Value::UNDEFINED {
             // Default constructor: a fresh zero-filled view of the exemplar's kind.
             let size = native::TA_KINDS[kind as usize].1;
-            let buf = self.alloc_array_buffer(count * size);
+            let buf = self.alloc_array_buffer(count * size)?;
             return Ok(self.alloc_typed_array(buf, kind, 0, count));
         }
         if !self.is_constructor(species) {
@@ -1087,25 +1091,31 @@ impl<'p> Vm<'p> {
                 } else {
                     self.to_js_string(a0)?
                 };
+                self.preflight_native_iteration_work(len as u64)?;
                 // The element COUNT is fixed at entry; a detach (or resizable shrink)
                 // during separator ToString makes each now-out-of-range element read
                 // as "" (Get → undefined → ""), so e.g. a detached length-3 array
                 // joins to ",,".
                 let eff = self.ta_effective_len(idx).unwrap_or(0);
-                let parts: Vec<String> = (0..len)
-                    .map(|i| {
-                        if i < eff {
-                            self.ta_elem_string(idx, i)
-                        } else {
-                            String::new()
-                        }
-                    })
-                    .collect();
-                Ok(Some(self.alloc_str(parts.join(&sep))))
+                let mut out = String::new();
+                for i in 0..len {
+                    let part = if i < eff {
+                        self.ta_elem_string(idx, i)
+                    } else {
+                        String::new()
+                    };
+                    self.append_guest_join_part(&mut out, &sep, &part, i)?;
+                }
+                Ok(Some(self.alloc_str(out)))
             }
             "toString" => {
-                let parts: Vec<String> = (0..len).map(|i| self.ta_elem_string(idx, i)).collect();
-                Ok(Some(self.alloc_str(parts.join(","))))
+                self.preflight_native_iteration_work(len as u64)?;
+                let mut out = String::new();
+                for i in 0..len {
+                    let part = self.ta_elem_string(idx, i);
+                    self.append_guest_join_part(&mut out, ",", &part, i)?;
+                }
+                Ok(Some(self.alloc_str(out)))
             }
             "toLocaleString" => {
                 // ToString(Invoke(element, "toLocaleString")) for each element,
@@ -1113,13 +1123,14 @@ impl<'p> Vm<'p> {
                 // toLocaleString and uses a real ToString, so a throwing
                 // toLocaleString / toString / valueOf propagates as an abrupt
                 // completion (the elements are numbers/bigints, never nullish).
-                let mut parts: Vec<String> = Vec::with_capacity(len);
+                self.preflight_native_iteration_work(len as u64)?;
+                let mut out = String::new();
                 for i in 0..len {
                     let el = self.ta_element_get(idx, i);
                     // A user toLocaleString may shrink the buffer: later reads come
                     // back undefined, which joins as the empty string per spec.
                     if el == Value::UNDEFINED || el == Value::NULL {
-                        parts.push(String::new());
+                        self.append_guest_join_part(&mut out, ",", "", i)?;
                         continue;
                     }
                     let f = self.get_prop(el, "toLocaleString")?;
@@ -1132,11 +1143,13 @@ impl<'p> Vm<'p> {
                         let r = self.call_value(f, el, &fwd)?;
                         self.to_js_string(r)?
                     } else {
-                        self.to_js_string(el)?
+                        return Err(Thrown(
+                            "TypeError: element toLocaleString is not callable".into(),
+                        ));
                     };
-                    parts.push(s);
+                    self.append_guest_join_part(&mut out, ",", &s, i)?;
                 }
-                Ok(Some(self.alloc_str(parts.join(","))))
+                Ok(Some(self.alloc_str(out)))
             }
             "indexOf" | "lastIndexOf" | "includes" => {
                 // Length is fixed at method entry (ValidateTypedArray already ran).
@@ -1172,6 +1185,7 @@ impl<'p> Vm<'p> {
                         from.min(entry_len - 1)
                     };
                     if hi >= 0 {
+                        self.preflight_native_iteration_work((hi as u64).saturating_add(1))?;
                         for i in (0..=hi as usize).rev() {
                             let e = self.ta_element_get(idx, i);
                             if e == Value::UNDEFINED {
@@ -1189,6 +1203,9 @@ impl<'p> Vm<'p> {
                     } else {
                         from.min(entry_len)
                     } as usize;
+                    self.preflight_native_iteration_work(
+                        (entry_len as u64).saturating_sub(lo as u64),
+                    )?;
                     for i in lo..entry_len as usize {
                         let e = self.ta_element_get(idx, i);
                         let eq = if name == "includes" {
@@ -1212,6 +1229,7 @@ impl<'p> Vm<'p> {
                 if !self.is_callable(a0) {
                     return Err(Thrown("TypeError: map callback is not a function".into()));
                 }
+                self.preflight_native_iteration_work(len as u64)?;
                 // TypedArraySpeciesCreate runs FIRST (its user code can resize or
                 // detach buffers), then each element is re-Get, mapped, and Set
                 // into the destination (per-element [[Set]] semantics: coercion
@@ -1233,6 +1251,7 @@ impl<'p> Vm<'p> {
                         "TypeError: {name} callback is not a function"
                     )));
                 }
+                self.preflight_native_iteration_work(len as u64)?;
                 // `mapped` holds Values across user callbacks: guard the GC.
                 let _gc = self.gc_lock_guard();
                 let mut mapped: Vec<Value> = Vec::new();
@@ -1305,6 +1324,7 @@ impl<'p> Vm<'p> {
                         "TypeError: {name} callback is not a function"
                     )));
                 }
+                self.preflight_native_iteration_work(len as u64)?;
                 let order: Vec<usize> = if name == "reduceRight" {
                     (0..len).rev().collect()
                 } else {
@@ -1366,12 +1386,14 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot fill a detached or out-of-bounds TypedArray".into(),
                     ));
                 }
+                self.preflight_native_iteration_work(end.saturating_sub(start) as u64)?;
                 for i in start..end {
                     self.ta_element_set(idx, i, v)?;
                 }
                 Ok(Some(recv))
             }
             "reverse" => {
+                self.preflight_native_iteration_work(len as u64)?;
                 let mut snap = self.ta_snapshot(idx);
                 snap.reverse();
                 for (i, v) in snap.into_iter().enumerate() {
@@ -1381,6 +1403,7 @@ impl<'p> Vm<'p> {
             }
             // ES2023 change-array-by-copy: build a NEW typed array of the same kind.
             "toReversed" => {
+                self.preflight_native_iteration_work(len as u64)?;
                 let mut snap = self.ta_snapshot(idx);
                 snap.reverse();
                 Ok(Some(self.ta_build_from(kind, &snap)?))
@@ -1392,6 +1415,10 @@ impl<'p> Vm<'p> {
                         "TypeError: the comparator argument must be a function or undefined".into(),
                     ));
                 }
+                self.preflight_native_iteration_work(typed_array_sort_work_bound(
+                    len,
+                    self.is_callable(cmp),
+                ))?;
                 let mut snap = self.ta_snapshot(idx);
                 if self.is_callable(cmp) {
                     let n = snap.len();
@@ -1465,6 +1492,7 @@ impl<'p> Vm<'p> {
                 if actual < 0.0 || actual >= cur as f64 {
                     return Err(Thrown("RangeError: invalid typed array index".into()));
                 }
+                self.preflight_native_iteration_work(len as u64)?;
                 // ...but the result has exactly the ENTRY length: re-Get each
                 // element (shrunk indices read undefined -> 0/0n via Set), and the
                 // replacement is silently skipped when its now-valid index lies
@@ -1479,6 +1507,7 @@ impl<'p> Vm<'p> {
                 let start = self.ta_rel_index(a0, 0, len)?;
                 let end = self.ta_rel_index(a1, len, len)?;
                 let count = end.max(start) - start;
+                self.preflight_native_iteration_work(count as u64)?;
                 // TypedArraySpeciesCreate (constructor[@@species]) FIRST — it can run
                 // user code that detaches the source buffer.
                 let dest = self.ta_species_create(idx, count)?;
@@ -1599,6 +1628,10 @@ impl<'p> Vm<'p> {
                         "TypeError: the comparator argument must be a function or undefined".into(),
                     ));
                 }
+                self.preflight_native_iteration_work(typed_array_sort_work_bound(
+                    len,
+                    self.is_callable(cmp),
+                ))?;
                 let mut snap = self.ta_snapshot(idx);
                 if self.is_callable(cmp) {
                     // Comparator sort (stable insertion to allow VM re-entry).
@@ -1656,6 +1689,7 @@ impl<'p> Vm<'p> {
                 let cur = self.ta_effective_len(idx).unwrap_or(0);
                 let count = end.max(start) - start;
                 let bound = count.min(cur.saturating_sub(start.max(target)));
+                self.preflight_native_iteration_work(bound as u64)?;
                 let src: Vec<Value> = (0..bound)
                     .map(|k| self.ta_element_get(idx, start + k))
                     .collect();
@@ -1712,11 +1746,15 @@ impl<'p> Vm<'p> {
                     && matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
                 {
                     let src = self.ta_snapshot(a0.heap_index());
-                    if offset + src.len() > len {
+                    let end = offset.checked_add(src.len()).ok_or_else(|| {
+                        Thrown("RangeError: source array is too long for the target offset".into())
+                    })?;
+                    if end > len {
                         return Err(Thrown(
                             "RangeError: source array is too long for the target offset".into(),
                         ));
                     }
+                    self.preflight_native_iteration_work(src.len() as u64)?;
                     for (k, v) in src.into_iter().enumerate() {
                         self.ta_element_set(idx, offset + k, v)?;
                     }
@@ -1731,8 +1769,20 @@ impl<'p> Vm<'p> {
                 // an array-like (length + integer indices), NOT iterated — matching
                 // the spec, which never invokes the source's @@iterator.
                 let len_val = self.get_prop(a0, "length")?;
-                let src_len = self.to_integer_or_zero(len_val)?.clamp(0, (1i64 << 53) - 1) as usize;
-                if offset + src_len > len {
+                let src_len_u64 =
+                    self.to_integer_or_zero(len_val)?.clamp(0, (1i64 << 53) - 1) as u64;
+                // Keep ToLength in its 53-bit domain until the hostile-code
+                // work check has run. Casting first makes 2^32 become zero on
+                // wasm32, bypassing both the bounds check and the native-loop
+                // budget.
+                self.preflight_native_iteration_work(src_len_u64)?;
+                let src_len = usize::try_from(src_len_u64).map_err(|_| {
+                    Thrown("RangeError: source array is too long for the target offset".into())
+                })?;
+                let end = offset.checked_add(src_len).ok_or_else(|| {
+                    Thrown("RangeError: source array is too long for the target offset".into())
+                })?;
+                if end > len {
                     return Err(Thrown(
                         "RangeError: source array is too long for the target offset".into(),
                     ));
@@ -2048,9 +2098,9 @@ impl<'p> Vm<'p> {
                     if is_shared {
                         // A SAB slice is a NEW SharedArrayBuffer (copied bytes,
                         // not aliased memory) — allocate truly-shared storage.
-                        self.alloc_shared_array_buffer(new_len, None)
+                        self.alloc_shared_array_buffer(new_len, None)?
                     } else {
-                        self.alloc_array_buffer(new_len)
+                        self.alloc_array_buffer(new_len)?
                     }
                 } else {
                     if !self.is_constructor(species) {
@@ -2150,7 +2200,7 @@ impl<'p> Vm<'p> {
                     HeapObj::ArrayBuffer { data, .. } => data.to_vec(),
                     _ => Vec::new(),
                 };
-                let new_idx = self.alloc_array_buffer(new_len);
+                let new_idx = self.alloc_array_buffer(new_len)?;
                 let n = bytes.len().min(new_len);
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
                     data[..n].copy_from_slice(&bytes[..n]);
@@ -2210,7 +2260,7 @@ impl<'p> Vm<'p> {
                     }
                     _ => Vec::new(),
                 };
-                let new_idx = self.alloc_array_buffer(slice.len());
+                let new_idx = self.alloc_array_buffer(slice.len())?;
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
                     data.copy_from_slice(&slice);
                 }
@@ -2250,7 +2300,7 @@ impl<'p> Vm<'p> {
                     HeapObj::ArrayBuffer { data, .. } => data.to_vec(),
                     _ => Vec::new(),
                 };
-                let new_idx = self.alloc_array_buffer(new_len);
+                let new_idx = self.alloc_array_buffer(new_len)?;
                 let n = bytes.len().min(new_len);
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
                     data[..n].copy_from_slice(&bytes[..n]);
@@ -2459,6 +2509,7 @@ impl<'p> Vm<'p> {
                         _ => break,
                     };
                     i += 1;
+                    self.preflight_native_iteration_work(i as u64)?;
                     // A tombstoned (deleted) entry is skipped.
                     if k.is_hole() {
                         continue;
@@ -2802,6 +2853,7 @@ impl<'p> Vm<'p> {
                         _ => break,
                     };
                     i += 1;
+                    self.preflight_native_iteration_work(i as u64)?;
                     // A tombstoned (deleted) slot is skipped.
                     if v.is_hole() {
                         continue;
@@ -2844,6 +2896,7 @@ impl<'p> Vm<'p> {
                 ) = match a0.is_heap().then(|| self.heap.get(a0.heap_index())) {
                     Some(HeapObj::Set(items)) => {
                         // Skip tombstoned (deleted) slots.
+                        self.preflight_native_iteration_work(items.len() as u64)?;
                         let items: Vec<Value> =
                             items.iter().copied().filter(|v| !v.is_hole()).collect();
                         let n = items.len() as i64;
@@ -2897,7 +2950,10 @@ impl<'p> Vm<'p> {
                 // copies O.[[SetData]] at this point, so any element added by the getters
                 // is included — see union/difference/symmetricDifference mutation tests).
                 let this_items: Vec<Value> = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.iter().copied().filter(|v| !v.is_hole()).collect(),
+                    HeapObj::Set(items) => {
+                        self.preflight_native_iteration_work(items.len() as u64)?;
+                        items.iter().copied().filter(|v| !v.is_hole()).collect()
+                    }
                     _ => Vec::new(),
                 };
                 let mem = |hay: &[Value], v: Value, vm: &Self| {
@@ -2917,8 +2973,10 @@ impl<'p> Vm<'p> {
                             }
                             _ => Vec::new(),
                         };
+                        let mut finder = crate::vm::collections::LocalFinder::new();
                         for v in self.set_rec_drain(&other_real, it)? {
-                            if !mem(&r, v, self) {
+                            if finder.find(&self.heap, &r, v).is_none() {
+                                finder.record_push(&self.heap, &r, v);
                                 r.push(v);
                             }
                         }
@@ -2941,6 +2999,7 @@ impl<'p> Vm<'p> {
                         // LAZY, for the same reason as intersection's else arm:
                         // the live test must run between two steps.
                         let mut real_pos = 0usize;
+                        let mut native_work = 0u64;
                         loop {
                             let v = match it {
                                 None => {
@@ -2956,6 +3015,8 @@ impl<'p> Vm<'p> {
                                     None => break,
                                 },
                             };
+                            native_work = native_work.saturating_add(r.len().max(1) as u64);
+                            self.preflight_native_iteration_work(native_work)?;
                             if self.set_has_live(idx, v) {
                                 // In O → remove it from the result if present.
                                 r.retain(|&x| !self.same_value_zero(x, v));
@@ -2970,7 +3031,13 @@ impl<'p> Vm<'p> {
                     // is the smaller side (and must NOT iterate the other's keys).
                     "intersection" => {
                         let mut r: Vec<Value> = Vec::new();
+                        let mut finder = crate::vm::collections::LocalFinder::new();
                         if this_size <= other_size {
+                            if let Some(items) = &other_real {
+                                self.preflight_native_iteration_work(
+                                    (this_size as u64).saturating_mul(items.len() as u64),
+                                )?;
+                            }
                             // Walk O.[[SetData]] LIVE by index, re-reading its
                             // length each step. `other`'s has() may delete an
                             // element and re-add it, which moves it to the END
@@ -2987,8 +3054,9 @@ impl<'p> Vm<'p> {
                                     continue; // tombstoned (deleted) slot
                                 }
                                 if self.set_rec_has(&other_real, other_has, a0, e)?
-                                    && !mem(&r, e, self)
+                                    && finder.find(&self.heap, &r, e).is_none()
                                 {
+                                    finder.record_push(&self.heap, &r, e);
                                     r.push(e);
                                 }
                             }
@@ -3002,14 +3070,28 @@ impl<'p> Vm<'p> {
                             match it {
                                 None => {
                                     for v in other_real.clone().unwrap_or_default() {
-                                        if self.set_has_live(idx, v) && !mem(&r, v, self) {
+                                        if self.set_has_live(idx, v)
+                                            && finder.find(&self.heap, &r, v).is_none()
+                                        {
+                                            finder.record_push(&self.heap, &r, v);
                                             r.push(v);
                                         }
                                     }
                                 }
                                 Some((kiter, next)) => {
+                                    let mut native_work = 0u64;
                                     while let Some(v) = self.set_rec_step(kiter, next)? {
-                                        if self.set_has_live(idx, v) && !mem(&r, v, self) {
+                                        native_work = native_work.saturating_add(1);
+                                        if let Err(e) =
+                                            self.preflight_native_iteration_work(native_work)
+                                        {
+                                            self.iterator_close_quiet(kiter);
+                                            return Err(e);
+                                        }
+                                        if self.set_has_live(idx, v)
+                                            && finder.find(&self.heap, &r, v).is_none()
+                                        {
+                                            finder.record_push(&self.heap, &r, v);
                                             r.push(v);
                                         }
                                     }
@@ -3021,6 +3103,11 @@ impl<'p> Vm<'p> {
                     "difference" => {
                         let mut r = this_items.clone();
                         if this_size <= other_size {
+                            if let Some(items) = &other_real {
+                                self.preflight_native_iteration_work(
+                                    (this_size as u64).saturating_mul(items.len() as u64),
+                                )?;
+                            }
                             let mut keep: Vec<Value> = Vec::new();
                             for &e in &r {
                                 if !self.set_rec_has(&other_real, other_has, a0, e)? {
@@ -3029,7 +3116,10 @@ impl<'p> Vm<'p> {
                             }
                             r = keep;
                         } else {
+                            let mut native_work = 0u64;
                             for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                                native_work = native_work.saturating_add(r.len().max(1) as u64);
+                                self.preflight_native_iteration_work(native_work)?;
                                 r.retain(|&x| !self.same_value_zero(x, v));
                             }
                         }
@@ -3039,6 +3129,11 @@ impl<'p> Vm<'p> {
                         if this_size > other_size {
                             Value::bool(false)
                         } else {
+                            if let Some(items) = &other_real {
+                                self.preflight_native_iteration_work(
+                                    (this_size as u64).saturating_mul(items.len() as u64),
+                                )?;
+                            }
                             // Iterate `this` LIVE: the argument's has() may delete a
                             // not-yet-visited element, so re-read the Set's length and
                             // current element each step (the spec re-reads thisSize and
@@ -3091,7 +3186,13 @@ impl<'p> Vm<'p> {
                             }
                             let next = self.get_prop(kiter, "next")?;
                             let mut ok = true;
+                            let mut native_work = 0u64;
                             while let Some(v) = self.iterator_step_with(kiter, next)? {
+                                native_work = native_work.saturating_add(1);
+                                if let Err(e) = self.preflight_native_iteration_work(native_work) {
+                                    self.iterator_close_quiet(kiter);
+                                    return Err(e);
+                                }
                                 if !self.set_has_live(idx, v) {
                                     ok = false;
                                     self.iterator_close(kiter)?;
@@ -3105,6 +3206,11 @@ impl<'p> Vm<'p> {
                         // isDisjointFrom
                         let mut disjoint = true;
                         if this_size <= other_size {
+                            if let Some(items) = &other_real {
+                                self.preflight_native_iteration_work(
+                                    (this_size as u64).saturating_mul(items.len() as u64),
+                                )?;
+                            }
                             // Iterate `this` LIVE (has() may delete not-yet-visited
                             // elements — see isDisjointFrom set-like-class-mutation).
                             let mut index = 0usize;
@@ -3140,7 +3246,13 @@ impl<'p> Vm<'p> {
                                 ));
                             }
                             let next = self.get_prop(kiter, "next")?;
+                            let mut native_work = 0u64;
                             while let Some(v) = self.iterator_step_with(kiter, next)? {
+                                native_work = native_work.saturating_add(1);
+                                if let Err(e) = self.preflight_native_iteration_work(native_work) {
+                                    self.iterator_close_quiet(kiter);
+                                    return Err(e);
+                                }
                                 if self.set_has_live(idx, v) {
                                     disjoint = false;
                                     self.iterator_close(kiter)?;
@@ -3194,13 +3306,8 @@ impl<'p> Vm<'p> {
     /// `O.[[SetData]]` itself, not a copy — an `other` whose `has`, `next` or
     /// `value` runs user code can add to or delete from the receiver in
     /// between, and that must be visible.
-    fn set_has_live(&self, set_idx: u32, v: Value) -> bool {
-        match self.heap.get(set_idx) {
-            HeapObj::Set(items) => items
-                .iter()
-                .any(|x| !x.is_hole() && self.same_value_zero(*x, v)),
-            _ => false,
-        }
+    fn set_has_live(&mut self, set_idx: u32, v: Value) -> bool {
+        self.coll_find(set_idx, v).is_some()
     }
 
     /// `GetKeysIterator(otherRec)` on its own: call `keys()`, require an object,
@@ -3267,7 +3374,17 @@ impl<'p> Vm<'p> {
             return Ok(real.clone().unwrap_or_default());
         };
         let mut out = Vec::new();
+        let mut native_work = 0u64;
         while let Some(v) = self.set_rec_step(kiter, next)? {
+            native_work = native_work.saturating_add(1);
+            if let Err(e) = self.preflight_native_iteration_work(native_work) {
+                self.iterator_close_quiet(kiter);
+                return Err(e);
+            }
+            out.try_reserve(1).map_err(|_| {
+                self.iterator_close_quiet(kiter);
+                Thrown("RangeError: set-like iterator allocation failed".into())
+            })?;
             out.push(v);
         }
         Ok(out)

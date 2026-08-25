@@ -30,6 +30,9 @@ use crate::value::Value;
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
 /// than growing unbounded. 100k is far beyond any non-pathological recursion
 /// and the flat register file makes each frame cheap.
+#[cfg(feature = "safe-sandbox")]
+const MAX_FRAMES: usize = 4_096;
+#[cfg(not(feature = "safe-sandbox"))]
 const MAX_FRAMES: usize = 100_000;
 
 /// Hard cap on NESTED `run_loop` entries (native re-entries: builtin
@@ -37,9 +40,30 @@ const MAX_FRAMES: usize = 100_000;
 /// is a Rust frame on the OS stack — unlike interpreter calls, which stay flat
 /// inside one `run_loop` — so runaway recursion routed through a re-entry
 /// (e.g. a generator body that re-enters its driver) must hit this catchable
-/// RangeError before the native stack overflows. Sized with headroom under a
-/// 1 MiB main-thread stack (Windows) at ~200 B/nesting level.
+/// RangeError before the native stack overflows. The safe profile's deliberately
+/// small ceiling was validated on a 1 MiB Windows main-thread stack; the native
+/// footprint of one re-entry varies substantially across builtin call paths.
+#[cfg(feature = "safe-sandbox")]
+// A JavaScript callback reached from a native meta-operation carries a much
+// larger Rust frame than transparent Proxy/prototype forwarding. On the 1 MiB
+// worker stack, allowing a fourth simultaneous `run_loop` entry can overflow
+// before a larger numeric ceiling is observed (nested Proxy get/has traps are a
+// compact reproducer). The outer script itself occupies depth one, so three
+// still preserves two nested observable callback/trap invocations.
+const MAX_RUN_LOOP_DEPTH: u32 = 3;
+#[cfg(not(feature = "safe-sandbox"))]
 const MAX_RUN_LOOP_DEPTH: u32 = 4096;
+
+/// Hard cap on Rust recursion through guest-controlled object meta-operations.
+/// Ordinary JavaScript calls use the VM's explicit frame stack, but transparent
+/// Proxy forwarding and a few exotic/prototype algorithms call their Rust
+/// implementation recursively. A guest can build an arbitrarily deep wrapper
+/// chain before performing one `get`/`has`/`define`/etc.; without a separate
+/// budget that single bytecode instruction can exhaust the native/Wasm stack.
+#[cfg(feature = "safe-sandbox")]
+const MAX_NATIVE_RECURSION_DEPTH: u32 = 32;
+#[cfg(not(feature = "safe-sandbox"))]
+const MAX_NATIVE_RECURSION_DEPTH: u32 = 4096;
 
 /// Hard cap on CONSECUTIVE tail-reuse activations (`try_tail_reuse`) with no
 /// intervening frame pop. Proper tail calls run in O(1) frames, so runaway
@@ -109,7 +133,43 @@ impl TiercActivationState {
 /// instead of OOMing the host. 2^22 elements ≈ 32 MB per array — far larger than
 /// any realistic program needs, while keeping a 12-way-parallel test262 run (each
 /// process possibly building several arrays) comfortably bounded.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 17;
+#[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
+
+/// Maximum materialized string size. The hardened profile keeps a single
+/// allocation small enough that the periodic heap poll cannot overshoot a
+/// host's budget by hundreds of megabytes. Rope length is capped separately in
+/// UTF-16 units; three WTF-8 bytes per unit is its worst-case representation.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_STRING_BYTES: usize = 1 << 20;
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) const MAX_STRING_BYTES: usize = 1 << 28;
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_STRING_UNITS: usize = 1 << 18;
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) const MAX_STRING_UNITS: usize = 1 << 28;
+
+/// Maximum amount of host-side iteration one JavaScript builtin may perform
+/// without returning to the bytecode dispatch loop. The instruction meter can
+/// interrupt JavaScript callbacks, but it cannot see a native loop over holes
+/// or an attacker-controlled array-like `length`; keep those operations
+/// independently bounded in the hostile-code profile.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_NATIVE_ITERATION_WORK: u64 = 1 << 18;
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) const MAX_NATIVE_ITERATION_WORK: u64 = u64::MAX;
+
+/// Maximum owned memory retained by one compiled RegExp program in the
+/// hostile-code profile. Source length alone is not a sufficient bound:
+/// Unicode properties expand into owned interval tables or string-alternative
+/// programs. The regex parser has independent transient-expansion budgets;
+/// this cap covers the immutable program that survives compilation.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_REGEX_PROGRAM_BYTES: usize = 4 << 20;
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) const MAX_REGEX_PROGRAM_BYTES: usize = usize::MAX;
 
 /// Largest length an ITERATION METHOD will materialize eagerly as a dense
 /// result (`Array.prototype.map`). Distinct from `MAX_DENSE_ARRAY_LEN`, which
@@ -119,6 +179,9 @@ pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 /// truncated result. 2^24 elements ≈ 134 MB — the largest array the engine
 /// already builds eagerly — beyond which `map` reports a RangeError instead of
 /// attempting a multi-gigabyte allocation the host cannot satisfy.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_EAGER_ITER_RESULT: usize = 1 << 17;
+#[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_EAGER_ITER_RESULT: usize = 1 << 24;
 
 /// An active `try` handler within a frame.
@@ -837,12 +900,21 @@ pub struct Vm<'p> {
     /// nesting is capped (see MAX_RUN_LOOP_DEPTH) and surfaces as a catchable
     /// RangeError instead.
     run_loop_depth: u32,
+    /// Active Rust recursion edges through guest-controlled Proxy/prototype
+    /// meta-operations. Unlike `run_loop_depth`, this covers transparent native
+    /// forwarding that never re-enters the bytecode loop.
+    native_recursion_depth: u32,
     /// Consecutive `try_tail_reuse` activations since the last frame pop.
     /// Tail reuse grows neither `frames` nor the native stack, so runaway
     /// tail recursion is invisible to both depth guards — this streak counter
     /// is its budget (see MAX_TAIL_REUSE_STREAK). Reset by `pop_frame_with`;
     /// any terminating tail loop pops eventually and starts fresh.
     tail_reuse_streak: u32,
+    /// Heap indices currently being stringified by Array join/toString/
+    /// toLocaleString. A recursive encounter contributes an empty element;
+    /// the bounded stack also prevents acyclic guest graphs from consuming the
+    /// native/WASM stack inside one VM instruction.
+    array_stringify_active: Vec<u32>,
     /// RegExp heap idx → EXACT WTF-8 bytes of its [[OriginalSource]], present
     /// ONLY when the pattern holds lone surrogates (the struct's `source:
     /// String` field is the LOSSY view — U+FFFD per surrogate). The `source`
@@ -859,6 +931,12 @@ pub struct Vm<'p> {
     /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
     regex_compile_cache:
         rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
+    /// Reusable pointer/size pairs for deduplicating shared compiled RegExp
+    /// programs during the periodic resident-memory audit. Regex literals,
+    /// species clones, the compile cache, and inline ASCII twins can all hold
+    /// the same `Arc`; charging it once per reference would reject harmless
+    /// clones while still failing to describe actual resident memory.
+    regex_program_audit_scratch: std::cell::RefCell<Vec<(usize, usize)>>,
     /// Lazy SameValueZero hash index over a Map/Set/WeakMap/WeakSet's backing
     /// Vec, keyed by the collection's heap index (see vm/collections.rs). An
     /// ABSENT entry means linear-scan behavior (always correct); an entry is
@@ -1792,13 +1870,38 @@ pub struct Vm<'p> {
     /// (array iteration, sort, iterate_to_vec, …). `gc_stress` (ZIPP_GC_STRESS)
     /// forces a collection at every safe point to flush out missed roots/edges.
     gc_floor: u32,
+    #[cfg(not(feature = "safe-sandbox"))]
     gc_lock: u32,
+    #[cfg(feature = "safe-sandbox")]
+    gc_lock: std::rc::Rc<std::cell::Cell<u32>>,
     gc_stress: bool,
 }
 
 /// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
 #[derive(Debug)]
 pub struct Thrown(pub String);
+
+impl<'p> Vm<'p> {
+    /// Execute one guest-controlled native recursion edge under the shared
+    /// stack budget. Keeping the increment/decrement in this closure wrapper is
+    /// deliberate: both `Ok` and ordinary abrupt completion (`Err`) restore the
+    /// counter before control returns to JavaScript, so a caught RangeError does
+    /// not poison later operations in the same VM.
+    pub(crate) fn with_native_recursion_guard<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Thrown>,
+    ) -> Result<T, Thrown> {
+        if self.native_recursion_depth >= MAX_NATIVE_RECURSION_DEPTH {
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
+        }
+        self.native_recursion_depth += 1;
+        let result = f(self);
+        self.native_recursion_depth -= 1;
+        result
+    }
+}
 
 // submodules (split from the former monolithic vm.rs)
 mod access;

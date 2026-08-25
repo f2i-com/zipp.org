@@ -29,7 +29,7 @@ impl<'p> Vm<'p> {
             // No trap: forward to the target's [[GetOwnProperty]] — which, when the
             // target is itself a Proxy, must recurse through ITS trap/target rather
             // than falling to the ordinary path (which ignores proxies).
-            None => match self.proxy_gopd(target, key)? {
+            None => match self.with_native_recursion_guard(|vm| vm.proxy_gopd(target, key))? {
                 Some(d) => Ok(Some(d)),
                 None => Ok(Some(self.object_get_own_property_descriptor(target, key))),
             },
@@ -52,10 +52,11 @@ impl<'p> Vm<'p> {
                 // TypedArray, a callable, an exotic — answers from the ordinary
                 // path. Reading only `HeapObj::Object`'s map (as this did) meant an
                 // exotic target skipped EVERY invariant below.
-                let target_desc = match self.proxy_gopd(target, key)? {
-                    Some(d) => d,
-                    None => self.object_get_own_property_descriptor(target, key),
-                };
+                let target_desc =
+                    match self.with_native_recursion_guard(|vm| vm.proxy_gopd(target, key))? {
+                        Some(d) => d,
+                        None => self.object_get_own_property_descriptor(target, key),
+                    };
                 let t_own = !target_desc.is_undefined();
                 let t_cfg = t_own && {
                     let v = self.get_prop(target_desc, "configurable")?;
@@ -583,6 +584,7 @@ impl<'p> Vm<'p> {
                 // prototype), then any named own props in the arr_props side table.
                 HeapObj::TypedArray { .. } => {
                     let len = self.ta_len_kind(idx).0;
+                    self.preflight_native_iteration_work(len as u64)?;
                     for i in 0..len {
                         keys.push(i.to_string());
                     }
@@ -920,24 +922,31 @@ impl<'p> Vm<'p> {
         Some(main)
     }
 
-    pub(crate) fn object_get_prototype_of(&mut self, obj: Value) -> Value {
-        if !obj.is_heap() {
-            return Value::NULL;
-        }
-        let idx = obj.heap_index();
-        // Proxy `getPrototypeOf` trap (errors degrade to null — this signature is
-        // infallible; the throwing path is rare and used internally by instanceof).
-        if let Some((target, handler, revoked)) = self.proxy_parts(idx) {
-            if revoked {
+    pub(crate) fn object_get_prototype_of(&mut self, mut obj: Value) -> Value {
+        // This internal signature deliberately degrades Proxy trap failures to
+        // null, so it cannot report the shared recursion RangeError. Transparently
+        // forwarding through a trap-less Proxy chain is therefore iterative.
+        let idx = loop {
+            if !obj.is_heap() {
                 return Value::NULL;
             }
-            if let Ok(Some(trap)) = self.proxy_trap(handler, "getPrototypeOf") {
-                return self
-                    .call_value(trap, handler, &[target])
-                    .unwrap_or(Value::NULL);
+            let idx = obj.heap_index();
+            // Proxy `getPrototypeOf` trap (errors degrade to null — this signature is
+            // infallible; the throwing path is rare and used internally by instanceof).
+            if let Some((target, handler, revoked)) = self.proxy_parts(idx) {
+                if revoked {
+                    return Value::NULL;
+                }
+                if let Ok(Some(trap)) = self.proxy_trap(handler, "getPrototypeOf") {
+                    return self
+                        .call_value(trap, handler, &[target])
+                        .unwrap_or(Value::NULL);
+                }
+                obj = target;
+                continue;
             }
-            return self.object_get_prototype_of(target);
-        }
+            break idx;
+        };
         if let Some(&p) = self.proto_of.get(&idx) {
             return p;
         }
@@ -1133,7 +1142,10 @@ impl<'p> Vm<'p> {
                 }
                 let trap = match self.proxy_trap(handler, "getPrototypeOf")? {
                     Some(t) => t,
-                    None => return self.get_prototype_of_checked(target),
+                    None => {
+                        return self
+                            .with_native_recursion_guard(|vm| vm.get_prototype_of_checked(target))
+                    }
                 };
                 let handler_proto = self.call_value(trap, handler, &[target])?;
                 if handler_proto != Value::NULL && !self.is_object_value(handler_proto) {
@@ -1160,7 +1172,8 @@ impl<'p> Vm<'p> {
                     // the target (it returns null), so a nested proxy target whose
                     // own trap throws reported "no exception" and, worse, compared
                     // against a bogus null (staging/sm/Proxy/getPrototypeOf.js).
-                    let target_proto = self.get_prototype_of_checked(target)?;
+                    let target_proto =
+                        self.with_native_recursion_guard(|vm| vm.get_prototype_of_checked(target))?;
                     if !self.same_value(handler_proto, target_proto) {
                         return Err(Thrown(
                             "TypeError: proxy 'getPrototypeOf' must return the target's prototype when the target is not extensible"

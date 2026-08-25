@@ -40,12 +40,36 @@ impl<'p> Vm<'p> {
     /// `Intl.Collator(locales, options).compare(this, that)` — so the two agree
     /// by construction rather than by two copies of the same approximation
     /// (`localeCompare/returns-same-results-as-Collator.js`).
-    pub(crate) fn collator_compare(&self, resolved: u32, a: &str, b: &str) -> f64 {
+    pub(crate) fn collator_compare(
+        &mut self,
+        resolved: u32,
+        a: &str,
+        b: &str,
+    ) -> Result<f64, Thrown> {
+        let work = a
+            .len()
+            .checked_add(b.len())
+            .ok_or_else(|| Thrown("RangeError: native builtin iteration limit exceeded".into()))?;
+        self.preflight_native_iteration_work(work as u64)?;
         let ignore_punct = self.intl_slot(resolved, "ignorePunctuation") == Value::bool(true);
         let sens = self.display(self.intl_slot(resolved, "sensitivity"));
         let upper_first = self.display(self.intl_slot(resolved, "caseFirst")) == "upper";
-        let key = |s: &str| collation_key(s, ignore_punct);
-        let (ka, kb) = (key(a), key(b));
+        let a_lengths = collation_key_lengths(a, ignore_punct)?;
+        let b_lengths = collation_key_lengths(b, ignore_punct)?;
+        let key_bytes = a_lengths
+            .0
+            .checked_add(a_lengths.1)
+            .and_then(|n| n.checked_add(a_lengths.2))
+            .and_then(|n| n.checked_add(b_lengths.0))
+            .and_then(|n| n.checked_add(b_lengths.1))
+            .and_then(|n| n.checked_add(b_lengths.2))
+            .filter(|&n| n <= MAX_STRING_BYTES)
+            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+        self.preflight_guest_string_size(key_bytes)?;
+        let (ka, kb) = (
+            collation_key(a, ignore_punct, a_lengths)?,
+            collation_key(b, ignore_punct, b_lengths)?,
+        );
         let ord = match ka.0.cmp(&kb.0) {
             std::cmp::Ordering::Equal => {
                 // Secondary (accents) is skipped by "base" and "case"; tertiary
@@ -70,11 +94,11 @@ impl<'p> Vm<'p> {
             }
             other => other,
         };
-        match ord {
+        Ok(match ord {
             std::cmp::Ordering::Less => -1.0,
             std::cmp::Ordering::Greater => 1.0,
             std::cmp::Ordering::Equal => 0.0,
-        }
+        })
     }
 }
 
@@ -97,11 +121,55 @@ pub(crate) fn is_variable_collation_char(c: char) -> bool {
 /// The case level records one flag per BASE character rather than per scalar of
 /// the lowercased primary, because a full case mapping can change length
 /// (U+0130 lowercases to two scalars) and the two levels must stay independent.
-fn collation_key(s: &str, ignore_punct: bool) -> (String, String, Vec<u8>) {
+fn collation_key_lengths(s: &str, ignore_punct: bool) -> Result<(usize, usize, usize), Thrown> {
     use unicode_normalization::UnicodeNormalization;
-    let mut primary = String::with_capacity(s.len());
+    let mut primary = 0usize;
+    let mut secondary = 0usize;
+    let mut case = 0usize;
+    for c in s.nfd() {
+        if ignore_punct && is_variable_collation_char(c) {
+            continue;
+        }
+        if unicode_normalization::char::is_combining_mark(c) {
+            secondary = secondary
+                .checked_add(c.len_utf8())
+                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            continue;
+        }
+        for mapped in c.to_lowercase() {
+            primary = primary
+                .checked_add(mapped.len_utf8())
+                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+        }
+        case = case
+            .checked_add(1)
+            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+    }
+    primary
+        .checked_add(secondary)
+        .and_then(|n| n.checked_add(case))
+        .filter(|&n| n <= MAX_STRING_BYTES)
+        .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+    Ok((primary, secondary, case))
+}
+
+fn collation_key(
+    s: &str,
+    ignore_punct: bool,
+    lengths: (usize, usize, usize),
+) -> Result<(String, String, Vec<u8>), Thrown> {
+    use unicode_normalization::UnicodeNormalization;
+    let mut primary = String::new();
+    primary
+        .try_reserve_exact(lengths.0)
+        .map_err(|_| Thrown("RangeError: collation allocation failed".into()))?;
     let mut secondary = String::new();
+    secondary
+        .try_reserve_exact(lengths.1)
+        .map_err(|_| Thrown("RangeError: collation allocation failed".into()))?;
     let mut case = Vec::new();
+    case.try_reserve_exact(lengths.2)
+        .map_err(|_| Thrown("RangeError: collation allocation failed".into()))?;
     for c in s.nfd() {
         if ignore_punct && is_variable_collation_char(c) {
             continue;
@@ -113,5 +181,8 @@ fn collation_key(s: &str, ignore_punct: bool) -> (String, String, Vec<u8>) {
         primary.extend(c.to_lowercase());
         case.push(u8::from(c.is_uppercase()));
     }
-    (primary, secondary, case)
+    debug_assert_eq!(primary.len(), lengths.0);
+    debug_assert_eq!(secondary.len(), lengths.1);
+    debug_assert_eq!(case.len(), lengths.2);
+    Ok((primary, secondary, case))
 }

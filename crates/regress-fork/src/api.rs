@@ -457,6 +457,22 @@ impl From<CompiledRegex> for Regex {
 }
 
 impl Regex {
+    /// Approximate bytes retained by this compiled regular expression.
+    ///
+    /// This is capacity-based and includes nested instruction, character-set,
+    /// group-name, start-predicate, and enabled lazy execution-tier allocations.
+    /// It deliberately excludes transient parse/optimisation storage, which has
+    /// been dropped by the time this method can be called.
+    pub fn resident_bytes(&self) -> usize {
+        let bytes = core::mem::size_of::<Self>().saturating_add(self.cr.resident_bytes());
+        #[cfg(feature = "linear-ascii")]
+        let bytes = bytes.saturating_add(crate::linear::resident_bytes(
+            &self.linear_candidate,
+            &self.linear_ascii,
+        ));
+        bytes
+    }
+
     /// Construct a regex by parsing `pattern` using the default flags.
     /// An Error may be returned if the syntax is invalid.
     /// Note that this is rather expensive; prefer to cache a Regex which is

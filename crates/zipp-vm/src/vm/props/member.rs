@@ -114,7 +114,9 @@ impl<'p> Vm<'p> {
             // the chain to the ordinary member path, which runs the trap with the
             // original receiver.
             if matches!(self.heap.get(cur), HeapObj::Proxy { .. }) {
-                return self.get_member(Value::heap(cur), key, receiver);
+                return self.with_native_recursion_guard(|vm| {
+                    vm.get_member(Value::heap(cur), key, receiver)
+                });
             }
             if let Some((attr, raw)) = self.own_member(cur, key) {
                 return if attr.accessor {
@@ -906,7 +908,9 @@ impl<'p> Vm<'p> {
                         }
                         Ok(r)
                     }
-                    None => self.get_member(target, key, receiver),
+                    None => {
+                        self.with_native_recursion_guard(|vm| vm.get_member(target, key, receiver))
+                    }
                 };
             }
             // Module Namespace exotic [[Get]]: an exported name reads its LIVE
@@ -1131,7 +1135,7 @@ impl<'p> Vm<'p> {
                     HeapObj::RegExp { source, .. } => Some(source.clone()),
                     _ => None,
                 };
-                return Ok(self.regexp_source_value(obj.heap_index(), src.as_deref().unwrap_or("")));
+                return self.regexp_source_value(obj.heap_index(), src.as_deref().unwrap_or(""));
             }
             // Accessor-aware: an `exec`/`test`/… turned into a getter on
             // %RegExp.prototype% (staging/sm/String/matchAll.js) is INVOKED with
@@ -1236,7 +1240,7 @@ impl<'p> Vm<'p> {
                 // an Array, another TypedArray, or a Proxy rather than an
                 // ordinary ObjMap.
                 return if proto.is_heap() {
-                    self.get_member(proto, key, receiver)
+                    self.with_native_recursion_guard(|vm| vm.get_member(proto, key, receiver))
                 } else {
                     Ok(Value::UNDEFINED)
                 };
@@ -1682,7 +1686,9 @@ impl<'p> Vm<'p> {
                         // proto_of (chains to Array.prototype); else the default arr_proto.
                         let eff = self.array_eff_proto(obj.heap_index());
                         if eff != 0 {
-                            self.get_member(Value::heap(eff), key, receiver)
+                            self.with_native_recursion_guard(|vm| {
+                                vm.get_member(Value::heap(eff), key, receiver)
+                            })
                         } else {
                             Ok(Value::UNDEFINED)
                         }
@@ -1780,7 +1786,9 @@ impl<'p> Vm<'p> {
                     None
                 };
                 match proto {
-                    Some(p) => self.get_member(p, key, receiver),
+                    Some(p) => {
+                        self.with_native_recursion_guard(|vm| vm.get_member(p, key, receiver))
+                    }
                     None => Ok(Value::UNDEFINED),
                 }
             }
@@ -1817,7 +1825,9 @@ impl<'p> Vm<'p> {
                 // parent (a built-in constructor or plain function, so
                 // `class X extends Temporal.Y {}` inherits `Y.from`).
                 if let Some(pidx) = c.parent {
-                    return self.get_member(Value::heap(pidx), key, receiver);
+                    return self.with_native_recursion_guard(|vm| {
+                        vm.get_member(Value::heap(pidx), key, receiver)
+                    });
                 }
                 // A class is a function: keys not found as a static fall back to
                 // Function.prototype (so `C.toString()` → the class source via

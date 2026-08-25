@@ -199,9 +199,12 @@ impl<'p> Vm<'p> {
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,
             run_loop_depth: 0,
+            native_recursion_depth: 0,
             tail_reuse_streak: 0,
+            array_stringify_active: Vec::new(),
             regexp_exact_source: std::collections::HashMap::new(),
             regex_compile_cache: rustc_hash::FxHashMap::default(),
+            regex_program_audit_scratch: std::cell::RefCell::new(Vec::new()),
             collection_index: rustc_hash::FxHashMap::default(),
             next_private_brand: 1,
             method_brand: std::collections::HashMap::new(),
@@ -441,7 +444,10 @@ impl<'p> Vm<'p> {
             // 0 until set_gc_floor() runs after setup; until then nothing is
             // collectable, so an early GC (if any) is a no-op.
             gc_floor: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
             gc_lock: 0,
+            #[cfg(feature = "safe-sandbox")]
+            gc_lock: std::rc::Rc::new(std::cell::Cell::new(0)),
             gc_stress: std::env::var_os("ZIPP_GC_STRESS").is_some(),
         }
     }
@@ -466,9 +472,249 @@ impl<'p> Vm<'p> {
         self.jit_enabled
     }
 
-    /// Approximate resident heap in bytes — see `embed::ScriptState::heap_bytes`.
+    fn vm_core_resident_bytes(&self) -> usize {
+        self.regs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(
+                self.frames
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Frame>()),
+            )
+            .saturating_add(
+                self.globals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.eval_funcs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<&crate::bytecode::FuncProto>()),
+            )
+            .saturating_add(
+                self.eval_classes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<&crate::bytecode::ClassDef>()),
+            )
+            .saturating_add(
+                self.class_values
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Option<Value>>()),
+            )
+            .saturating_add(
+                self.microtasks
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Microtask>()),
+            )
+            .saturating_add(
+                self.pending_yield_handlers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Handler>()),
+            )
+            .saturating_add(
+                self.async_activations
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.global_gens
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.array_stringify_active
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(
+                self.module_func_ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u32, u32, u32)>()),
+            )
+            .saturating_add(
+                self.link_pending_deps
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.timer_queue
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(clock::Instant, Value)>()),
+            )
+            .saturating_add(self.idx_key_scratch.capacity())
+            .saturating_add(
+                self.regex_program_audit_scratch
+                    .borrow()
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+            )
+            .saturating_add(self.sloppy_eval_memo.capacity())
+    }
+
+    /// Conservative bytes reserved by a hash table's bucket allocation.
+    ///
+    /// `HashMap::capacity` intentionally hides its raw bucket/control layout.
+    /// Two entry widths per reported slot is the same stable, conservative
+    /// approximation used by `ObjMap`'s numeric index: it covers load-factor
+    /// slack and control bytes without depending on libstd/hashbrown internals.
+    #[inline]
+    fn hash_map_resident_bytes<K, V, S>(map: &std::collections::HashMap<K, V, S>) -> usize {
+        map.capacity()
+            .saturating_mul(std::mem::size_of::<(K, V)>().saturating_mul(2))
+    }
+
+    #[inline]
+    fn hash_set_resident_bytes<T, S>(set: &std::collections::HashSet<T, S>) -> usize {
+        set.capacity()
+            .saturating_mul(std::mem::size_of::<T>().saturating_mul(2))
+    }
+
+    /// Reserved allocations in the private-element side tables.  These are
+    /// especially important for a sandbox: every instance clones every field
+    /// name, so one long source identifier can otherwise amplify into an
+    /// unmetered allocation per constructed object.
+    fn private_side_table_resident_bytes(&self) -> usize {
+        let mut n = Self::hash_map_resident_bytes(&self.private_fields)
+            .saturating_add(Self::hash_map_resident_bytes(&self.method_brand))
+            .saturating_add(Self::hash_map_resident_bytes(&self.instance_brand))
+            .saturating_add(Self::hash_map_resident_bytes(&self.brand_private_names))
+            .saturating_add(Self::hash_map_resident_bytes(&self.brand_owner));
+
+        for fields in self.private_fields.values() {
+            n = n.saturating_add(Self::hash_map_resident_bytes(fields));
+            n = fields
+                .keys()
+                .fold(n, |n, (_, name)| n.saturating_add(name.capacity()));
+        }
+        for brands in self.method_brand.values() {
+            n = n.saturating_add(brands.capacity().saturating_mul(std::mem::size_of::<u64>()));
+        }
+        for brands in self.instance_brand.values() {
+            n = n.saturating_add(brands.capacity().saturating_mul(std::mem::size_of::<u64>()));
+        }
+        for names in self.brand_private_names.values() {
+            n = n.saturating_add(
+                names
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(String, u8)>()),
+            );
+            n = names
+                .iter()
+                .fold(n, |n, (name, _)| n.saturating_add(name.capacity()));
+        }
+        n
+    }
+
+    /// Reserved allocations in the lazy Map/Set SameValueZero indexes.  The
+    /// backing keys/values remain charged on their heap objects; this covers
+    /// only the VM-owned hash directory and each index's flat bucket Vec.
+    fn collection_index_resident_bytes(&self) -> usize {
+        self.collection_index.values().fold(
+            Self::hash_map_resident_bytes(&self.collection_index),
+            |n, index| n.saturating_add(index.resident_bytes()),
+        )
+    }
+
+    /// Bytes retained by unique compiled RegExp programs reachable from heap
+    /// objects (including ASCII twins) or the compile cache. `Arc` identities
+    /// are sorted and deduplicated so species clones and cache references are
+    /// charged once, matching the allocator rather than the JS object count.
+    fn regex_program_resident_bytes(&self) -> usize {
+        let mut programs = self.regex_program_audit_scratch.borrow_mut();
+        programs.clear();
+        self.heap.visit_regexp_programs(|program| {
+            programs.push((
+                std::sync::Arc::as_ptr(program) as usize,
+                program.resident_bytes(),
+            ));
+        });
+        for program in self.regex_compile_cache.values() {
+            programs.push((
+                std::sync::Arc::as_ptr(program) as usize,
+                program.resident_bytes(),
+            ));
+        }
+        programs.sort_unstable_by_key(|&(identity, _)| identity);
+        programs.dedup_by_key(|entry| entry.0);
+        programs.iter().fold(0usize, |bytes, &(_, program_bytes)| {
+            bytes.saturating_add(program_bytes)
+        })
+    }
+
+    /// Reconcile capacity growth within existing heap objects and side tables.
+    /// This is also the public resident-byte figure: reporting and enforcement
+    /// must not disagree about allocations that only the periodic audit sees.
+    pub(crate) fn audit_heap_bytes(&self) -> usize {
+        // Grow/reuse the RegExp audit scratch first so vm_core_resident_bytes
+        // below includes its current capacity in this same audit.
+        let regex_program_bytes = self.regex_program_resident_bytes();
+        let mut n = self
+            .heap
+            .audit_resident_bytes()
+            .saturating_add(self.vm_core_resident_bytes())
+            .saturating_add(self.private_side_table_resident_bytes())
+            .saturating_add(self.collection_index_resident_bytes())
+            .saturating_add(regex_program_bytes);
+        n = self.frames.iter().fold(n, |n, frame| {
+            n.saturating_add(
+                frame
+                    .handlers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Handler>()),
+            )
+        });
+        if let Some((_, _, handlers)) = &self.pending_await {
+            n = n.saturating_add(
+                handlers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Handler>()),
+            );
+        }
+        for table in [&self.fn_props, &self.arr_props] {
+            n = n.saturating_add(table.resident_bytes());
+            n = table
+                .values()
+                .fold(n, |n, map| n.saturating_add(map.resident_bytes()));
+        }
+        n = n
+            .saturating_add(self.proto_of.resident_bytes())
+            .saturating_add(self.regexp_result_props.resident_bytes())
+            .saturating_add(self.array_js_len.resident_bytes())
+            .saturating_add(self.arguments_objs.resident_bytes());
+        n = self.regexp_exact_source.values().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.regexp_exact_source)),
+            |n, bytes| n.saturating_add(bytes.capacity()),
+        );
+        n = self.regex_compile_cache.keys().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.regex_compile_cache)),
+            |n, (source, flags, _)| {
+                n.saturating_add(source.capacity())
+                    .saturating_add(flags.capacity())
+            },
+        );
+        n = self.eval_global_map.keys().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.eval_global_map)),
+            |n, key| n.saturating_add(key.capacity()),
+        );
+        n = self.deleted_globals.iter().fold(
+            n.saturating_add(Self::hash_set_resident_bytes(&self.deleted_globals)),
+            |n, key| n.saturating_add(key.capacity()),
+        );
+        n = self.symbol_registry.keys().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.symbol_registry)),
+            |n, key| n.saturating_add(key.capacity()),
+        );
+        self.symbol_keys.keys().fold(
+            n.saturating_add(Self::hash_map_resident_bytes(&self.symbol_keys)),
+            |n, key| n.saturating_add(key.capacity()),
+        )
+    }
+
+    /// Payload-aware resident VM estimate — see `embed::ScriptState::heap_bytes`.
+    /// Kept as a named entry point for cheap call-site readability; the audit
+    /// itself takes `&self` and is the single source of truth.
     pub(crate) fn heap_bytes(&self) -> usize {
-        self.heap.len() * std::mem::size_of::<crate::heap::HeapObj>()
+        self.audit_heap_bytes()
     }
 
     /// Force the JIT on/off (overrides the `ZIPP_NOJIT` default). Used by the

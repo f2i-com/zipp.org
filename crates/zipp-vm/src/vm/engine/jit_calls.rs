@@ -76,7 +76,7 @@ impl<'p> Vm<'p> {
         let proto = self.func(expected_fid as usize);
         let callee_regs = (proto.reg_count as usize).max(1);
         let needed = self.regs.len().checked_add(callee_regs)?;
-        if self.regs_would_overflow(needed)
+        if (self.reg_capacity != 0 && needed > self.reg_capacity)
             || self.current_realm_id().is_some()
             || self.get_function_realm(callee) != 0
             || self.closure_eval_scope.contains_key(&callee.heap_index())

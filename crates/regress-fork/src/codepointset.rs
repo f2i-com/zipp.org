@@ -112,6 +112,17 @@ impl CodePointSet {
         CodePointSet { ivs: Vec::new() }
     }
 
+    /// Bytes reserved by this set's owned interval storage.
+    ///
+    /// This is intentionally capacity-based: optimising or intersecting a
+    /// character class may shorten the logical set without returning its
+    /// allocation to the host allocator.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.ivs
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Interval>())
+    }
+
     pub(crate) fn clear(&mut self) {
         self.ivs.clear();
     }

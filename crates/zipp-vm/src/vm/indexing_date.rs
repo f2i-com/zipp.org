@@ -257,7 +257,7 @@ impl<'p> Vm<'p> {
                         None => Value::NULL,
                     };
                     if proto.is_heap() {
-                        return self.get_member(proto, k, obj);
+                        return self.with_native_recursion_guard(|vm| vm.get_member(proto, k, obj));
                     }
                     return Ok(Value::UNDEFINED);
                 }
@@ -877,6 +877,9 @@ impl<'p> Vm<'p> {
         buf.push_str(&self.func(func_id as usize).string_constants[name as usize]);
         let (digits, start) = crate::vm::coerce::fmt_i32_buf(key);
         // SAFETY: fmt_i32_buf yields only ASCII '-' and '0'..='9'.
+        #[cfg(feature = "safe-sandbox")]
+        buf.push_str(std::str::from_utf8(&digits[start..]).expect("decimal digits are ASCII"));
+        #[cfg(not(feature = "safe-sandbox"))]
         buf.push_str(unsafe { std::str::from_utf8_unchecked(&digits[start..]) });
     }
 

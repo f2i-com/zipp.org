@@ -64,6 +64,21 @@ impl From<LexError> for SyntaxError {
 
 pub type PResult<T> = Result<T, SyntaxError>;
 
+/// Recursive-descent work is deliberately capped in the hardened build.  A
+/// JavaScript source file is data supplied by the guest; letting its grammar
+/// nesting map one-for-one onto the native (or WebAssembly) call stack turns a
+/// syntax error into a process abort.  This is a parser-stack limit, not the VM
+/// call-stack limit used while executing JavaScript.
+#[cfg(feature = "safe-sandbox")]
+const MAX_SAFE_SYNTAX_RECURSION: usize = 48;
+
+/// Left-associated operator/member chains are built iteratively by the parser,
+/// but produce a recursively-shaped AST consumed by the compiler and capture
+/// analysis.  Bound each individual grammar tier before constructing a tree
+/// deep enough to overflow those later walks.
+#[cfg(feature = "safe-sandbox")]
+const MAX_SAFE_SYNTAX_CHAIN: usize = 16;
+
 /// Grammar parameters — the `[Yield]`, `[Await]`, `[In]`, `[Return]` subscripts
 /// the spec threads through its productions, plus strictness.
 ///
@@ -477,6 +492,11 @@ pub struct Parser<'s> {
     /// it (`export @dec class C {}`), waiting for the ClassDeclaration it
     /// belongs to: `(offset of the first `@`, the list)`.
     pub(crate) pending_class_decorators: Option<(u32, Vec<super::ast::Expr>)>,
+    /// Number of active recursive grammar entry points.  Present only in the
+    /// hardened profile so ordinary/conformance builds retain their historical
+    /// grammar acceptance.
+    #[cfg(feature = "safe-sandbox")]
+    syntax_recursion: usize,
 }
 
 impl<'s> Parser<'s> {
@@ -525,7 +545,53 @@ impl<'s> Parser<'s> {
             pending_export_locals: Vec::new(),
             accessor_seq: 0,
             pending_class_decorators: None,
+            #[cfg(feature = "safe-sandbox")]
+            syntax_recursion: 0,
         })
+    }
+
+    /// Run one recursion-bearing grammar production under the hardened
+    /// parser-stack budget.  The closure form is important: decrementing after
+    /// it returns also covers every `?`/early-error path without an unsafe raw
+    /// pointer or a guard that keeps `self` borrowed.
+    pub(crate) fn with_syntax_recursion<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> PResult<T>,
+    ) -> PResult<T> {
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            return f(self);
+        }
+
+        #[cfg(feature = "safe-sandbox")]
+        {
+            if self.syntax_recursion >= MAX_SAFE_SYNTAX_RECURSION {
+                return Err(SyntaxError::new(
+                    "SyntaxError: source nesting exceeds the sandbox limit",
+                    self.cur().span.start,
+                ));
+            }
+            self.syntax_recursion += 1;
+            let result = f(self);
+            self.syntax_recursion -= 1;
+            result
+        }
+    }
+
+    /// Reject an iterative grammar chain before it becomes a deeply recursive
+    /// AST.  `links` is the number of suffix/operator links already accepted at
+    /// the current grammar tier.
+    pub(crate) fn check_syntax_chain(&self, links: usize) -> PResult<()> {
+        #[cfg(feature = "safe-sandbox")]
+        if links >= MAX_SAFE_SYNTAX_CHAIN {
+            return Err(SyntaxError::new(
+                "SyntaxError: source expression nesting exceeds the sandbox limit",
+                self.cur().span.start,
+            ));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        let _ = links;
+        Ok(())
     }
 
     // ---- token plumbing ----------------------------------------------------

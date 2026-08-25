@@ -10,19 +10,21 @@ use core::slice::SliceIndex;
 // A macro which expresses either checked or unchecked reachability, depending on prohibit-unsafe.
 macro_rules! rs_unreachable {
     () => {{
-        if cfg!(feature = "prohibit-unsafe") {
-            unreachable!();
-        } else {
-            unsafe { core::hint::unreachable_unchecked() }
+        #[cfg(feature = "prohibit-unsafe")]
+        unreachable!();
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        unsafe {
+            core::hint::unreachable_unchecked()
         }
     }};
-    ($msg:expr) => {
-        if cfg!(feature = "prohibit-unsafe") {
-            unreachable!($msg);
-        } else {
-            unsafe { core::hint::unreachable_unchecked() }
+    ($msg:expr) => {{
+        #[cfg(feature = "prohibit-unsafe")]
+        unreachable!($msg);
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        unsafe {
+            core::hint::unreachable_unchecked()
         }
-    };
+    }};
 }
 
 /// A trait which performs bounds checking only in debug mode.
@@ -38,21 +40,19 @@ where
     #[inline(always)]
     fn iat(&self, idx: Idx) -> &Self::Output {
         debug_assert!(self.get(idx.clone()).is_some(), "Index out of bounds");
-        if cfg!(feature = "prohibit-unsafe") {
-            self.index(idx)
-        } else {
-            unsafe { self.get_unchecked(idx) }
-        }
+        #[cfg(feature = "prohibit-unsafe")]
+        return self.index(idx);
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        return unsafe { self.get_unchecked(idx) };
     }
 
     #[inline(always)]
     fn mat(&mut self, idx: Idx) -> &mut Self::Output {
         debug_assert!(self.get(idx.clone()).is_some(), "Index out of bounds");
-        if cfg!(feature = "prohibit-unsafe") {
-            self.index_mut(idx)
-        } else {
-            unsafe { self.get_unchecked_mut(idx) }
-        }
+        #[cfg(feature = "prohibit-unsafe")]
+        return self.index_mut(idx);
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        return unsafe { self.get_unchecked_mut(idx) };
     }
 }
 
@@ -63,21 +63,19 @@ where
     #[inline(always)]
     fn iat(&self, idx: Idx) -> &Self::Output {
         debug_assert!(self.get(idx.clone()).is_some(), "Index out of bounds");
-        if cfg!(feature = "prohibit-unsafe") {
-            self.index(idx)
-        } else {
-            unsafe { self.get_unchecked(idx) }
-        }
+        #[cfg(feature = "prohibit-unsafe")]
+        return self.index(idx);
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        return unsafe { self.get_unchecked(idx) };
     }
 
     #[inline(always)]
     fn mat(&mut self, idx: Idx) -> &mut Self::Output {
         debug_assert!(self.get(idx.clone()).is_some(), "Index out of bounds");
-        if cfg!(feature = "prohibit-unsafe") {
-            self.index_mut(idx)
-        } else {
-            unsafe { self.get_unchecked_mut(idx) }
-        }
+        #[cfg(feature = "prohibit-unsafe")]
+        return self.index_mut(idx);
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        return unsafe { self.get_unchecked_mut(idx) };
     }
 }
 

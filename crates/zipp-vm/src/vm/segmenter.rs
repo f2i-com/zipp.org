@@ -44,6 +44,13 @@
 
 use crate::heap::char_units;
 
+/// Conservative work for one boundary query. The current implementation
+/// validates/counts units, materializes scalar values, walks them to derive all
+/// boundaries, and (for word segments) may walk again for `isWordLike`.
+pub(crate) fn segment_work_bound(byte_len: usize) -> u64 {
+    (byte_len as u64).saturating_mul(8)
+}
+
 fn is_mark(c: char) -> bool {
     unicode_normalization::char::is_combining_mark(c)
 }

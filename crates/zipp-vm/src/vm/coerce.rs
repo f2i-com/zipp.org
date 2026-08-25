@@ -6,6 +6,7 @@ use crate::heap::{
     PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
+use std::fmt::Write as _;
 
 /// Largest combined length (UTF-16 units) that `a + b` builds as an immediate
 /// FLAT string instead of a rope node. A small rope costs MORE than the copy:
@@ -141,6 +142,19 @@ fn markdown_push_escaped_ascii(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 impl<'p> Vm<'p> {
+    /// Preflight a loop that runs entirely inside one VM instruction. Such work
+    /// is invisible to the ordinary bytecode step meter, so array-like lengths
+    /// and similar guest-controlled counts need a separate safe-profile bound.
+    pub(crate) fn preflight_native_iteration_work(&self, count: u64) -> Result<(), Thrown> {
+        if count > MAX_NATIVE_ITERATION_WORK {
+            Err(Thrown(
+                "RangeError: native builtin iteration limit exceeded".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Sandboxed VMs retain the historical exact-capacity builder. The public
     /// heap ceiling intentionally counts HeapObj slots, not payload buffers;
     /// applying this reserve there would therefore add up to 31 uncharged
@@ -504,6 +518,183 @@ pub(crate) fn pad2_conditional_stats() -> (u64, u64) {
     pad2stats::cond_dump()
 }
 
+/// Console inspection is a diagnostic surface, not a second serializer. Keep
+/// it small and total even when the value graph is cyclic or deliberately much
+/// larger than the configured output budget. The byte limit is per argument;
+/// the recorder still applies the lower aggregate stdout/stderr limit to the
+/// completed line.
+const INSPECT_MAX_DEPTH: usize = 16;
+const INSPECT_MAX_NODES: usize = 1_024;
+const INSPECT_MAX_BYTES: usize = 64 * 1024;
+const INSPECT_TRUNCATION_MARKER: &str = "...";
+
+/// `display` is used by a number of read-only coercion and diagnostic paths.
+/// It cannot be allowed to recursively allocate one `String` per array element:
+/// an array containing many aliases to the same large string would amplify a
+/// small guest heap into gigabytes of transient host allocations. Keep one
+/// fallible output buffer, cap graph recursion/work, and detect active cycles.
+const DISPLAY_MAX_DEPTH: usize = 64;
+#[cfg(feature = "safe-sandbox")]
+const DISPLAY_MAX_NODES: usize = 1 << 19;
+#[cfg(not(feature = "safe-sandbox"))]
+const DISPLAY_MAX_NODES: usize = 1 << 24;
+const DISPLAY_LIMIT_MARKER: &str = "<string coercion exceeded sandbox limits>";
+
+struct DisplayBuffer {
+    out: String,
+    active: Vec<u32>,
+    nodes: usize,
+    failed: bool,
+}
+
+impl DisplayBuffer {
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            active: Vec::new(),
+            nodes: 0,
+            failed: false,
+        }
+    }
+
+    fn consume_node(&mut self) -> bool {
+        if self.failed || self.nodes >= DISPLAY_MAX_NODES {
+            self.failed = true;
+            return false;
+        }
+        self.nodes += 1;
+        true
+    }
+
+    fn push_str(&mut self, text: &str) -> bool {
+        if self.failed {
+            return false;
+        }
+        let Some(total) = self.out.len().checked_add(text.len()) else {
+            self.failed = true;
+            return false;
+        };
+        if total > MAX_STRING_BYTES {
+            self.failed = true;
+            return false;
+        }
+        // Grow geometrically but never *request* capacity beyond the sandbox's
+        // output ceiling. Reserving each tiny comma exactly would repeatedly
+        // copy the accumulated string and turn a bounded display into O(n^2).
+        if total > self.out.capacity() {
+            let desired = total
+                .max(self.out.capacity().max(16).saturating_mul(2))
+                .min(MAX_STRING_BYTES);
+            if self
+                .out
+                .try_reserve_exact(desired.saturating_sub(self.out.len()))
+                .is_err()
+            {
+                self.failed = true;
+                return false;
+            }
+        }
+        self.out.push_str(text);
+        true
+    }
+
+    fn push_char(&mut self, ch: char) -> bool {
+        let mut bytes = [0u8; 4];
+        self.push_str(ch.encode_utf8(&mut bytes))
+    }
+
+    fn finish(self) -> Result<String, Thrown> {
+        if self.failed {
+            Err(Thrown("RangeError: Invalid string length".into()))
+        } else {
+            Ok(self.out)
+        }
+    }
+}
+
+impl std::fmt::Write for DisplayBuffer {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if self.push_str(text) {
+            Ok(())
+        } else {
+            Err(std::fmt::Error)
+        }
+    }
+}
+
+struct InspectBuffer {
+    out: String,
+    nodes: usize,
+    active: Vec<u32>,
+    truncated: bool,
+}
+
+impl InspectBuffer {
+    fn new() -> Self {
+        Self {
+            out: String::with_capacity(256),
+            nodes: 0,
+            active: Vec::with_capacity(INSPECT_MAX_DEPTH),
+            truncated: false,
+        }
+    }
+
+    /// Charge one value/rope node before inspecting it. Once this fails every
+    /// later write is suppressed and `finish` appends one stable marker.
+    fn consume_node(&mut self) -> bool {
+        if self.truncated || self.nodes >= INSPECT_MAX_NODES {
+            self.truncated = true;
+            return false;
+        }
+        self.nodes += 1;
+        true
+    }
+
+    fn push_str(&mut self, text: &str) -> bool {
+        if self.truncated {
+            return false;
+        }
+        // Always retain room for a marker if this write discovers truncation.
+        let payload_limit = INSPECT_MAX_BYTES.saturating_sub(INSPECT_TRUNCATION_MARKER.len());
+        let available = payload_limit.saturating_sub(self.out.len());
+        if text.len() <= available {
+            self.out.push_str(text);
+            return true;
+        }
+
+        let mut end = available.min(text.len());
+        while end != 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.out.push_str(&text[..end]);
+        self.truncated = true;
+        false
+    }
+
+    fn push_char(&mut self, ch: char) -> bool {
+        let mut bytes = [0u8; 4];
+        self.push_str(ch.encode_utf8(&mut bytes))
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            debug_assert!(self.out.len() + INSPECT_TRUNCATION_MARKER.len() <= INSPECT_MAX_BYTES);
+            self.out.push_str(INSPECT_TRUNCATION_MARKER);
+        }
+        self.out
+    }
+}
+
+impl std::fmt::Write for InspectBuffer {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        if self.push_str(text) {
+            Ok(())
+        } else {
+            Err(std::fmt::Error)
+        }
+    }
+}
+
 /// Native emitters inline the allocation-free hit unless counters are enabled;
 /// an ICSTATS run deliberately routes hits through the shared helper so the
 /// mechanism census remains exact without burdening production code.
@@ -649,14 +840,26 @@ impl<'p> Vm<'p> {
             // is an ordinary (mutable, even deletable) property and a LIVE-
             // mapped index must read the formal's register, not the snapshot.
             if !self.arguments_objs.contains_key(&obj.heap_index()) {
-                return Ok(items.clone()); // dense fast path
+                self.preflight_native_iteration_work(items.len() as u64)?;
+                let mut out = Vec::new();
+                out.try_reserve_exact(items.len())
+                    .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
+                out.extend_from_slice(items);
+                return Ok(out); // dense fast path
             }
         }
         let len_v = self.get_prop(obj, "length")?;
-        let len = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1) as usize;
-        let mut out = Vec::with_capacity(len.min(4096));
+        let len_u64 = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+        // Do not narrow ToLength before applying the safe-profile work cap:
+        // on wasm32 an attacker-controlled 2^32 used to wrap to an empty list.
+        self.preflight_native_iteration_work(len_u64)?;
+        let len = usize::try_from(len_u64)
+            .map_err(|_| Thrown("RangeError: argument list is too large".into()))?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len)
+            .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
         for i in 0..len {
-            out.push(self.get_index(obj, Value::int(i as i32))?);
+            out.push(self.get_index(obj, Value::num(i as f64))?);
         }
         Ok(out)
     }
@@ -683,7 +886,22 @@ impl<'p> Vm<'p> {
 
     /// Recursively flatten nested arrays up to `depth` levels (for `Array.flat`).
     /// Each nested array is cloned out before recursing (releases the heap borrow).
-    pub(crate) fn flatten_array(&self, items: &[Value], depth: i32) -> Vec<Value> {
+    pub(crate) fn flatten_array(&self, items: &[Value], depth: i32) -> Result<Vec<Value>, Thrown> {
+        let mut work = 0u64;
+        self.flatten_array_at(items, depth, 0, &mut work)
+    }
+
+    fn flatten_array_at(
+        &self,
+        items: &[Value],
+        depth: i32,
+        active_depth: u32,
+        work: &mut u64,
+    ) -> Result<Vec<Value>, Thrown> {
+        *work = work
+            .checked_add(items.len() as u64)
+            .ok_or_else(|| Thrown("RangeError: native builtin iteration limit exceeded".into()))?;
+        self.preflight_native_iteration_work(*work)?;
         let mut out = Vec::new();
         for v in items {
             let nested: Option<Vec<Value>> = if depth > 0 && v.is_heap() {
@@ -695,11 +913,37 @@ impl<'p> Vm<'p> {
                 None
             };
             match nested {
-                Some(a) => out.extend(self.flatten_array(&a, depth - 1)),
-                None => out.push(*v),
+                Some(a) => {
+                    let next_depth = active_depth.checked_add(1).ok_or_else(|| {
+                        Thrown("RangeError: array flattening nesting limit exceeded".into())
+                    })?;
+                    #[cfg(feature = "safe-sandbox")]
+                    if next_depth > 64 {
+                        return Err(Thrown(
+                            "RangeError: array flattening nesting limit exceeded".into(),
+                        ));
+                    }
+                    let flattened = self.flatten_array_at(&a, depth - 1, next_depth, work)?;
+                    if (out.len() as u64).saturating_add(flattened.len() as u64)
+                        > MAX_NATIVE_ITERATION_WORK
+                    {
+                        return Err(Thrown(
+                            "RangeError: native builtin iteration limit exceeded".into(),
+                        ));
+                    }
+                    out.extend(flattened);
+                }
+                None => {
+                    if out.len() as u64 >= MAX_NATIVE_ITERATION_WORK {
+                        return Err(Thrown(
+                            "RangeError: native builtin iteration limit exceeded".into(),
+                        ));
+                    }
+                    out.push(*v);
+                }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Strict equality between two raw values (no register indirection). Mirrors
@@ -788,7 +1032,7 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn to_js_string(&mut self, v: Value) -> Result<String, Thrown> {
         if !v.is_heap() || self.heap.is_str_like(v.heap_index()) {
-            return Ok(self.display(v));
+            return self.display_checked(v);
         }
         // ToString of a Symbol is a TypeError (use `.toString()` / `String(sym)`
         // explicitly instead — but even `String(sym)` routes through the dedicated
@@ -864,33 +1108,44 @@ impl<'p> Vm<'p> {
     /// is valid. Plain functions and classes qualify; native methods, bound values,
     /// and non-callables do not. (test262's `isConstructor` helper probes this via
     /// `Reflect.construct(fn, [], v)`, so getting it right matters across the suite.)
-    pub(crate) fn is_constructor(&self, v: Value) -> bool {
-        if !v.is_heap() {
-            return false;
-        }
-        match self.heap.get(v.heap_index()) {
-            // A class is always a constructor. A plain function/closure is too, but a
-            // generator / async / arrow / concise-method function has no [[Construct]].
-            HeapObj::Class(_) => true,
-            HeapObj::Func(_) | HeapObj::Closure { .. } => {
-                match self.heap.as_callable(v.heap_index()) {
-                    Some((fid, _)) => {
-                        let fp = self.func(fid as usize);
-                        !(fp.is_generator || fp.is_async || fp.non_constructable)
-                    }
-                    None => true,
-                }
+    pub(crate) fn is_constructor(&self, mut v: Value) -> bool {
+        loop {
+            if !v.is_heap() {
+                return false;
             }
-            // The built-in constructor globals (Object/Array/Map/…) are constructors.
-            HeapObj::Object(m) => m.is_ctor,
-            // A bound function exposes [[Construct]] iff its target does.
-            HeapObj::Bound { target, .. } => self.is_constructor(*target),
-            // A non-revoked Proxy is a constructor iff its target is (the
-            // `construct` trap is only callable when the target has [[Construct]]).
-            HeapObj::Proxy {
-                target, revoked, ..
-            } => !*revoked && self.is_constructor(*target),
-            _ => false,
+            return match self.heap.get(v.heap_index()) {
+                // A class is always a constructor. A plain function/closure is too, but a
+                // generator / async / arrow / concise-method function has no [[Construct]].
+                HeapObj::Class(_) => true,
+                HeapObj::Func(_) | HeapObj::Closure { .. } => {
+                    match self.heap.as_callable(v.heap_index()) {
+                        Some((fid, _)) => {
+                            let fp = self.func(fid as usize);
+                            !(fp.is_generator || fp.is_async || fp.non_constructable)
+                        }
+                        None => true,
+                    }
+                }
+                // The built-in constructor globals (Object/Array/Map/…) are constructors.
+                HeapObj::Object(m) => m.is_ctor,
+                // A bound function exposes [[Construct]] iff its target does.
+                HeapObj::Bound { target, .. } => {
+                    v = *target;
+                    continue;
+                }
+                // A non-revoked Proxy is a constructor iff its target is (the
+                // `construct` trap is only callable when the target has [[Construct]]).
+                HeapObj::Proxy {
+                    target, revoked, ..
+                } => {
+                    if *revoked {
+                        return false;
+                    }
+                    v = *target;
+                    continue;
+                }
+                _ => false,
+            };
         }
     }
 
@@ -1049,6 +1304,27 @@ impl<'p> Vm<'p> {
         self.add_values(va, vb)
     }
 
+    /// Preflight a mutation of a flat guest string. The optimized append paths
+    /// bypass ordinary `add_values`, so they must independently enforce both
+    /// safe-profile ceilings before touching the uniquely-owned accumulator.
+    #[inline]
+    fn inplace_string_growth_fits(&self, idx: u32, add_units: usize, add_bytes: usize) -> bool {
+        match self.heap.get(idx) {
+            HeapObj::Str(string) => {
+                string
+                    .units()
+                    .checked_add(add_units)
+                    .is_some_and(|units| units <= MAX_STRING_UNITS)
+                    && string
+                        .as_bytes()
+                        .len()
+                        .checked_add(add_bytes)
+                        .is_some_and(|bytes| bytes <= MAX_STRING_BYTES)
+            }
+            _ => false,
+        }
+    }
+
     /// The `+` operator on two already-fetched Values (shared by the interpreter's
     /// `Add`/`StrConcat` and the JIT's `jit_concat` helper).
     pub(crate) fn add_values(&mut self, va: Value, vb: Value) -> Result<Value, Thrown> {
@@ -1069,16 +1345,24 @@ impl<'p> Vm<'p> {
             let (li, ri) = (va.heap_index(), vb.heap_index());
             let llen = self.heap.str_units(li).unwrap_or(0);
             let rlen = self.heap.str_units(ri).unwrap_or(0);
+            let total = llen
+                .checked_add(rlen)
+                .filter(|&n| n <= MAX_STRING_UNITS)
+                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            // Never create a zero-growth rope. Repeated `large += ""` could
+            // otherwise grow an arbitrarily deep object graph while its string
+            // length stayed fixed, defeating every length-derived traversal cap.
+            // Keep the established fresh-result invariant for JIT concat chains
+            // by materialising a fresh flat string instead of aliasing a child.
+            if llen == 0 || rlen == 0 {
+                return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, total)));
+            }
             // A SMALL result is built flat eagerly (one alloc, no flatten
             // later); only a large one pays for a rope node.
-            if llen + rlen <= SMALL_CONCAT_FLAT_UNITS {
-                return Ok(Value::heap(self.heap.alloc_concat_flat(
-                    li,
-                    ri,
-                    llen + rlen,
-                )));
+            if total <= SMALL_CONCAT_FLAT_UNITS {
+                return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, total)));
             }
-            return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
+            return Ok(Value::heap(self.heap.alloc_cons(li, ri, total)));
         }
         // Fast path: string + int (the `"key_" + i` map-key shape; both sides are
         // primitives, so skipping ToPrimitive is unobservable). A SMALL result is
@@ -1137,15 +1421,18 @@ impl<'p> Vm<'p> {
             let ri = self.to_str_idx(pb);
             let llen = self.heap.str_units(li).unwrap_or(0);
             let rlen = self.heap.str_units(ri).unwrap_or(0);
-            // Small result → flat eagerly (see the string+string fast path).
-            if llen + rlen <= SMALL_CONCAT_FLAT_UNITS {
-                return Ok(Value::heap(self.heap.alloc_concat_flat(
-                    li,
-                    ri,
-                    llen + rlen,
-                )));
+            let total = llen
+                .checked_add(rlen)
+                .filter(|&n| n <= MAX_STRING_UNITS)
+                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+            if llen == 0 || rlen == 0 {
+                return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, total)));
             }
-            return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
+            // Small result → flat eagerly (see the string+string fast path).
+            if total <= SMALL_CONCAT_FLAT_UNITS {
+                return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, total)));
+            }
+            return Ok(Value::heap(self.heap.alloc_cons(li, ri, total)));
         }
         // Numeric `+`: both BigInt → BigInt addition; BigInt + non-BigInt →
         // the spec's mixing TypeError; otherwise Number addition (ToNumber of
@@ -1315,6 +1602,25 @@ impl<'p> Vm<'p> {
                 || (c.is_heap()
                     && matches!(self.heap.get(c.heap_index()), HeapObj::Str(s) if s.is_ascii()));
             if b_ok && c_ok {
+                let b_len = match self.heap.get(b.heap_index()) {
+                    HeapObj::Str(string) => string.as_bytes().len(),
+                    _ => 0,
+                };
+                let c_len = if c.is_int() {
+                    let (digits, start) = fmt_i32_buf(c.as_int());
+                    digits.len() - start
+                } else {
+                    match self.heap.get(c.heap_index()) {
+                        HeapObj::Str(string) => string.as_bytes().len(),
+                        _ => 0,
+                    }
+                };
+                let Some(add_len) = b_len.checked_add(c_len) else {
+                    return self.add_values_right_pair(a, b, c);
+                };
+                if !self.inplace_string_growth_fits(a.heap_index(), add_len, add_len) {
+                    return self.add_values_right_pair(a, b, c);
+                }
                 let ai = a.heap_index();
                 let taken = std::mem::replace(
                     self.heap.get_mut(ai),
@@ -1426,6 +1732,9 @@ impl<'p> Vm<'p> {
                 debug_assert!(
                     matches!(self.heap.get(vi), HeapObj::Str(s) if s.as_bytes() == [vi as u8])
                 );
+                if !self.inplace_string_growth_fits(acc.heap_index(), 1, 1) {
+                    return None;
+                }
                 if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
                     js.push_ascii(vi as u8);
                     return Some(acc);
@@ -1437,6 +1746,9 @@ impl<'p> Vm<'p> {
         if mutable && val.is_int() {
             let n = val.as_int();
             if (0..=9).contains(&n) {
+                if !self.inplace_string_growth_fits(acc.heap_index(), 1, 1) {
+                    return None;
+                }
                 if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
                     js.push_ascii(b'0' + n as u8);
                     return Some(acc);
@@ -1448,6 +1760,10 @@ impl<'p> Vm<'p> {
             // fused concat chains (`"#" + ri(9000) + …`), and the general
             // path below would allocate a temporary heap string per leaf.
             let (buf, start) = fmt_i32_buf(n);
+            let digit_len = buf.len() - start;
+            if !self.inplace_string_growth_fits(acc.heap_index(), digit_len, digit_len) {
+                return None;
+            }
             if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
                 js.push_wtf8(&buf[start..]);
                 return Some(acc);
@@ -1465,6 +1781,16 @@ impl<'p> Vm<'p> {
         // append the cow path fed).
         if mutable && val.is_heap() && val.heap_index() != acc.heap_index() {
             let ai = acc.heap_index();
+            let (add_units, add_bytes) = match self.heap.get(val.heap_index()) {
+                HeapObj::Str(vs) => (vs.units(), vs.as_bytes().len()),
+                // Rope RHS: take the general path below.
+                _ => (0, 0),
+            };
+            if add_units != 0 || add_bytes != 0 {
+                if !self.inplace_string_growth_fits(ai, add_units, add_bytes) {
+                    return None;
+                }
+            }
             let slot = self.heap.get_mut(ai);
             if matches!(slot, HeapObj::Str(_)) {
                 let taken = std::mem::replace(
@@ -1492,7 +1818,11 @@ impl<'p> Vm<'p> {
             .str_wtf8_cow(ri)
             .map(|c| c.into_owned())
             .unwrap_or_default();
+        let add_units = self.heap.str_units(ri).unwrap_or(0);
         if mutable {
+            if !self.inplace_string_growth_fits(acc.heap_index(), add_units, add.len()) {
+                return None;
+            }
             if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
                 js.push_wtf8(&add); // updates the cached unit length + ascii flag
                 return Some(acc);
@@ -1506,6 +1836,15 @@ impl<'p> Vm<'p> {
             .str_wtf8_cow(li)
             .map(|c| c.into_owned())
             .unwrap_or_default();
+        let total_units = self
+            .heap
+            .str_units(li)
+            .unwrap_or(0)
+            .checked_add(add_units)?;
+        let total_bytes = s.len().checked_add(add.len())?;
+        if total_units > MAX_STRING_UNITS || total_bytes > MAX_STRING_BYTES {
+            return None;
+        }
         crate::heap::wtf8_push(&mut s, &add);
         Some(Value::heap(
             self.heap
@@ -1558,6 +1897,9 @@ impl<'p> Vm<'p> {
                     _ => return None,
                 };
                 let len = seed.len().checked_add(1)?;
+                if len > MAX_STRING_UNITS || len > MAX_STRING_BYTES {
+                    return None;
+                }
                 let mut bytes = Vec::with_capacity(len.max(STR_APPEND_INDEX_FIRST_RESERVE));
                 bytes.extend_from_slice(seed);
                 bytes.push(byte);
@@ -1570,6 +1912,9 @@ impl<'p> Vm<'p> {
             // `str_append_inplace` copies the seed + byte into a non-interned
             // flat Str, exactly like the interpreter fallback, without coercion.
             return self.str_append_inplace(acc, Value::heap(byte as u32));
+        }
+        if !self.inplace_string_growth_fits(acc.heap_index(), 1, 1) {
+            return None;
         }
         match self.heap.get_mut(acc.heap_index()) {
             HeapObj::Str(out) => {
@@ -2194,240 +2539,479 @@ impl<'p> Vm<'p> {
     /// String COERCION (`String(v)`, `'' + v`, property keys). Arrays join with
     /// commas; objects become `[object Object]` — JS `toString` semantics.
     pub(crate) fn display(&self, v: Value) -> String {
-        if v.is_int() {
-            v.as_int().to_string()
-        } else if v.is_double() {
-            fmt_f64(v.as_f64())
-        } else if v.is_bool() {
-            v.as_bool().to_string()
-        } else if v.is_null() {
-            "null".into()
-        } else if v.is_undefined() {
-            "undefined".into()
-        } else if v.is_heap() {
-            match self.heap.get(v.heap_index()) {
-                HeapObj::Proxy { target, .. } => return self.display(*target),
-                HeapObj::Temporal { kind: 0, fields } => {
-                    // Duration fields store f64 BITS in the i64 slots.
-                    let mut f = [0f64; 10];
-                    for (i, s) in f.iter_mut().enumerate() {
-                        *s = f64::from_bits(*fields.get(i).unwrap_or(&0) as u64);
+        self.display_checked(v)
+            .unwrap_or_else(|_| DISPLAY_LIMIT_MARKER.to_owned())
+    }
+
+    /// Fallible form used by observable ToString paths. Keeping the failure
+    /// typed lets those callers surface the configured string/depth/work limit
+    /// as a RangeError instead of silently accepting a truncated property key.
+    pub(crate) fn display_checked(&self, v: Value) -> Result<String, Thrown> {
+        let mut out = DisplayBuffer::new();
+        self.display_value_into(&mut out, v, 0);
+        out.finish()
+    }
+
+    /// The special `String(symbol)` / Symbol.prototype.toString form. Ordinary
+    /// ToString(Symbol) must throw, so this cannot use `to_js_string`; compose
+    /// the already-string description with the same output and heap checks as
+    /// every other guest-derived string builder.
+    pub(crate) fn symbol_descriptive_string(&mut self, symbol: Value) -> Result<String, Thrown> {
+        let desc = match symbol.is_heap().then(|| self.heap.get(symbol.heap_index())) {
+            Some(HeapObj::Symbol { desc, .. }) => *desc,
+            _ => Value::UNDEFINED,
+        };
+        let description = if desc == Value::UNDEFINED {
+            None
+        } else {
+            Some(self.display_checked(desc)?)
+        };
+        let mut out = String::new();
+        self.append_guest_string(&mut out, "Symbol(")?;
+        if let Some(description) = description {
+            self.append_guest_string(&mut out, &description)?;
+        }
+        self.append_guest_string(&mut out, ")")?;
+        Ok(out)
+    }
+
+    fn display_string_into(&self, out: &mut DisplayBuffer, idx: u32) {
+        // `str_cow` would first materialize a second full-size String. Traverse
+        // ropes iteratively and write their leaves straight into the result.
+        let mut stack = Vec::new();
+        if stack.try_reserve_exact(16).is_err() {
+            out.failed = true;
+            return;
+        }
+        stack.push(idx);
+        while let Some(part) = stack.pop() {
+            if !out.consume_node() {
+                return;
+            }
+            match self.heap.get(part) {
+                HeapObj::Str(s) if s.is_wellformed() => {
+                    if !out.push_str(s.as_str_wf()) {
+                        return;
                     }
-                    duration_to_string(&f)
+                }
+                HeapObj::Str(s) => {
+                    for cp in crate::heap::wtf8_code_points(s.as_bytes()) {
+                        if !out.push_char(char::from_u32(cp).unwrap_or('\u{FFFD}')) {
+                            return;
+                        }
+                    }
+                }
+                HeapObj::Cons { left, right, .. } => {
+                    if stack.try_reserve(2).is_err() {
+                        out.failed = true;
+                        return;
+                    }
+                    stack.push(*right);
+                    stack.push(*left);
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn display_error_into(&self, out: &mut DisplayBuffer, idx: u32, depth: usize) {
+        let name_start = out.out.len();
+        if let Some(name) = self.read_data_prop(idx, "name") {
+            self.display_value_into(out, name, depth + 1);
+        } else {
+            out.push_str("Error");
+        }
+        if out.failed {
+            return;
+        }
+        let name_end = out.out.len();
+        if name_end != name_start {
+            out.push_str(": ");
+        }
+        let message_start = out.out.len();
+        if let Some(message) = self.read_data_prop(idx, "message") {
+            self.display_value_into(out, message, depth + 1);
+        }
+        if !out.failed && out.out.len() == message_start {
+            // No message: remove the speculative separator.
+            out.out.truncate(name_end);
+        }
+    }
+
+    fn display_value_into(&self, out: &mut DisplayBuffer, v: Value, depth: usize) {
+        if !out.consume_node() {
+            return;
+        }
+        if depth > DISPLAY_MAX_DEPTH {
+            out.failed = true;
+            return;
+        }
+
+        if v.is_int() {
+            let _ = write!(out, "{}", v.as_int());
+        } else if v.is_double() {
+            out.push_str(&fmt_f64(v.as_f64()));
+        } else if v.is_bool() {
+            out.push_str(if v.as_bool() { "true" } else { "false" });
+        } else if v.is_null() {
+            out.push_str("null");
+        } else if v.is_undefined() {
+            out.push_str("undefined");
+        } else if v.is_heap() {
+            let idx = v.heap_index();
+            // Cycles through arrays/proxies/boxed values stringify as an empty
+            // join element, matching the observable self-referential Array case.
+            if out.active.contains(&idx) {
+                return;
+            }
+            if out.active.try_reserve(1).is_err() {
+                out.failed = true;
+                return;
+            }
+            out.active.push(idx);
+
+            match self.heap.get(idx) {
+                HeapObj::Proxy { target, .. } => self.display_value_into(out, *target, depth + 1),
+                HeapObj::Temporal { kind: 0, fields } => {
+                    let mut f = [0f64; 10];
+                    for (i, slot) in f.iter_mut().enumerate() {
+                        *slot = f64::from_bits(*fields.get(i).unwrap_or(&0) as u64);
+                    }
+                    out.push_str(&duration_to_string(&f));
                 }
                 HeapObj::Temporal { kind: 1, fields } => {
-                    iso_date_string(fields[0], fields[1], fields[2])
+                    out.push_str(&iso_date_string(fields[0], fields[1], fields[2]));
                 }
                 HeapObj::Temporal { kind: 2, fields } => {
                     let mut f = [0i64; 6];
-                    for (i, s) in f.iter_mut().enumerate() {
-                        *s = *fields.get(i).unwrap_or(&0);
+                    for (i, slot) in f.iter_mut().enumerate() {
+                        *slot = *fields.get(i).unwrap_or(&0);
                     }
-                    time_string(&f)
+                    out.push_str(&time_string(&f));
                 }
                 HeapObj::Temporal { kind: 3, fields } => {
                     let g = |i: usize| *fields.get(i).unwrap_or(&0);
-                    format!(
-                        "{}T{}",
-                        iso_date_string(g(0), g(1), g(2)),
-                        time_string(&[g(3), g(4), g(5), g(6), g(7), g(8)])
-                    )
+                    out.push_str(&iso_date_string(g(0), g(1), g(2)));
+                    out.push_str("T");
+                    out.push_str(&time_string(&[g(3), g(4), g(5), g(6), g(7), g(8)]));
                 }
                 HeapObj::Temporal { kind: 4, fields } => {
                     let ns = ((fields[0] as i128) << 64) | ((fields[1] as u64) as i128);
-                    instant_to_string(ns)
+                    out.push_str(&instant_to_string(ns));
                 }
-                HeapObj::Temporal { kind: 5, fields } => year_month_string(fields[0], fields[1]),
+                HeapObj::Temporal { kind: 5, fields } => {
+                    out.push_str(&year_month_string(fields[0], fields[1]));
+                }
                 HeapObj::Temporal { kind: 6, fields } => {
-                    format!("{:02}-{:02}", fields[1], fields[2])
+                    let _ = write!(out, "{:02}-{:02}", fields[1], fields[2]);
                 }
-                HeapObj::Temporal { kind: 7, .. } => self.zdt_to_string(v.heap_index()),
-                HeapObj::Temporal { .. } => "[object Temporal]".into(),
-                HeapObj::Intl { .. } => "[object Object]".into(),
-                // Display is a LOSSY observation: a lone surrogate reads U+FFFD.
-                HeapObj::Str(s) => s.to_lossy_string(),
-                HeapObj::Cons { .. } => self
-                    .heap
-                    .str_cow(v.heap_index())
-                    .map(|c| c.into_owned())
-                    .unwrap_or_default(),
+                HeapObj::Temporal { kind: 7, .. } => {
+                    out.push_str(&self.zdt_to_string(idx));
+                }
+                HeapObj::Temporal { .. } => {
+                    out.push_str("[object Temporal]");
+                }
+                HeapObj::Intl { .. } => {
+                    out.push_str("[object Object]");
+                }
+                HeapObj::Str(_) | HeapObj::Cons { .. } => self.display_string_into(out, idx),
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }
                 | HeapObj::Bound { .. }
                 | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
-                | HeapObj::NativeClosure { .. } => "function".into(),
-                HeapObj::Cell(inner) => self.display(*inner),
-                HeapObj::EvalScope(_) => "[object EvalScope]".into(),
-                HeapObj::Array(items) => items
-                    .iter()
-                    .map(|e| {
-                        if e.is_nullish() {
-                            String::new()
-                        } else {
-                            self.display(*e)
+                | HeapObj::NativeClosure { .. } => {
+                    out.push_str("function");
+                }
+                HeapObj::Cell(inner) => self.display_value_into(out, *inner, depth + 1),
+                HeapObj::EvalScope(_) => {
+                    out.push_str("[object EvalScope]");
+                }
+                HeapObj::Array(items) => {
+                    for (i, element) in items.iter().enumerate() {
+                        if i != 0 && !out.push_str(",") {
+                            break;
                         }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(","),
-                HeapObj::Object(_) => {
-                    // Error instances ToString to "name: message" (Error.prototype.toString).
-                    if self.is_error_instance(v.heap_index()) {
-                        self.error_display_string(v.heap_index())
-                    } else {
-                        "[object Object]".into()
+                        if !element.is_nullish() {
+                            self.display_value_into(out, *element, depth + 1);
+                        }
+                        if out.failed {
+                            break;
+                        }
                     }
                 }
-                HeapObj::Class(c) => format!("class {} {{ }}", c.name),
-                HeapObj::Map { .. } => "[object Map]".into(),
-                HeapObj::Set(_) => "[object Set]".into(),
-                HeapObj::WeakMap { .. } => "[object WeakMap]".into(),
-                HeapObj::WeakSet(_) => "[object WeakSet]".into(),
-                HeapObj::WeakRef(_) => "[object WeakRef]".into(),
-                HeapObj::FinalizationRegistry { .. } => "[object FinalizationRegistry]".into(),
-                HeapObj::Iterator { .. } => "[object Array Iterator]".into(),
-                HeapObj::IterHelper { .. } => "[object Iterator Helper]".into(),
-                // A boxed primitive stringifies as its wrapped value (ToString).
-                HeapObj::Boxed { value, .. } => self.display(*value),
-                // ToString of a Symbol actually throws (see `to_js_string`); this
-                // infallible debug form is "Symbol(desc)".
-                HeapObj::Symbol { desc, .. } => {
-                    let d = if *desc == Value::UNDEFINED {
-                        String::new()
+                HeapObj::Object(_) => {
+                    if self.is_error_instance(idx) {
+                        self.display_error_into(out, idx, depth);
                     } else {
-                        self.display(*desc)
-                    };
-                    format!("Symbol({d})")
+                        out.push_str("[object Object]");
+                    }
                 }
-                // ToString(BigInt) is the decimal digits with NO "n" (String(1n) === "1").
-                HeapObj::BigInt(n) => n.to_string(),
-                HeapObj::BigIntBig(b) => b.to_string(),
+                HeapObj::Class(class) => {
+                    out.push_str("class ");
+                    out.push_str(&class.name);
+                    out.push_str(" { }");
+                }
+                HeapObj::Map { .. } => {
+                    out.push_str("[object Map]");
+                }
+                HeapObj::Set(_) => {
+                    out.push_str("[object Set]");
+                }
+                HeapObj::WeakMap { .. } => {
+                    out.push_str("[object WeakMap]");
+                }
+                HeapObj::WeakSet(_) => {
+                    out.push_str("[object WeakSet]");
+                }
+                HeapObj::WeakRef(_) => {
+                    out.push_str("[object WeakRef]");
+                }
+                HeapObj::FinalizationRegistry { .. } => {
+                    out.push_str("[object FinalizationRegistry]");
+                }
+                HeapObj::Iterator { .. } => {
+                    out.push_str("[object Array Iterator]");
+                }
+                HeapObj::IterHelper { .. } => {
+                    out.push_str("[object Iterator Helper]");
+                }
+                HeapObj::Boxed { value, .. } => self.display_value_into(out, *value, depth + 1),
+                HeapObj::Symbol { desc, .. } => {
+                    out.push_str("Symbol(");
+                    if *desc != Value::UNDEFINED {
+                        self.display_value_into(out, *desc, depth + 1);
+                    }
+                    out.push_str(")");
+                }
+                HeapObj::BigInt(number) => {
+                    let _ = write!(out, "{number}");
+                }
+                HeapObj::BigIntBig(number) => {
+                    let _ = write!(out, "{number}");
+                }
                 HeapObj::RegExp { source, flags, .. } => {
-                    let s = if source.is_empty() { "(?:)" } else { source };
-                    format!("/{s}/{flags}")
+                    out.push_str("/");
+                    out.push_str(if source.is_empty() { "(?:)" } else { source });
+                    let _ = write!(out, "/{flags}");
                 }
-                // ToString of a TypedArray is the comma-joined elements (like Array).
                 HeapObj::TypedArray { length, .. } => {
-                    let n = *length;
-                    let idx = v.heap_index();
-                    (0..n)
-                        .map(|i| self.ta_elem_string(idx, i))
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    for i in 0..*length {
+                        if !out.consume_node() || (i != 0 && !out.push_str(",")) {
+                            break;
+                        }
+                        if !out.push_str(&self.ta_elem_string(idx, i)) {
+                            break;
+                        }
+                    }
                 }
-                HeapObj::ArrayBuffer { .. } => "[object ArrayBuffer]".into(),
-                HeapObj::DataView { .. } => "[object DataView]".into(),
-                HeapObj::Generator { .. } => "[object Generator]".into(),
-                HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
-                HeapObj::Promise { .. } => "[object Promise]".into(),
-                HeapObj::BoundResolver { .. } => "function".into(),
-                // Internal: never user-visible (an async call yields its Promise).
-                HeapObj::AsyncState(_) => "[object Promise]".into(),
+                HeapObj::ArrayBuffer { .. } => {
+                    out.push_str("[object ArrayBuffer]");
+                }
+                HeapObj::DataView { .. } => {
+                    out.push_str("[object DataView]");
+                }
+                HeapObj::Generator { .. } => {
+                    out.push_str("[object Generator]");
+                }
+                HeapObj::AsyncGenerator(_) => {
+                    out.push_str("[object AsyncGenerator]");
+                }
+                HeapObj::Promise { .. } => {
+                    out.push_str("[object Promise]");
+                }
+                HeapObj::BoundResolver { .. } => {
+                    out.push_str("function");
+                }
+                HeapObj::AsyncState(_) => {
+                    out.push_str("[object Promise]");
+                }
                 HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
-                    "[object Object]".into()
+                    out.push_str("[object Object]");
                 }
-                // `String(date)` / `"" + date` → ToPrimitive(string) → toString(),
-                // which is the human form (NOT the ISO toISOString used by toJSON).
-                HeapObj::Date(ms) => date_to_string(*ms),
-            }
+                HeapObj::Date(ms) => {
+                    out.push_str(&date_to_string(*ms));
+                }
+            };
+            let popped = out.active.pop();
+            debug_assert_eq!(popped, Some(idx));
         } else {
-            "undefined".into()
+            out.push_str("undefined");
         }
     }
 
     /// INSPECT (`console.log` rendering). Strings are quoted only when nested;
     /// arrays/objects use node's spaced bracket style (`[ 1, 2, 3 ]`,
-    /// `{ a: 1 }`).
-    pub(crate) fn inspect(&self, v: Value) -> String {
-        if v.is_heap() {
-            match self.heap.get(v.heap_index()) {
-                // Top-level strings unquoted; LOSSY (console rendering).
-                HeapObj::Str(s) => return s.to_lossy_string(),
-                HeapObj::Cons { .. } => {
-                    return self
-                        .heap
-                        .str_cow(v.heap_index())
-                        .map(|c| c.into_owned())
-                        .unwrap_or_default();
-                }
-                _ => return self.inspect_nested(v),
+    /// `{ a: 1 }`). Unlike a serializer this is deliberately bounded: hostile
+    /// graphs must not turn one Print instruction into unbounded native work.
+    /// Render a complete console line into one bounded buffer. A per-argument
+    /// cap is insufficient: thousands of individually small arguments followed
+    /// by `Vec<String>::join` can otherwise allocate far beyond the output
+    /// meter before that meter sees the finished line.
+    pub(crate) fn inspect_line<F>(&self, count: usize, mut value_at: F) -> String
+    where
+        F: FnMut(usize) -> Value,
+    {
+        let mut out = InspectBuffer::new();
+        for i in 0..count {
+            if i != 0 && !out.push_char(' ') {
+                break;
+            }
+            self.inspect_value_into(&mut out, value_at(i), false, 0);
+            if out.truncated {
+                break;
             }
         }
-        self.display(v)
+        out.finish()
     }
 
-    /// `console.log` label for a function value: `[Function: name]`, or
-    /// `[Function (anonymous)]` for an arrow / unnamed expression (synthetic
-    /// names start with `<`). Class methods are stored as `Class.method`; show
-    /// just the method part, as node does.
-    pub(crate) fn func_label(&self, fid: u32) -> String {
+    fn inspect_string_into(&self, out: &mut InspectBuffer, idx: u32) {
+        // Traverse ropes iteratively. A skewed `s += piece` rope can be millions
+        // of nodes deep, so flattening or recursive display here would defeat
+        // the console limits before a byte reached the output recorder.
+        let mut stack = Vec::with_capacity(16);
+        stack.push(idx);
+        while let Some(part) = stack.pop() {
+            if !out.consume_node() {
+                return;
+            }
+            match self.heap.get(part) {
+                HeapObj::Str(s) if s.is_wellformed() => {
+                    if !out.push_str(s.as_str_wf()) {
+                        return;
+                    }
+                }
+                HeapObj::Str(s) => {
+                    for cp in crate::heap::wtf8_code_points(s.as_bytes()) {
+                        let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                        if !out.push_char(ch) {
+                            return;
+                        }
+                    }
+                }
+                HeapObj::Cons { left, right, .. } => {
+                    // Pushing right first preserves left-to-right output.
+                    stack.push(*right);
+                    stack.push(*left);
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Write a function label without allocating a copy of an
+    /// attacker-controlled source name.
+    fn inspect_function_label_into(&self, out: &mut InspectBuffer, fid: u32) {
         let name = &self.func(fid as usize).name;
         if name.is_empty() || name.starts_with('<') {
-            "[Function (anonymous)]".into()
+            out.push_str("[Function (anonymous)]");
         } else {
-            let short = name.rsplit('.').next().unwrap_or(name);
-            format!("[Function: {short}]")
+            out.push_str("[Function: ");
+            out.push_str(name.rsplit('.').next().unwrap_or(name));
+            out.push_str("]");
         }
     }
 
-    pub(crate) fn inspect_nested(&self, v: Value) -> String {
-        if !v.is_heap() {
-            return self.display(v);
+    fn inspect_value_into(&self, out: &mut InspectBuffer, v: Value, nested: bool, depth: usize) {
+        if !out.consume_node() {
+            return;
         }
-        match self.heap.get(v.heap_index()) {
+        if depth >= INSPECT_MAX_DEPTH {
+            out.push_str("[MaxDepth]");
+            return;
+        }
+        if v.is_int() {
+            let _ = write!(out, "{}", v.as_int());
+            return;
+        }
+        if v.is_double() {
+            out.push_str(&fmt_f64(v.as_f64()));
+            return;
+        }
+        if v.is_bool() {
+            out.push_str(if v.as_bool() { "true" } else { "false" });
+            return;
+        }
+        if v.is_null() {
+            out.push_str("null");
+            return;
+        }
+        if v.is_undefined() || !v.is_heap() {
+            out.push_str("undefined");
+            return;
+        }
+
+        let idx = v.heap_index();
+        if out.active.contains(&idx) {
+            out.push_str("[Circular]");
+            return;
+        }
+        out.active.push(idx);
+        self.inspect_heap_into(out, idx, nested, depth);
+        let popped = out.active.pop();
+        debug_assert_eq!(popped, Some(idx));
+    }
+
+    fn inspect_heap_into(&self, out: &mut InspectBuffer, idx: u32, nested: bool, depth: usize) {
+        match self.heap.get(idx) {
             HeapObj::Proxy { target, .. } => {
-                let t = *target;
-                return self.inspect_nested(t);
+                self.inspect_value_into(out, *target, true, depth + 1);
             }
             HeapObj::Temporal { kind: 0, fields } => {
                 // Duration fields store f64 BITS in the i64 slots.
                 let mut f = [0f64; 10];
-                for (i, s) in f.iter_mut().enumerate() {
-                    *s = f64::from_bits(*fields.get(i).unwrap_or(&0) as u64);
+                for (i, slot) in f.iter_mut().enumerate() {
+                    *slot = f64::from_bits(*fields.get(i).unwrap_or(&0) as u64);
                 }
-                format!("Temporal.Duration <{}>", duration_to_string(&f))
+                let _ = write!(out, "Temporal.Duration <{}>", duration_to_string(&f));
             }
             HeapObj::Temporal { kind: 1, fields } => {
-                format!(
+                let _ = write!(
+                    out,
                     "Temporal.PlainDate <{}>",
                     iso_date_string(fields[0], fields[1], fields[2])
-                )
+                );
             }
             HeapObj::Temporal { kind: 2, fields } => {
                 let mut f = [0i64; 6];
-                for (i, s) in f.iter_mut().enumerate() {
-                    *s = *fields.get(i).unwrap_or(&0);
+                for (i, slot) in f.iter_mut().enumerate() {
+                    *slot = *fields.get(i).unwrap_or(&0);
                 }
-                format!("Temporal.PlainTime <{}>", time_string(&f))
+                let _ = write!(out, "Temporal.PlainTime <{}>", time_string(&f));
             }
             HeapObj::Temporal { kind: 3, fields } => {
-                let g = |i: usize| *fields.get(i).unwrap_or(&0);
-                format!(
+                let get = |i: usize| *fields.get(i).unwrap_or(&0);
+                let _ = write!(
+                    out,
                     "Temporal.PlainDateTime <{}T{}>",
-                    iso_date_string(g(0), g(1), g(2)),
-                    time_string(&[g(3), g(4), g(5), g(6), g(7), g(8)])
-                )
+                    iso_date_string(get(0), get(1), get(2)),
+                    time_string(&[get(3), get(4), get(5), get(6), get(7), get(8)])
+                );
             }
             HeapObj::Temporal { kind: 4, fields } => {
                 let ns = ((fields[0] as i128) << 64) | ((fields[1] as u64) as i128);
-                format!("Temporal.Instant <{}>", instant_to_string(ns))
+                let _ = write!(out, "Temporal.Instant <{}>", instant_to_string(ns));
             }
             HeapObj::Temporal { kind: 5, fields } => {
-                format!(
+                let _ = write!(
+                    out,
                     "Temporal.PlainYearMonth <{}>",
                     year_month_string(fields[0], fields[1])
-                )
+                );
             }
             HeapObj::Temporal { kind: 6, fields } => {
-                format!("Temporal.PlainMonthDay <{:02}-{:02}>", fields[1], fields[2])
+                let _ = write!(
+                    out,
+                    "Temporal.PlainMonthDay <{:02}-{:02}>",
+                    fields[1], fields[2]
+                );
             }
             HeapObj::Temporal { kind: 7, .. } => {
-                format!(
-                    "Temporal.ZonedDateTime <{}>",
-                    self.zdt_to_string(v.heap_index())
-                )
+                let _ = write!(out, "Temporal.ZonedDateTime <{}>", self.zdt_to_string(idx));
             }
-            HeapObj::Temporal { .. } => "[object Temporal]".into(),
+            HeapObj::Temporal { .. } => {
+                out.push_str("[object Temporal]");
+            }
             HeapObj::Intl { kind, .. } => {
                 const NAMES: [&str; 10] = [
                     "NumberFormat",
@@ -2441,148 +3025,243 @@ impl<'p> Vm<'p> {
                     "DisplayNames",
                     "DurationFormat",
                 ];
-                format!(
-                    "Intl.{} {{}}",
-                    NAMES.get(*kind as usize).copied().unwrap_or("?")
-                )
+                let name = NAMES.get(*kind as usize).copied().unwrap_or("?");
+                let _ = write!(out, "Intl.{name} {{}}");
             }
-            HeapObj::Str(s) => format!("'{}'", s.as_str_lossy()),
-            HeapObj::Cons { .. } => {
-                let out = self
-                    .heap
-                    .str_cow(v.heap_index())
-                    .map(|c| c.into_owned())
-                    .unwrap_or_default();
-                format!("'{out}'")
+            HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                if nested {
+                    out.push_char('\'');
+                }
+                self.inspect_string_into(out, idx);
+                if nested {
+                    out.push_char('\'');
+                }
             }
-            HeapObj::Func(id) => self.func_label(*id),
-            HeapObj::Closure { func, .. } => self.func_label(*func),
-            HeapObj::Bound { .. } => "[Function: bound]".into(),
+            HeapObj::Func(fid) => self.inspect_function_label_into(out, *fid),
+            HeapObj::Closure { func, .. } => self.inspect_function_label_into(out, *func),
+            HeapObj::Bound { .. } => {
+                out.push_str("[Function: bound]");
+            }
             HeapObj::Wrapped { name, .. } => {
                 if name.is_empty() {
-                    "[Function (anonymous)]".into()
+                    out.push_str("[Function (anonymous)]");
                 } else {
-                    format!("[Function: {name}]")
+                    out.push_str("[Function: ");
+                    out.push_str(name);
+                    out.push_char(']');
                 }
             }
-            HeapObj::Native(_) | HeapObj::NativeClosure { .. } => "[Function (native)]".into(),
-            HeapObj::Cell(inner) => self.inspect_nested(*inner),
-            HeapObj::EvalScope(_) => "[object EvalScope]".into(),
+            HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
+                out.push_str("[Function (native)]");
+            }
+            HeapObj::Cell(inner) => {
+                self.inspect_value_into(out, *inner, true, depth + 1);
+            }
+            HeapObj::EvalScope(_) => {
+                out.push_str("[object EvalScope]");
+            }
             HeapObj::Array(items) => {
                 if items.is_empty() {
-                    return "[]".into();
+                    out.push_str("[]");
+                    return;
                 }
-                let parts: Vec<String> = items.iter().map(|e| self.inspect_nested(*e)).collect();
-                format!("[ {} ]", parts.join(", "))
+                out.push_str("[ ");
+                for (i, value) in items.iter().enumerate() {
+                    if i != 0 {
+                        out.push_str(", ");
+                    }
+                    self.inspect_value_into(out, *value, true, depth + 1);
+                    if out.truncated {
+                        break;
+                    }
+                }
+                out.push_str(" ]");
             }
             HeapObj::Object(map) => {
-                // A class instance prints with its constructor name (`Pt { … }`).
-                let prefix = match map.class {
-                    Some(cidx) => match self.heap.get(cidx) {
-                        HeapObj::Class(c) => format!("{} ", c.name),
-                        _ => String::new(),
-                    },
-                    None => String::new(),
-                };
+                // A class instance prints with its constructor name (`Pt { ... }`).
+                if let Some(class_idx) = map.class {
+                    if let HeapObj::Class(class) = self.heap.get(class_idx) {
+                        out.push_str(&class.name);
+                        out.push_char(' ');
+                    }
+                }
                 if map.keys.is_empty() {
-                    return format!("{prefix}{{}}");
+                    out.push_str("{}");
+                    return;
                 }
-                let parts: Vec<String> = map
-                    .keys
-                    .iter()
-                    .zip(map.vals.iter())
-                    .map(|(k, val)| format!("{k}: {}", self.inspect_nested(*val)))
-                    .collect();
-                format!("{prefix}{{ {} }}", parts.join(", "))
+                out.push_str("{ ");
+                for (i, (key, value)) in map.keys.iter().zip(map.vals.iter()).enumerate() {
+                    if i != 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(key);
+                    out.push_str(": ");
+                    self.inspect_value_into(out, *value, true, depth + 1);
+                    if out.truncated {
+                        break;
+                    }
+                }
+                out.push_str(" }");
             }
-            HeapObj::Class(c) => format!("[class {}]", c.name),
+            HeapObj::Class(class) => {
+                out.push_str("[class ");
+                out.push_str(&class.name);
+                out.push_char(']');
+            }
             HeapObj::Map { keys, vals } => {
+                let _ = write!(out, "Map({}) {{", keys.len());
                 if keys.is_empty() {
-                    return "Map(0) {}".into();
+                    out.push_char('}');
+                    return;
                 }
-                let parts: Vec<String> = keys
-                    .iter()
-                    .zip(vals.iter())
-                    .map(|(k, v)| {
-                        format!("{} => {}", self.inspect_nested(*k), self.inspect_nested(*v))
-                    })
-                    .collect();
-                format!("Map({}) {{ {} }}", keys.len(), parts.join(", "))
+                out.push_char(' ');
+                for (i, (key, value)) in keys.iter().zip(vals.iter()).enumerate() {
+                    if i != 0 {
+                        out.push_str(", ");
+                    }
+                    self.inspect_value_into(out, *key, true, depth + 1);
+                    out.push_str(" => ");
+                    self.inspect_value_into(out, *value, true, depth + 1);
+                    if out.truncated {
+                        break;
+                    }
+                }
+                out.push_str(" }");
             }
             HeapObj::Set(items) => {
+                let _ = write!(out, "Set({}) {{", items.len());
                 if items.is_empty() {
-                    return "Set(0) {}".into();
+                    out.push_char('}');
+                    return;
                 }
-                let parts: Vec<String> = items.iter().map(|v| self.inspect_nested(*v)).collect();
-                format!("Set({}) {{ {} }}", items.len(), parts.join(", "))
+                out.push_char(' ');
+                for (i, value) in items.iter().enumerate() {
+                    if i != 0 {
+                        out.push_str(", ");
+                    }
+                    self.inspect_value_into(out, *value, true, depth + 1);
+                    if out.truncated {
+                        break;
+                    }
+                }
+                out.push_str(" }");
             }
-            HeapObj::WeakMap { .. } => "WeakMap { <items unknown> }".into(),
-            HeapObj::WeakSet(_) => "WeakSet { <items unknown> }".into(),
-            HeapObj::WeakRef(_) => "WeakRef {}".into(),
-            HeapObj::FinalizationRegistry { .. } => "FinalizationRegistry {}".into(),
-            HeapObj::Iterator { .. } => "Object [Array Iterator] {}".into(),
-            HeapObj::IterHelper { .. } => "Object [Iterator Helper] {}".into(),
+            HeapObj::WeakMap { .. } => {
+                out.push_str("WeakMap { <items unknown> }");
+            }
+            HeapObj::WeakSet(_) => {
+                out.push_str("WeakSet { <items unknown> }");
+            }
+            HeapObj::WeakRef(_) => {
+                out.push_str("WeakRef {}");
+            }
+            HeapObj::FinalizationRegistry { .. } => {
+                out.push_str("FinalizationRegistry {}");
+            }
+            HeapObj::Iterator { .. } => {
+                out.push_str("Object [Array Iterator] {}");
+            }
+            HeapObj::IterHelper { .. } => {
+                out.push_str("Object [Iterator Helper] {}");
+            }
             HeapObj::Boxed { kind, value } => {
-                let inner = self.inspect_nested(*value);
-                match kind {
-                    0 => format!("[String: {inner}]"),
-                    1 => format!("[Number: {inner}]"),
-                    _ => format!("[Boolean: {inner}]"),
-                }
+                let prefix = match kind {
+                    0 => "[String: ",
+                    1 => "[Number: ",
+                    _ => "[Boolean: ",
+                };
+                out.push_str(prefix);
+                self.inspect_value_into(out, *value, true, depth + 1);
+                out.push_char(']');
             }
             HeapObj::Symbol { desc, .. } => {
-                let d = if *desc == Value::UNDEFINED {
-                    String::new()
-                } else {
-                    self.display(*desc)
-                };
-                format!("Symbol({d})")
+                out.push_str("Symbol(");
+                if *desc != Value::UNDEFINED {
+                    self.inspect_value_into(out, *desc, false, depth + 1);
+                }
+                out.push_char(')');
             }
             // console.log shows BigInt with the `n` suffix (1n), unlike ToString.
-            HeapObj::BigInt(n) => format!("{n}n"),
-            HeapObj::BigIntBig(b) => format!("{b}n"),
+            HeapObj::BigInt(n) => {
+                let _ = write!(out, "{n}n");
+            }
+            HeapObj::BigIntBig(big) => {
+                let _ = write!(out, "{big}n");
+            }
             HeapObj::RegExp { source, flags, .. } => {
-                let s = if source.is_empty() { "(?:)" } else { source };
-                format!("/{s}/{flags}")
+                out.push_char('/');
+                out.push_str(if source.is_empty() { "(?:)" } else { source });
+                out.push_char('/');
+                out.push_str(flags);
             }
             HeapObj::TypedArray { kind, length, .. } => {
-                let (name, n, idx) = (native::TA_KINDS[*kind as usize].0, *length, v.heap_index());
-                let parts: Vec<String> = (0..n).map(|i| self.ta_elem_string(idx, i)).collect();
-                if n == 0 {
-                    format!("{name}(0) []")
-                } else {
-                    format!("{name}({n}) [ {} ]", parts.join(", "))
+                let name = native::TA_KINDS[*kind as usize].0;
+                let len = *length;
+                let _ = write!(out, "{name}({len}) [");
+                if len == 0 {
+                    out.push_char(']');
+                    return;
                 }
+                out.push_char(' ');
+                for i in 0..len {
+                    if !out.consume_node() {
+                        break;
+                    }
+                    if i != 0 {
+                        out.push_str(", ");
+                    }
+                    let element = self.ta_elem_string(idx, i);
+                    out.push_str(&element);
+                    if out.truncated {
+                        break;
+                    }
+                }
+                out.push_str(" ]");
             }
             HeapObj::ArrayBuffer { data, .. } => {
-                format!("ArrayBuffer {{ byteLength: {} }}", data.len())
+                let _ = write!(out, "ArrayBuffer {{ byteLength: {} }}", data.len());
             }
             HeapObj::DataView { byte_length, .. } => {
-                format!("DataView {{ byteLength: {byte_length} }}")
+                let _ = write!(out, "DataView {{ byteLength: {byte_length} }}");
             }
-            HeapObj::Generator { .. } => "Object [Generator] {}".into(),
-            HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
+            HeapObj::Generator { .. } => {
+                out.push_str("Object [Generator] {}");
+            }
+            HeapObj::AsyncGenerator(_) => {
+                out.push_str("Object [AsyncGenerator] {}");
+            }
             HeapObj::Promise { state, result, .. } => match state {
-                crate::heap::PromiseState::Pending => "Promise { <pending> }".into(),
+                crate::heap::PromiseState::Pending => {
+                    out.push_str("Promise { <pending> }");
+                }
                 crate::heap::PromiseState::Fulfilled => {
-                    format!("Promise {{ {} }}", self.inspect_nested(*result))
+                    out.push_str("Promise { ");
+                    self.inspect_value_into(out, *result, true, depth + 1);
+                    out.push_str(" }");
                 }
                 crate::heap::PromiseState::Rejected => {
-                    format!("Promise {{ <rejected> {} }}", self.inspect_nested(*result))
+                    out.push_str("Promise { <rejected> ");
+                    self.inspect_value_into(out, *result, true, depth + 1);
+                    out.push_str(" }");
                 }
             },
-            HeapObj::BoundResolver { .. } => "[Function (anonymous)]".into(),
+            HeapObj::BoundResolver { .. } => {
+                out.push_str("[Function (anonymous)]");
+            }
             // Internal: never user-visible (an async call yields its Promise).
-            HeapObj::AsyncState(_) => "Promise { <pending> }".into(),
+            HeapObj::AsyncState(_) => {
+                out.push_str("Promise { <pending> }");
+            }
             HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
-                "[object Object]".into()
+                out.push_str("[object Object]");
             }
             // node renders a Date in console.log as its ISO string (unquoted).
             HeapObj::Date(ms) => {
                 if ms.is_nan() {
-                    "Invalid Date".into()
+                    out.push_str("Invalid Date");
                 } else {
-                    date_to_iso(*ms)
+                    let iso = date_to_iso(*ms);
+                    out.push_str(&iso);
                 }
             }
         }
@@ -2674,6 +3353,58 @@ pub(crate) fn cmp_i128_f64(x: i128, y: f64) -> Option<std::cmp::Ordering> {
         Ordering::Equal if y > yf => Ordering::Less, // x == floor(y) < y
         ord => ord,
     })
+}
+
+#[cfg(test)]
+mod display_safety_tests {
+    use super::*;
+
+    fn program(source: &str) -> Program {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        crate::compile::compile_program(&ast, source).expect("source compiles")
+    }
+
+    #[test]
+    fn cyclic_array_display_is_total_and_matches_join_semantics() {
+        let program = program("var x = 0;");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+
+        let idx = vm.heap.alloc(HeapObj::Array(Vec::new()));
+        let value = Value::heap(idx);
+        match vm.heap.get_mut(idx) {
+            HeapObj::Array(items) => items.extend([Value::int(1), value, Value::int(2)]),
+            _ => unreachable!(),
+        }
+        assert_eq!(vm.display(value), "1,,2");
+    }
+
+    #[test]
+    fn excessive_display_graph_depth_fails_without_native_recursion_overflow() {
+        let program = program("var x = 0;");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+
+        let mut value = Value::int(1);
+        for _ in 0..=DISPLAY_MAX_DEPTH {
+            value = Value::heap(vm.heap.alloc(HeapObj::Array(vec![value])));
+        }
+        assert!(vm.display_checked(value).is_err());
+        assert_eq!(vm.display(value), DISPLAY_LIMIT_MARKER);
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    #[test]
+    fn aliased_large_strings_cannot_amplify_transient_display_allocations() {
+        let program = program("var x = 0;");
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+
+        let large = Value::heap(vm.heap.alloc_str("x".repeat(MAX_STRING_BYTES / 2 + 1)));
+        let array = Value::heap(vm.heap.alloc(HeapObj::Array(vec![large, large])));
+        assert!(vm.display_checked(array).is_err());
+        assert_eq!(vm.display(array), DISPLAY_LIMIT_MARKER);
+    }
 }
 
 #[cfg(test)]
@@ -3002,6 +3733,32 @@ mod str_append_ascii_char_tests {
         );
         assert_eq!(vm.display(acc), before);
     }
+
+    #[cfg(feature = "safe-sandbox")]
+    #[test]
+    fn optimized_append_paths_stop_at_the_safe_string_ceiling_without_mutation() {
+        let mut vm = vm();
+
+        for rhs in [Value::heap(b'x' as u32), Value::int(42), Value::TRUE] {
+            let acc = mutable_str(&mut vm, &"a".repeat(MAX_STRING_UNITS));
+            assert_eq!(vm.str_append_inplace(acc, rhs), None);
+            assert_eq!(vm.heap.str_units(acc.heap_index()), Some(MAX_STRING_UNITS));
+            assert!(vm.add_values(acc, rhs).is_err());
+            assert_eq!(vm.heap.str_units(acc.heap_index()), Some(MAX_STRING_UNITS));
+        }
+
+        let acc = mutable_str(&mut vm, &"a".repeat(MAX_STRING_UNITS));
+        let rhs = mutable_str(&mut vm, "tail");
+        assert_eq!(vm.str_append_inplace(acc, rhs), None);
+        assert_eq!(vm.heap.str_units(acc.heap_index()), Some(MAX_STRING_UNITS));
+
+        let self_alias = mutable_str(&mut vm, &"a".repeat(MAX_STRING_UNITS));
+        assert_eq!(vm.str_append_inplace(self_alias, self_alias), None);
+        assert_eq!(
+            vm.heap.str_units(self_alias.heap_index()),
+            Some(MAX_STRING_UNITS)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3046,6 +3803,22 @@ mod str_append_index_ascii_tests {
             }
             other => panic!("builder changed kind: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    #[test]
+    fn indexed_ascii_append_stops_at_the_safe_string_ceiling() {
+        let mut vm = vm();
+        let source = Value::heap(b'x' as u32);
+        let out = flat(
+            &mut vm,
+            crate::heap::JsStr::new("a".repeat(MAX_STRING_UNITS)),
+        );
+        assert_eq!(
+            vm.str_append_index_ascii_fast(out, source, Value::int(0)),
+            None
+        );
+        assert_eq!(vm.heap.str_units(out.heap_index()), Some(MAX_STRING_UNITS));
     }
 
     #[test]
@@ -3125,6 +3898,107 @@ mod str_append_index_ascii_tests {
         assert!(vm.str_append_index_reserve_allowed());
         vm.set_instrumentation(crate::vm::instrument::Recorder::new());
         assert!(!vm.str_append_index_reserve_allowed());
+    }
+}
+
+#[cfg(test)]
+mod inspect_bounds_tests {
+    use super::{INSPECT_MAX_BYTES, INSPECT_TRUNCATION_MARKER};
+
+    fn run_ok(src: &str) -> Vec<String> {
+        let outcome = crate::run(src).expect("source compiles");
+        assert!(
+            outcome.error.is_none(),
+            "unexpected runtime error: {:?}",
+            outcome.error
+        );
+        outcome.output
+    }
+
+    #[test]
+    fn ordinary_console_shapes_are_preserved() {
+        let output = run_ok(
+            r#"
+            console.log("top");
+            console.log([1, "x", true]);
+            console.log({ a: 1, b: "x" });
+            console.log(new Uint8Array([1, 2, 255]));
+            "#,
+        );
+        assert_eq!(
+            output,
+            [
+                "top",
+                "[ 1, 'x', true ]",
+                "{ a: 1, b: 'x' }",
+                "Uint8Array(3) [ 1, 2, 255 ]",
+            ]
+        );
+    }
+
+    #[test]
+    fn cycles_stop_but_shared_siblings_render_normally() {
+        let output = run_ok(
+            r#"
+            const array = [];
+            array[0] = array;
+            console.log(array);
+
+            const object = {};
+            object.self = object;
+            console.log(object);
+
+            const shared = { v: 1 };
+            console.log([shared, shared]);
+            "#,
+        );
+        assert_eq!(
+            output,
+            [
+                "[ [Circular] ]",
+                "{ self: [Circular] }",
+                "[ { v: 1 }, { v: 1 } ]",
+            ]
+        );
+    }
+
+    #[test]
+    fn depth_and_node_limits_truncate_hostile_values() {
+        let output = run_ok(
+            r#"
+            let deep = 0;
+            for (let i = 0; i < 64; i++) deep = [deep];
+            console.log(deep);
+            console.log(new Uint8Array(5000));
+            "#,
+        );
+        assert!(output[0].contains("[MaxDepth]"), "{}", output[0]);
+        assert!(
+            output[1].starts_with("Uint8Array(5000) [ 0, 0, "),
+            "{}",
+            output[1]
+        );
+        assert!(output[1].ends_with(INSPECT_TRUNCATION_MARKER));
+        assert!(output[1].len() < INSPECT_MAX_BYTES);
+    }
+
+    #[test]
+    fn byte_limit_keeps_utf8_valid_and_reserves_one_marker() {
+        let output = run_ok(
+            "console.log('\u{e9}'.repeat(70000));\n\
+             console.log('x'.repeat(40000), 'y'.repeat(40000));\n\
+             const indirect = print; indirect(...Array(5000).fill('z'));",
+        );
+        let unicode = &output[0];
+        assert!(unicode.len() <= INSPECT_MAX_BYTES);
+        assert!(unicode.ends_with(INSPECT_TRUNCATION_MARKER));
+        assert!(unicode[..unicode.len() - INSPECT_TRUNCATION_MARKER.len()]
+            .chars()
+            .all(|ch| ch == '\u{e9}'));
+        for line in &output[1..] {
+            assert!(line.len() <= INSPECT_MAX_BYTES, "{}", line.len());
+            assert!(line.ends_with(INSPECT_TRUNCATION_MARKER));
+        }
     }
 }
 

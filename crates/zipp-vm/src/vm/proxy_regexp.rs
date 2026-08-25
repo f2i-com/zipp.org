@@ -7,6 +7,15 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Convert an already-ToLength-clamped integer to a host index without the
+/// wasm32 `u64 as usize` wraparound. RegExp search indices beyond the largest
+/// host-addressable string index are semantically just out of range, so
+/// saturation is the useful representation here.
+#[inline]
+fn host_index_saturating(value: i64) -> usize {
+    usize::try_from(value.max(0) as u64).unwrap_or(usize::MAX)
+}
+
 /// The prototype/constructor half of `regexp_matchall_fast_ok`, resolved to
 /// SLOT INDICES (B68 item 2). The full gate re-found `flags`/`exec`/
 /// `constructor`/`@@match` on the ~20-key %RegExp.prototype% plus `@@species`
@@ -818,36 +827,70 @@ impl<'p> Vm<'p> {
     /// EscapeRegExpPattern: render `source` so it round-trips between two `/`
     /// delimiters — escape a bare `/` and the line terminators, pass `\x` pairs
     /// through verbatim, and map the empty pattern to `(?:)`.
-    pub(crate) fn escaped_source(&self, source: &str) -> String {
+    pub(crate) fn escaped_source(&self, source: &str) -> Result<String, Thrown> {
         if source.is_empty() {
-            return "(?:)".to_string();
+            return Ok("(?:)".to_string());
         }
-        let chars: Vec<char> = source.chars().collect();
+        let checked_add = |total: usize, additional: usize| {
+            total
+                .checked_add(additional)
+                .filter(|&n| n <= MAX_STRING_BYTES)
+                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))
+        };
+        let mut total = 0usize;
+        let mut chars = source.chars().peekable();
+        let mut in_class = false;
+        while let Some(c) = chars.next() {
+            let additional = if c == '\\' && chars.peek().is_some() {
+                let next = chars.next().expect("peeked character exists");
+                1 + match next {
+                    '\n' | '\r' => 1,
+                    '\u{2028}' | '\u{2029}' => 5,
+                    other => other.len_utf8(),
+                }
+            } else {
+                match c {
+                    '[' => {
+                        in_class = true;
+                        1
+                    }
+                    ']' => {
+                        in_class = false;
+                        1
+                    }
+                    '/' if !in_class => 2,
+                    '\n' | '\r' => 2,
+                    '\u{2028}' | '\u{2029}' => 6,
+                    _ => c.len_utf8(),
+                }
+            };
+            total = checked_add(total, additional)?;
+        }
         let mut out = String::new();
-        let mut i = 0;
+        out.try_reserve_exact(total)
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
         // A `/` inside a character class needs no escape — RegularExpressionClassChar
         // admits it literally — and escaping it there made `new RegExp("[/]").source`
         // report `[\/]`. An unescaped `[` opens the class and the next unescaped `]`
         // closes it (classes do not nest for this purpose: `/[[]/]/` really does end
         // its class at the first `]`).
         let mut in_class = false;
-        while i < chars.len() {
-            let c = chars[i];
-            if c == '\\' && i + 1 < chars.len() {
+        let mut chars = source.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' && chars.peek().is_some() {
                 // An escape pair passes through UNCHANGED — except that the
                 // escaped character may itself be a raw LineTerminator, and
                 // EscapeRegExpPattern's whole job is that `eval("/" + source +
                 // "/")` re-parses. Emitting `\` + a literal LF produced an
                 // unterminated regular expression.
                 out.push('\\');
-                match chars[i + 1] {
+                match chars.next().expect("peeked character exists") {
                     '\n' => out.push_str("n"),
                     '\r' => out.push_str("r"),
                     '\u{2028}' => out.push_str("u2028"),
                     '\u{2029}' => out.push_str("u2029"),
                     other => out.push(other),
                 }
-                i += 2;
                 continue;
             }
             match c {
@@ -866,9 +909,9 @@ impl<'p> Vm<'p> {
                 '\u{2029}' => out.push_str("\\u2029"),
                 _ => out.push(c),
             }
-            i += 1;
         }
-        out
+        debug_assert_eq!(out.len(), total);
+        Ok(out)
     }
 
     /// WTF-8 twin of [`escaped_source`], for a pattern holding lone surrogates
@@ -878,21 +921,53 @@ impl<'p> Vm<'p> {
     /// constructor. A lone surrogate passes through as itself (the spec's
     /// EscapeRegExpPattern leaves it untouched), which `escaped_source` could
     /// never produce from its lossy `&str` view.
-    pub(crate) fn escaped_source_wtf8(&self, bytes: &[u8]) -> Vec<u8> {
+    pub(crate) fn escaped_source_wtf8(&self, bytes: &[u8]) -> Result<Vec<u8>, Thrown> {
         if bytes.is_empty() {
-            return b"(?:)".to_vec();
+            return Ok(b"(?:)".to_vec());
         }
-        let cps: Vec<u32> = crate::heap::wtf8_code_points(bytes).collect();
-        let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 4);
-        let mut i = 0;
+        let cp_len = |cp: u32| match cp {
+            0..=0x7f => 1,
+            0x80..=0x7ff => 2,
+            0x800..=0xffff => 3,
+            _ => 4,
+        };
+        let mut total = 0usize;
+        let mut cps = crate::heap::wtf8_code_points(bytes).peekable();
+        let mut in_class = false;
+        while let Some(c) = cps.next() {
+            let additional = if c == u32::from('\\') && cps.peek().is_some() {
+                cp_len(c) + cp_len(cps.next().expect("peeked code point exists"))
+            } else {
+                match c {
+                    0x5B => {
+                        in_class = true;
+                        1
+                    }
+                    0x5D => {
+                        in_class = false;
+                        1
+                    }
+                    0x2F if !in_class => 2,
+                    0x0A | 0x0D => 2,
+                    0x2028 | 0x2029 => 6,
+                    _ => cp_len(c),
+                }
+            };
+            total = total
+                .checked_add(additional)
+                .filter(|&n| n <= MAX_STRING_BYTES)
+                .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+        }
+        let mut out: Vec<u8> = Vec::new();
+        out.try_reserve_exact(total)
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
         // Same character-class rule as `escaped_source`: `/` is literal inside `[…]`.
         let mut in_class = false;
-        while i < cps.len() {
-            let c = cps[i];
-            if c == u32::from('\\') && i + 1 < cps.len() {
+        let mut cps = crate::heap::wtf8_code_points(bytes).peekable();
+        while let Some(c) = cps.next() {
+            if c == u32::from('\\') && cps.peek().is_some() {
                 crate::heap::wtf8_push_cp(&mut out, c);
-                crate::heap::wtf8_push_cp(&mut out, cps[i + 1]);
-                i += 2;
+                crate::heap::wtf8_push_cp(&mut out, cps.next().expect("peeked code point exists"));
                 continue;
             }
             match c {
@@ -911,22 +986,26 @@ impl<'p> Vm<'p> {
                 0x2029 => out.extend_from_slice(b"\\u2029"),
                 _ => crate::heap::wtf8_push_cp(&mut out, c),
             }
-            i += 1;
         }
-        out
+        debug_assert_eq!(out.len(), total);
+        Ok(out)
     }
 
     /// The `source` string Value for the RegExp at `idx` whose lossy escaped
     /// source is `src`: exact-WTF-8 when the side table has the pattern's
     /// exact bytes (lone surrogates round-trip), else the plain lossy string.
-    pub(crate) fn regexp_source_value(&mut self, idx: u32, src: &str) -> Value {
+    pub(crate) fn regexp_source_value(&mut self, idx: u32, src: &str) -> Result<Value, Thrown> {
         if let Some(b) = self.regexp_exact_source.get(&idx) {
-            let esc = self.escaped_source_wtf8(b);
+            self.preflight_native_iteration_work((b.len() as u64).saturating_mul(2))?;
+            let esc = self.escaped_source_wtf8(b)?;
+            self.preflight_guest_string_size(esc.len())?;
             let js = crate::heap::JsStr::from_wtf8(esc);
-            return Value::heap(self.heap.alloc_js(js));
+            return Ok(Value::heap(self.heap.alloc_js(js)));
         }
-        let s = self.escaped_source(src);
-        self.alloc_str(s)
+        self.preflight_native_iteration_work((src.len() as u64).saturating_mul(2))?;
+        let s = self.escaped_source(src)?;
+        self.preflight_guest_string_size(s.len())?;
+        Ok(self.alloc_str(s))
     }
 
     /// RegExp.prototype[Symbol.search] core: reset lastIndex to 0, exec, restore
@@ -990,15 +1069,21 @@ impl<'p> Vm<'p> {
         // Collect all exec results through the exec protocol (honouring user `exec`).
         let mut results: Vec<Value> = Vec::new();
         let mut guard = 0u32;
+        let mut native_work = 0u64;
         loop {
             guard += 1;
             if guard > 5_000_000 {
                 break;
             }
+            native_work = native_work.saturating_add(1);
+            self.preflight_native_iteration_work(native_work)?;
             let result = self.regexp_exec_abstract(rx.heap_index(), s_val)?;
             if result == Value::NULL {
                 break;
             }
+            results.try_reserve(1).map_err(|_| {
+                Thrown("RangeError: RegExp replacement result allocation failed".into())
+            })?;
             results.push(result);
             if !global {
                 break;
@@ -1008,7 +1093,9 @@ impl<'p> Vm<'p> {
             if self.to_js_string(match0)?.is_empty() {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 // ToLength: clamp to 2^53-1 BEFORE the advance.
-                let this_index = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+                let this_index = host_index_saturating(
+                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1),
+                );
                 let next = advance_string_index(&u16s, this_index, full_unicode);
                 self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
@@ -1018,8 +1105,14 @@ impl<'p> Vm<'p> {
         let mut accumulated: Vec<u8> = Vec::new();
         let mut next_pos: usize = 0;
         for result in results {
+            native_work = native_work.saturating_add(1);
+            self.preflight_native_iteration_work(native_work)?;
             let len_v = self.get_prop(result, "length")?;
-            let n_captures = (self.to_integer_or_zero(len_v)?.max(0) as usize).saturating_sub(1);
+            let n_captures_u64 = (self.to_integer_or_zero(len_v)?.max(0) as u64).saturating_sub(1);
+            native_work = native_work.saturating_add(n_captures_u64);
+            self.preflight_native_iteration_work(native_work)?;
+            let n_captures = usize::try_from(n_captures_u64)
+                .map_err(|_| Thrown("RangeError: RegExp capture list is too large".into()))?;
             let matched_v = self.get_prop(result, "0")?;
             // ToString(Get(result,"0")) — IDENTITY for a string value; its UNIT
             // length determines how far this match consumes the subject.
@@ -1027,7 +1120,10 @@ impl<'p> Vm<'p> {
             let match_len = self.heap.str_units(matched_val.heap_index()).unwrap_or(0);
             let pos_v = self.get_prop(result, "index")?;
             let position = self.to_integer_or_zero(pos_v)?.clamp(0, length_s as i64) as usize;
-            let mut captures: Vec<Option<String>> = Vec::with_capacity(n_captures);
+            let mut captures: Vec<Option<String>> = Vec::new();
+            captures
+                .try_reserve_exact(n_captures)
+                .map_err(|_| Thrown("RangeError: RegExp capture-list allocation failed".into()))?;
             for n in 1..=n_captures {
                 let cap_v = self.get_prop(result, &n.to_string())?;
                 captures.push(if cap_v == Value::UNDEFINED {
@@ -1041,7 +1137,13 @@ impl<'p> Vm<'p> {
             // Replacement bytes (WTF-8): the functional path appends a returned
             // string's EXACT bytes; the template path expands over lossy views.
             let replacement: Vec<u8> = if functional {
-                let mut argv: Vec<Value> = Vec::with_capacity(n_captures + 4);
+                let argv_len = n_captures.checked_add(4).ok_or_else(|| {
+                    Thrown("RangeError: RegExp replacement argument list is too large".into())
+                })?;
+                let mut argv: Vec<Value> = Vec::new();
+                argv.try_reserve_exact(argv_len).map_err(|_| {
+                    Thrown("RangeError: RegExp replacement argument allocation failed".into())
+                })?;
                 argv.push(matched_val);
                 for c in &captures {
                     argv.push(match c {
@@ -1111,13 +1213,13 @@ impl<'p> Vm<'p> {
                     named_defined,
                     &pre,
                     &post,
-                    (1usize << 28).saturating_sub(accumulated.len()),
+                    MAX_STRING_BYTES.saturating_sub(accumulated.len()),
                 )?
                 .into_bytes()
             };
             if position >= next_pos {
                 push_units(&mut accumulated, &u16s[next_pos..position]);
-                if replacement.len() > (1usize << 28).saturating_sub(accumulated.len()) {
+                if replacement.len() > MAX_STRING_BYTES.saturating_sub(accumulated.len()) {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
                 crate::heap::wtf8_push(&mut accumulated, &replacement);
@@ -1199,11 +1301,14 @@ impl<'p> Vm<'p> {
         self.set_prop(rx, "lastIndex", Value::int(0), false)?;
         let mut elems: Vec<Value> = Vec::new();
         let mut guard = 0u32;
+        let mut native_work = 0u64;
         loop {
             guard += 1;
             if guard > 5_000_000 {
                 break;
             }
+            native_work = native_work.saturating_add(1);
+            self.preflight_native_iteration_work(native_work)?;
             let result = self.regexp_exec_abstract(re, s_val)?;
             if result == Value::NULL {
                 break;
@@ -1213,11 +1318,16 @@ impl<'p> Vm<'p> {
             // lone-surrogate match survives into the result array.
             let m0_val = self.to_str_value(m0)?;
             let is_empty = self.heap.str_units(m0_val.heap_index()) == Some(0);
+            elems
+                .try_reserve(1)
+                .map_err(|_| Thrown("RangeError: RegExp match-result allocation failed".into()))?;
             elems.push(m0_val);
             if is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 // ToLength: clamp to 2^53-1 BEFORE the advance.
-                let this_index = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+                let this_index = host_index_saturating(
+                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1),
+                );
                 let next = advance_string_index(&u16s, this_index, full_unicode);
                 self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
@@ -1305,11 +1415,14 @@ impl<'p> Vm<'p> {
         let mut p: usize = 0;
         let mut q: usize = 0;
         let mut guard = 0u32;
+        let mut native_work = 0u64;
         while q < size {
             guard += 1;
             if guard > 5_000_000 {
                 break;
             }
+            native_work = native_work.saturating_add(1);
+            self.preflight_native_iteration_work(native_work)?;
             self.set_prop(splitter, "lastIndex", Value::num(q as f64), true)?;
             let z = self.regexp_exec_abstract(splitter.heap_index(), s_val)?;
             if z == Value::NULL {
@@ -1318,7 +1431,7 @@ impl<'p> Vm<'p> {
             }
             // e = min(ToLength(Get(splitter,"lastIndex")), size).
             let li_v = self.get_prop(splitter, "lastIndex")?;
-            let e = (self.to_integer_or_zero(li_v)?.max(0) as usize).min(size);
+            let e = (self.to_integer_or_zero(li_v)?.max(0) as u64).min(size as u64) as usize;
             if e == p {
                 q = advance_string_index(&u16s, q, unicode_matching);
                 continue;
@@ -1331,7 +1444,15 @@ impl<'p> Vm<'p> {
             p = e;
             // Each capturing group (1..n) is emitted between the pieces.
             let zlen_v = self.get_prop(z, "length")?;
-            let n_captures = (self.to_integer_or_zero(zlen_v)?.max(0) as usize).saturating_sub(1);
+            let n_captures_u64 = (self.to_integer_or_zero(zlen_v)?.max(0) as u64).saturating_sub(1);
+            // Only captures that fit before `limit` are observable; charge and
+            // convert exactly that many so a huge declared length cannot wrap
+            // on wasm32, while a small limit retains its early-return behavior.
+            let n_captures_u64 = n_captures_u64.min(lim.saturating_sub(a.len() as u64));
+            native_work = native_work.saturating_add(n_captures_u64);
+            self.preflight_native_iteration_work(native_work)?;
+            let n_captures = usize::try_from(n_captures_u64)
+                .map_err(|_| Thrown("RangeError: RegExp capture list is too large".into()))?;
             for i in 1..=n_captures {
                 let cap = self.get_prop(z, &i.to_string())?;
                 a.push(cap);
@@ -1496,7 +1617,7 @@ impl<'p> Vm<'p> {
             _ => {
                 return Err(Thrown(
                     "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
-                ))
+                ));
             }
         };
         // ToLength(Get(R,"lastIndex")) is RegExpBuiltinExec step 4 and it
@@ -1506,7 +1627,7 @@ impl<'p> Vm<'p> {
         // flag bits used to be fused into the same heap.get as the slot, so a
         // recompile that added `g` never updated lastIndex and one that dropped
         // `y` still clobbered it.
-        let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+        let li = host_index_saturating(self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1));
         let (global, sticky, has_indices, unicode) = match prebits {
             // Pre-decoded at iterator creation (B118): `lastIndex` was a
             // number (checked by the caller), so no user code ran above and
@@ -1550,7 +1671,7 @@ impl<'p> Vm<'p> {
                 _ => {
                     return Err(Thrown(
                         "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
-                    ))
+                    ));
                 }
             },
         };
@@ -2535,9 +2656,21 @@ impl<'p> Vm<'p> {
                     rflags.as_str(),
                 )
                 .ok()
-                .map(std::sync::Arc::new);
+                .and_then(|program| {
+                    // The twin is an optional optimisation: a per-program cap
+                    // decline falls back to the authoritative compile without
+                    // changing RegExp semantics. A heap preflight failure still
+                    // latches the recorder's terminal resource status.
+                    self.preflight_regex_program(&program)
+                        .is_ok()
+                        .then(|| std::sync::Arc::new(program))
+                });
                 if let (Some(k), Some(rc)) = (cache_key, compiled.as_ref()) {
-                    if self.regex_compile_cache.len() >= 512 {
+                    #[cfg(feature = "safe-sandbox")]
+                    const REGEX_TWIN_CACHE_LIMIT: usize = 32;
+                    #[cfg(not(feature = "safe-sandbox"))]
+                    const REGEX_TWIN_CACHE_LIMIT: usize = 512;
+                    if self.regex_compile_cache.len() >= REGEX_TWIN_CACHE_LIMIT {
                         self.regex_compile_cache.clear();
                     }
                     self.regex_compile_cache.insert(k, rc.clone());
@@ -3812,7 +3945,9 @@ impl<'p> Vm<'p> {
                     // ToLength(Get(R,"lastIndex")) — a throwing
                     // lastIndex.valueOf must propagate, not be swallowed; the
                     // 2^53-1 clamp applies BEFORE the advance.
-                    let cur = self.to_integer_or_zero(cur_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+                    let cur = host_index_saturating(
+                        self.to_integer_or_zero(cur_v)?.clamp(0, (1i64 << 53) - 1),
+                    );
                     let next = self.advance_index_on_value(string, cur, full_unicode);
                     self.set_regexp_last_index(regexp, next);
                 }
@@ -3838,14 +3973,16 @@ impl<'p> Vm<'p> {
         if unicode && s.is_heap() {
             self.heap.flatten(s.heap_index());
             if let HeapObj::Str(js) = self.heap.get(s.heap_index()) {
-                if let (Some(hi), Some(lo)) = (js.unit_at(index), js.unit_at(index + 1)) {
+                if let (Some(hi), Some(lo)) =
+                    (js.unit_at(index), js.unit_at(index.saturating_add(1)))
+                {
                     if (0xD800..=0xDBFF).contains(&hi) && (0xDC00..=0xDFFF).contains(&lo) {
-                        return index + 2;
+                        return index.saturating_add(2);
                     }
                 }
             }
         }
-        index + 1
+        index.saturating_add(1)
     }
 
     /// Regex-backed `String.prototype.replace`/`replaceAll`. `repl` is a function
@@ -3968,7 +4105,7 @@ impl<'p> Vm<'p> {
                     .str_wtf8_cow(rv.heap_index())
                     .map(|c| c.into_owned())
                     .unwrap_or_default();
-                if bytes.len() > (1usize << 28).saturating_sub(out.len()) {
+                if bytes.len() > MAX_STRING_BYTES.saturating_sub(out.len()) {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
                 crate::heap::wtf8_push(&mut out, &bytes);
@@ -3996,7 +4133,7 @@ impl<'p> Vm<'p> {
                     !named.is_empty(),
                     &String::from_utf16_lossy(&u16s[..st]),
                     &String::from_utf16_lossy(&u16s[en..]),
-                    (1usize << 28).saturating_sub(out.len()),
+                    MAX_STRING_BYTES.saturating_sub(out.len()),
                 )?;
                 crate::heap::wtf8_push(&mut out, rep.as_bytes());
             }
@@ -4133,7 +4270,7 @@ impl<'p> Vm<'p> {
                     .str_wtf8_cow(rv.heap_index())
                     .map(|c| c.into_owned())
                     .unwrap_or_default();
-                if bytes.len() > (1usize << 28).saturating_sub(out.len()) {
+                if bytes.len() > MAX_STRING_BYTES.saturating_sub(out.len()) {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
                 crate::heap::wtf8_push(&mut out, &bytes);
@@ -4156,7 +4293,7 @@ impl<'p> Vm<'p> {
                     !named.is_empty(),
                     &subject[..st],
                     &subject[en..],
-                    (1usize << 28).saturating_sub(out.len()),
+                    MAX_STRING_BYTES.saturating_sub(out.len()),
                 )?;
                 crate::heap::wtf8_push(&mut out, rep.as_bytes());
             }
@@ -4272,13 +4409,13 @@ pub(crate) fn push_units(out: &mut Vec<u8>, units: &[u16]) {
 /// by a low surrogate (one astral code point).
 pub(crate) fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
     if unicode
-        && index + 1 < units.len()
+        && index.saturating_add(1) < units.len()
         && (0xD800..=0xDBFF).contains(&units[index])
         && (0xDC00..=0xDFFF).contains(&units[index + 1])
     {
-        index + 2
+        index.saturating_add(2)
     } else {
-        index + 1
+        index.saturating_add(1)
     }
 }
 

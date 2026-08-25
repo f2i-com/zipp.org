@@ -107,6 +107,7 @@ pub struct ScriptState {
     /// — before the `Program` it borrows is freed.
     vm: Option<Vm<'static>>,
     /// Owning pointer to the leaked `Program`. Freed in `Drop`, after `vm`.
+    #[cfg(not(feature = "safe-sandbox"))]
     program: *mut Program,
 }
 
@@ -123,10 +124,14 @@ pub fn compile_script(src: &str) -> Result<ScriptState, String> {
     // Leak, hand the `&'static` to the VM, and keep the raw pointer so `Drop`
     // can reclaim it. See the invariant on `ScriptState`.
     let leaked: &'static mut Program = Box::leak(Box::new(program));
+    #[cfg(feature = "safe-sandbox")]
+    let mut vm = Vm::new(&*leaked);
+    #[cfg(not(feature = "safe-sandbox"))]
     let program = leaked as *mut Program;
     // SAFETY: `leaked` is a live, uniquely-owned allocation; reborrowing it as
     // shared for the VM is fine because `program` is only dereferenced again in
     // `Drop`, after the VM (the sole holder of the shared borrow) is gone.
+    #[cfg(not(feature = "safe-sandbox"))]
     let mut vm = Vm::new(unsafe { &*program });
     // No test262 host object for embedded code. `$262.agent.start()` spawns a
     // detached OS thread running its own VM — outside any budget, abort flag,
@@ -137,6 +142,7 @@ pub fn compile_script(src: &str) -> Result<ScriptState, String> {
     vm.host_262 = false;
     Ok(ScriptState {
         vm: Some(vm),
+        #[cfg(not(feature = "safe-sandbox"))]
         program,
     })
 }
@@ -405,15 +411,14 @@ impl ScriptState {
         }
     }
 
-    /// Approximate resident heap, in bytes.
+    /// Payload-aware resident heap estimate, in bytes.
     ///
-    /// Slot count times the size of a heap object. Slots are never returned to
-    /// the allocator once claimed, so this is a HIGH-WATER figure — the peak the
-    /// script reached, not what it holds now — which is the more useful number
-    /// for a host reporting resource use, and the one a limit would be set
-    /// against. It counts the object table only: a string or array payload
-    /// lives in its own allocation and is not included, so treat this as an
-    /// indicator rather than an accounting of every byte.
+    /// This includes retained capacities for the object table, strings, arrays,
+    /// ArrayBuffers, property maps, collections, suspended activations, GC side
+    /// tables, and Arc-deduplicated compiled regular-expression programs. It
+    /// remains an estimate: allocator metadata and opaque dependency internals
+    /// are not all introspectable. Hosts requiring a hard memory boundary must
+    /// additionally cap a worker process/container or WebAssembly linear memory.
     pub fn heap_bytes(&self) -> usize {
         self.vm.as_ref().map_or(0, |vm| vm.heap_bytes())
     }
@@ -608,6 +613,7 @@ impl ScriptState {
     }
 }
 
+#[cfg(not(feature = "safe-sandbox"))]
 impl Drop for ScriptState {
     fn drop(&mut self) {
         // Order is the whole point: the VM borrows the `Program`, so it must be

@@ -2356,6 +2356,10 @@ impl<'p> Vm<'p> {
                 }
             };
             let kvals = self.array_snapshot(karr.heap_index());
+            if let Err(Thrown(msg)) = self.preflight_native_iteration_work(kvals.len() as u64) {
+                self.reject_with_thrown(result, &msg);
+                return Ok(Value::heap(result));
+            }
             let mut vals = Vec::with_capacity(kvals.len());
             for kv in kvals {
                 let ks = self.key_of(kv);
@@ -2473,6 +2477,7 @@ impl<'p> Vm<'p> {
                 cap_reject,
                 keys: comb_keys,
             })));
+        let mut native_work = 0u64;
         loop {
             // Array iteration does NOT skip holes: it performs Get(array,
             // index), so an inherited numeric property or accessor may supply
@@ -2517,6 +2522,17 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            native_work = native_work.saturating_add(1);
+            if let Err(Thrown(msg)) = self.preflight_native_iteration_work(native_work) {
+                let err = self.alloc_error_from_message(&msg);
+                if fast_pos.is_none() {
+                    let saved = self.pending_throw;
+                    let _ = self.iterator_close(iter);
+                    self.pending_throw = saved;
+                }
+                self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
+                return Ok(Value::heap(result));
+            }
             // DEMOTE before any per-element path that could run user code: a
             // non-intrinsic resolve/constructor, or a heap OBJECT value that
             // is not a plain promise (its constructor Get / thenable `then`
@@ -3287,28 +3303,33 @@ impl<'p> Vm<'p> {
                 }
             }
             let now = crate::vm::clock::Instant::now();
-            // Fire due timers (FIFO among due ones by due-time order).
-            //
-            // Firing ORDER and removal ORDER are different orders and must not
-            // share a list: callbacks run earliest-due-first, but `Vec::remove`
-            // is only index-safe from the back. Sorting one list by due time and
-            // then removing through it in reverse assumed due-time order implied
-            // index order; it does not, so a timer queued earlier but due LATER
-            // (`race([sleep(9), sleep(5)])`) removed a stale index and panicked
-            // — a hard crash, since the release profile is `panic = "abort"`.
-            let due_idx: Vec<usize> = (0..self.timer_queue.len())
-                .filter(|&i| self.timer_queue[i].0 <= now)
-                .collect();
-            // `due_idx` is ascending by construction, so a STABLE sort by due
-            // time keeps insertion order among equal deadlines (FIFO).
-            let mut order = due_idx.clone();
-            order.sort_by_key(|&i| self.timer_queue[i].0);
-            let fired: Vec<Value> = order.iter().map(|&i| self.timer_queue[i].1).collect();
-            // Now drop the entries, highest index first.
-            for &i in due_idx.iter().rev() {
-                self.timer_queue.remove(i);
+            // Fire due timers (FIFO among equal deadlines). `setTimeout`
+            // preflights the queue's worst-case scan+sort work before admitting
+            // each entry. Compact with `retain` so alternating due/future timers
+            // cannot turn repeated `Vec::remove` shifts into quadratic work.
+            // Attach the insertion index as a unique secondary key, allowing an
+            // allocation-free unstable sort without losing FIFO ties.
+            let mut fired: Vec<(crate::vm::clock::Instant, usize, Value)> = Vec::new();
+            if fired.try_reserve_exact(self.timer_queue.len()).is_err() {
+                // A host allocation failure must not panic/abort the sandbox.
+                // Drop the macrotasks: no guest callback is safer than running
+                // them out of order or looping forever on the same queue.
+                self.timer_queue.clear();
+                break;
             }
-            for cb in fired {
+            let mut insertion_index = 0usize;
+            self.timer_queue.retain(|&(deadline, callback)| {
+                let index = insertion_index;
+                insertion_index = insertion_index.saturating_add(1);
+                if deadline <= now {
+                    fired.push((deadline, index, callback));
+                    false
+                } else {
+                    true
+                }
+            });
+            fired.sort_unstable_by_key(|&(deadline, index, _)| (deadline, index));
+            for (_, _, cb) in fired {
                 let _gc = self.gc_lock_guard();
                 let _ = self.call_value(cb, Value::UNDEFINED, &[]);
             }

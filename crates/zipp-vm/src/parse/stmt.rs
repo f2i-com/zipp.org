@@ -35,7 +35,9 @@ pub fn parse(src: &str, opts: ParseOptions) -> PResult<Program> {
 pub fn parse_exact(src: &str, exact: Option<&[u8]>, opts: ParseOptions) -> PResult<Program> {
     let goal = opts.goal;
     let mut p = Parser::new_exact(src, exact, opts)?;
-    p.parse_program(goal)
+    let program = p.parse_program(goal)?;
+    super::limits::validate_program_nesting(&program)?;
+    Ok(program)
 }
 
 /// Parse `src` as a STANDALONE FormalParameters list, requiring the whole
@@ -533,6 +535,10 @@ impl<'s> Parser<'s> {
     /// legal here and NOT in the Statement-only positions (an `if` body, a loop
     /// body), which is why the two entry points are distinct.
     pub(crate) fn parse_stmt_list_item(&mut self) -> PResult<Stmt> {
+        self.with_syntax_recursion(|p| p.parse_stmt_list_item_guarded())
+    }
+
+    fn parse_stmt_list_item_guarded(&mut self) -> PResult<Stmt> {
         let s = self.parse_stmt_list_item_inner()?;
         // The token after a StatementListItem opens a new statement, so a `/`
         // there is a REGEX — but the `}` that ended this item was scanned before
@@ -808,6 +814,10 @@ impl<'s> Parser<'s> {
     // ---- statements --------------------------------------------------------
 
     pub(crate) fn parse_stmt(&mut self) -> PResult<Stmt> {
+        self.with_syntax_recursion(|p| p.parse_stmt_guarded())
+    }
+
+    fn parse_stmt_guarded(&mut self) -> PResult<Stmt> {
         let s = self.parse_stmt_inner()?;
         // Same correction for an unbraced body (`if (c) { … } /re/.test(x)`) and
         // for the `)` of `do … while (…)`, after which §14.7.2 inserts the `;`.

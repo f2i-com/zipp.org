@@ -188,7 +188,7 @@ impl<'p> Vm<'p> {
             .collect();
         let mut out: Vec<(String, String, &'static str)> = vec![];
         let mut runs = elements.into_iter();
-        for (ty, v) in list_parts_en(&strings, "unit", list_style) {
+        for (ty, v) in list_parts_en(&strings, "unit", list_style)? {
             if ty == "element" {
                 out.extend(runs.next().unwrap_or_default());
             } else {

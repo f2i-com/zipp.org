@@ -137,7 +137,8 @@ impl<'p> Vm<'p> {
                 ));
             }
             return match self.proxy_trap(handler, "defineProperty")? {
-                None => self.object_define_property(target, key, desc),
+                None => self
+                    .with_native_recursion_guard(|vm| vm.object_define_property(target, key, desc)),
                 Some(trap) => {
                     let (value, get, set, wr, en, cf) = self.read_descriptor(desc)?;
                     let mut m = ObjMap::new();

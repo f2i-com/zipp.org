@@ -243,11 +243,10 @@ impl<'a> Utf8Input<'a> {
     #[inline(always)]
     fn getb(&self, pos: <Self as InputIndexer>::Position) -> u8 {
         debug_assert!(self.left_end() <= pos && pos < self.right_end());
-        if cfg!(feature = "prohibit-unsafe") {
-            self.contents()[self.pos_to_offset(pos)]
-        } else {
-            unsafe { *self.contents().get_unchecked(self.pos_to_offset(pos)) }
-        }
+        #[cfg(feature = "prohibit-unsafe")]
+        return self.contents()[self.pos_to_offset(pos)];
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        return unsafe { *self.contents().get_unchecked(self.pos_to_offset(pos)) };
     }
 
     /// \return a slice as a str.
@@ -255,19 +254,18 @@ impl<'a> Utf8Input<'a> {
     fn str_slice(&self, range: ops::Range<<Self as InputIndexer>::Position>) -> &'a str {
         self.debug_assert_boundary(range.start);
         self.debug_assert_boundary(range.end);
-        if cfg!(feature = "prohibit-unsafe") {
-            &self.input[core::ops::Range {
+        #[cfg(feature = "prohibit-unsafe")]
+        return &self.input[core::ops::Range {
+            start: self.pos_to_offset(range.start),
+            end: self.pos_to_offset(range.end),
+        }];
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        return unsafe {
+            self.input.get_unchecked(core::ops::Range {
                 start: self.pos_to_offset(range.start),
                 end: self.pos_to_offset(range.end),
-            }]
-        } else {
-            unsafe {
-                self.input.get_unchecked(core::ops::Range {
-                    start: self.pos_to_offset(range.start),
-                    end: self.pos_to_offset(range.end),
-                })
-            }
-        }
+            })
+        };
     }
 
     /// Assert that a position is valid, i.e. between our left and right ends.
@@ -461,25 +459,25 @@ impl<'a> InputIndexer for Utf8Input<'a> {
         }
     }
 
-    #[cfg(feature = "index-positions")]
+    #[cfg(any(feature = "index-positions", feature = "prohibit-unsafe"))]
     #[inline(always)]
     fn left_end(&self) -> Self::Position {
         Self::Position::new(0)
     }
 
-    #[cfg(feature = "index-positions")]
+    #[cfg(any(feature = "index-positions", feature = "prohibit-unsafe"))]
     #[inline(always)]
     fn right_end(&self) -> Self::Position {
         Self::Position::new(self.bytelength())
     }
 
-    #[cfg(not(feature = "index-positions"))]
+    #[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
     #[inline(always)]
     fn left_end(&self) -> Self::Position {
         Self::Position::new(self.contents().as_ptr())
     }
 
-    #[cfg(not(feature = "index-positions"))]
+    #[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
     #[inline(always)]
     fn right_end(&self) -> Self::Position {
         self.left_end() + self.bytelength()
@@ -637,11 +635,10 @@ impl<'a> AsciiInput<'a> {
     #[inline(always)]
     fn getb(&self, pos: <Self as InputIndexer>::Position) -> u8 {
         debug_assert!(self.left_end() <= pos && pos < self.right_end());
-        if cfg!(feature = "prohibit-unsafe") {
-            self.contents()[self.pos_to_offset(pos)]
-        } else {
-            unsafe { *self.contents().get_unchecked(self.pos_to_offset(pos)) }
-        }
+        #[cfg(feature = "prohibit-unsafe")]
+        return self.contents()[self.pos_to_offset(pos)];
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        return unsafe { *self.contents().get_unchecked(self.pos_to_offset(pos)) };
     }
 
     #[inline(always)]
@@ -731,25 +728,25 @@ impl<'a> InputIndexer for AsciiInput<'a> {
         self.next_left(&mut pos)
     }
 
-    #[cfg(feature = "index-positions")]
+    #[cfg(any(feature = "index-positions", feature = "prohibit-unsafe"))]
     #[inline(always)]
     fn left_end(&self) -> Self::Position {
         Self::Position::new(0)
     }
 
-    #[cfg(feature = "index-positions")]
+    #[cfg(any(feature = "index-positions", feature = "prohibit-unsafe"))]
     #[inline(always)]
     fn right_end(&self) -> Self::Position {
         Self::Position::new(self.bytelength())
     }
 
-    #[cfg(not(feature = "index-positions"))]
+    #[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
     #[inline(always)]
     fn left_end(&self) -> Self::Position {
         Self::Position::new(self.contents().as_ptr())
     }
 
-    #[cfg(not(feature = "index-positions"))]
+    #[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
     #[inline(always)]
     fn right_end(&self) -> Self::Position {
         self.left_end() + self.bytelength()

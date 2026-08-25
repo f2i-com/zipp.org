@@ -226,7 +226,7 @@ impl<'p> Vm<'p> {
                     && matches!(self.heap.get(a0.heap_index()), HeapObj::Symbol { .. })
                 {
                     // String(symbol) yields its "Symbol(desc)" text, not a TypeError.
-                    self.display(a0)
+                    self.symbol_descriptive_string(a0)?
                 } else {
                     self.to_js_string(a0)?
                 };
@@ -366,13 +366,19 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(idx))
     }
 
-    pub(crate) fn is_callable(&self, v: Value) -> bool {
-        // An [[IsHTMLDDA]] exotic (`document.all`) is callable (returns undefined).
-        if v.is_heap() && !self.is_htmldda.is_empty() && self.is_htmldda.contains(&v.heap_index()) {
-            return true;
-        }
-        v.is_heap()
-            && match self.heap.get(v.heap_index()) {
+    pub(crate) fn is_callable(&self, mut v: Value) -> bool {
+        loop {
+            // An [[IsHTMLDDA]] exotic (`document.all`) is callable (returns undefined).
+            if v.is_heap()
+                && !self.is_htmldda.is_empty()
+                && self.is_htmldda.contains(&v.heap_index())
+            {
+                return true;
+            }
+            if !v.is_heap() {
+                return false;
+            }
+            return match self.heap.get(v.heap_index()) {
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }
                 | HeapObj::Bound { .. }
@@ -397,9 +403,13 @@ impl<'p> Vm<'p> {
                 // A Proxy is callable iff its target is — the [[Call]] slot is
                 // fixed at creation, and REVOCATION does not change callability
                 // (the target field survives revocation behind the flag).
-                HeapObj::Proxy { target, .. } => self.is_callable(*target),
+                HeapObj::Proxy { target, .. } => {
+                    v = *target;
+                    continue;
+                }
                 _ => false,
-            }
+            };
+        }
     }
 
     /// `obj.hasOwnProperty(key)` — own data/accessor property, array index/length,
@@ -1062,11 +1072,16 @@ impl<'p> Vm<'p> {
                 return Err($e);
             }};
         }
+        let mut native_work = 0u64;
         loop {
             let entry = match self.iterator_step(iter)? {
                 Some(e) => e,
                 None => break,
             };
+            native_work = native_work.saturating_add(1);
+            if let Err(e) = self.preflight_native_iteration_work(native_work) {
+                close_and_throw!(e);
+            }
             if !self.is_object_value(entry) {
                 let msg = self.alloc_str("Iterator value is not an entry object".to_string());
                 let te = self.make_error(1, Some(msg));
@@ -1118,11 +1133,16 @@ impl<'p> Vm<'p> {
                 return Err($e);
             }};
         }
+        let mut native_work = 0u64;
         loop {
             let entry = match self.iterator_step(iter)? {
                 Some(e) => e,
                 None => break,
             };
+            native_work = native_work.saturating_add(1);
+            if let Err(e) = self.preflight_native_iteration_work(native_work) {
+                close_and_throw!(e);
+            }
             if pair {
                 if !self.is_object_value(entry) {
                     let msg = self.alloc_str("Iterator value is not an entry object".to_string());
@@ -1241,6 +1261,7 @@ impl<'p> Vm<'p> {
                 HeapObj::TypedArray { length, .. } => *length,
                 _ => 0,
             };
+            self.preflight_native_iteration_work(n as u64)?;
             return Ok((0..n).map(|i| self.ta_element_get(ta, i)).collect());
         }
         let v = self.get_iterator(v)?;
@@ -1453,6 +1474,11 @@ impl<'p> Vm<'p> {
                 };
                 match dest {
                     Some(a) => {
+                        if let Err(e) =
+                            self.preflight_native_iteration_work((k as u64).saturating_add(1))
+                        {
+                            close_and_throw!(e);
+                        }
                         if let Err(e) = self.create_data_property_or_throw(a, k, mapped) {
                             close_and_throw!(e);
                         }
@@ -1500,10 +1526,19 @@ impl<'p> Vm<'p> {
         let len_v = self.get_prop(obj, "length")?;
         let n_i = self.to_integer_or_zero(len_v)?;
         let n = if n_i > 0 {
-            (n_i as u64).min((1u64 << 53) - 1) as usize
+            (n_i as u64).min((1u64 << 53) - 1)
         } else {
             0
         };
+        // A custom Array.from constructor may return an ordinary object, so
+        // neither the dense-array ceiling nor the VM heap poll bounds the
+        // property-by-property loop below.  Reject hostile array-like lengths
+        // before they become one uninterruptible native operation.  Keep the
+        // value as u64 until after this check: narrowing first would wrap on
+        // wasm32 and could turn 2^32 into a zero-length operation.
+        self.preflight_native_iteration_work(n)?;
+        let n = usize::try_from(n)
+            .map_err(|_| Thrown("RangeError: array-like length exceeds the engine limit".into()))?;
         if custom_ctor {
             let a = self.construct(this_ctor, &[Value::num(n as f64)])?;
             for i in 0..n {

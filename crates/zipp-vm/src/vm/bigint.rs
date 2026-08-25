@@ -29,8 +29,12 @@ use num_bigint::{BigInt as NumBig, Sign};
 use num_traits::{FromPrimitive, One, Signed, ToPrimitive, Zero};
 use std::cmp::Ordering;
 
-/// Maximum BigInt magnitude in BITS (matches V8's 2^30 limit). Anything that
-/// would exceed it throws RangeError rather than attempting the allocation.
+/// Maximum BigInt magnitude in bits. The ordinary engine matches V8's 2^30
+/// limit; the hardened profile caps one value at roughly 128 KiB so a single
+/// shift/power cannot overshoot a worker's memory ceiling by 128 MiB.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const MAX_BIGINT_BITS: u64 = 1 << 20;
+#[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_BIGINT_BITS: u64 = 1 << 30;
 
 pub(crate) const BIGINT_MIX_ERR: &str =

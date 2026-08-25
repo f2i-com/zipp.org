@@ -316,7 +316,7 @@ impl<'p> Vm<'p> {
                     "RangeError: ArrayBuffer length exceeds the maximum".into(),
                 ));
             }
-            let buf = self.alloc_array_buffer(n);
+            let buf = self.alloc_array_buffer(n)?;
             if let Some(m) = max {
                 self.ab_max.insert(buf, m);
             }
@@ -331,7 +331,7 @@ impl<'p> Vm<'p> {
                 ));
             }
             // Truly-shared storage (marks shared_buffers + links sab_proto).
-            let buf = self.alloc_shared_array_buffer(n, max);
+            let buf = self.alloc_shared_array_buffer(n, max)?;
             if let Some(m) = max {
                 self.ab_max.insert(buf, m);
             }
@@ -641,7 +641,9 @@ impl<'p> Vm<'p> {
                     Ok(res)
                 }
                 // No trap: forward to the target's [[Construct]], preserving newTarget.
-                None => self.construct_with_newtarget(target, args, new_target),
+                None => self.with_native_recursion_guard(|vm| {
+                    vm.construct_with_newtarget(target, args, new_target)
+                }),
             };
         }
         // Symbol/BigInt report IsConstructor true (is_ctor — they serve as a
@@ -932,7 +934,9 @@ impl<'p> Vm<'p> {
             // newTarget is the bound function itself; otherwise keep the caller's
             // newTarget so OrdinaryCreateFromConstructor uses its prototype.
             let nt = if new_target == cv { target } else { new_target };
-            return self.construct_with_newtarget(target, &combined, nt);
+            return self.with_native_recursion_guard(|vm| {
+                vm.construct_with_newtarget(target, &combined, nt)
+            });
         }
         let (ctor, ctor_ups, has_explicit, parent, extends_null) =
             match self.heap.get(cv.heap_index()) {
@@ -1203,10 +1207,18 @@ impl<'p> Vm<'p> {
                     "RangeError: ArrayBuffer length exceeds the maximum".into(),
                 ));
             }
+            #[cfg(feature = "instrument")]
+            self.instrument_preflight_heap_growth(n)
+                .map_err(|message| Thrown(message.into()))?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(n)
+                .map_err(|_| Thrown("RangeError: ArrayBuffer allocation failed".into()))?;
+            bytes.resize(n, 0u8);
             self.heap.replace(
                 oidx,
                 HeapObj::ArrayBuffer {
-                    data: vec![0u8; n].into(),
+                    data: bytes.into(),
                     detached: false,
                 },
             );

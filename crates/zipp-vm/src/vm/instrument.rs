@@ -253,6 +253,10 @@ enum Claim {
 /// a flag that is almost never set; 4096 instructions is well under a
 /// millisecond, so the host still sees a prompt stop.
 const ABORT_CHECK_MASK: u64 = 0xFFF;
+/// A full payload reconciliation walks the heap, so do it less often than the
+/// cheap abort poll. New objects and known large buffers are charged eagerly;
+/// this audit catches capacity growth of already-existing collections.
+const HEAP_AUDIT_MASK: u64 = 0xFFFF;
 
 /// Per-VM instrumentation state. Allocated only when a host asks for it.
 pub(crate) struct Recorder {
@@ -485,6 +489,25 @@ fn blank(row: &mut TraceStep) {
 pub(crate) type Tick = Result<(), &'static str>;
 
 impl super::Vm<'_> {
+    /// Reject a known contiguous allocation before asking the global allocator
+    /// for it. The periodic full-heap scan remains the backstop for aggregate
+    /// growth, while this closes the single-allocation overshoot that otherwise
+    /// lets an ArrayBuffer exceed a small budget by gigabytes before the next
+    /// bytecode poll.
+    pub(crate) fn instrument_preflight_heap_growth(&mut self, bytes: usize) -> Tick {
+        let resident = self.heap_bytes();
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return Ok(());
+        };
+        if let Some(message) = rec.terminal_message() {
+            return Err(message);
+        }
+        if rec.heap_limit != usize::MAX && bytes > rec.heap_limit.saturating_sub(resident) {
+            return Err(rec.exhaust(ResourceExhaustion::Heap));
+        }
+        Ok(())
+    }
+
     /// Configure VM-wide dynamic-code ceilings. Every `do_eval` caller is
     /// covered: direct/indirect `eval`, Function constructors, ShadowRealm,
     /// and embedder eval helpers. Requires an attached recorder.
@@ -539,7 +562,7 @@ impl super::Vm<'_> {
     /// overshoot that happened outside the bytecode loop (for example during a
     /// host-to-guest write) into the same sticky status as an in-loop check.
     pub(crate) fn instrument_resource_limit_error(&mut self) -> Option<&'static str> {
-        let heap_bytes = self.heap_bytes();
+        let heap_bytes = self.audit_heap_bytes();
         let rec = self.instr_rec.as_mut()?;
         if rec.exhaustion.is_none() && rec.output_exhausted {
             rec.exhaust(ResourceExhaustion::Output);
@@ -591,7 +614,7 @@ impl super::Vm<'_> {
         // would run to the end of its lent chunk unexamined.
         let ceiling = rec.heap_limit;
         if ceiling != usize::MAX {
-            if self.heap_bytes() > ceiling {
+            if self.audit_heap_bytes() > ceiling {
                 if let Some(rec) = self.instr_rec.as_mut() {
                     rec.exhaust(ResourceExhaustion::Heap);
                 }
@@ -764,11 +787,13 @@ impl super::Vm<'_> {
                     return Err(rec.exhaust(ResourceExhaustion::Abort));
                 }
             }
+        }
+        if rec.ticks & HEAP_AUDIT_MASK == 0 {
             ceiling = rec.heap_limit;
         }
         let tracing = rec.tracing;
 
-        if ceiling != usize::MAX && self.heap_bytes() > ceiling {
+        if ceiling != usize::MAX && self.audit_heap_bytes() > ceiling {
             let rec = self.instr_rec.as_mut().expect("recorder checked above");
             return Err(rec.exhaust(ResourceExhaustion::Heap));
         }

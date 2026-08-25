@@ -153,7 +153,7 @@ fn getters_tojson_prototypes_sparse_indices_and_proxies_decline() {
 
 #[test]
 fn errors_options_wrappers_and_depth_keep_the_general_semantics() {
-    let out = run_ok(
+    let mut out = run_ok(
         r#"
         "use strict";
         function caught(label, thunk) {
@@ -176,25 +176,42 @@ fn errors_options_wrappers_and_depth_keep_the_general_semantics() {
           new Number(2), new String("x"), new Boolean(false)
         ]));
 
+        "#,
+    );
+    #[cfg(not(feature = "safe-sandbox"))]
+    out.extend(run_ok(
+        r#"
         // The native walk caps its own recursion at 256, then discards the
-        // private prefix. The ordinary serializer must still complete this.
+        // private prefix. The ordinary serializer must still complete this in
+        // the compatibility profile.
         var deep = 1;
         for (var i=0; i<300; i++) deep=[deep];
         var s = JSON.stringify(deep);
         console.log("deep=" + s.length + ":" + s.slice(0,3) + ":" + s.slice(-3));
         "#,
-    );
-    assert_eq!(
-        out,
-        [
-            "cycle=throw:TypeError",
-            "bigint=throw:TypeError",
-            r#"replacer={"a":2,"b":3}"#,
-            r#"indent="{\n  \"a\": [\n    1,\n    {\n      \"b\": 2\n    }\n  ]\n}""#,
-            r#"boxed=[2,"x",false]"#,
-            "deep=601:[[[:]]]",
-        ]
-    );
+    ));
+    #[cfg(feature = "safe-sandbox")]
+    out.extend(run_ok(
+        r#"
+        var deep = 1;
+        for (var i=0; i<300; i++) deep=[deep];
+        try { JSON.stringify(deep); }
+        catch (e) { console.log("deep=throw:" + e.name); }
+        "#,
+    ));
+
+    let mut expected = vec![
+        "cycle=throw:TypeError",
+        "bigint=throw:TypeError",
+        r#"replacer={"a":2,"b":3}"#,
+        r#"indent="{\n  \"a\": [\n    1,\n    {\n      \"b\": 2\n    }\n  ]\n}""#,
+        r#"boxed=[2,"x",false]"#,
+    ];
+    #[cfg(not(feature = "safe-sandbox"))]
+    expected.push("deep=601:[[[:]]]");
+    #[cfg(feature = "safe-sandbox")]
+    expected.push("deep=throw:RangeError");
+    assert_eq!(out, expected);
 }
 
 /// Each implementation switch is process-cached. Fresh child processes prove

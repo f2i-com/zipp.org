@@ -77,7 +77,8 @@ pub(crate) fn canonical_display_names_code(ty: &str, code: &str) -> Option<Strin
 /// `numberingSystem` options before any data lookup (ECMA-402 IsWellFormed
 /// CalendarCode / IsWellFormedNumberingSystemCode).
 pub(crate) fn is_well_formed_type_code(s: &str) -> bool {
-    !s.is_empty()
+    crate::vm::locale_tag::locale_parse_work_bound(s.len()) <= crate::vm::MAX_NATIVE_ITERATION_WORK
+        && !s.is_empty()
         && s.split('-')
             .all(|p| (3..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric()))
 }

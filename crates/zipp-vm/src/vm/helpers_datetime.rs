@@ -1186,7 +1186,7 @@ pub(crate) fn list_parts_en(
     items: &[String],
     ty: &str,
     style: &str,
-) -> Vec<(&'static str, String)> {
+) -> Result<Vec<(&'static str, String)>, Thrown> {
     let row = crate::vm::cldr_en::LIST_PATTERNS
         .iter()
         .find(|(t, s, ..)| *t == ty && *s == style)
@@ -1204,7 +1204,27 @@ pub(crate) fn list_parts_en(
         ),
         None => (" and ", ", ", ", ", ", and "),
     };
-    let mut out: Vec<(&'static str, String)> = vec![];
+    let part_count = items
+        .len()
+        .checked_mul(2)
+        .and_then(|n| n.checked_sub(usize::from(!items.is_empty())))
+        .ok_or_else(|| Thrown("RangeError: list result is too large".into()))?;
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    out.try_reserve_exact(part_count)
+        .map_err(|_| Thrown("RangeError: list allocation failed".into()))?;
+    let mut total_bytes = 0usize;
+    let mut copy_part = |text: &str| -> Result<String, Thrown> {
+        total_bytes = total_bytes
+            .checked_add(text.len())
+            .filter(|&n| n <= MAX_STRING_BYTES)
+            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(text.len())
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        owned.push_str(text);
+        Ok(owned)
+    };
     let n = items.len();
     for (i, it) in items.iter().enumerate() {
         if i > 0 {
@@ -1220,11 +1240,11 @@ pub(crate) fn list_parts_en(
             } else {
                 middle
             };
-            out.push(("literal", lit.to_string()));
+            out.push(("literal", copy_part(lit)?));
         }
-        out.push(("element", it.clone()));
+        out.push(("element", copy_part(it)?));
     }
-    out
+    Ok(out)
 }
 
 /// A non-negative finite number as the typed parts RelativeTimeFormat's embedded

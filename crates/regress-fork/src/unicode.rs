@@ -167,11 +167,10 @@ pub fn fold(cu: u32) -> u32 {
         }
     });
     if let Ok(index) = searched {
-        let fr: &FoldRange = if cfg!(feature = "prohibit-unsafe") {
-            unsafe { FOLDS.get_unchecked(index) }
-        } else {
-            FOLDS.get(index).expect("Invalid index")
-        };
+        #[cfg(feature = "prohibit-unsafe")]
+        let fr: &FoldRange = FOLDS.get(index).expect("Invalid index");
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        let fr: &FoldRange = unsafe { FOLDS.get_unchecked(index) };
         fr.apply(cu)
     } else {
         cu
@@ -189,11 +188,10 @@ fn uppercase(cu: u32) -> u32 {
         }
     });
     if let Ok(index) = searched {
-        let fr: &FoldRange = if cfg!(feature = "prohibit-unsafe") {
-            unsafe { TO_UPPERCASE.get_unchecked(index) }
-        } else {
-            TO_UPPERCASE.get(index).expect("Invalid index")
-        };
+        #[cfg(feature = "prohibit-unsafe")]
+        let fr: &FoldRange = TO_UPPERCASE.get(index).expect("Invalid index");
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        let fr: &FoldRange = unsafe { TO_UPPERCASE.get_unchecked(index) };
         fr.apply(cu)
     } else {
         cu

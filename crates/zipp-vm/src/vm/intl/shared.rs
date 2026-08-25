@@ -8,8 +8,80 @@ use crate::heap::{
 use crate::value::Value;
 use crate::vm::*;
 use crate::vm::{cldr_en, dtf_pattern};
+use std::collections::HashSet;
+
+fn account_locale_list_bytes(total: &mut usize, additional: usize) -> Result<(), Thrown> {
+    *total = total
+        .checked_add(additional)
+        .filter(|&bytes| bytes <= MAX_STRING_BYTES)
+        .ok_or_else(|| Thrown("RangeError: locale list text limit exceeded".into()))?;
+    Ok(())
+}
+
+fn push_unique_locale(
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    retained_bytes: &mut usize,
+    tag: String,
+) -> Result<(), Thrown> {
+    if seen.contains(&tag) {
+        return Ok(());
+    }
+    account_locale_list_bytes(retained_bytes, tag.len())?;
+    out.try_reserve(1)
+        .map_err(|_| Thrown("RangeError: locale list allocation failed".into()))?;
+    seen.try_reserve(1)
+        .map_err(|_| Thrown("RangeError: locale list allocation failed".into()))?;
+
+    // Keep the ordered output and the membership index separately without an
+    // infallible String::clone allocation.
+    let mut membership_key = String::new();
+    membership_key
+        .try_reserve_exact(tag.len())
+        .map_err(|_| Thrown("RangeError: locale list allocation failed".into()))?;
+    membership_key.push_str(&tag);
+    seen.insert(membership_key);
+    out.push(tag);
+    Ok(())
+}
 
 impl<'p> Vm<'p> {
+    /// Copy one ListFormat element into a native temporary while bounding the
+    /// aggregate text retained by the whole list. Reusing the same near-limit
+    /// guest string many times must not turn into one native clone per element.
+    fn push_string_list_value(
+        &mut self,
+        out: &mut Vec<String>,
+        total_bytes: &mut usize,
+        value: Value,
+    ) -> Result<(), Thrown> {
+        if !(value.is_heap() && self.heap.is_str_like(value.heap_index())) {
+            return Err(Thrown("TypeError: list elements must be strings".into()));
+        }
+        let idx = value.heap_index();
+        self.heap.flatten(idx);
+        let byte_len = match self.heap.get(idx) {
+            HeapObj::Str(js) => js.as_bytes().len(),
+            _ => unreachable!("flattened string remains string-like"),
+        };
+        let next_total = total_bytes
+            .checked_add(byte_len)
+            .filter(|&n| n <= MAX_STRING_BYTES)
+            .ok_or_else(|| Thrown("RangeError: Invalid string length".into()))?;
+        self.preflight_guest_string_size(next_total)?;
+        out.try_reserve(1)
+            .map_err(|_| Thrown("RangeError: list allocation failed".into()))?;
+        let text = self.heap.str_cow(idx).expect("validated string-like value");
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(text.len())
+            .map_err(|_| Thrown("RangeError: string allocation failed".into()))?;
+        owned.push_str(&text);
+        out.push(owned);
+        *total_bytes = next_total;
+        Ok(())
+    }
+
     /// Read an internal slot stored on an Intl instance's `resolved` object.
     pub(crate) fn intl_slot(&self, resolved: u32, key: &str) -> Value {
         if let HeapObj::Object(m) = self.heap.get(resolved) {
@@ -187,6 +259,9 @@ impl<'p> Vm<'p> {
                 .str_cow(locales.heap_index())
                 .unwrap()
                 .into_owned();
+            self.preflight_native_iteration_work(crate::vm::locale_tag::locale_parse_work_bound(
+                s.len(),
+            ))?;
             out.push(canonicalize_locale(&s).ok_or_else(|| {
                 Thrown(format!(
                     "RangeError: Incorrect locale information provided: {s}"
@@ -216,6 +291,21 @@ impl<'p> Vm<'p> {
         } else {
             len_f.min(9.007e15) as u64
         };
+        // The loop below is one native operation: holes, proxy traps, locale
+        // parsing, and deduplication do not return to the bytecode step meter.
+        // Reject the full ToLength before observing any indexed property.
+        self.preflight_native_iteration_work(len)?;
+
+        // CanonicalizeLocaleList preserves first-seen order, so `out` remains a
+        // Vec. Keep a randomized hash set beside it to avoid the former O(n^2)
+        // Vec::contains scan for many distinct attacker-selected tags. Bound
+        // the aggregate text scanned and retained as well as the element count:
+        // 262k individually near-limit locale strings must not become hundreds
+        // of gigabytes of invisible native work.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut processed_bytes = 0usize;
+        let mut retained_bytes = 0usize;
+        let mut parse_work = 0u64;
         for i in 0..len {
             let key = Value::num(i as f64);
             if !self.has_property_dyn(obj, key)? {
@@ -223,9 +313,11 @@ impl<'p> Vm<'p> {
             }
             let el = self.get_index(obj, key)?;
             if let Some(tag) = self.locale_slot_tag(el) {
-                if !out.contains(&tag) {
-                    out.push(tag);
-                }
+                account_locale_list_bytes(&mut processed_bytes, tag.len())?;
+                parse_work = parse_work
+                    .saturating_add(crate::vm::locale_tag::locale_parse_work_bound(tag.len()));
+                self.preflight_native_iteration_work(parse_work)?;
+                push_unique_locale(&mut out, &mut seen, &mut retained_bytes, tag)?;
                 continue;
             }
             let is_string = el.is_heap() && self.heap.is_str_like(el.heap_index());
@@ -235,14 +327,16 @@ impl<'p> Vm<'p> {
                 ));
             }
             let s = self.to_js_string(el)?;
+            account_locale_list_bytes(&mut processed_bytes, s.len())?;
+            parse_work =
+                parse_work.saturating_add(crate::vm::locale_tag::locale_parse_work_bound(s.len()));
+            self.preflight_native_iteration_work(parse_work)?;
             let c = canonicalize_locale(&s).ok_or_else(|| {
                 Thrown(format!(
                     "RangeError: Incorrect locale information provided: {s}"
                 ))
             })?;
-            if !out.contains(&c) {
-                out.push(c);
-            }
+            push_unique_locale(&mut out, &mut seen, &mut retained_bytes, c)?;
         }
         Ok(out)
     }
@@ -265,7 +359,9 @@ impl<'p> Vm<'p> {
         if v == Value::UNDEFINED {
             return Ok(default.to_string());
         }
-        self.to_js_string(v)
+        let s = self.to_js_string(v)?;
+        self.preflight_native_iteration_work(s.len() as u64)?;
+        Ok(s)
     }
 
     /// RangeError if `s` is not in `allowed` (when non-empty) — the deferred
@@ -301,6 +397,7 @@ impl<'p> Vm<'p> {
             return Ok(default.to_string());
         }
         let s = self.to_js_string(v)?;
+        self.preflight_native_iteration_work(s.len() as u64)?;
         self.unit_allowed(&s, key, allowed)?;
         Ok(s)
     }
@@ -323,6 +420,7 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let s = self.to_js_string(v)?;
+        self.preflight_native_iteration_work(s.len() as u64)?;
         self.unit_allowed(&s, key, allowed)?;
         Ok(Some(s))
     }
@@ -449,7 +547,9 @@ impl<'p> Vm<'p> {
         if smallest_v == Value::UNDEFINED {
             return Err(Thrown("RangeError: smallestUnit is required".into()));
         }
-        let su = normalize_unit(&self.to_js_string(smallest_v)?, "");
+        let smallest = self.to_js_string(smallest_v)?;
+        self.preflight_native_iteration_work(smallest.len() as u64)?;
+        let su = normalize_unit(&smallest, "");
         if !allowed.contains(&su.as_str()) {
             return Err(Thrown(format!("RangeError: invalid smallestUnit: {su}")));
         }
@@ -589,6 +689,7 @@ impl<'p> Vm<'p> {
                 self.to_js_string(tag)?
             }
         };
+        self.preflight_native_iteration_work(lt::locale_parse_work_bound(base.len()))?;
         let mut t = lt::parse_lang_tag(&base)
             .ok_or_else(|| Thrown(format!("RangeError: invalid language tag: {base}")))?;
         // ApplyOptionsToTag canonicalizes the tag BEFORE the options are applied
@@ -624,14 +725,25 @@ impl<'p> Vm<'p> {
         if let Some(v) = self.opt_string_opt(options, "variants", &[])? {
             // `variants` is the whole "-"-joined run: every subtag must match
             // unicode_variant_subtag and none may repeat.
+            let base_work = lt::locale_parse_work_bound(v.len());
+            self.preflight_native_iteration_work(base_work)?;
             let mut seen: Vec<String> = vec![];
+            let mut membership: HashSet<String> = HashSet::new();
             for part in v.split('-') {
                 let lp = part.to_ascii_lowercase();
-                if !lt::is_variant_subtag(&lp) || seen.contains(&lp) {
+                if !lt::is_variant_subtag(&lp) || membership.contains(&lp) {
                     return Err(Thrown(format!("RangeError: invalid variants option: {v}")));
                 }
+                seen.try_reserve(1)
+                    .map_err(|_| Thrown("RangeError: locale variants allocation failed".into()))?;
+                membership
+                    .try_reserve(1)
+                    .map_err(|_| Thrown("RangeError: locale variants allocation failed".into()))?;
+                membership.insert(lp.clone());
                 seen.push(lp);
             }
+            let total_work = base_work.saturating_add(lt::locale_sort_work_bound(seen.len()));
+            self.preflight_native_iteration_work(total_work)?;
             seen.sort();
             t.variants = seen;
         }
@@ -805,17 +917,22 @@ impl<'p> Vm<'p> {
             // A dense array / string / generator has no user-visible step
             // function to observe, so the shared drain is equivalent there.
             let vals = self.iterate_to_vec(iterable)?;
-            let mut out = Vec::with_capacity(vals.len());
+            self.preflight_native_iteration_work(vals.len() as u64)?;
+            let mut out = Vec::new();
+            out.try_reserve_exact(vals.len())
+                .map_err(|_| Thrown("RangeError: list allocation failed".into()))?;
+            let mut total_bytes = 0usize;
             for v in vals {
-                if !(v.is_heap() && self.heap.is_str_like(v.heap_index())) {
-                    return Err(Thrown("TypeError: list elements must be strings".into()));
-                }
-                out.push(self.heap.str_cow(v.heap_index()).unwrap().into_owned());
+                self.push_string_list_value(&mut out, &mut total_bytes, v)?;
             }
             return Ok(out);
         };
         let mut out: Vec<String> = vec![];
+        let mut total_bytes = 0usize;
+        let mut iterations = 0u64;
         loop {
+            iterations = iterations.saturating_add(1);
+            self.preflight_native_iteration_work(iterations)?;
             let res = self.call_value(next, iter, &[])?;
             if !self.is_object_value(res) {
                 return Err(Thrown(
@@ -831,7 +948,10 @@ impl<'p> Vm<'p> {
                 self.iterator_close_quiet(iter);
                 return Err(Thrown("TypeError: list elements must be strings".into()));
             }
-            out.push(self.heap.str_cow(v.heap_index()).unwrap().into_owned());
+            if let Err(error) = self.push_string_list_value(&mut out, &mut total_bytes, v) {
+                self.iterator_close_quiet(iter);
+                return Err(error);
+            }
         }
         Ok(out)
     }

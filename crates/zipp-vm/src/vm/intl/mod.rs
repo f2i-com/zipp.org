@@ -299,6 +299,7 @@ impl<'p> Vm<'p> {
                     "UTC".to_string()
                 } else {
                     let s = self.to_js_string(tz_v)?;
+                    self.preflight_native_iteration_work(s.len() as u64)?;
                     match canonicalize_time_zone(&s) {
                         Some(c) => c,
                         None => return Err(Thrown(format!("RangeError: invalid time zone: {s}"))),

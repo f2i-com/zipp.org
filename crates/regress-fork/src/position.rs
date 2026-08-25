@@ -18,10 +18,10 @@ where
 }
 
 /// Choose the preferred position type with this alias.
-#[cfg(feature = "index-positions")]
+#[cfg(any(feature = "index-positions", feature = "prohibit-unsafe"))]
 pub type DefPosition<'a> = IndexPosition<'a>;
 
-#[cfg(not(feature = "index-positions"))]
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 pub type DefPosition<'a> = RefPosition<'a>;
 
 /// A simple index-based position.
@@ -97,8 +97,10 @@ impl PositionType for IndexPosition<'_> {}
 /// This must use raw pointers because it must be capable of representing the one-past-the-end value.
 /// TODO: thread lifetimes through this.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 pub struct RefPosition<'a>(core::ptr::NonNull<u8>, PhantomData<&'a ()>);
 
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 impl<'a> fmt::Debug for RefPosition<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let addr = self.0.as_ptr() as usize;
@@ -107,6 +109,7 @@ impl<'a> fmt::Debug for RefPosition<'a> {
 }
 
 #[allow(dead_code)]
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 impl RefPosition<'_> {
     /// The big idea of RefPosition is that `Option<RefPosition>` becomes pointer-sized, by using nullptr as the None value.
     /// Good candidate for const-panics when stabilized.
@@ -129,17 +132,15 @@ impl RefPosition<'_> {
         debug_assert!(!ptr.is_null(), "Pointer cannot be null");
         // Annoyingly there's no *const NonNull.
         let mutp = ptr as *mut u8;
-        let nonnullp = if cfg!(feature = "prohibit-unsafe") {
-            core::ptr::NonNull::new(mutp).expect("Pointer was null")
-        } else {
-            unsafe { core::ptr::NonNull::new_unchecked(mutp) }
-        };
+        let nonnullp = unsafe { core::ptr::NonNull::new_unchecked(mutp) };
         Self(nonnullp, PhantomData)
     }
 }
 
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 impl PositionType for RefPosition<'_> {}
 
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 impl ops::Add<usize> for RefPosition<'_> {
     type Output = Self;
 
@@ -149,6 +150,7 @@ impl ops::Add<usize> for RefPosition<'_> {
     }
 }
 
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 impl<'a> ops::Sub<RefPosition<'a>> for RefPosition<'a> {
     type Output = usize;
 
@@ -160,6 +162,7 @@ impl<'a> ops::Sub<RefPosition<'a>> for RefPosition<'a> {
     }
 }
 
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 impl ops::Sub<usize> for RefPosition<'_> {
     type Output = Self;
 
@@ -170,6 +173,7 @@ impl ops::Sub<usize> for RefPosition<'_> {
     }
 }
 
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 impl ops::AddAssign<usize> for RefPosition<'_> {
     #[inline(always)]
     fn add_assign(&mut self, rhs: usize) {
@@ -177,6 +181,7 @@ impl ops::AddAssign<usize> for RefPosition<'_> {
     }
 }
 
+#[cfg(all(not(feature = "index-positions"), not(feature = "prohibit-unsafe")))]
 impl ops::SubAssign<usize> for RefPosition<'_> {
     #[inline(always)]
     fn sub_assign(&mut self, rhs: usize) {

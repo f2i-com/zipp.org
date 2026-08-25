@@ -92,6 +92,32 @@ impl<V> Default for SlotTable<V> {
 }
 
 impl<V> SlotTable<V> {
+    /// Reserved bytes owned directly by the table (including allocated index
+    /// pages, but excluding allocations owned inside each `V`).
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let pages = self
+            .pages
+            .iter()
+            .filter_map(Option::as_ref)
+            .fold(0usize, |n, page| {
+                n.saturating_add(page.pos.len().saturating_mul(std::mem::size_of::<u32>()))
+            });
+        self.pages
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<Page>>())
+            .saturating_add(
+                self.vals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<V>()),
+            )
+            .saturating_add(
+                self.keys
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
+            .saturating_add(pages)
+    }
+
     #[inline]
     fn pos(&self, k: u32) -> Option<usize> {
         let page = self.pages.get((k >> PAGE_BITS) as usize)?.as_ref()?;

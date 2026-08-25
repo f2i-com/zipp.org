@@ -194,9 +194,12 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
     fn pop_backtrack(&mut self) {
         // Note we never pop the last instruction so this will never be empty.
         debug_assert!(!self.bts.is_empty());
-        if cfg!(feature = "prohibit-unsafe") {
+        #[cfg(feature = "prohibit-unsafe")]
+        {
             self.bts.pop();
-        } else {
+        }
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        {
             unsafe { self.bts.set_len(self.bts.len() - 1) }
         }
     }

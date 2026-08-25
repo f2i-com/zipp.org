@@ -19,6 +19,42 @@
 //! pu_extensions      = sep [xX] (sep alphanum{1,8})+
 //! ```
 
+use std::collections::HashSet;
+
+const LOCALE_PARSE_WORK_PER_BYTE: u64 = 16;
+const LOCALE_SORT_WORK_PER_ITEM_BYTE: u64 = 8;
+
+/// A conservative native-work estimate for parsing a guest-controlled locale
+/// string. Parsing visits the input several times (splitting, validating,
+/// lower-casing and hashing), so charging only one unit per byte would still
+/// permit a single Intl operation to run well past the native-call budget.
+pub(crate) fn locale_parse_work_bound(byte_len: usize) -> u64 {
+    (byte_len as u64).saturating_mul(LOCALE_PARSE_WORK_PER_BYTE)
+}
+
+/// Comparison sorts below compare at most eight ASCII bytes per item. Charge
+/// the full worst-case comparison width so a valid tag with thousands of
+/// distinct variants/attributes cannot hide an n*log(n) native loop behind a
+/// merely linear input-size check.
+pub(crate) fn locale_sort_work_bound(items: usize) -> u64 {
+    if items < 2 {
+        return 0;
+    }
+    let rounds = usize::BITS - (items - 1).leading_zeros();
+    (items as u64)
+        .saturating_mul(rounds as u64)
+        .saturating_mul(LOCALE_SORT_WORK_PER_ITEM_BYTE)
+}
+
+fn add_locale_work(work: &mut u64, additional: u64) -> Option<()> {
+    *work = work.checked_add(additional)?;
+    (*work <= crate::vm::MAX_NATIVE_ITERATION_WORK).then_some(())
+}
+
+fn add_locale_sort_work(work: &mut u64, items: usize) -> Option<()> {
+    add_locale_work(work, locale_sort_work_bound(items))
+}
+
 /// A parsed `unicode_locale_id`. Every field is already canonical-cased and
 /// canonically ordered, so `to_string` is a plain re-join.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -77,7 +113,8 @@ pub(crate) fn is_variant_subtag(s: &str) -> bool {
 /// alphanumeric subtags. Also the shape ECMA-402 demands of the `calendar`,
 /// `collation`, `numberingSystem` and `firstDayOfWeek` options.
 pub(crate) fn is_type_sequence(s: &str) -> bool {
-    !s.is_empty()
+    locale_parse_work_bound(s.len()) <= crate::vm::MAX_NATIVE_ITERATION_WORK
+        && !s.is_empty()
         && s.split('-')
             .all(|p| (3..=8).contains(&p.len()) && is_alnum(p))
 }
@@ -197,10 +234,22 @@ fn canon_u_value(v: &str) -> String {
 /// Parse + canonicalize a `unicode_locale_id`. `None` when the tag is not
 /// structurally valid (ECMA-402 IsStructurallyValidLanguageTag).
 pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
+    let mut work = 0;
+    parse_lang_tag_with_work(tag, &mut work)
+}
+
+fn parse_lang_tag_with_work(tag: &str, work: &mut u64) -> Option<LangTag> {
+    // Check the O(1) byte length before is_ascii/split can start traversing an
+    // attacker-sized string. In the default profile the shared limit is
+    // u64::MAX, preserving the existing compatibility behaviour.
+    add_locale_work(work, locale_parse_work_bound(tag.len()))?;
     if tag.is_empty() || !tag.is_ascii() {
         return None;
     }
-    let parts: Vec<&str> = tag.split('-').collect();
+    let part_count = tag.bytes().filter(|&b| b == b'-').count() + 1;
+    let mut parts: Vec<&str> = Vec::new();
+    parts.try_reserve_exact(part_count).ok()?;
+    parts.extend(tag.split('-'));
     if parts.iter().any(|p| p.is_empty() || p.len() > 8) {
         return None;
     }
@@ -235,20 +284,27 @@ pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
             };
             i += 1;
         }
+        let mut variant_keys: HashSet<String> = HashSet::new();
         while i < parts.len() && is_variant_subtag(parts[i]) {
             let v = parts[i].to_ascii_lowercase();
             // "de-DE-1996-1996" / "en-emodeng-emodeng": a repeated variant makes
             // the tag structurally invalid, not merely redundant.
-            if t.variants.contains(&v) {
+            if variant_keys.contains(&v) {
                 return None;
             }
+            variant_keys.try_reserve(1).ok()?;
+            t.variants.try_reserve(1).ok()?;
+            variant_keys.insert(v.clone());
             t.variants.push(v);
             i += 1;
         }
+        add_locale_sort_work(work, t.variants.len())?;
         t.variants.sort();
     }
     // ── extensions ──
-    let mut seen: Vec<char> = vec![];
+    // There are only 128 ASCII singleton values; a direct membership table
+    // avoids even the small deterministic linear-probe list here.
+    let mut seen = [false; 128];
     while i < parts.len() {
         if parts[i].len() != 1 {
             return None; // a non-singleton where an extension must start
@@ -258,10 +314,11 @@ pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
             return None;
         }
         // "cmn-hans-cn-u-u": each singleton may appear at most once.
-        if seen.contains(&sing) {
+        let sing_index = sing as usize;
+        if seen[sing_index] {
             return None;
         }
-        seen.push(sing);
+        seen[sing_index] = true;
         i += 1;
         let start = i;
         // `pu_extensions = sep [xX] (sep alphanum{1,8})+` runs to the END of the
@@ -291,11 +348,11 @@ pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
                     .join("-");
             }
             'u' => {
-                parse_unicode_ext(body, &mut t)?;
+                parse_unicode_ext(body, &mut t, work)?;
                 t.has_u = true;
             }
             't' => {
-                t.transform = parse_transform_ext(body)?;
+                t.transform = parse_transform_ext(body, work)?;
             }
             _ => {
                 // other_extensions: (sep alphanum{2,8})+
@@ -315,23 +372,29 @@ pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
             }
         }
     }
+    add_locale_sort_work(work, t.other.len())?;
     t.other.sort_by_key(|(c, _)| *c);
     Some(t)
 }
 
 /// `unicode_locale_extensions = "u" ((sep attribute)+ (sep keyword)* | (sep keyword)+)`
-fn parse_unicode_ext(body: &[&str], t: &mut LangTag) -> Option<()> {
+fn parse_unicode_ext(body: &[&str], t: &mut LangTag, work: &mut u64) -> Option<()> {
     let mut j = 0usize;
+    let mut attributes: HashSet<String> = HashSet::new();
     while j < body.len() && !is_u_key(body[j]) {
         if !is_u_attribute(body[j]) {
             return None;
         }
         let a = body[j].to_ascii_lowercase();
-        if !t.u_attributes.contains(&a) {
+        if !attributes.contains(&a) {
+            attributes.try_reserve(1).ok()?;
+            t.u_attributes.try_reserve(1).ok()?;
+            attributes.insert(a.clone());
             t.u_attributes.push(a);
         }
         j += 1;
     }
+    let mut keyword_keys: HashSet<String> = HashSet::new();
     while j < body.len() {
         if !is_u_key(body[j]) {
             return None;
@@ -348,10 +411,15 @@ fn parse_unicode_ext(body: &[&str], t: &mut LangTag) -> Option<()> {
         let value = canon_u_value(&body[vstart..j].join("-"));
         // "da-u-ca-gregory-ca-buddhist": a repeated key keeps its FIRST value
         // (UTS-35 canonicalization drops the later duplicates).
-        if !t.u_keywords.iter().any(|(k, _)| *k == key) {
+        if !keyword_keys.contains(&key) {
+            keyword_keys.try_reserve(1).ok()?;
+            t.u_keywords.try_reserve(1).ok()?;
+            keyword_keys.insert(key.clone());
             t.u_keywords.push((key, value));
         }
     }
+    add_locale_sort_work(work, t.u_attributes.len())?;
+    add_locale_sort_work(work, t.u_keywords.len())?;
     t.u_attributes.sort();
     t.u_keywords.sort_by(|a, b| a.0.cmp(&b.0));
     Some(())
@@ -359,7 +427,7 @@ fn parse_unicode_ext(body: &[&str], t: &mut LangTag) -> Option<()> {
 
 /// `transformed_extensions = "t" ((sep tlang (sep tfield)*) | (sep tfield)+)`,
 /// where `tfield = tkey tvalue` and `tkey = alpha digit`.
-fn parse_transform_ext(body: &[&str]) -> Option<String> {
+fn parse_transform_ext(body: &[&str], work: &mut u64) -> Option<String> {
     let is_tkey = |s: &str| {
         s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1].is_ascii_digit()
     };
@@ -375,14 +443,15 @@ fn parse_transform_ext(body: &[&str]) -> Option<String> {
         if body[0].eq_ignore_ascii_case("root") {
             return None;
         }
-        let tlang = parse_lang_tag(&body[..end].join("-"))?;
+        let tlang_text = body[..end].join("-");
+        let tlang = parse_lang_tag_with_work(&tlang_text, work)?;
         if !tlang.other.is_empty() || tlang.has_u || !tlang.private.is_empty() {
             return None;
         }
         out.push(tlang.base_name().to_ascii_lowercase());
         j = end;
     }
-    let mut keys: Vec<String> = vec![];
+    let mut keys: HashSet<String> = HashSet::new();
     let mut fields: Vec<(String, String)> = vec![];
     while j < body.len() {
         if !is_tkey(body[j]) {
@@ -392,7 +461,8 @@ fn parse_transform_ext(body: &[&str]) -> Option<String> {
         if keys.contains(&k) {
             return None;
         }
-        keys.push(k.clone());
+        keys.try_reserve(1).ok()?;
+        keys.insert(k.clone());
         j += 1;
         let vstart = j;
         while j < body.len() && !is_tkey(body[j]) {
@@ -416,6 +486,7 @@ fn parse_transform_ext(body: &[&str]) -> Option<String> {
     if out.is_empty() && fields.is_empty() {
         return None;
     }
+    add_locale_sort_work(work, fields.len())?;
     fields.sort_by(|a, b| a.0.cmp(&b.0));
     for (k, v) in fields {
         out.push(k);

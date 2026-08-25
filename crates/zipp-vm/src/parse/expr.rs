@@ -131,6 +131,10 @@ impl<'s> Parser<'s> {
 
     /// `AssignmentExpression`.
     pub(crate) fn parse_assign(&mut self) -> PResult<Expr> {
+        self.with_syntax_recursion(|p| p.parse_assign_inner())
+    }
+
+    fn parse_assign_inner(&mut self) -> PResult<Expr> {
         // `yield` is an AssignmentExpression of its own, not an operand.
         if self.ctx.yield_ && self.at_kw(Keyword::Yield) {
             return self.parse_yield();
@@ -363,7 +367,10 @@ impl<'s> Parser<'s> {
                 "SyntaxError: '??' cannot be mixed with '||' or '&&' without parentheses",
             ));
         }
+        let mut links = 0usize;
         while self.at(Punct::QuestionQuestion) {
+            self.check_syntax_chain(links)?;
+            links += 1;
             self.bump_before_operand()?;
             let (right, saw) = self.parse_or_chain()?;
             if saw {
@@ -382,7 +389,10 @@ impl<'s> Parser<'s> {
 
     fn parse_or_chain(&mut self) -> PResult<(Expr, bool)> {
         let (mut left, mut saw) = self.parse_and_chain()?;
+        let mut links = 0usize;
         while self.at(Punct::PipePipe) {
+            self.check_syntax_chain(links)?;
+            links += 1;
             saw = true;
             self.bump_before_operand()?;
             let (right, _) = self.parse_and_chain()?;
@@ -398,7 +408,10 @@ impl<'s> Parser<'s> {
     fn parse_and_chain(&mut self) -> PResult<(Expr, bool)> {
         let mut left = self.parse_binary(4)?;
         let mut saw = false;
+        let mut links = 0usize;
         while self.at(Punct::AmpAmp) {
+            self.check_syntax_chain(links)?;
+            links += 1;
             saw = true;
             self.bump_before_operand()?;
             let right = self.parse_binary(4)?;
@@ -413,6 +426,10 @@ impl<'s> Parser<'s> {
 
     /// Precedence climbing. `min` is the lowest binding power this call accepts.
     fn parse_binary(&mut self, min: u8) -> PResult<Expr> {
+        self.with_syntax_recursion(|p| p.parse_binary_inner(min))
+    }
+
+    fn parse_binary_inner(&mut self, min: u8) -> PResult<Expr> {
         // `[+In] PrivateIdentifier in ShiftExpression` is a production of
         // RelationalExpression, NOT a PrimaryExpression: the private name is
         // legal only where a RelationalExpression is admissible (`min <= 9`,
@@ -427,6 +444,7 @@ impl<'s> Parser<'s> {
         } else {
             self.parse_unary()?
         };
+        let mut links = 0usize;
         loop {
             // `in` and `instanceof` are keywords at binary precedence, and `in`
             // is suppressed inside a `for` head.
@@ -448,6 +466,8 @@ impl<'s> Parser<'s> {
             if prec < min {
                 break;
             }
+            self.check_syntax_chain(links)?;
+            links += 1;
             self.bump_before_operand()?;
             // `**` is RIGHT-associative, so its right operand accepts the same
             // precedence rather than one higher.
@@ -508,6 +528,10 @@ impl<'s> Parser<'s> {
     // ---- unary / update ----------------------------------------------------
 
     fn parse_unary(&mut self) -> PResult<Expr> {
+        self.with_syntax_recursion(|p| p.parse_unary_inner())
+    }
+
+    fn parse_unary_inner(&mut self) -> PResult<Expr> {
         use Punct as P;
         let op = match self.cur().kind.as_punct() {
             Some(P::Minus) => Some(UnaryOp::Minus),
@@ -680,8 +704,11 @@ impl<'s> Parser<'s> {
             }
         }
         let mut saw_optional = false;
+        let mut links = 0usize;
         loop {
             if self.at(Punct::Dot) {
+                self.check_syntax_chain(links)?;
+                links += 1;
                 self.bump_after_operand()?;
                 let prop = self.member_prop()?;
                 e = Expr::Member(Box::new(Member {
@@ -690,6 +717,8 @@ impl<'s> Parser<'s> {
                     optional: false,
                 }));
             } else if self.at(Punct::QuestionDot) {
+                self.check_syntax_chain(links)?;
+                links += 1;
                 // `super?.x` / `super?.[x]` are early SyntaxErrors: `super` is
                 // not a valid optional-chain base.
                 if matches!(&e, Expr::Super) {
@@ -727,6 +756,8 @@ impl<'s> Parser<'s> {
                     }));
                 }
             } else if self.at(Punct::LBracket) {
+                self.check_syntax_chain(links)?;
+                links += 1;
                 self.bump_before_operand()?;
                 let saved_in = self.ctx.in_;
                 self.ctx.in_ = true;
@@ -739,6 +770,8 @@ impl<'s> Parser<'s> {
                     optional: false,
                 }));
             } else if self.at(Punct::LParen) {
+                self.check_syntax_chain(links)?;
+                links += 1;
                 let args = self.parse_args()?;
                 e = Expr::Call(Box::new(CallExpr {
                     callee: e,
@@ -746,6 +779,8 @@ impl<'s> Parser<'s> {
                     optional: false,
                 }));
             } else if matches!(self.cur().kind, TokenKind::Template { .. }) {
+                self.check_syntax_chain(links)?;
+                links += 1;
                 // A tagged template. `` a?.b`x` `` is a SyntaxError: an optional
                 // chain may not be tagged.
                 if saw_optional {
@@ -791,6 +826,10 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_new(&mut self) -> PResult<Expr> {
+        self.with_syntax_recursion(|p| p.parse_new_inner())
+    }
+
+    fn parse_new_inner(&mut self) -> PResult<Expr> {
         let pos = self.cur().span.start;
         // `new` is followed by a MemberExpression — an OPERAND — so `new /re/`
         // is a regex literal (a runtime TypeError, not a syntax error).
@@ -841,8 +880,11 @@ impl<'s> Parser<'s> {
                 pos,
             ));
         }
+        let mut links = 0usize;
         loop {
             if self.at(Punct::Dot) {
+                self.check_syntax_chain(links)?;
+                links += 1;
                 self.bump_after_operand()?;
                 let prop = self.member_prop()?;
                 callee = Expr::Member(Box::new(Member {
@@ -851,6 +893,8 @@ impl<'s> Parser<'s> {
                     optional: false,
                 }));
             } else if self.at(Punct::LBracket) {
+                self.check_syntax_chain(links)?;
+                links += 1;
                 self.bump_before_operand()?;
                 let idx = self.parse_expr()?;
                 self.expect(Punct::RBracket, false)?;
@@ -860,6 +904,8 @@ impl<'s> Parser<'s> {
                     optional: false,
                 }));
             } else if matches!(self.cur().kind, TokenKind::Template { .. }) {
+                self.check_syntax_chain(links)?;
+                links += 1;
                 // `MemberExpression : MemberExpression TemplateLiteral` — a
                 // tagged template is itself a MemberExpression, so ``new tag`t` ``
                 // constructs the TAG'S RESULT, not the tag.

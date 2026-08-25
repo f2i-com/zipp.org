@@ -131,6 +131,9 @@ impl<'s> Lexer<'s> {
 
     /// Decode the char at `pos` (which must be a UTF-8 boundary), and its width.
     fn char_at(&self, pos: usize) -> (char, usize) {
+        #[cfg(feature = "safe-sandbox")]
+        let s = std::str::from_utf8(&self.src[pos..]).expect("lexer source is valid UTF-8");
+        #[cfg(not(feature = "safe-sandbox"))]
         let s = unsafe { std::str::from_utf8_unchecked(&self.src[pos..]) };
         match s.chars().next() {
             Some(c) => (c, c.len_utf8()),

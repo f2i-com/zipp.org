@@ -30,10 +30,13 @@ impl<'p> Vm<'p> {
         // through `to_js_string`, whose lossy view would turn a lone surrogate
         // into U+FFFD; ToString on a String is the identity anyway.
         let sv = if input.is_heap() && self.heap.is_str_like(input.heap_index()) {
+            let units = self.heap.str_units(input.heap_index()).unwrap_or(0);
+            self.preflight_native_iteration_work(units as u64)?;
             self.heap.flatten(input.heap_index());
             input
         } else {
             let s = self.to_js_string(input)?;
+            self.preflight_native_iteration_work(s.len() as u64)?;
             self.alloc_str(s)
         };
         let mut r = ObjMap::new();

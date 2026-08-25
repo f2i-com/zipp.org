@@ -68,11 +68,19 @@ use crate::value::Value;
 /// `Vec<Value>` of freshly-allocated objects while re-entering the interpreter
 /// (a callback), where a safe point could otherwise free that working set.
 pub(crate) struct GcGuard {
+    #[cfg(not(feature = "safe-sandbox"))]
     lock: *mut u32,
+    #[cfg(feature = "safe-sandbox")]
+    lock: std::rc::Rc<std::cell::Cell<u32>>,
 }
 
 impl Drop for GcGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.lock.set(self.lock.get().saturating_sub(1));
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
         // SAFETY: the guard never outlives the `&mut Vm` it was created from, and
         // a `Vm` behind `&mut self` is not relocated for the guard's lifetime.
         unsafe {
@@ -93,16 +101,30 @@ impl Vm<'_> {
     /// Suspend GC for the returned guard's scope (see [`GcGuard`]).
     #[inline]
     pub(crate) fn gc_lock_guard(&mut self) -> GcGuard {
-        self.gc_lock += 1;
-        GcGuard {
-            lock: &mut self.gc_lock as *mut u32,
+        #[cfg(feature = "safe-sandbox")]
+        {
+            self.gc_lock.set(self.gc_lock.get().saturating_add(1));
+            return GcGuard {
+                lock: std::rc::Rc::clone(&self.gc_lock),
+            };
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            self.gc_lock += 1;
+            GcGuard {
+                lock: &mut self.gc_lock as *mut u32,
+            }
         }
     }
 
     /// Run a collection if one is due (or always, under stress) and it is safe.
     #[inline]
     pub(crate) fn maybe_gc(&mut self) {
-        if self.gc_lock == 0 && self.gc_floor != 0 && (self.heap.gc_requested() || self.gc_stress) {
+        #[cfg(feature = "safe-sandbox")]
+        let unlocked = self.gc_lock.get() == 0;
+        #[cfg(not(feature = "safe-sandbox"))]
+        let unlocked = self.gc_lock == 0;
+        if unlocked && self.gc_floor != 0 && (self.heap.gc_requested() || self.gc_stress) {
             self.gc();
         }
     }

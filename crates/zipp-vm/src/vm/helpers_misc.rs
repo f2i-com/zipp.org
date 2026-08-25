@@ -5322,7 +5322,10 @@ pub(crate) extern "win64" fn jit_iter_next(
         s
     } else if let Some(s) = vm.array_iter_step(it_idx) {
         s
-    } else if let Some(p) = vm.collection_iter_step(it_idx) {
+    } else if let Some(p) = match vm.collection_iter_step(it_idx) {
+        Ok(step) => step,
+        Err(t) => return vm.jit_thrown_to_sentinel(t),
+    } {
         Ok(p)
     } else {
         // TypedArray-backed (per-step bounds check can throw) and every other

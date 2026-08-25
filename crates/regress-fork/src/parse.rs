@@ -292,6 +292,36 @@ where
     })
 }
 
+/// Regex groups and Unicode-set nesting recurse through the Rust parser and
+/// later through IR walks.  The sandbox profile must turn hostile nesting into
+/// a normal RegExp syntax error rather than exhausting the native/Wasm stack.
+#[cfg(feature = "prohibit-unsafe")]
+const MAX_SAFE_REGEX_NESTING: usize = 32;
+
+/// Alternation is represented as a binary IR tree.  Its parser loop is flat,
+/// but an unbounded number of `|` branches would hand the recursive optimizer
+/// and emitter an unbounded right spine.
+#[cfg(feature = "prohibit-unsafe")]
+const MAX_SAFE_REGEX_ALTERNATIVES: usize = 64;
+
+/// Aggregate Unicode-property expansion admitted by one safe-profile compile.
+/// Property tables are static, but the parser copies their ranges into owned
+/// IR sets. Without an aggregate budget a tiny repeated `\p{...}` spelling can
+/// retain tens of megabytes before source-size accounting sees anything but a
+/// few input bytes.
+#[cfg(feature = "prohibit-unsafe")]
+const MAX_SAFE_REGEX_PROPERTY_INTERVALS: usize = 1 << 15;
+
+/// Unicode properties of strings (`v` mode) expand into an alternation with
+/// one owned node/vector chain per string. `RGI_Emoji` currently has 3,953
+/// alternatives, so this admits one standards-defined atom but rejects the
+/// dangerous repeated-expansion shape before copying its second table.
+#[cfg(feature = "prohibit-unsafe")]
+const MAX_SAFE_REGEX_STRING_ALTERNATIVES: usize = 1 << 12;
+
+#[cfg(feature = "prohibit-unsafe")]
+const MAX_SAFE_REGEX_STRING_CODEPOINTS: usize = 1 << 16;
+
 fn make_cat(nodes: ir::NodeList) -> ir::Node {
     match nodes.len() {
         0 => ir::Node::Empty,
@@ -301,14 +331,42 @@ fn make_cat(nodes: ir::NodeList) -> ir::Node {
 }
 
 fn make_alt(nodes: ir::NodeList) -> ir::Node {
-    let mut mright = None;
-    for node in nodes.into_iter().rev() {
-        match mright {
-            None => mright = Some(node),
-            Some(right) => mright = Some(ir::Node::Alt(Box::new(node), Box::new(right))),
+    #[cfg(feature = "prohibit-unsafe")]
+    {
+        // Properties-of-strings such as `\p{RGI_Emoji}` expand one source atom
+        // into thousands of alternatives. A right spine makes every later IR
+        // walk recurse thousands of frames even though the source itself has
+        // no visible nesting. Keep the same left-to-right alternative order in
+        // a balanced tree so its native/Wasm stack cost is logarithmic.
+        let mut level = nodes;
+        if level.is_empty() {
+            return ir::Node::Empty;
         }
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut it = level.into_iter();
+            while let Some(left) = it.next() {
+                next.push(match it.next() {
+                    Some(right) => ir::Node::Alt(Box::new(left), Box::new(right)),
+                    None => left,
+                });
+            }
+            level = next;
+        }
+        return level.pop().unwrap();
     }
-    mright.unwrap_or(ir::Node::Empty)
+
+    #[cfg(not(feature = "prohibit-unsafe"))]
+    {
+        let mut mright = None;
+        for node in nodes.into_iter().rev() {
+            match mright {
+                None => mright = Some(node),
+                Some(right) => mright = Some(ir::Node::Alt(Box::new(node), Box::new(right))),
+            }
+        }
+        mright.unwrap_or(ir::Node::Empty)
+    }
 }
 
 /// \return a CodePointSet for a given character escape (positive or negative).
@@ -446,6 +504,19 @@ where
 
     /// Whether a lookbehind was encountered.
     has_lookbehind: bool,
+
+    /// Active recursive group / nested-class-set productions in the hardened
+    /// profile. Ordinary builds intentionally retain their previous limits.
+    #[cfg(feature = "prohibit-unsafe")]
+    recursion_depth: usize,
+
+    /// Aggregate owned IR copied out of static Unicode property tables.
+    #[cfg(feature = "prohibit-unsafe")]
+    property_intervals: usize,
+    #[cfg(feature = "prohibit-unsafe")]
+    string_property_alternatives: usize,
+    #[cfg(feature = "prohibit-unsafe")]
+    string_property_codepoints: usize,
 }
 
 impl<I> Parser<I>
@@ -520,8 +591,32 @@ where
 
     /// ES6 21.2.2.3 Disjunction.
     fn consume_disjunction(&mut self) -> Result<ir::Node, Error> {
+        #[cfg(feature = "prohibit-unsafe")]
+        {
+            // The outer Pattern disjunction is depth one but is not itself a
+            // source nesting level, hence `>` rather than `>=` here.
+            if self.recursion_depth > MAX_SAFE_REGEX_NESTING {
+                return error("Regular expression nesting exceeds the sandbox limit");
+            }
+            self.recursion_depth += 1;
+        }
+
+        let result = self.consume_disjunction_inner();
+
+        #[cfg(feature = "prohibit-unsafe")]
+        {
+            self.recursion_depth -= 1;
+        }
+        result
+    }
+
+    fn consume_disjunction_inner(&mut self) -> Result<ir::Node, Error> {
         let mut terms = vec![self.consume_term()?];
         while self.try_consume('|') {
+            #[cfg(feature = "prohibit-unsafe")]
+            if terms.len() >= MAX_SAFE_REGEX_ALTERNATIVES {
+                return error("Regular expression alternatives exceed the sandbox limit");
+            }
             terms.push(self.consume_term()?)
         }
         Ok(make_alt(terms))
@@ -1053,6 +1148,24 @@ where
 
     // CharacterClass :: ClassContents :: ClassSetExpression
     fn consume_class_set_expression(&mut self, negate_set: bool) -> Result<ClassSet, Error> {
+        #[cfg(feature = "prohibit-unsafe")]
+        {
+            if self.recursion_depth > MAX_SAFE_REGEX_NESTING {
+                return error("Regular expression nesting exceeds the sandbox limit");
+            }
+            self.recursion_depth += 1;
+        }
+
+        let result = self.consume_class_set_expression_inner(negate_set);
+
+        #[cfg(feature = "prohibit-unsafe")]
+        {
+            self.recursion_depth -= 1;
+        }
+        result
+    }
+
+    fn consume_class_set_expression_inner(&mut self, negate_set: bool) -> Result<ClassSet, Error> {
         let mut result = ClassSet::new();
 
         let first = match self.peek() {
@@ -2048,6 +2161,10 @@ where
                     }
 
                     // Entering a new group.
+                    #[cfg(feature = "prohibit-unsafe")]
+                    if paren_depth >= MAX_SAFE_REGEX_NESTING {
+                        return error("Regular expression nesting exceeds the sandbox limit");
+                    }
                     paren_depth += 1;
                     alt_indices.insert(paren_depth, 0);
                 }
@@ -2108,6 +2225,8 @@ where
                     else {
                         break;
                     };
+                    #[cfg(feature = "prohibit-unsafe")]
+                    self.charge_unicode_property_expansion(&value)?;
                     return Ok(value);
                 }
                 '=' if name.is_none() => {
@@ -2127,6 +2246,59 @@ where
         }
 
         error("Invalid property name")
+    }
+
+    #[cfg(feature = "prohibit-unsafe")]
+    fn charge_unicode_property_expansion(
+        &mut self,
+        property: &PropertyEscapeKind,
+    ) -> Result<(), Error> {
+        match property {
+            PropertyEscapeKind::CharacterClass(intervals) => {
+                self.property_intervals = self
+                    .property_intervals
+                    .checked_add(intervals.len())
+                    .ok_or_else(|| Error {
+                        text: "Regular expression Unicode property expansion exceeds the sandbox limit"
+                            .to_string(),
+                    })?;
+                if self.property_intervals > MAX_SAFE_REGEX_PROPERTY_INTERVALS {
+                    return error(
+                        "Regular expression Unicode property expansion exceeds the sandbox limit",
+                    );
+                }
+            }
+            PropertyEscapeKind::StringSet(strings) => {
+                let codepoints = strings.iter().try_fold(0usize, |n, s| {
+                    n.checked_add(s.len()).ok_or_else(|| Error {
+                        text: "Regular expression Unicode string-property expansion exceeds the sandbox limit"
+                            .to_string(),
+                    })
+                })?;
+                self.string_property_alternatives = self
+                    .string_property_alternatives
+                    .checked_add(strings.len())
+                    .ok_or_else(|| Error {
+                        text: "Regular expression Unicode string-property expansion exceeds the sandbox limit"
+                            .to_string(),
+                    })?;
+                self.string_property_codepoints = self
+                    .string_property_codepoints
+                    .checked_add(codepoints)
+                    .ok_or_else(|| Error {
+                        text: "Regular expression Unicode string-property expansion exceeds the sandbox limit"
+                            .to_string(),
+                    })?;
+                if self.string_property_alternatives > MAX_SAFE_REGEX_STRING_ALTERNATIVES
+                    || self.string_property_codepoints > MAX_SAFE_REGEX_STRING_CODEPOINTS
+                {
+                    return error(
+                        "Regular expression Unicode string-property expansion exceeds the sandbox limit",
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn finalize(&self, mut re: ir::Regex) -> Result<ir::Regex, Error> {
@@ -2158,6 +2330,14 @@ where
         named_group_indices: HashMap::new(),
         group_count_max: 0,
         has_lookbehind: false,
+        #[cfg(feature = "prohibit-unsafe")]
+        recursion_depth: 0,
+        #[cfg(feature = "prohibit-unsafe")]
+        property_intervals: 0,
+        #[cfg(feature = "prohibit-unsafe")]
+        string_property_alternatives: 0,
+        #[cfg(feature = "prohibit-unsafe")]
+        string_property_codepoints: 0,
     };
     p.try_parse()
 }

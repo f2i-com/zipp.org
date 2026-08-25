@@ -252,3 +252,53 @@ pub struct CompiledRegex {
     #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
     pub rxjit: crate::rxjit::JitSlot,
 }
+
+impl CompiledRegex {
+    /// Owned allocations retained by the immutable compiled program.
+    ///
+    /// The returned figure includes vector/box capacities and their nested
+    /// payloads, but not `self` itself (the public `Regex` wrapper adds that).
+    /// Optional lazily-created execution tiers are accounted by their wrapper.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let mut bytes = self
+            .insns
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Insn>())
+            .saturating_add(
+                self.brackets
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<BracketContents>()),
+            )
+            .saturating_add(
+                self.group_names
+                    .len()
+                    .saturating_mul(core::mem::size_of::<Box<str>>()),
+            );
+
+        for insn in &self.insns {
+            if let Insn::BackRefMulti { groups, .. } = insn {
+                bytes =
+                    bytes.saturating_add(groups.len().saturating_mul(core::mem::size_of::<u32>()));
+            }
+        }
+        for bracket in &self.brackets {
+            bytes = bytes.saturating_add(bracket.cps.resident_bytes());
+        }
+        for name in &self.group_names {
+            bytes = bytes.saturating_add(name.len());
+        }
+        if let StartPredicate::ByteSeq(finder) = &self.start_pred {
+            bytes = bytes
+                .saturating_add(core::mem::size_of::<memmem::Finder<'static>>())
+                .saturating_add(finder.needle().len());
+        }
+        if let Some(plan) = &self.suffix_start {
+            bytes = bytes.saturating_add(plan.resident_bytes());
+        }
+        #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+        {
+            bytes = bytes.saturating_add(self.rxjit.resident_bytes());
+        }
+        bytes
+    }
+}

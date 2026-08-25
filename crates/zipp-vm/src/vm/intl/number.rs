@@ -205,6 +205,7 @@ impl<'p> Vm<'p> {
             return Ok(UseGrouping::Bool(false));
         }
         let s = self.to_js_string(v)?;
+        self.preflight_native_iteration_work(s.len() as u64)?;
         if s == "true" || s == "false" {
             return Ok(UseGrouping::Str(fallback.to_string()));
         }

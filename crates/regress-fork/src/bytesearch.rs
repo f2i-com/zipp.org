@@ -264,6 +264,7 @@ impl ByteBitmap {
 
     /// \return the index of the first byte in the slice that is present in this
     /// bitmap, using some unsafe tricks.
+    #[cfg(not(feature = "prohibit-unsafe"))]
     #[inline(always)]
     fn unsafe_find_in_slice(&self, bytes: &[u8]) -> Option<usize> {
         type Chunk = u32;
@@ -310,16 +311,17 @@ impl ByteBitmap {
 impl ByteSearcher for ByteBitmap {
     #[inline(always)]
     fn find_in(&self, bytes: &[u8]) -> Option<usize> {
-        if cfg!(feature = "prohibit-unsafe") {
+        #[cfg(feature = "prohibit-unsafe")]
+        {
             for (idx, byte) in bytes.iter().enumerate() {
                 if self.contains(*byte) {
                     return Some(idx);
                 }
             }
-            None
-        } else {
-            self.unsafe_find_in_slice(bytes)
+            return None;
         }
+        #[cfg(not(feature = "prohibit-unsafe"))]
+        return self.unsafe_find_in_slice(bytes);
     }
 }
 

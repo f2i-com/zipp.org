@@ -14,9 +14,30 @@
 use crate::bytecode::{static_key_plans_enabled, StaticKeyPlan};
 use crate::value::Value;
 use std::borrow::Cow;
+use std::cell::Cell;
+#[cfg(not(feature = "safe-sandbox"))]
 use std::cell::UnsafeCell;
+#[cfg(feature = "safe-sandbox")]
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+
+#[inline]
+fn vec_capacity_bytes<T>(v: &Vec<T>) -> usize {
+    v.capacity().saturating_mul(std::mem::size_of::<T>())
+}
+
+fn string_vec_payload(v: &Vec<String>) -> usize {
+    vec_capacity_bytes(v)
+        .saturating_add(v.iter().fold(0usize, |n, s| n.saturating_add(s.capacity())))
+}
+
+fn named_value_vec_payload(v: &Vec<(String, Value)>) -> usize {
+    vec_capacity_bytes(v).saturating_add(
+        v.iter()
+            .fold(0usize, |n, (s, _)| n.saturating_add(s.capacity())),
+    )
+}
 
 /// Number of keys at which an [`ObjMap`] builds its hash [`PropIndex`].
 /// Measured on 2M-op probes (interpreter): LOOKUPS through the index win
@@ -71,6 +92,7 @@ fn prop_tag(key: &str) -> u32 {
 ///
 /// Read ONCE per index construction (`with_capacity`), never per operation: the
 /// variant is fixed for the life of an index, and `grow` preserves it.
+#[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
 fn split_propindex_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
@@ -108,7 +130,14 @@ fn split_propindex_enabled() -> bool {
 /// the two arrays together are the same bytes as the one they replace but split
 /// so the hot sweep touches only half of them.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
 pub enum PropIndex {
+    /// Hostile-code profile: exact string ordering gives a deterministic
+    /// logarithmic lookup bound even when wasm32 cannot supply secret hash
+    /// entropy. Keys are cloned only after the map crosses the index threshold;
+    /// the authoritative insertion-ordered vectors remain unchanged.
+    #[cfg(feature = "safe-sandbox")]
+    Tree { entries: BTreeMap<String, u32> },
     /// Pre-W19: one flat `Vec<(tag, slot)>`.
     Inter {
         table: Vec<(u32, u32)>,
@@ -128,13 +157,24 @@ pub enum PropIndex {
 
 impl PropIndex {
     fn with_capacity(n: usize) -> PropIndex {
-        // Capacity for `n` entries at < 3/4 load, minimum 32, power of two.
-        let cap = (n * 4 / 3 + 1).next_power_of_two().max(32);
-        Self::with_capacity_kind(cap, split_propindex_enabled())
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = n;
+            return PropIndex::Tree {
+                entries: BTreeMap::new(),
+            };
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            // Capacity for `n` entries at < 3/4 load, minimum 32, power of two.
+            let cap = (n * 4 / 3 + 1).next_power_of_two().max(32);
+            Self::with_capacity_kind(cap, split_propindex_enabled())
+        }
     }
 
     /// `with_capacity` with the layout NAMED rather than latched — the seam the
     /// differential test drives both representations through in one process.
+    #[cfg_attr(feature = "safe-sandbox", allow(dead_code))]
     fn with_capacity_kind(cap: usize, split: bool) -> PropIndex {
         debug_assert!(cap.is_power_of_two() && cap >= 32);
         if split {
@@ -164,8 +204,14 @@ impl PropIndex {
     /// Position in `keys` of the entry equal to `key`, confirmed by compare.
     #[inline]
     fn find(&self, keys: &[String], key: &str) -> Option<usize> {
+        #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::Tree { entries } = self {
+            return entries.get(key).copied().map(|slot| slot as usize);
+        }
         let tag = prop_tag(key);
         match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { table, mask, .. } => {
                 let mut i = tag as usize & mask;
                 loop {
@@ -200,6 +246,8 @@ impl PropIndex {
     #[inline]
     fn cap(&self) -> usize {
         match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { entries } => entries.len(),
             PropIndex::Inter { mask, .. } | PropIndex::Split { mask, .. } => mask + 1,
         }
     }
@@ -207,24 +255,61 @@ impl PropIndex {
     #[inline]
     fn len(&self) -> usize {
         match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { entries } => entries.len(),
             PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len,
+        }
+    }
+
+    fn resident_bytes(&self) -> usize {
+        match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { entries } => {
+                // std's B-tree node fanout/layout is private. 128 bytes per
+                // entry plus owned string capacity deliberately overcounts its
+                // current node overhead while keeping heap audits stable.
+                std::mem::size_of::<Self>()
+                    .saturating_add(entries.len().saturating_mul(128))
+                    .saturating_add(
+                        entries
+                            .keys()
+                            .fold(0usize, |n, key| n.saturating_add(key.capacity())),
+                    )
+            }
+            PropIndex::Inter { table, .. } => vec_capacity_bytes(table),
+            PropIndex::Split { tags, slots, .. } => {
+                vec_capacity_bytes(tags).saturating_add(vec_capacity_bytes(slots))
+            }
         }
     }
 
     /// Record `slot` under `key`. The caller guarantees the key is absent
     /// (every insertion path misses in `pos()` first).
     fn insert(&mut self, key: &str, slot: u32) {
+        #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::Tree { entries } = self {
+            // The mutation must not live inside `debug_assert!`: its argument
+            // is removed in release builds, which would leave every production
+            // safe-profile index empty.
+            let previous = entries.insert(key.to_owned(), slot);
+            debug_assert!(previous.is_none());
+            return;
+        }
         if (self.len() + 1) * 4 >= self.cap() * 3 {
             self.grow();
         }
         self.insert_raw(prop_tag(key), slot);
         match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { len, .. } | PropIndex::Split { len, .. } => *len += 1,
         }
     }
 
     fn insert_raw(&mut self, tag: u32, slot: u32) {
         match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { .. } => unreachable!(),
             PropIndex::Inter { table, mask, .. } => {
                 let mut i = tag as usize & *mask;
                 while table[i].1 != PROP_EMPTY {
@@ -255,7 +340,11 @@ impl PropIndex {
     /// order; only the physical layout differs.
     fn remove_slot(&mut self, tag: u32, slot: u32) {
         match self {
-            PropIndex::Inter { table, mask, len } => {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { .. } => unreachable!(),
+            PropIndex::Inter {
+                table, mask, len, ..
+            } => {
                 let mask = *mask;
                 // Walk the probe chain to the entry recording `slot` (tags can
                 // collide; slot values are unique across the table).
@@ -295,6 +384,7 @@ impl PropIndex {
                 slots,
                 mask,
                 len,
+                ..
             } => {
                 let mask = *mask;
                 let mut j = tag as usize & mask;
@@ -336,10 +426,32 @@ impl PropIndex {
         }
     }
 
+    /// Remove one authoritative property slot. The balanced safe-profile
+    /// index owns the exact key; the ordinary flat layouts retain their stored
+    /// tag/backward-shift protocol. Every later authoritative Vec slot shifts
+    /// down in either representation.
+    fn remove(&mut self, key: &str, slot: u32) {
+        #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::Tree { entries } = self {
+            // As above, perform the state change outside the debug-only check.
+            let removed = entries.remove(key);
+            debug_assert_eq!(removed, Some(slot));
+            for value in entries.values_mut() {
+                if *value > slot {
+                    *value -= 1;
+                }
+            }
+            return;
+        }
+        self.remove_slot(prop_tag(key), slot);
+    }
+
     /// Double and rehash from the stored tags (bucket = `tag & mask`).
     /// Preserves the variant — an index never changes layout mid-life.
     fn grow(&mut self) {
         match self {
+            #[cfg(feature = "safe-sandbox")]
+            PropIndex::Tree { .. } => return,
             PropIndex::Inter { table, mask, .. } => {
                 let cap = table.len() * 2;
                 let old = std::mem::replace(table, vec![(0, PROP_EMPTY); cap]);
@@ -373,6 +485,15 @@ impl PropIndex {
     /// catches it.
     #[cfg(test)]
     fn verify(&self, keys: &[String]) {
+        #[cfg(feature = "safe-sandbox")]
+        if let PropIndex::Tree { entries } = self {
+            assert_eq!(entries.len(), keys.len());
+            for (slot, key) in keys.iter().enumerate() {
+                assert_eq!(entries.get(key), Some(&(slot as u32)));
+                assert_eq!(self.find(keys, key), Some(slot));
+            }
+            return;
+        }
         let cap = self.cap();
         if let PropIndex::Split {
             tags, slots, mask, ..
@@ -384,6 +505,8 @@ impl PropIndex {
         let mut live = 0usize;
         for i in 0..cap {
             let (t, sl) = match self {
+                #[cfg(feature = "safe-sandbox")]
+                PropIndex::Tree { .. } => unreachable!(),
                 PropIndex::Inter { table, .. } => table[i],
                 PropIndex::Split { tags, slots, .. } => (tags[i], slots[i]),
             };
@@ -626,6 +749,19 @@ impl<'a> IntoIterator for &'a mut PropKeys {
 }
 
 impl PropKeys {
+    fn resident_bytes(&self) -> usize {
+        match self {
+            // A planned list is compiler-owned and shared by every object made
+            // from that literal; charging it per object would multiply the same
+            // allocation. It is covered by the separate source/code limits.
+            Self::Planned { .. } => 0,
+            Self::Owned(keys) => vec_capacity_bytes(keys).saturating_add(
+                keys.iter()
+                    .fold(0usize, |n, key| n.saturating_add(key.capacity())),
+            ),
+        }
+    }
+
     fn planned(plan: StaticKeyPlan) -> Self {
         Self::Planned {
             all: plan,
@@ -785,6 +921,27 @@ impl PropAttr {
 }
 
 impl ObjMap {
+    pub(crate) fn resident_bytes(&self) -> usize {
+        let mut n = self
+            .keys
+            .resident_bytes()
+            .saturating_add(vec_capacity_bytes(&self.vals))
+            .saturating_add(vec_capacity_bytes(&self.attrs));
+        if let Some(index) = &self.index {
+            n = n.saturating_add(index.resident_bytes());
+        }
+        if let Some(index) = &self.numeric_index {
+            // Hash table control bytes are implementation-private. Two buckets'
+            // worth per reported entry is a conservative stable approximation.
+            n = n.saturating_add(
+                index
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u32, u32)>() * 2),
+            );
+        }
+        n
+    }
+
     // ---- accessors ---------------------------------------------------------
     //
     // The three parallel `Vec`s are still public while the hidden-class
@@ -1358,7 +1515,7 @@ impl ObjMap {
             if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
                 self.index = None;
             } else {
-                ix.remove_slot(prop_tag(&key), i as u32);
+                ix.remove(&key, i as u32);
             }
         }
     }
@@ -1798,7 +1955,10 @@ impl JsStr {
         // encodings; the bytes otherwise originate from safe `String`s or the
         // engine's WTF-8 encoders, so they are valid UTF-8 (checked by
         // `from_wtf8`'s debug assertion).
-        unsafe { std::str::from_utf8_unchecked(&self.bytes) }
+        #[cfg(feature = "safe-sandbox")]
+        return std::str::from_utf8(&self.bytes).expect("well-formed JsStr invariant");
+        #[cfg(not(feature = "safe-sandbox"))]
+        return unsafe { std::str::from_utf8_unchecked(&self.bytes) };
     }
 
     /// The content as `&str`, LOSSY for the lone-surrogate case (each lone
@@ -1809,7 +1969,12 @@ impl JsStr {
     pub fn as_str_lossy(&self) -> Cow<'_, str> {
         if self.wellformed {
             // SAFETY: as in `as_str_wf` — `wellformed` ⇒ valid UTF-8.
-            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&self.bytes) })
+            #[cfg(feature = "safe-sandbox")]
+            return Cow::Borrowed(
+                std::str::from_utf8(&self.bytes).expect("well-formed JsStr invariant"),
+            );
+            #[cfg(not(feature = "safe-sandbox"))]
+            return Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&self.bytes) });
         } else {
             Cow::Owned(wtf8_to_lossy_string(&self.bytes))
         }
@@ -2395,7 +2560,10 @@ pub enum AbData {
 /// element accesses cast interior pointers to `AtomicU8`..`AtomicU64`, and a
 /// TypedArray's `byteOffset` is element-size aligned by construction.
 pub struct SharedMem {
+    #[cfg(not(feature = "safe-sandbox"))]
     buf: UnsafeCell<Box<[u64]>>,
+    #[cfg(feature = "safe-sandbox")]
+    buf: Box<[u8]>,
     /// Fixed capacity in bytes (== `maxByteLength`; == the initial length for a
     /// non-growable SAB).
     cap: usize,
@@ -2410,19 +2578,39 @@ pub struct SharedMem {
 // it) and `len` only changes through an atomic. Atomic ops (Atomics.*) go
 // through real atomic instructions on interior pointers, never through the
 // plain slice views.
+#[cfg(not(feature = "safe-sandbox"))]
 unsafe impl Send for SharedMem {}
+#[cfg(not(feature = "safe-sandbox"))]
 unsafe impl Sync for SharedMem {}
 
 impl SharedMem {
     /// Allocate `cap` bytes of zeroed shared storage with `len` initially
     /// visible (`len <= cap`; a non-growable SAB passes `len == cap`).
-    pub fn new(len: usize, cap: usize) -> SharedMem {
+    pub fn try_new(len: usize, cap: usize) -> Result<SharedMem, std::collections::TryReserveError> {
+        #[cfg(not(feature = "safe-sandbox"))]
         let words = cap.div_ceil(8).max(1);
-        SharedMem {
-            buf: UnsafeCell::new(vec![0u64; words].into_boxed_slice()),
+        #[cfg(not(feature = "safe-sandbox"))]
+        let buf = {
+            let mut v = Vec::new();
+            v.try_reserve_exact(words)?;
+            v.resize(words, 0u64);
+            v.into_boxed_slice()
+        };
+        #[cfg(feature = "safe-sandbox")]
+        let buf = {
+            let mut v = Vec::new();
+            v.try_reserve_exact(cap.max(1))?;
+            v.resize(cap.max(1), 0u8);
+            v.into_boxed_slice()
+        };
+        Ok(SharedMem {
+            #[cfg(not(feature = "safe-sandbox"))]
+            buf: UnsafeCell::new(buf),
+            #[cfg(feature = "safe-sandbox")]
+            buf,
             cap,
             len: AtomicUsize::new(len.min(cap)),
-        }
+        })
     }
     /// The current visible byte length.
     #[inline]
@@ -2440,7 +2628,17 @@ impl SharedMem {
     /// matching `Vec::resize` semantics on the Local variant.
     pub fn set_byte_len(&self, n: usize) {
         let n = n.min(self.cap);
+        #[cfg(feature = "safe-sandbox")]
+        {
+            // SharedArrayBuffer is not exposed by the safe profile. Keep the
+            // representation memory-safe if an internal path still constructs
+            // one; no mutable alias or cross-thread byte access is available.
+            self.len.store(n, Ordering::Release);
+            return;
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
         let old = self.len.swap(n, Ordering::AcqRel);
+        #[cfg(not(feature = "safe-sandbox"))]
         if n < old {
             // SAFETY: n..old is within the fixed allocation; single-VM quirk
             // path (no concurrent agents reach a shrinking SAB).
@@ -2450,15 +2648,21 @@ impl SharedMem {
         }
     }
     /// Raw base pointer (8-byte aligned) — for the Atomics element accesses.
+    #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     pub fn base_ptr(&self) -> *mut u8 {
         unsafe { (*self.buf.get()).as_mut_ptr() as *mut u8 }
     }
     #[inline]
     fn as_slice(&self) -> &[u8] {
-        // SAFETY: the allocation is fixed and outlives `self`; see the
-        // Send/Sync note for why cross-thread tearing is acceptable here.
-        unsafe { std::slice::from_raw_parts(self.base_ptr(), self.byte_len()) }
+        #[cfg(feature = "safe-sandbox")]
+        return &self.buf[..self.byte_len()];
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            // SAFETY: the allocation is fixed and outlives `self`; see the
+            // Send/Sync note for why cross-thread tearing is acceptable here.
+            unsafe { std::slice::from_raw_parts(self.base_ptr(), self.byte_len()) }
+        }
     }
 }
 
@@ -2478,6 +2682,16 @@ impl AbData {
         match self {
             AbData::Local(v) => v.len(),
             AbData::Shared(m) => m.byte_len(),
+        }
+    }
+
+    /// Bytes reserved by the backing allocation (not merely the currently
+    /// visible length of a growable buffer).
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            AbData::Local(v) => v.capacity(),
+            AbData::Shared(m) => m.capacity(),
         }
     }
     #[inline]
@@ -2546,9 +2760,14 @@ impl std::ops::DerefMut for AbData {
             // for the engine's usage. Within one VM the heap hands out only
             // one buffer borrow at a time; Atomics ops never use this path
             // (they use real atomic instructions on SharedMem directly).
+            #[cfg(not(feature = "safe-sandbox"))]
             AbData::Shared(m) => unsafe {
                 std::slice::from_raw_parts_mut(m.base_ptr(), m.byte_len())
             },
+            #[cfg(feature = "safe-sandbox")]
+            AbData::Shared(_) => {
+                panic!("SharedArrayBuffer mutation is disabled by the safe-sandbox profile")
+            }
         }
     }
 }
@@ -2878,6 +3097,112 @@ pub enum HeapObj {
     Class(Box<ClassData>),
 }
 
+impl HeapObj {
+    /// Heap allocations owned directly by this slot. This deliberately uses
+    /// capacities rather than lengths: shrinking a JS aggregate does not give
+    /// its reserved address space back to the host allocator.
+    fn resident_payload_bytes(&self) -> usize {
+        match self {
+            HeapObj::Str(s) => s.bytes.capacity(),
+            HeapObj::Closure { upvalues, .. } => vec_capacity_bytes(upvalues),
+            HeapObj::EvalScope(bindings) => bindings
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Value)>() * 2)
+                .saturating_add(
+                    bindings
+                        .keys()
+                        .fold(0usize, |n, key| n.saturating_add(key.capacity())),
+                ),
+            HeapObj::Bound { args, .. } => vec_capacity_bytes(args),
+            HeapObj::Wrapped { name, .. } => name.capacity(),
+            HeapObj::NativeClosure { state, .. } => vec_capacity_bytes(state),
+            HeapObj::Array(items) => vec_capacity_bytes(items),
+            HeapObj::Object(map) => {
+                std::mem::size_of::<ObjMap>().saturating_add(map.resident_bytes())
+            }
+            HeapObj::Promise { reactions, .. } => match reactions {
+                Reactions::Many(v) => vec_capacity_bytes(v),
+                _ => 0,
+            },
+            HeapObj::Combinator(data) => {
+                let mut n = std::mem::size_of::<CombinatorData>()
+                    .saturating_add(vec_capacity_bytes(&data.results))
+                    .saturating_add(vec_capacity_bytes(&data.settled))
+                    .saturating_add(string_vec_payload(&data.keys));
+                // Keep the fold visibly saturating when fields are extended.
+                n = n.saturating_add(0);
+                n
+            }
+            HeapObj::Generator { regs, handlers, .. } => {
+                vec_capacity_bytes(regs).saturating_add(vec_capacity_bytes(handlers))
+            }
+            HeapObj::AsyncGenerator(state) => std::mem::size_of::<AsyncGenState>()
+                .saturating_add(vec_capacity_bytes(&state.regs))
+                .saturating_add(vec_capacity_bytes(&state.handlers))
+                .saturating_add(vec_capacity_bytes(&state.queue)),
+            HeapObj::AsyncState(state) => std::mem::size_of::<AsyncStateData>()
+                .saturating_add(vec_capacity_bytes(&state.regs))
+                .saturating_add(vec_capacity_bytes(&state.handlers)),
+            HeapObj::Map { keys, vals } | HeapObj::WeakMap { keys, vals } => {
+                vec_capacity_bytes(keys).saturating_add(vec_capacity_bytes(vals))
+            }
+            HeapObj::Set(values)
+            | HeapObj::WeakSet(values)
+            | HeapObj::FinalizationRegistry { tokens: values, .. } => vec_capacity_bytes(values),
+            HeapObj::RegExp { source, flags, .. } => {
+                // Compiled programs (including the ASCII twin) are measured
+                // through Regex::resident_bytes and Arc-deduplicated by the
+                // VM audit. Keep the observable source/flag text charged here.
+                source.len().saturating_add(flags.len())
+            }
+            HeapObj::ArrayBuffer { data, .. } => data.resident_bytes(),
+            HeapObj::Temporal { fields, .. } => vec_capacity_bytes(fields),
+            HeapObj::BigIntBig(value) => (value.bits() as usize)
+                .div_ceil(8)
+                .saturating_add(std::mem::size_of::<num_bigint::BigInt>()),
+            HeapObj::Symbol { prop_key, .. } => prop_key.capacity(),
+            HeapObj::Iterator { items, .. } => vec_capacity_bytes(items),
+            HeapObj::Class(class) => {
+                let mut n = std::mem::size_of::<ClassData>()
+                    .saturating_add(class.name.capacity())
+                    .saturating_add(class.source.capacity())
+                    .saturating_add(named_value_vec_payload(&class.methods))
+                    .saturating_add(named_value_vec_payload(&class.getters))
+                    .saturating_add(named_value_vec_payload(&class.setters))
+                    .saturating_add(string_vec_payload(&class.proto_order))
+                    .saturating_add(class.statics.resident_bytes())
+                    .saturating_add(named_value_vec_payload(&class.static_getters))
+                    .saturating_add(named_value_vec_payload(&class.static_setters))
+                    .saturating_add(vec_capacity_bytes(&class.computed_field_keys))
+                    .saturating_add(vec_capacity_bytes(&class.ctor_upvalues))
+                    .saturating_add(vec_capacity_bytes(&class.field_thunk_upvalues));
+                if let Some(dec) = &class.dec {
+                    n = n
+                        .saturating_add(std::mem::size_of::<DecState>())
+                        .saturating_add(vec_capacity_bytes(&dec.field_inits))
+                        .saturating_add(
+                            dec.field_inits
+                                .iter()
+                                .fold(0usize, |n, v| n.saturating_add(vec_capacity_bytes(v))),
+                        )
+                        .saturating_add(vec_capacity_bytes(&dec.elem_extra))
+                        .saturating_add(
+                            dec.elem_extra
+                                .iter()
+                                .fold(0usize, |n, v| n.saturating_add(vec_capacity_bytes(v))),
+                        )
+                        .saturating_add(vec_capacity_bytes(&dec.keys))
+                        .saturating_add(vec_capacity_bytes(&dec.instance_extra))
+                        .saturating_add(vec_capacity_bytes(&dec.static_extra))
+                        .saturating_add(vec_capacity_bytes(&dec.class_extra));
+                }
+                n
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// Heap index of the interned empty string. The 128 single-ASCII-char strings
 /// occupy indices `0..128`; the empty string is `128`.
 pub const INTERN_EMPTY: u32 = 128;
@@ -2893,6 +3218,12 @@ pub const INTERN_PINNED_END: u32 = INTERN_PAD2_END;
 
 pub struct Heap {
     objs: Vec<HeapObj>,
+    /// Last reconciled live payload total and its monotonic peak. Per-slot
+    /// charges let collection/reuse subtract the correct tracked size without
+    /// confusing cumulative allocation churn with resident high-water.
+    resident_payload_current: Cell<usize>,
+    resident_payload_high_water: Cell<usize>,
+    resident_payload_charged: Vec<Cell<usize>>,
     /// Per-object version, parallel to `objs` (one `u32` per heap object). Bumped
     /// whenever an object gains a NEW key (which may reallocate its `vals`). The
     /// JIT inline cache reads this (by heap index) to validate a cached
@@ -3174,6 +3505,13 @@ impl Heap {
         }
         debug_assert_eq!(objs.len(), INTERN_PINNED_END as usize + 1);
         let live = objs.len();
+        let resident_payload_charged: Vec<Cell<usize>> = objs
+            .iter()
+            .map(|obj| Cell::new(obj.resident_payload_bytes()))
+            .collect();
+        let resident_payload_high_water = resident_payload_charged
+            .iter()
+            .fold(0usize, |n, bytes| n.saturating_add(bytes.get()));
         let oracle = std::env::var_os("ZIPP_GCSTATS").is_some();
         let born = if oracle {
             vec![0; objs.len()]
@@ -3208,6 +3546,9 @@ impl Heap {
         let valgrain = std::env::var_os("ZIPP_NO_VALGRAIN_REMSET").is_none();
         Heap {
             objs,
+            resident_payload_current: Cell::new(resident_payload_high_water),
+            resident_payload_high_water: Cell::new(resident_payload_high_water),
+            resident_payload_charged,
             versions,
             free: Vec::new(),
             live,
@@ -3271,6 +3612,11 @@ impl Heap {
 
     #[inline]
     pub fn alloc(&mut self, obj: HeapObj) -> u32 {
+        let payload = obj.resident_payload_bytes();
+        let current = self.resident_payload_current.get().saturating_add(payload);
+        self.resident_payload_current.set(current);
+        self.resident_payload_high_water
+            .set(self.resident_payload_high_water.get().max(current));
         self.live += 1;
         if self.live >= self.gc_threshold {
             self.gc_requested = true;
@@ -3279,6 +3625,8 @@ impl Heap {
         // stale inline-cache entry for the old occupant misses).
         if let Some(idx) = self.free.pop() {
             self.objs[idx as usize] = obj;
+            debug_assert_eq!(self.resident_payload_charged[idx as usize].get(), 0);
+            self.resident_payload_charged[idx as usize].set(payload);
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
             if self.nursery {
                 if self.pretenure == 0 {
@@ -3308,6 +3656,7 @@ impl Heap {
         }
         let idx = self.objs.len() as u32;
         self.objs.push(obj);
+        self.resident_payload_charged.push(Cell::new(payload));
         self.versions.push(0);
         if self.nursery {
             if self.pretenure == 0 {
@@ -3651,6 +4000,43 @@ impl Heap {
         self.objs.len()
     }
 
+    /// O(1) conservative resident-byte high-water estimate. Initial payloads are
+    /// charged at allocation and [`Self::audit_resident_bytes`] periodically
+    /// incorporates capacity growth in existing objects. The payload peak is
+    /// monotonic, while per-slot charges prevent freed/reused allocation churn
+    /// from being mistaken for simultaneously resident memory.
+    pub fn resident_bytes(&self) -> usize {
+        vec_capacity_bytes(&self.objs)
+            .saturating_add(vec_capacity_bytes(&self.resident_payload_charged))
+            .saturating_add(vec_capacity_bytes(&self.versions))
+            .saturating_add(vec_capacity_bytes(&self.free))
+            .saturating_add(vec_capacity_bytes(&self.born))
+            .saturating_add(vec_capacity_bytes(&self.young))
+            .saturating_add(vec_capacity_bytes(&self.gen))
+            .saturating_add(vec_capacity_bytes(&self.remset))
+            .saturating_add(vec_capacity_bytes(&self.scan_roots))
+            .saturating_add(self.nonyoung_cache.capacity().div_ceil(8))
+            .saturating_add(vec_capacity_bytes(&self.vremset))
+            .saturating_add(self.resident_payload_high_water.get())
+    }
+
+    /// Reconcile in-place payload growth into the current and peak caches. This
+    /// is O(n) in heap slots and is therefore deliberately called much less
+    /// often than the abort/step poll; new objects are charged eagerly.
+    pub fn audit_resident_bytes(&self) -> usize {
+        debug_assert_eq!(self.objs.len(), self.resident_payload_charged.len());
+        let mut payload = 0usize;
+        for (obj, charged) in self.objs.iter().zip(&self.resident_payload_charged) {
+            let bytes = obj.resident_payload_bytes();
+            charged.set(bytes);
+            payload = payload.saturating_add(bytes);
+        }
+        self.resident_payload_current.set(payload);
+        self.resident_payload_high_water
+            .set(self.resident_payload_high_water.get().max(payload));
+        self.resident_bytes()
+    }
+
     /// Whether the dispatch loop should run a collection (live count passed the
     /// adaptive threshold). Cleared by `note_gc_done`.
     #[inline]
@@ -3670,6 +4056,9 @@ impl Heap {
     /// live reference remains. Never call on a pinned built-in slot.
     #[inline]
     pub fn free_slot(&mut self, idx: u32) {
+        let payload = self.resident_payload_charged[idx as usize].replace(0);
+        self.resident_payload_current
+            .set(self.resident_payload_current.get().saturating_sub(payload));
         self.objs[idx as usize] = HeapObj::Date(f64::NAN);
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
         if self.nursery {
@@ -3765,6 +4154,16 @@ impl Heap {
     /// invariant, and it is not one a shape-keyed guard should have to make.
     #[inline]
     pub fn replace(&mut self, idx: u32, obj: HeapObj) {
+        let new_payload = obj.resident_payload_bytes();
+        let old_payload = self.resident_payload_charged[idx as usize].replace(new_payload);
+        let current = self
+            .resident_payload_current
+            .get()
+            .saturating_sub(old_payload)
+            .saturating_add(new_payload);
+        self.resident_payload_current.set(current);
+        self.resident_payload_high_water
+            .set(self.resident_payload_high_water.get().max(current));
         // Nursery barrier (NURSERY_DESIGN.md §1 case 8): the incoming object
         // may hold young references; if the SLOT is old, its whole edge list
         // is re-traced at the next minor (holder-grain — the value set is a
@@ -3808,6 +4207,26 @@ impl Heap {
     #[inline]
     pub fn get_mut(&mut self, idx: u32) -> &mut HeapObj {
         &mut self.objs[idx as usize]
+    }
+
+    /// Visit every compiled RegExp program held directly by a live heap slot.
+    /// Both the authoritative Unicode program and its optional ASCII byte-opt
+    /// twin participate. Callers deduplicate the shared `Arc` identities.
+    pub(crate) fn visit_regexp_programs(
+        &self,
+        mut visit: impl FnMut(&std::sync::Arc<regress::Regex>),
+    ) {
+        for obj in &self.objs {
+            if let HeapObj::RegExp {
+                regex, ascii_twin, ..
+            } = obj
+            {
+                visit(regex);
+                if let Some(Some(twin)) = ascii_twin {
+                    visit(twin);
+                }
+            }
+        }
     }
 
     #[inline]
@@ -4395,6 +4814,39 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    #[test]
+    fn safe_propindex_tree_ignores_precomputed_legacy_bucket_collisions() {
+        // This 10k-key family shares the low eight bits of the former public
+        // FNV/splitmix tag. Targeting all fourteen bits of its final 16k-bucket
+        // table is the same offline operation at a higher trial count and made
+        // construction quadratic. Exact-key B-tree ordering has no bucket for
+        // either family to target.
+        const COUNT: usize = 10_000;
+        const MASK: u32 = 255;
+        let mut keys = Vec::with_capacity(COUNT);
+        let mut candidate = 0u64;
+        while keys.len() < COUNT {
+            let key = format!("attacker_{candidate:x}");
+            if prop_tag(&key) & MASK == 0 {
+                keys.push(key);
+            }
+            candidate += 1;
+        }
+
+        let index = PropIndex::build(&keys);
+        assert!(matches!(&*index, PropIndex::Tree { .. }));
+        for (slot, key) in keys.iter().enumerate() {
+            assert_eq!(index.find(&keys, key), Some(slot));
+        }
+
+        // ObjMap::clone clones the index verbatim and keeps all exact mappings.
+        let cloned = index.clone();
+        for (slot, key) in keys.iter().enumerate() {
+            assert_eq!(cloned.find(&keys, key), Some(slot));
         }
     }
 
@@ -5068,5 +5520,29 @@ mod tests {
             !h.minor_due(true),
             "GC stress must retain its fixed three-minor cadence"
         );
+    }
+
+    #[test]
+    fn payload_peak_tracks_resident_reuse_not_cumulative_churn() {
+        let mut h = Heap::new();
+        let baseline = h.resident_payload_current.get();
+        let first = h.alloc(HeapObj::Str(JsStr::new("x".repeat(1024))));
+        let charge = h.resident_payload_charged[first as usize].get();
+        assert_eq!(h.resident_payload_current.get(), baseline + charge);
+        let first_peak = h.resident_payload_high_water.get();
+
+        h.free_slot(first);
+        assert_eq!(h.resident_payload_current.get(), baseline);
+        let reused = h.alloc(HeapObj::Str(JsStr::new("y".repeat(1024))));
+        assert_eq!(reused, first);
+        assert_eq!(h.resident_payload_current.get(), baseline + charge);
+        assert_eq!(
+            h.resident_payload_high_water.get(),
+            first_peak,
+            "reusing an equal-size slot must not double-charge lifetime churn"
+        );
+
+        h.audit_resident_bytes();
+        assert_eq!(h.resident_payload_current.get(), baseline + charge);
     }
 }

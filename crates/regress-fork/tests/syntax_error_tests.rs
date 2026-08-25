@@ -60,3 +60,37 @@ fn test_syntax_errors() {
     test_1_error(r"\2(a)", "Invalid character escape");
     test_1_error("(?q:abc)", "Invalid group modifier");
 }
+
+#[cfg(feature = "prohibit-unsafe")]
+#[test]
+fn sandbox_rejects_repeated_unicode_property_expansion() {
+    let repeated_character_property = r"\p{L}".repeat(512);
+    let err = regress::Regex::with_flags(&repeated_character_property, "u")
+        .expect_err("aggregate character-property expansion must be bounded");
+    assert!(err.text.contains("property expansion exceeds"), "{err}");
+
+    // One RGI_Emoji atom is 3,953 alternatives in the generated Unicode
+    // table. The second must fail before its alternatives are copied into IR.
+    let err = regress::Regex::with_flags(r"\p{RGI_Emoji}\p{RGI_Emoji}", "v")
+        .expect_err("repeated string-property expansion must be bounded");
+    assert!(err.text.contains("property expansion exceeds"), "{err}");
+}
+
+#[cfg(feature = "prohibit-unsafe")]
+#[test]
+fn resident_bytes_covers_unicode_expansion() {
+    let simple = regress::Regex::new("abc").unwrap().resident_bytes();
+    let character_property = regress::Regex::with_flags(r"\p{L}", "u")
+        .unwrap()
+        .resident_bytes();
+    let string_property = regress::Regex::with_flags(r"\p{RGI_Emoji}", "v")
+        .unwrap()
+        .resident_bytes();
+
+    eprintln!(
+        "compiled resident bytes: simple={simple}, property={character_property}, RGI_Emoji={string_property}"
+    );
+    assert!(simple > 0);
+    assert!(character_property > simple);
+    assert!(string_property > character_property);
+}

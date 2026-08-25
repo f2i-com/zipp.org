@@ -29,18 +29,26 @@ impl<'p> Vm<'p> {
         args: &[Value],
         kind: u8,
     ) -> Result<Value, Thrown> {
-        let (parts, body) = if args.is_empty() {
-            (Vec::new(), String::new())
+        self.preflight_native_iteration_work(args.len() as u64)?;
+        let (params, body) = if args.is_empty() {
+            (String::new(), String::new())
         } else {
             // CreateDynamicFunction coerces the PARAMETER strings in argument
             // order first, then the body (a throwing toString surfaces in that
-            // order — observable).
-            let mut parts: Vec<String> = Vec::with_capacity(args.len() - 1);
-            for a in &args[..args.len() - 1] {
-                parts.push(self.to_js_string(*a)?);
+            // order — observable). Stream the comma-joined parameter source into
+            // one admitted buffer: retaining every converted part and then
+            // joining could duplicate an attacker-controlled aggregate before
+            // the dynamic-source meter had a chance to reject it.
+            let mut params = String::new();
+            for (i, a) in args[..args.len() - 1].iter().enumerate() {
+                if i != 0 {
+                    self.append_guest_string(&mut params, ",")?;
+                }
+                let part = self.to_js_string(*a)?;
+                self.append_guest_string(&mut params, &part)?;
             }
             let body = self.to_js_string(args[args.len() - 1])?;
-            (parts, body)
+            (params, body)
         };
         let prefix = match kind {
             1 => "function* ",
@@ -57,15 +65,8 @@ impl<'p> Vm<'p> {
         const NAME_OPEN: &str = "anonymous(";
         const PARAM_BODY_SEP: &str = "\n) {\n";
         const SOURCE_CLOSE: &str = "\n})";
-        let params_len = parts
-            .iter()
-            .enumerate()
-            .try_fold(0usize, |total, (i, part)| {
-                total
-                    .checked_add(usize::from(i != 0))
-                    .and_then(|n| n.checked_add(part.len()))
-            });
-        let source_len = params_len.and_then(|params_len| {
+        let params_len = params.len();
+        let source_len = Some(params_len).and_then(|params_len| {
             SOURCE_OPEN
                 .len()
                 .checked_add(prefix.len())
@@ -81,13 +82,6 @@ impl<'p> Vm<'p> {
         let source_len = source_len
             .ok_or_else(|| Thrown("RangeError: dynamic code source length overflow".into()))?;
 
-        let mut params = String::with_capacity(params_len.expect("source length checked above"));
-        for (i, part) in parts.into_iter().enumerate() {
-            if i != 0 {
-                params.push(',');
-            }
-            params.push_str(&part);
-        }
         // CreateDynamicFunction parses the parameter STRING on its own as
         // FormalParameters (whole string consumed) before the assembled
         // source: a `/*`, backtick, or `)` in the params could otherwise
@@ -104,7 +98,7 @@ impl<'p> Vm<'p> {
         // The newline before `)` defends against a `//` comment in the last
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.
-        let mut source = String::with_capacity(source_len);
+        let mut source = self.guest_string_with_capacity(source_len)?;
         source.push_str(SOURCE_OPEN);
         source.push_str(prefix);
         source.push_str(NAME_OPEN);

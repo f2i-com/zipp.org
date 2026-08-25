@@ -83,26 +83,6 @@ impl<'p> Vm<'p> {
         None
     }
 
-    /// `Error.prototype.toString` semantics for the read-only `display` path:
-    /// "name: message", dropping the separator when either part is empty.
-    pub(crate) fn error_display_string(&self, idx: u32) -> String {
-        let name = self
-            .read_data_prop(idx, "name")
-            .map(|v| self.display(v))
-            .unwrap_or_else(|| "Error".into());
-        let msg = self
-            .read_data_prop(idx, "message")
-            .map(|v| self.display(v))
-            .unwrap_or_default();
-        if name.is_empty() {
-            msg
-        } else if msg.is_empty() {
-            name
-        } else {
-            format!("{name}: {msg}")
-        }
-    }
-
     /// Methods on a number receiver: `toFixed`, `toString`. Returns `Ok(None)`
     /// for an unrecognised name (the caller then treats it as a missing property
     /// → TypeError, matching JS).

@@ -59,7 +59,20 @@ impl<'p> Vm<'p> {
     /// operator's non-overridden path. A bound function resolves to its target; a
     /// throwing `prototype` getter / non-object prototype propagates per spec
     /// (unlike the operator's cached-prototype fast path).
-    pub(crate) fn ordinary_has_instance(&mut self, c: Value, v: Value) -> Result<bool, Thrown> {
+    pub(crate) fn ordinary_has_instance(&mut self, mut c: Value, v: Value) -> Result<bool, Thrown> {
+        // Bound functions are guest-chainable. OrdinaryHasInstance delegates to
+        // [[BoundTargetFunction]], but doing that with a Rust self-call lets one
+        // `instanceof` exhaust the native stack before any VM frame limit runs.
+        loop {
+            let target = match c.is_heap().then(|| self.heap.get(c.heap_index())) {
+                Some(HeapObj::Bound { target, .. }) => Some(*target),
+                _ => None,
+            };
+            match target {
+                Some(target) => c = target,
+                None => break,
+            }
+        }
         if !self.is_callable(c) {
             // Symbol/BigInt are callable globals (typeof "function") that
             // is_callable reports false for (no user-invocable [[Construct]]);
@@ -71,13 +84,6 @@ impl<'p> Vm<'p> {
             if !special {
                 return Ok(false);
             }
-        }
-        // A bound function uses its [[BoundTargetFunction]] (recursively).
-        if let Some(HeapObj::Bound { target, .. }) =
-            c.is_heap().then(|| self.heap.get(c.heap_index()))
-        {
-            let t = *target;
-            return self.ordinary_has_instance(t, v);
         }
         if !self.is_object_value(v) {
             return Ok(false);
@@ -485,12 +491,12 @@ impl<'p> Vm<'p> {
                             args.first().copied()
                         };
                         if let Some(m) = msg.filter(|m| *m != Value::UNDEFINED) {
-                            let mi = self.to_str_idx(m);
+                            let message_value = self.to_str_value(m)?;
                             if let HeapObj::Object(map) = self.heap.get_mut(obj.heap_index()) {
                                 // `message` is a non-enumerable own data property.
                                 map.define(
                                     "message",
-                                    Value::heap(mi),
+                                    message_value,
                                     PropAttr {
                                         writable: true,
                                         enumerable: false,
