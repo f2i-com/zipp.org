@@ -13,6 +13,15 @@
 use super::*;
 
 /// Same-binary ablation for the whole closure-creation lane.
+///
+/// DEFAULT-OFF pending B181: the lane widened which bodies compile AND
+/// cross-call, and a widened body can reach a mid-body `SELF_CALL_DEOPT`
+/// (the general `CallMethod` route's miss) AFTER an effect (`CellSet`) — a
+/// cross-called frame can only replay the WHOLE call, double-applying the
+/// effect. test262 caught it (`cannot-override-this-with-thisArg`: a
+/// one-element `forEach` callback ran twice). Re-enable via
+/// `ZIPP_TIERC_CLOSURE_MAKE=1` only for measurement; the fix is a plan-time
+/// cross-entry exclusion for effect-then-deopt bodies, gated like any wave.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 pub(crate) fn tierc_closure_make_enabled() -> bool {
@@ -22,7 +31,8 @@ pub(crate) fn tierc_closure_make_enabled() -> bool {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("ZIPP_NO_TIERC_CLOSURE_MAKE").is_none();
+            let on = std::env::var_os("ZIPP_TIERC_CLOSURE_MAKE").is_some()
+                && std::env::var_os("ZIPP_NO_TIERC_CLOSURE_MAKE").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }

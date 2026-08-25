@@ -193,6 +193,7 @@ fn child(mode: &str, vars: &[(&str, &str)]) -> (String, String) {
         .env("ZIPP_JIT_THRESHOLD", "1")
         .env("ZIPP_JITLOG", "1");
     for key in [
+        "ZIPP_TIERC_CLOSURE_MAKE",
         "ZIPP_NO_TIERC_CLOSURE_MAKE",
         "ZIPP_NO_TIERC_ITER",
         "ZIPP_NO_OBJECT_FINALIZE",
@@ -220,7 +221,10 @@ fn child(mode: &str, vars: &[(&str, &str)]) -> (String, String) {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[test]
 fn app_ops_match_comparators_interpreter_and_gc_paths() {
-    let (jit, jit_log) = child("jit", &[]);
+    // B181: the closure lane is default-off pending the cross-entry
+    // effect-then-deopt exclusion; opt in explicitly so this equivalence
+    // matrix keeps exercising the lane it was written for.
+    let (jit, jit_log) = child("jit", &[("ZIPP_TIERC_CLOSURE_MAKE", "1")]);
     assert!(
         jit_log.contains("Tier C fn") && jit_log.contains(" compiled"),
         "hot application bodies never compiled through Tier C:\n{jit_log}"
@@ -228,7 +232,11 @@ fn app_ops_match_comparators_interpreter_and_gc_paths() {
     let (nojit, _) = child("nojit", &[("ZIPP_NOJIT", "1")]);
     let (gc, _) = child(
         "gc",
-        &[("ZIPP_GC_STRESS", "1"), ("ZIPP_NURSERY_VERIFY", "1")],
+        &[
+            ("ZIPP_TIERC_CLOSURE_MAKE", "1"),
+            ("ZIPP_GC_STRESS", "1"),
+            ("ZIPP_NURSERY_VERIFY", "1"),
+        ],
     );
     let (lanes_off, _) = child(
         "lanes-off",
