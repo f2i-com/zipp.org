@@ -131,12 +131,17 @@ fn optimized_ablation_nojit_and_gc_modes_match() {
             "hot",
             &[("ZIPP_JIT_THRESHOLD", "1"), ("ZIPP_JITLOG", "1")][..],
         ),
+        // The intrinsic-off comparators ALSO disable the general method route:
+        // with it live, an off-switched name simply takes the live-IC path
+        // instead of blacklisting the function, and the rejection line these
+        // modes assert on would (correctly) never print.
         (
             "collections_off",
             &[
                 ("ZIPP_JIT_THRESHOLD", "1"),
                 ("ZIPP_JITLOG", "1"),
                 ("ZIPP_NO_TIERC_COLL_MUTATE", "1"),
+                ("ZIPP_NO_TIERC_CLOSURE_MAKE", "1"),
             ][..],
         ),
         (
@@ -145,6 +150,7 @@ fn optimized_ablation_nojit_and_gc_modes_match() {
                 ("ZIPP_JIT_THRESHOLD", "1"),
                 ("ZIPP_JITLOG", "1"),
                 ("ZIPP_NO_TIERC_STRING_UPPER", "1"),
+                ("ZIPP_NO_TIERC_CLOSURE_MAKE", "1"),
             ][..],
         ),
         ("nojit", &[("ZIPP_NOJIT", "1")][..]),

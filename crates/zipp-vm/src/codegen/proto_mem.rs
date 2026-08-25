@@ -842,12 +842,82 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             }
             // Capture-free ordinary function literals and their method-home
             // side-table write.  Runtime helpers revalidate the immutable
-            // MakeFunc site plus the exact active callee before any effect;
-            // MakeClosure/MakeArrow stay interpreter-only because their
-            // lexical/capture state needs a different construction protocol.
+            // MakeFunc site plus the exact active callee before any effect.
             Instr::MakeFunc { .. } | Instr::SetHomeObject { .. } => {
                 if !crate::vm::tierc_makefunc_home_enabled() {
                     reject!("[tierC-reject] MakeFunc/SetHomeObject (disabled)");
+                }
+            }
+            // Closure-CREATING ops: capture cells and real closures/arrows.
+            // The helpers revalidate the immutable site against the exact
+            // active callable and replicate the interpreter's lexical
+            // inheritance (cells, `this`, `[[HomeObject]]`, `new.target`,
+            // EvalScope, realm); every decline is a pure prefix. This is what
+            // lets application-shaped render/handler code compile at all — a
+            // React-style component allocates a handler arrow per item.
+            Instr::MakeCell { .. }
+            | Instr::MakeCellTdz { .. }
+            | Instr::MakeCellFnName { .. }
+            | Instr::MarkCellConst { .. }
+            | Instr::MakeClosure { .. }
+            | Instr::MakeArrow { .. }
+            // Direct cell reads/writes in the CREATING function (a boxed local
+            // is accessed through its cell once captured). Pure helpers; a TDZ
+            // read/write declines so the interpreter throws its exact error.
+            | Instr::CellGet { .. }
+            | Instr::CellSet { .. }
+            | Instr::CellSetChecked { .. } => {
+                if !crate::vm::tierc_closure_make_enabled() {
+                    reject!("[tierC-reject] closure-make op (disabled)");
+                }
+            }
+            // Generic element write `a[i] = v` — the region path's exact
+            // `jit_set_index` helper (dense store/grow, unpinned TypedArrays);
+            // anything needing observable coercion or exotic receivers deopts.
+            Instr::SetIndex { .. } => {
+                if !crate::vm::tierc_closure_make_enabled() {
+                    reject!("[tierC-reject] op SetIndex (disabled)");
+                }
+            }
+            // `array[index](args…)` — the region path's guarded dense
+            // computed-call helper; every miss is a pure prefix.
+            Instr::CallMethodComputed { .. } => {
+                if !(crate::vm::tierc_closure_make_enabled() && computed_call_dense_enabled()) {
+                    reject!("[tierC-reject] op CallMethodComputed (disabled)");
+                }
+            }
+            // `new Array(…)` — the interpreter arm's dense subset via a pure
+            // helper; RangeError/sparse lengths decline to the interpreter.
+            Instr::ArrayCtor { .. } => {
+                if !crate::vm::tierc_closure_make_enabled() {
+                    reject!("[tierC-reject] op ArrayCtor (disabled)");
+                }
+            }
+            // Sync `for-of` machinery and its close-on-abrupt-exit finally
+            // bracket. Every helper implements the interpreter arm's built-in
+            // fast path (pristine dense-array iterator, no-op normal-completion
+            // tails, frame handler pushes for the verified frame-backed
+            // activation) and declines observable protocol steps purely.
+            // Functions with handler ops never receive cross entries, so
+            // frame-free activations cannot reach the bracket helpers.
+            Instr::GetIterator { .. }
+            | Instr::IterPrime { .. }
+            | Instr::IterNext { .. }
+            | Instr::PushFinally { .. }
+            | Instr::PopFinally
+            | Instr::EndFinally { .. }
+            | Instr::IterCloseFinally { .. }
+            | Instr::ObjectKeys { .. } => {
+                if !crate::vm::tierc_iter_enabled() {
+                    reject!("[tierC-reject] iterator/finally op (disabled)");
+                }
+            }
+            // `key in obj` (never the `#x in obj` brand form): dense-present
+            // fast path, then the full proxy-aware [[HasProperty]] with the
+            // call-protocol throw wiring.
+            Instr::HasProp { brand: false, .. } => {
+                if !crate::vm::tierc_iter_enabled() {
+                    reject!("[tierC-reject] op HasProp (disabled)");
                 }
             }
             Instr::GlobalFn {
@@ -948,7 +1018,11 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                         && matches!(key, Some("toUpperCase")))
                     || (argc == 1
                         && substring1_intrinsic_enabled()
-                        && matches!(key, Some("substring") | Some("slice")));
+                        && matches!(key, Some("substring") | Some("slice")))
+                    // Every other name/arity: the general live-IC route (see
+                    // the emitter's final CallMethod arm). A user-closure
+                    // callee runs natively; natives/exotics deopt per call.
+                    || crate::vm::tierc_closure_make_enabled();
                 if !ok {
                     reject!("[tierC-reject] CallMethod {key:?} argc={argc}");
                 }
@@ -1171,6 +1245,50 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 count,
                 ..
             } => (Uses::range(val_base, count), Some(dst)),
+            // Capture cells are read-modify-write on their register; closure
+            // creation reads only named operands here (ParentLocal cell
+            // sources were def'd by an earlier MakeCell* in the same body, so
+            // entry-uninit analysis is unaffected — the instr_uses convention).
+            Instr::MakeCell { reg } | Instr::MakeCellFnName { reg } => (u1(reg), Some(reg)),
+            Instr::MakeCellTdz { reg } => (u0(), Some(reg)),
+            Instr::MarkCellConst { reg } => (u1(reg), None),
+            Instr::MakeClosure { dst, .. } => (u0(), Some(dst)),
+            Instr::MakeArrow { dst, this_reg, .. } => (u1(this_reg), Some(dst)),
+            Instr::CellGet { dst, cell } => (u1(cell), Some(dst)),
+            Instr::CellSet { cell, src } | Instr::CellSetChecked { cell, src } => {
+                (u2(cell, src), None)
+            }
+            Instr::SetIndex { obj, key, val } => (u3(obj, key, val), None),
+            Instr::CallMethodComputed {
+                dst,
+                obj,
+                key,
+                arg_base,
+                argc,
+            } => (Uses::range(arg_base, argc).plus(obj).plus(key), Some(dst)),
+            Instr::ArrayCtor {
+                dst,
+                arg_base,
+                argc,
+            } => (Uses::range(arg_base, argc), Some(dst)),
+            Instr::GetIterator { dst, src } => (u1(src), Some(dst)),
+            Instr::IterPrime { dst, iter } => (u1(iter), Some(dst)),
+            Instr::ObjectKeys { dst, obj } => (u1(obj), Some(dst)),
+            Instr::HasProp {
+                dst,
+                key,
+                obj,
+                brand: false,
+            } => (u2(key, obj), Some(dst)),
+            // The finally bracket manipulates frame state only; EndFinally and
+            // IterCloseFinally read their completion registers on either path.
+            Instr::PushFinally { .. } | Instr::PopFinally => (u0(), None),
+            Instr::EndFinally { kind_reg, val_reg } => (u2(kind_reg, val_reg), None),
+            Instr::IterCloseFinally { iter, kind_reg } => (u2(iter, kind_reg), None),
+            // IterNext writes three registers, which does not fit the
+            // single-def mask model; a decline only costs the zero-fill
+            // fallback (and handler-op functions get no cross entry anyway).
+            Instr::IterNext { .. } => return None,
             Instr::LooseEq { dst, a, b } => (u2(a, b), Some(dst)),
             Instr::MathOp {
                 dst,
@@ -1281,6 +1399,102 @@ mod smallvec {
             }
             true
         }
+    }
+}
+
+/// The general Tier-C `CallMethod` route: try the own-slot direct inliner,
+/// then the method cross-call, then the interpreter's live method IC — each
+/// prefix pure, each fallback unchanged, `CALL_THREW` unwinding at this ip.
+/// Extracted so the `random` intrinsic arm and every non-intrinsic name emit
+/// the identical protocol.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+fn emit_tierc_general_method(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    epilogue: dynasmrt::DynamicLabel,
+    call_method_ic: usize,
+    packed_fip: u64,
+    packed_args: u64,
+    argc: u16,
+    dst: u16,
+    arg_base: u16,
+    refetch: Option<(usize, usize)>,
+    own_slot_direct: bool,
+) {
+    // A metered region deliberately skips the native prefixes: their callee
+    // entries have not yet proved byte-for-byte charge equivalence with the
+    // interpreter CallMethod (`own_slot_direct` is pre-gated on the meter).
+    let method_cross = tierc_method_crosscall_enabled();
+    let method_done = ops.new_dynamic_label();
+    if own_slot_direct {
+        let direct_helper = crate::vm::jit_cross_own_method_call as usize;
+        let direct_fallback = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov rcx, rdi                        // vm
+            ; mov rdx, rbx                        // caller window base
+            ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+            ; mov r9, QWORD packed_fip as i64
+            ; mov rax, QWORD direct_helper as i64
+            ; call rax
+            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => direct_fallback               // pure decline -> existing path
+            ; mov r10, QWORD CALL_THREW as i64
+            ; cmp rax, r10
+            ; je => bail                          // committed throw
+            ; mov [rbx + dreg(dst)], rax
+        );
+        if let Some((vb, icb)) = refetch {
+            emit_refetch_pinned(ops, vb, Some(icb));
+        }
+        dynasm!(ops
+            ; jmp => method_done
+            ; => direct_fallback
+        );
+    }
+    if method_cross {
+        let method_cross_helper = crate::vm::jit_cross_method_call as usize;
+        let method_fallback = ops.new_dynamic_label();
+        dynasm!(ops
+            ; mov rcx, rdi                        // vm
+            ; mov rdx, rbx                        // caller window base
+            ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+            ; mov r9, QWORD packed_fip as i64
+            ; mov rax, QWORD method_cross_helper as i64
+            ; call rax
+            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => method_fallback               // pure decline → generic helper
+            ; mov r10, QWORD CALL_THREW as i64
+            ; cmp rax, r10
+            ; je => bail                          // committed throw
+            ; mov [rbx + dreg(dst)], rax
+        );
+        if let Some((vb, icb)) = refetch {
+            emit_refetch_pinned(ops, vb, Some(icb));
+        }
+        dynasm!(ops
+            ; jmp => method_done
+            ; => method_fallback
+        );
+    }
+    emit_region_call_ic(
+        ops,
+        ip,
+        bail,
+        epilogue,
+        call_method_ic,
+        packed_fip,
+        packed_args,
+        argc,
+        dst,
+        refetch,
+        None,
+    );
+    if own_slot_direct || method_cross {
+        dynasm!(ops ; => method_done);
     }
 }
 
@@ -1965,6 +2179,339 @@ pub(crate) fn compile_proto_mem(
                 );
                 // The allocation can move all backing Vec storage even though
                 // heap indices themselves are stable.
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::MakeCell { .. }
+            | Instr::MakeCellTdz { .. }
+            | Instr::MakeCellFnName { .. }
+            | Instr::MarkCellConst { .. } => {
+                // Capture-cell ops write their fresh cell back INTO the live
+                // window through the validated pointer, so success needs no
+                // destination store here. The helper re-reads the immutable
+                // site and validates the activation before any effect.
+                let helper = crate::vm::jit_make_cell as usize;
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let window = proto.reg_count.max(1) as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_fip as i64
+                    ; mov r9, QWORD window as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::MakeClosure { dst, .. } | Instr::MakeArrow { dst, .. } => {
+                // Real closures/arrows: the helper resolves capture cells from
+                // the live window and the verified activation, and replicates
+                // the interpreter's lexical this/home/new.target/EvalScope
+                // inheritance before returning the fresh callable's bits.
+                let helper = crate::vm::jit_make_closure as usize;
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let window = proto.reg_count.max(1) as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed_fip as i64
+                    ; mov r9, QWORD window as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::CellGet { dst, cell } => {
+                // The region path's exact pure cell read; a TDZ read declines
+                // to the interpreter's ReferenceError. No alloc → no refetch.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(cell)]
+                    ; mov rax, QWORD heap.cell_get as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::CellSet { cell, src } => {
+                // The region path's unconditional cell store (its internal
+                // nursery barrier is the single commit). No alloc.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(cell)]
+                    ; mov r8, [rbx + dreg(src)]
+                    ; mov rax, QWORD heap.cell_set as i64
+                    ; call rax
+                );
+            }
+            Instr::CellSetChecked { cell, src } => {
+                // TDZ-checked store: the decline precedes the write, so the
+                // interpreter replays its exact ReferenceError.
+                let helper = crate::vm::jit_cell_set_tdz_checked as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(cell)]
+                    ; mov r8, [rbx + dreg(src)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::SetIndex { obj, key, val } => {
+                // The region path's generic element write: dense store/grow and
+                // unpinned-TypedArray number stores; observable coercion or
+                // exotic receivers deopt. A grow REALLOCATES the dense Vec, so
+                // pinned tables refetch exactly as after any allocating helper.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(obj)]
+                    ; mov r8, [rbx + dreg(key)]
+                    ; mov r9, [rbx + dreg(val)]
+                    ; mov rax, QWORD heap.set_index as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::CallMethodComputed {
+                dst,
+                obj,
+                key,
+                arg_base,
+                argc,
+            } => {
+                // The region path's guarded dense `array[index](args…)`: only a
+                // present own dense slot holding a plain Func/Closure frame-
+                // calls; every miss is a pure prefix the interpreter replays.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed_args = ((obj as u64) << 32) | ((key as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    heap.call_method_computed_dense,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    refetch,
+                    None,
+                );
+            }
+            Instr::ArrayCtor {
+                dst,
+                arg_base,
+                argc,
+            } => {
+                // Dense `new Array(…)` subset; RangeError/sparse lengths and
+                // malformed windows decline before any allocation.
+                let helper = crate::vm::jit_array_ctor as usize;
+                let packed = ((proto.reg_count.max(1) as u64) << 32)
+                    | ((arg_base as u64) << 16)
+                    | argc as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::GetIterator { dst, src } => {
+                // Pristine dense-array identity only; every observable
+                // protocol step declines. Pure → no refetch.
+                let helper = crate::vm::jit_get_iterator as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(src)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::IterPrime { dst, iter } => {
+                // Built-in iterables prime `undefined` with no observable get.
+                let helper = crate::vm::jit_iter_prime as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(iter)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::IterNext {
+                value_dst,
+                done_dst,
+                iter,
+                idx,
+                next,
+            } => {
+                // The REGION path's `jit_iter_next` verbatim: the dense-array
+                // positional walk plus the intrinsic array/collection/regexp
+                // iterator steps; everything else deopts before state moves.
+                // The helper runs the loop safe point and can allocate, so
+                // pinned tables re-derive afterwards.
+                let packed = ((iter as u64) << 48)
+                    | ((next as u64) << 32)
+                    | ((value_dst as u64) << 16)
+                    | done_dst as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, rbx                        // frame register window
+                    ; mov r8, QWORD packed as i64         // iter/next/value/done regs
+                    ; mov r9d, idx as i32                 // dense-Array cursor reg
+                    ; mov rax, QWORD heap.iter_next as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // non-intrinsic → redo in interp
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // threw → unwind, NOT redo
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::PushFinally {
+                target,
+                kind_reg,
+                val_reg,
+            } => {
+                // The region path's total handler-stack push. Tier-C bodies
+                // with handler ops never receive cross entries, so the active
+                // frame is always this activation's own.
+                let packed = ((target as u64) << 32) | ((kind_reg as u64) << 16) | val_reg as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed as i64
+                    ; mov rax, QWORD heap.push_finally as i64
+                    ; call rax
+                );
+            }
+            Instr::PopFinally => {
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rax, QWORD heap.pop_finally as i64
+                    ; call rax
+                );
+            }
+            Instr::EndFinally { kind_reg, .. } => {
+                // Only the NORMAL completion falls through natively; abrupt
+                // completions decline into the interpreter's routing.
+                let helper = crate::vm::jit_end_finally as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(kind_reg)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::IterCloseFinally { kind_reg, .. } => {
+                // Normal/jump completions do not close; return/throw decline
+                // (IteratorClose is observable user code).
+                let helper = crate::vm::jit_iter_close_finally as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(kind_reg)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::HasProp {
+                dst,
+                key,
+                obj,
+                brand: false,
+            } => {
+                // The region path's read-only `jit_has_property` helper: the
+                // full non-Proxy [[HasProperty]] walk, byte-identical to the
+                // interpreter on the served chains; a Proxy anywhere, an
+                // object key's observable ToString, or a non-object RHS
+                // declines so the interpreter re-executes. PURE — no refetch.
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(key)]         // key bits
+                    ; mov r8, [rbx + dreg(obj)]          // obj bits
+                    ; mov rax, QWORD heap.has_property as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::ObjectKeys { dst, obj } => {
+                // Ordinary-object/array own-key snapshot (allocates; no user
+                // code). Proxies and primitives decline purely.
+                let helper = crate::vm::jit_object_keys as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(obj)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
@@ -3040,65 +3587,7 @@ pub(crate) fn compile_proto_mem(
                             None,
                         );
                     } else {
-                        // A metered region deliberately skips this prefix: its
-                        // native callee entry has not yet proved byte-for-byte
-                        // charge equivalence with the interpreter CallMethod.
-                        let own_slot_direct = method_own_slot_direct;
-                        let method_cross = tierc_method_crosscall_enabled();
-                        let method_done = ops.new_dynamic_label();
-                        if own_slot_direct {
-                            let direct_helper = crate::vm::jit_cross_own_method_call as usize;
-                            let direct_fallback = ops.new_dynamic_label();
-                            dynasm!(ops
-                                ; mov rcx, rdi                        // vm
-                                ; mov rdx, rbx                        // caller window base
-                                ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
-                                ; mov r9, QWORD packed_fip as i64
-                                ; mov rax, QWORD direct_helper as i64
-                                ; call rax
-                                ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                                ; cmp rax, r10
-                                ; je => direct_fallback               // pure decline -> existing path
-                                ; mov r10, QWORD CALL_THREW as i64
-                                ; cmp rax, r10
-                                ; je => bail                          // committed throw
-                                ; mov [rbx + dreg(dst)], rax
-                            );
-                            if let Some((vb, icb)) = refetch {
-                                emit_refetch_pinned(&mut ops, vb, Some(icb));
-                            }
-                            dynasm!(ops
-                                ; jmp => method_done
-                                ; => direct_fallback
-                            );
-                        }
-                        if method_cross {
-                            let method_cross_helper = crate::vm::jit_cross_method_call as usize;
-                            let method_fallback = ops.new_dynamic_label();
-                            dynasm!(ops
-                                ; mov rcx, rdi                        // vm
-                                ; mov rdx, rbx                        // caller window base
-                                ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
-                                ; mov r9, QWORD packed_fip as i64
-                                ; mov rax, QWORD method_cross_helper as i64
-                                ; call rax
-                                ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                                ; cmp rax, r10
-                                ; je => method_fallback               // pure decline → generic helper
-                                ; mov r10, QWORD CALL_THREW as i64
-                                ; cmp rax, r10
-                                ; je => bail                          // committed throw
-                                ; mov [rbx + dreg(dst)], rax
-                            );
-                            if let Some((vb, icb)) = refetch {
-                                emit_refetch_pinned(&mut ops, vb, Some(icb));
-                            }
-                            dynasm!(ops
-                                ; jmp => method_done
-                                ; => method_fallback
-                            );
-                        }
-                        emit_region_call_ic(
+                        emit_tierc_general_method(
                             &mut ops,
                             ip,
                             bail,
@@ -3108,12 +3597,10 @@ pub(crate) fn compile_proto_mem(
                             packed_args,
                             argc,
                             dst,
+                            arg_base,
                             refetch,
-                            None,
+                            method_own_slot_direct,
                         );
-                        if own_slot_direct || method_cross {
-                            dynasm!(ops ; => method_done);
-                        }
                     }
                 } else if key == "toUpperCase" && argc == 0 && tierc_string_upper_enabled() {
                     dynasm!(ops
@@ -3223,7 +3710,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov [rbx + dreg(dst)], rax
                     );
                     emit_region_bail(&mut ops, ip, bail, epilogue);
-                } else {
+                } else if matches!(key, "charCodeAt" | "indexOf" | "push") && argc == 1 {
                     // charCodeAt / indexOf / push — one-arg dedicated helpers.
                     let helper = match key {
                         "indexOf" => heap.str_index_of,
@@ -3242,6 +3729,32 @@ pub(crate) fn compile_proto_mem(
                         ; mov [rbx + dreg(dst)], rax
                     );
                     emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else {
+                    // Every remaining name/arity: the same live-IC route as
+                    // `random` — a USER function/closure runs to completion
+                    // through the method cross-call or generic helper; natives
+                    // and accessor/exotic receivers deopt per call. Admission
+                    // accepts these only under the closure-make latch: a hot
+                    // application method (`getState`) is a user closure, and
+                    // blacklisting the whole caller costs far more than a rare
+                    // native-name bail.
+                    let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                    let packed_args =
+                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    emit_tierc_general_method(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        heap.call_method_ic,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        arg_base,
+                        refetch,
+                        method_own_slot_direct,
+                    );
                 }
             }
             Instr::Call {

@@ -103,7 +103,7 @@ pub(crate) fn tierc_int_string_enabled() -> bool {
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
-fn regs_window_valid(vm: &Vm<'_>, regs: *const u64, reg_count: usize) -> bool {
+pub(crate) fn regs_window_valid(vm: &Vm<'_>, regs: *const u64, reg_count: usize) -> bool {
     if regs.is_null() {
         return false;
     }

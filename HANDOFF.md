@@ -80,6 +80,30 @@ lever. Survival's residual is ~15% GC (survivor tracing; `jit_set_index`
 old→young traffic) plus per-node `MakeFunc` + string concat. The router's is
 Map get/set helpers and 4-shape polymorphic property access.
 
+### Wave 54 addendum — the application-op lanes (B174)
+
+The paragraph above was acted on immediately: `ZIPP_NO_TIERC_CLOSURE_MAKE`
+(cells, MakeClosure/MakeArrow with full lexical inheritance, CellGet/CellSet,
+SetIndex, ArrayCtor, dense CallMethodComputed, and a GENERAL CallMethod
+live-IC route) and `ZIPP_NO_TIERC_ITER` (pristine-array GetIterator identity,
+IterPrime, the region `jit_iter_next` step, the finally bracket via the region
+push/pop helpers, ObjectKeys, HasProp). Handler-op functions are excluded from
+native cross entries, so the bracket only ever runs frame-backed and a native
+throw unwinds into handlers exactly where the interpreter would look.
+
+**The honest result is B50's lesson replayed at scale: reaching the tier is
+not being faster in it.** React's whole hot path now compiles (interp share
+51% → 23%) yet the row moved only **−2.91% [−3.80,−2.42]**; every other row
+and the frozen 13 measured null (no row outside its CI). The per-op MEM-tier
+helper cost ≈ interpreter dispatch for this code shape. Kept as an ENABLER on
+the MULTI_SPLIT precedent: with the bodies compiled, the next measurable
+targets are the per-op costs themselves — the `acc_arms=0/N` IC sites, the
+direct-miss eviction churn (`fn10 EVICTED … batched 6`), and the
+helper-per-op floor. A stray-process note: two leaked `cargo.exe` builds made
+an intermediate sniff read as a 10–25% regression across three rows; the
+paired harness on a quiet machine showed every one was noise. Kill strays
+before believing any number.
+
 ---
 
 ## Continuation snapshot — 2026-08-25, Waves 40–52 checkpoint

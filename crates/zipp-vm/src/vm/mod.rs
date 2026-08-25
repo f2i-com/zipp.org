@@ -1936,6 +1936,8 @@ pub(crate) mod bigint;
 mod cldr_alias;
 mod cldr_alias_data;
 mod cldr_en;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod closure_make_jit;
 mod coerce;
 mod collections;
 mod const_cache;
@@ -1953,6 +1955,8 @@ mod helpers_misc;
 pub(crate) mod helpers_num2;
 mod helpers_numeric;
 mod intl;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod iter_jit;
 mod iterhelpers;
 mod locale_tag;
 mod misc_methods;
@@ -2003,6 +2007,8 @@ mod ic;
 
 pub(crate) use bigint::*;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use closure_make_jit::*;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use field_stream::*;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use function_literal_jit::*;
@@ -2012,5 +2018,7 @@ pub(crate) use helpers_misc::*;
 pub(crate) use helpers_num2::*;
 pub(crate) use helpers_numeric::*;
 pub(crate) use ic::{GetAct, SetAct, RET_DISCARD};
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use iter_jit::*;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use object_literal_jit::*;

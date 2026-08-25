@@ -3165,6 +3165,18 @@ impl Jit {
                     .is_none()
                     .then(|| markdown_inline_plan(proto))
                     .flatten();
+                // A body containing handler ops mutates the ACTIVE FRAME's
+                // handler stack; a frame-free cross-call has no frame to hold
+                // them, so such functions never receive a cross entry and every
+                // invocation goes through the ordinary framed call path.
+                let has_handler_ops = proto
+                    .code
+                    .iter()
+                    .any(|i| matches!(i, Instr::PushHandler { .. } | Instr::PushFinally { .. }));
+                if has_handler_ops {
+                    self.clear_cross_entry(func_id);
+                    return;
+                }
                 self.set_cross_entry(
                     func_id,
                     entry,
