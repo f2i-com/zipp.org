@@ -392,6 +392,14 @@ const MODES: &[Mode] = &[
         env: &[("ZIPP_NO_ICGATE", "1")],
     },
     Mode {
+        name: "noshapeways",
+        env: &[("ZIPP_NO_SHAPE_WAYS", "1")],
+    },
+    Mode {
+        name: "noattrselide",
+        env: &[("ZIPP_NO_ATTRS_ELIDE", "1")],
+    },
+    Mode {
         name: "nofusedcmp",
         env: &[("ZIPP_NO_FUSED_CMPJUMP", "1")],
     },

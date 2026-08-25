@@ -572,7 +572,8 @@ pub(crate) enum IcProbe {
 /// Registers: `r14` = IC table base and `r13` = the heap's parallel version
 /// array base, both pinned for the whole native run; `rbx` = the caller's
 /// register window. The probe clobbers `rax` (hit only), `rcx`, `rdx`, `r8d`,
-/// `r9`, `r10` and `r11d`.
+/// `r9`, `r10` and `r11` (the identity walk touches only `r11d`; the
+/// shape-way direct form composes a 64-bit pattern in full `r11`).
 ///
 /// SAFETY (`[r13 + idx*4]` is in bounds): the receiver's version is read only
 /// after the identity compare matched a FILLED way, whose `obj_bits` the miss
@@ -603,6 +604,59 @@ pub(crate) fn emit_ic_probe(
         // Accessors have no tagged-way consumer in this form.
         debug_assert!(acc.is_none());
         dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+        if matches!(probe_kind, IcProbe::Get { .. }) && super::shape_ways_enabled() {
+            // ── SHAPE WAYS (B178) ── the native form of the shape-slot memo:
+            // guard the receiver's LIVE shape mirror against the way's baked
+            // shape and read `vals[slot]` through the live vals mirror — no
+            // call. Soundness is the mirror discipline (heap.rs field docs):
+            // a mirror-shape match proves the entry was refreshed after the
+            // map's last version-bumping mutation, same shape ⇒ same key
+            // sequence ⇒ same slot, and the vals base was captured by the
+            // same event. Non-Object heap slots hold mirror 0 (DICT), which
+            // no way carries; empty ways are all-zero, which the marker bit
+            // (1 << 32) in the composed pattern can never equal; stale
+            // IDENTITY entries from the site's pre-direct compile carry the
+            // 0x7FFD NaN tag in their high word and likewise never match.
+            // Both mirror bases are loaded through the VM (`rdi`) on every
+            // access — helper allocations grow the mirrors mid-run and
+            // nothing re-derives a pinned copy.
+            let ways = ops.new_dynamic_label();
+            let hit = ops.new_dynamic_label();
+            let skip = ops.new_dynamic_label();
+            let shape_off = crate::vm::host_api::JIT_SHAPE_MIRROR_RAW_OFFSET as i32;
+            let vals_off = crate::vm::host_api::JIT_VALS_MIRROR_RAW_OFFSET as i32;
+            let IcProbe::Get { dst } = probe_kind else {
+                unreachable!()
+            };
+            dynasm!(ops
+                ; mov r10, rax
+                ; shr r10, 48
+                ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
+                ; jne => skip
+                ; mov ecx, eax                        // heap idx (low 32)
+                ; mov r9, [rdi + shape_off]
+                ; mov r11d, [r9 + rcx*4]              // live mirror shape
+                ; bts r11, 32                         // compose (1<<32)|shape
+                ; lea r9, [r14 + ic_off]              // way 0 of this site
+                ; mov r8d, JIT_IC_WAYS as i32
+                ; => ways
+                ; cmp r11, [r9]
+                ; je => hit
+                ; add r9, JIT_IC_STRIDE as i32
+                ; dec r8d
+                ; jnz => ways
+                ; jmp => skip
+                ; => hit
+                ; mov r10, [rdi + vals_off]
+                ; mov rcx, [r10 + rcx*8]              // live vals base
+                ; mov edx, [r9 + 20]
+                ; and edx, 0x00FF_FFFF                // slot (low 24)
+                ; mov rax, [rcx + rdx*8]              // vals[slot] (CALL-FREE)
+                ; mov [rbx + dreg(dst)], rax
+                ; jmp => cont
+                ; => skip
+            );
+        }
         return;
     }
     let probe = ops.new_dynamic_label();

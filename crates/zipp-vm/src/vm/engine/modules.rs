@@ -248,6 +248,7 @@ impl<'p> Vm<'p> {
             }
         }
         self.module_namespaces.insert(ns_idx, own_map.clone());
+        self.heap.pin_mirror_dict(ns_idx);
         self.module_own.insert(path.to_path_buf(), own_map);
         full
     }
@@ -621,6 +622,7 @@ impl<'p> Vm<'p> {
             }
         } else {
             self.module_namespaces.insert(ns_idx, own_pre.clone());
+            self.heap.pin_mirror_dict(ns_idx);
             self.module_own.insert(path.clone(), own_pre);
         }
         // Dependencies that suspend at top-level await get collected past this
@@ -1323,6 +1325,7 @@ impl<'p> Vm<'p> {
             let rid = real.heap_index();
             if let Some(map) = self.module_namespaces.get(&rid).cloned() {
                 self.module_namespaces.insert(idx, map);
+                self.heap.pin_mirror_dict(idx);
             }
             if let Some(amb) = self.module_ambiguous.get(&rid).cloned() {
                 self.module_ambiguous.insert(idx, amb);

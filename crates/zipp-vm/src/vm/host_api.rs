@@ -52,6 +52,18 @@ pub(crate) const JIT_GLOBAL_ROUTE_EPOCH_OFFSET: usize =
 pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, mi_class_epoch);
 
+/// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).
+/// The shape-way probes load the base pointers through the live VM argument
+/// on EVERY access — the mirror vectors grow when helpers allocate, and
+/// unlike the pinned `r13` versions base nothing re-derives these, so a
+/// baked address would dangle after growth.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SHAPE_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, shape_mirror_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_VALS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, vals_ptr_mirror_raw);
+
 /// Whether a global slot holds a top-level function/class declaration or an
 /// ordinary variable. Hosts use this to decide what is callable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

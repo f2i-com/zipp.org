@@ -349,6 +349,17 @@ env_off_switch!(
     fn int_ta_length_enabled() = "ZIPP_NO_INT_TA_LENGTH"
 );
 
+env_off_switch!(
+    /// Default-on kill switch for NATIVE SHAPE WAYS at direct-miss `GetProp`
+    /// sites (B178): guard the receiver's live shape mirror, read
+    /// `vals[slot]` through the vals mirror, no helper call. Off restores
+    /// the helper-only direct-miss form byte-identically, and the miss
+    /// helper stops filling shape ways (both sides latch this one value —
+    /// a way under a way-blind probe is dead weight, a probe over unfilled
+    /// ways always misses; neither is unsound, but A/B demands symmetry).
+    fn shape_ways_enabled() = "ZIPP_NO_SHAPE_WAYS"
+);
+
 /// Encode a live non-BigInt TypedArray kind as a length-only pin marker.
 pub(crate) fn ta_len_pin_kind(kind: u8) -> Option<u8> {
     if !int_ta_length_enabled() || kind >= TA_LEN_PIN_COUNT {
@@ -2604,6 +2615,27 @@ impl IcEntry {
             obj_bits,
             vals_ptr,
             version,
+            slot_nhops: slot,
+            hops: [(0, 0); JIT_IC_MAX_HOPS],
+        })
+    }
+
+    /// A SHAPE way (B178), fillable only at a site compiled in the
+    /// direct-miss GET form: `obj_bits` holds `(1 << 32) | shape` — a marker
+    /// pattern no real receiver bits can equal (live heap Values carry the
+    /// 0x7FFD NaN tag in the high word, and empty ways are all-zero) — and
+    /// the probe compares it against the SAME pattern composed from the
+    /// receiver's live shape mirror. `vals_ptr`/`version` are unused (the
+    /// hit reads the live vals mirror; the mirror discipline replaces the
+    /// version guard).
+    pub fn shape_way(shape: u32, slot: u32) -> Option<IcEntry> {
+        if slot > 0x00FF_FFFF || shape == crate::shape::DICT {
+            return None;
+        }
+        Some(IcEntry {
+            obj_bits: (1u64 << 32) | shape as u64,
+            vals_ptr: 0,
+            version: 0,
             slot_nhops: slot,
             hops: [(0, 0); JIT_IC_MAX_HOPS],
         })

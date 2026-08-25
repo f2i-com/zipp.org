@@ -3198,12 +3198,12 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 // carrying any Value/pointer out of the shared heap view.
                 (map.keys.get(s).is_some_and(|k| k == key)
                     && map.attr_get(s).is_some_and(|a| !a.accessor))
-                .then(|| (map.val_at(s), map.vals_ptr() as u64, slot))
+                .then(|| (map.val_at(s), map.vals_ptr() as u64, slot, sh))
             })
     } else {
         None
     };
-    if let Some((val, vals_ptr, slot)) = shape_hit {
+    if let Some((val, vals_ptr, slot, sh)) = shape_hit {
         match jit_direct_miss_gate(vm, site_idx) {
             crate::codegen::DirectMissGate::Recompile => {
                 // Own data reads are side-effect-free. The parked native frame
@@ -3211,7 +3211,27 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 // direct-form recompile, with no getter/effect duplicated.
                 return crate::codegen::SELF_CALL_DEOPT;
             }
-            crate::codegen::DirectMissGate::Direct => return val.bits(),
+            crate::codegen::DirectMissGate::Direct => {
+                // ── B178: install the native form of this memo hit ──
+                // Repair the shape/vals mirrors (the map is settled here —
+                // strictly after any mutation's bump invalidated them) and
+                // fill a SHAPE way for the compiled direct-form probe. Only
+                // a native miss re-enters this helper, so filling is
+                // self-limiting: one trip per (site, shape) once mirrors are
+                // birth-correct (FinalizeObject), one per object for
+                // append-built literals whose mirror stayed at EMPTY.
+                if crate::codegen::shape_ways_enabled() {
+                    vm.heap.refresh_mirror(idx);
+                    if !vm.jit.ic_thrashing(site_idx) {
+                        if let Some(e) = crate::codegen::IcEntry::shape_way(sh, slot) {
+                            vm.jit.set_ic(site_idx, e);
+                        }
+                    } else if crate::codegen::ic_refill_gate_enabled() {
+                        vm.jit.ic_rot_bump(site_idx);
+                    }
+                }
+                return val.bits();
+            }
             crate::codegen::DirectMissGate::Probe => {}
         }
         // Refill only while the site still has ways to give. Once it has

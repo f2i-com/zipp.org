@@ -418,6 +418,8 @@ impl<'p> Vm<'p> {
             }
         }
         self.arr_proto = build(self, &arr_methods, None);
+        let arr_proto = self.arr_proto;
+        self.heap.pin_mirror_dict(arr_proto);
         self.str_proto = build(self, &str_methods, None);
         let str_proto = self.str_proto;
         // `String.prototype.trimLeft`/`trimRight` ARE `trimStart`/`trimEnd` — the
@@ -2632,6 +2634,7 @@ impl<'p> Vm<'p> {
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
         self.global_this = global_this;
+        self.heap.pin_mirror_dict(global_this);
         // The test262 `$262` host object: { global, detachArrayBuffer, gc }.
         let d262_detach = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_DETACH)));
         let d262_gc = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_GC)));

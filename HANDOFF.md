@@ -230,12 +230,37 @@ jit-mem + 11% gc; 2.77M property accesses take only 242 IC misses because the
 INTERPRETER-side shape memo absorbs the identity thrash — so every access at
 a `direct_miss` site pays a helper round-trip (~10-15ns) where node pays a
 hidden-class guarded load (~1ns). `touch()` recompiles with `direct_miss=5`
-(`ZIPP_JITLOG`). The next mechanism is therefore NATIVE SHAPE WAYS at
-direct-miss sites: guard the receiver's live shape (via a version-disciplined
-mirror array), load `vals` through a parallel raw-pointer mirror, no call.
-GET-only v1; the full design contract (mirror invariant, fail-safe staleness
-for mid-construction objects, fill policy, gates) is in the w57 spec and the
-B178 ledger row.
+(`ZIPP_JITLOG`).
+
+### Wave 57: native shape ways landed (B178)
+
+The direct-miss GET form now carries native shape ways — the B178 ledger row
+has the full mechanism, discipline, review outcome and numbers. Headlines:
+shapes-stable **−23.2%**, warm-router **−17.4%**, reactish **−13.7%**,
+shapes-megamorphic −6.6%, survival −5.4%, types-churn −4.4%, all CIs
+excluding zero; suites + 8k soak + 4-lens adversarial review green (one
+confirmed major — realm globals' stale guardable mirrors — fixed by pinning
+every `ic_obj_ok`-excluded receiver unmatchable at registration).
+
+What v1 deliberately leaves on the table, in expected-value order:
+1. **SetProp shape ways** — `touch()` writes `object.value` once per 3 reads;
+   the write path still pays the helper. Needs the write-barrier story: a
+   native store to `vals[slot]` must run the nursery value-grain barrier
+   (old holder, young value) — the region `jit_set_index` helpers show the
+   contract. Likely worth another −5-10% on the cluster.
+2. **The build half** — FinalizeObject's helper (validate + Vec build +
+   alloc + shape memo + young log) is now the object rows' floor (~40-60ns
+   per literal). Candidates: emit the allocation inline (bump the objs Vec
+   natively with a slow-path call), or batch the young-log/mirror writes.
+3. **Non-direct sites** — sites that never prove thrash keep identity ways;
+   a shape way is strictly more general for own data. Promoting shape ways
+   to the DEFAULT first probe form (identity ways only for pinned
+   receivers) removes the 32-eviction warmup and the form split, but
+   changes bytes at EVERY property site — measure carefully.
+4. **calls-closures 2.07x / npm-nanoid 2.74x** are NOT property-bound: the
+   closure row is MakeCell/MakeClosure helper cost (map item 4, per-op
+   Tier-C floor), nanoid is the module-local string append lane (map item
+   2). Both untouched by waves 56-57.
 
 ---
 

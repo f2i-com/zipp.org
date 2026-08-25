@@ -1108,6 +1108,9 @@ impl<'p> Vm<'p> {
         // (active_realm / realm_globals) and the get/set interception that makes
         // `other.x` read/write the same binding a bare `x` sees inside the realm.
         self.realm_global_objs.insert(g_idx, r);
+        // Excluded receiver (ic_obj_ok): defines continue on this map after
+        // alloc with no version bump, so its mirror must never be guardable.
+        self.heap.pin_mirror_dict(g_idx);
         // The realm's own `eval`: a distinct function object whose call runs the
         // code against THIS realm's global bindings (call_value intercepts it).
         let eval_idx = self.heap.alloc(HeapObj::Native(native::GLOBAL_EVAL));

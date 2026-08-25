@@ -718,6 +718,7 @@ impl<'p> Vm<'p> {
         // inline cache that captured the old vals pointer.
         self.heap.bump_version(idx);
         self.module_namespaces.insert(idx, slot_map);
+        self.heap.pin_mirror_dict(idx);
     }
 
     pub(crate) fn disposable_op(

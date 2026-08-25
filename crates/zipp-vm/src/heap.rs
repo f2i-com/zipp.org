@@ -3518,6 +3518,40 @@ pub struct Heap {
     /// `vals`-pointer: a matching version proves `vals` hasn't reallocated since
     /// the cache was filled. Allocated in lockstep with `objs` so indices align.
     versions: Vec<u32>,
+    /// SHAPE MIRROR, parallel to `objs`: the object's hidden class as of the
+    /// last settling event, or [`crate::shape::DICT`] (0). The emitted
+    /// shape-way probes (B178) guard on THIS word — `mirror == way.shape`
+    /// licenses a direct `vals[slot]` read with no helper call — so its
+    /// maintenance discipline is the soundness argument:
+    ///
+    ///  * `alloc`/`replace` REFRESH it from the live map (a fresh object's
+    ///    settled shape; for the append-built literal paths the captured
+    ///    shape is EMPTY, which no way can carry — an empty map has no
+    ///    property to fill — so the entry is stale-but-unmatchable while the
+    ///    literal is under construction).
+    ///  * `bump_version` INVALIDATES it to 0 rather than refreshing: every
+    ///    reachable-object shape change bumps the version (the documented IC
+    ///    contract), and 0 is fail-safe regardless of whether a caller bumps
+    ///    before or after mutating — a refresh here would capture the WRONG
+    ///    side at a bump-first call site, and a shape-way hit has no second
+    ///    guard to catch it.
+    ///  * the JIT miss helper REPAIRS it to the live shape when it resolves
+    ///    own data on a guardable map (strictly after any mutation settled).
+    ///  * `free_slot` clears it; non-`Object` slots hold 0 forever, so a
+    ///    string/array receiver can never match a way.
+    shape_mirror: Vec<u32>,
+    /// `vals` base-pointer mirror, parallel to `objs` (0 for non-`Object`
+    /// slots). Maintained by exactly the [`Heap::shape_mirror`] events; a
+    /// shape-way hit dereferences it only AFTER the mirror-shape guard
+    /// matched, which proves the entry was refreshed after the map's last
+    /// version-bumping mutation (key adds are what reallocate `vals`).
+    vals_ptr_mirror: Vec<u64>,
+    /// Raw bases of the two mirrors, re-cached whenever the vectors grow. The
+    /// emitted probes load these THROUGH the VM (`[rdi + offset]`) on every
+    /// access, so growth during a native run (helper allocations) is safe —
+    /// unlike the pinned `r13` versions base, nothing re-derives these.
+    pub(crate) shape_mirror_raw: u64,
+    pub(crate) vals_ptr_mirror_raw: u64,
     /// Free list of reclaimed slot indices (filled by the mark-sweep GC's sweep,
     /// drained by `alloc`). A reused slot is overwritten and its version bumped so
     /// any stale JIT inline-cache entry misses. Empty until the first collection.
@@ -3832,12 +3866,16 @@ impl Heap {
         let pretenure_on = std::env::var_os("ZIPP_NO_PRETENURE").is_none();
         let nonyoung_cache_on = std::env::var_os("ZIPP_NO_NONYOUNG_CACHE").is_none();
         let valgrain = std::env::var_os("ZIPP_NO_VALGRAIN_REMSET").is_none();
-        Heap {
+        let mut h = Heap {
             objs,
             resident_payload_current: Cell::new(resident_payload_high_water),
             resident_payload_high_water: Cell::new(resident_payload_high_water),
             resident_payload_charged,
             payload_accounting: Cell::new(false),
+            shape_mirror: vec![crate::shape::DICT; versions.len()],
+            vals_ptr_mirror: vec![0; versions.len()],
+            shape_mirror_raw: 0,
+            vals_ptr_mirror_raw: 0,
             versions,
             free: Vec::new(),
             live,
@@ -3872,7 +3910,45 @@ impl Heap {
             nonyoung_cache_on,
             vremset: Vec::new(),
             valgrain,
-        }
+        };
+        h.recache_mirror_raws();
+        h
+    }
+
+    /// Re-cache the raw bases the emitted shape-way probes read through the
+    /// VM. Called after any growth of the mirror vectors (and once at boot).
+    #[inline]
+    fn recache_mirror_raws(&mut self) {
+        self.shape_mirror_raw = self.shape_mirror.as_ptr() as u64;
+        self.vals_ptr_mirror_raw = self.vals_ptr_mirror.as_ptr() as u64;
+    }
+
+    /// Pin slot `idx`'s mirrors permanently unmatchable. For the receivers
+    /// `ic_obj_ok` excludes from every property cache (the global object,
+    /// %Array.prototype%, realm globals, module namespaces): their live
+    /// semantics are layered OVER the ObjMap, the fill/repair path never
+    /// touches them (the exclusion returns before it), and several are
+    /// populated after allocation without version bumps — so their mirrors
+    /// must never hold a guardable shape. The exclusion becomes an invariant
+    /// here instead of an accident of shape non-collision (B178 review).
+    #[inline]
+    pub fn pin_mirror_dict(&mut self, idx: u32) {
+        self.shape_mirror[idx as usize] = crate::shape::DICT;
+        self.vals_ptr_mirror[idx as usize] = 0;
+    }
+
+    /// Refresh slot `idx`'s shape/vals mirrors from the live object — the
+    /// settling events: allocation, wholesale replace, and the JIT miss
+    /// helper's repair after resolving own data (see the field docs for why
+    /// `bump_version` must NOT use this).
+    #[inline]
+    pub fn refresh_mirror(&mut self, idx: u32) {
+        let (sh, vp) = match &self.objs[idx as usize] {
+            HeapObj::Object(m) => (m.shape(), m.vals.as_ptr() as u64),
+            _ => (crate::shape::DICT, 0),
+        };
+        self.shape_mirror[idx as usize] = sh;
+        self.vals_ptr_mirror[idx as usize] = vp;
     }
 
     /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
@@ -3925,6 +4001,7 @@ impl Heap {
             debug_assert_eq!(self.resident_payload_charged[idx as usize].get(), 0);
             self.resident_payload_charged[idx as usize].set(payload);
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            self.refresh_mirror(idx);
             if self.nursery {
                 if self.pretenure == 0 {
                     self.young.push(idx);
@@ -3955,6 +4032,10 @@ impl Heap {
         self.objs.push(obj);
         self.resident_payload_charged.push(Cell::new(payload));
         self.versions.push(0);
+        self.shape_mirror.push(crate::shape::DICT);
+        self.vals_ptr_mirror.push(0);
+        self.recache_mirror_raws();
+        self.refresh_mirror(idx);
         if self.nursery {
             if self.pretenure == 0 {
                 self.young.push(idx);
@@ -4356,6 +4437,8 @@ impl Heap {
     /// live reference remains. Never call on a pinned built-in slot.
     #[inline]
     pub fn free_slot(&mut self, idx: u32) {
+        self.shape_mirror[idx as usize] = crate::shape::DICT;
+        self.vals_ptr_mirror[idx as usize] = 0;
         let payload = self.resident_payload_charged[idx as usize].replace(0);
         self.resident_payload_current
             .set(self.resident_payload_current.get().saturating_sub(payload));
@@ -4473,6 +4556,7 @@ impl Heap {
         self.write_barrier(idx);
         self.objs[idx as usize] = obj;
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.refresh_mirror(idx);
     }
 
     /// Bump object `idx`'s version (call after a key-add reallocates its `vals`).
@@ -4484,6 +4568,12 @@ impl Heap {
     #[inline]
     pub fn bump_version(&mut self, idx: u32) {
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        // Invalidate, don't refresh: callers bump on either side of the
+        // mutation, and a refresh here would capture the wrong side at a
+        // bump-first site — a shape-way hit has no second guard to catch it.
+        // The next miss on the object repairs the mirror from the settled map.
+        self.shape_mirror[idx as usize] = crate::shape::DICT;
+        self.vals_ptr_mirror[idx as usize] = 0;
     }
 
     /// Base pointer of the parallel version array (for the JIT inline cache). The
@@ -5850,6 +5940,43 @@ mod tests {
 
         h.audit_resident_bytes();
         assert_eq!(h.resident_payload_current.get(), baseline + charge);
+    }
+
+    #[test]
+    fn shape_mirror_settles_at_alloc_invalidates_at_bump_repairs_on_demand() {
+        let mut h = Heap::new();
+        let mut m = ObjMap::new();
+        m.push_data("a".to_string(), Value::num(1.0));
+        m.push_data("b".to_string(), Value::num(2.0));
+        let sh = m.shape();
+        assert!(m.shape_guardable());
+        let idx = h.alloc(HeapObj::Object(Box::new(m)));
+        // Alloc is a settling event: mirror == live shape, vals base captured.
+        assert_eq!(h.shape_mirror[idx as usize], sh);
+        assert_ne!(h.vals_ptr_mirror[idx as usize], 0);
+
+        // A version bump (every reachable-object shape change) INVALIDATES —
+        // order-independence is the point, so no refresh here.
+        h.bump_version(idx);
+        assert_eq!(h.shape_mirror[idx as usize], crate::shape::DICT);
+        assert_eq!(h.vals_ptr_mirror[idx as usize], 0);
+
+        // The miss helper's repair re-settles from the live map.
+        h.refresh_mirror(idx);
+        assert_eq!(h.shape_mirror[idx as usize], sh);
+        assert_ne!(h.vals_ptr_mirror[idx as usize], 0);
+
+        // Reclaim clears; a recycled slot re-settles from the NEW occupant.
+        h.free_slot(idx);
+        assert_eq!(h.shape_mirror[idx as usize], crate::shape::DICT);
+        assert_eq!(h.vals_ptr_mirror[idx as usize], 0);
+        let again = h.alloc(HeapObj::Str(JsStr::new("s".into())));
+        assert_eq!(again, idx, "free list must hand the slot back");
+        assert_eq!(
+            h.shape_mirror[idx as usize],
+            crate::shape::DICT,
+            "a non-Object occupant must never be matchable by a shape way"
+        );
     }
 
     #[test]
